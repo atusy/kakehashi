@@ -674,6 +674,11 @@ impl LanguageServerPool {
 
     /// Increment the version of a virtual document and return the new version,
     /// or `None` if the document has not been opened.
+    ///
+    /// Test-only: production sends always go through
+    /// [`Self::increment_version_if_content_changed`] (the content-guarded path,
+    /// #422); this bare delegation is retained for the version-tracking unit tests.
+    #[cfg(test)]
     pub(super) async fn increment_document_version(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -681,6 +686,22 @@ impl LanguageServerPool {
     ) -> Option<i32> {
         self.document_tracker
             .increment_document_version(virtual_uri, connection_key)
+            .await
+    }
+
+    /// Increment the version only when `content` differs from the last `didChange`
+    /// sent to this connection for this virtual document; `None` skips the re-send
+    /// (content unchanged, or the doc isn't registered for this connection). The
+    /// content guard keeps a position-only host edit from re-analyzing every region
+    /// (#422). Delegates to [`DocumentTracker::increment_version_if_content_changed`].
+    pub(super) async fn increment_version_if_content_changed(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) -> Option<i32> {
+        self.document_tracker
+            .increment_version_if_content_changed(virtual_uri, connection_key, content)
             .await
     }
 

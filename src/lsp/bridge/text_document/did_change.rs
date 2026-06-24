@@ -89,10 +89,17 @@ impl LanguageServerPool {
                     Arc::clone(handle)
                 };
 
-                // increment_document_version acts as per-connection filter:
-                // returns None if this connection hasn't registered the doc.
+                // Per-connection filter (returns None if this connection hasn't
+                // registered the doc) AND content guard: skip the re-send when this
+                // region's extracted content is unchanged since the last didChange to
+                // this connection, so a position-only host edit doesn't re-analyze
+                // every region (#422). Mirrors the host path's fingerprint guard.
                 let Some(version) = self
-                    .increment_document_version(&virtual_uri, &connection_key)
+                    .increment_version_if_content_changed(
+                        &virtual_uri,
+                        &connection_key,
+                        &injection.content,
+                    )
                     .await
                 else {
                     continue;

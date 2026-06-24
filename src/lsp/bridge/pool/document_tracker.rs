@@ -16,6 +16,17 @@ use url::Url;
 use super::ConnectionKey;
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
 
+/// Hash of a virtual document's extracted content, used to skip re-sending an
+/// unchanged `didChange` (#422). Mirrors the host path's fingerprint
+/// (`text_document/host.rs`); collisions only risk a missed re-send, which the
+/// next genuine content change corrects.
+fn content_fingerprint(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Represents an opened virtual document for tracking.
 ///
 /// Used for didClose propagation when host document closes.
@@ -49,6 +60,14 @@ pub(crate) struct DocumentTracker {
     /// Keyed by connection (not language) to enable process sharing while
     /// keeping per-root connections distinct.
     document_versions: Mutex<HashMap<ConnectionKey, HashMap<String, i32>>>,
+    /// Map of connection key → (virtual document URI → fingerprint of the content
+    /// last sent to that connection). Lets the virt sync skip re-sending `didChange`
+    /// when a host edit didn't change a region's extracted content (mirrors the
+    /// host path's fingerprint guard in `text_document/host.rs`), so a position-only
+    /// edit doesn't re-analyze every region and flicker (#422). An entry is recorded
+    /// only when a `didChange` is actually sent, keeping "fingerprint set ⟺ content
+    /// sent" — never bumping the gate without a corresponding sync.
+    document_fingerprints: Mutex<HashMap<ConnectionKey, HashMap<String, u64>>>,
     /// Tracks which virtual documents were opened for each host document.
     ///
     /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
@@ -74,6 +93,7 @@ impl DocumentTracker {
     pub(crate) fn new() -> Self {
         Self {
             document_versions: Mutex::new(HashMap::new()),
+            document_fingerprints: Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
@@ -243,6 +263,52 @@ impl DocumentTracker {
         None
     }
 
+    /// Like [`Self::increment_document_version`], but a no-op (`None`) when
+    /// `content` is unchanged since the last `didChange` sent to this connection
+    /// for this virtual document — so a host edit that doesn't alter a region's
+    /// extracted content doesn't re-sync and re-analyze it (#422). The fingerprint
+    /// is recorded only after the version bump succeeds (i.e. a `didChange` will be
+    /// sent), keeping "fingerprint set ⟺ content sent". `None` is also returned when
+    /// the document isn't registered for this connection (as for `increment`).
+    pub(super) async fn increment_version_if_content_changed(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) -> Option<i32> {
+        let uri_string = virtual_uri.to_uri_string();
+        let fp = content_fingerprint(content);
+
+        // Unchanged content for this connection → skip the re-send (and the version
+        // bump). Held briefly and released before the version lock (the two maps are
+        // never locked simultaneously, matching the rest of this type).
+        {
+            let fingerprints = self.document_fingerprints.lock().await;
+            if fingerprints
+                .get(connection_key)
+                .and_then(|docs| docs.get(&uri_string))
+                == Some(&fp)
+            {
+                return None;
+            }
+        }
+
+        // Content changed (or first didChange / unknown): bump the version. `None`
+        // here means the doc isn't registered for this connection, so don't record a
+        // fingerprint (nothing was sent).
+        let version = self
+            .increment_document_version(virtual_uri, connection_key)
+            .await?;
+
+        self.document_fingerprints
+            .lock()
+            .await
+            .entry(connection_key.clone())
+            .or_default()
+            .insert(uri_string, fp);
+        Some(version)
+    }
+
     /// Remove a document from `document_versions` and `opened_documents`.
     ///
     /// Does NOT remove from `host_to_virtual` — that cleanup is handled
@@ -257,6 +323,15 @@ impl DocumentTracker {
 
         let mut versions = self.document_versions.lock().await;
         if let Some(docs) = versions.get_mut(connection_key) {
+            docs.remove(&uri_string);
+        }
+        drop(versions);
+        if let Some(docs) = self
+            .document_fingerprints
+            .lock()
+            .await
+            .get_mut(connection_key)
+        {
             docs.remove(&uri_string);
         }
 
@@ -286,6 +361,12 @@ impl DocumentTracker {
                 .map(|docs| docs.into_keys().collect())
                 .unwrap_or_default()
         };
+        // Drop this connection's fingerprints too, so a respawn under the same key
+        // re-syncs from scratch rather than skipping on a stale fingerprint (#422).
+        self.document_fingerprints
+            .lock()
+            .await
+            .remove(connection_key);
         for uri in &uris {
             self.decrement_opened(uri);
             self.remove_from_reverse_index(uri, connection_key);
@@ -835,6 +916,75 @@ mod tests {
             .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert_eq!(version, Some(3), "Second increment should return 3");
+    }
+
+    #[tokio::test]
+    async fn increment_version_if_content_changed_skips_unchanged_content() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+
+        // First call records the fingerprint and bumps (1 -> 2).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
+                .await,
+            Some(2),
+            "first didChange sends and bumps the version"
+        );
+        // Same content → skip (no bump, no re-send).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
+                .await,
+            None,
+            "unchanged content must skip the re-send"
+        );
+        // Changed content → bump again (2 -> 3).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 2")
+                .await,
+            Some(3),
+            "changed content sends and bumps"
+        );
+    }
+
+    #[tokio::test]
+    async fn increment_version_if_content_changed_returns_none_for_unregistered() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        // Never opened for this connection: no version registered, so no send — and
+        // no fingerprint recorded (so a later open + same content still sends once).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(
+                    &virtual_uri,
+                    &ConnectionKey::for_server("lua"),
+                    "local x = 1",
+                )
+                .await,
+            None,
+        );
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(
+                    &virtual_uri,
+                    &ConnectionKey::for_server("lua"),
+                    "local x = 1",
+                )
+                .await,
+            Some(2),
+            "after registration the first send goes through even with the same content"
+        );
     }
 
     // ========================================
