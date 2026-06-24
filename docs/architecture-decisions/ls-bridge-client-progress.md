@@ -23,14 +23,18 @@ all N downstreams' `End`s/responses (they collide); it forwards exactly one or
 composes one, as the Decision details. (A request that reaches a single server is
 just relayed.)
 
-Today the bridge does not forward client-provided tokens to downstreams at all.
+Originally the bridge forwarded no client-provided tokens to downstreams at all.
 The host raw-request path strips them (`strip_progress_tokens`,
 `src/lsp/bridge/text_document/host.rs`), and the per-method virtual request
-builders construct fresh params with default (empty) progress fields, so no
-token is carried either way. A downstream honoring them would stream into the
-void, since the bridge discards downstream notifications, and could legally
-return an empty final result. The cost is that client-requested progress never
-reaches the editor.
+builders constructed fresh params with default (empty) progress fields, so no
+token was carried either way. (The host path still strips, and
+`partialResultToken` is still dropped; wired methods now carry a bridge-minted
+`workDoneToken` — see the Decision–Implementation Gap.) With the token stripped
+the downstream had none to report against, and the bridge discarded downstream
+notifications regardless — so client-requested progress did not reach the editor
+(and a server that did emit `$/progress` could legally still return an empty final
+result). This is what the decision below set out to fix; it now reaches the editor
+on the wired paths.
 
 ## Decision
 
@@ -73,11 +77,14 @@ The lifecycle engages only when there is progress worth showing; otherwise the
 request just returns its result (today's behavior, minus the strip).
 
 - **Single downstream (N = 1).** Relay that server's own `Begin`/`report`/`End`
-  against the client's original token (client tokens are already unique, so no
-  remapping). If it emits none, the editor sees no progress. This holds even when
-  the sole server was selected via the wildcard: the `Rest`-never-anchor rule
-  disambiguates among *racing* contenders, and a single downstream has none — so
-  its real `Begin` is safe to forward.
+  onto the client's original token — what the editor sees. (Client tokens are
+  already unique, so the server-declared `ProgressRegistry` namespacing is not
+  involved; internally the bridge mints a per-server token so the reader can route
+  the downstream's `$/progress` to the request's aggregator, which retargets it
+  onto the client token.) If it emits none, the editor sees no progress. This
+  holds even when the sole server was selected via the wildcard: the
+  `Rest`-never-anchor rule disambiguates among *racing* contenders, and a single
+  downstream has none — so its real `Begin` is safe to forward.
 - **preferred, N > 1.** This strategy short-circuits (it does not wait for the
   losers), so there is no collection count to report. If the anchor emits its own
   progress, forward its `Begin`/`report`/`End` (real title) and suppress every
@@ -234,13 +241,38 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 
 ## Decision–Implementation Gap
 
-Not yet implemented (tracked in issue #414); today both client-provided tokens
-are stripped before fan-out. Specific points to settle during implementation:
+**Implemented** (issue #414): the `workDoneToken` path for the **N = 1** relay
+and the **`preferred`** strategy with a **single fixed anchor** — the dispatch
+mints a per-server bridge token only for the tracked source (sole server at
+N = 1, highest-priority *named* anchor at N > 1; a wildcard `Rest` group that
+outranks the candidate yields no anchor), routes that downstream's `$/progress`
+onto the editor's token, and guarantees a terminal `End` on teardown. Wired for
+`textDocument/references`; #446 extends it to the goto family (under #437) and
+#448 adds the `workDoneProgress` capability advertisement (under #445; without it
+spec-compliant clients never send a token).
 
-- The empty-vs-non-empty threshold that triggers fall-through must
-  **match the existing preferred-strategy empty-result behavior** — a uniform
-  fall-through-on-empty across the priority walk, not a per-method exception.
-  Align with the preferred strategy; do not invent a new threshold.
+**Deferred** (still stripped or unhandled; tracked):
+
+- **`partialResultToken`** is still stripped — only `workDoneToken` is bridged so
+  far (the intermediate phase this section already anticipated). #439.
+- **`concatenated`** client progress is not built; a concatenated request shows
+  no client progress (cost/benefit go/no-go pending). #440.
+- **Dynamic fall-through re-anchoring** is not built: the single fixed anchor's
+  open `Begin` is closed by the synthetic terminal `End` rather than handed to the
+  next named anchor's real `End`. #438.
+- **Method coverage** beyond references (and the goto family added by #446) —
+  notably the whole-document, multi-region methods (`documentSymbol`, …), which
+  fan out to several regions per request and so need a request-level shared
+  aggregator, not the per-dispatch one. #437.
+- **Host-layer** client progress: the host path still strips the token. #441.
+
+The remaining notes below are design-tuning points; the empty-vs-non-empty
+fall-through threshold and the `Rest`-never-anchor rule are now **decided** as
+described above.
+
+Points still open for the deferred work above (`partialResultToken`,
+*concatenated*, and the `Rest`-member refinement):
+
 - `partialResultToken` support depends on the aggregation layer accepting
   incremental input. Until that lands, `partialResultToken` may stay stripped
   while `workDoneToken` is bridged — a valid intermediate phase. Without
@@ -259,8 +291,7 @@ are stripped before fan-out. Specific points to settle during implementation:
   ones are in — trading streaming latency for ordering fidelity. An
   implementation may relax this if a method's partial results are
   order-insensitive.
-- Treating `Rest`-group members as never-anchors trades progress visibility for
-  title correctness: under *preferred*, if the delivered winner is an unnamed
-  `Rest` member doing long work, its own progress is not shown (no safe a priori
-  title). A future refinement could surface it once it is the sole active `Rest`
-  member.
+- The decided `Rest`-never-anchor rule trades progress visibility for title
+  correctness: under *preferred*, if the delivered winner is an unnamed `Rest`
+  member doing long work, its own progress is not shown (no safe a priori title).
+  A future refinement could surface it once it is the sole active `Rest` member.

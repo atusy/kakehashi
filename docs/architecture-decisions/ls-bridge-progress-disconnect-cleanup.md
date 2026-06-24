@@ -11,19 +11,19 @@ forwards the create, and then relays each `$/progress` (begin → report → end
 against that token until a terminating `End` clears the mapping.
 
 A downstream can exit *between* `Begin` and `End` — it crashes, is shut down, or
-is respawned while work is in flight. Today the bridge handles that only
-*internally*: when the connection's reader task exits, the registry purges the
-connection's mappings and the forwarding loop drops their admissions (the
+is respawned while work is in flight. Before #413 was implemented the bridge
+handled that only *internally*: when the connection's reader task exited, the
+registry purged the connection's mappings and the forwarding loop dropped their
+admissions (the
 `ForgetWorkDoneProgress` notification removes them from `created_tokens` in
-`src/lsp/lsp_impl/lifecycle.rs`). It never forwards a terminating `End` to the
-editor.
+`src/lsp/lsp_impl/lifecycle.rs`). It forwarded no terminating `End` to the editor.
 
-The consequence is a **dangling progress indicator**: the editor created the
+The consequence was a **dangling progress indicator**: the editor created the
 progress token on `window/workDoneProgress/create`, the downstream started it
-with `Begin`, but no `End` ever arrives, so the spinner stays up indefinitely.
+with `Begin`, but no `End` ever arrived, so the spinner stayed up indefinitely.
 Some editors offer no way to dismiss a progress indicator they believe is still
-running. Work-done progress is a strict begin/end lifecycle, and the bridge
-currently breaks it on the disconnect path.
+running. Work-done progress is a strict begin/end lifecycle, and the bridge broke
+it on the disconnect path (now fixed — see the Decision–Implementation Gap).
 
 ## Decision
 
@@ -104,7 +104,10 @@ ls-bridge-client-progress relies on for client-provided tokens.
 
 ## Decision–Implementation Gap
 
-Not yet implemented (tracked in issue #413). Today the reader-exit path purges
-the registry mappings and forgets the loop admissions but forwards no terminating
-`End`, so an editor still sees a dangling indicator when a downstream dies
-mid-progress. This record captures the agreed fix ahead of the change.
+**Implemented** (issue #413). On `ForgetWorkDoneProgress` the forwarding loop now
+synthesizes a terminating `$/progress` `End` for every begun-not-ended
+server-declared token, so a downstream that dies mid-progress no longer leaves a
+dangling indicator. A token created but never begun gets no `End`; a token that
+already ended is not ended again (the real `End` and the forget share the FIFO
+upstream channel, so the loop's begun-not-ended set is cleared before any later
+forget).
