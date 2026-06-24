@@ -6,17 +6,21 @@
 //! with the real URI and the response verbatim. The first layer producing a
 //! non-empty result wins (`preferred`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Location, SymbolInformation, Uri,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Location, NumberOrString,
+    SymbolInformation, Uri,
 };
 
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::server::FanInResult;
-use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::aggregation::server::{
+    FanInResult, FanOutTask, dispatch_preferred, dispatch_preferred_with_tokens,
+    mint_region_progress_source,
+};
+use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard};
 use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, parse_host_verbatim};
 
 use super::super::{Kakehashi, uri_to_url};
@@ -29,9 +33,10 @@ impl Kakehashi {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        let work_done_token = params.work_done_progress_params.work_done_token.clone();
         let lsp_uri = params.text_document.uri;
 
-        let virt = self.document_symbol_virt_layer(&lsp_uri);
+        let virt = self.document_symbol_virt_layer(&lsp_uri, work_done_token);
         self.walk_layers(
             &lsp_uri,
             METHOD,
@@ -51,6 +56,7 @@ impl Kakehashi {
     async fn document_symbol_virt_layer(
         &self,
         lsp_uri: &Uri,
+        work_done_token: Option<NumberOrString>,
     ) -> Result<Option<DocumentSymbolResponse>> {
         // Convert ls_types::Uri to url::Url for internal use
         let Ok(uri) = uri_to_url(lsp_uri) else {
@@ -113,6 +119,19 @@ impl Kakehashi {
         // Outer JoinSet: one task per injection region, all in parallel
         let mut outer_join_set: JoinSet<Vec<DocumentSymbol>> = JoinSet::new();
 
+        // Shared client progress: a whole-document request fans out over several
+        // injection regions (one `dispatch_preferred` each), so they share ONE
+        // aggregator + ONE teardown guard. The aggregator's winner rule shows the
+        // first region to begin as one coherent `Begin → … → End` on the editor's
+        // token (ls-bridge-client-progress). `None` when no `workDoneToken`.
+        let shared_cp = work_done_token.map(|client_token| {
+            (
+                Arc::new(Mutex::new(ClientProgressAggregator::new(client_token))),
+                Arc::clone(pool.client_progress_registry()),
+            )
+        });
+        let mut cp_minted: Vec<NumberOrString> = Vec::new();
+
         for resolved in all_regions {
             // Get ALL bridge server configs for this injection language
             let configs = self.bridge_configs_for_injection_language(
@@ -138,36 +157,65 @@ impl Kakehashi {
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
             };
+
+            // Mint this region's tracked-source token into the shared aggregator
+            // (the per-region map dispatch hands to its winning downstream).
+            let region_cp_tokens = shared_cp.as_ref().and_then(|(aggregator, registry)| {
+                mint_region_progress_source(&region_ctx, registry, aggregator)
+            });
+            if let Some(map) = &region_cp_tokens {
+                cp_minted.extend(map.values().cloned());
+            }
+
             let pool = Arc::clone(&pool);
 
             outer_join_set.spawn(async move {
-                let result = dispatch_preferred(
-                    &region_ctx,
-                    pool.clone(),
-                    |t| async move {
-                        t.pool
-                            .send_document_symbol_request(
-                                &t.server_name,
-                                &t.server_config,
-                                &t.uri,
-                                &t.injection_language,
-                                &t.region_id,
-                                t.offset,
-                                &t.virtual_content,
-                                t.upstream_id,
-                            )
-                            .await
-                    },
-                    |opt| matches!(opt, Some(v) if !v.is_empty()),
-                    None,
-                )
-                .await;
+                let send = |t: FanOutTask| async move {
+                    t.pool
+                        .send_document_symbol_request(
+                            &t.server_name,
+                            &t.server_config,
+                            &t.uri,
+                            &t.injection_language,
+                            &t.region_id,
+                            t.offset,
+                            &t.virtual_content,
+                            t.upstream_id,
+                            t.client_progress_token,
+                        )
+                        .await
+                };
+                let is_nonempty =
+                    |opt: &Option<Vec<DocumentSymbol>>| matches!(opt, Some(v) if !v.is_empty());
+                let result = match region_cp_tokens {
+                    Some(tokens) => {
+                        dispatch_preferred_with_tokens(
+                            &region_ctx,
+                            pool.clone(),
+                            send,
+                            is_nonempty,
+                            None,
+                            tokens,
+                        )
+                        .await
+                    }
+                    None => {
+                        dispatch_preferred(&region_ctx, pool.clone(), send, is_nonempty, None).await
+                    }
+                };
                 match result {
                     FanInResult::Done(symbols) => symbols.unwrap_or_default(),
                     FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
                 }
             });
         }
+
+        // One teardown guard for the whole request, held across the region
+        // collection so the synthetic terminal `End` fires once, after every
+        // region settles (or on cancel, when `collect` drops the JoinSet).
+        let _cp_guard = shared_cp.map(|(aggregator, registry)| {
+            ClientProgressDeregisterGuard::new(registry, cp_minted, aggregator, pool.upstream_tx())
+        });
 
         // Collect results, aborting early if $/cancelRequest arrives.
         let result = crate::lsp::aggregation::region::collect_region_results_with_cancel(

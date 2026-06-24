@@ -13,14 +13,14 @@
 use std::io;
 
 use crate::config::settings::BridgeServerConfig;
-use tower_lsp_server::ls_types::{DocumentSymbol, SymbolInformation};
+use tower_lsp_server::ls_types::{DocumentSymbol, NumberOrString, SymbolInformation};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_whole_document_request, response_has_jsonrpc_error,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WholeDocumentRequestParams,
+    build_whole_document_request_with_progress, response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -44,6 +44,7 @@ impl LanguageServerPool {
         offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
+        client_progress_token: Option<NumberOrString>,
     ) -> io::Result<Option<Vec<DocumentSymbol>>> {
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(host_uri))
@@ -59,7 +60,11 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
-            build_document_symbol_request,
+            // Hand the downstream the bridge-minted token so its `$/progress`
+            // routes to this request's shared aggregator (ls-bridge-client-progress).
+            |virtual_uri, request_id| {
+                build_document_symbol_request(virtual_uri, request_id, client_progress_token)
+            },
             |response, ctx| {
                 transform_document_symbol_response_to_host(
                     response,
@@ -79,8 +84,14 @@ impl LanguageServerPool {
 fn build_document_symbol_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
-) -> JsonRpcRequest<DocumentParams> {
-    build_whole_document_request(virtual_uri, request_id, "textDocument/documentSymbol")
+    client_progress_token: Option<NumberOrString>,
+) -> JsonRpcRequest<WholeDocumentRequestParams> {
+    build_whole_document_request_with_progress(
+        virtual_uri,
+        request_id,
+        "textDocument/documentSymbol",
+        client_progress_token,
+    )
 }
 
 /// Translate a documentSymbol response from virtual to host coordinates and
@@ -227,7 +238,7 @@ mod tests {
     #[test]
     fn document_symbol_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_document_symbol_request(&virtual_uri, RequestId::new(42));
+        let request = build_document_symbol_request(&virtual_uri, RequestId::new(42), None);
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -235,7 +246,7 @@ mod tests {
     #[test]
     fn document_symbol_request_has_correct_method_and_no_position() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_document_symbol_request(&virtual_uri, RequestId::new(123));
+        let request = build_document_symbol_request(&virtual_uri, RequestId::new(123), None);
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["jsonrpc"], "2.0");
