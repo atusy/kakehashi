@@ -20,8 +20,13 @@ use crate::lsp::bridge::protocol::VirtualDocumentUri;
 
 /// Hash of a virtual document's extracted content, used to skip re-sending an
 /// unchanged `didChange` (#422). Mirrors the host path's fingerprint
-/// (`text_document/host.rs`); collisions only risk a missed re-send, which the
-/// next genuine content change corrects.
+/// (`text_document/host.rs`).
+///
+/// A 64-bit hash collision (two *different* contents hashing equal — astronomically
+/// unlikely for `DefaultHasher`) would make a genuinely changed region look unchanged
+/// and skip its re-sync: the downstream then analyzes stale content until a *later*
+/// edit happens to hash differently, and if no further edit occurs it stays stale.
+/// This is the standard fingerprint-guard tradeoff, accepted for the collision odds.
 fn content_fingerprint(content: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();

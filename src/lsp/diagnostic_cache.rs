@@ -337,17 +337,21 @@ impl DiagnosticAggregator {
         cache.get(host).cloned().unwrap_or_default()
     }
 
-    /// Whether `host` has any cached `Region` push slot — i.e. a downstream
-    /// diagnostic held in *virtual* coordinates that re-anchors against the region's
-    /// current offset at publish time. Used to decide whether a host edit that moved
-    /// regions needs a geometry re-merge (#422); `Host`/`PullLayer` slots are already
-    /// host-local and don't move with a region edit.
+    /// Whether `host` has a cached `Region` push slot with **non-empty** diagnostics
+    /// — i.e. a downstream diagnostic held in *virtual* coordinates that re-anchors
+    /// against the region's current offset at publish time. Used to decide whether a
+    /// host edit that moved regions needs a geometry re-merge (#422); `Host`/`PullLayer`
+    /// slots are already host-local and don't move with a region edit. A *kept-but-empty*
+    /// Region slot (a server cleared its diagnostics) has nothing to re-anchor, so it is
+    /// ignored — otherwise a quiet/diagnostic-free file would keep paying the offset
+    /// recompute on every edit.
     pub(crate) fn has_region_slots(&self, host: &Url) -> bool {
         let cache = self.lock();
         cache.get(host).is_some_and(|sources| {
-            sources
-                .keys()
-                .any(|source| matches!(source, DiagnosticSource::Region(_)))
+            sources.iter().any(|(source, servers)| {
+                matches!(source, DiagnosticSource::Region(_))
+                    && servers.values().any(|slot| !slot.diagnostics.is_empty())
+            })
         })
     }
 
@@ -1096,7 +1100,21 @@ mod tests {
             "a Host slot is host-local and does not need geometry re-anchoring"
         );
 
-        // A Region push slot does.
+        // A kept-but-EMPTY Region slot (a server cleared its diagnostics) has nothing
+        // to re-anchor, so it must NOT trigger the geometry re-merge.
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r".into()),
+            "luals".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![],
+        );
+        assert!(
+            !agg.has_region_slots(&host()),
+            "an empty Region slot has no diagnostics to re-anchor"
+        );
+
+        // A NON-EMPTY Region push slot does.
         agg.record(
             &host(),
             DiagnosticSource::Region("r".into()),
