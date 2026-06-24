@@ -30,9 +30,11 @@
 //! deferred `pullFallback` / capability classification removes the overlap by
 //! giving each server one native source.
 //!
-//! Also deferred: per-source strategy fan-in (`preferred` sticky / `concatenated`
-//! visible-walk; cross-source order is HashMap-nondeterministic until then), the
-//! `content_epoch` version gate, region-invalidation/crash eviction, and
+//! Region-invalidation eviction is implemented (`evict_source`, wired into the
+//! edit path that orphans a region — #424). Still deferred: per-source strategy
+//! fan-in (`preferred` sticky / `concatenated` visible-walk; cross-source order is
+//! HashMap-nondeterministic until then), the `content_epoch` version gate,
+//! **crash/server** eviction (needs connection-generation identity, #469), and
 //! host-layer eager-open (diagnostics on open before the first request).
 
 use std::collections::HashMap;
@@ -90,9 +92,9 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 /// - [`DiagnosticSource::Region`] slots hold virtual coordinates and are
 ///   transformed via `region_offsets[region_id]` (lazy re-anchor against the
 ///   region's *current* offset). A region with no current offset (it no longer
-///   resolves, e.g. it was edited away) is skipped here; its now-stale slot
-///   lingers in the cache until the whole host is dropped on `didClose`
-///   (per-region / crash eviction is a deferred follow-up).
+///   resolves, e.g. it was edited away) is skipped here; the edit that orphaned it
+///   also evicts its now-stale slot (`evict_source`, #424), so it no longer lingers
+///   until the host's `didClose`. (Crash/server eviction is still deferred — #469.)
 /// - [`DiagnosticSource::Host`] and [`DiagnosticSource::PullLayer`] slots are
 ///   already host-local and pass through unchanged.
 ///
