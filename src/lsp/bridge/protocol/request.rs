@@ -104,6 +104,38 @@ pub(crate) fn build_whole_document_request(
     JsonRpcRequest::new(request_id.as_i64(), method, params)
 }
 
+/// A whole-document request's params plus an optional client-provided
+/// `workDoneToken` (ls-bridge-client-progress). `DocumentParams` has no progress
+/// field, so we flatten it and add the token alongside; when the token is `None`
+/// this serializes byte-identically to the bare `DocumentParams`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WholeDocumentRequestParams {
+    #[serde(flatten)]
+    document: DocumentParams,
+    #[serde(rename = "workDoneToken", skip_serializing_if = "Option::is_none")]
+    work_done_token: Option<NumberOrString>,
+}
+
+/// Like [`build_whole_document_request`], but carries the editor's `workDoneToken`
+/// so the downstream reports `$/progress` against it (ls-bridge-client-progress).
+/// `client_progress_token = None` is equivalent to [`build_whole_document_request`].
+pub(crate) fn build_whole_document_request_with_progress(
+    virtual_uri: &VirtualDocumentUri,
+    request_id: RequestId,
+    method: &'static str,
+    client_progress_token: Option<NumberOrString>,
+) -> JsonRpcRequest<WholeDocumentRequestParams> {
+    let params = WholeDocumentRequestParams {
+        document: DocumentParams {
+            text_document: TextDocumentIdentifier {
+                uri: virtual_uri_to_lsp_uri(virtual_uri),
+            },
+        },
+        work_done_token: client_progress_token,
+    };
+    JsonRpcRequest::new(request_id.as_i64(), method, params)
+}
+
 /// Build a JSON-RPC didOpen notification carrying a virtual document's initial
 /// content to a downstream language server.
 pub(crate) fn build_didopen_notification(
@@ -146,6 +178,53 @@ mod tests {
     use super::super::super::text_document::test_helpers::test_host_uri;
     use super::*;
     use tower_lsp_server::ls_types::Position;
+
+    #[test]
+    fn whole_document_request_carries_work_done_token_only_when_present() {
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+
+        // With a token: present in params.
+        let with = build_whole_document_request_with_progress(
+            &virtual_uri,
+            RequestId::new(1),
+            "textDocument/documentSymbol",
+            Some(NumberOrString::String("cprog-1".to_string())),
+        );
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["params"]["workDoneToken"], "cprog-1");
+        assert!(json["params"]["textDocument"].is_object());
+
+        // Number token variant round-trips too.
+        let with_num = build_whole_document_request_with_progress(
+            &virtual_uri,
+            RequestId::new(2),
+            "textDocument/documentSymbol",
+            Some(NumberOrString::Number(7)),
+        );
+        assert_eq!(
+            serde_json::to_value(&with_num).unwrap()["params"]["workDoneToken"],
+            7
+        );
+
+        // Without a token: byte-identical to the bare whole-document params
+        // (the field is skipped), so this is non-regressing.
+        let without = build_whole_document_request_with_progress(
+            &virtual_uri,
+            RequestId::new(1),
+            "textDocument/documentSymbol",
+            None,
+        );
+        let bare = build_whole_document_request(
+            &virtual_uri,
+            RequestId::new(1),
+            "textDocument/documentSymbol",
+        );
+        assert_eq!(
+            serde_json::to_string(&without).unwrap(),
+            serde_json::to_string(&bare).unwrap(),
+            "None token serializes identically to the bare request"
+        );
+    }
 
     #[test]
     fn position_request_first_line_applies_column_offset() {

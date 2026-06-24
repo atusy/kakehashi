@@ -137,16 +137,21 @@ impl Drop for ClientProgressDeregisterGuard {
         // notification before its response — and the response is what completes
         // fan-in and drops this guard (ls-bridge-message-ordering).
         self.registry.deregister(&self.tokens);
-        let terminal = self
+        // Enqueue the synthetic terminal `End` **while still holding the aggregator
+        // lock**, so it is ordered strictly before/after any concurrent reader's
+        // relay (which also enqueues under the lock) — never interleaved. Combined
+        // with `take_terminal_end` marking the lifecycle ended, no relay can escape
+        // after this terminal (guards the cancel race; ls-bridge-client-progress).
+        let mut aggregator = self
             .aggregator
             .lock()
-            .recover_poison("ClientProgressAggregator teardown")
-            .take_terminal_end();
-        if let Some(params) = terminal {
+            .recover_poison("ClientProgressAggregator teardown");
+        if let Some(params) = aggregator.take_terminal_end() {
             let _ = self
                 .upstream_tx
                 .send(crate::lsp::bridge::actor::UpstreamNotification::ClientProgress { params });
         }
+        drop(aggregator);
     }
 }
 
@@ -225,23 +230,28 @@ impl ClientProgressAggregator {
         })
     }
 
-    /// On request teardown, return a synthetic terminal `End` for the client token
-    /// **iff** a `Begin` was relayed but no `End` — so the editor's indicator is
-    /// always closed even when the winner's `End` never arrives or races the
-    /// response (ls-bridge-client-progress pairing invariant). Marks the lifecycle
-    /// ended so it fires at most once and a later real `End` is ignored.
+    /// On request teardown, **terminate the lifecycle** and return a synthetic
+    /// terminal `End` for the client token **iff** a `Begin` was relayed but no
+    /// `End` — so the editor's indicator is always closed even when the winner's
+    /// `End` never arrives or races the response (ls-bridge-client-progress pairing
+    /// invariant).
+    ///
+    /// `ended` is set **unconditionally**, even when no `Begin` was relayed yet:
+    /// after teardown the aggregator must relay nothing, otherwise a `$/progress`
+    /// a reader routed just before teardown (e.g. on a cancel that drops the
+    /// dispatch before the response) could relay a `Begin` *after* this terminal,
+    /// leaving a dangling indicator. The caller enqueues the returned `End` while
+    /// still holding the aggregator lock, so a concurrent relay is ordered strictly
+    /// before or after this terminal — never interleaved.
     pub(crate) fn take_terminal_end(&mut self) -> Option<ProgressParams> {
-        if self.winner.is_some() && !self.ended {
-            self.ended = true;
-            Some(ProgressParams {
-                token: self.client_token.clone(),
-                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                    tower_lsp_server::ls_types::WorkDoneProgressEnd { message: None },
-                )),
-            })
-        } else {
-            None
-        }
+        let emit = self.winner.is_some() && !self.ended;
+        self.ended = true;
+        emit.then(|| ProgressParams {
+            token: self.client_token.clone(),
+            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                tower_lsp_server::ls_types::WorkDoneProgressEnd { message: None },
+            )),
+        })
     }
 }
 
@@ -496,6 +506,28 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no Begin was relayed, so no terminal End is synthesized"
+        );
+    }
+
+    #[test]
+    fn no_relay_escapes_after_teardown_even_without_a_prior_begin() {
+        // Cancel race: teardown can run before any `Begin` was relayed (a cancel
+        // drops the dispatch before the response). `take_terminal_end` must mark
+        // the lifecycle ended unconditionally, so a `$/progress` a reader routed
+        // just before teardown cannot relay a `Begin` afterwards — which would
+        // dangle, with no terminal to follow.
+        let mut agg = ClientProgressAggregator::new(client_token());
+        assert!(
+            agg.take_terminal_end().is_none(),
+            "no Begin yet → no terminal End"
+        );
+        assert!(
+            agg.on_downstream_progress(&src(), begin()).is_none(),
+            "after teardown, a late Begin relays nothing"
+        );
+        assert!(
+            agg.on_downstream_progress(&src(), end()).is_none(),
+            "and a late End relays nothing"
         );
     }
 }

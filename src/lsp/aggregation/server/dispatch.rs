@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use tower_lsp_server::ls_types::NumberOrString;
 
 use crate::lsp::bridge::{
-    ClientProgressAggregator, ClientProgressDeregisterGuard, LanguageServerPool,
-    ResolvedServerConfig,
+    ClientProgressAggregator, ClientProgressDeregisterGuard, ClientProgressRegistry,
+    LanguageServerPool, ResolvedServerConfig,
 };
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::CancelReceiver;
@@ -244,6 +244,53 @@ where
     // would have nowhere to route.
     drop(client_progress);
     result
+}
+
+/// Like [`dispatch_preferred`], but routes client progress to an
+/// externally-supplied per-server token map instead of minting its own — and owns
+/// no teardown guard (the caller does).
+///
+/// For a multi-region request (e.g. `documentSymbol`), the handler creates ONE
+/// shared aggregator + ONE teardown guard for the whole request and mints a token
+/// per region with [`mint_region_progress_source`]; each region's dispatch routes
+/// its tracked source's `$/progress` to that shared aggregator via `tokens`. The
+/// shared aggregator's winner rule then shows one coherent lifecycle across all
+/// regions (ls-bridge-client-progress).
+pub(crate) async fn dispatch_preferred_with_tokens<T, F, Fut>(
+    ctx: &DocumentRequestContext,
+    pool: Arc<LanguageServerPool>,
+    f: F,
+    is_nonempty: impl Fn(&T) -> bool,
+    cancel_rx: Option<CancelReceiver>,
+    tokens: HashMap<String, NumberOrString>,
+) -> FanInResult<T>
+where
+    T: Send + 'static,
+    F: Fn(FanOutTask) -> Fut,
+    Fut: Future<Output = io::Result<T>> + Send + 'static,
+{
+    let entries = expanded_entries(ctx);
+    let selected = select_servers(&ctx.configs, &entries);
+    let mut join_set = fan_out(ctx, pool, f, &selected, Some(&tokens));
+    preferred::preferred(&mut join_set, is_nonempty, &entries, cancel_rx).await
+}
+
+/// Mint the client-progress token for one region of a multi-region request: pick
+/// the region's tracked source (sole server / named anchor; `None` for an
+/// all-`Rest` fan-out) and register a bridge token to the request's shared
+/// `aggregator`. Returns the `server → token` map for
+/// [`dispatch_preferred_with_tokens`]. The caller must deregister the returned
+/// token via its shared teardown guard.
+pub(crate) fn mint_region_progress_source(
+    ctx: &DocumentRequestContext,
+    registry: &ClientProgressRegistry,
+    aggregator: &Arc<Mutex<ClientProgressAggregator>>,
+) -> Option<HashMap<String, NumberOrString>> {
+    let entries = expanded_entries(ctx);
+    let selected = select_servers(&ctx.configs, &entries);
+    let tracked = tracked_progress_source(&selected, &entries)?;
+    let token = registry.register(Arc::clone(aggregator));
+    Some(HashMap::from([(tracked.to_string(), token)]))
 }
 
 /// Server-level aggregation entry point using the concatenated strategy.
