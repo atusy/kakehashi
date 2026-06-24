@@ -19,7 +19,9 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Range, Uri};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use tower_lsp_server::ls_types::{InlayHintParams, TextDocumentIdentifier};
+use tower_lsp_server::ls_types::{
+    InlayHintParams, NumberOrString, TextDocumentIdentifier, WorkDoneProgressParams,
+};
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
@@ -45,6 +47,7 @@ impl LanguageServerPool {
         offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
+        client_progress_token: Option<NumberOrString>,
     ) -> io::Result<Option<Vec<InlayHint>>> {
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(host_uri))
@@ -61,7 +64,13 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_inlay_hint_request(virtual_uri, host_range, &offset, request_id)
+                build_inlay_hint_request(
+                    virtual_uri,
+                    host_range,
+                    &offset,
+                    request_id,
+                    client_progress_token,
+                )
             },
             |response, ctx| {
                 transform_inlay_hint_response_to_host(
@@ -87,6 +96,7 @@ fn build_inlay_hint_request(
     host_range: Range,
     offset: &RegionOffset,
     request_id: RequestId,
+    client_progress_token: Option<NumberOrString>,
 ) -> JsonRpcRequest<InlayHintParams> {
     // Translate range from host to virtual coordinates
     let mut virtual_range = host_range;
@@ -97,7 +107,11 @@ fn build_inlay_hint_request(
             uri: virtual_uri_to_lsp_uri(virtual_uri),
         },
         range: virtual_range,
-        work_done_progress_params: Default::default(),
+        // Carry the bridge-minted token so the downstream's `$/progress` routes to
+        // this request's aggregator (ls-bridge-client-progress).
+        work_done_progress_params: WorkDoneProgressParams {
+            work_done_token: client_progress_token,
+        },
     };
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/inlayHint", params)
 }
@@ -196,6 +210,7 @@ mod tests {
             host_range,
             &RegionOffset::new(5, 0),
             RequestId::new(1),
+            None,
         );
 
         assert_uses_virtual_uri(&request, "lua");
@@ -221,6 +236,7 @@ mod tests {
             host_range,
             &RegionOffset::new(region_start_line, 0),
             RequestId::new(42),
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -254,6 +270,7 @@ mod tests {
             host_range,
             &RegionOffset::new(5, 4),
             RequestId::new(1),
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -285,6 +302,7 @@ mod tests {
             host_range,
             &RegionOffset::new(5, 4),
             RequestId::new(1),
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -316,6 +334,7 @@ mod tests {
             host_range,
             &RegionOffset::new(10, 0),
             RequestId::new(1),
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();

@@ -7,7 +7,7 @@
 //! wins (`preferred`).
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{InlayHint, InlayHintParams, Range, Uri};
+use tower_lsp_server::ls_types::{InlayHint, InlayHintParams, NumberOrString, Range, Uri};
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
@@ -21,10 +21,11 @@ impl Kakehashi {
         params: InlayHintParams,
     ) -> Result<Option<Vec<InlayHint>>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        let work_done_token = params.work_done_progress_params.work_done_token.clone();
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 
-        let virt = self.inlay_hint_virt_layer(&lsp_uri, range);
+        let virt = self.inlay_hint_virt_layer(&lsp_uri, range, work_done_token);
         self.walk_layers(
             &lsp_uri,
             METHOD,
@@ -42,10 +43,12 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         range: Range,
+        client_progress_token: Option<NumberOrString>,
     ) -> Result<Option<Vec<InlayHint>>> {
-        let Some(ctx) = self.resolve_bridge_contexts_for_range(lsp_uri, range, METHOD) else {
+        let Some(mut ctx) = self.resolve_bridge_contexts_for_range(lsp_uri, range, METHOD) else {
             return Ok(None);
         };
+        ctx.document.client_progress_token = client_progress_token;
 
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
@@ -68,6 +71,7 @@ impl Kakehashi {
                         t.offset,
                         &t.virtual_content,
                         t.upstream_id,
+                        t.client_progress_token,
                     )
                     .await
             },
