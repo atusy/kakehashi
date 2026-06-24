@@ -250,10 +250,13 @@ impl Kakehashi {
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 // Advertise `workDoneProgress` so spec-compliant clients attach a
                 // `workDoneToken` we can bridge (ls-bridge-client-progress, #445).
-                // NOTE: `type_definition`/`implementation` cannot advertise it here
-                // — in ls-types 0.0.6 their only `Options` variant is
+                // NOTE: `type_definition`/`implementation` also have the plumbing,
+                // but cannot advertise it via this crate's typed API — in
+                // ls-types 0.0.6 their only `Options` variant wraps
                 // `StaticTextDocumentRegistrationOptions`, which has no
-                // `workDoneProgress` field. Tracked as a known limitation.
+                // `workDoneProgress` field (the LSP spec *does* define it). They
+                // stay `Simple(true)`, so their client-progress plumbing is inert
+                // for spec-compliant clients until that crate gap is closed (#447).
                 declaration_provider: Some(DeclarationCapability::Options(DeclarationOptions {
                     work_done_progress_options: WorkDoneProgressOptions {
                         work_done_progress: Some(true),
