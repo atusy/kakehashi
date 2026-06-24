@@ -216,8 +216,12 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     // tasks and returns) so it never head-of-line-blocks the pull on a slow
     // server's readiness; pull-capable servers fingerprint-dedup the extra sync.
     if let Some(host) = snapshot_data.as_ref().and_then(|s| s.host.as_ref()) {
+        // Sync target comes from the host context itself (`host.uri`), not the
+        // outer scheduled `uri` — they're equal today, but keying off the host
+        // context keeps the sync correct if a scheduled URI ever differs from its
+        // host document.
         bridge.eager_sync_host_document_on_servers(
-            &uri,
+            &host.uri,
             &host.language_id,
             &host.text,
             host.configs.clone(),
