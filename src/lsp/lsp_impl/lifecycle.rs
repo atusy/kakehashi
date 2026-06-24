@@ -7,12 +7,13 @@ use tower_lsp_server::jsonrpc::Result;
 #[cfg(feature = "experimental")]
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
-    CodeLensOptions, CompletionOptions, DeclarationCapability, DiagnosticOptions,
-    DiagnosticServerCapabilities, DocumentLinkOptions, DocumentOnTypeFormattingOptions,
-    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, LinkedEditingRangeServerCapabilities,
-    OneOf, RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    CodeLensOptions, CompletionOptions, DeclarationCapability, DeclarationOptions,
+    DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentLinkOptions,
+    DocumentOnTypeFormattingOptions, FoldingRangeProviderCapability, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions, RenameOptions, SaveOptions,
+    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
@@ -247,8 +248,22 @@ impl Kakehashi {
                     ),
                 ),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-                declaration_provider: Some(DeclarationCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(true)),
+                // Advertise `workDoneProgress` so spec-compliant clients attach a
+                // `workDoneToken` we can bridge (ls-bridge-client-progress, #445).
+                // NOTE: `type_definition`/`implementation` cannot advertise it here
+                // — in ls-types 0.0.6 their only `Options` variant is
+                // `StaticTextDocumentRegistrationOptions`, which has no
+                // `workDoneProgress` field. Tracked as a known limitation.
+                declaration_provider: Some(DeclarationCapability::Options(DeclarationOptions {
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                })),
+                definition_provider: Some(OneOf::Right(DefinitionOptions {
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                })),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -262,7 +277,11 @@ impl Kakehashi {
                     retrigger_characters: Some(vec![",".to_string()]),
                     ..Default::default()
                 }),
-                references_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Right(ReferenceOptions {
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                })),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 document_link_provider: Some(DocumentLinkOptions {
                     resolve_provider: None,
