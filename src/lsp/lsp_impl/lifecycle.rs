@@ -487,10 +487,12 @@ async fn forward_upstream_request(
 ///   `workspace/diagnostic/refresh` — the server-declared work-done progress
 ///   notifications (`CreateWorkDoneProgress`/`Progress`/`ForgetWorkDoneProgress`,
 ///   window-work-done-progress), and `PublishDiagnostics`/`EvictConnectionDiagnostics`,
-///   none of which may be lost or reordered. Each wake-up drains a capped burst and
-///   coalesces same-`(connection, uri)` `PublishDiagnostics` to the latest
-///   (`coalesce_upstream_batch`, #426); every other notification is a barrier, so
-///   FIFO order (and create-before-progress) is preserved.
+///   which may not be lost. Each wake-up drains a capped burst and coalesces
+///   same-`(connection, uri)` `PublishDiagnostics` to the latest
+///   (`coalesce_upstream_batch`, #426); every other notification is an
+///   order-preserving barrier, so publishes never cross one — `publish`↔`evict`
+///   order and create-before-progress hold. (Distinct-key publishes within a run
+///   may be reordered, which is benign; see `coalesce_upstream_batch`.)
 /// - `upstream_request_rx` (unbounded): downstream-initiated *requests*
 ///   (`window/showMessageRequest`, `window/showDocument`) forwarded with the
 ///   editor's response relayed back; loss-intolerant (a dropped request hangs
@@ -570,6 +572,13 @@ async fn upstream_forwarding_loop(
                             }
                         }
                         for notification in coalesce_upstream_batch(batch) {
+                            // Re-check cancellation between deliveries so a shutdown
+                            // during a large batch isn't delayed by up to 256 republish
+                            // awaits (the outer `select!` only re-checks between batches);
+                            // the biased cancel arm then breaks the loop on the next turn.
+                            if cancel_token.is_cancelled() {
+                                break;
+                            }
                             deliver_upstream_notification(
                                 &client,
                                 notification,
@@ -641,11 +650,15 @@ const UPSTREAM_COALESCE_BATCH_CAP: usize = 256;
 /// `(host, source, server)`, the earlier pushes' work is wasted — coalescing skips
 /// it, so the loop does at most one republish per distinct key per batch.
 ///
-/// FIFO order is preserved exactly: every non-publish notification — including
-/// [`UpstreamNotification::EvictConnectionDiagnostics`] — is a **barrier** that
-/// first flushes the pending coalesced publishes (in arrival order) and then itself,
-/// so a publish can never be reordered across an evict for its connection (a
-/// `Publish(c)` then `Evict(c)` still nets to evicted, as in the un-coalesced FIFO).
+/// **Barrier order is exact**: every non-publish notification — including
+/// [`UpstreamNotification::EvictConnectionDiagnostics`] — is a barrier that the
+/// pending coalesced publishes stay *before*, so a publish can never be reordered
+/// across one (a `Publish(c)` then `Evict(c)` still nets to evicted, and
+/// create-before-progress holds). Within a run of consecutive publishes the order is
+/// *not* exact: a same-key push collapses onto the first occurrence's position, and
+/// distinct keys may be reordered relative to each other. That is benign because each
+/// delivery re-merges and republishes the host's *full* current slot set, so the
+/// editor's end state is independent of intra-run publish order.
 fn coalesce_upstream_batch(
     batch: Vec<crate::lsp::bridge::UpstreamNotification>,
 ) -> Vec<crate::lsp::bridge::UpstreamNotification> {
@@ -1283,6 +1296,26 @@ mod tests {
         }
 
         #[test]
+        fn within_a_run_a_later_same_key_push_takes_the_first_position() {
+            // Documents the intra-run reorder: [A1, B, A2] with A1/A2 same key and B a
+            // *different-key publish* (no barrier) coalesces A1←A2 onto A1's position,
+            // so A2's content lands before B. Benign — each delivery re-merges the full
+            // host set — but it is NOT exact FIFO, unlike barrier order.
+            let out = coalesce_upstream_batch(vec![
+                publish(1, "u", "a1"),
+                publish(2, "v", "b"),
+                publish(1, "u", "a2"),
+            ]);
+            assert_eq!(out.len(), 2);
+            assert_eq!(
+                msg_at(&out, 0),
+                "a2",
+                "same-key latest, at the first position"
+            );
+            assert_eq!(msg_at(&out, 1), "b");
+        }
+
+        #[test]
         fn coalesces_each_key_independently_around_a_barrier() {
             // Two keys before a barrier (one coalesced), the barrier, then the first
             // key again after it (kept separate).
@@ -1419,6 +1452,100 @@ mod tests {
 
         cancel.cancel();
         let _ = loop_handle.await;
+    }
+
+    /// Cancellation is re-checked *between* deliveries of a coalesced batch, so a
+    /// shutdown mid-batch is not delayed by the rest of the batch (#426). Two
+    /// `DiagnosticRefresh` are drained into one batch; cancelling during the first's
+    /// editor round-trip must make the loop skip the second and exit.
+    #[tokio::test]
+    async fn forwarding_loop_rechecks_cancellation_between_batched_deliveries() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Request, Response};
+        use tower_lsp_server::ls_types::{InitializeParams, InitializeResult};
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, mut responses) = socket.split();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Two refreshes queued before the loop runs → drained into one batch.
+        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            request_rx,
+            None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+        ));
+
+        // The loop delivers the first refresh (a request that awaits the editor).
+        let first = requests
+            .next()
+            .await
+            .expect("first refresh request emitted");
+        assert_eq!(first.method(), "workspace/diagnostic/refresh");
+        // Cancel during the first delivery's round-trip; when it completes the loop
+        // must re-check cancellation and skip the second batched refresh.
+        cancel.cancel();
+        responses
+            .send(Response::from_ok(
+                first.id().expect("refresh request id").clone(),
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+
+        // The loop must skip the second refresh and exit. Were cancellation NOT
+        // re-checked mid-batch, it would deliver the second refresh and block on its
+        // (never-sent) response — so this would hang. The timeout turns that
+        // regression into a failure instead of an infinite hang.
+        tokio::time::timeout(std::time::Duration::from_secs(5), loop_handle)
+            .await
+            .expect("loop must exit after cancellation, not block on the skipped refresh")
+            .unwrap();
+        // `requests`/`responses` intentionally dropped without asserting stream
+        // closure: `service` still holds a Client clone, so the stream stays open.
+        drop((requests, responses));
     }
 
     /// When the editor REJECTS `window/workDoneProgress/create`, the loop must
