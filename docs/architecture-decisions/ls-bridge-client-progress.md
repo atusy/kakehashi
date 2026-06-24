@@ -242,7 +242,8 @@ outranks the candidate yields no anchor), routes that downstream's `$/progress`
 onto the editor's token, and guarantees a terminal `End` on teardown. Wired for
 `textDocument/references`; the goto family and the `workDoneProgress` capability
 advertisement (without which spec-compliant clients never send a token) are in
-flight under #437 / #445.
+flight (#446 for the goto family under #437; #448 for the advertisement under
+#445).
 
 **Deferred** (still stripped or unhandled; tracked):
 
@@ -253,10 +254,10 @@ flight under #437 / #445.
 - **Dynamic fall-through re-anchoring** is not built: the single fixed anchor's
   open `Begin` is closed by the synthetic terminal `End` rather than handed to the
   next named anchor's real `End`. #438.
-- **Method coverage** beyond references/goto — notably the whole-document,
-  multi-region methods (`documentSymbol`, …), which fan out to several regions per
-  request and so need a request-level shared aggregator, not the per-dispatch one.
-  #437.
+- **Method coverage** beyond references (and the in-flight goto family) — notably
+  the whole-document, multi-region methods (`documentSymbol`, …), which fan out to
+  several regions per request and so need a request-level shared aggregator, not
+  the per-dispatch one. #437.
 - **Host-layer** client progress: the host path still strips the token. #441.
 
 The remaining notes below are design-tuning points; the empty-vs-non-empty
