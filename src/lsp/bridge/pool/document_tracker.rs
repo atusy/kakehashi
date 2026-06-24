@@ -257,6 +257,11 @@ impl DocumentTracker {
     /// Increment the version of a virtual document and return the new version.
     ///
     /// Returns `None` if the document has not been opened.
+    ///
+    /// Test-only: production goes through `increment_version_if_content_changed`
+    /// (which bumps the version inline, reusing its `uri_string`, #422); this bare
+    /// version of the bump is retained for the version-tracking unit tests.
+    #[cfg(test)]
     pub(super) async fn increment_document_version(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -277,10 +282,12 @@ impl DocumentTracker {
     /// Like [`Self::increment_document_version`], but a no-op (`None`) when
     /// `content` is unchanged since the last `didChange` sent to this connection
     /// for this virtual document — so a host edit that doesn't alter a region's
-    /// extracted content doesn't re-sync and re-analyze it (#422). The fingerprint
-    /// is recorded only after the version bump succeeds (i.e. a `didChange` will be
-    /// sent), keeping "fingerprint set ⟺ content sent". `None` is also returned when
-    /// the document isn't registered for this connection (as for `increment`).
+    /// extracted content doesn't re-sync and re-analyze it (#422). This method does
+    /// **not** record the fingerprint; the caller records it via
+    /// [`Self::record_sent_content_fingerprint`] only after the `didChange` is
+    /// confirmed enqueued, keeping "fingerprint set ⟺ content sent". `None` is also
+    /// returned when the document isn't registered for this connection (as for
+    /// `increment`).
     pub(super) async fn increment_version_if_content_changed(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -291,11 +298,10 @@ impl DocumentTracker {
         let fp = content_fingerprint(content);
 
         // Unchanged content (vs the last fingerprint **recorded as sent**) → skip the
-        // re-send and the version bump. The fingerprint is NOT updated here: the caller
-        // records it via `record_sent_content_fingerprint` only after the didChange is
-        // confirmed enqueued, so a dropped send (full/closed writer queue) leaves the
-        // old fingerprint and the next edit re-sends (self-healing). Held briefly and
-        // released before the version lock (the two maps are never locked together).
+        // re-send and the version bump. The fingerprint is NOT updated here (see the
+        // doc): a dropped send leaves the old fingerprint so the next edit re-sends
+        // (self-healing). Held briefly and released before the version lock (the two
+        // maps are never locked together).
         {
             let fingerprints = self.document_fingerprints.lock().await;
             if fingerprints
@@ -307,10 +313,13 @@ impl DocumentTracker {
             }
         }
 
-        // Content changed (or first didChange / unknown): bump the version. `None`
-        // means the doc isn't registered for this connection.
-        self.increment_document_version(virtual_uri, connection_key)
-            .await
+        // Content changed (or first didChange / unknown): bump the version inline,
+        // reusing `uri_string` (rather than delegating to `increment_document_version`,
+        // which would recompute it). `None` means the doc isn't registered here.
+        let mut versions = self.document_versions.lock().await;
+        let version = versions.get_mut(connection_key)?.get_mut(&uri_string)?;
+        *version += 1;
+        Some(*version)
     }
 
     /// Record the fingerprint of the content just **successfully enqueued** as a
@@ -324,12 +333,19 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
         content: &str,
     ) {
-        self.document_fingerprints
-            .lock()
-            .await
-            .entry(connection_key.clone())
-            .or_default()
-            .insert(virtual_uri.to_uri_string(), content_fingerprint(content));
+        let uri_string = virtual_uri.to_uri_string();
+        let fp = content_fingerprint(content);
+        let mut fingerprints = self.document_fingerprints.lock().await;
+        // Clone the connection key only when first inserting it (common path: the
+        // connection is already present, so look up by borrow).
+        if let Some(docs) = fingerprints.get_mut(connection_key) {
+            docs.insert(uri_string, fp);
+        } else {
+            fingerprints
+                .entry(connection_key.clone())
+                .or_default()
+                .insert(uri_string, fp);
+        }
     }
 
     /// Remove a document from `document_versions` and `opened_documents`.

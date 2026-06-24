@@ -152,6 +152,29 @@ pub(crate) fn merge_cached_diagnostics(
     merged
 }
 
+/// Whether two diagnostic slices are equal as **multisets** (same elements with the
+/// same multiplicity, order-independent) — used by no-op-publish suppression to
+/// ignore the merge's `HashMap` ordering (#422). An O(n²) greedy match: for each `a`
+/// element, consume the first unused equal `b` element. The per-host diagnostic count
+/// is small, so this beats serializing/sorting and never collapses distinct sets.
+fn same_diagnostic_multiset(a: &[Diagnostic], b: &[Diagnostic]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut matched = vec![false; b.len()];
+    for da in a {
+        let found = b
+            .iter()
+            .enumerate()
+            .find(|(i, db)| !matched[*i] && *db == da);
+        match found {
+            Some((i, _)) => matched[i] = true,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Transform a pushed region diagnostic from virtual to host coordinates.
 ///
 /// Mirrors the pull path's `transform_diagnostic`
@@ -341,28 +364,25 @@ impl DiagnosticAggregator {
     ///
     /// The comparison is **order-independent**: `merge_cached_diagnostics` walks
     /// `HashMap`-keyed sources/servers, so the same logical set can serialize in a
-    /// different order between republishes. Both the incoming set and the stored one
-    /// are sorted by each diagnostic's full serialized form (a total order over every
-    /// field) first, so a multi-source/multi-server host is not wrongly seen as
-    /// "changed" merely because the merge order shuffled — while a genuine change in
-    /// any field is still detected.
+    /// different order between republishes. The two sets are compared as **multisets**
+    /// of full `Diagnostic` values ([`same_diagnostic_multiset`]), so a
+    /// multi-source/multi-server host is not wrongly seen as "changed" merely because
+    /// the merge order shuffled — while a genuine change in any field is still
+    /// detected. The per-host diagnostic count is small, so the O(n²) match is cheap
+    /// and avoids serializing every diagnostic.
     pub(crate) fn published_set_changed(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
-        let mut sorted = diagnostics.to_vec();
-        // `sort_by_cached_key` serializes each diagnostic once (O(n)), not per
-        // comparison; the small per-host diagnostic count makes this cheap.
-        sorted.sort_by_cached_key(|d| serde_json::to_string(d).unwrap_or_default());
-
         let mut last = self
             .last_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_published");
-        match last.get(host) {
-            Some(prev) if *prev == sorted => false,
-            _ => {
-                last.insert(host.clone(), sorted);
-                true
-            }
+        if last
+            .get(host)
+            .is_some_and(|prev| same_diagnostic_multiset(prev, diagnostics))
+        {
+            return false;
         }
+        last.insert(host.clone(), diagnostics.to_vec());
+        true
     }
 
     /// Forget the last-published set for `host` (host `didClose`), so its entry
