@@ -254,16 +254,10 @@ print("hello")
         );
     }
 
-    /// Host-layer eager-open (#429): the host document is opened (didOpen sent) on
-    /// a `_self` host server directly by the eager-open path. Exercised in
-    /// isolation via `eager_open_host_document_on_servers` (not `did_open_impl`)
-    /// so the host-event synthetic diagnostic pull — which would also open the doc
-    /// — can't mask whether eager-open itself works.
-    #[tokio::test]
-    async fn eager_open_sends_didopen_to_self_host_server() {
-        let (service, _socket) = LspService::new(Kakehashi::new);
-        let server = service.inner();
-
+    /// Register the rust grammar and apply settings with a single `rust_ls` `_self`
+    /// host server (host bridging on for rust). Caller then inserts a ready test
+    /// connection for `rust_ls`.
+    fn configure_rust_self_host(server: &Kakehashi) {
         server
             .language
             .language_registry_for_parallel()
@@ -273,8 +267,8 @@ print("hello")
         language_servers.insert(
             "rust_ls".to_string(),
             BridgeServerConfig {
-                // Inert: `insert_ready_test_connection` below pre-inserts a Ready
-                // handle, so this cmd is never actually spawned.
+                // Inert: the caller pre-inserts a Ready handle via
+                // `insert_ready_test_connection`, so this cmd is never spawned.
                 cmd: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -307,7 +301,19 @@ print("hello")
             languages,
             ..Default::default()
         });
+    }
 
+    /// Host-layer eager-open (#429): the host document is opened (didOpen sent) on
+    /// a `_self` host server directly by the eager-open path. Exercised in
+    /// isolation via `eager_open_host_document_on_servers` (not `did_open_impl`)
+    /// so the host-event synthetic diagnostic pull — which would also open the doc
+    /// — can't mask whether eager-open itself works.
+    #[tokio::test]
+    async fn eager_open_sends_didopen_to_self_host_server() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        configure_rust_self_host(server);
         server.bridge.insert_ready_test_connection("rust_ls").await;
 
         let uri = Url::parse("file:///test/host_eager.rs").unwrap();
@@ -331,5 +337,181 @@ print("hello")
         })
         .await
         .expect("eager-open should send didOpen for the host document to the _self host server");
+    }
+
+    /// On-edit host re-sync (#431): a second `eager_sync_host_document_on_servers`
+    /// with changed text sends a versioned `didChange` (version advances to 2), so
+    /// a push-only host server re-analyzes current text instead of stale text. The
+    /// debounced diagnostic path routes through the same method at its cadence.
+    #[tokio::test]
+    async fn eager_sync_resyncs_host_document_on_changed_text() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_resync.rs").unwrap();
+        let settings = server.settings_manager.load_settings();
+        let configs = server
+            .bridge
+            .get_host_configs_for_language(&settings, "rust");
+
+        // First sync opens the doc at version 1.
+        server.bridge.eager_sync_host_document_on_servers(
+            &uri,
+            "rust",
+            std::sync::Arc::from("fn main() {}"),
+            configs.clone(),
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    == Some(1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first eager-sync should didOpen the host document at version 1");
+
+        // A re-sync with changed text must send a didChange, advancing to version 2.
+        server.bridge.eager_sync_host_document_on_servers(
+            &uri,
+            "rust",
+            std::sync::Arc::from("fn other() {}"),
+            configs,
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    == Some(2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("re-sync with changed text should send a didChange advancing to version 2");
+    }
+
+    /// On-edit re-sync wiring (#431): when the debounced diagnostic *fires*,
+    /// `execute_debounced_diagnostic` re-syncs the host doc to its `_self` servers
+    /// via the coordinator. Drives `DebouncedDiagnosticsManager::schedule` with a
+    /// zero debounce and a host snapshot, then asserts the host doc gets synced.
+    /// The test `rust_ls` connection advertises no `diagnosticProvider`, so the
+    /// capability-gated pull skips it — only the eager-sync hook can sync it, which
+    /// isolates the wiring (removing the hook would fail this test).
+    #[tokio::test]
+    async fn debounced_fire_resyncs_host_document() {
+        use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
+        use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
+        use crate::lsp::lsp_impl::DiagnosticPublisher;
+        use crate::lsp::lsp_impl::bridge_context::HostRequestContext;
+        use crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshot;
+        use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_debounce.rs").unwrap();
+        let settings = server.settings_manager.load_settings();
+        let configs = server
+            .bridge
+            .get_host_configs_for_language(&settings, "rust");
+
+        let snapshot = DiagnosticSnapshot {
+            virt_contexts: vec![],
+            host: Some(HostRequestContext {
+                uri: uri.clone(),
+                language_id: "rust".to_string(),
+                text: std::sync::Arc::from("fn main() {}"),
+                configs,
+                priorities: vec![],
+                strategy: AggregationStrategy::Concatenated,
+                max_fan_out: None,
+                upstream_request_id: None,
+            }),
+            layer_cfg: ResolvedLayerConfig {
+                priorities: vec![LayerSource::Host],
+                strategy: AggregationStrategy::Concatenated,
+            },
+        };
+
+        // Fire immediately (zero debounce) and assert the host doc was synced.
+        DebouncedDiagnosticsManager::with_duration(Duration::ZERO).schedule(
+            uri.clone(),
+            Some(snapshot),
+            server.bridge.pool_arc(),
+            std::sync::Arc::clone(&server.bridge),
+            std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
+            std::sync::Arc::new(DiagnosticPublisher::new(server)),
+        );
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("debounce fire should re-sync the host document to the _self server");
+    }
+
+    /// Locks the load-bearing property behind #431: `prepare_diagnostic_snapshot`
+    /// builds the host context for a `_self`-bridged doc WITHOUT gating on the
+    /// server advertising `diagnosticProvider`. A push-only `rust_ls` (no
+    /// diagnosticProvider, like marksman) is therefore in `snapshot.host.configs`,
+    /// so the debounce-fire re-sync reaches it. If the snapshot were
+    /// capability-gated, the whole on-edit re-sync would be a no-op for exactly the
+    /// push-only servers it exists to serve.
+    #[tokio::test]
+    async fn prepare_diagnostic_snapshot_includes_push_only_host_server() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/host_snapshot.rs").unwrap();
+        let text = "fn main() {}".to_string();
+        server
+            .documents
+            .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), text, Some("rust"), vec![])
+            .await;
+
+        let snapshot = server
+            .diagnostic_scheduler()
+            .prepare_diagnostic_snapshot(&uri)
+            .expect("a parsed _self-bridged doc yields a diagnostic snapshot");
+        let host = snapshot.host.expect(
+            "host context is built for a _self-bridged doc, not gated on diagnosticProvider",
+        );
+        assert!(
+            host.configs.iter().any(|c| c.server_name == "rust_ls"),
+            "the push-only rust_ls must be in the host context so the debounce re-sync reaches it"
+        );
     }
 }

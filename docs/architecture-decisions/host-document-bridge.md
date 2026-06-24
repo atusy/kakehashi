@@ -92,9 +92,10 @@ Partially implemented:
   (push-propagation-diagnostic-forwarding, #421) — accepted when the URI names an
   open host-bridged document. The host document is opened eagerly on each `_self`
   host server at host `didOpen` (#429), so a push-only host server pushes on open
-  rather than only after the first request. On-edit re-sync to push-only host
-  servers without a host request (as-you-type) is still deferred — they see edits
-  via the lazy request-path sync (save / hover).
+  rather than only after the first request; and it is re-synced on edit at the
+  debounced diagnostic cadence (#431), so a push-only host server (skipped by the
+  capability-gated pull) re-analyzes current text rather than stale text after a
+  change.
 
 ## Context
 

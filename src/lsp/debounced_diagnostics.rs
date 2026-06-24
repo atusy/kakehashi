@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use tokio::task::AbortHandle;
 use url::Url;
 
-use super::bridge::LanguageServerPool;
+use super::bridge::{BridgeCoordinator, LanguageServerPool};
 
 use super::lsp_impl::DiagnosticPublisher;
 use super::lsp_impl::text_document::publish_diagnostic::{
@@ -43,6 +43,9 @@ struct DebouncedDiagnosticData {
     snapshot_data: Option<DiagnosticSnapshot>,
     /// Bridge pool for sending diagnostic requests
     bridge_pool: Arc<LanguageServerPool>,
+    /// Bridge coordinator — used to eager re-sync the host document to `_self`
+    /// host servers at the debounced cadence (#431).
+    bridge: Arc<BridgeCoordinator>,
     /// Reference to synthetic diagnostics manager for task registration
     synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: feeds the pull result into the cache and
@@ -94,6 +97,7 @@ impl DebouncedDiagnosticsManager {
         uri: Url,
         snapshot_data: Option<DiagnosticSnapshot>,
         bridge_pool: Arc<LanguageServerPool>,
+        bridge: Arc<BridgeCoordinator>,
         synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
         publisher: Arc<DiagnosticPublisher>,
     ) {
@@ -119,6 +123,7 @@ impl DebouncedDiagnosticsManager {
             uri: uri.clone(),
             snapshot_data,
             bridge_pool,
+            bridge,
             synthetic_diagnostics,
             publisher,
         };
@@ -199,9 +204,29 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         uri,
         snapshot_data,
         bridge_pool,
+        bridge,
         synthetic_diagnostics,
         publisher,
     } = data;
+
+    // #431: re-sync the host document to its `_self` host servers at this debounced
+    // cadence (after the user stops typing), so a push-only host server — which the
+    // capability-gated pull below skips — re-analyzes the current text and pushes
+    // fresh diagnostics instead of stale ones. Fire-and-forget (spawns per-server
+    // tasks and returns) so it never head-of-line-blocks the pull on a slow
+    // server's readiness; pull-capable servers fingerprint-dedup the extra sync.
+    if let Some(host) = snapshot_data.as_ref().and_then(|s| s.host.as_ref()) {
+        // Sync target comes from the host context itself (`host.uri`), not the
+        // outer scheduled `uri` — they're equal today, but keying off the host
+        // context keeps the sync correct if a scheduled URI ever differs from its
+        // host document.
+        bridge.eager_sync_host_document_on_servers(
+            &host.uri,
+            &host.language_id,
+            host.text.clone(),
+            host.configs.clone(),
+        );
+    }
 
     // Spawn the actual diagnostic task (similar to DiagnosticScheduler::spawn_synthetic_diagnostic_task)
     // This task is registered with SyntheticDiagnosticsManager for superseding

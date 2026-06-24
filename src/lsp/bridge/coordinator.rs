@@ -545,10 +545,8 @@ impl BridgeCoordinator {
     /// Eagerly open the real host document on every `_self` host-bridge server for
     /// `host_language` (host-document-bridge, #429), so a push-only host server
     /// starts analyzing and pushing diagnostics on `didOpen` instead of only after
-    /// the first host-bridged request. Spawns one fire-and-forget task per server;
-    /// no-op (and cancels any prior batch) when host bridging is off for the
-    /// language. Re-syncing on `didChange` is deferred (push-only servers still see
-    /// edits via the lazy request-path sync — save/hover — not as-you-type).
+    /// the first host-bridged request. No-op (and cancels any prior batch) when
+    /// host bridging is off for the language.
     pub(crate) fn eager_open_host_document_on_servers(
         &self,
         settings: &WorkspaceSettings,
@@ -557,9 +555,33 @@ impl BridgeCoordinator {
         text: &str,
     ) {
         let configs = self.get_host_configs_for_language(settings, host_language);
+        self.eager_sync_host_document_on_servers(host_uri, host_language, Arc::from(text), configs);
+    }
+
+    /// Sync the real host document to a resolved set of `_self` host servers
+    /// (host-document-bridge). `sync_host_document` sends `didOpen` the first time
+    /// and a versioned `didChange` when the text changed, so this is used both for
+    /// the eager open on `didOpen` (#429) and the eager **re-sync on edit** at the
+    /// debounced diagnostic cadence (#431) — the latter is what keeps a push-only
+    /// host server (skipped by the capability-gated pull) analyzing current text
+    /// rather than stale text. Spawns one fire-and-forget task per server; no-op
+    /// (and cancels any prior batch) when `configs` is empty.
+    ///
+    /// `language_id` is the downstream `languageId` — for a `_self` bridge that is
+    /// the host language itself (consistent with `HostRequestContext.language_id`).
+    /// `text` is taken as `Arc<str>` so the debounced re-sync path can hand over its
+    /// existing `HostRequestContext.text` allocation (a cheap clone) rather than
+    /// copying the full document on every fire.
+    pub(crate) fn eager_sync_host_document_on_servers(
+        &self,
+        host_uri: &Url,
+        language_id: &str,
+        text: Arc<str>,
+        configs: Vec<ResolvedServerConfig>,
+    ) {
         if configs.is_empty() {
             // Host bridging off / no host server for this language — drop any
-            // prior batch so a stale open can't fire.
+            // prior batch so a stale sync can't fire.
             self.cancel_host_eager_open(host_uri);
             return;
         }
@@ -570,18 +592,29 @@ impl BridgeCoordinator {
         // (didClose) or `abort_all_eager_open` (shutdown) removed the entry, a
         // handle registered afterwards is aborted on the spot. It does NOT prevent
         // a task whose body already started on another worker before registration
-        // from sending its didOpen — that residual is identical to the region path
-        // (see the field doc), bounded and benign; left open for parity.
+        // from sending its didOpen/didChange — that residual is identical to the
+        // region path (see the field doc), bounded and benign; left open for parity.
+        //
+        // On-edit re-sync carries *different* text per fire, so a superseded task
+        // emitting after a newer one could in principle roll the host server back to
+        // older text (a higher version with stale content). The supersede above
+        // closes the common case: each task's only blocking point before the sync is
+        // `get_or_create_connection_wait_ready` (an `.await` on `wait_for_ready`), so
+        // `abort()` cancels a parked older task *there*, before it reaches
+        // `sync_host_document`; and debounce fires are ≥500ms apart, far wider than
+        // the µs spawn→register window, so the prior fire's handle is already
+        // registered (hence abortable) when the next fire supersedes. The only
+        // residual is a µs alignment — an older task unblocking from wait-ready at
+        // the exact instant a newer fire's task reaches the (await-free) sync — which
+        // is the deferred `content_epoch` stale-overwrite window (#422), not a new
+        // bug class; it self-heals on the next edit.
         let generation = self.supersede_host_eager_open(host_uri);
 
         // Share the text + languageId across per-server tasks via `Arc<str>` rather
         // than cloning the (potentially large) document text once per host server.
-        // For a `_self` bridge the downstream `languageId` is the host language
-        // itself (consistent with the lazy request path's
-        // `HostRequestContext.language_id`), so derive it rather than taking a
-        // separate arg that a caller could transpose with `text`.
-        let text: Arc<str> = Arc::from(text);
-        let language_id: Arc<str> = Arc::from(host_language);
+        // `text` already arrives as `Arc<str>` (the debounce path hands over its
+        // `HostRequestContext.text` without copying).
+        let language_id: Arc<str> = Arc::from(language_id);
         for config in configs {
             let pool = self.pool_arc();
             let host_uri_owned = host_uri.clone();

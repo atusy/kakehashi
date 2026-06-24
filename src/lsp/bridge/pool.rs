@@ -557,6 +557,26 @@ impl LanguageServerPool {
             .any(|(uri, connection_key)| uri == &key && connection_key.server() == server_name)
     }
 
+    /// The current sync version of the host document at `host_uri` on `server_name`,
+    /// or `None` if not synced. `sync_host_document` sets v1 on the didOpen and
+    /// bumps it on each content-changing didChange — so a value > 1 proves a re-sync
+    /// happened. Used to verify on-edit host re-sync (#431).
+    #[cfg(test)]
+    pub(crate) async fn host_document_version(
+        &self,
+        host_uri: &Url,
+        server_name: &str,
+    ) -> Option<i32> {
+        let key = host_uri.to_string();
+        self.host_documents()
+            .await
+            .iter()
+            .find(|((uri, connection_key), _)| {
+                uri == &key && connection_key.server() == server_name
+            })
+            .map(|(_, state)| state.version)
+    }
+
     /// Resolve a virtual-document URI string to its `(host_url, region_id)`
     /// (used by `window/showDocument` translation). See
     /// [`DocumentTracker::resolve_virtual_uri`].
