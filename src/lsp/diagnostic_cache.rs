@@ -415,6 +415,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reclaim_during_contention_preserves_the_waiter_handoff() {
+        // The end-to-end shape reclaim must never break: a republish is queued
+        // behind an in-flight one for the same host while a sweep runs. A queued
+        // waiter keeps an `Arc` to the lock (lock_owned consumes the Arc by value),
+        // so the weak still upgrades and the entry survives the sweep — and the
+        // waiter then acquires the *same* lock, preserving per-host ordering.
+        let agg = Arc::new(DiagnosticAggregator::new());
+        let a = Url::parse("file:///a.md").unwrap();
+
+        // In-flight republish holds the lock.
+        let held = agg.lock_republish(&a).await;
+
+        // A second republish for the same host parks as a queued waiter.
+        let agg2 = Arc::clone(&agg);
+        let a2 = a.clone();
+        let waiter = tokio::spawn(async move {
+            let _g = agg2.lock_republish(&a2).await;
+        });
+        // Let the waiter reach lock_owned().await and park. (The assertion below is
+        // robust even if it hasn't yet — `held` alone keeps the weak upgradeable —
+        // but parking is the case under test.)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        agg.reclaim_republish_locks();
+        assert_eq!(
+            agg.republish_lock_count(),
+            1,
+            "a lock under active contention must survive reclamation"
+        );
+
+        // Releasing the in-flight guard lets the queued waiter acquire and finish —
+        // proving reclaim did not strand it nor split it onto a second lock.
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the queued waiter must acquire once the holder releases")
+            .expect("the waiter task must not panic");
+    }
+
     fn messages(slots: &ServerSlots) -> Vec<String> {
         let mut out: Vec<String> = slots
             .values()
