@@ -111,8 +111,7 @@ impl CallHierarchyEnvelope {
     /// The virtual URI string this envelope's item belongs to. Used as the
     /// "own region" match target when filtering response items.
     fn virtual_uri_string(&self) -> Option<String> {
-        let host_uri = Url::parse(&self.host_uri).ok()?;
-        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).ok()?;
+        let host_uri_lsp = host_uri_lsp(&self.host_uri)?;
         Some(
             VirtualDocumentUri::new(&host_uri_lsp, &self.injection_language, &self.region_id)
                 .to_uri_string(),
@@ -194,15 +193,26 @@ fn translate_from_ranges_to_host(ranges: &mut [Range], offset: &RegionOffset) {
 /// repoint its `uri` at the region's virtual document and translate both ranges
 /// with the envelope's offset snapshot. Pure (no I/O) so the request-side
 /// coordinate path is unit-testable (the inverse of `transform_item_to_host`).
-fn translate_item_to_virtual(item: &mut CallHierarchyItem, envelope: &CallHierarchyEnvelope) {
+/// Repoint a host-coordinate item at the region's virtual document and translate
+/// its ranges host→virtual, in place. Returns `false` (leaving the item untouched)
+/// if the virtual URI can't be rebuilt — the caller must then NOT forward the item,
+/// since translating the ranges without repointing the uri would send the downstream
+/// a host URI with virtual ranges (inconsistent).
+fn translate_item_to_virtual(
+    item: &mut CallHierarchyItem,
+    envelope: &CallHierarchyEnvelope,
+) -> bool {
+    let Some(virtual_uri) = envelope.virtual_uri_string() else {
+        return false;
+    };
+    let Ok(uri) = tower_lsp_server::ls_types::Uri::from_str(&virtual_uri) else {
+        return false;
+    };
     let offset = RegionOffset::from(&envelope.offset);
-    if let Some(virtual_uri) = envelope.virtual_uri_string()
-        && let Ok(uri) = tower_lsp_server::ls_types::Uri::from_str(&virtual_uri)
-    {
-        item.uri = uri;
-    }
+    item.uri = uri;
     translate_host_range_to_virtual(&mut item.range, &offset);
     translate_host_range_to_virtual(&mut item.selection_range, &offset);
+    true
 }
 
 impl LanguageServerPool {
@@ -228,7 +238,7 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/prepareCallHierarchy") {
             return Ok(None);
         }
-        let host_uri_string = host_uri.to_string();
+        let host_uri_string = host_uri.as_str().to_owned();
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -393,8 +403,15 @@ impl LanguageServerPool {
 
         // The item is in HOST coordinates; translate it to VIRTUAL and point its
         // uri at the virtual document before sending. `item.data` already holds
-        // the downstream's original value (the caller stripped the envelope).
-        translate_item_to_virtual(&mut item, envelope);
+        // the downstream's original value (the caller stripped the envelope). If the
+        // virtual URI can't be rebuilt, fail soft rather than send an inconsistent
+        // (host-uri, virtual-ranges) item downstream.
+        if !translate_item_to_virtual(&mut item, envelope) {
+            if let Some(ref id) = upstream_id {
+                self.unregister_upstream_request(id, connection_key);
+            }
+            return None;
+        }
         let request = build_call_hierarchy_resolve_request(method, &item, request_id);
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
@@ -822,7 +839,7 @@ mod tests {
         let mut item = item_at("file:///test.md", range(6, 0, 6, 5));
         item.data = Some(json!({"original": true}));
 
-        translate_item_to_virtual(&mut item, &envelope);
+        assert!(translate_item_to_virtual(&mut item, &envelope));
 
         // uri now points at the region's virtual document
         assert_eq!(item.uri.as_str(), envelope.virtual_uri_string().unwrap());
