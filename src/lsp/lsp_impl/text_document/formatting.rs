@@ -25,13 +25,15 @@
 //! a single sorted edit vector. Both are `pub(super)` so the sibling range
 //! handler in [`super::range_formatting`] reuses them verbatim.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, TextEdit};
+use tower_lsp_server::ls_types::{
+    DocumentFormattingParams, NumberOrString, Position, Range, TextEdit,
+};
 
 use crate::config::settings::AggregationStrategy;
 use crate::config::settings::{LayerSource, PRIORITIES_WILDCARD};
@@ -42,9 +44,12 @@ use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
 use crate::lsp::aggregation::server::effective_priorities_from;
 use crate::lsp::aggregation::server::run_sequential_format_pipeline;
+use crate::lsp::aggregation::server::{
+    dispatch_preferred_with_tokens, mint_region_progress_source,
+};
 use crate::lsp::bridge::{
-    RegionOffset, ResolvedServerConfig, UpstreamId, VirtualDocumentUri,
-    translate_virtual_range_to_host,
+    ClientProgressAggregator, ClientProgressDeregisterGuard, RegionOffset, ResolvedServerConfig,
+    UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
 };
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
@@ -73,6 +78,10 @@ impl Kakehashi {
     ) -> Result<Option<Vec<TextEdit>>> {
         let lsp_uri = params.text_document.uri;
         let options = params.options;
+        // The editor's work-done token for this request, if any. Client progress
+        // is wired only for the preferred per-region branch (concatenated is
+        // deferred, #440); minting per region happens inside `virt_format_edits`.
+        let work_done_token = params.work_done_progress_params.work_done_token.clone();
 
         let Ok(uri) = uri_to_url(&lsp_uri) else {
             log::warn!("Invalid URI in formatting: {}", lsp_uri.as_str());
@@ -122,6 +131,7 @@ impl Kakehashi {
                     &options,
                     &upstream_request_id,
                     &cancel_state,
+                    work_done_token.clone(),
                 );
                 let host = self.host_format_edits(&lsp_uri, &original, &options, &cancel_state);
                 crate::lsp::lsp_impl::bridge_context::race_layers_preferred(
@@ -163,6 +173,7 @@ impl Kakehashi {
                                 &options,
                                 &upstream_request_id,
                                 &cancel_state,
+                                work_done_token.clone(),
                             )
                             .await?
                         }
@@ -201,6 +212,7 @@ impl Kakehashi {
     /// Format every injection region (the **virt** layer): resolve regions
     /// from the parsed snapshot, format each one per its aggregation config,
     /// and concatenate the per-region edits (disjoint spans).
+    #[allow(clippy::too_many_arguments)]
     async fn virt_format_edits(
         &self,
         uri: &url::Url,
@@ -209,6 +221,7 @@ impl Kakehashi {
         options: &tower_lsp_server::ls_types::FormattingOptions,
         upstream_request_id: &Option<UpstreamId>,
         cancel_state: &FormattingCancelState<'_>,
+        client_progress_token: Option<NumberOrString>,
     ) -> Result<Option<Vec<TextEdit>>> {
         let Some(injection_query) = self.language.injection_query(language_name) else {
             return Ok(None);
@@ -237,6 +250,21 @@ impl Kakehashi {
         // rebuilding per region would make many-region documents quadratic.
         // Lazy because only concatenated-plan regions need it.
         let mut host_mapper: Option<crate::text::PositionMapper> = None;
+
+        // Shared client progress: a formatting request fans out over several
+        // injection regions, so the preferred-branch regions share ONE
+        // aggregator + ONE teardown guard. The aggregator's winner rule shows
+        // the first region to begin as one coherent `Begin → … → End` on the
+        // editor's token (ls-bridge-client-progress). Concatenated-pipeline
+        // regions are excluded from minting (client progress deferred, #440).
+        // `None` when no `workDoneToken`.
+        let shared_cp = client_progress_token.map(|client_token| {
+            (
+                Arc::new(Mutex::new(ClientProgressAggregator::new(client_token))),
+                Arc::clone(pool.client_progress_registry()),
+            )
+        });
+        let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
         for resolved in all_regions {
             let configs = self
@@ -345,6 +373,22 @@ impl Kakehashi {
                 }
             };
 
+            // Mint this region's tracked-source token into the shared
+            // aggregator ONLY for the preferred branch. Concatenated regions
+            // (`pipeline.is_some()`) get no token — concatenated client progress
+            // is deferred (#440). `pipeline.is_none()` only borrows, so `pipeline`
+            // can still be moved into the spawn below.
+            let region_cp_tokens = if pipeline.is_none() {
+                shared_cp.as_ref().and_then(|(aggregator, registry)| {
+                    mint_region_progress_source(&region_ctx, registry, aggregator)
+                })
+            } else {
+                None
+            };
+            if let Some(map) = &region_cp_tokens {
+                cp_minted.extend(map.values().cloned());
+            }
+
             let pool = Arc::clone(&pool);
             let options = options.clone();
             let region_cancel_rx = cancel_state.derive_receiver();
@@ -369,11 +413,19 @@ impl Kakehashi {
                         options,
                         region_cancel_rx,
                         request_error_sink,
+                        region_cp_tokens,
                     )
                     .await
                 }
             });
         }
+
+        // One teardown guard for the whole request, held across the edit
+        // collection so the synthetic terminal `End` fires once, after every
+        // region settles (or on cancel). Dropped at the end of this block.
+        let _cp_guard = shared_cp.map(|(aggregator, registry)| {
+            ClientProgressDeregisterGuard::new(registry, cp_minted, aggregator, pool.upstream_tx())
+        });
 
         let response = finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
@@ -699,60 +751,78 @@ async fn pipeline_step_request_kind(
 
 /// `preferred`-strategy formatting for one region: the existing
 /// first-non-empty-wins fan-out, factored out of the per-region task body.
+///
+/// `client_progress_tokens` carries the region's tracked-source progress token
+/// (minted by [`mint_region_progress_source`] into the request's shared
+/// aggregator) when the editor attached a `workDoneToken`; `None` otherwise.
+/// When present, the dispatch routes the winning downstream's `$/progress`
+/// onto the editor's token via [`dispatch_preferred_with_tokens`]; when absent
+/// it falls back to [`dispatch_preferred`] (no client progress).
 async fn dispatch_preferred_formatting(
     region_ctx: &DocumentRequestContext,
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
     options: tower_lsp_server::ls_types::FormattingOptions,
     region_cancel_rx: Option<CancelReceiver>,
     request_error_sink: RequestErrorSink,
+    client_progress_tokens: Option<std::collections::HashMap<String, NumberOrString>>,
 ) -> Option<Vec<TextEdit>> {
-    let result = dispatch_preferred(
-        region_ctx,
-        pool,
-        move |t| {
-            let options = options.clone();
-            // Count request failures at the SOURCE, not from the fan-in
-            // verdict: `FanInResult::Done` discards the error count, so a
-            // failed higher-priority formatter rescued by a fallback server
-            // would otherwise go unreported and a CLI run would exit 0
-            // despite a broken configured formatter.
-            let request_error_sink = request_error_sink.clone();
-            async move {
-                let result = t
-                    .pool
-                    .send_formatting_request(
-                        &t.server_name,
-                        &t.server_config,
-                        &t.uri,
-                        &t.injection_language,
-                        &t.region_id,
-                        t.offset,
-                        &t.virtual_content,
-                        options,
-                        t.upstream_id,
-                        // Full-formatting client progress is out of scope here
-                        // (this PR wires rangeFormatting); tracked in #459.
-                        None,
-                        None,
-                    )
-                    .await;
-                if result.is_err() {
-                    count_request_errors(&request_error_sink, 1);
-                }
-                result
+    let send = move |t: crate::lsp::aggregation::server::FanOutTask| {
+        let options = options.clone();
+        // Count request failures at the SOURCE, not from the fan-in
+        // verdict: `FanInResult::Done` discards the error count, so a
+        // failed higher-priority formatter rescued by a fallback server
+        // would otherwise go unreported and a CLI run would exit 0
+        // despite a broken configured formatter.
+        let request_error_sink = request_error_sink.clone();
+        async move {
+            let result = t
+                .pool
+                .send_formatting_request(
+                    &t.server_name,
+                    &t.server_config,
+                    &t.uri,
+                    &t.injection_language,
+                    &t.region_id,
+                    t.offset,
+                    &t.virtual_content,
+                    options,
+                    t.upstream_id,
+                    // Hand the winning downstream its bridge-minted client-progress
+                    // token (the tracked source's); the aggregator relays its
+                    // `$/progress` onto the editor's token. `None` for suppressed
+                    // candidates and when the request carries no `workDoneToken`.
+                    t.client_progress_token,
+                    None,
+                )
+                .await;
+            if result.is_err() {
+                count_request_errors(&request_error_sink, 1);
             }
-        },
-        // `Some(vec![])` is an authoritative "no edits needed" from the
-        // formatter — both an explicit empty list and (since the bridge
-        // transform stopped collapsing it) a `null` response per LSP — so
-        // accept it instead of falling through to a lower-priority server that
-        // might re-format the same code. `None` now strictly means "no usable
-        // response" (missing provider, error, malformed payload) and triggers
-        // fallback.
-        |opt| opt.is_some(),
-        region_cancel_rx,
-    )
-    .await;
+            result
+        }
+    };
+    // `Some(vec![])` is an authoritative "no edits needed" from the
+    // formatter — both an explicit empty list and (since the bridge
+    // transform stopped collapsing it) a `null` response per LSP — so
+    // accept it instead of falling through to a lower-priority server that
+    // might re-format the same code. `None` now strictly means "no usable
+    // response" (missing provider, error, malformed payload) and triggers
+    // fallback.
+    let is_nonempty = |opt: &Option<Vec<TextEdit>>| opt.is_some();
+    let result = match client_progress_tokens {
+        Some(tokens) => {
+            dispatch_preferred_with_tokens(
+                region_ctx,
+                pool,
+                send,
+                is_nonempty,
+                region_cancel_rx,
+                tokens,
+            )
+            .await
+        }
+        None => dispatch_preferred(region_ctx, pool, send, is_nonempty, region_cancel_rx).await,
+    };
     match result {
         FanInResult::Done(edits) => edits,
         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
