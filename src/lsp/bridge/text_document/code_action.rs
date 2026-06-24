@@ -4,16 +4,27 @@
 //! range is translated host->virtual; in the response, each `CodeAction`'s edit
 //! ranges and diagnostic ranges are translated virtual->host.
 //!
-//! Scope / deferred follow-ups:
-//! - Request `context.diagnostics` is empty (the handler does not forward the
-//!   editor's host-coordinate diagnostics yet).
-//! - `WorkspaceEdit` translation handles the `changes` map and the
-//!   `documentChanges` **`Edits`** form (`Vec<TextDocumentEdit>`). The
-//!   `documentChanges` **`Operations`** form (resource create/rename/delete) is a
-//!   follow-up (#471): an action carrying it has its whole `edit` dropped rather
-//!   than emit untranslated virtual coordinates or a virtual-URI resource op.
-//! - `Command` items pass through unchanged; `codeAction/resolve` is not wired,
-//!   so `data` passes through but a follow-up resolve request is unhandled.
+//! Scope: this first increment reliably bridges **eager-edit** code actions in
+//! injection regions — actions that arrive with a `WorkspaceEdit` (`changes` or
+//! `documentChanges` `Edits`), which is the common quick-fix/refactor case. The
+//! following are honest, documented limitations, tracked for a comprehensive
+//! follow-up (#474):
+//! - **Host layer**: only the virtual (injection) layer is bridged; codeAction for
+//!   the host document itself does not yet fan out via `walk_layers` (unlike most
+//!   methods). A range outside an injection region returns nothing.
+//! - **Commands**: `Command` items and `CodeAction.command` pass through, but
+//!   kakehashi has no `workspace/executeCommand` routing, so a command-only action
+//!   is not executable until that lands. (`CodeAction`s that ALSO carry an edit
+//!   still apply that edit.)
+//! - **Lazy actions / `codeAction/resolve`**: not wired (the round-trip transform
+//!   it needs is a follow-up, #471), and the capability advertises `Simple(true)`
+//!   (no `resolveProvider`), so an action that arrives with only `data` (no edit)
+//!   cannot be resolved.
+//! - Request `context.diagnostics` is empty (the editor's host-coordinate
+//!   diagnostics are not yet forwarded back to virtual + filtered to the region).
+//! - `WorkspaceEdit.documentChanges` **`Operations`** form (resource
+//!   create/rename/delete) drops the whole `edit` rather than emit untranslated
+//!   virtual coordinates or a virtual-URI resource op.
 //!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
@@ -754,6 +765,78 @@ mod tests {
                 assert_eq!(
                     tdes[0].text_document.version, None,
                     "the virtual document's version is dropped on re-key to host"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("expected Edits"),
+        }
+    }
+
+    #[test]
+    fn code_action_document_changes_drops_cross_region_edit() {
+        // A documentChanges Edits list with the own region's edit AND a DIFFERENT
+        // region's edit: the cross-region TextDocumentEdit is dropped (we can't
+        // translate another region's virtual coords against this request's offset).
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let cross_region = VirtualDocumentUri::new(&host_uri, "lua", "region-9").to_uri_string();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "title": "Cross",
+                    "edit": {
+                        "documentChanges": [
+                            {
+                                "textDocument": { "uri": virtual_uri, "version": 1 },
+                                "edits": [{
+                                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                                    "newText": "a"
+                                }]
+                            },
+                            {
+                                "textDocument": { "uri": cross_region, "version": 1 },
+                                "edits": [{
+                                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                                    "newText": "b"
+                                }]
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let actions = transform_code_action_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        )
+        .unwrap();
+
+        let action = match &actions[0] {
+            CodeActionOrCommand::CodeAction(a) => a,
+            CodeActionOrCommand::Command(_) => panic!("Expected CodeAction"),
+        };
+        match action
+            .edit
+            .as_ref()
+            .unwrap()
+            .document_changes
+            .as_ref()
+            .unwrap()
+        {
+            DocumentChanges::Edits(tdes) => {
+                assert_eq!(
+                    tdes.len(),
+                    1,
+                    "the cross-region TextDocumentEdit is dropped"
+                );
+                assert_eq!(
+                    tdes[0].text_document.uri, host_uri,
+                    "the own-region edit is kept and re-keyed to host"
                 );
             }
             DocumentChanges::Operations(_) => panic!("expected Edits"),
