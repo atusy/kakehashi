@@ -18,7 +18,7 @@ const METHOD: &str = "textDocument/rename";
 impl Kakehashi {
     pub(crate) async fn rename_impl(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
-        let work_done_token = params.work_done_progress_params.work_done_token.clone();
+        let work_done_token = params.work_done_progress_params.work_done_token;
         let lsp_uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
