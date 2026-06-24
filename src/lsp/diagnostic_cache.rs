@@ -30,9 +30,11 @@
 //! deferred `pullFallback` / capability classification removes the overlap by
 //! giving each server one native source.
 //!
-//! Also deferred: per-source strategy fan-in (`preferred` sticky / `concatenated`
-//! visible-walk; cross-source order is HashMap-nondeterministic until then), the
-//! `content_epoch` version gate, region-invalidation/crash eviction, and
+//! Region-invalidation eviction is implemented (`evict_source`, wired into the
+//! edit path that orphans a region — #424). Still deferred: per-source strategy
+//! fan-in (`preferred` sticky / `concatenated` visible-walk; cross-source order is
+//! HashMap-nondeterministic until then), the `content_epoch` version gate,
+//! **crash/server** eviction (needs connection-generation identity, #469), and
 //! host-layer eager-open (diagnostics on open before the first request).
 
 use std::collections::HashMap;
@@ -90,9 +92,9 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 /// - [`DiagnosticSource::Region`] slots hold virtual coordinates and are
 ///   transformed via `region_offsets[region_id]` (lazy re-anchor against the
 ///   region's *current* offset). A region with no current offset (it no longer
-///   resolves, e.g. it was edited away) is skipped here; its now-stale slot
-///   lingers in the cache until the whole host is dropped on `didClose`
-///   (per-region / crash eviction is a deferred follow-up).
+///   resolves, e.g. it was edited away) is skipped here; the edit that orphaned it
+///   also evicts its now-stale slot (`evict_source`, #424), so it no longer lingers
+///   until the host's `didClose`. (Crash/server eviction is still deferred — #469.)
 /// - [`DiagnosticSource::Host`] and [`DiagnosticSource::PullLayer`] slots are
 ///   already host-local and pass through unchanged.
 ///
@@ -244,6 +246,25 @@ impl DiagnosticAggregator {
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
         let mut cache = self.lock();
         cache.remove(host).is_some()
+    }
+
+    /// Drop one `source`'s slots (every server) under `host` — e.g. a region
+    /// invalidated by an edit, whose stale `Region` slots would otherwise linger
+    /// until the whole host is closed (#424). Returns whether the source existed.
+    /// The host entry is removed if it becomes empty.
+    pub(crate) fn evict_source(&self, host: &Url, source: &DiagnosticSource) -> bool {
+        let mut cache = self.lock();
+        // Borrow by `&Url` (no key clone) — the common case (host present, other
+        // sources remain) is a single lookup. The host entry is removed only when
+        // this was its last source, which costs a second lookup but is rare.
+        let Some(slots) = cache.get_mut(host) else {
+            return false;
+        };
+        let removed = slots.remove(source).is_some();
+        if slots.is_empty() {
+            cache.remove(host);
+        }
+        removed
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Url, SourceSlots>> {
@@ -508,5 +529,41 @@ mod tests {
         assert!(agg.evict_host(&host()));
         assert!(agg.snapshot(&host()).is_empty());
         assert!(!agg.evict_host(&host()), "second evict is a no-op");
+    }
+
+    #[test]
+    fn evict_source_drops_only_that_source() {
+        let agg = DiagnosticAggregator::new();
+        let region = DiagnosticSource::Region("R1".to_string());
+        agg.record(&host(), region.clone(), "srv".to_string(), vec![diag("r")]);
+        agg.set_pull_layer(&host(), vec![diag("p")]);
+
+        assert!(agg.evict_source(&host(), &region));
+        let snap = agg.snapshot(&host());
+        assert!(!snap.contains_key(&region), "the region source is evicted");
+        assert!(
+            snap.contains_key(&DiagnosticSource::PullLayer),
+            "other sources for the host are untouched"
+        );
+        assert!(
+            !agg.evict_source(&host(), &region),
+            "a second evict of the same source is a no-op"
+        );
+    }
+
+    #[test]
+    fn evict_source_removes_the_host_when_its_last_source_goes() {
+        let agg = DiagnosticAggregator::new();
+        let region = DiagnosticSource::Region("R1".to_string());
+        agg.record(&host(), region.clone(), "srv".to_string(), vec![diag("r")]);
+        assert!(agg.evict_source(&host(), &region));
+        assert!(
+            !agg.lock().contains_key(&host()),
+            "the host entry itself is dropped (not left present-but-empty) once its last source is evicted"
+        );
+        assert!(
+            !agg.evict_source(&host(), &region),
+            "evicting a source from an absent host is a no-op"
+        );
     }
 }

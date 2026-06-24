@@ -9,6 +9,7 @@ use crate::lsp::auto_install::AutoInstallManager;
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::bridge::coordinator::BridgeInjection;
 use crate::lsp::cache::CacheCoordinator;
+use crate::lsp::diagnostic_cache::{DiagnosticAggregator, DiagnosticSource};
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
@@ -27,6 +28,7 @@ pub(crate) struct InjectionCoordinator {
     settings_manager: std::sync::Arc<SettingsManager>,
     auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
+    diagnostics: std::sync::Arc<DiagnosticAggregator>,
 }
 
 impl InjectionCoordinator {
@@ -40,6 +42,7 @@ impl InjectionCoordinator {
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
+            diagnostics: std::sync::Arc::clone(&server.diagnostics),
         }
     }
 
@@ -64,6 +67,17 @@ impl InjectionCoordinator {
         self.bridge
             .close_invalidated_docs(host_uri, invalidated_ulids)
             .await;
+
+        // Evict each invalidated region's diagnostic slots from the cache (#424) —
+        // AFTER `close_invalidated_docs` removed the virtual-doc tracking, so a
+        // racing queued push can no longer resolve the orphaned region's URI and
+        // recreate the slot we just evicted. The merge already *skips* a region with
+        // no current offset, so the editor never sees stale diagnostics; this
+        // reclaims the lingering slot on the edit that orphaned it.
+        for ulid in invalidated_ulids {
+            self.diagnostics
+                .evict_source(host_uri, &DiagnosticSource::Region(ulid.to_string()));
+        }
     }
 
     /// Resolve all injection regions for a document, with stable region IDs from
