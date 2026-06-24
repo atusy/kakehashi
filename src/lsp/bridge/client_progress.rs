@@ -513,8 +513,16 @@ mod tests {
     /// `$/progress` the way the reader does — resolve the bridge token through
     /// the registry, feed the resolved aggregator — then tear the request down.
     /// Asserts the relayed `Begin` and the synthetic terminal `End` both reach
-    /// the editor on the client token, exercising the full route+relay+teardown
-    /// wiring rather than mutating the aggregator directly.
+    /// the editor on the client token, exercising the route+relay+teardown wiring
+    /// rather than mutating the aggregator directly.
+    ///
+    /// The route+relay step inlines the reader's glue
+    /// (`window::progress::forward`: `route` → `on_downstream_progress` →
+    /// `upstream_tx.send`) deliberately — invoking the real `forward()` needs a
+    /// `ServerRequestDeps` reader harness that does not exist yet (the gap #442
+    /// itself notes). The concurrency invariant `forward()` adds (enqueue under
+    /// the aggregator lock) is out of a single-threaded test's reach and is
+    /// covered by `no_relay_escapes_after_teardown_even_without_a_prior_begin`.
     #[test]
     fn reader_route_relays_begin_then_teardown_synthesizes_end() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

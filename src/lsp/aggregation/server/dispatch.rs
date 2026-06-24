@@ -357,6 +357,8 @@ mod tests {
     /// `None`, so a suppressed server reports no `$/progress` for the request.
     #[tokio::test]
     async fn setup_client_progress_tracks_only_the_anchor_and_fan_out_suppresses_the_rest() {
+        use crate::error::LockResultExt;
+
         let pool = Arc::new(LanguageServerPool::new());
         let ctx = ctx_with_token(Some(NumberOrString::String("editor-wd".to_string())));
         // N>1: named anchor `ra` ahead of a `Rest` member `typos`.
@@ -387,7 +389,7 @@ mod tests {
                 let seen = Arc::clone(&seen_for_closure);
                 async move {
                     seen.lock()
-                        .expect("seen lock")
+                        .recover_poison("suppression test seen")
                         .push((task.server_name.clone(), task.client_progress_token.clone()));
                     Ok::<(), io::Error>(())
                 }
@@ -397,7 +399,7 @@ mod tests {
         );
         while join_set.join_next().await.is_some() {}
 
-        let got = seen.lock().expect("seen lock").clone();
+        let got = seen.lock().recover_poison("suppression test seen").clone();
         let anchor = got
             .iter()
             .find(|(name, _)| name == "ra")
@@ -406,9 +408,10 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "typos")
             .expect("the Rest member fanned out");
-        assert!(
-            anchor.1.is_some(),
-            "the anchor receives the bridge progress token"
+        assert_eq!(
+            anchor.1.as_ref(),
+            map.get("ra"),
+            "the anchor receives exactly the minted bridge progress token"
         );
         assert!(
             suppressed.1.is_none(),
