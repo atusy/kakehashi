@@ -1139,10 +1139,27 @@ mod tests {
             }
         }
 
+        /// A `PublishDiagnostics` carrying an empty list — a *clearing* push.
+        fn publish_clear(conn: u64, uri: &str) -> UpstreamNotification {
+            UpstreamNotification::PublishDiagnostics {
+                uri: uri.to_string(),
+                server: "srv".to_string(),
+                connection_id: ProgressConnectionId::for_test(conn),
+                diagnostics: vec![],
+            }
+        }
+
         fn evict(conn: u64) -> UpstreamNotification {
             UpstreamNotification::EvictConnectionDiagnostics {
                 connection_id: ProgressConnectionId::for_test(conn),
             }
+        }
+
+        fn is_empty_publish(n: &UpstreamNotification) -> bool {
+            matches!(
+                n,
+                UpstreamNotification::PublishDiagnostics { diagnostics, .. } if diagnostics.is_empty()
+            )
         }
 
         /// The latest message of `out[idx]`, which must be a `PublishDiagnostics`.
@@ -1237,6 +1254,54 @@ mod tests {
             let out = coalesce_upstream_batch(vec![UpstreamNotification::DiagnosticRefresh]);
             assert_eq!(out.len(), 1);
             assert!(matches!(out[0], UpstreamNotification::DiagnosticRefresh));
+        }
+
+        #[test]
+        fn coalesces_a_run_then_delivers_the_evict_after_it() {
+            // [P, P, Evict]: the two same-key pushes collapse to the latest, then the
+            // evict (which originally followed both) is delivered after it.
+            let out =
+                coalesce_upstream_batch(vec![publish(1, "u", "a"), publish(1, "u", "b"), evict(1)]);
+            assert_eq!(out.len(), 2);
+            assert_eq!(msg_at(&out, 0), "b");
+            assert!(matches!(
+                out[1],
+                UpstreamNotification::EvictConnectionDiagnostics { .. }
+            ));
+        }
+
+        #[test]
+        fn a_later_clear_supersedes_an_earlier_error_in_a_run() {
+            // The clear must win (latest), so the editor ends cleared — a dropped
+            // clear would leave a stale diagnostic on screen.
+            let out = coalesce_upstream_batch(vec![publish(1, "u", "err"), publish_clear(1, "u")]);
+            assert_eq!(out.len(), 1);
+            assert!(
+                is_empty_publish(&out[0]),
+                "the clearing push supersedes the earlier error"
+            );
+        }
+
+        #[test]
+        fn coalesces_each_key_independently_around_a_barrier() {
+            // Two keys before a barrier (one coalesced), the barrier, then the first
+            // key again after it (kept separate).
+            let out = coalesce_upstream_batch(vec![
+                publish(1, "u", "a1"),
+                publish(2, "v", "b"),
+                publish(1, "u", "a2"),
+                UpstreamNotification::DiagnosticRefresh,
+                publish(1, "u", "a3"),
+            ]);
+            assert_eq!(out.len(), 4);
+            assert_eq!(msg_at(&out, 0), "a2", "key (1,u) coalesces to its latest");
+            assert_eq!(msg_at(&out, 1), "b", "the distinct key (2,v) is untouched");
+            assert!(matches!(out[2], UpstreamNotification::DiagnosticRefresh));
+            assert_eq!(
+                msg_at(&out, 3),
+                "a3",
+                "the push after the barrier is separate"
+            );
         }
     }
 
