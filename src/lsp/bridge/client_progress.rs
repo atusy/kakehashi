@@ -509,6 +509,72 @@ mod tests {
         );
     }
 
+    /// Reader → registry-route → guard integration (#442): drive a downstream
+    /// `$/progress` the way the reader does — resolve the bridge token through
+    /// the registry, feed the resolved aggregator — then tear the request down.
+    /// Asserts the relayed `Begin` and the synthetic terminal `End` both reach
+    /// the editor on the client token, exercising the full route+relay+teardown
+    /// wiring rather than mutating the aggregator directly.
+    #[test]
+    fn reader_route_relays_begin_then_teardown_synthesizes_end() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = std::sync::Arc::new(ClientProgressRegistry::new());
+        let aggregator =
+            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token())));
+        let token = registry.register(aggregator.clone());
+
+        let guard = ClientProgressDeregisterGuard::new(
+            registry.clone(),
+            vec![token.clone()],
+            aggregator,
+            tx.clone(),
+        );
+
+        // Reader step: a downstream `$/progress` Begin arrives for `token`. The
+        // reader resolves it through the registry and relays the returned params.
+        let routed = registry
+            .route(&token)
+            .expect("token routes to its aggregator");
+        let relayed = routed
+            .lock()
+            .recover_poison("test route")
+            .on_downstream_progress(&token, begin())
+            .expect("the first Begin is relayed");
+        let _ = tx.send(UpstreamNotification::ClientProgress { params: relayed });
+
+        // The editor sees the Begin on its own token.
+        match rx.try_recv().expect("Begin relayed upstream") {
+            UpstreamNotification::ClientProgress { params } => {
+                assert_eq!(params.token, client_token(), "Begin on the client token");
+                assert!(matches!(
+                    params.value,
+                    ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_))
+                ));
+            }
+            _ => panic!("expected a ClientProgress Begin"),
+        }
+
+        // Request settles: the dispatch returns and drops the guard, which
+        // synthesizes the terminal End (the downstream's own End raced the
+        // response / never came) and deregisters the route.
+        drop(guard);
+        match rx.try_recv().expect("teardown synthesizes a terminal End") {
+            UpstreamNotification::ClientProgress { params } => {
+                assert_eq!(params.token, client_token(), "End on the client token");
+                assert!(matches!(
+                    params.value,
+                    ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+                ));
+            }
+            _ => panic!("expected a ClientProgress End"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one Begin and one End");
+        assert!(
+            registry.route(&token).is_none(),
+            "the route is deregistered on teardown"
+        );
+    }
+
     #[test]
     fn no_relay_escapes_after_teardown_even_without_a_prior_begin() {
         // Cancel race: teardown can run before any `Begin` was relayed (a cancel
