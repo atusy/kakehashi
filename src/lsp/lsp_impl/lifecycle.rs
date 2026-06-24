@@ -489,10 +489,9 @@ async fn forward_upstream_request(
 ///   window-work-done-progress), and `PublishDiagnostics`/`EvictConnectionDiagnostics`,
 ///   which may not be lost. Each wake-up drains a capped burst and coalesces
 ///   same-`(connection, uri)` `PublishDiagnostics` to the latest
-///   (`coalesce_upstream_batch`, #426); every other notification is an
-///   order-preserving barrier, so publishes never cross one — `publish`↔`evict`
-///   order and create-before-progress hold. (Distinct-key publishes within a run
-///   may be reordered, which is benign; see `coalesce_upstream_batch`.)
+///   (`coalesce_upstream_batch`, #426): only superseded earlier pushes are dropped,
+///   and every surviving notification — publishes and barriers alike — keeps its
+///   FIFO order, so `publish`↔`evict` order and create-before-progress hold.
 /// - `upstream_request_rx` (unbounded): downstream-initiated *requests*
 ///   (`window/showMessageRequest`, `window/showDocument`) forwarded with the
 ///   editor's response relayed back; loss-intolerant (a dropped request hangs
