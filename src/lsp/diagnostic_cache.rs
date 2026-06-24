@@ -152,27 +152,54 @@ pub(crate) fn merge_cached_diagnostics(
     merged
 }
 
+/// Largest set for which the allocation-free O(n²) match is used; above this, a
+/// noisy server's payload would make the quadratic compare a republish bottleneck,
+/// so we switch to the O(n) serialized-count path.
+const MULTISET_QUADRATIC_CAP: usize = 64;
+
 /// Whether two diagnostic slices are equal as **multisets** (same elements with the
 /// same multiplicity, order-independent) — used by no-op-publish suppression to
-/// ignore the merge's `HashMap` ordering (#422). An O(n²) greedy match: for each `a`
-/// element, consume the first unused equal `b` element. The per-host diagnostic count
-/// is small, so this beats serializing/sorting and never collapses distinct sets.
+/// ignore the merge's `HashMap` ordering (#422).
+///
+/// For the common small set (`<= MULTISET_QUADRATIC_CAP`) an O(n²) greedy match: for
+/// each `a` element, consume the first unused equal `b` element — no allocation or
+/// serialization. For a large set (a noisy server) that would be a republish
+/// bottleneck, so fall back to an O(n) multiset compare keyed by each diagnostic's
+/// serialized form (a total, order-independent key). Neither path collapses distinct
+/// sets.
 fn same_diagnostic_multiset(a: &[Diagnostic], b: &[Diagnostic]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut matched = vec![false; b.len()];
-    for da in a {
-        let found = b
-            .iter()
-            .enumerate()
-            .find(|(i, db)| !matched[*i] && *db == da);
-        match found {
-            Some((i, _)) => matched[i] = true,
-            None => return false,
+    if a.len() <= MULTISET_QUADRATIC_CAP {
+        let mut matched = vec![false; b.len()];
+        for da in a {
+            let found = b
+                .iter()
+                .enumerate()
+                .find(|(i, db)| !matched[*i] && *db == da);
+            match found {
+                Some((i, _)) => matched[i] = true,
+                None => return false,
+            }
         }
+        return true;
     }
-    true
+    // Large set: O(n) signed-count multiset compare. `+1` for each `a`, `-1` for each
+    // `b`; equal multisets net to all-zero (the length check above means a non-empty
+    // residual implies a real difference, not just a count imbalance).
+    let mut counts: HashMap<String, isize> = HashMap::new();
+    for d in a {
+        *counts
+            .entry(serde_json::to_string(d).unwrap_or_default())
+            .or_default() += 1;
+    }
+    for d in b {
+        *counts
+            .entry(serde_json::to_string(d).unwrap_or_default())
+            .or_default() -= 1;
+    }
+    counts.values().all(|&c| c == 0)
 }
 
 /// Transform a pushed region diagnostic from virtual to host coordinates.
@@ -1079,6 +1106,27 @@ mod tests {
         assert!(
             !agg.published_set_changed(&host(), &[b, a]),
             "suppression must be order-independent for multi-source/server hosts"
+        );
+    }
+
+    #[test]
+    fn published_set_changed_large_set_is_order_independent_and_exact() {
+        // > MULTISET_QUADRATIC_CAP diagnostics → exercises the O(n) serialized-count
+        // path. It must stay order-independent and still detect a real change.
+        let agg = DiagnosticAggregator::new();
+        let big: Vec<Diagnostic> = (0..100u32).map(|i| diag_at("m", i, 0)).collect();
+        assert!(agg.published_set_changed(&host(), &big));
+        let mut shuffled = big.clone();
+        shuffled.reverse();
+        assert!(
+            !agg.published_set_changed(&host(), &shuffled),
+            "large set: a mere reorder is not a change"
+        );
+        let mut changed = big.clone();
+        changed[50] = diag_at("DIFFERENT", 50, 0);
+        assert!(
+            agg.published_set_changed(&host(), &changed),
+            "large set: a single differing diagnostic is a change"
         );
     }
 
