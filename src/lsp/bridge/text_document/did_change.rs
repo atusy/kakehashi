@@ -18,7 +18,9 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{ConnectionHandle, ConnectionState, LanguageServerPool};
+use super::super::pool::{
+    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult,
+};
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
 impl LanguageServerPool {
@@ -89,10 +91,17 @@ impl LanguageServerPool {
                     Arc::clone(handle)
                 };
 
-                // increment_document_version acts as per-connection filter:
-                // returns None if this connection hasn't registered the doc.
+                // Per-connection filter (returns None if this connection hasn't
+                // registered the doc) AND content guard: skip the re-send when this
+                // region's extracted content is unchanged since the last didChange to
+                // this connection, so a position-only host edit doesn't re-analyze
+                // every region (#422). Mirrors the host path's fingerprint guard.
                 let Some(version) = self
-                    .increment_document_version(&virtual_uri, &connection_key)
+                    .increment_version_if_content_changed(
+                        &virtual_uri,
+                        &connection_key,
+                        &injection.content,
+                    )
                     .await
                 else {
                     continue;
@@ -100,26 +109,40 @@ impl LanguageServerPool {
 
                 // Send didChange notification via single-writer loop (ls-bridge-message-ordering).
                 // This is non-blocking and maintains FIFO ordering.
-                Self::send_didchange_for_virtual_doc(
+                let send_result = Self::send_didchange_for_virtual_doc(
                     &handle,
                     &virtual_uri.to_uri_string(),
                     &injection.content,
                     version,
                 );
+                // Record the fingerprint ONLY on a confirmed enqueue (#422): a dropped
+                // send (full/closed queue) must leave the old fingerprint so the next
+                // edit re-sends, rather than marking content the server never received.
+                if matches!(send_result, NotificationSendResult::Queued) {
+                    self.record_sent_content_fingerprint(
+                        &virtual_uri,
+                        &connection_key,
+                        &injection.content,
+                    )
+                    .await;
+                }
             }
         }
     }
 
-    /// Send a didChange notification for a virtual document.
+    /// Send a didChange notification for a virtual document, returning the
+    /// enqueue outcome.
     ///
     /// Uses the channel-based single-writer loop (ls-bridge-message-ordering): non-blocking, and
-    /// if the queue is full the notification is dropped with a warning log.
+    /// if the queue is full the notification is dropped with a warning log. The
+    /// returned [`NotificationSendResult`] lets the caller record the content
+    /// fingerprint only on a confirmed `Queued` enqueue (#422).
     fn send_didchange_for_virtual_doc(
         handle: &Arc<ConnectionHandle>,
         virtual_uri: &str,
         content: &str,
         version: i32,
-    ) {
+    ) -> NotificationSendResult {
         let uri = match Uri::from_str(virtual_uri) {
             Ok(u) => u,
             Err(e) => {
@@ -127,7 +150,9 @@ impl LanguageServerPool {
                     target: "kakehashi::bridge",
                     "Skipping didChange for invalid URI '{}': {}", virtual_uri, e
                 );
-                return;
+                // Nothing was enqueued; treat as a non-`Queued` outcome so the caller
+                // does not record a fingerprint for content the server never received.
+                return NotificationSendResult::SerializationFailed;
             }
         };
 
@@ -142,7 +167,7 @@ impl LanguageServerPool {
 
         let notification = JsonRpcNotification::new("textDocument/didChange", params);
 
-        // Send via the single-writer loop (non-blocking, fire-and-forget)
-        handle.send_notification(notification);
+        // Send via the single-writer loop (non-blocking, fire-and-forget).
+        handle.send_notification(notification)
     }
 }

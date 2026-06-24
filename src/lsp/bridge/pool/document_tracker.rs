@@ -11,10 +11,28 @@ use std::collections::HashMap;
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 
+use crate::error::LockResultExt;
+
 use url::Url;
 
 use super::ConnectionKey;
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
+
+/// Hash of a virtual document's extracted content, used to skip re-sending an
+/// unchanged `didChange` (#422). Mirrors the host path's fingerprint
+/// (`text_document/host.rs`).
+///
+/// A 64-bit hash collision (two *different* contents hashing equal — astronomically
+/// unlikely for `DefaultHasher`) would make a genuinely changed region look unchanged
+/// and skip its re-sync: the downstream then analyzes stale content until a *later*
+/// edit happens to hash differently, and if no further edit occurs it stays stale.
+/// This is the standard fingerprint-guard tradeoff, accepted for the collision odds.
+fn content_fingerprint(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Represents an opened virtual document for tracking.
 ///
@@ -49,6 +67,23 @@ pub(crate) struct DocumentTracker {
     /// Keyed by connection (not language) to enable process sharing while
     /// keeping per-root connections distinct.
     document_versions: Mutex<HashMap<ConnectionKey, HashMap<String, i32>>>,
+    /// Map of connection key → (virtual document URI → fingerprint of the content
+    /// last sent to that connection). Lets the virt sync skip re-sending `didChange`
+    /// when a host edit didn't change a region's extracted content (mirrors the
+    /// host path's fingerprint guard in `text_document/host.rs`), so a position-only
+    /// edit doesn't re-analyze every region and flicker (#422). An entry is recorded
+    /// only after a content sync is **confirmed enqueued** — seeded by the initial
+    /// `didOpen` (`LanguageServerPool::ensure_document_opened`) and updated on each
+    /// `didChange` (`record_sent_content_fingerprint`, called only on a `Queued`
+    /// send) — keeping "fingerprint set ⟺ content sent" so the gate is never bumped
+    /// without a corresponding sync (a dropped send leaves the old fingerprint, and
+    /// the next edit re-syncs).
+    ///
+    /// A `std::sync::Mutex` (not tokio's): only ever held for a brief synchronous map
+    /// op, never across an `.await`, so the async mutex's overhead is unwanted (mirrors
+    /// `DiagnosticAggregator::last_published`). Poisoning is recovered via
+    /// `LockResultExt::recover_poison`.
+    document_fingerprints: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, u64>>>,
     /// Tracks which virtual documents were opened for each host document.
     ///
     /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
@@ -74,6 +109,7 @@ impl DocumentTracker {
     pub(crate) fn new() -> Self {
         Self {
             document_versions: Mutex::new(HashMap::new()),
+            document_fingerprints: std::sync::Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
@@ -160,6 +196,17 @@ impl DocumentTracker {
                 docs.remove(&uri_string);
             }
         }
+        // Drop any fingerprint symmetrically with the version (#422) — benign today
+        // (unclaim runs right after a failed didOpen, before any didChange recorded a
+        // fingerprint) but keeps the two maps consistent if that ever changes.
+        if let Some(docs) = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints")
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
 
         // Then decrement the opened refcount and clean reverse index
         self.decrement_opened(&uri_string);
@@ -226,6 +273,11 @@ impl DocumentTracker {
     /// Increment the version of a virtual document and return the new version.
     ///
     /// Returns `None` if the document has not been opened.
+    ///
+    /// Test-only: production goes through `increment_version_if_content_changed`
+    /// (which bumps the version inline, reusing its `uri_string`, #422); this bare
+    /// version of the bump is retained for the version-tracking unit tests.
+    #[cfg(test)]
     pub(super) async fn increment_document_version(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -243,6 +295,81 @@ impl DocumentTracker {
         None
     }
 
+    /// Like [`Self::increment_document_version`], but a no-op (`None`) when
+    /// `content` is unchanged since the last `didChange` sent to this connection
+    /// for this virtual document — so a host edit that doesn't alter a region's
+    /// extracted content doesn't re-sync and re-analyze it (#422). This method does
+    /// **not** record the fingerprint; the caller records it via
+    /// [`Self::record_sent_content_fingerprint`] only after the `didChange` is
+    /// confirmed enqueued, keeping "fingerprint set ⟺ content sent". `None` is also
+    /// returned when the document isn't registered for this connection (as for
+    /// `increment`).
+    pub(super) async fn increment_version_if_content_changed(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) -> Option<i32> {
+        let uri_string = virtual_uri.to_uri_string();
+        let fp = content_fingerprint(content);
+
+        // Unchanged content (vs the last fingerprint **recorded as sent**) → skip the
+        // re-send and the version bump. The fingerprint is NOT updated here (see the
+        // doc): a dropped send leaves the old fingerprint so the next edit re-sends
+        // (self-healing). Held briefly and released before the version lock (the two
+        // maps are never locked together).
+        {
+            let fingerprints = self
+                .document_fingerprints
+                .lock()
+                .recover_poison("DocumentTracker::document_fingerprints");
+            if fingerprints
+                .get(connection_key)
+                .and_then(|docs| docs.get(&uri_string))
+                == Some(&fp)
+            {
+                return None;
+            }
+        }
+
+        // Content changed (or first didChange / unknown): bump the version inline,
+        // reusing `uri_string` (rather than delegating to `increment_document_version`,
+        // which would recompute it). `None` means the doc isn't registered here.
+        let mut versions = self.document_versions.lock().await;
+        let version = versions.get_mut(connection_key)?.get_mut(&uri_string)?;
+        *version += 1;
+        Some(*version)
+    }
+
+    /// Record the fingerprint of the content just **successfully enqueued** as a
+    /// `didChange` to this connection, so a later edit leaving the region's content
+    /// identical is skipped (#422). Call this only after the send returns `Queued` —
+    /// recording before the send (or on a dropped send) would mark content the server
+    /// never received, defeating the self-heal on the next edit.
+    pub(super) async fn record_sent_content_fingerprint(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) {
+        let uri_string = virtual_uri.to_uri_string();
+        let fp = content_fingerprint(content);
+        let mut fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        // Clone the connection key only when first inserting it (common path: the
+        // connection is already present, so look up by borrow).
+        if let Some(docs) = fingerprints.get_mut(connection_key) {
+            docs.insert(uri_string, fp);
+        } else {
+            fingerprints
+                .entry(connection_key.clone())
+                .or_default()
+                .insert(uri_string, fp);
+        }
+    }
+
     /// Remove a document from `document_versions` and `opened_documents`.
     ///
     /// Does NOT remove from `host_to_virtual` — that cleanup is handled
@@ -257,6 +384,15 @@ impl DocumentTracker {
 
         let mut versions = self.document_versions.lock().await;
         if let Some(docs) = versions.get_mut(connection_key) {
+            docs.remove(&uri_string);
+        }
+        drop(versions);
+        if let Some(docs) = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints")
+            .get_mut(connection_key)
+        {
             docs.remove(&uri_string);
         }
 
@@ -286,6 +422,12 @@ impl DocumentTracker {
                 .map(|docs| docs.into_keys().collect())
                 .unwrap_or_default()
         };
+        // Drop this connection's fingerprints too, so a respawn under the same key
+        // re-syncs from scratch rather than skipping on a stale fingerprint (#422).
+        self.document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints")
+            .remove(connection_key);
         for uri in &uris {
             self.decrement_opened(uri);
             self.remove_from_reverse_index(uri, connection_key);
@@ -835,6 +977,109 @@ mod tests {
             .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert_eq!(version, Some(3), "Second increment should return 3");
+    }
+
+    #[tokio::test]
+    async fn increment_version_if_content_changed_skips_unchanged_content() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+
+        // First call bumps (1 -> 2). The caller records the fingerprint only after a
+        // confirmed send.
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
+                .await,
+            Some(2),
+            "first didChange sends and bumps the version"
+        );
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "local x = 1")
+            .await;
+        // Same content now recorded-as-sent → skip (no bump, no re-send).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
+                .await,
+            None,
+            "unchanged content must skip the re-send once recorded as sent"
+        );
+        // Changed content → bump again (2 -> 3).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 2")
+                .await,
+            Some(3),
+            "changed content sends and bumps"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_didchange_self_heals_because_the_fingerprint_is_not_recorded() {
+        // The fingerprint is recorded only on a confirmed send. If a send is dropped
+        // (caller skips record_sent_content_fingerprint), the same content must still
+        // re-send on the next edit — otherwise the server keeps stale content (#422).
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+
+        // Send bumps (1 -> 2) but we do NOT record it (the send was dropped).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
+                .await,
+            Some(2),
+        );
+        // Same content re-sends (bumps again) because no fingerprint was recorded.
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
+                .await,
+            Some(3),
+            "a dropped send must self-heal: identical content re-sends, not skips"
+        );
+    }
+
+    #[tokio::test]
+    async fn increment_version_if_content_changed_returns_none_for_unregistered() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        // Never opened for this connection: no version registered, so no send — and
+        // no fingerprint recorded (so a later open + same content still sends once).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(
+                    &virtual_uri,
+                    &ConnectionKey::for_server("lua"),
+                    "local x = 1",
+                )
+                .await,
+            None,
+        );
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(
+                    &virtual_uri,
+                    &ConnectionKey::for_server("lua"),
+                    "local x = 1",
+                )
+                .await,
+            Some(2),
+            "after registration the first send goes through even with the same content"
+        );
     }
 
     // ========================================

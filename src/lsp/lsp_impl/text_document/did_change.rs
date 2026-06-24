@@ -105,6 +105,19 @@ impl Kakehashi {
             .process_injections(&uri, true)
             .await;
 
+        // Geometry re-merge (#422): a host edit can shift a region's position without
+        // changing its extracted content — the fingerprint guard then skips re-syncing
+        // it, so no downstream re-push will re-anchor its cached diagnostics. Republish
+        // (off the debounce) so the cached region push slots re-anchor to their new
+        // host coordinates via lazy re-anchor. Gated on actually having region push
+        // slots so a quiet/diagnostic-free file pays nothing; the no-op-publish
+        // suppression then emits only when the re-anchored coordinates really changed.
+        if self.diagnostics.has_region_slots(&uri) {
+            crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(self)
+                .republish(&uri)
+                .await;
+        }
+
         // pull-first-diagnostic-forwarding Phase 3: Schedule debounced diagnostic push on didChange.
         // After 500ms of no changes, diagnostics will be collected and published.
         // This provides near-real-time feedback while avoiding excessive requests during typing.

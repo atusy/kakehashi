@@ -152,6 +152,63 @@ pub(crate) fn merge_cached_diagnostics(
     merged
 }
 
+/// Largest set for which the serialization-free O(n²) match is used; above this, a
+/// noisy server's payload would make the quadratic compare a republish bottleneck,
+/// so we switch to the O(n) serialized-count path.
+const MULTISET_QUADRATIC_CAP: usize = 64;
+
+/// Whether two diagnostic slices are equal as **multisets** (same elements with the
+/// same multiplicity, order-independent) — used by no-op-publish suppression to
+/// ignore the merge's `HashMap` ordering (#422).
+///
+/// For the common small set (`<= MULTISET_QUADRATIC_CAP`) an O(n²) greedy match: for
+/// each `a` element, consume the first unused equal `b` element — no serialization
+/// (just a small `bool` match-mask). For a large set (a noisy server) that would be a
+/// republish bottleneck, so fall back to an O(n) multiset compare keyed by each
+/// diagnostic's serialized form (a total, order-independent key). Neither path
+/// collapses distinct sets.
+fn same_diagnostic_multiset(a: &[Diagnostic], b: &[Diagnostic]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.len() <= MULTISET_QUADRATIC_CAP {
+        let mut matched = vec![false; b.len()];
+        for da in a {
+            let found = b
+                .iter()
+                .enumerate()
+                .find(|(i, db)| !matched[*i] && *db == da);
+            match found {
+                Some((i, _)) => matched[i] = true,
+                None => return false,
+            }
+        }
+        return true;
+    }
+    // Large set: O(n) signed-count multiset compare. `+1` for each `a`, `-1` for each
+    // `b`; equal multisets net to all-zero (the length check above means a non-empty
+    // residual implies a real difference, not just a count imbalance).
+    //
+    // A serialization failure (effectively impossible for `Diagnostic`) must not
+    // collapse distinct diagnostics onto an empty key — that could read two different
+    // sets as equal and wrongly suppress a needed publish. So on any `Err`, bail out
+    // reporting "not equal" (the caller then publishes — safe, never hides).
+    let mut counts: HashMap<String, isize> = HashMap::new();
+    for d in a {
+        let Ok(key) = serde_json::to_string(d) else {
+            return false;
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    for d in b {
+        let Ok(key) = serde_json::to_string(d) else {
+            return false;
+        };
+        *counts.entry(key).or_default() -= 1;
+    }
+    counts.values().all(|&c| c == 0)
+}
+
 /// Transform a pushed region diagnostic from virtual to host coordinates.
 ///
 /// Mirrors the pull path's `transform_diagnostic`
@@ -199,6 +256,12 @@ pub(crate) struct DiagnosticAggregator {
     /// removed — reclamation cannot race a republish into minting a second lock for
     /// the same host.
     republish_locks: Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>,
+    /// The last diagnostic set published to the editor per host, so a republish
+    /// that would re-send an identical set is suppressed — the editor already has
+    /// it, and a redundant `publishDiagnostics` is a needless flicker/noise source
+    /// (#422). Updated under the host's republish lock (same-host republishes are
+    /// serialized), and forgotten on `didClose` ([`Self::forget_published`]).
+    last_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
 }
 
 impl DiagnosticAggregator {
@@ -308,10 +371,68 @@ impl DiagnosticAggregator {
         cache.get(host).cloned().unwrap_or_default()
     }
 
+    /// Whether `host` has a cached `Region` push slot with **non-empty** diagnostics
+    /// — i.e. a downstream diagnostic held in *virtual* coordinates that re-anchors
+    /// against the region's current offset at publish time. Used to decide whether a
+    /// host edit that moved regions needs a geometry re-merge (#422); `Host`/`PullLayer`
+    /// slots are already host-local and don't move with a region edit. A *kept-but-empty*
+    /// Region slot (a server cleared its diagnostics) has nothing to re-anchor, so it is
+    /// ignored — otherwise a quiet/diagnostic-free file would keep paying the offset
+    /// recompute on every edit.
+    pub(crate) fn has_region_slots(&self, host: &Url) -> bool {
+        let cache = self.lock();
+        cache.get(host).is_some_and(|sources| {
+            sources.iter().any(|(source, servers)| {
+                matches!(source, DiagnosticSource::Region(_))
+                    && servers.values().any(|slot| !slot.diagnostics.is_empty())
+            })
+        })
+    }
+
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
         let mut cache = self.lock();
         cache.remove(host).is_some()
+    }
+
+    /// Whether `diagnostics` differs from the set last published for `host`,
+    /// recording it as the new last when it does. Returns `false` when identical,
+    /// so the caller skips a redundant `publishDiagnostics` the editor already has
+    /// (#422). Called under the host's republish lock, so same-host calls serialize.
+    ///
+    /// The comparison is **order-independent**: `merge_cached_diagnostics` walks
+    /// `HashMap`-keyed sources/servers, so the same logical set can serialize in a
+    /// different order between republishes. The two sets are compared as **multisets**
+    /// of full `Diagnostic` values ([`same_diagnostic_multiset`]), so a
+    /// multi-source/multi-server host is not wrongly seen as "changed" merely because
+    /// the merge order shuffled — while a genuine change in any field is still
+    /// detected. The per-host diagnostic count is small, so the O(n²) match is cheap
+    /// and avoids serializing every diagnostic.
+    pub(crate) fn published_set_changed(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
+        let mut last = self
+            .last_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_published");
+        // Single lookup via `get_mut`: update in place when the host is already
+        // present (the common path), cloning the `host` key only on first insert.
+        if let Some(prev) = last.get_mut(host) {
+            if same_diagnostic_multiset(prev, diagnostics) {
+                return false;
+            }
+            *prev = diagnostics.to_vec();
+            return true;
+        }
+        last.insert(host.clone(), diagnostics.to_vec());
+        true
+    }
+
+    /// Forget the last-published set for `host` (host `didClose`), so its entry
+    /// does not linger and a later re-open publishes afresh.
+    pub(crate) fn forget_published(&self, host: &Url) {
+        self.last_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_published")
+            .remove(host);
     }
 
     /// Drop one `source`'s slots (every server) under `host` — e.g. a region
@@ -952,5 +1073,110 @@ mod tests {
             !agg.lock().contains_key(&host()),
             "the now-empty host entry is removed, not left present-but-empty"
         );
+    }
+
+    #[test]
+    fn published_set_changed_suppresses_an_identical_republish() {
+        let agg = DiagnosticAggregator::new();
+        // First publish always counts as changed (nothing published before).
+        assert!(agg.published_set_changed(&host(), &[diag("a")]));
+        // An identical set is suppressed.
+        assert!(!agg.published_set_changed(&host(), &[diag("a")]));
+        // A different set publishes again.
+        assert!(agg.published_set_changed(&host(), &[diag("a"), diag("b")]));
+        assert!(!agg.published_set_changed(&host(), &[diag("a"), diag("b")]));
+        // Going back to empty is a change (clears the editor).
+        assert!(agg.published_set_changed(&host(), &[]));
+        assert!(!agg.published_set_changed(&host(), &[]));
+    }
+
+    #[test]
+    fn forget_published_lets_the_next_identical_set_publish_again() {
+        let agg = DiagnosticAggregator::new();
+        assert!(agg.published_set_changed(&host(), &[diag("a")]));
+        assert!(!agg.published_set_changed(&host(), &[diag("a")]));
+        // After didClose forgets the host, a re-open's identical first set publishes.
+        agg.forget_published(&host());
+        assert!(
+            agg.published_set_changed(&host(), &[diag("a")]),
+            "a re-opened host must publish its first set even if it matches the pre-close one"
+        );
+    }
+
+    #[test]
+    fn published_set_changed_ignores_merge_order() {
+        let agg = DiagnosticAggregator::new();
+        let a = diag_at("a", 0, 0);
+        let b = diag_at("b", 1, 0);
+        assert!(agg.published_set_changed(&host(), &[a.clone(), b.clone()]));
+        // The same logical set in a different (HashMap-shuffled) order is NOT a change.
+        assert!(
+            !agg.published_set_changed(&host(), &[b, a]),
+            "suppression must be order-independent for multi-source/server hosts"
+        );
+    }
+
+    #[test]
+    fn published_set_changed_large_set_is_order_independent_and_exact() {
+        // > MULTISET_QUADRATIC_CAP diagnostics → exercises the O(n) serialized-count
+        // path. It must stay order-independent and still detect a real change.
+        let agg = DiagnosticAggregator::new();
+        let big: Vec<Diagnostic> = (0..100u32).map(|i| diag_at("m", i, 0)).collect();
+        assert!(agg.published_set_changed(&host(), &big));
+        let mut shuffled = big.clone();
+        shuffled.reverse();
+        assert!(
+            !agg.published_set_changed(&host(), &shuffled),
+            "large set: a mere reorder is not a change"
+        );
+        let mut changed = big.clone();
+        changed[50] = diag_at("DIFFERENT", 50, 0);
+        assert!(
+            agg.published_set_changed(&host(), &changed),
+            "large set: a single differing diagnostic is a change"
+        );
+    }
+
+    #[test]
+    fn has_region_slots_only_true_for_region_sources() {
+        let agg = DiagnosticAggregator::new();
+        assert!(!agg.has_region_slots(&host()), "empty host has none");
+
+        // A Host push slot is host-local — it does not count as a region slot.
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "selene".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("h")],
+        );
+        assert!(
+            !agg.has_region_slots(&host()),
+            "a Host slot is host-local and does not need geometry re-anchoring"
+        );
+
+        // A kept-but-EMPTY Region slot (a server cleared its diagnostics) has nothing
+        // to re-anchor, so it must NOT trigger the geometry re-merge.
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r".into()),
+            "luals".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![],
+        );
+        assert!(
+            !agg.has_region_slots(&host()),
+            "an empty Region slot has no diagnostics to re-anchor"
+        );
+
+        // A NON-EMPTY Region push slot does.
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r".into()),
+            "luals".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("r")],
+        );
+        assert!(agg.has_region_slots(&host()));
     }
 }
