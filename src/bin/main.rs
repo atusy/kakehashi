@@ -745,6 +745,10 @@ fn run_compile_parser(
     grammar_dir: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<(), ExitCode> {
+    // Self-bound the compile so a parent crash mid-compile can't leave us (and a
+    // hung cc) running as an orphan; the parent's deadline is still the usual
+    // trigger.
+    parser::arm_compile_watchdog();
     match parser::compile_parser_inprocess(grammar_dir, output_path) {
         Ok(()) => Ok(()),
         Err(e) => {

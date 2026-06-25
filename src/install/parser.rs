@@ -163,6 +163,37 @@ pub fn compile_parser_inprocess(
         .map_err(|e| ParserInstallError::CompileError(e.to_string()))
 }
 
+/// Arm a self-deadline inside the `__compile-parser` subprocess.
+///
+/// The parent's [`run_killable_subprocess`] normally enforces the deadline and
+/// kills the compile's process group. But if the *parent* (`kakehashi`) dies
+/// mid-compile — editor crash, `SIGTERM`, cancellation — this subprocess is
+/// orphaned and the loader's synchronous `cc` would keep running forever. This
+/// backstop closes that: become our own process-group leader (so the group kill
+/// can only reach us and our `cc`, never a shell that launched us directly), then
+/// spawn a watchdog that group-kills us shortly after [`PARSER_COMPILE_TIMEOUT`].
+///
+/// On a normal/quick compile the process exits first and the watchdog thread is
+/// torn down with it; the grace margin keeps the parent's deadline the usual
+/// trigger. Unix-only (process groups); a no-op elsewhere. The subcommand entry
+/// (`src/bin/main.rs`) calls this before compiling.
+pub fn arm_compile_watchdog() {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::{Pid, setpgid};
+        // Own group leader. When spawned by run_killable_subprocess the parent
+        // already did this via process_group(0) (a harmless repeat); when run
+        // directly it makes the group-kill below safe. Ignore EPERM-if-already.
+        let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+        std::thread::spawn(|| {
+            std::thread::sleep(PARSER_COMPILE_TIMEOUT + Duration::from_secs(30));
+            // pgid 0 = our own process group (us + the cc we shelled out).
+            let _ = killpg(Pid::from_raw(0), Signal::SIGKILL);
+        });
+    }
+}
+
 /// Resolve the path to re-exec for the `__compile-parser` subprocess.
 ///
 /// On Linux, prefer `/proc/self/exe`: if the running `kakehashi` binary is
@@ -295,7 +326,7 @@ pub fn install_parser(
     // by this process still fails at the rename — a loaded DLL can't be removed — a
     // pre-existing platform limitation this scheme doesn't change.)
     fs::create_dir_all(&parser_dir)?;
-    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let tmp_file = parser_dir.join(format!(
         ".{}.{}.{}.{}.tmp",
         language,
