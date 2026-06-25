@@ -13,16 +13,16 @@ fn kakehashi() -> Command {
 }
 
 #[test]
-fn compile_parser_subcommand_exits_nonzero_on_bad_grammar() {
+fn compile_parser_subcommand_exits_nonzero_on_nonexistent_grammar() {
     let tmp = tempfile::tempdir().expect("temp dir");
-    let missing_grammar = tmp.path().join("no-such-grammar");
+    let nonexistent_grammar = tmp.path().join("no-such-grammar");
     let out = tmp
         .path()
         .join(format!("out.{}", std::env::consts::DLL_EXTENSION));
 
     let output = kakehashi()
         .arg("__compile-parser")
-        .arg(&missing_grammar)
+        .arg(&nonexistent_grammar)
         .arg(&out)
         .output()
         .expect("spawn kakehashi __compile-parser");
@@ -34,7 +34,7 @@ fn compile_parser_subcommand_exits_nonzero_on_bad_grammar() {
     );
     assert!(
         !out.exists(),
-        "no shared library should be produced for a bad grammar"
+        "no shared library should be produced for a nonexistent grammar"
     );
 }
 

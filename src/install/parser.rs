@@ -162,6 +162,26 @@ pub fn compile_parser_inprocess(
         .map_err(|e| ParserInstallError::CompileError(e.to_string()))
 }
 
+/// Resolve the path to re-exec for the `__compile-parser` subprocess.
+///
+/// On Linux, prefer `/proc/self/exe`: if the running `kakehashi` binary is
+/// replaced (a package upgrade while the LSP server runs), `current_exe()`
+/// resolves to a stale `".../kakehashi (deleted)"` path that no longer spawns,
+/// whereas `/proc/self/exe` still execs the original image. Elsewhere
+/// `current_exe()` is the portable answer.
+fn self_exe_for_reexec() -> Result<PathBuf, ParserInstallError> {
+    #[cfg(target_os = "linux")]
+    {
+        let proc_self = PathBuf::from("/proc/self/exe");
+        if proc_self.exists() {
+            return Ok(proc_self);
+        }
+    }
+    std::env::current_exe().map_err(|e| {
+        ParserInstallError::CompileError(format!("locating the kakehashi binary: {e}"))
+    })
+}
+
 /// Compile a Tree-sitter parser under a hard, killable deadline.
 ///
 /// The loader's `compile_parser_at_path` shells out to `cc` without surfacing the
@@ -173,10 +193,7 @@ pub fn compile_parser_inprocess(
 /// `fork`: forking a multithreaded process is unsafe past the child's first
 /// non-async-signal-safe call.
 fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
-    let exe = std::env::current_exe().map_err(|e| {
-        ParserInstallError::CompileError(format!("locating the kakehashi binary: {e}"))
-    })?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(self_exe_for_reexec()?);
     cmd.arg("__compile-parser")
         .arg(grammar_path)
         .arg(output_path)
@@ -251,13 +268,20 @@ pub fn install_parser(
     // would make later runs skip reinstall and load a broken parser); writing to a
     // temp and renaming only on success means a failure never clobbers a
     // previously-working parser (e.g. a `force` reinstall that fails) and concurrent
-    // readers never observe a half-written file. `std::process::id()` keeps the temp
-    // unique even though the per-language install dedup already serializes installs.
+    // readers never observe a half-written file.
+    //
+    // The temp name combines the pid with a process-local counter so two installs
+    // in the same process never collide on it, independent of the per-language
+    // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
+    // by this process still fails at the rename — a loaded DLL can't be removed — a
+    // pre-existing platform limitation this scheme doesn't change.)
     fs::create_dir_all(&parser_dir)?;
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_file = parser_dir.join(format!(
-        ".{}.{}.{}.tmp",
+        ".{}.{}.{}.{}.tmp",
         language,
         std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::env::consts::DLL_EXTENSION
     ));
     let compiled = match options.compile {
