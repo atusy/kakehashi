@@ -266,6 +266,13 @@ pub fn install_parser(
     };
     match compiled {
         Ok(()) => {
+            // On unix `rename` atomically replaces an existing parser. Windows
+            // `rename` instead fails if the destination exists, which would make a
+            // `force` reinstall fail after a good compile — remove the old file
+            // first there (a small non-atomic window, acceptable on the
+            // non-primary platform).
+            #[cfg(windows)]
+            let _ = fs::remove_file(&parser_file);
             if let Err(e) = fs::rename(&tmp_file, &parser_file) {
                 let _ = fs::remove_file(&tmp_file);
                 return Err(ParserInstallError::IoError(e));
@@ -761,12 +768,14 @@ mod tests {
         // Background a grandchild that touches `survived` 2s out; `spawned` is
         // touched right after launching it (proving the descendant was actually
         // started, so an absent `survived` can't be a vacuous pass from sh dying
-        // before it forked the child).
-        cmd.arg("-c").arg(format!(
-            "( sleep 2; touch '{}' ) & touch '{}'; wait",
-            survived.display(),
-            spawned.display()
-        ));
+        // before it forked the child). Paths are passed as positional params
+        // ($1/$2), not interpolated, so a temp dir containing a quote can't break
+        // the script.
+        cmd.arg("-c")
+            .arg(r#"( sleep 2; touch "$1" ) & touch "$2"; wait"#)
+            .arg("sh")
+            .arg(&survived)
+            .arg(&spawned);
 
         let started = std::time::Instant::now();
         let result = run_killable_subprocess(cmd, Duration::from_millis(700), "test compile");
