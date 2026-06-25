@@ -27,18 +27,28 @@ pub(crate) struct DiagnosticSnapshot {
     /// Per-region virt contexts; empty when the virt layer is gated off or
     /// the document has no bridgeable injection regions.
     pub(crate) virt_contexts: Vec<DocumentRequestContext>,
-    /// Host-layer context (host-document-bridge); `None` unless the host
-    /// layer is in `layers.aggregation` priorities AND `bridge._self` is
-    /// opted in with a capable server.
+    /// Host-layer context (host-document-bridge); `None` unless the host layer
+    /// is in `layers.aggregation` priorities AND `bridge._self` is opted in with
+    /// a configured server. Present even when the host **pull** is gated off
+    /// (see `host_pull_enabled`) because it also carries the text the #431
+    /// debounced re-sync pushes to push-only `_self` servers.
     pub(crate) host: Option<HostRequestContext>,
+    /// Whether the host context should be **pulled** on this event (Path A).
+    /// `false` when host `pullFallback = false` or the host's effective server
+    /// selection is empty; the context still drives the re-sync. Always `false`
+    /// when `host` is `None`.
+    pub(crate) host_pull_enabled: bool,
     /// Cross-layer combine config for `textDocument/publishDiagnostics`.
     pub(crate) layer_cfg: ResolvedLayerConfig,
 }
 
 impl DiagnosticSnapshot {
-    /// Whether any layer can contribute diagnostics.
+    /// Whether any layer can contribute to the **pull** this event — the
+    /// Publish-vs-Clear decision for the `PullLayer`. The host counts only when
+    /// it will actually be pulled (`host_pull_enabled`); a configured-but-gated
+    /// host context is for the re-sync, not the pull.
     pub(crate) fn has_contributors(&self) -> bool {
-        !self.virt_contexts.is_empty() || self.host.is_some()
+        !self.virt_contexts.is_empty() || (self.host.is_some() && self.host_pull_enabled)
     }
 }
 
@@ -96,6 +106,7 @@ pub(crate) async fn collect_push_diagnostics(
     let DiagnosticSnapshot {
         virt_contexts,
         host,
+        host_pull_enabled,
         layer_cfg,
     } = snapshot;
 
@@ -127,9 +138,13 @@ pub(crate) async fn collect_push_diagnostics(
 
     let host_fut = async {
         match &host {
-            // Push diagnostics are LSP-mode-only; failures are log-only.
-            Some(ctx) => collect_host_diagnostics(ctx, Arc::clone(pool), &None).await,
-            None => Vec::new(),
+            // Pull only when enabled; a configured-but-gated host context exists
+            // for the re-sync (above), not the pull. Push diagnostics are
+            // LSP-mode-only, so failures are log-only (`&None` error sink).
+            Some(ctx) if host_pull_enabled => {
+                collect_host_diagnostics(ctx, Arc::clone(pool), &None).await
+            }
+            _ => Vec::new(),
         }
     };
 

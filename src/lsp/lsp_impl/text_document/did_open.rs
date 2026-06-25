@@ -128,7 +128,8 @@ mod tests {
     use super::*;
     use crate::config::WorkspaceSettings;
     use crate::config::settings::{
-        BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY, LanguageSettings,
+        AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY,
+        LanguageSettings,
     };
     use crate::lsp::bridge::VirtualDocumentUri;
     use tokio::time::{Duration, timeout};
@@ -435,6 +436,7 @@ print("hello")
 
         let snapshot = DiagnosticSnapshot {
             virt_contexts: vec![],
+            host_pull_enabled: true,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
@@ -512,6 +514,65 @@ print("hello")
         assert!(
             host.configs.iter().any(|c| c.server_name == "rust_ls"),
             "the push-only rust_ls must be in the host context so the debounce re-sync reaches it"
+        );
+    }
+
+    /// #425 regression guard: host `pullFallback = false` gates the host **pull**
+    /// (`host_pull_enabled = false`) but must NOT drop the host context — the
+    /// #431 debounced re-sync still needs it to push current text to a push-only
+    /// `_self` server. If the gate dropped the context, that server would analyze
+    /// stale text (re-opening #380 for the host).
+    #[tokio::test]
+    async fn prepare_diagnostic_snapshot_keeps_host_for_resync_when_pull_gated() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        // Override the `_self` aggregation: pullFallback = false for the
+        // proactive-publish method.
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        if let Some(bridge) = settings
+            .languages
+            .get_mut("rust")
+            .and_then(|lang| lang.bridge.as_mut())
+        {
+            bridge.insert(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/publishDiagnostics".to_string(),
+                        AggregationConfig {
+                            pull_fallback: Some(false),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            );
+        }
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/host_pull_gated.rs").unwrap();
+        let text = "fn main() {}".to_string();
+        server
+            .documents
+            .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), text, Some("rust"), vec![])
+            .await;
+
+        let snapshot = server
+            .diagnostic_scheduler()
+            .prepare_diagnostic_snapshot(&uri)
+            .expect("a parsed _self-bridged doc still yields a snapshot when the pull is gated");
+        assert!(
+            snapshot.host.is_some(),
+            "the host context is kept for the re-sync even when the pull is gated off"
+        );
+        assert!(
+            !snapshot.host_pull_enabled,
+            "pullFallback = false disables the host pull (host_pull_enabled = false)"
         );
     }
 }
