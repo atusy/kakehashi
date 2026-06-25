@@ -1,4 +1,4 @@
-# Capability Tier Parse Decoupling
+# Parse-Decoupled Document Lifecycle
 
 **Related Decisions**: [per-document-parse-actor](per-document-parse-actor.md),
 [host-document-bridge](host-document-bridge.md),

@@ -1,7 +1,7 @@
 # Per-Document Parse Actor
 
 **Related Decisions**:
-[capability-tier-parse-decoupling](capability-tier-parse-decoupling.md),
+[parse-decoupled-document-lifecycle](parse-decoupled-document-lifecycle.md),
 [replace-tree-sitter-cli-with-loader](replace-tree-sitter-cli-with-loader.md),
 [push-propagation-diagnostic-forwarding](push-propagation-diagnostic-forwarding.md),
 [lazy-node-identity-tracking](lazy-node-identity-tracking.md)
@@ -12,7 +12,7 @@ This decision covers the **virt and native tiers** — the work that
 intrinsically needs kakehashi's tree-sitter parse (region location for injected
 languages, and the tree-derived `semanticTokens` / `selectionRange` /
 `kakehashi/node` / `kakehashi/captures` features). The host tier needs no tree
-and is decoupled separately; see capability-tier-parse-decoupling. With the host
+and is decoupled separately; see parse-decoupled-document-lifecycle. With the host
 tier hoisted ahead of the parse, what remains is to get the parse itself off the
 latency-critical ingress path and give a document's parse lifecycle a single
 owner.
@@ -52,7 +52,7 @@ therefore costs real time per edit. Coalescing a burst into a single parse over
 the accumulated text is a genuine optimization, not a speculative one.
 
 **Change-path host immediacy requires the parse to be off-ingress.** Per
-capability-tier-parse-decoupling, host-tier forwards must be immediate on the
+parse-decoupled-document-lifecycle, host-tier forwards must be immediate on the
 *change* path too. If the parse runs inline in the change handler — holding the
 writer ticket for the tens-to-hundreds of milliseconds above — the next
 `didChange`, and any host forward sequenced behind it, waits on the parse. The
@@ -482,7 +482,7 @@ write-only-mailbox / shared-store-read split is load-bearing.
   instead. Handlers **enqueue from within the gated critical section**, so mailbox
   FIFO still equals wire order.
 - Host-tier work is out of scope here — it neither needs the tree nor waits on the
-  parse; see capability-tier-parse-decoupling.
+  parse; see parse-decoupled-document-lifecycle.
 
 ## Decision–Implementation Gap
 
@@ -498,5 +498,5 @@ reader fallbacks still write the store, and compilation still runs in
 non-cancellable `spawn_blocking`. The actor, the unified epoch, the CAS writes,
 the child-task model, the ingress plumbing, the injected-install re-homing, and
 the killable-subprocess install deadline are all unbuilt. A staged rollout may
-land Option 1 (minimal spawn) and capability-tier-parse-decoupling first as
+land Option 1 (minimal spawn) and parse-decoupled-document-lifecycle first as
 interim steps before the full actor.
