@@ -567,7 +567,7 @@ fn run_killable_subprocess(
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     kill_process_group(&mut child);
-                    let _ = child.wait();
+                    reap_bounded(&mut child);
                     return Err(ParserInstallError::CompileError(format!(
                         "{} timed out after {:?}",
                         context, timeout
@@ -577,11 +577,32 @@ fn run_killable_subprocess(
             }
             Err(e) => {
                 kill_process_group(&mut child);
-                let _ = child.wait();
+                reap_bounded(&mut child);
                 return Err(ParserInstallError::CompileError(format!(
                     "{}: {}",
                     context, e
                 )));
+            }
+        }
+    }
+}
+
+/// Reap the (already-killed) child, but only for a bounded time. After `SIGKILL`
+/// a child dies at once, so this returns immediately in practice. The bound
+/// matters only in the pathological case where the child can't be killed
+/// (uninterruptible D-state, blocked signals, sandbox limits): rather than
+/// `child.wait()` blocking forever — reintroducing the very unbounded wait this
+/// deadline exists to prevent — we give up after the bound and leave a zombie.
+fn reap_bounded(child: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
     }
