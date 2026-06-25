@@ -159,9 +159,9 @@ within one open document). The design makes the per-document **epoch** the pair
 
 - the **incarnation** is the retained process-wide open generation
   (`open_counter` / `open_generations`), drawn fresh on every `didOpen`. It is
-  deliberately **not** the ingress ticket: `IngressOrderGate::finish_close`
-  removes a URI's sequencing state on close, so the ticket **restarts at 1 on
-  reopen** and is not monotonic across lifetimes. Were the epoch the ticket
+  deliberately **not** the ingress ticket: `DocumentSequencer::finish_close`
+  (behind `IngressOrderGate`) removes a URI's sequencing state on close, so the
+  ticket **restarts at 1 on reopen** and is not monotonic across lifetimes. Were the epoch the ticket
   alone, a straggler write from a previous lifetime could match the reopened
   document's ticket. The incarnation is the high half precisely to close that
   gap.
@@ -329,9 +329,9 @@ creates a fresh actor at a fresh incarnation.
 
 Teardown must also wake any reader blocked on an epoch that will now never be
 reached: dropping the epoch channel on actor termination signals those waiters to
-proceed (into the empty fallback), mirroring how the gate's `finish_close` drops
-its `done` sender. Without it a reader racing the close would stall to the 200 ms
-timeout — bounded, but needless.
+proceed (into the empty fallback), mirroring how the sequencer's
+`DocumentSequencer::finish_close` drops its `done` sender. Without it a reader
+racing the close would stall to the 200 ms timeout — bounded, but needless.
 
 ### Complementary: a real install deadline via a killable subprocess
 
