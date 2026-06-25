@@ -2,7 +2,7 @@ use crate::config::settings::ResolvedAggregationConfig;
 use crate::document::DocumentStore;
 use crate::language::InjectionResolver;
 use crate::language::LanguageCoordinator;
-use crate::lsp::aggregation::server::{expand_priorities, select_servers, truncate_entries};
+use crate::lsp::aggregation::server::{expand_priorities, truncate_entries};
 use crate::lsp::bridge::{BridgeCoordinator, ResolvedServerConfig};
 use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
 use crate::lsp::lsp_impl::bridge_context::resolve_aggregation_config_from_settings;
@@ -18,10 +18,12 @@ use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
 /// Whether the proactive pull's **config-level** server selection for a method
 /// is non-empty — the visible walk resolved exactly as dispatch does (expand
-/// `priorities`, truncate by `maxFanOut`, then the allowlist select). An empty
-/// selection (`priorities = []`, `maxFanOut = 0`, or names only unconfigured
-/// servers) means the pull would fan out to nobody, so the caller skips the
-/// context entirely.
+/// `priorities`, then truncate by `maxFanOut`). The walk already drops
+/// unconfigured names and empty `Rest` groups, so a non-empty walk is exactly a
+/// non-empty selection; checking `is_empty()` avoids `select_servers`' config
+/// map + `ResolvedServerConfig` clones. An empty selection (`priorities = []`,
+/// `maxFanOut = 0`, or names only unconfigured servers) means the pull would fan
+/// out to nobody, so the caller skips the context entirely.
 ///
 /// This is a *selection* check, not a contribution prediction: a non-empty
 /// selection still builds a context and runs the pull even if every selected
@@ -38,8 +40,7 @@ fn dispatches_to_any_server(
     configs: &[ResolvedServerConfig],
     max_fan_out: Option<usize>,
 ) -> bool {
-    let entries = truncate_entries(expand_priorities(priorities, configs), max_fan_out);
-    !select_servers(configs, &entries).is_empty()
+    !truncate_entries(expand_priorities(priorities, configs), max_fan_out).is_empty()
 }
 
 pub(crate) struct DiagnosticScheduler {

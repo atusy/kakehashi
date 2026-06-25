@@ -488,6 +488,12 @@ impl LanguageServerPool {
                 && handle.has_capability("textDocument/diagnostic")
             {
                 pull_driven.insert(server.to_string());
+                // `pull_driven` only ever holds names from `candidates`, so once
+                // every candidate has matched there is nothing left to find —
+                // stop scanning the remaining connections.
+                if pull_driven.len() == candidates.len() {
+                    break;
+                }
             }
         }
         pull_driven

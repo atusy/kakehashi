@@ -195,14 +195,9 @@ impl DiagnosticPublisher {
             return;
         }
         // Distinct push-server names across the Region/Host sources, borrowed
-        // from the snapshot (no key clones on this republish hot path).
-        let mut push_servers = std::collections::HashSet::new();
-        for (source, servers) in snapshot.iter() {
-            if matches!(source, DiagnosticSource::PullLayer) {
-                continue;
-            }
-            push_servers.extend(servers.keys().map(String::as_str));
-        }
+        // from the snapshot (no key clones on this republish hot path) — the same
+        // set Path B's fold derives, so share the helper.
+        let push_servers = crate::lsp::diagnostic_cache::push_slot_servers(snapshot);
         if push_servers.is_empty() {
             return; // PullLayer-only snapshot (the common pull-driven case).
         }
