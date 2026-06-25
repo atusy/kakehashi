@@ -163,101 +163,107 @@ impl DiagnosticScheduler {
         // Virt layer: `None` = the document can never have virt diagnostics
         // (no injection query), distinct from `Some(vec![])` = gated off or
         // currently no regions (publish-empty-to-clear).
-        let virt_contexts: Option<Vec<DocumentRequestContext>> = if !layer_cfg
-            .allows(crate::config::settings::LayerSource::Virt)
-        {
-            log::debug!(
-                target: LOG_TARGET,
-                "virt layer disabled for {} via layers.aggregation priorities",
-                language_name
-            );
-            Some(Vec::new())
-        } else {
-            self.language
-                .injection_query(&language_name)
-                .map(|injection_query| {
-                    let all_regions = InjectionResolver::resolve_all(
-                        &self.language,
-                        self.bridge.node_tracker(),
-                        uri,
-                        snapshot.tree(),
-                        snapshot.text(),
-                        injection_query.as_ref(),
-                    );
+        let virt_contexts: Option<Vec<DocumentRequestContext>> =
+            if !layer_cfg.allows(crate::config::settings::LayerSource::Virt) {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "virt layer disabled for {} via layers.aggregation priorities",
+                    language_name
+                );
+                Some(Vec::new())
+            } else {
+                self.language
+                    .injection_query(&language_name)
+                    .map(|injection_query| {
+                        let all_regions = InjectionResolver::resolve_all(
+                            &self.language,
+                            self.bridge.node_tracker(),
+                            uri,
+                            snapshot.tree(),
+                            snapshot.text(),
+                            injection_query.as_ref(),
+                        );
 
-                    let mut contexts = Vec::new();
-                    // Configs + aggregation are keyed by injection language, so
-                    // resolve them once per distinct language (a document can
-                    // hold many regions of one language). `None` caches a skipped
-                    // language: no configured server, OR the pull would dispatch
-                    // to none. The key is cloned only on the resolving miss, not
-                    // on every region.
-                    type ResolvedLang =
-                        Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
-                    let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
-                        std::collections::HashMap::new();
-                    for resolved in all_regions {
-                        if !resolved_by_lang.contains_key(&resolved.injection_language) {
-                            let lang = &resolved.injection_language;
-                            let computed: ResolvedLang = {
-                                let configs = self.bridge.get_all_configs_for_language(
-                                    &settings,
-                                    &language_name,
-                                    lang,
-                                );
-                                if configs.is_empty() {
-                                    None
-                                } else {
-                                    let agg = resolve_aggregation_config_from_settings(
-                                        &settings,
-                                        &language_name,
-                                        lang,
-                                        "textDocument/publishDiagnostics",
-                                    );
-                                    // Only keep a language the pull will actually
-                                    // dispatch (#425): drop it when `pullFallback =
-                                    // false` OR its effective server selection is
-                                    // empty (`priorities = []`, `maxFanOut = 0`, or
-                                    // names only unconfigured servers). This keeps
-                                    // the invariant "PullLayer present ⟺ a pull
-                                    // dispatched to ≥1 server", so an absent/Clear
-                                    // pull layer never falsely suppresses a server's
-                                    // spontaneous push. The push path is untouched —
-                                    // only kakehashi's pulling stops.
-                                    if !agg.pull_fallback
-                                        || !dispatches_to_any_server(
-                                            &agg.priorities,
-                                            &configs,
-                                            agg.max_fan_out,
-                                        )
-                                    {
-                                        None
-                                    } else {
-                                        Some((configs, agg))
-                                    }
+                        let mut contexts = Vec::new();
+                        // Configs + aggregation are keyed by injection language, so
+                        // resolve them once per distinct language (a document can
+                        // hold many regions of one language). `None` caches a skipped
+                        // language: no configured server, OR the pull would dispatch
+                        // to none. The key is cloned only on the resolving miss, not
+                        // on every region.
+                        type ResolvedLang =
+                            Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
+                        let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
+                            std::collections::HashMap::new();
+                        for resolved in all_regions {
+                            // `get` on the common (cache-hit) path is a single lookup;
+                            // only the resolving miss touches the map again, cloning
+                            // the language key just for that insert.
+                            let entry = match resolved_by_lang.get(&resolved.injection_language) {
+                                Some(entry) => entry,
+                                None => {
+                                    let lang = &resolved.injection_language;
+                                    let computed: ResolvedLang = {
+                                        let configs = self.bridge.get_all_configs_for_language(
+                                            &settings,
+                                            &language_name,
+                                            lang,
+                                        );
+                                        if configs.is_empty() {
+                                            None
+                                        } else {
+                                            let agg = resolve_aggregation_config_from_settings(
+                                                &settings,
+                                                &language_name,
+                                                lang,
+                                                "textDocument/publishDiagnostics",
+                                            );
+                                            // Only keep a language the pull will actually
+                                            // dispatch (#425): drop it when `pullFallback =
+                                            // false` OR its effective server selection is
+                                            // empty (`priorities = []`, `maxFanOut = 0`, or
+                                            // names only unconfigured servers). This keeps
+                                            // the invariant "PullLayer present ⟺ a pull
+                                            // dispatched to ≥1 server", so an absent/Clear
+                                            // pull layer never falsely suppresses a
+                                            // server's spontaneous push. The push path is
+                                            // untouched — only kakehashi's pulling stops.
+                                            if !agg.pull_fallback
+                                                || !dispatches_to_any_server(
+                                                    &agg.priorities,
+                                                    &configs,
+                                                    agg.max_fan_out,
+                                                )
+                                            {
+                                                None
+                                            } else {
+                                                Some((configs, agg))
+                                            }
+                                        }
+                                    };
+                                    resolved_by_lang
+                                        .entry(resolved.injection_language.clone())
+                                        .or_insert(computed)
                                 }
                             };
-                            resolved_by_lang.insert(resolved.injection_language.clone(), computed);
-                        }
-                        let Some((configs, agg)) = &resolved_by_lang[&resolved.injection_language]
-                        else {
-                            continue;
-                        };
+                            let Some((configs, agg)) = entry else {
+                                continue;
+                            };
 
-                        contexts.push(DocumentRequestContext {
-                            uri: uri.clone(),
-                            resolved,
-                            configs: configs.clone(),
-                            upstream_request_id: None,
-                            priorities: agg.priorities.clone(),
-                            strategy: agg.strategy,
-                            max_fan_out: agg.max_fan_out,
-                            client_progress_token: None,
-                        });
-                    }
-                    contexts
-                })
-        };
+                            contexts.push(DocumentRequestContext {
+                                uri: uri.clone(),
+                                resolved,
+                                configs: configs.clone(),
+                                upstream_request_id: None,
+                                priorities: agg.priorities.clone(),
+                                strategy: agg.strategy,
+                                max_fan_out: agg.max_fan_out,
+                                client_progress_token: None,
+                            });
+                        }
+                        contexts
+                    })
+            };
 
         // Host layer (host-document-bridge): participates when listed in the
         // layer priorities AND opted in via bridge._self.enabled with a

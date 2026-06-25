@@ -354,17 +354,23 @@ impl Kakehashi {
         let mut region_offsets = HashMap::new();
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset) in region_meta {
-            let push_fallback = *push_fallback_by_lang
-                .entry(injection_language)
-                .or_insert_with_key(|lang| {
-                    resolve_aggregation_config_from_settings(
+            // `get` on the common (cache-hit) path is a single lookup; only the
+            // resolving miss touches the map again, moving the owned language key
+            // in (no clone).
+            let push_fallback = match push_fallback_by_lang.get(&injection_language) {
+                Some(&fallback) => fallback,
+                None => {
+                    let fallback = resolve_aggregation_config_from_settings(
                         &settings,
                         language_name,
-                        lang,
+                        &injection_language,
                         "textDocument/diagnostic",
                     )
-                    .push_fallback
-                });
+                    .push_fallback;
+                    push_fallback_by_lang.insert(injection_language, fallback);
+                    fallback
+                }
+            };
             if push_fallback {
                 region_offsets.insert(region_id, offset);
             }
