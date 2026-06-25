@@ -429,6 +429,72 @@ impl DiagnosticAggregator {
         })
     }
 
+    /// Every distinct server name with a cached **push** slot (`Region`/`Host`,
+    /// never `PullLayer`) for `host`. Path B's `pushFallback` fold uses this to
+    /// classify which cached pushers are push-driven (#425).
+    pub(crate) fn push_slot_servers(&self, host: &Url) -> std::collections::HashSet<String> {
+        let cache = self.lock();
+        let mut servers = std::collections::HashSet::new();
+        if let Some(sources) = cache.get(host) {
+            for (source, slots) in sources {
+                if matches!(source, DiagnosticSource::PullLayer) {
+                    continue;
+                }
+                servers.extend(slots.keys().cloned());
+            }
+        }
+        servers
+    }
+
+    /// Cached **push** diagnostics for `host`, partitioned by layer, for every
+    /// `(source, server)` the `include` predicate accepts — Path B's
+    /// `pushFallback` fold (#425). `Region` slots are transformed to host
+    /// coordinates via `region_offsets` (a region with no current offset is
+    /// skipped, like the proactive merge); `Host` slots are already host-local.
+    /// The `PullLayer` blob is never returned — Path B live-pulls pull-driven
+    /// servers, so folding the blob would double-count them.
+    ///
+    /// Returns `(virt_layer_items, host_layer_items)` so the caller can extend
+    /// each layer's live-pull result before the cross-layer combine.
+    pub(crate) fn cached_push_diagnostics(
+        &self,
+        host: &Url,
+        region_offsets: &HashMap<String, RegionOffset>,
+        include: impl Fn(&DiagnosticSource, &str) -> bool,
+    ) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+        let host_str = host.as_str();
+        let mut region_items = Vec::new();
+        let mut host_items = Vec::new();
+        for (source, servers) in self.snapshot(host) {
+            match &source {
+                DiagnosticSource::PullLayer => {}
+                DiagnosticSource::Region(region_id) => {
+                    let Some(offset) = region_offsets.get(region_id) else {
+                        continue;
+                    };
+                    for (server, slot) in servers {
+                        if !include(&source, &server) {
+                            continue;
+                        }
+                        for mut diagnostic in slot.diagnostics {
+                            transform_region_diagnostic(&mut diagnostic, offset, host_str);
+                            region_items.push(diagnostic);
+                        }
+                    }
+                }
+                DiagnosticSource::Host => {
+                    for (server, slot) in servers {
+                        if !include(&source, &server) {
+                            continue;
+                        }
+                        host_items.extend(slot.diagnostics);
+                    }
+                }
+            }
+        }
+        (region_items, host_items)
+    }
+
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
         let mut cache = self.lock();
@@ -917,6 +983,119 @@ mod tests {
             ],
             "host push slots pass through in host coordinates, per server"
         );
+    }
+
+    #[test]
+    fn push_slot_servers_lists_push_servers_excluding_pull_layer() {
+        let agg = DiagnosticAggregator::new();
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r1".into()),
+            "linter".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("x")],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "hostlint".into(),
+            Some(ProgressConnectionId::for_test(2)),
+            vec![diag("y")],
+        );
+        agg.set_pull_layer(&host(), vec![diag("p")]);
+
+        let servers = agg.push_slot_servers(&host());
+        assert_eq!(
+            servers,
+            std::collections::HashSet::from(["linter".to_string(), "hostlint".to_string()]),
+            "the synthetic pull-layer server is never reported as a pusher"
+        );
+    }
+
+    #[test]
+    fn cached_push_diagnostics_partitions_by_layer_and_transforms_regions() {
+        let agg = DiagnosticAggregator::new();
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r1".into()),
+            "linter".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag_at("region", 0, 0)],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "hostlint".into(),
+            Some(ProgressConnectionId::for_test(2)),
+            vec![diag_at("host", 8, 0)],
+        );
+        // The pull blob must never be folded into the client-pull response.
+        agg.set_pull_layer(&host(), vec![diag_at("pull", 9, 0)]);
+
+        let mut offsets = HashMap::new();
+        offsets.insert("r1".to_string(), RegionOffset::new(5, 0));
+
+        let (region_items, host_items) =
+            agg.cached_push_diagnostics(&host(), &offsets, |_source, _server| true);
+
+        assert_eq!(region_items.len(), 1);
+        assert_eq!(region_items[0].message, "region");
+        assert_eq!(
+            region_items[0].range.start.line, 5,
+            "region push is transformed to host coordinates (base line 5)"
+        );
+        assert_eq!(
+            host_items
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["host"],
+            "host push passes through; the pull blob is excluded"
+        );
+    }
+
+    #[test]
+    fn cached_push_diagnostics_respects_include_predicate_and_missing_offset() {
+        let agg = DiagnosticAggregator::new();
+        // Two region servers; only "linter" is included by the predicate.
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r1".into()),
+            "linter".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag_at("kept", 0, 0)],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r1".into()),
+            "ra".into(),
+            Some(ProgressConnectionId::for_test(2)),
+            vec![diag_at("excluded", 0, 0)],
+        );
+        // A region with no current offset is skipped entirely.
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("gone".into()),
+            "linter".into(),
+            Some(ProgressConnectionId::for_test(3)),
+            vec![diag_at("stale", 0, 0)],
+        );
+
+        let mut offsets = HashMap::new();
+        offsets.insert("r1".to_string(), RegionOffset::new(0, 0));
+
+        let (region_items, host_items) =
+            agg.cached_push_diagnostics(&host(), &offsets, |_source, server| server == "linter");
+
+        assert_eq!(
+            region_items
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"],
+            "only the included server's slot in a region with a live offset is returned"
+        );
+        assert!(host_items.is_empty());
     }
 
     #[test]

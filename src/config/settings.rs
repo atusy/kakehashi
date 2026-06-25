@@ -219,6 +219,10 @@ pub(crate) struct ResolvedAggregationConfig {
     /// pulled on host events into the proactive cache. Only meaningful for the
     /// `textDocument/publishDiagnostics` method (Path A).
     pub(crate) pull_fallback: bool,
+    /// Resolved `pushFallback` (default `true`): whether push-driven servers'
+    /// cached pushes are folded into the client-pull response. Only meaningful
+    /// for the `textDocument/diagnostic` method (Path B).
+    pub(crate) push_fallback: bool,
 }
 
 /// The resolved default for an absent `pullFallback` / `pushFallback`: both
@@ -235,6 +239,7 @@ impl ResolvedAggregationConfig {
             priorities: default_priorities(),
             max_fan_out: None,
             pull_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
+            push_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
         }
     }
 }
@@ -295,12 +300,14 @@ impl BridgeLanguageConfig {
                 priorities: entry.priorities.unwrap_or_else(default_priorities),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
                 pull_fallback: entry.pull_fallback.unwrap_or(DEFAULT_DIAGNOSTIC_FALLBACK),
+                push_fallback: entry.push_fallback.unwrap_or(DEFAULT_DIAGNOSTIC_FALLBACK),
             },
             None => ResolvedAggregationConfig {
                 strategy: default_aggregation_strategy_for_method(method),
                 priorities: default_priorities(),
                 max_fan_out: None,
                 pull_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
+                push_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
             },
         }
     }
@@ -2390,19 +2397,21 @@ kind = "injections""#;
     }
 
     #[test]
-    fn resolve_aggregation_pull_fallback_defaults_true_and_honors_explicit() {
-        // Absent → default true (every server contributes to the proactive path).
+    fn resolve_aggregation_fallbacks_default_true_and_honor_explicit() {
+        // Absent → both default true (every server contributes to both paths).
         let none =
             BridgeLanguageConfig::default().resolve_aggregation("textDocument/publishDiagnostics");
         assert!(none.pull_fallback, "absent pullFallback resolves to true");
+        assert!(none.push_fallback, "absent pushFallback resolves to true");
 
-        // Explicit false survives resolution.
+        // Explicit false on each toggle survives resolution independently.
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
                 "textDocument/publishDiagnostics".to_string(),
                 AggregationConfig {
                     pull_fallback: Some(false),
+                    push_fallback: Some(false),
                     ..Default::default()
                 },
             )])),
@@ -2411,6 +2420,10 @@ kind = "injections""#;
         assert!(
             !agg.pull_fallback,
             "explicit pullFallback = false is honored"
+        );
+        assert!(
+            !agg.push_fallback,
+            "explicit pushFallback = false is honored"
         );
     }
 
