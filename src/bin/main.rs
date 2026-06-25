@@ -690,6 +690,9 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         force,
         verbose,
         no_cache,
+        // The CLI runs from the kakehashi binary, so the killable subprocess path
+        // is available and a hung cc is deadline-bounded.
+        compile: parser::ParserCompile::KillableSubprocess,
     };
 
     match parser::install_parser(language, &options) {

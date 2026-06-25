@@ -157,6 +157,9 @@ pub mod test_support {
             force: false,
             verbose: false,
             no_cache: false,
+            // Test setup runs from a test-harness binary, whose `current_exe()` has
+            // no `__compile-parser` subcommand — compile in-process.
+            compile: parser::ParserCompile::InProcess,
         };
         let mut all_ok = true;
         for lang in TEST_LANGUAGES {
@@ -259,6 +262,9 @@ fn install_language_blocking(
         force,
         verbose: false,
         no_cache: false,
+        // Auto-install runs inside the LSP server (current_exe is kakehashi); a
+        // hung cc must be deadline-killable so it can't wedge the install.
+        compile: parser::ParserCompile::KillableSubprocess,
     };
 
     // AlreadyExists means the artifact is present and usable — success,

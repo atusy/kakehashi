@@ -78,6 +78,24 @@ pub struct ParserInstallResult {
     pub revision: String,
 }
 
+/// How the parser source is compiled.
+///
+/// The killable path re-execs **this** binary's `__compile-parser` subcommand, so
+/// it is only valid when the running executable is the `kakehashi` binary (the LSP
+/// server and the `language install` CLI). A caller whose `current_exe()` is
+/// something else — a test harness binary, an external embedder — must compile
+/// in-process, since that other binary has no `__compile-parser` subcommand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParserCompile {
+    /// Compile inside a killable subprocess (re-exec `__compile-parser`) so a hung
+    /// `cc` can be deadline-killed. The production default.
+    #[default]
+    KillableSubprocess,
+    /// Compile in-process — no killable deadline. For callers whose `current_exe()`
+    /// is not the `kakehashi` binary (e.g. test setup).
+    InProcess,
+}
+
 /// Options for parser installation.
 pub struct InstallOptions {
     /// Base data directory.
@@ -88,6 +106,8 @@ pub struct InstallOptions {
     pub verbose: bool,
     /// Whether to bypass the metadata cache.
     pub no_cache: bool,
+    /// How to compile the parser source (see [`ParserCompile`]).
+    pub compile: ParserCompile,
 }
 
 /// Check if a parser file exists for the given language.
@@ -227,7 +247,10 @@ pub fn install_parser(
 
     // Compile the parser directly to the install path
     fs::create_dir_all(&parser_dir)?;
-    compile_parser(&source_dir, &parser_file)?;
+    match options.compile {
+        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &parser_file)?,
+        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &parser_file)?,
+    }
 
     if options.verbose {
         eprintln!("Installed to: {}", parser_file.display());
@@ -666,54 +689,40 @@ mod tests {
         );
     }
 
-    /// A deadline kill must reap the whole process **group**, not just the direct
-    /// child. The parser compiler shells out to `cc` as a *grandchild*; a bare
-    /// `child.kill()` would leave it running — the hang this deadline exists to
-    /// bound. We model it with `sh` (the group leader) backgrounding a long-lived
-    /// grandchild, and assert the grandchild dies when the deadline fires.
+    /// A deadline kill must terminate the whole process **group**, not just the
+    /// direct child. The parser compiler shells out to `cc` as a *grandchild*; a
+    /// bare `child.kill()` would leave it running — the hang this deadline exists
+    /// to bound. We model it with `sh` (the group leader) backgrounding a
+    /// grandchild that, *if it survives*, creates a marker file 2s out. The
+    /// deadline fires at 700ms, so a group kill must stop the grandchild before it
+    /// can touch the marker. Observing a side effect only a survivor produces is
+    /// robust against orphan-reaping timing and PID reuse (a bare child.kill()
+    /// would orphan the grandchild, which then creates the marker → RED).
     #[cfg(unix)]
     #[test]
-    fn run_killable_subprocess_reaps_grandchildren_on_deadline() {
-        use nix::sys::signal::Signal;
-
+    fn run_killable_subprocess_terminates_descendants_on_deadline() {
         let tmp = tempdir().expect("temp dir");
-        let pidfile = tmp.path().join("grandchild.pid");
+        let marker = tmp.path().join("grandchild-survived");
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(format!(
-            "sleep 60 & printf %s \"$!\" > '{}'; wait",
-            pidfile.display()
-        ));
+        cmd.arg("-c")
+            .arg(format!("( sleep 2; touch '{}' ) & wait", marker.display()));
 
-        // 1s (not a tight 300ms) so a loaded CI box still records the grandchild
-        // pid via `printf` before the group is killed — otherwise the pidfile read
-        // below could panic instead of failing cleanly.
-        let result = run_killable_subprocess(cmd, Duration::from_millis(1000), "test compile");
+        let started = std::time::Instant::now();
+        let result = run_killable_subprocess(cmd, Duration::from_millis(700), "test compile");
         assert!(
             result.is_err(),
             "a subprocess that outlives the deadline must error out"
         );
 
-        let pid_raw: i32 = std::fs::read_to_string(&pidfile)
-            .expect("grandchild recorded its pid")
-            .trim()
-            .parse()
-            .expect("valid pid");
-        let pid = nix::unistd::Pid::from_raw(pid_raw);
-
-        // Poll for the group kill to land (and the grandchild to be reaped by init).
-        let mut alive = true;
-        for _ in 0..100 {
-            match nix::sys::signal::kill(pid, None::<Signal>) {
-                Err(nix::errno::Errno::ESRCH) => {
-                    alive = false;
-                    break;
-                }
-                _ => std::thread::sleep(Duration::from_millis(20)),
-            }
+        // Wait past the grandchild's would-be touch time (2s), then assert it
+        // never ran — its group was killed at 700ms.
+        while started.elapsed() < Duration::from_millis(2500) {
+            std::thread::sleep(Duration::from_millis(50));
         }
         assert!(
-            !alive,
-            "the backgrounded grandchild must be killed with the process group, not orphaned"
+            !marker.exists(),
+            "the backgrounded grandchild created its marker, so it survived the \
+             deadline — it must be terminated with the process group, not orphaned"
         );
     }
 
