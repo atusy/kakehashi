@@ -215,16 +215,26 @@ pub(crate) struct ResolvedAggregationConfig {
     pub(crate) strategy: AggregationStrategy,
     pub(crate) priorities: Vec<String>,
     pub(crate) max_fan_out: Option<usize>,
+    /// Resolved `pullFallback` (default `true`): whether pull-driven servers are
+    /// pulled on host events into the proactive cache. Only meaningful for the
+    /// `textDocument/publishDiagnostics` method (Path A).
+    pub(crate) pull_fallback: bool,
 }
+
+/// The resolved default for an absent `pullFallback` / `pushFallback`: both
+/// fallback channels are on, so every server contributes to both diagnostic
+/// paths regardless of which single mechanism it natively supports.
+const DEFAULT_DIAGNOSTIC_FALLBACK: bool = true;
 
 impl ResolvedAggregationConfig {
     /// Create a config with all fields at their defaults (`Preferred`
-    /// strategy, `["*"]` priorities = all servers, first-win).
+    /// strategy, `["*"]` priorities = all servers, first-win, fallbacks on).
     pub(crate) fn with_defaults() -> Self {
         Self {
             strategy: AggregationStrategy::Preferred,
             priorities: default_priorities(),
             max_fan_out: None,
+            pull_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
         }
     }
 }
@@ -284,11 +294,13 @@ impl BridgeLanguageConfig {
                 // fan-out kill switch (aggregation-priorities-wildcard).
                 priorities: entry.priorities.unwrap_or_else(default_priorities),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
+                pull_fallback: entry.pull_fallback.unwrap_or(DEFAULT_DIAGNOSTIC_FALLBACK),
             },
             None => ResolvedAggregationConfig {
                 strategy: default_aggregation_strategy_for_method(method),
                 priorities: default_priorities(),
                 max_fan_out: None,
+                pull_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
             },
         }
     }
@@ -2375,6 +2387,31 @@ kind = "injections""#;
             "default priorities must be [\"*\"] (all servers), not [] (disabled)"
         );
         assert_eq!(agg.max_fan_out, None);
+    }
+
+    #[test]
+    fn resolve_aggregation_pull_fallback_defaults_true_and_honors_explicit() {
+        // Absent → default true (every server contributes to the proactive path).
+        let none =
+            BridgeLanguageConfig::default().resolve_aggregation("textDocument/publishDiagnostics");
+        assert!(none.pull_fallback, "absent pullFallback resolves to true");
+
+        // Explicit false survives resolution.
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "textDocument/publishDiagnostics".to_string(),
+                AggregationConfig {
+                    pull_fallback: Some(false),
+                    ..Default::default()
+                },
+            )])),
+        };
+        let agg = config.resolve_aggregation("textDocument/publishDiagnostics");
+        assert!(
+            !agg.pull_fallback,
+            "explicit pullFallback = false is honored"
+        );
     }
 
     #[test]

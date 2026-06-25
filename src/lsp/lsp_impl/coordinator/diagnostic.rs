@@ -171,6 +171,17 @@ impl DiagnosticScheduler {
                                 "textDocument/publishDiagnostics",
                             );
 
+                            // `pullFallback = false` drops this region's
+                            // pull-driven servers from the proactive path: the
+                            // host-event pull does not fan out to them (Path A,
+                            // #425). Their spontaneous pushes are still cached and
+                            // published; only kakehashi's pulling stops. An empty
+                            // contexts list still publishes-empty to clear any
+                            // stale pull contribution.
+                            if !agg.pull_fallback {
+                                continue;
+                            }
+
                             contexts.push(DocumentRequestContext {
                                 uri: uri.clone(),
                                 resolved,
@@ -203,6 +214,13 @@ impl DiagnosticScheduler {
                     }
                     let agg =
                         lang_settings.resolve_host_aggregation("textDocument/publishDiagnostics");
+                    // `pullFallback = false` skips the host-layer pull (Path A,
+                    // #425); a push-driven `_self` server still publishes via its
+                    // cached pushes, and a pull-only `_self` server simply stops
+                    // being pulled on host events.
+                    if !agg.pull_fallback {
+                        return None;
+                    }
                     Some(HostRequestContext {
                         uri: uri.clone(),
                         language_id: language_name.clone(),
