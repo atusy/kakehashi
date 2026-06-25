@@ -67,6 +67,28 @@ pub struct AggregationConfig {
     /// - Negative: treated as no limit (silently ignored via `usize::try_from`)
     #[serde(default)]
     pub max_fan_out: Option<i64>,
+    /// Whether **pull-driven** servers (those advertising
+    /// `diagnosticProvider`) are pulled on host events and merged into the
+    /// proactive `publishDiagnostics` cache, so they too publish proactively
+    /// (push-propagation-diagnostic-forwarding "Per-server source and
+    /// fallback"). Belongs in the `textDocument/publishDiagnostics` (Path A)
+    /// method block.
+    ///
+    /// `None` = inherit (default `true`). `false` drops pull-driven servers
+    /// from the proactive path entirely; their *spontaneous* pushes are still
+    /// cached and published (it only stops kakehashi from pulling them).
+    #[serde(default)]
+    pub pull_fallback: Option<bool>,
+    /// Whether **push-driven** servers' (those *not* advertising
+    /// `diagnosticProvider`) cached pushes are folded into the client-pull
+    /// `textDocument/diagnostic` response (push-propagation-diagnostic-forwarding
+    /// "Per-server source and fallback"). Belongs in the
+    /// `textDocument/diagnostic` (Path B) method block.
+    ///
+    /// `None` = inherit (default `true`). `false` answers a client pull from
+    /// live pull-driven servers only, ignoring cached pushes.
+    #[serde(default)]
+    pub push_fallback: Option<bool>,
 }
 
 /// Configuration for a single bridged language within a host filetype.
@@ -2333,6 +2355,7 @@ kind = "injections""#;
                     strategy: Some(AggregationStrategy::Concatenated),
                     priorities: Some(vec!["server_a".to_string(), "server_b".to_string()]),
                     max_fan_out: Some(3),
+                    ..Default::default()
                 },
             )])),
         };
@@ -2352,6 +2375,21 @@ kind = "injections""#;
             "default priorities must be [\"*\"] (all servers), not [] (disabled)"
         );
         assert_eq!(agg.max_fan_out, None);
+    }
+
+    #[test]
+    fn aggregation_config_deserializes_fallback_toggles_as_camel_case() {
+        // The wire form is camelCase (push-propagation-diagnostic-forwarding):
+        // `pullFallback` / `pushFallback`, both optional.
+        let cfg: AggregationConfig =
+            serde_json::from_str(r#"{ "pullFallback": false, "pushFallback": true }"#).unwrap();
+        assert_eq!(cfg.pull_fallback, Some(false));
+        assert_eq!(cfg.push_fallback, Some(true));
+
+        // Absent toggles stay `None` (inherit), distinct from an explicit value.
+        let absent: AggregationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.pull_fallback, None);
+        assert_eq!(absent.push_fallback, None);
     }
 
     #[test]

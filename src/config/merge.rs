@@ -217,6 +217,8 @@ pub(crate) fn merge_aggregation_configs(
             .clone()
             .or_else(|| base.priorities.clone()),
         max_fan_out: overlay.max_fan_out.or(base.max_fan_out),
+        pull_fallback: overlay.pull_fallback.or(base.pull_fallback),
+        push_fallback: overlay.push_fallback.or(base.push_fallback),
     }
 }
 
@@ -2558,5 +2560,48 @@ mod tests {
         let overlay = settings::AggregationConfig::default(); // max_fan_out: None
         let merged = merge_aggregation_configs(&base, &overlay);
         assert_eq!(merged.max_fan_out, Some(5));
+    }
+
+    #[test]
+    fn merge_aggregation_configs_fallback_toggles_overlay_wins() {
+        let base = settings::AggregationConfig {
+            pull_fallback: Some(true),
+            push_fallback: Some(true),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            pull_fallback: Some(false),
+            push_fallback: Some(false),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.pull_fallback, Some(false));
+        assert_eq!(merged.push_fallback, Some(false));
+    }
+
+    #[test]
+    fn merge_aggregation_configs_fallback_toggles_inherit_from_base() {
+        // Each toggle merges independently: an unset overlay field inherits the
+        // base while a set one (here `push_fallback`) overrides.
+        let base = settings::AggregationConfig {
+            pull_fallback: Some(false),
+            push_fallback: Some(false),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            push_fallback: Some(true),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(
+            merged.pull_fallback,
+            Some(false),
+            "unset overlay inherits base"
+        );
+        assert_eq!(
+            merged.push_fallback,
+            Some(true),
+            "set overlay overrides base"
+        );
     }
 }
