@@ -92,8 +92,11 @@ compilation.
 
 The mailbox is **unbounded**, which is what makes the sends non-blocking. The
 queue itself is *not* inherently bounded by document size — under sustained input
-it holds one message per un-drained `SetText`, and a full-document sync (an empty
-edit list) carries the entire text, not a small delta. Deltas are **never dropped** — dropping one corrupts the text, and standard LSP
+it holds one message per un-drained `SetText`, and a full-document sync — a
+rangeless content change, which yields an empty derived `InputEdit` list — carries
+the entire text, not a small delta.
+
+Deltas are **never dropped** — dropping one corrupts the text, and standard LSP
 incremental sync offers no server-initiated full-text resynchronization to
 recover from a drop — so coalescing-by-discarding is not an option and the
 mailbox cannot be capped by shedding messages. What keeps memory in check is the
@@ -150,7 +153,7 @@ install path's re-entry:
 On install completion the actor transitions `Installing → Ready` and parses the
 **latest** text (not the open-time text). There is no separate
 `reload_language_after_install` re-entry: re-parse is simply the actor's normal
-`Ready` behaviour applied to current state.
+`Ready` behavior applied to current state.
 
 ### The actor owns the text; only the *parse* coalesces
 
@@ -218,7 +221,9 @@ their persistence through an **atomic, non-inserting, generation-checked** store
 update (one that no-ops when the document is gone or its generation moved). This
 matters for the resurrection guarantee below: the reader-fallback write is the
 one remaining way a closed document could be re-inserted, so it must be closed at
-the write itself, not by a check that a concurrent close can slip past. Optionally, the actor publishes an
+the write itself, not by a check that a concurrent close can slip past.
+
+Optionally, the actor publishes an
 *install-pending* signal into the store (the store carries no such field today —
 only `has_tree`/`in_progress`); a reader seeing it returns empty immediately
 without waiting, since the parse cannot complete until an unbounded install
@@ -258,9 +263,9 @@ only on a successful tree write, or a parse/install failure would never advance
 it and readers would always burn the full timeout. A reader waits — bounded by
 the existing 200ms — until the watermark reaches the tail ticket that preceded
 it, then reads whatever the store holds (a tree, or empty), instead of waiting on
-`has_tree`. While an install is genuinely still pending the watermark has not yet
+`has_tree`. While an install is genuinely still pending, the watermark has not yet
 resolved, so the reader times out into the empty fallback, which is the intended
-install-pending behaviour. This
+install-pending behavior. This
 preserves the #374 reader-observes-preceding-writes guarantee without re-coupling
 the handler to parse latency or to the unbounded install.
 
@@ -333,7 +338,8 @@ writer ticket. So re-homing `process_injections` has three distinct parts:
 - **External bridge-server spawn** — genuinely fire-and-forget.
 - **`didChange` forwarding to already-opened virtual documents** — wire-order
   sensitive; sequenced **after** the parse it depends on (it needs the fresh
-  tree) and in writer order, so it is ordered, not loosed.
+  tree) and in writer order — i.e. it must stay ordered, not be turned into an
+  unordered fire-and-forget task.
 
 All three splits must be preserved when re-homing this step.
 
@@ -431,7 +437,7 @@ write-only-mailbox / shared-store-read split is load-bearing.
   bridge-server spawn is fire-and-forget, but the bridge `didChange` forwarding
   to already-opened virtual documents is wire-order-sensitive and must stay
   ordered after the parse it depends on (or remain in the gated handler), not
-  be loosed as unordered fire-and-forget.
+  be turned into an unordered fire-and-forget task.
 
 ### Neutral
 
