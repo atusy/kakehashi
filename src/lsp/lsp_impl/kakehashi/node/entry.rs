@@ -446,24 +446,20 @@ impl Kakehashi {
             .await;
 
         if let Some(tree) = parsed {
-            // Race guard: between the text snapshot above and parse completion,
-            // a didChange may have updated the document. Storing our tree would
-            // associate it with stale text, breaking the (text, tree) consistency
-            // invariant. Compare against the current text and discard if it has
-            // moved; the next request will re-trigger the parse against the
-            // newer text.
-            let text_unchanged = self
+            // Persist atomically and non-insertingly: store the tree only if the
+            // document still exists with the text we parsed. Between the snapshot
+            // above and now, a didChange may have moved the text (storing our tree
+            // would break the (text, tree) consistency invariant) or a didClose may
+            // have removed the document (re-inserting it would resurrect a closed
+            // doc — #342/#374). The single atomic CAS closes both at the write
+            // itself; the next request re-triggers the parse against newer text.
+            if !self
                 .documents
-                .get(uri)
-                .map(|doc| doc.text() == text)
-                .unwrap_or(false);
-            if text_unchanged {
-                self.documents
-                    .update_document(uri.clone(), text, Some(tree));
-            } else {
+                .update_tree_if_text_unchanged(uri, &text, tree)
+            {
                 log::debug!(
                     target: "kakehashi::node",
-                    "discarding on-demand parse for {} — text changed during parse",
+                    "discarding on-demand parse for {} — text changed or document closed during parse",
                     uri
                 );
             }

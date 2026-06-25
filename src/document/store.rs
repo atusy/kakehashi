@@ -195,6 +195,43 @@ impl DocumentStore {
         self.update_tree_availability(&uri, has_tree);
     }
 
+    /// Store `new_tree` for an **existing** document, but only if its current text
+    /// still equals `expected_text`. Returns `true` iff the tree was stored.
+    ///
+    /// This is the safe persistence path for an **on-demand reader parse** (e.g.
+    /// `kakehashi/node`'s parse fallback). Unlike [`update_document`] it is
+    /// **non-inserting**: a `Vacant` entry — the document was closed while the
+    /// parse ran — is left untouched, so a parse completing after a `didClose`
+    /// cannot **resurrect** the document. Folding the text-equality check into the
+    /// same atomic `entry()` operation also closes the check-then-write window
+    /// against a concurrent `didChange`: a tree parsed from now-stale text is
+    /// dropped rather than associated with the newer text.
+    pub fn update_tree_if_text_unchanged(
+        &self,
+        uri: &Url,
+        expected_text: &str,
+        new_tree: Tree,
+    ) -> bool {
+        let stored = match self.documents.entry(uri.clone()) {
+            Entry::Occupied(mut entry) => {
+                let doc = entry.get_mut();
+                if doc.text() == expected_text {
+                    doc.update_tree_and_text(new_tree, expected_text.to_string());
+                    true
+                } else {
+                    false
+                }
+            }
+            // Closed (or never opened): do NOT insert — that would resurrect a
+            // document a concurrent didClose just removed.
+            Entry::Vacant(_) => false,
+        };
+        if stored {
+            self.update_tree_availability(uri, true);
+        }
+        stored
+    }
+
     /// Update document with an edited previous tree for proper changed_ranges() support.
     ///
     /// Call when parsing used an edited old tree (via `tree.edit()`): the
@@ -343,6 +380,74 @@ mod tests {
             store.open_generation(&uri),
             stale,
             "a closed URI's entry must be dropped so a reopen draws a fresh generation"
+        );
+    }
+
+    fn parse_rust(text: &str) -> Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    #[test]
+    fn update_tree_if_text_unchanged_does_not_resurrect_closed_document() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///closed.rs").unwrap();
+        // No document inserted: models a didClose that removed the entry while an
+        // on-demand reader parse was still running.
+        let stored =
+            store.update_tree_if_text_unchanged(&uri, "fn main() {}", parse_rust("fn main() {}"));
+        assert!(
+            !stored,
+            "must not store a tree for a vacant (closed) document"
+        );
+        assert!(
+            store.get(&uri).is_none(),
+            "the closed document must not be resurrected by the reader parse"
+        );
+    }
+
+    #[test]
+    fn update_tree_if_text_unchanged_stores_when_text_matches() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///live.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let stored =
+            store.update_tree_if_text_unchanged(&uri, "fn main() {}", parse_rust("fn main() {}"));
+        assert!(stored, "a live document with unchanged text gets the tree");
+        assert!(
+            store.get(&uri).unwrap().tree().is_some(),
+            "the parsed tree must be visible after the CAS write"
+        );
+    }
+
+    #[test]
+    fn update_tree_if_text_unchanged_drops_stale_text_parse() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///edited.rs").unwrap();
+        // The document moved on (a didChange landed) while the parse for the old
+        // text was in flight.
+        store.insert(
+            uri.clone(),
+            "fn newer() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let stored =
+            store.update_tree_if_text_unchanged(&uri, "fn main() {}", parse_rust("fn main() {}"));
+        assert!(!stored, "a tree parsed from now-stale text must be dropped");
+        assert!(
+            store.get(&uri).unwrap().tree().is_none(),
+            "the stale tree must not overwrite the current text's (still-absent) tree"
         );
     }
 
