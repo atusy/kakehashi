@@ -11,7 +11,6 @@ use log::debug;
 use serde::Deserialize;
 use tower_lsp_server::ls_types::{ProgressParams, ProgressParamsValue, WorkDoneProgress};
 
-use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
 
 /// Translate and forward a downstream `$/progress` notification to the editor.
@@ -47,17 +46,16 @@ pub(in crate::lsp::bridge) fn forward(
     // own `workDoneToken` and emits it ungated (ls-bridge-client-progress).
     if let Some(aggregator) = deps.client_progress_registry.route(&params.token) {
         // The incoming token identifies the source; the aggregator picks the first
-        // source to `Begin` as the winner and relays only its progress. Enqueue the
-        // relay **while still holding the aggregator lock**, so it is ordered
-        // strictly before/after the teardown's terminal `End` (which also enqueues
-        // under the lock) — never interleaved (guards the cancel race).
-        let mut agg = aggregator.lock().recover_poison("ClientProgressAggregator");
-        if let Some(out) = agg.on_downstream_progress(&params.token, params.value) {
-            let _ = deps
-                .upstream_tx
-                .send(UpstreamNotification::ClientProgress { params: out });
-        }
-        drop(agg);
+        // source to `Begin` as the winner and relays only its progress. The shared
+        // helper enqueues the relay under the aggregator lock so it is ordered
+        // strictly before/after the teardown's terminal `End` (guards the cancel
+        // race; ls-bridge-client-progress).
+        crate::lsp::bridge::client_progress::relay_to_aggregator(
+            &aggregator,
+            &deps.upstream_tx,
+            &params.token,
+            params.value,
+        );
         return;
     }
 

@@ -319,4 +319,103 @@ mod tests {
         let entries = [PriorityEntry::Rest(vec!["a".to_string(), "b".to_string()])];
         assert_eq!(tracked_progress_source(&selected, &entries), None);
     }
+
+    /// A `DocumentRequestContext` carrying `token`, with otherwise inert region
+    /// metadata — `setup_client_progress` reads only the token, and `fan_out`
+    /// reads the region fields but does not depend on their values here.
+    fn ctx_with_token(token: Option<NumberOrString>) -> DocumentRequestContext {
+        use crate::config::settings::AggregationStrategy;
+        use crate::language::injection::{CacheableInjectionRegion, ResolvedInjection};
+
+        DocumentRequestContext {
+            uri: url::Url::parse("file:///suppression.md").expect("valid URI"),
+            resolved: ResolvedInjection {
+                region: CacheableInjectionRegion {
+                    language: "rust".to_string(),
+                    byte_range: 0..0,
+                    line_range: 0..0,
+                    start_column: 0,
+                    region_id: "r0".to_string(),
+                    content_hash: 0,
+                },
+                injection_language: "rust".to_string(),
+                virtual_content: String::new(),
+                line_column_offsets: vec![],
+            },
+            configs: vec![],
+            upstream_request_id: None,
+            priorities: vec![],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: token,
+        }
+    }
+
+    /// Suppression regression (#442): under *preferred*, `setup_client_progress`
+    /// mints **exactly one** bridge token — for the named anchor only — and
+    /// `fan_out` hands that token to the anchor while every other candidate gets
+    /// `None`, so a suppressed server reports no `$/progress` for the request.
+    #[tokio::test]
+    async fn setup_client_progress_tracks_only_the_anchor_and_fan_out_suppresses_the_rest() {
+        use crate::error::LockResultExt;
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let ctx = ctx_with_token(Some(NumberOrString::String("editor-wd".to_string())));
+        // N>1: named anchor `ra` ahead of a `Rest` member `typos`.
+        let selected = [config("ra"), config("typos")];
+        let entries = [
+            PriorityEntry::Server("ra".to_string()),
+            PriorityEntry::Rest(vec!["typos".to_string()]),
+        ];
+
+        let (map, _guard) = setup_client_progress(&ctx, &pool, &selected, &entries)
+            .expect("a workDoneToken + a named anchor yields a tracked source");
+
+        assert_eq!(map.len(), 1, "exactly one bridge token is minted");
+        assert!(map.contains_key("ra"), "the named anchor is tracked");
+        assert!(!map.contains_key("typos"), "the Rest member is suppressed");
+        assert!(
+            pool.client_progress_registry().route(&map["ra"]).is_some(),
+            "the minted token is registered in the routing table"
+        );
+
+        // fan_out hands the anchor its token and every other server `None`.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_closure = Arc::clone(&seen);
+        let mut join_set = fan_out(
+            &ctx,
+            Arc::clone(&pool),
+            move |task: FanOutTask| {
+                let seen = Arc::clone(&seen_for_closure);
+                async move {
+                    seen.lock()
+                        .recover_poison("suppression test seen")
+                        .push((task.server_name.clone(), task.client_progress_token.clone()));
+                    Ok::<(), io::Error>(())
+                }
+            },
+            &selected,
+            Some(&map),
+        );
+        while join_set.join_next().await.is_some() {}
+
+        let got = seen.lock().recover_poison("suppression test seen").clone();
+        let anchor = got
+            .iter()
+            .find(|(name, _)| name == "ra")
+            .expect("the anchor fanned out");
+        let suppressed = got
+            .iter()
+            .find(|(name, _)| name == "typos")
+            .expect("the Rest member fanned out");
+        assert_eq!(
+            anchor.1.as_ref(),
+            map.get("ra"),
+            "the anchor receives exactly the minted bridge progress token"
+        );
+        assert!(
+            suppressed.1.is_none(),
+            "the suppressed server receives no progress token"
+        );
+    }
 }

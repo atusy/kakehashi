@@ -241,17 +241,23 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 
 ## Decision–Implementation Gap
 
-**Implemented** (issue #414): the `workDoneToken` path for the **N = 1** relay
-and the **`preferred`** strategy with a **single fixed anchor** — the dispatch
-mints a per-server bridge token only for the tracked source (sole server at
-N = 1, highest-priority *named* anchor at N > 1; a wildcard `Rest` group that
-outranks the candidate yields no anchor), routes that downstream's `$/progress`
-onto the editor's token, and guarantees a terminal `End` on teardown. Wired for
-`textDocument/references`; #446 extends it to the goto family (under #437) and
-#448 adds the `workDoneProgress` capability advertisement (under #445; without it
-spec-compliant clients never send a token).
+**Implemented** (issue #414 and follow-ups): the `workDoneToken` path for the
+**N = 1** relay and the **`preferred`** strategy with a **single fixed anchor** —
+the dispatch mints a per-server bridge token only for the tracked source (sole
+server at N = 1, highest-priority *named* anchor at N > 1; a wildcard `Rest`
+group that outranks the candidate yields no anchor), routes that downstream's
+`$/progress` onto the editor's token, and guarantees a terminal `End` on
+teardown. Coverage spans the **single-region** methods (`references`, the goto
+family, `inlayHint`) and the **multi-region** methods (`documentSymbol`,
+`formatting`, `rangeFormatting`, `codeLens` — whole-document except
+`rangeFormatting`, which is range-scoped): the latter fan out over several
+injection regions and so share **one** request-level aggregator and teardown
+guard, joined by the **winner-token rule** (the first source to relay a `Begin`
+owns the lifecycle), instead of a per-dispatch aggregator. (`documentColor` is
+not yet wired — it still passes no client token.) Per-method plumbing and
+remaining capability-advertisement gaps are tracked under #437/#447/#457.
 
-**Deferred** (still stripped or unhandled; tracked):
+**Deferred** (still stripped, unhandled, or inert; tracked by issue):
 
 - **`partialResultToken`** is still stripped — only `workDoneToken` is bridged so
   far (the intermediate phase this section already anticipated). #439.
@@ -260,10 +266,10 @@ spec-compliant clients never send a token).
 - **Dynamic fall-through re-anchoring** is not built: the single fixed anchor's
   open `Begin` is closed by the synthetic terminal `End` rather than handed to the
   next named anchor's real `End`. #438.
-- **Method coverage** beyond references (and the goto family added by #446) —
-  notably the whole-document, multi-region methods (`documentSymbol`, …), which
-  fan out to several regions per request and so need a request-level shared
-  aggregator, not the per-dispatch one. #437.
+- **`workDoneProgress` advertisement gaps**: a few providers carry the plumbing
+  but cannot advertise the capability until the `ls-types` typed API models the
+  field, so spec-compliant clients send no token for them — `typeDefinition` /
+  `implementation` (#447) and `codeLens` (#457).
 - **Host-layer** client progress: the host path still strips the token. #441.
 
 The remaining notes below are design-tuning points; the empty-vs-non-empty
