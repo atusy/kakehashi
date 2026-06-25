@@ -223,6 +223,12 @@ fn strip_inherited_aggregation_config(
         max_fan_out: (current.max_fan_out != inherited.max_fan_out)
             .then_some(current.max_fan_out)
             .flatten(),
+        pull_fallback: (current.pull_fallback != inherited.pull_fallback)
+            .then_some(current.pull_fallback)
+            .flatten(),
+        push_fallback: (current.push_fallback != inherited.push_fallback)
+            .then_some(current.push_fallback)
+            .flatten(),
     }
 }
 
@@ -818,11 +824,13 @@ mod strip_inherited_tests {
             priorities: Some(vec!["pyright".to_string()]),
             strategy: Some(AggregationStrategy::Preferred),
             max_fan_out: Some(2),
+            ..Default::default()
         };
         let current = AggregationConfig {
             priorities: Some(vec!["pyright".to_string()]),
             strategy: Some(AggregationStrategy::Concatenated),
             max_fan_out: Some(2),
+            ..Default::default()
         };
         let result = strip_inherited_aggregation_config(&inherited, &current);
         assert_eq!(result.priorities, None, "priorities match → stripped");

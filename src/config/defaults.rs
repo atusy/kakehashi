@@ -114,6 +114,10 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                             "textDocument/diagnostic".to_string(),
                             AggregationConfig {
                                 strategy: Some(AggregationStrategy::Concatenated),
+                                // pushFallback (Path B): push-driven servers'
+                                // cached pushes fold into the client-pull
+                                // response (push-propagation-diagnostic-forwarding).
+                                push_fallback: Some(true),
                                 ..Default::default()
                             },
                         ),
@@ -121,6 +125,10 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                             "textDocument/publishDiagnostics".to_string(),
                             AggregationConfig {
                                 strategy: Some(AggregationStrategy::Concatenated),
+                                // pullFallback (Path A): pull-driven servers are
+                                // pulled on host events into the proactive cache
+                                // (push-propagation-diagnostic-forwarding).
+                                pull_fallback: Some(true),
                                 ..Default::default()
                             },
                         ),
@@ -304,6 +312,11 @@ mod tests {
             .get("textDocument/diagnostic")
             .expect("should have diagnostic aggregation");
         assert_eq!(diag_agg.strategy, Some(AggregationStrategy::Concatenated));
+        assert_eq!(
+            diag_agg.push_fallback,
+            Some(true),
+            "the template documents pushFallback's default on the client-pull method"
+        );
 
         let pub_diag_agg = agg
             .get("textDocument/publishDiagnostics")
@@ -311,6 +324,11 @@ mod tests {
         assert_eq!(
             pub_diag_agg.strategy,
             Some(AggregationStrategy::Concatenated)
+        );
+        assert_eq!(
+            pub_diag_agg.pull_fallback,
+            Some(true),
+            "the template documents pullFallback's default on the proactive-publish method"
         );
     }
 

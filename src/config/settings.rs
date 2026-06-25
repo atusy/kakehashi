@@ -67,6 +67,28 @@ pub struct AggregationConfig {
     /// - Negative: treated as no limit (silently ignored via `usize::try_from`)
     #[serde(default)]
     pub max_fan_out: Option<i64>,
+    /// Whether **pull-driven** servers (those advertising
+    /// `diagnosticProvider`) are pulled on host events and merged into the
+    /// proactive `publishDiagnostics` cache, so they too publish proactively
+    /// (push-propagation-diagnostic-forwarding "Per-server source and
+    /// fallback"). Belongs in the `textDocument/publishDiagnostics` (Path A)
+    /// method block.
+    ///
+    /// `None` = inherit (default `true`). `false` drops pull-driven servers
+    /// from the proactive path entirely; their *spontaneous* pushes are still
+    /// cached and published (it only stops kakehashi from pulling them).
+    #[serde(default)]
+    pub pull_fallback: Option<bool>,
+    /// Whether **push-driven** servers' (those *not* advertising
+    /// `diagnosticProvider`) cached pushes are folded into the client-pull
+    /// `textDocument/diagnostic` response (push-propagation-diagnostic-forwarding
+    /// "Per-server source and fallback"). Belongs in the
+    /// `textDocument/diagnostic` (Path B) method block.
+    ///
+    /// `None` = inherit (default `true`). `false` answers a client pull from
+    /// live pull-driven servers only, ignoring cached pushes.
+    #[serde(default)]
+    pub push_fallback: Option<bool>,
 }
 
 /// Configuration for a single bridged language within a host filetype.
@@ -193,16 +215,31 @@ pub(crate) struct ResolvedAggregationConfig {
     pub(crate) strategy: AggregationStrategy,
     pub(crate) priorities: Vec<String>,
     pub(crate) max_fan_out: Option<usize>,
+    /// Resolved `pullFallback` (default `true`): whether pull-driven servers are
+    /// pulled on host events into the proactive cache. Only meaningful for the
+    /// `textDocument/publishDiagnostics` method (Path A).
+    pub(crate) pull_fallback: bool,
+    /// Resolved `pushFallback` (default `true`): whether push-driven servers'
+    /// cached pushes are folded into the client-pull response. Only meaningful
+    /// for the `textDocument/diagnostic` method (Path B).
+    pub(crate) push_fallback: bool,
 }
+
+/// The resolved default for an absent `pullFallback` / `pushFallback`: both
+/// fallback channels are on, so every server contributes to both diagnostic
+/// paths regardless of which single mechanism it natively supports.
+const DEFAULT_DIAGNOSTIC_FALLBACK: bool = true;
 
 impl ResolvedAggregationConfig {
     /// Create a config with all fields at their defaults (`Preferred`
-    /// strategy, `["*"]` priorities = all servers, first-win).
+    /// strategy, `["*"]` priorities = all servers, first-win, fallbacks on).
     pub(crate) fn with_defaults() -> Self {
         Self {
             strategy: AggregationStrategy::Preferred,
             priorities: default_priorities(),
             max_fan_out: None,
+            pull_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
+            push_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
         }
     }
 }
@@ -262,11 +299,15 @@ impl BridgeLanguageConfig {
                 // fan-out kill switch (aggregation-priorities-wildcard).
                 priorities: entry.priorities.unwrap_or_else(default_priorities),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
+                pull_fallback: entry.pull_fallback.unwrap_or(DEFAULT_DIAGNOSTIC_FALLBACK),
+                push_fallback: entry.push_fallback.unwrap_or(DEFAULT_DIAGNOSTIC_FALLBACK),
             },
             None => ResolvedAggregationConfig {
                 strategy: default_aggregation_strategy_for_method(method),
                 priorities: default_priorities(),
                 max_fan_out: None,
+                pull_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
+                push_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
             },
         }
     }
@@ -2333,6 +2374,7 @@ kind = "injections""#;
                     strategy: Some(AggregationStrategy::Concatenated),
                     priorities: Some(vec!["server_a".to_string(), "server_b".to_string()]),
                     max_fan_out: Some(3),
+                    ..Default::default()
                 },
             )])),
         };
@@ -2352,6 +2394,52 @@ kind = "injections""#;
             "default priorities must be [\"*\"] (all servers), not [] (disabled)"
         );
         assert_eq!(agg.max_fan_out, None);
+    }
+
+    #[test]
+    fn resolve_aggregation_fallbacks_default_true_and_honor_explicit() {
+        // Absent → both default true (every server contributes to both paths).
+        let none =
+            BridgeLanguageConfig::default().resolve_aggregation("textDocument/publishDiagnostics");
+        assert!(none.pull_fallback, "absent pullFallback resolves to true");
+        assert!(none.push_fallback, "absent pushFallback resolves to true");
+
+        // Explicit false on each toggle survives resolution independently.
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "textDocument/publishDiagnostics".to_string(),
+                AggregationConfig {
+                    pull_fallback: Some(false),
+                    push_fallback: Some(false),
+                    ..Default::default()
+                },
+            )])),
+        };
+        let agg = config.resolve_aggregation("textDocument/publishDiagnostics");
+        assert!(
+            !agg.pull_fallback,
+            "explicit pullFallback = false is honored"
+        );
+        assert!(
+            !agg.push_fallback,
+            "explicit pushFallback = false is honored"
+        );
+    }
+
+    #[test]
+    fn aggregation_config_deserializes_fallback_toggles_as_camel_case() {
+        // The wire form is camelCase (push-propagation-diagnostic-forwarding):
+        // `pullFallback` / `pushFallback`, both optional.
+        let cfg: AggregationConfig =
+            serde_json::from_str(r#"{ "pullFallback": false, "pushFallback": true }"#).unwrap();
+        assert_eq!(cfg.pull_fallback, Some(false));
+        assert_eq!(cfg.push_fallback, Some(true));
+
+        // Absent toggles stay `None` (inherit), distinct from an explicit value.
+        let absent: AggregationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.pull_fallback, None);
+        assert_eq!(absent.push_fallback, None);
     }
 
     #[test]

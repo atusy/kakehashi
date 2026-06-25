@@ -965,6 +965,7 @@ mod tests {
                 priorities: None,
                 strategy: Some(strategy),
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         BridgeLanguageConfig {
@@ -1243,6 +1244,7 @@ mod tests {
                 priorities: None,
                 strategy: Some(AggregationStrategy::Concatenated),
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         agg.insert(
@@ -1251,6 +1253,7 @@ mod tests {
                 priorities: None,
                 strategy: Some(AggregationStrategy::Preferred),
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         let mut bridge = HashMap::new();
@@ -1284,6 +1287,7 @@ mod tests {
                 priorities: Some(vec!["black".to_string(), "isort".to_string()]),
                 strategy: Some(AggregationStrategy::Concatenated),
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         let mut bridge = HashMap::new();
@@ -1318,6 +1322,7 @@ mod tests {
                 priorities: None,
                 strategy: Some(AggregationStrategy::Concatenated),
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         agg.insert(
@@ -1326,6 +1331,7 @@ mod tests {
                 priorities: Some(vec!["black".to_string()]),
                 strategy: None,
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         let mut bridge = HashMap::new();
@@ -1386,6 +1392,7 @@ mod tests {
                 priorities: None,
                 strategy: Some(AggregationStrategy::Concatenated),
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         let mut wildcard_agg = HashMap::new();
@@ -1395,6 +1402,7 @@ mod tests {
                 priorities: Some(vec!["black".to_string()]),
                 strategy: None,
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         let mut bridge = HashMap::new();
@@ -1436,6 +1444,7 @@ mod tests {
                 priorities: Some(vec![]),
                 strategy: Some(AggregationStrategy::Concatenated),
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         let mut bridge = HashMap::new();
@@ -1471,6 +1480,7 @@ mod tests {
                 ]),
                 strategy: Some(AggregationStrategy::Concatenated),
                 max_fan_out: None,
+                ..Default::default()
             },
         );
         let mut bridge = HashMap::new();

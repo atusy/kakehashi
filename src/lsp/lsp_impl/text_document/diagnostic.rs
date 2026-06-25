@@ -7,6 +7,7 @@
 //! `JoinSet` aborts all downstream tasks, and cancels are also forwarded
 //! downstream fire-and-forget via middleware.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use tower_lsp_server::ls_types::{
     Diagnostic, DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     FullDocumentDiagnosticReport, RelatedFullDocumentDiagnosticReport,
 };
+use url::Url;
 
 use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
@@ -24,8 +26,11 @@ use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
     dispatch_host_preferred, dispatch_preferred,
 };
-use crate::lsp::bridge::LanguageServerPool;
-use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
+use crate::lsp::bridge::{LanguageServerPool, RegionOffset};
+use crate::lsp::diagnostic_cache::{DiagnosticSource, cached_push_diagnostics, push_slot_servers};
+use crate::lsp::lsp_impl::bridge_context::{
+    DocumentRequestContext, HostRequestContext, resolve_aggregation_config_from_settings,
+};
 use crate::lsp::lsp_impl::text_document::{RequestErrorSink, count_request_errors};
 
 // ============================================================================
@@ -150,30 +155,48 @@ impl Kakehashi {
 
         let pool = self.bridge.pool_arc();
 
+        // Resolve injection regions once: the live virt pull below and the
+        // pushFallback fold (#425) after the join share them.
+        let virt_regions = if virt_enabled {
+            self.language
+                .injection_query(&language_name)
+                .map(|injection_query| {
+                    InjectionResolver::resolve_all(
+                        &self.language,
+                        self.bridge.node_tracker(),
+                        &uri,
+                        snapshot.tree(),
+                        snapshot.text(),
+                        injection_query.as_ref(),
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Lightweight per-region metadata `(region_id, injection_language,
+        // current offset)` for the pushFallback fold; the live pull below moves
+        // the regions themselves.
+        let region_meta: Vec<(String, String, RegionOffset)> = virt_regions
+            .iter()
+            .map(|r| {
+                (
+                    r.region.region_id.clone(),
+                    r.injection_language.clone(),
+                    RegionOffset::with_per_line_offsets(
+                        r.region.line_range.start,
+                        r.line_column_offsets.clone(),
+                    ),
+                )
+            })
+            .collect();
+
         // Virt layer: 2-level aggregation —
         //   Inner: dispatch per region (fans out to all servers for that region)
         //   Outer: collect across regions
         let virt_fut = async {
-            if !virt_enabled {
-                return Vec::new();
-            }
-            let Some(injection_query) = self.language.injection_query(&language_name) else {
-                return Vec::new();
-            };
-            let all_regions = InjectionResolver::resolve_all(
-                &self.language,
-                self.bridge.node_tracker(),
-                &uri,
-                snapshot.tree(),
-                snapshot.text(),
-                injection_query.as_ref(),
-            );
-            if all_regions.is_empty() {
-                return Vec::new();
-            }
-
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
-            for resolved in all_regions {
+            for resolved in virt_regions {
                 let configs = self.bridge_configs_for_injection_language(
                     &language_name,
                     &resolved.injection_language,
@@ -234,7 +257,7 @@ impl Kakehashi {
         // Both layers fan out concurrently; the layer strategy decides the
         // combine. Cancel drops both in-flight layer futures.
         let combined = async { tokio::join!(virt_fut, host_fut) };
-        let (virt_items, host_items) = match cancel_rx {
+        let (mut virt_items, mut host_items) = match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
                     biased;
@@ -256,9 +279,139 @@ impl Kakehashi {
         // _upstream_id_with_notify).
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
+        // pushFallback (Path B, #425): the live pulls above cover only
+        // pull-driven servers (capability-gated). Fold in push-driven servers'
+        // cached pushes so they also answer the client pull.
+        self.fold_push_fallback_diagnostics(
+            &uri,
+            &language_name,
+            region_meta,
+            host_ctx.is_some(),
+            &mut virt_items,
+            &mut host_items,
+        )
+        .await;
+
         Ok(make_diagnostic_report(combine_layer_diagnostics(
             &layer_cfg, virt_items, host_items,
         )))
+    }
+
+    /// pushFallback fold (Path B, #425): append push-driven servers' cached
+    /// pushes to the per-layer pull results. The live pull already covers
+    /// pull-driven servers (their native source), so only servers that do **not**
+    /// advertise `diagnosticProvider` are folded — their cached pushes are their
+    /// native source. Region pushes are transformed to host coordinates against
+    /// the region's current offset; host pushes are already host-local.
+    ///
+    /// `host_layer_participates` is `host_ctx.is_some()` — the host layer is in
+    /// the method's priorities AND `bridge._self` is opted in with configured
+    /// servers (capability is *not* required: a push-only `_self` server yields a
+    /// host context whose live pull returns empty, and this fold supplies it).
+    ///
+    /// Under a per-region `strategy = preferred`, the folded push-driven slots are
+    /// *appended* after the region's live election rather than competing in it —
+    /// consistent with Path A's concatenate-everything merge and the deferred
+    /// per-source strategy fan-in (push-propagation-diagnostic-forwarding), not an
+    /// election bug. For the same reason the fold honors only `pushFallback`, not
+    /// the visible walk: it does not re-apply `priorities`/`maxFanOut`, so a
+    /// push-driven server outside the walk is still folded — exactly what Path A's
+    /// proactive merge already publishes, until the deferred fan-in resolves the
+    /// walk for both paths together.
+    async fn fold_push_fallback_diagnostics(
+        &self,
+        host: &Url,
+        language_name: &str,
+        region_meta: Vec<(String, String, RegionOffset)>,
+        host_layer_participates: bool,
+        virt_items: &mut Vec<Diagnostic>,
+        host_items: &mut Vec<Diagnostic>,
+    ) {
+        // One snapshot drives both the candidate classification and the fold, so
+        // a push arriving across the classifying `await` below cannot land in the
+        // folded set while skipping classification (no TOCTOU double-count).
+        let snapshot = self.diagnostics.snapshot(host);
+        let candidates = push_slot_servers(&snapshot);
+        if candidates.is_empty() {
+            return; // no cached pushes for this host
+        }
+        // Classify live (static caps + dynamic registrations); fold only the
+        // push-driven ones so a pull-driven server is not double-counted.
+        let pull_driven = self.bridge.pool().pull_driven_servers(&candidates).await;
+
+        // Load settings once: resolving per-region pushFallback in the loop and
+        // the host gate below otherwise re-reads it N+1 times and could resolve
+        // different regions against different snapshots if config is swapped
+        // mid-request.
+        let settings = self.settings_manager.load_settings();
+
+        // Current offsets for the transform, keyed by region — built ONLY for
+        // regions whose `pushFallback` is on (resolved once per distinct
+        // injection language, since a document can hold many regions of one
+        // language). A region without an offset is skipped by
+        // `cached_push_diagnostics`, so this map doubles as the per-region
+        // pushFallback gate — no separate set, no `region_id` clone.
+        let mut region_offsets = HashMap::new();
+        let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
+        for (region_id, injection_language, offset) in region_meta {
+            // `get` on the common (cache-hit) path is a single lookup; only the
+            // resolving miss touches the map again, moving the owned language key
+            // in (no clone).
+            let push_fallback = match push_fallback_by_lang.get(&injection_language) {
+                Some(&fallback) => fallback,
+                None => {
+                    let fallback = resolve_aggregation_config_from_settings(
+                        &settings,
+                        language_name,
+                        &injection_language,
+                        "textDocument/diagnostic",
+                    )
+                    .push_fallback;
+                    push_fallback_by_lang.insert(injection_language, fallback);
+                    fallback
+                }
+            };
+            if push_fallback {
+                region_offsets.insert(region_id, offset);
+            }
+        }
+
+        // Host `pushFallback` gate: the host layer participates AND pushFallback
+        // is on for the host's diagnostic method.
+        let host_push_enabled = host_layer_participates
+            && settings
+                .resolve_host_language_settings(language_name)
+                .map(|s| {
+                    s.resolve_host_aggregation("textDocument/diagnostic")
+                        .push_fallback
+                })
+                .unwrap_or(false);
+
+        let include = |source: &DiagnosticSource, server: &str| {
+            // Pull-driven servers are excluded unconditionally: their native
+            // source is the live pull above, which already gates on the same
+            // capability AND on this method's `priorities`/`maxFanOut`. A
+            // pull-driven server that `priorities` drops from the live fan-out is
+            // therefore also dropped here — config-consistent, not a leak. (The
+            // only lossy corner is a pull-driven server whose live pull times out
+            // this cycle while holding a stale cached push; transient, and it
+            // never hides a current diagnostic.)
+            if pull_driven.contains(server) {
+                return false; // covered by the live pull
+            }
+            match source {
+                // A `Region` slot only reaches `include` when `region_offsets`
+                // has its offset, i.e. its `pushFallback` is on — so the gate is
+                // already applied; nothing more to check beyond `pull_driven`.
+                DiagnosticSource::Region(_) => true,
+                DiagnosticSource::Host => host_push_enabled,
+                DiagnosticSource::PullLayer => false,
+            }
+        };
+        let (region_push, host_push) =
+            cached_push_diagnostics(host, snapshot, &region_offsets, include);
+        virt_items.extend(region_push);
+        host_items.extend(host_push);
     }
 }
 

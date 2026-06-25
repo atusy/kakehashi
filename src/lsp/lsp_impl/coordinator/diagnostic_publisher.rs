@@ -165,6 +165,48 @@ impl DiagnosticPublisher {
         }
     }
 
+    /// Remove cached **push** slots (`Region`/`Host`) whose server is
+    /// **pull-driven** when a `PullLayer` blob is present, so a pull-driven
+    /// server that both answers the host-event pull (landing in `PullLayer`)
+    /// AND spontaneously pushes `publishDiagnostics` is not counted twice —
+    /// each server has exactly one native source
+    /// (push-propagation-diagnostic-forwarding "Per-server source and
+    /// fallback", #425).
+    ///
+    /// Classification is live (static initialize caps + dynamic registrations,
+    /// `LanguageServerPool::pull_driven_servers`) and non-creating. The push
+    /// slots stay cached — this filters only the publish snapshot clone, like
+    /// [`Self::filter_stale_host_slots`] — so the pull contribution wins while a
+    /// later crash/edit eviction still clears the push slot.
+    ///
+    /// Interim limitation: `PullLayer` is one host-wide blob with no per-server
+    /// identity, so the trigger is "any PullLayer present", not "this exact
+    /// server was pulled". With a *mixed* per-region `pullFallback` (one
+    /// region's pull-driven server pulled, a sibling's not), a pull-driven
+    /// server whose region set `pullFallback = false` can still have its push
+    /// suppressed while the blob carries the sibling region. The deferred
+    /// per-source fan-in (per-`(source, server)` pull slots) removes this.
+    async fn filter_pull_driven_push_slots(
+        &self,
+        snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
+    ) {
+        if !snapshot.contains_key(&DiagnosticSource::PullLayer) {
+            // No pull blob to double-count against.
+            return;
+        }
+        // Distinct push-server names across the Region/Host sources, borrowed
+        // from the snapshot (no key clones on this republish hot path) — the same
+        // set Path B's fold derives, so share the helper.
+        let push_servers = crate::lsp::diagnostic_cache::push_slot_servers(snapshot);
+        if push_servers.is_empty() {
+            return; // PullLayer-only snapshot (the common pull-driven case).
+        }
+        let pull_driven = self.bridge.pool().pull_driven_servers(&push_servers).await;
+        // Drop the borrow of `snapshot` before the mutable retain below.
+        drop(push_servers);
+        retain_non_pull_driven_push_slots(snapshot, &pull_driven);
+    }
+
     /// Record a downstream region push and republish the host (Path A).
     ///
     /// `virtual_uri` is the URI the downstream published for; it is resolved to
@@ -210,6 +252,22 @@ impl DiagnosticPublisher {
     /// self-heals on the next completed pull.
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
         self.aggregator.set_pull_layer(host, diagnostics);
+        self.republish(host).await;
+    }
+
+    /// Evict the host's `PullLayer` blob and republish — the host-event pull had
+    /// no contributors this event (every layer `pullFallback`-gated, or none).
+    ///
+    /// Eviction (vs publishing an empty blob) is deliberate: an **absent**
+    /// `PullLayer` both clears any stale pull result and stops
+    /// [`Self::filter_pull_driven_push_slots`] from treating "no pull ran" as
+    /// "pull present", which would otherwise suppress a pull-driven server's
+    /// spontaneous push under `pullFallback = false` (#425). A pull that ran and
+    /// returned clean keeps its empty `PullLayer` (via [`Self::publish_pull_layer`]),
+    /// so that path still suppresses a stale push — the two empties differ.
+    pub(crate) async fn clear_pull_layer(&self, host: &Url) {
+        self.aggregator
+            .evict_source(host, &DiagnosticSource::PullLayer);
         self.republish(host).await;
     }
 
@@ -263,6 +321,12 @@ impl DiagnosticPublisher {
         // slots stay cached (cleared on `didClose`); they're just filtered out of
         // this publish. (The analogous Region/config-change re-merge is deferred.)
         self.filter_stale_host_slots(host, &mut snapshot);
+        // Drop a pull-driven server's push slots when the host-event pull blob
+        // (`PullLayer`) is present: that server already contributes via the
+        // pull, so keeping its spontaneous push too would double-count it
+        // (#425). The cache keeps the slot; only this publish snapshot is
+        // filtered.
+        self.filter_pull_driven_push_slots(&mut snapshot).await;
         // Recompute injection offsets only when there are region push slots to
         // transform. A PullLayer-only snapshot (the common pull-driven case) needs
         // none, so skip the whole-document injection resolution — and shorten the
@@ -350,6 +414,27 @@ impl DiagnosticPublisher {
         }
         offsets
     }
+}
+
+/// Remove `Region`/`Host` push slots whose server is in `pull_driven` when a
+/// `PullLayer` blob is present in `snapshot`, dropping any source left empty.
+/// The pure core of [`DiagnosticPublisher::filter_pull_driven_push_slots`],
+/// split out so the dedup rule is testable without a live pool. A no-op when
+/// `pull_driven` is empty or there is no `PullLayer` to double-count against.
+fn retain_non_pull_driven_push_slots(
+    snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
+    pull_driven: &std::collections::HashSet<String>,
+) {
+    if pull_driven.is_empty() || !snapshot.contains_key(&DiagnosticSource::PullLayer) {
+        return;
+    }
+    snapshot.retain(|source, servers| {
+        if matches!(source, DiagnosticSource::PullLayer) {
+            return true;
+        }
+        servers.retain(|server, _| !pull_driven.contains(server));
+        !servers.is_empty()
+    });
 }
 
 #[cfg(test)]
@@ -632,5 +717,113 @@ mod tests {
             host.contains_key("live_ls"),
             "the live connection's slot survives the eviction"
         );
+    }
+
+    use crate::lsp::diagnostic_cache::SourceSlots;
+    use std::collections::HashSet;
+
+    /// Build a snapshot for `host` with a `PullLayer` blob plus two `Host` push
+    /// slots: `ra` (a pull-driven server that also pushed) and `linter` (a
+    /// push-driven server).
+    fn snapshot_with_pull_layer_and_two_host_pushes(host: &Url) -> SourceSlots {
+        let agg = DiagnosticAggregator::new();
+        agg.set_pull_layer(host, vec![diag("pulled")]);
+        agg.record(
+            host,
+            DiagnosticSource::Host,
+            "ra".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("ra-push")],
+        );
+        agg.record(
+            host,
+            DiagnosticSource::Host,
+            "linter".to_string(),
+            Some(ProgressConnectionId::for_test(2)),
+            vec![diag("linter-push")],
+        );
+        agg.snapshot(host)
+    }
+
+    #[test]
+    fn retain_drops_pull_driven_push_slot_but_keeps_push_driven_and_pull_blob() {
+        let host = Url::parse("file:///test/host.rs").unwrap();
+        let mut snap = snapshot_with_pull_layer_and_two_host_pushes(&host);
+
+        retain_non_pull_driven_push_slots(&mut snap, &HashSet::from(["ra".to_string()]));
+
+        let host_slots = snap
+            .get(&DiagnosticSource::Host)
+            .expect("the Host source survives because the push-driven slot remains");
+        assert!(
+            !host_slots.contains_key("ra"),
+            "a pull-driven server's push slot is dropped (the pull covers it)"
+        );
+        assert!(
+            host_slots.contains_key("linter"),
+            "a push-driven server's slot is kept (the pull never covered it)"
+        );
+        assert!(
+            snap.contains_key(&DiagnosticSource::PullLayer),
+            "the pull blob itself is never filtered"
+        );
+    }
+
+    #[test]
+    fn retain_is_a_noop_without_a_pull_layer() {
+        // pullFallback-off / no-pull-yet path: with no PullLayer there is nothing
+        // to double-count against, so even a pull-driven server's spontaneous
+        // push is published (keeps #380 closed).
+        let host = Url::parse("file:///test/host.rs").unwrap();
+        let agg = DiagnosticAggregator::new();
+        agg.record(
+            &host,
+            DiagnosticSource::Host,
+            "ra".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("ra-push")],
+        );
+        let mut snap = agg.snapshot(&host);
+
+        retain_non_pull_driven_push_slots(&mut snap, &HashSet::from(["ra".to_string()]));
+
+        assert!(
+            snap[&DiagnosticSource::Host].contains_key("ra"),
+            "no PullLayer present → no suppression"
+        );
+    }
+
+    #[test]
+    fn retain_drops_a_source_left_empty_after_filtering() {
+        let host = Url::parse("file:///test/host.rs").unwrap();
+        let agg = DiagnosticAggregator::new();
+        agg.set_pull_layer(&host, vec![diag("pulled")]);
+        agg.record(
+            &host,
+            DiagnosticSource::Host,
+            "ra".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("ra-push")],
+        );
+        let mut snap = agg.snapshot(&host);
+
+        retain_non_pull_driven_push_slots(&mut snap, &HashSet::from(["ra".to_string()]));
+
+        assert!(
+            !snap.contains_key(&DiagnosticSource::Host),
+            "a source whose every server was pull-driven is removed entirely"
+        );
+        assert!(snap.contains_key(&DiagnosticSource::PullLayer));
+    }
+
+    #[test]
+    fn retain_with_empty_pull_driven_set_keeps_everything() {
+        let host = Url::parse("file:///test/host.rs").unwrap();
+        let mut snap = snapshot_with_pull_layer_and_two_host_pushes(&host);
+
+        retain_non_pull_driven_push_slots(&mut snap, &HashSet::new());
+
+        let host_slots = &snap[&DiagnosticSource::Host];
+        assert!(host_slots.contains_key("ra") && host_slots.contains_key("linter"));
     }
 }

@@ -49,6 +49,10 @@
 //!   `didChange`. Used by `tests/e2e_push_diagnostics.rs` to prove a downstream's
 //!   spontaneous push reaches the editor in host coordinates and that an empty push
 //!   clears it (#427).
+//! - `diagnostics-push-pullcap` — advertises `diagnosticProvider` (pull-driven)
+//!   AND spontaneously pushes one diagnostic on `didOpen`. Used by
+//!   `tests/e2e_push_diagnostics.rs` to prove `pullFallback = false` still
+//!   publishes a pull-driven server's spontaneous push (#425).
 //! - `diagnostics-push-crash` — pushes the same diagnostic on `didOpen`, then exits
 //!   the process on the next `didChange` to simulate a downstream crash while the
 //!   host stays open. Used to prove the bridge evicts the dead connection's slots
@@ -143,7 +147,11 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
-                    "diagnostics" | "diagnostics-fail" => json!({
+                    // `diagnostics-push-pullcap` is BOTH: it advertises
+                    // `diagnosticProvider` (pull-driven) AND pushes on didOpen
+                    // (below). Used to prove `pullFallback = false` still
+                    // publishes a pull-driven server's spontaneous push (#425).
+                    "diagnostics" | "diagnostics-fail" | "diagnostics-push-pullcap" => json!({
                         "diagnosticProvider": {
                             "interFileDependencies": false,
                             "workspaceDiagnostics": false
@@ -240,7 +248,10 @@ fn main() {
                     // coordinates and publishes it to the editor (#427).
                     // `diagnostics-push-crash` pushes the same diagnostic, then exits
                     // the process on the next `didChange` to simulate a crash (#469).
-                    if mode == "diagnostics-push" || mode == "diagnostics-push-crash" {
+                    if mode == "diagnostics-push"
+                        || mode == "diagnostics-push-crash"
+                        || mode == "diagnostics-push-pullcap"
+                    {
                         notify(
                             &mut writer,
                             "textDocument/publishDiagnostics",
