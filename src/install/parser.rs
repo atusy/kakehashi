@@ -557,8 +557,10 @@ fn run_killable_subprocess(
 
 /// Kill the child **and** any grandchildren it spawned. The child was started as
 /// its own process-group leader, so its pgid equals its pid and a group-wide
-/// signal reaches the whole tree (`cc`, linkers, etc.). Falls back to a direct
-/// kill on non-unix, where the process-group model differs.
+/// signal reaches the whole tree (`cc`, linkers, etc.). On non-unix this falls
+/// back to a direct `child.kill()`, which does **not** reap grandchildren — the
+/// orphaned-`cc` hazard is unmitigated there (kakehashi targets unix in practice;
+/// a Job Object would be the Windows equivalent).
 fn kill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -682,7 +684,10 @@ mod tests {
             pidfile.display()
         ));
 
-        let result = run_killable_subprocess(cmd, Duration::from_millis(300), "test compile");
+        // 1s (not a tight 300ms) so a loaded CI box still records the grandchild
+        // pid via `printf` before the group is killed — otherwise the pidfile read
+        // below could panic instead of failing cleanly.
+        let result = run_killable_subprocess(cmd, Duration::from_millis(1000), "test compile");
         assert!(
             result.is_err(),
             "a subprocess that outlives the deadline must error out"
