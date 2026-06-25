@@ -91,13 +91,18 @@ is the liveness fix: no ingress ticket and no mailbox is ever held hostage by
 compilation.
 
 The mailbox is **unbounded**, which is what makes the sends non-blocking. The
-risk that normally argues against unbounded channels — memory growth under fast
-input — does not apply here: `SetText` carries only a small delta, the actor
-applies it to the owned text and drops it, and parse coalescing keeps at most one
-parse in flight regardless of how many `SetText`s queue. So the queued state is
-bounded by the document size, not by edit history. A bounded mailbox would
-instead push backpressure onto the ingress thread, re-creating the stall the
-design removes; it is therefore rejected.
+queue itself is *not* inherently bounded by document size — under sustained input
+it holds one message per un-drained `SetText`, and a full-document sync (an empty
+edit list) carries the entire text, not a small delta. What keeps memory in check
+is the actor's per-message cost: applying a delta to the owned text is a cheap
+string op (parse and install are offloaded), so the actor drains far faster than
+an editor produces edits, and the backlog stays transient. The actor further
+**drains all currently-ready `SetText`s and applies them before scheduling a
+single parse**, collapsing a burst into one parse rather than one per message. A
+bounded mailbox would instead push backpressure onto the ingress thread,
+re-creating the stall the design removes; it is therefore rejected, with the
+caveat that a pathological producer is handled by a hard queued-bytes ceiling
+that drops to a full-text resynchronization rather than growing without limit.
 
 ### Install is shared and global; only the parse is the actor's child
 
@@ -191,7 +196,19 @@ the Negative consequences.
 Read requests do **not** query the actor's mailbox. The actor *publishes* parse
 results into the shared `DocumentStore`; readers snapshot the store directly,
 exactly as today, using the existing `wait_for_parse_completion(200ms)` bounded
-wait plus an empty/`null` fallback. Optionally, the actor publishes an
+wait plus an empty/`null` fallback.
+
+One wrinkle: the actor is **not** the only writer of the store's tree today.
+Reader handlers carry an on-demand parsing fallback for the race where a request
+arrives before parsing finishes — `try_parse_and_update_document`
+(`semantic_tokens.rs`), and the analogous paths in `selection_range.rs` and the
+node-lookup `entry.rs` — which parse and then *update the store*. With the actor
+owning parsing, these fallbacks should either return a **private** tree without
+writing the store, or write only through a lifetime/generation check (they
+already guard on "document still present and text unchanged"). This matters for
+the resurrection guarantee below: an unguarded reader-fallback write is the one
+remaining way a closed document could be re-inserted, so it must be closed, not
+just the install/parse child path. Optionally, the actor publishes an
 *install-pending* signal into the store (the store carries no such field today —
 only `has_tree`/`in_progress`); a reader seeing it returns empty immediately
 without waiting, since the parse cannot complete until an unbounded install
@@ -251,12 +268,14 @@ replacement, so they are removed rather than left as dead synchronization.
 The actor's lifetime is exactly the open document's lifetime. `Close` aborts the
 in-flight **parse** (the store-writing child), unsubscribes from the shared
 install, and terminates the actor; the store entry is removed. The shared
-install itself is *not* aborted — a sibling may still need it. Because the only
-step that writes this document's tree into the store is the aborted per-actor
-parse, a late install completing afterward has no actor to hand off to and
-cannot re-insert the closed document — **resurrection is structurally
-impossible**, with no separate supersede machinery. A reopen creates a fresh
-actor.
+install itself is *not* aborted — a sibling may still need it. A late install
+completing afterward has no actor to hand off to, so the abortable per-actor
+parse can no longer re-insert the closed document — **the install/parse
+resurrection path is structurally closed**, with no separate supersede machinery.
+This holds *provided* the reader-fallback store write noted above is also
+lifetime-guarded; that on-demand path is the only other writer that could
+resurrect a closed document, and it must keep its "document still present"
+guard (or stop writing the store entirely). A reopen creates a fresh actor.
 
 Teardown must also wake any reader blocked on a watermark ticket that will now
 never be processed: dropping the watermark channel on actor termination signals
@@ -268,21 +287,39 @@ timeout — bounded, but needless.
 ### Complementary: install-wide deadline
 
 Moving install off the ingress path stops it from wedging requests, but a hung
-compiler should still not leak forever. An install-wide deadline (covering
-`compile_parser`) bounds the shared installer itself, so a stuck compilation
-eventually fails every subscribing actor instead of pinning a task forever. This
-is complementary to the actor, not a substitute for it.
+compiler should still not leak forever. A deadline here is **not** achievable by
+wrapping the current future in `tokio::time::timeout`: installation runs in
+`spawn_blocking` (`install_language_async`, `src/install.rs`), and compilation
+calls `Loader::compile_parser_at_path` (`src/install/parser.rs`), which shells
+out to `cc` *without surfacing the child process* to the caller. A timeout would
+let the `await` return while the blocking thread and its `cc` child keep running
+— the leak the deadline was meant to prevent. A real deadline therefore requires
+running compilation as a **controllable subprocess/process group** that the
+installer can kill (and reap) when the deadline fires, publishing failure only
+after termination. This is complementary to the actor, not a substitute for it.
 
 ### Injection orchestration stays downstream
 
 `process_injections` runs as a consequence of a completed main parse, not inside
 the actor loop, so injection work never stalls main-document parsing. It is not
-uniformly fire-and-forget, though: spawning external bridge servers is genuinely
-fire-and-forget, but the `didChange` forwarding to already-opened virtual
-documents is wire-order-sensitive and must be sequenced **after** the parse it
-depends on (it needs the fresh tree) and in writer order — so it is ordered, not
-loosed. The split between the fire-and-forget spawn and the ordered forwarding
-must be preserved when re-homing this step.
+uniformly fire-and-forget, though, and it hides a **second instance of the very
+liveness hazard this ADR exists to fix**: `process_injections` is awaited inside
+the gated `didOpen`/`didChange` handlers (`did_open.rs`, `did_change.rs`), and it
+in turn awaits `check_injected_languages_auto_install` →
+`maybe_auto_install_language(is_injection=true)` (`injection.rs`) — the same
+untimed C compiler, now for an *injected* language's parser, still inside the
+writer ticket. So re-homing `process_injections` has three distinct parts:
+
+- **Injected-language auto-install** — must route through the *same* shared,
+  deadline-bounded installer as the main language and be subscribed to, never
+  awaited in a gated handler or the actor loop. This is a liveness requirement,
+  not just tidiness.
+- **External bridge-server spawn** — genuinely fire-and-forget.
+- **`didChange` forwarding to already-opened virtual documents** — wire-order
+  sensitive; sequenced **after** the parse it depends on (it needs the fresh
+  tree) and in writer order, so it is ordered, not loosed.
+
+All three splits must be preserved when re-homing this step.
 
 ## Considered Options
 
@@ -305,8 +342,11 @@ ticket is released after at most the deadline.
 
 Rejected as insufficient. It bounds the worst case but still holds the ticket
 for the deadline's duration, does nothing for ordinary latency, and leaves the
-scattered lifecycle untouched. Retained as a *complementary* mitigation (see
-Decision), not an alternative.
+scattered lifecycle untouched. It is also harder than it looks — compilation runs
+in non-cancellable `spawn_blocking` with no exposed child process, so a real
+deadline needs a killable subprocess (see the install-wide deadline subsection),
+not a `timeout` wrapper. Retained as a *complementary* mitigation (see Decision),
+not an alternative.
 
 ### 3. Per-document parse actor (chosen)
 
@@ -337,9 +377,11 @@ write-only-mailbox / shared-store-read split is load-bearing.
 - **`skip_parse` disappears**, folded into the `Uninstalled/Installing/Ready`
   state machine; the install path stops re-entering parsing from a second call
   site.
-- **Resurrection is structurally impossible** — closing aborts the actor's
-  store-writing parse, so a later shared-install completion has no actor to write
-  through — without adding supersede machinery to the parse path.
+- **The install/parse resurrection path is structurally closed** — closing
+  aborts the actor's store-writing parse, so a later shared-install completion
+  has no actor to write through — without adding supersede machinery to the parse
+  path. (The reader-fallback store write is the one residual resurrection vector;
+  it must stay lifetime-guarded — see Negative.)
 - **One owner** for a document's text, its parse-readiness state, and parse
   scheduling (global install stays shared), which is easier to reason about than
   lock-guarded shared state.
@@ -361,6 +403,11 @@ write-only-mailbox / shared-store-read split is load-bearing.
 - **A new read-path coupling** is introduced: readers must wait on the actor's
   per-URI processed-through watermark instead of `has_tree`. Getting this watermark
   wrong silently reintroduces the #342/#374 stale-tree race.
+- **Reader on-demand parse fallbacks must stop being unguarded store writers.**
+  `try_parse_and_update_document` and its analogues persist a tree to the store;
+  with the actor owning parsing they must return a private tree or write only
+  behind the lifetime/text-unchanged guard, or they reopen the resurrection
+  vector the actor otherwise closes.
 - **Injection orchestration must be re-homed** carefully: the heavy external
   bridge-server spawn is fire-and-forget, but the bridge `didChange` forwarding
   to already-opened virtual documents is wire-order-sensitive and must stay
@@ -394,7 +441,12 @@ carries the `skip_parse` flag, `did_change_impl` still serializes via
 on install completion, and readers still wait on `has_tree` (there is no
 processed-through watermark, and no install-pending signal in the store). The
 `IngressOrderGate` ticket is still middleware-private — no handler receives it —
-so the watermark plumbing does not exist yet either. The actor, its state
-machine, the child-task model, the reader watermark and its ingress plumbing, and
-the install-wide deadline are all unbuilt. A staged rollout may land Option 1
-(minimal spawn) first as an interim liveness fix before the full actor.
+so the watermark plumbing does not exist yet either. Injected-language
+auto-install is also still awaited inline in the gated handlers (via
+`process_injections`), reader fallbacks still write the store
+(`try_parse_and_update_document`), and compilation still runs in non-cancellable
+`spawn_blocking`. The actor, its state machine, the child-task model, the reader
+watermark and its ingress plumbing, the injected-install re-homing, the
+private/guarded reader fallback, and the killable-subprocess install deadline are
+all unbuilt. A staged rollout may land Option 1 (minimal spawn) first as an
+interim liveness fix before the full actor.
