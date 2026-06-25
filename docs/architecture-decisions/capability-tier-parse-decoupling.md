@@ -43,9 +43,9 @@ tiers by their dependence on kakehashi's own tree-sitter parse:
 1. `maybe_auto_install_language` (when the main parser is missing and
    auto-install is on) — network/git plus an **unbounded** C-compiler step (see
    per-document-parse-actor for the liveness analysis);
-2. `parse_document` — measured at **~120–700 ms** for a 50–2000-block
-   injection-heavy Markdown (10 KB–435 KB), and bounded only by a 10 s
-   parse timeout;
+2. `parse_document` plus the injection processing it feeds — measured together
+   at **~120–310 ms** for a 50–2000-block injection-heavy Markdown
+   (10 KB–435 KB), and bounded only by a 10 s parse timeout;
 3. `process_injections` — which itself needs the tree.
 
 The host attach is the *next* statement after those, even though
@@ -108,16 +108,19 @@ Hoisting must not let a host `didChange` overtake the host `didOpen` at the
 external server. It cannot, for two independent reasons grounded in the current
 bridge:
 
-- **Single emitter, state-machine discriminated.** All host forwards flow
-  through `sync_host_document` (`src/lsp/bridge/text_document/host.rs`), whose
-  per-`(uri, connection)` map entry decides the message: a *vacant* entry emits
-  `didOpen`, an *occupied* entry emits `didChange`. A bare change before any open
-  is structurally impossible — the first sync always emits `didOpen`.
-- **Lock-order equals wire order.** The enqueue happens under the
-  `host_documents` mutex via a non-blocking `try_send` onto the per-connection
-  FIFO, with no `await` between lock acquisition and enqueue. The first caller to
-  take the lock enqueues first and the single writer task drains in FIFO order,
-  so wire order matches caller order.
+- **Single emitter, state-machine discriminated (the load-bearing reason).** All
+  host forwards flow through `sync_host_document`
+  (`src/lsp/bridge/text_document/host.rs`), whose per-`(uri, connection)` map entry
+  decides the message: a *vacant* entry emits `didOpen`, an *occupied* entry emits
+  `didChange`. A bare change before any open is structurally impossible — the first
+  sync of a pair always finds the entry vacant and emits `didOpen`, *regardless* of
+  which spawned task reaches the lock first. This carries the invariant on its own.
+- **FIFO enqueue under the lock.** Within the locked region the message goes onto
+  the per-connection FIFO via a non-blocking `try_send` with no `await` between
+  lock and enqueue, and the single writer task drains in FIFO order — so the
+  `didOpen`/`didChange` decided by the entry state cannot then be reordered on the
+  wire. (Which task acquires the lock first is task-schedule order, not handler
+  order; the entry-state discrimination is what makes that irrelevant.)
 
 Hoisting the open *earlier* only strengthens open-before-change on the open path.
 This invariant is stated explicitly here because it is what makes the
@@ -138,7 +141,7 @@ installing, these tiers return their empty fallback — the intended
 
 Leave the handler ordering as is. Rejected: it makes host-language UX hostage to
 tree work it does not need, up to and including an unbounded compiler hold. The
-measured 120–700 ms parse and the unbounded install are paid by every host-tier
+measured 120–310 ms parse and the unbounded install are paid by every host-tier
 feature for nothing.
 
 ### 2. Fold this into the parse-actor refactor only (rejected as the *first* step)

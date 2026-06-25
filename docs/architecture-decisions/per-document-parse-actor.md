@@ -93,10 +93,12 @@ scheduling have **no single owner**.
 
 Introduce a **per-document parse actor**: one actor task per open document that
 exclusively owns that document's text, parser-readiness state, and parse
-scheduling, and a **single per-document epoch** that is the one source of truth
-for ordering, resurrection-safety, and parse-staleness — subsuming
-`open_generations`, `ParseState.generation`, the reader watermark, and the
-`edit_lock`'s resurrection-guard duty.
+scheduling, and a **single per-document epoch** — the ingress writer ticket made
+authoritative — that is the one source of truth for ordering, resurrection-safety,
+and parse-staleness. It absorbs the three other per-document version-sequences
+(`open_generations`, `ParseState.generation`, and the otherwise-new reader
+watermark), and its per-write check additionally takes over the `edit_lock`'s
+resurrection-guard duty.
 
 ### Writes are messages; the loop never blocks on the slow op
 
@@ -148,9 +150,9 @@ policy.
 ### One epoch for ordering, resurrection, and staleness
 
 A single monotonic per-document **epoch** — the ingress writer-ticket sequence,
-made authoritative — replaces the four ad-hoc sequences. The unification is of
-the *source*, not of a single scalar: two derived quantities read off the same
-ticket sequence. The actor publishes a **processed-through watermark** (the
+made authoritative — becomes the one version-sequence the other three collapse
+into. The unification is of the *source*, not of a single scalar: two derived
+quantities read off the same ticket sequence. The actor publishes a **processed-through watermark** (the
 highest ticket whose state has fully resolved) that readers wait on, and stamps
 each store write with the **epoch at which it was scheduled** that the CAS write
 compares before committing. Everything keys on that one sequence:
@@ -399,9 +401,10 @@ write-only-mailbox / shared-store-read split is load-bearing.
   accumulated text, saving the measured per-edit reparse cost on injection-heavy
   documents.
 - **One epoch, not four.** Wire-order readiness, resurrection-safety, and
-  parse-staleness key on a single per-document counter, subsuming
-  `open_generations`, `ParseState.generation`, the reader watermark, and the
-  `edit_lock`'s resurrection-guard duty.
+  parse-staleness key on a single per-document counter — the ingress ticket made
+  authoritative — into which the other three version-sequences
+  (`open_generations`, `ParseState.generation`, the reader watermark) collapse,
+  and which additionally takes over the `edit_lock`'s resurrection-guard duty.
 - **`skip_parse` disappears**, folded into the `Uninstalled/Installing/Ready`
   state machine; the install path stops re-entering parsing from a second call
   site.
