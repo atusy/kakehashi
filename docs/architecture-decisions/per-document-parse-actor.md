@@ -93,16 +93,20 @@ compilation.
 The mailbox is **unbounded**, which is what makes the sends non-blocking. The
 queue itself is *not* inherently bounded by document size — under sustained input
 it holds one message per un-drained `SetText`, and a full-document sync (an empty
-edit list) carries the entire text, not a small delta. What keeps memory in check
-is the actor's per-message cost: applying a delta to the owned text is a cheap
-string op (parse and install are offloaded), so the actor drains far faster than
-an editor produces edits, and the backlog stays transient. The actor further
-**drains all currently-ready `SetText`s and applies them before scheduling a
-single parse**, collapsing a burst into one parse rather than one per message. A
-bounded mailbox would instead push backpressure onto the ingress thread,
-re-creating the stall the design removes; it is therefore rejected, with the
-caveat that a pathological producer is handled by a hard queued-bytes ceiling
-that drops to a full-text resynchronization rather than growing without limit.
+edit list) carries the entire text, not a small delta. Deltas are **never dropped** — dropping one corrupts the text, and standard LSP
+incremental sync offers no server-initiated full-text resynchronization to
+recover from a drop — so coalescing-by-discarding is not an option and the
+mailbox cannot be capped by shedding messages. What keeps memory in check is the
+actor's per-message cost: applying a delta to the owned text is a cheap string op
+(parse and install are offloaded off the loop), so the actor drains the mailbox
+far faster than an editor produces edits, and the backlog stays transient even
+while a parse or an unbounded install is outstanding. The actor further **drains
+all currently-ready `SetText`s and applies them before scheduling a single
+parse**, collapsing a burst into one parse rather than one per message. The
+deliberate tradeoff: the only lever that could hard-cap the queue is transport
+backpressure, which would push the stall back onto the ingress thread and
+re-create exactly what this design removes — so unboundedness is accepted, relied
+on staying transient by the drain-rate argument, not by a drop policy.
 
 ### Install is shared and global; only the parse is the actor's child
 
@@ -122,8 +126,10 @@ So the two operations are separated deliberately:
 - **Global install** — shared, deduplicated, deadline-bounded (see below), owned
   by a process-wide installer. An actor in `Installing` *subscribes* to its
   completion; it does not own or abort it.
-- **Per-document parse** — owned by the actor, the **only** step that writes the
-  document's tree into the store, and the only child aborted on `Close`.
+- **Per-document parse** — owned by the actor, the **authoritative** writer of
+  the document's tree into the store (the reader on-demand fallback is the one
+  other writer, which must be made private or atomically guarded — see "Reads
+  bypass the mailbox"), and the only child aborted on `Close`.
 
 This split is what lets both the liveness fix and the resurrection guarantee
 hold: aborting the per-document parse on `Close` never kills an install a
@@ -202,13 +208,17 @@ One wrinkle: the actor is **not** the only writer of the store's tree today.
 Reader handlers carry an on-demand parsing fallback for the race where a request
 arrives before parsing finishes — `try_parse_and_update_document`
 (`semantic_tokens.rs`), and the analogous paths in `selection_range.rs` and the
-node-lookup `entry.rs` — which parse and then *update the store*. With the actor
-owning parsing, these fallbacks should either return a **private** tree without
-writing the store, or write only through a lifetime/generation check (they
-already guard on "document still present and text unchanged"). This matters for
-the resurrection guarantee below: an unguarded reader-fallback write is the one
-remaining way a closed document could be re-inserted, so it must be closed, not
-just the install/parse child path. Optionally, the actor publishes an
+node-lookup `entry.rs` — which parse and then *update the store*. The existing
+"document still present and text unchanged" guard is **not** sufficient on its
+own: it is check-then-write, so a `didClose` can land between the check and the
+write, and the store's `update_document` *inserts on vacancy* — re-creating the
+closed document. With the actor owning parsing, the robust fix is to make these
+fallbacks return a **private** tree without writing the store at all, or to route
+their persistence through an **atomic, non-inserting, generation-checked** store
+update (one that no-ops when the document is gone or its generation moved). This
+matters for the resurrection guarantee below: the reader-fallback write is the
+one remaining way a closed document could be re-inserted, so it must be closed at
+the write itself, not by a check that a concurrent close can slip past. Optionally, the actor publishes an
 *install-pending* signal into the store (the store carries no such field today —
 only `has_tree`/`in_progress`); a reader seeing it returns empty immediately
 without waiting, since the parse cannot complete until an unbounded install
@@ -241,12 +251,16 @@ check is therefore insufficient.
 The replacement: the actor publishes a per-URI **monotonic processed-through
 watermark** keyed to the ingress writer sequence. Each mutation handler stamps
 its enqueued message with the writer ticket **plumbed to it from the gate**; when
-the actor finishes applying-and-parsing the state through ticket *N* (and has
-written the resulting tree into the store), it advances the published watermark
-to *N*. A reader waits — bounded by the existing 200ms — until the watermark
-reaches the tail ticket that preceded it, instead of waiting on `has_tree`. If an
-install is pending the watermark cannot advance, so the reader simply times out
-into the empty fallback, which is the intended install-pending behaviour. This
+the state through ticket *N* reaches a **terminal outcome** — `Parsed` (tree
+written), `NoTree` (parsed to nothing), or `InstallFailed` — the actor advances
+the published watermark to *N*. The watermark must advance on *resolution*, not
+only on a successful tree write, or a parse/install failure would never advance
+it and readers would always burn the full timeout. A reader waits — bounded by
+the existing 200ms — until the watermark reaches the tail ticket that preceded
+it, then reads whatever the store holds (a tree, or empty), instead of waiting on
+`has_tree`. While an install is genuinely still pending the watermark has not yet
+resolved, so the reader times out into the empty fallback, which is the intended
+install-pending behaviour. This
 preserves the #374 reader-observes-preceding-writes guarantee without re-coupling
 the handler to parse latency or to the unbounded install.
 
@@ -405,9 +419,11 @@ write-only-mailbox / shared-store-read split is load-bearing.
   wrong silently reintroduces the #342/#374 stale-tree race.
 - **Reader on-demand parse fallbacks must stop being unguarded store writers.**
   `try_parse_and_update_document` and its analogues persist a tree to the store;
-  with the actor owning parsing they must return a private tree or write only
-  behind the lifetime/text-unchanged guard, or they reopen the resurrection
-  vector the actor otherwise closes.
+  the current present-and-unchanged guard is check-then-write and the store
+  inserts on vacancy, so a concurrent `didClose` resurrects the document. They
+  must return a private tree, or persist through an atomic non-inserting
+  generation-checked update, or they reopen the resurrection vector the actor
+  otherwise closes.
 - **Injection orchestration must be re-homed** carefully: the heavy external
   bridge-server spawn is fire-and-forget, but the bridge `didChange` forwarding
   to already-opened virtual documents is wire-order-sensitive and must stay
