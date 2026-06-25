@@ -517,6 +517,76 @@ print("hello")
         );
     }
 
+    /// Parse-decoupled lifecycle (parse-decoupled-document-lifecycle ADR): the
+    /// host document is attached to its `_self` server during `did_open_impl`
+    /// WITHOUT waiting for the tree-sitter parse. The host tier needs only the
+    /// text and a language name, never the tree, so an unbounded/slow parse (or
+    /// install) must not gate it.
+    ///
+    /// We block the parse deterministically by holding the parser-pool lock, so
+    /// `parse_document` -> `parse_with_pool` parks on `pool.lock().await` and
+    /// never finishes within the test. We drive `did_open_impl` concurrently and
+    /// assert the host doc still opens. Before the host-tier hoist the attach sat
+    /// *after* this (now-blocked) parse, so the host doc would never open and this
+    /// test would fail at its timeout.
+    #[tokio::test]
+    async fn host_document_attaches_before_parse_completes() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_attach_no_wait.rs").unwrap();
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+
+        // Hold the parser-pool lock so the parse parks indefinitely (see above).
+        let pool_guard = server.parser_pool.lock().await;
+
+        let params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: lsp_uri,
+                language_id: "rust".to_string(),
+                version: 1,
+                text: "fn main() {}".to_string(),
+            },
+        };
+
+        let did_open = server.did_open_impl(params);
+        tokio::pin!(did_open);
+
+        let opened = tokio::select! {
+            // The handler parks at the blocked parse; if it ever returns, do a
+            // final check rather than assuming.
+            _ = &mut did_open => {
+                server
+                    .bridge
+                    .pool()
+                    .is_host_document_opened(&uri, "rust_ls")
+                    .await
+            }
+            result = timeout(Duration::from_secs(2), async {
+                loop {
+                    if server
+                        .bridge
+                        .pool()
+                        .is_host_document_opened(&uri, "rust_ls")
+                        .await
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.is_ok(),
+        };
+
+        drop(pool_guard);
+        assert!(
+            opened,
+            "host document must attach to the _self server without waiting for the parse"
+        );
+    }
+
     /// #425 regression guard: host `pullFallback = false` gates the host **pull**
     /// (`host_pull_enabled = false`) but must NOT drop the host context — the
     /// #431 debounced re-sync still needs it to push current text to a push-only
