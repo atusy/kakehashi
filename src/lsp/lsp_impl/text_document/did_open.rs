@@ -29,6 +29,25 @@ impl Kakehashi {
         self.documents
             .insert(uri.clone(), text.clone(), language_name.clone(), None);
 
+        // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
+        // host document to any `_self` host-bridge server *before* the parser load,
+        // the parse, and auto-install — none of which the host tier depends on.
+        // `eager_open_host_document_on_servers` needs only the (path-resolved)
+        // language name and text, so a push-only host server (e.g.
+        // lua-language-server) starts analyzing and pushing diagnostics immediately
+        // instead of waiting out a ~120-310ms parse or an unbounded install. It
+        // spawns fire-and-forget per-server tasks (non-blocking); no-op when host
+        // bridging is off for the language. Hoisting the open earlier only
+        // strengthens the open-before-change invariant — `sync_host_document`'s
+        // per-(uri, connection) state machine still emits didOpen before any
+        // didChange regardless of task-schedule order (see
+        // ls-bridge-message-ordering).
+        if let Some(ref lang) = language_name {
+            let settings = self.settings_manager.load_settings();
+            self.bridge
+                .eager_open_host_document_on_servers(&settings, lang, &uri, &text);
+        }
+
         // Check if we need to auto-install
         let mut deferred_events = Vec::new();
         let mut skip_parse = false; // Track if auto-install was triggered
@@ -95,17 +114,6 @@ impl Kakehashi {
         self.injection_coordinator()
             .process_injections(&uri, false)
             .await;
-
-        // Host-layer eager-open (#429): open the real host document on any `_self`
-        // host-bridge server so a push-only host server (e.g. lua-language-server)
-        // starts analyzing and pushing diagnostics on open, instead of only after
-        // the first host-bridged request lazily opens it. No-op when host bridging
-        // is off for the language; spawns fire-and-forget tasks (non-blocking).
-        if let Some(ref lang) = language_name {
-            let settings = self.settings_manager.load_settings();
-            self.bridge
-                .eager_open_host_document_on_servers(&settings, lang, &uri, &text);
-        }
 
         // pull-first-diagnostic-forwarding Phase 2: Trigger synthetic diagnostic push on didOpen
         // This provides proactive diagnostics for clients that don't support pull diagnostics.
