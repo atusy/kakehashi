@@ -223,16 +223,28 @@ check is therefore insufficient.
 
 The replacement: the actor publishes a per-URI **monotonic processed-through
 watermark** keyed to the ingress writer sequence. Each mutation handler stamps
-its enqueued message with the writer ticket it holds; when the actor finishes
-applying-and-parsing the state through ticket *N* (and has written the resulting
-tree into the store), it advances the published watermark to *N*. A reader
-captures the current tail ticket at gate `call` time (it already does, for the
-reader barrier) and waits — bounded by the existing 200ms — until the watermark
-reaches that ticket, instead of waiting on `has_tree`. If an install is pending
-the watermark cannot advance, so the reader simply times out into the empty
-fallback, which is the intended install-pending behaviour. This preserves the
-#374 reader-observes-preceding-writes guarantee without re-coupling the handler
-to parse latency or to the unbounded install.
+its enqueued message with the writer ticket **plumbed to it from the gate**; when
+the actor finishes applying-and-parsing the state through ticket *N* (and has
+written the resulting tree into the store), it advances the published watermark
+to *N*. A reader waits — bounded by the existing 200ms — until the watermark
+reaches the tail ticket that preceded it, instead of waiting on `has_tree`. If an
+install is pending the watermark cannot advance, so the reader simply times out
+into the empty fallback, which is the intended install-pending behaviour. This
+preserves the #374 reader-observes-preceding-writes guarantee without re-coupling
+the handler to parse latency or to the unbounded install.
+
+This requires new plumbing in `IngressOrderGate` (`src/lsp/ingress_order.rs`):
+today the ticket is middleware-private — a writer handler does not receive
+`gate.ticket()`, and a reader handler does not receive the tail ticket the gate's
+`ReaderBarrier` snapshots at `call` time. Both must be exposed (via a task-local,
+a request extension, or by moving the enqueue into the middleware) so the writer
+can stamp its message and the reader can name the watermark it waits on. The
+ingress middleware is therefore part of the refactor surface, not untouched.
+
+The reader-side `edit_lock` acquisitions that act as settle guards today
+(`semantic_tokens.rs`, `selection_range.rs`) become uncontended once the
+writer side no longer takes the lock; the watermark is their functional
+replacement, so they are removed rather than left as dead synchronization.
 
 ### Lifetime equals document lifetime
 
@@ -245,6 +257,13 @@ parse, a late install completing afterward has no actor to hand off to and
 cannot re-insert the closed document — **resurrection is structurally
 impossible**, with no separate supersede machinery. A reopen creates a fresh
 actor.
+
+Teardown must also wake any reader blocked on a watermark ticket that will now
+never be processed: dropping the watermark channel on actor termination signals
+those waiters to proceed (into the empty fallback), mirroring how the gate's
+`finish_close` drops its `done` sender and waiters treat the error as "nothing
+left to wait for." Without it a reader racing the close would stall to the 200ms
+timeout — bounded, but needless.
 
 ### Complementary: install-wide deadline
 
@@ -328,7 +347,9 @@ write-only-mailbox / shared-store-read split is load-bearing.
 ### Negative
 
 - **ADR-sized refactor** touching `did_open`, `did_change`, `did_close`, the
-  install coordinator, the store, and every reader's wait path.
+  install coordinator, the store, the `IngressOrderGate` middleware (to plumb the
+  writer ticket and tail ticket out to the handlers), and every reader's wait
+  path.
 - **Lifecycle and cancellation must be exact.** Child-task abort on `Close`,
   completion plumbed back as messages, and mailbox backpressure are all new
   surface area to get right.
@@ -372,6 +393,8 @@ carries the `skip_parse` flag, `did_change_impl` still serializes via
 `edit_lock`, and `reload_language_after_install` still re-enters the parse path
 on install completion, and readers still wait on `has_tree` (there is no
 processed-through watermark, and no install-pending signal in the store). The
-actor, its state machine, the child-task model, the reader watermark, and the
-install-wide deadline are all unbuilt. A staged rollout may land Option 1
+`IngressOrderGate` ticket is still middleware-private — no handler receives it —
+so the watermark plumbing does not exist yet either. The actor, its state
+machine, the child-task model, the reader watermark and its ingress plumbing, and
+the install-wide deadline are all unbuilt. A staged rollout may land Option 1
 (minimal spawn) first as an interim liveness fix before the full actor.
