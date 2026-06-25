@@ -397,15 +397,16 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
     match format {
         OutputFormat::Default => {
             let severity = severity_word(diagnostic.severity);
-            let source = diagnostic
-                .source
-                .as_deref()
-                .map(|s| format!(" [{s}]"))
-                .unwrap_or_default();
-            format!(
-                "{display}:{line}:{col}: {severity}: {}{source}",
-                one_line(&diagnostic.message)
-            )
+            let message = one_line(&diagnostic.message);
+            // Branch on the source rather than building a separate ` [src]`
+            // String first, saving one allocation per diagnostic that has a
+            // source.
+            match diagnostic.source.as_deref() {
+                Some(source) => {
+                    format!("{display}:{line}:{col}: {severity}: {message} [{source}]")
+                }
+                None => format!("{display}:{line}:{col}: {severity}: {message}"),
+            }
         }
         OutputFormat::Jsonl => {
             let code = diagnostic.code.as_ref().map(|c| match c {
@@ -514,12 +515,16 @@ type RangeSortKey = (u32, u32, u32, u32);
 /// twice per comparison across an `O(N log N)` sort, so it must not allocate.
 fn sort_key(diagnostic: &Diagnostic) -> (RangeSortKey, u8, Option<&str>, CodeSortKey<'_>, &str) {
     let severity_rank = match diagnostic.severity {
+        // Absent and out-of-spec severities both rank as an error (1), matching
+        // how `effective_severity` gates them — so the sort order agrees with
+        // the exit-code semantics rather than burying an unknown severity below
+        // hints.
         None => 1,
         Some(DiagnosticSeverity::ERROR) => 1,
         Some(DiagnosticSeverity::WARNING) => 2,
         Some(DiagnosticSeverity::INFORMATION) => 3,
         Some(DiagnosticSeverity::HINT) => 4,
-        Some(_) => 5,
+        Some(_) => 1,
     };
     let code_key = match &diagnostic.code {
         None => (0, 0, None),
@@ -731,6 +736,20 @@ mod tests {
         let mut ten = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
         ten.code = Some(NumberOrString::Number(10));
         assert!(sort_key(&nine) < sort_key(&ten));
+    }
+
+    #[test]
+    fn sort_key_ranks_out_of_spec_severity_as_an_error() {
+        // An out-of-spec severity gates as an error (effective_severity), so it
+        // must also sort alongside errors — ahead of a warning, not below hints.
+        let bogus: DiagnosticSeverity =
+            serde_json::from_value(serde_json::json!(99)).expect("transparent i32 severity");
+        let unknown = diag(0, 0, Some(bogus), "m");
+        let error = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
+        let warning = diag(0, 0, Some(DiagnosticSeverity::WARNING), "m");
+        // Same severity rank as an error (tie), and strictly ahead of a warning.
+        assert_eq!(sort_key(&unknown).1, sort_key(&error).1);
+        assert!(sort_key(&unknown) < sort_key(&warning));
     }
 
     #[test]
