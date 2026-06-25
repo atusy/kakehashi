@@ -464,6 +464,20 @@ async fn dispatch_concatenated_diagnostics(
 }
 
 /// Dispatch diagnostics using the preferred strategy (first non-empty response wins).
+///
+/// KNOWN LIMITATION (CLI exit codes, tracked in #487): when a winner is
+/// decided, the preferred fan-in (`aggregation::server::fan_in::preferred`)
+/// `abort_all()`s the losing tasks WITHOUT joining them, so a
+/// losing server that fails its request can run `count_request_errors` after
+/// this returns and after the CLI has loaded `sink`. Such a non-winning
+/// failure may therefore not surface as `kakehashi diagnose` exit 2. The
+/// default `concatenated` strategy drains every task (`join_next` to `None`)
+/// and is exact; the all-servers-fail case yields `NoResult` with no winner,
+/// hence no abort and a deterministic count. Only "preferred + a winner + a
+/// non-winning failure" is racy — and under preferred semantics the winner's
+/// result is authoritative, so whether that should be exit 2 at all is a
+/// product question. See #487 for the fix options (shared with the formatting
+/// preferred path).
 async fn dispatch_preferred_diagnostics(
     region_ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,

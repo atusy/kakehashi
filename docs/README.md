@@ -634,6 +634,12 @@ could not be read, a path could not be opened, or a configured downstream
 server failed) — independent of the diagnostics, so it surfaces a broken run
 rather than looking clean to CI.
 
+> The `2` exit on a downstream failure is exact under the default
+> `concatenated` aggregation strategy. Under the non-default `preferred`
+> strategy, a *non-winning* server's request-time failure may not surface as
+> exit `2` (the winning server's result is authoritative). See
+> [#487](https://github.com/atusy/kakehashi/issues/487).
+
 Diagnostics stream to stdout as each file is processed. Every file is always
 scanned so the exit code reflects the whole set; if stdout is closed before the
 scan finishes (e.g. `kakehashi diagnose . | head`), further writes are
