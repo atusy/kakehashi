@@ -29,6 +29,25 @@ impl Kakehashi {
         self.documents
             .insert(uri.clone(), text.clone(), language_name.clone(), None);
 
+        // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
+        // host document to any `_self` host-bridge server *before* the parser load,
+        // the parse, and auto-install — none of which the host tier depends on.
+        // `eager_open_host_document_on_servers` needs only the (path-resolved)
+        // language name and text, so a push-only host server (e.g.
+        // lua-language-server) starts analyzing and pushing diagnostics immediately
+        // instead of waiting out a ~120-310ms parse or an unbounded install. It
+        // spawns fire-and-forget per-server tasks (non-blocking); no-op when host
+        // bridging is off for the language. Hoisting the open earlier only
+        // strengthens the open-before-change invariant — `sync_host_document`'s
+        // per-(uri, connection) state machine still emits didOpen before any
+        // didChange regardless of task-schedule order (see
+        // ls-bridge-message-ordering).
+        if let Some(ref lang) = language_name {
+            let settings = self.settings_manager.load_settings();
+            self.bridge
+                .eager_open_host_document_on_servers(&settings, lang, &uri, &text);
+        }
+
         // Check if we need to auto-install
         let mut deferred_events = Vec::new();
         let mut skip_parse = false; // Track if auto-install was triggered
@@ -95,17 +114,6 @@ impl Kakehashi {
         self.injection_coordinator()
             .process_injections(&uri, false)
             .await;
-
-        // Host-layer eager-open (#429): open the real host document on any `_self`
-        // host-bridge server so a push-only host server (e.g. lua-language-server)
-        // starts analyzing and pushing diagnostics on open, instead of only after
-        // the first host-bridged request lazily opens it. No-op when host bridging
-        // is off for the language; spawns fire-and-forget tasks (non-blocking).
-        if let Some(ref lang) = language_name {
-            let settings = self.settings_manager.load_settings();
-            self.bridge
-                .eager_open_host_document_on_servers(&settings, lang, &uri, &text);
-        }
 
         // pull-first-diagnostic-forwarding Phase 2: Trigger synthetic diagnostic push on didOpen
         // This provides proactive diagnostics for clients that don't support pull diagnostics.
@@ -515,6 +523,81 @@ print("hello")
             host.configs.iter().any(|c| c.server_name == "rust_ls"),
             "the push-only rust_ls must be in the host context so the debounce re-sync reaches it"
         );
+    }
+
+    /// Parse-decoupled lifecycle (parse-decoupled-document-lifecycle ADR): the
+    /// host document is attached to its `_self` server during `did_open_impl`
+    /// WITHOUT waiting for the tree-sitter parse. The host tier needs only the
+    /// text and a language name, never the tree, so an unbounded/slow parse (or
+    /// install) must not gate it.
+    ///
+    /// We block the parse deterministically by holding the parser-pool lock, so
+    /// `parse_document` -> `parse_with_pool` parks on `pool.lock().await` and
+    /// never finishes within the test. We drive `did_open_impl` concurrently and
+    /// assert the host doc still opens. Before the host-tier hoist the attach sat
+    /// *after* this (now-blocked) parse, so the host doc would never open and this
+    /// test would fail at its timeout.
+    #[tokio::test]
+    async fn host_document_attaches_before_parse_completes() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_attach_no_wait.rs").unwrap();
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+
+        // Hold the parser-pool lock so the parse parks indefinitely (see above).
+        let pool_guard = server.parser_pool.lock().await;
+
+        let params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: lsp_uri,
+                language_id: "rust".to_string(),
+                version: 1,
+                text: "fn main() {}".to_string(),
+            },
+        };
+
+        let did_open = server.did_open_impl(params);
+        tokio::pin!(did_open);
+
+        tokio::select! {
+            // The whole point of this test is that the host opens *while the parse
+            // is blocked*. If the handler returns instead, the parse wasn't
+            // actually gating (e.g. parsing got skipped) and the old post-parse
+            // attach position would pass too — i.e. the test would no longer
+            // discriminate the hoist. Fail loudly rather than checking vacuously.
+            _ = &mut did_open => {
+                panic!(
+                    "did_open_impl returned while the parse was blocked; the parse \
+                     was not gating, so this test cannot discriminate the host-tier hoist"
+                );
+            }
+            result = timeout(Duration::from_secs(2), async {
+                loop {
+                    if server
+                        .bridge
+                        .pool()
+                        .is_host_document_opened(&uri, "rust_ls")
+                        .await
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => {
+                result.expect(
+                    "host document must attach to the _self server without waiting for the parse",
+                );
+            }
+        }
+
+        // Cleanup: release the lock so the parked parse can finish, then drive
+        // the handler to completion.
+        drop(pool_guard);
+        did_open.await;
     }
 
     /// #425 regression guard: host `pullFallback = false` gates the host **pull**
