@@ -15,13 +15,23 @@ use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
 use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
-/// Whether the proactive pull would dispatch to **at least one** server for a
-/// method, resolving the visible walk exactly as dispatch does (expand
+/// Whether the proactive pull's **config-level** server selection for a method
+/// is non-empty — the visible walk resolved exactly as dispatch does (expand
 /// `priorities`, truncate by `maxFanOut`, then the allowlist select). An empty
-/// result (`priorities = []`, `maxFanOut = 0`, or names only unconfigured
-/// servers) means no pull runs, so the caller skips the context — keeping the
-/// invariant "a `PullLayer` is present only when a pull actually dispatched"
-/// (#425), so an empty pull layer never falsely suppresses a spontaneous push.
+/// selection (`priorities = []`, `maxFanOut = 0`, or names only unconfigured
+/// servers) means the pull would fan out to nobody, so the caller skips the
+/// context entirely.
+///
+/// This is a *selection* check, not a contribution prediction: a non-empty
+/// selection still builds a context and runs the pull even if every selected
+/// server is capability-gated at runtime (`send_diagnostic_request` /
+/// `send_host_raw_request` return empty when a server lacks
+/// `textDocument/diagnostic`), leaving a present-but-**empty** `PullLayer`. That
+/// is harmless for the pull/push dedup (#425): a capability-gated server is, by
+/// definition, *push*-driven, so `filter_pull_driven_push_slots` never
+/// suppresses its spontaneous push against that empty blob. The skip here only
+/// stops a *config*-empty selection from minting an empty `PullLayer` that would
+/// falsely suppress a genuinely pull-driven server's push.
 fn dispatches_to_any_server(
     priorities: &[String],
     configs: &[ResolvedServerConfig],
