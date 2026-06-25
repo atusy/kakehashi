@@ -186,39 +186,29 @@ fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
     tokens.truncate(write + 1);
 }
 
-/// Check whether a single-line token is fully inside any active injection region.
+/// Check whether a single-line token is fully inside one active injection region.
 ///
 /// Uses lexicographic tuple comparison: `(line, col) >= (start_line, start_col)`
 /// covers all four cases (middle line, start line, end line, single-line region).
-fn is_fully_in_active_injection_region(
-    token: &RawToken,
-    regions: &[ActiveInjectionBounds],
-) -> bool {
+fn token_fully_in_region(token: &RawToken, r: &ActiveInjectionBounds) -> bool {
     let token_end = token.column + token.length;
-    regions.iter().any(|r| {
-        (token.line, token.column) >= (r.start_line, r.start_col)
-            && (token.line, token_end) <= (r.end_line, r.end_col)
-    })
+    (token.line, token.column) >= (r.start_line, r.start_col)
+        && (token.line, token_end) <= (r.end_line, r.end_col)
 }
 
-/// Check whether a token exactly matches any active injection region's bounds.
+/// Check whether a token exactly matches one active injection region's bounds.
 ///
 /// This mirrors the exact-match exception in `is_in_exclusion_range()`: when
 /// a host capture sits on the same tree-sitter node as `@injection.content`
 /// (e.g., fish `(comment) @comment` + `(comment) @injection.content`), the
 /// host token should survive to the sweep-line algorithm, which splits it
 /// around injection tokens and preserves the host type in uncovered gaps.
-fn is_exact_match_active_injection_region(
-    token: &RawToken,
-    regions: &[ActiveInjectionBounds],
-) -> bool {
+fn token_exact_matches_region(token: &RawToken, r: &ActiveInjectionBounds) -> bool {
     let token_end = token.column + token.length;
-    regions.iter().any(|r| {
-        token.line == r.start_line
-            && token.line == r.end_line
-            && token.column == r.start_col
-            && token_end == r.end_col
-    })
+    token.line == r.start_line
+        && token.line == r.end_line
+        && token.column == r.start_col
+        && token_end == r.end_col
 }
 
 /// Collect the injection region intervals that overlap a host token's line.
@@ -416,6 +406,13 @@ fn filter_by_injection_regions(
     if regions.is_empty() {
         return tokens;
     }
+    // Index regions by every host line they span, so each host token only
+    // examines the regions on its own line. Without this index the three
+    // per-token region checks below each scan ALL regions, making the pass
+    // O(tokens × regions); when the region count grows with document size
+    // (e.g. one injection per comment/macro in Rust), that is quadratic on
+    // the hot path — the dominant cost found by profiling.
+    let regions_by_line = build_regions_by_line(regions);
     let region_map = build_region_intervals_map(regions, lines);
     let mut filtered = Vec::with_capacity(tokens.len());
     for token in tokens {
@@ -423,11 +420,21 @@ fn filter_by_injection_regions(
             filtered.push(token);
             continue;
         }
-        if is_exact_match_active_injection_region(&token, regions) {
+        let line_regions = regions_by_line
+            .get(&token.line)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        if line_regions
+            .iter()
+            .any(|&i| token_exact_matches_region(&token, &regions[i]))
+        {
             filtered.push(token);
             continue;
         }
-        if is_fully_in_active_injection_region(&token, regions) {
+        if line_regions
+            .iter()
+            .any(|&i| token_fully_in_region(&token, &regions[i]))
+        {
             continue;
         }
         // Partial overlap: check if any overlapping region is single-line.
@@ -441,7 +448,8 @@ fn filter_by_injection_regions(
         // injection architecture processes each depth level separately,
         // so a given depth's active regions are homogeneous in nature.
         let token_end = token.column + token.length;
-        let overlaps_single_line_region = regions.iter().any(|r| {
+        let overlaps_single_line_region = line_regions.iter().any(|&i| {
+            let r = &regions[i];
             r.start_line == r.end_line
                 && r.start_line == token.line
                 && r.start_col < token_end
@@ -458,6 +466,23 @@ fn filter_by_injection_regions(
         }
     }
     filtered
+}
+
+/// Index active injection regions by every host line they span.
+///
+/// Returns a map from line number to the indices (into `regions`) of the
+/// regions that touch that line. A token on line L only needs to consider
+/// regions in `map[L]`, turning the per-token region checks in
+/// [`filter_by_injection_regions`] from O(regions) into O(regions-on-line)
+/// — amortized O(1) for the common case of few regions per line.
+fn build_regions_by_line(regions: &[ActiveInjectionBounds]) -> HashMap<usize, Vec<usize>> {
+    let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, r) in regions.iter().enumerate() {
+        for line in r.start_line..=r.end_line {
+            map.entry(line).or_default().push(i);
+        }
+    }
+    map
 }
 
 /// Post-process and delta-encode raw tokens into SemanticTokensResult.
