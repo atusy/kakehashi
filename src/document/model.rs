@@ -124,6 +124,16 @@ impl Document {
         self.tree = Some(new_tree);
     }
 
+    /// Attach a parsed tree **without** touching the text.
+    ///
+    /// For an on-demand reader parse whose parsed text already equals the stored
+    /// text: there is no content-version transition to record, so `previous_tree`
+    /// / `previous_text` are left as-is and the text is neither re-cloned nor
+    /// replaced.
+    pub(crate) fn set_tree(&mut self, tree: Tree) {
+        self.tree = Some(tree);
+    }
+
     /// Update text and clear layers/state
     pub(crate) fn update_text(&mut self, text: String) {
         self.text = text;

@@ -212,19 +212,22 @@ impl DocumentStore {
         expected_text: &str,
         new_tree: Tree,
     ) -> bool {
-        let stored = match self.documents.entry(uri.clone()) {
-            Entry::Occupied(mut entry) => {
-                let doc = entry.get_mut();
-                if doc.text() == expected_text {
-                    doc.update_tree_and_text(new_tree, expected_text.to_string());
-                    true
-                } else {
-                    false
-                }
+        // `get_mut` (non-inserting, borrowed key) rather than `entry(uri.clone())`:
+        // a missing document — a concurrent didClose removed it — yields `None` and
+        // is left untouched, so the parse can't resurrect it, and we avoid cloning
+        // the `Url`. The `RefMut` holds the shard write lock for the whole arm, so
+        // the text check and the tree write are atomic against didChange/didClose.
+        // Text already equals `expected_text`, so only the tree is attached — no
+        // text re-clone, no `previous_text` churn.
+        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
+            if doc.text() == expected_text {
+                doc.set_tree(new_tree);
+                true
+            } else {
+                false
             }
-            // Closed (or never opened): do NOT insert — that would resurrect a
-            // document a concurrent didClose just removed.
-            Entry::Vacant(_) => false,
+        } else {
+            false
         };
         if stored {
             self.update_tree_availability(uri, true);
