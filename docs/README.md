@@ -593,6 +593,58 @@ server failed to start, errored on the request, timed out, or returned a
 protocol-invalid response — even when a fallback server still produced
 output).
 
+### Diagnostics
+
+`kakehashi diagnose` pulls diagnostics for files through the same bridge the
+LSP server uses (injection regions via `virt`, the host document via
+`bridge._self`, aggregated per `layers.aggregation`) and prints them in a
+machine-readable format. File selection matches `format` (directories walked
+respecting `.gitignore`, explicit paths win, `--excludes` filters every path
+under the current directory — including explicitly listed ones).
+
+Only **pull** diagnostics (`textDocument/diagnostic`) are reported. **Push**
+diagnostics (`textDocument/publishDiagnostics`) are not collected, so a
+downstream server that only publishes diagnostics — and does not answer a pull
+request — contributes nothing to `kakehashi diagnose`.
+
+```bash
+# Report diagnostics (default format: file:line:col: severity: message [source])
+kakehashi diagnose README.md docs/
+
+# Output formats: default (the above) or jsonl (one JSON object per line)
+kakehashi diagnose . --output-format jsonl
+
+# CI gate: errors always exit 1; --fail-on-warning makes warnings fail too.
+# To never fail on diagnostics, append `|| true`.
+kakehashi diagnose . --fail-on-warning
+
+# Diagnose stdin; the filename drives language detection and config resolution
+cat README.md | kakehashi diagnose --stdin-filename README.md
+```
+
+Diagnostics go to stdout; the one-line summary, any errors, and `RUST_LOG`
+output go to stderr — so stdout stays a clean data channel for `| jq` / `| head`
+(redirect or ignore stderr in CI if the summary is unwanted).
+
+Line and column are 1-based; a diagnostic with no severity is treated as an
+error (so it can never silently slip past the gate). Exit codes: `0` no failing
+diagnostic; `1` a failing diagnostic — any error always, plus warnings with
+`--fail-on-warning` (info/hint never fail); `2` an operational error (a file
+could not be read, a path could not be opened, or a configured downstream
+server failed) — independent of the diagnostics, so it surfaces a broken run
+rather than looking clean to CI.
+
+> The `2` exit on a downstream failure is exact under the default
+> `concatenated` aggregation strategy. Under the non-default `preferred`
+> strategy, a *non-winning* server's request-time failure may not surface as
+> exit `2` (the winning server's result is authoritative). See
+> [#487](https://github.com/atusy/kakehashi/issues/487).
+
+Diagnostics stream to stdout as each file is processed. Every file is always
+scanned so the exit code reflects the whole set; if stdout is closed before the
+scan finishes (e.g. `kakehashi diagnose . | head`), further writes are
+suppressed but the scan still completes.
+
 ## Editor Integration
 
 ### Neovim

@@ -26,6 +26,7 @@ use crate::lsp::aggregation::server::{
 };
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
+use crate::lsp::lsp_impl::text_document::{RequestErrorSink, count_request_errors};
 
 // ============================================================================
 // Shared diagnostic utilities (used by both pull and push diagnostics)
@@ -50,10 +51,15 @@ const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) async fn collect_region_diagnostics(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
+    request_error_sink: &RequestErrorSink,
 ) -> Vec<Diagnostic> {
     match ctx.strategy {
-        AggregationStrategy::Concatenated => dispatch_concatenated_diagnostics(ctx, pool).await,
-        AggregationStrategy::Preferred => dispatch_preferred_diagnostics(ctx, pool).await,
+        AggregationStrategy::Concatenated => {
+            dispatch_concatenated_diagnostics(ctx, pool, request_error_sink).await
+        }
+        AggregationStrategy::Preferred => {
+            dispatch_preferred_diagnostics(ctx, pool, request_error_sink).await
+        }
     }
 }
 
@@ -65,6 +71,20 @@ impl Kakehashi {
     pub(crate) async fn diagnostic_impl(
         &self,
         params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        self.diagnostic_impl_with_error_sink(params, None).await
+    }
+
+    /// Like [`Self::diagnostic_impl`], but records request-time downstream
+    /// failures — timeouts, crashes, or error responses that occur AFTER a
+    /// server is ready — into `request_error_sink`. LSP mode passes `None`
+    /// (failures are log-only; the editor retries); CLI `diagnose` passes
+    /// `Some` so a one-shot run can map them onto exit 2 instead of a false
+    /// "clean". Startup failures are detected separately by the CLI ready-wait.
+    pub(crate) async fn diagnostic_impl_with_error_sink(
+        &self,
+        params: DocumentDiagnosticParams,
+        request_error_sink: RequestErrorSink,
     ) -> Result<DocumentDiagnosticReportResult> {
         let lsp_uri = params.text_document.uri;
 
@@ -181,9 +201,11 @@ impl Kakehashi {
                     client_progress_token: None,
                 };
                 let pool = Arc::clone(&pool);
+                let task_sink = request_error_sink.clone();
 
-                outer_join_set
-                    .spawn(async move { collect_region_diagnostics(&region_ctx, pool).await });
+                outer_join_set.spawn(async move {
+                    collect_region_diagnostics(&region_ctx, pool, &task_sink).await
+                });
             }
 
             // Cancellation is handled by the outer select dropping this
@@ -202,7 +224,9 @@ impl Kakehashi {
         // `bridge._self.aggregation` (concatenated by default).
         let host_fut = async {
             match &host_ctx {
-                Some(ctx) => collect_host_diagnostics(ctx, Arc::clone(&pool)).await,
+                Some(ctx) => {
+                    collect_host_diagnostics(ctx, Arc::clone(&pool), &request_error_sink).await
+                }
                 None => Vec::new(),
             }
         };
@@ -275,36 +299,50 @@ pub(crate) fn combine_layer_diagnostics(
 pub(crate) async fn collect_host_diagnostics(
     ctx: &HostRequestContext,
     pool: Arc<LanguageServerPool>,
+    request_error_sink: &RequestErrorSink,
 ) -> Vec<Diagnostic> {
-    let send = |t: HostFanOutTask| async move {
-        let result = tokio::time::timeout(
-            DIAGNOSTIC_REQUEST_TIMEOUT,
-            t.pool.send_host_raw_request(
-                &t.server_name,
-                &t.server_config,
-                &crate::lsp::bridge::HostDocument {
-                    uri: &t.uri,
-                    language_id: &t.language_id,
-                    text: &t.text,
-                },
-                "textDocument/diagnostic",
-                serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
-                t.upstream_id,
-                // Same policy as the virt diagnostic path: wait through
-                // server initialization — the first didOpen-triggered pull
-                // would otherwise hit an Initializing server and silently
-                // lose the host layer. The outer timeout bounds the wait.
-                crate::lsp::bridge::ConnectionReadiness::WaitReady,
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(std::io::Error::other(format!(
-                "host diagnostic request timed out for {}",
-                t.server_name
-            )))
-        })?;
-        Ok(parse_host_diagnostic_report(result))
+    let send = |t: HostFanOutTask| {
+        // Cloned per call so the returned future is `'static`, and so a
+        // request-time host failure (timeout, crash, error response after the
+        // server is ready) is counted — letting CLI mode surface it as exit 2
+        // instead of silently losing the host layer.
+        let sink = request_error_sink.clone();
+        async move {
+            let result = tokio::time::timeout(
+                DIAGNOSTIC_REQUEST_TIMEOUT,
+                t.pool.send_host_raw_request(
+                    &t.server_name,
+                    &t.server_config,
+                    &crate::lsp::bridge::HostDocument {
+                        uri: &t.uri,
+                        language_id: &t.language_id,
+                        text: &t.text,
+                    },
+                    "textDocument/diagnostic",
+                    serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
+                    t.upstream_id,
+                    // Same policy as the virt diagnostic path: wait through
+                    // server initialization — the first didOpen-triggered pull
+                    // would otherwise hit an Initializing server and silently
+                    // lose the host layer. The outer timeout bounds the wait.
+                    crate::lsp::bridge::ConnectionReadiness::WaitReady,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::other(format!(
+                    "host diagnostic request timed out for {}",
+                    t.server_name
+                )))
+            });
+            match result {
+                Ok(value) => Ok(parse_host_diagnostic_report(value)),
+                Err(e) => {
+                    count_request_errors(&sink, 1);
+                    Err(e)
+                }
+            }
+        }
     };
 
     // Cancellation is handled by the caller dropping this future.
@@ -385,15 +423,35 @@ async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<D
     })
 }
 
+/// Send one fan-out diagnostic request, counting a request-time failure into
+/// `sink`. The fan-in's own `NoResult { errors }` count is discarded once any
+/// server succeeds (a partial failure still yields `Done`), so counting here —
+/// once per observed failure — is what lets CLI mode surface a downstream
+/// server that crashed or timed out after becoming ready (mirrors the
+/// formatting path).
+/// `sink` is taken by value (an owned `Option<Arc<…>>`) so the returned future
+/// is `'static`, as the fan-out dispatch requires.
+async fn send_diagnostic_request_counting_errors(
+    t: FanOutTask,
+    sink: RequestErrorSink,
+) -> std::io::Result<Vec<Diagnostic>> {
+    let result = send_diagnostic_fan_out_request(t).await;
+    if result.is_err() {
+        count_request_errors(&sink, 1);
+    }
+    result
+}
+
 /// Dispatch diagnostics using the concatenated strategy (merge results from every server).
 async fn dispatch_concatenated_diagnostics(
     region_ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
+    sink: &RequestErrorSink,
 ) -> Vec<Diagnostic> {
     let result = dispatch_concatenated(
         region_ctx,
         pool,
-        send_diagnostic_fan_out_request,
+        |t| send_diagnostic_request_counting_errors(t, sink.clone()),
         None, // cancel handled at outer level
         None, // no custom log_target
     )
@@ -406,14 +464,29 @@ async fn dispatch_concatenated_diagnostics(
 }
 
 /// Dispatch diagnostics using the preferred strategy (first non-empty response wins).
+///
+/// KNOWN LIMITATION (CLI exit codes, tracked in #487): when a winner is
+/// decided, the preferred fan-in (`aggregation::server::fan_in::preferred`)
+/// `abort_all()`s the losing tasks WITHOUT joining them, so a
+/// losing server that fails its request can run `count_request_errors` after
+/// this returns and after the CLI has loaded `sink`. Such a non-winning
+/// failure may therefore not surface as `kakehashi diagnose` exit 2. The
+/// default `concatenated` strategy drains every task (`join_next` to `None`)
+/// and is exact; the all-servers-fail case yields `NoResult` with no winner,
+/// hence no abort and a deterministic count. Only "preferred + a winner + a
+/// non-winning failure" is racy — and under preferred semantics the winner's
+/// result is authoritative, so whether that should be exit 2 at all is a
+/// product question. See #487 for the fix options (shared with the formatting
+/// preferred path).
 async fn dispatch_preferred_diagnostics(
     region_ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
+    sink: &RequestErrorSink,
 ) -> Vec<Diagnostic> {
     let result = dispatch_preferred(
         region_ctx,
         pool,
-        send_diagnostic_fan_out_request,
+        |t| send_diagnostic_request_counting_errors(t, sink.clone()),
         |v: &Vec<Diagnostic>| !v.is_empty(),
         None, // cancel handled at outer level
     )

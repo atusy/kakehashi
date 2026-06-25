@@ -35,7 +35,8 @@ use super::super::pool::{
     MessageSender, UpstreamId,
 };
 use super::super::protocol::{
-    JsonRpcNotification, JsonRpcRequest, RequestId, response_has_jsonrpc_error,
+    JsonRpcNotification, JsonRpcRequest, RequestId, jsonrpc_error_summary,
+    response_has_jsonrpc_error,
 };
 use crate::config::settings::BridgeServerConfig;
 
@@ -220,8 +221,10 @@ impl LanguageServerPool {
     /// Send a host bridge request with the upstream params forwarded
     /// **verbatim** (host-document-bridge): the params already reference the
     /// real URI and real coordinates, so no per-method request shaping is
-    /// needed. Returns the raw `result` value, or `None` for a `null`
-    /// result, a JSON-RPC error, or a missing capability.
+    /// needed. Returns the raw `result` value, `Ok(None)` for a `null`/absent
+    /// result or a missing capability, and `Err` for a transport failure or a
+    /// downstream JSON-RPC error response (a request failure, so a sink can
+    /// count it).
     ///
     /// One exception to verbatim: the progress tokens are stripped. The
     /// bridge discards downstream notifications, so a server honoring
@@ -270,7 +273,10 @@ impl LanguageServerPool {
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
             move |response| parse_host_raw_response(response, method),
         )
-        .await
+        // Outer `?`: transport/protocol failure from `execute_host_request`.
+        // Inner `Result` from the parser: a downstream JSON-RPC error response.
+        // Both are request failures, so flatten them into one `Err`.
+        .await?
     }
 
     /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],
@@ -435,17 +441,32 @@ fn host_url_to_lsp_uri(uri: &Url) -> io::Result<Uri> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
-/// Strip the JSON-RPC envelope: `None` for an error response or a `null`
-/// result, the bare `result` value otherwise.
+/// Strip the JSON-RPC envelope: `Err` for an error response (a request
+/// failure), `Ok(None)` for a `null` or absent result, and `Ok(Some(result))`
+/// with the bare `result` value otherwise.
 fn parse_host_raw_response(
     mut response: serde_json::Value,
     method: &'static str,
-) -> Option<serde_json::Value> {
+) -> io::Result<Option<serde_json::Value>> {
+    // A downstream JSON-RPC error response is a request failure, not "no
+    // result" — propagate it as `Err` so a request-error sink can surface it
+    // (mirrors the formatting path). The generic host bridging caller
+    // (`host_layer_value_with_ctx`) collapses `Err` and `Ok(None)` to the same
+    // empty layer, so this only adds a WARNING log there; the host diagnostic
+    // path uses the `Err` to count the failure for CLI mode's exit code.
     if response_has_jsonrpc_error(&response, method) {
-        return None;
+        return Err(io::Error::other(format!(
+            "downstream server answered {method} with an error response: {}",
+            jsonrpc_error_summary(&response)
+        )));
     }
-    let result = response.get_mut("result")?.take();
-    if result.is_null() { None } else { Some(result) }
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        // No `result` and no `error` is a protocol violation, but kept as an
+        // empty layer here (not `Err`) to preserve the long-standing raw-host
+        // behavior for non-diagnostic methods.
+        return Ok(None);
+    };
+    Ok(if result.is_null() { None } else { Some(result) })
 }
 
 /// Parse a host formatting response with formatting's null semantics:
@@ -461,7 +482,8 @@ fn parse_host_formatting_response(
 ) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, method) {
         return Err(io::Error::other(format!(
-            "downstream server answered {method} with an error response"
+            "downstream server answered {method} with an error response: {}",
+            jsonrpc_error_summary(&response)
         )));
     }
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
@@ -539,8 +561,9 @@ mod tests {
                 "start": { "line": 34, "character": 0 },
                 "end": { "line": 34, "character": 11 } } }]
         });
-        let result =
-            parse_host_raw_response(response, "textDocument/definition").expect("result expected");
+        let result = parse_host_raw_response(response, "textDocument/definition")
+            .expect("no request failure")
+            .expect("result expected");
         assert_eq!(result[0]["uri"], "file:///doc.md");
         assert_eq!(
             result[0]["range"]["start"]["line"], 34,
@@ -551,16 +574,22 @@ mod tests {
     #[test]
     fn raw_response_null_is_none() {
         let response = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null });
-        assert!(parse_host_raw_response(response, "textDocument/hover").is_none());
+        assert!(
+            parse_host_raw_response(response, "textDocument/hover")
+                .expect("null result is not a failure")
+                .is_none()
+        );
     }
 
     #[test]
-    fn raw_response_error_is_none() {
+    fn raw_response_error_is_err() {
+        // A JSON-RPC error response is a request failure, surfaced as `Err` so
+        // a request-error sink (CLI diagnose) can count it.
         let response = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "error": { "code": -32603, "message": "boom" }
         });
-        assert!(parse_host_raw_response(response, "textDocument/hover").is_none());
+        assert!(parse_host_raw_response(response, "textDocument/hover").is_err());
     }
 
     #[test]

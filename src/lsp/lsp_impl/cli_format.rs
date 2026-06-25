@@ -64,13 +64,13 @@ impl Kakehashi {
         self.initialized_impl(InitializedParams {}).await;
     }
 
-    /// Whether the path alone identifies a formattable language (loading the
+    /// Whether the path alone identifies a known language (loading the
     /// parser if installed but not yet loaded). Used to filter directory
-    /// walks; explicit files skip this (content-based detection still
-    /// applies when they are opened). Lossy conversion keeps non-UTF-8
-    /// paths eligible for extension matching, consistent with
-    /// [`Self::cli_format_text`].
-    pub(crate) fn cli_can_format_path(&self, path: &Path) -> bool {
+    /// walks for both `format` and `diagnose`; explicit files skip this
+    /// (content-based detection still applies when they are opened). Lossy
+    /// conversion keeps non-UTF-8 paths eligible for extension matching,
+    /// consistent with [`Self::cli_format_text`].
+    pub(crate) fn cli_can_handle_path(&self, path: &Path) -> bool {
         self.language
             .loadable_language_for_path(&path.to_string_lossy())
             .is_some()
@@ -133,7 +133,9 @@ impl Kakehashi {
         })
         .await;
 
-        let mut server_failures = self.wait_bridge_servers_ready(&url, ready_timeout).await;
+        let mut server_failures = self
+            .wait_bridge_servers_ready(&url, "textDocument/formatting", ready_timeout)
+            .await;
         if !self.wait_eager_open_finished(&url, ready_timeout).await {
             // Formatting would race the still-pending didOpens (the
             // downstream server may see an unknown URI and answer null =
@@ -205,26 +207,25 @@ impl Kakehashi {
     /// for this document have finished.
     ///
     /// An eager-open task claims each region's virtual document BEFORE its
-    /// `didOpen` reaches the writer queue, so a formatting request issued in
-    /// that window skips its own `didOpen` (already claimed) and overtakes
-    /// the eager one on the wire — the downstream server then sees an
-    /// unknown URI and answers `null`, which the preferred fan-in accepts as
-    /// authoritative "no edits". Editors retry past this cold-start race; a
-    /// one-shot CLI run must instead wait the tasks out: once finished,
-    /// every `didOpen` is enqueued and the single-writer FIFO keeps the
-    /// formatting request behind them.
+    /// `didOpen` reaches the writer queue, so a request issued in that window
+    /// skips its own `didOpen` (already claimed) and overtakes the eager one
+    /// on the wire — the downstream server then sees an unknown URI and
+    /// answers `null`, which the preferred fan-in accepts as authoritative
+    /// (e.g. "no edits" for formatting, "no diagnostics" for diagnose).
+    /// Editors retry past this cold-start race; a one-shot CLI run must
+    /// instead wait the tasks out: once finished, every `didOpen` is enqueued
+    /// and the single-writer FIFO keeps the request behind them.
     ///
     /// Returns `false` when the deadline expired with tasks still pending —
-    /// the caller reports that as a failure rather than formatting into the
-    /// race.
-    async fn wait_eager_open_finished(&self, uri: &Url, timeout: Duration) -> bool {
+    /// the caller reports that as a failure rather than issuing into the race.
+    pub(crate) async fn wait_eager_open_finished(&self, uri: &Url, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while !self.bridge.eager_open_tasks_finished(uri) {
             if tokio::time::Instant::now() >= deadline {
                 log::warn!(
                     target: "kakehashi::cli",
                     "eager-open tasks for {uri} did not finish within {timeout:?}; \
-                     formatting may race their didOpen"
+                     the request may race their didOpen"
                 );
                 return false;
             }
@@ -238,16 +239,25 @@ impl Kakehashi {
     /// when `bridge._self.enabled`, host-layer servers — is Ready, returning
     /// a description of each server that failed to come up.
     ///
-    /// `formatting_impl` treats a not-yet-ready server as a failed step and
-    /// skips it — correct for an editor where the next request retries, but a
-    /// one-shot CLI run would silently produce no edits. Host requests do
-    /// run their own handshake wait inside `get_or_create_connection`, but
+    /// `method` is the LSP request the caller is about to make (e.g.
+    /// `textDocument/formatting` or `textDocument/diagnostic`); it gates
+    /// host-layer participation, since `bridge._self` opts in per method.
+    ///
+    /// The relevant handler treats a not-yet-ready server as a failed step
+    /// and skips it — correct for an editor where the next request retries,
+    /// but a one-shot CLI run would silently produce no result. Host requests
+    /// do run their own handshake wait inside `get_or_create_connection`, but
     /// that time is spent inside the request's own budget — pre-warming here
     /// keeps a slow cold host server from surfacing as a spurious request
     /// failure. Spawning is idempotent
     /// (`get_or_create_connection_wait_ready`), so this overlaps with the
     /// eager-open `didOpen` triggered.
-    async fn wait_bridge_servers_ready(&self, uri: &Url, timeout: Duration) -> Vec<String> {
+    pub(crate) async fn wait_bridge_servers_ready(
+        &self,
+        uri: &Url,
+        method: &str,
+        timeout: Duration,
+    ) -> Vec<String> {
         let mut configs = Vec::new();
 
         // Virt layer: servers configured for the document's injection regions.
@@ -273,7 +283,7 @@ impl Kakehashi {
 
         // Host layer (bridge._self): resolves to nothing unless opted in.
         if let Ok(lsp_uri) = url_to_uri(uri)
-            && let Some(ctx) = self.resolve_host_bridge_context(&lsp_uri, "textDocument/formatting")
+            && let Some(ctx) = self.resolve_host_bridge_context(&lsp_uri, method)
         {
             configs.extend(ctx.configs);
         }

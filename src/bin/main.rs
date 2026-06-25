@@ -69,6 +69,40 @@ enum Commands {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 1)]
         insert_spaces: bool,
     },
+    /// Report diagnostics for files via the configured downstream language servers
+    ///
+    /// Only pull diagnostics (textDocument/diagnostic) are collected. Push
+    /// diagnostics (textDocument/publishDiagnostics) are NOT reported, so a
+    /// downstream server that only publishes diagnostics and does not answer a
+    /// pull request will contribute nothing here.
+    ///
+    /// Directories are walked recursively respecting .gitignore; explicitly
+    /// listed files are diagnosed even when gitignored.
+    ///
+    /// Exit codes: 0 = no failing diagnostics; 1 = a failing diagnostic (any
+    /// error, plus warnings with --fail-on-warning; info/hint never fail —
+    /// append `|| true` to never fail); 2 = an operational error (unreadable
+    /// file, downstream server failure), independent of the diagnostics.
+    Diagnose {
+        /// Files or directories to diagnose ("-" for stdin with --stdin-filename)
+        paths: Vec<PathBuf>,
+
+        /// Read from stdin, treat content as this file path, print its diagnostics
+        #[arg(long)]
+        stdin_filename: Option<PathBuf>,
+
+        /// Exclude paths matching this gitignore-style pattern (repeatable)
+        #[arg(long = "excludes")]
+        excludes: Vec<String>,
+
+        /// How to render each diagnostic
+        #[arg(long, value_enum, default_value = "default")]
+        output_format: kakehashi::cli::diagnose::OutputFormat,
+
+        /// Exit 1 on warnings too, not just errors (info/hint never fail)
+        #[arg(long)]
+        fail_on_warning: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -223,14 +257,17 @@ fn main() -> ExitCode {
     }
 
     // LSP server mode keeps SIGPIPE ignored so the bridge sees a closed
-    // downstream peer as a recoverable BrokenPipe error. The format command
-    // drives the same bridge (it writes to downstream language-server
-    // stdin), so it needs the same disposition — otherwise a crashed
-    // downstream server would kill the CLI with SIGPIPE instead of exiting 2
-    // with a useful error; its own stdout writes handle BrokenPipe
-    // explicitly (see `cli::format::run_stdin`). Other subcommands keep the
-    // default disposition restored above.
-    if matches!(cli.command, None | Some(Commands::Format { .. })) {
+    // downstream peer as a recoverable BrokenPipe error. The format and
+    // diagnose commands drive the same bridge (they write to downstream
+    // language-server stdin), so they need the same disposition — otherwise a
+    // crashed downstream server would kill the CLI with SIGPIPE instead of
+    // exiting 2 with a useful error; their own stdout writes handle BrokenPipe
+    // explicitly (see `cli::format::run_stdin` / `cli::diagnose::write_chunk`).
+    // Other subcommands keep the default disposition restored above.
+    if matches!(
+        cli.command,
+        None | Some(Commands::Format { .. } | Commands::Diagnose { .. })
+    ) {
         ignore_sigpipe();
     }
 
@@ -270,6 +307,19 @@ fn main() -> ExitCode {
             fail_on_change,
             tab_size,
             insert_spaces,
+        }),
+        Some(Commands::Diagnose {
+            paths,
+            stdin_filename,
+            excludes,
+            output_format,
+            fail_on_warning,
+        }) => run_diagnose(kakehashi::cli::diagnose::DiagnoseOptions {
+            paths,
+            stdin_filename,
+            excludes,
+            output_format,
+            fail_on_warning,
         }),
         None => {
             // Start LSP server (backward compatible default behavior)
@@ -680,6 +730,23 @@ fn run_format(options: kakehashi::cli::format::FormatOptions) -> Result<(), Exit
 
     let code = kakehashi::cli::format::run(options);
     if code == kakehashi::cli::format::EXIT_OK {
+        Ok(())
+    } else {
+        Err(ExitCode::from(code))
+    }
+}
+
+/// Run the diagnose command. Like `format`, diagnostics flow through the same
+/// downstream language-server bridge as LSP mode, so it builds its own tokio
+/// runtime inside `cli::diagnose::run`.
+fn run_diagnose(options: kakehashi::cli::diagnose::DiagnoseOptions) -> Result<(), ExitCode> {
+    // Logging to stderr, configured via RUST_LOG — diagnostics go to stdout.
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Stderr)
+        .init();
+
+    let code = kakehashi::cli::diagnose::run(options);
+    if code == kakehashi::cli::diagnose::EXIT_OK {
         Ok(())
     } else {
         Err(ExitCode::from(code))
