@@ -20,12 +20,12 @@ tiers by their dependence on kakehashi's own tree-sitter parse:
   document to its external language server (the `_self` host bridge; see
   host-document-bridge). These forward to an external server keyed by the host
   language. They need the document **text and a language name only** — never the
-  tree. `eager_open_host_document_on_servers`
-  (`src/lsp/bridge/coordinator.rs`) takes `(settings, language: &str, uri,
-  text)`; no tree, no loaded parser. The language name it needs is
-  `language_for_path(path).or(language_id)`, a **path-based** resolution computed
-  in `did_open_impl` *before* `ensure_language_loaded` — so it is available ahead
-  of the parser-load attempt, not only ahead of the parse.
+  tree. `eager_open_host_document_on_servers` (`src/lsp/bridge/coordinator.rs`)
+  takes `(settings, language: &str, uri, text)`; no tree, no loaded parser. The
+  language name it needs is `language_for_path(path).or(language_id)`, a
+  **path-based** resolution computed in `did_open_impl` *before*
+  `ensure_language_loaded` — so it is available ahead of the parser-load attempt,
+  not only ahead of the parse.
 - **Virt tier** — the same features over *injected* regions. These need the tree
   **only to locate the region** under the cursor
   (`InjectionResolver::resolve_at_byte_offset(..., snapshot.tree(), ...)`); the
@@ -116,9 +116,13 @@ bridge:
   sync of a pair always finds the entry vacant and emits `didOpen`, *regardless* of
   which spawned task reaches the lock first. This carries the invariant on its own.
 - **FIFO enqueue under the lock.** Within the locked region the message goes onto
-  the per-connection FIFO via a non-blocking `try_send` with no `await` between
-  lock and enqueue, and the single writer task drains in FIFO order — so the
-  `didOpen`/`didChange` decided by the entry state cannot then be reordered on the
+  the per-connection FIFO. The enqueue itself is a synchronous `try_send`: the
+  `send_notification` call `sync_host_document` awaits is `async` in signature but
+  completes **without yielding** in the current `MessageSender`, so the lock is
+  not released between deciding the message and enqueuing it (this is an
+  implementation property of the current sender, not a hard structural guarantee
+  about `await` placement). The single writer task then drains in FIFO order — so
+  the `didOpen`/`didChange` decided by the entry state cannot be reordered on the
   wire. (Which task acquires the lock first is task-schedule order, not handler
   order; the entry-state discrimination is what makes that irrelevant.)
 
