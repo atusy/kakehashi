@@ -269,8 +269,8 @@ since the last completed parse:
 
 ```text
 on SetText(delta):  latest = apply(latest, delta); pending_edits += delta.edits;
-                    if parsing { dirty = true } else { start_parse(latest, take(pending_edits)) }
-on parse_done:      if dirty { dirty = false; start_parse(latest, take(pending_edits)) }
+                    if parsing { dirty = true } else { parsing = true; start_parse(latest, take(pending_edits)) }
+on parse_done:      if dirty { dirty = false; start_parse(latest, take(pending_edits)) } else { parsing = false }
 ```
 
 A parse is incremental when a base tree exists, feeding tree-sitter the
