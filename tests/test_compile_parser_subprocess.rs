@@ -45,6 +45,11 @@ fn compile_parser_subcommand_is_hidden_from_help() {
         .output()
         .expect("spawn kakehashi --help");
 
+    assert!(
+        output.status.success(),
+        "--help must succeed (else the hidden-check below is vacuous); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(
         !help.contains("__compile-parser"),

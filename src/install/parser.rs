@@ -181,11 +181,20 @@ pub fn arm_compile_watchdog() {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::{Pid, setpgid};
-        // Own group leader. When spawned by run_killable_subprocess the parent
-        // already did this via process_group(0) (a harmless repeat); when run
-        // directly it makes the group-kill below safe. Ignore EPERM-if-already.
+        use nix::unistd::{Pid, getpgrp, getpid, setpgid};
+        // Become our own group leader. When spawned by run_killable_subprocess the
+        // parent already did this via process_group(0) (a harmless repeat); when run
+        // directly it isolates us from the launching shell's group.
         let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+        // CRITICAL: only arm the group-kill if we are *confirmed* our own group
+        // leader (pgid == pid). If setpgid failed (sandbox, already a session
+        // leader), we're still in the parent's/shell's group, and killpg(0) would
+        // SIGKILL *that* group — terminating the parent (or an interactive shell)
+        // along with us. In that case skip the watchdog: the parent-side deadline
+        // still bounds the compile; we only forgo the orphan backstop.
+        if getpgrp() != getpid() {
+            return;
+        }
         std::thread::spawn(|| {
             std::thread::sleep(PARSER_COMPILE_TIMEOUT + Duration::from_secs(30));
             // pgid 0 = our own process group (us + the cc we shelled out).
