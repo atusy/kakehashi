@@ -533,15 +533,16 @@ fn run_with_timeout(
 /// *grandchild*). A bare `child.kill()` reaches only the direct child and leaves
 /// the `cc` grandchild running — the very hang this deadline exists to bound. So
 /// the child is spawned as its own **process-group leader** and the deadline kill
-/// targets the whole **group**, reaping grandchildren too.
+/// targets the whole **group**, terminating grandchildren too (the direct child is
+/// reaped here; the terminated descendants are reaped by init after reparenting).
 fn run_killable_subprocess(
     mut cmd: Command,
     timeout: Duration,
     context: &str,
 ) -> Result<std::process::ExitStatus, ParserInstallError> {
     // Spawn the child as its own process-group leader (pgid == child pid), so a
-    // deadline kill can target the whole group and reap grandchildren (the `cc`
-    // the compile shells out to) rather than orphaning them.
+    // deadline kill can terminate the whole group (the `cc` the compile shells out
+    // to) rather than orphaning grandchildren.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -578,12 +579,14 @@ fn run_killable_subprocess(
     }
 }
 
-/// Kill the child **and** any grandchildren it spawned. The child was started as
-/// its own process-group leader, so its pgid equals its pid and a group-wide
-/// signal reaches the whole tree (`cc`, linkers, etc.). On non-unix this falls
-/// back to a direct `child.kill()`, which does **not** reap grandchildren — the
-/// orphaned-`cc` hazard is unmitigated there (kakehashi targets unix in practice;
-/// a Job Object would be the Windows equivalent).
+/// Terminate the child **and** every descendant it spawned. The child was started
+/// as its own process-group leader, so its pgid equals its pid and a group-wide
+/// `SIGKILL` reaches the whole tree (`cc`, linkers, etc.). This only *terminates*
+/// descendants; the caller reaps the direct child via `child.wait()`, and the
+/// terminated descendants are reparented to init and reaped there. On non-unix this
+/// falls back to a direct `child.kill()`, which does **not** reach descendants —
+/// the orphaned-`cc` hazard is unmitigated there (kakehashi targets unix in
+/// practice; a Job Object would be the Windows equivalent).
 fn kill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -702,16 +705,28 @@ mod tests {
     #[test]
     fn run_killable_subprocess_terminates_descendants_on_deadline() {
         let tmp = tempdir().expect("temp dir");
-        let marker = tmp.path().join("grandchild-survived");
+        let survived = tmp.path().join("grandchild-survived");
+        let spawned = tmp.path().join("grandchild-spawned");
         let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(format!("( sleep 2; touch '{}' ) & wait", marker.display()));
+        // Background a grandchild that touches `survived` 2s out; `spawned` is
+        // touched right after launching it (proving the descendant was actually
+        // started, so an absent `survived` can't be a vacuous pass from sh dying
+        // before it forked the child).
+        cmd.arg("-c").arg(format!(
+            "( sleep 2; touch '{}' ) & touch '{}'; wait",
+            survived.display(),
+            spawned.display()
+        ));
 
         let started = std::time::Instant::now();
         let result = run_killable_subprocess(cmd, Duration::from_millis(700), "test compile");
         assert!(
             result.is_err(),
             "a subprocess that outlives the deadline must error out"
+        );
+        assert!(
+            spawned.exists(),
+            "the grandchild must have been spawned (else the test would pass vacuously)"
         );
 
         // Wait past the grandchild's would-be touch time (2s), then assert it
@@ -720,7 +735,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(
-            !marker.exists(),
+            !survived.exists(),
             "the backgrounded grandchild created its marker, so it survived the \
              deadline — it must be terminated with the process group, not orphaned"
         );
