@@ -42,6 +42,29 @@ use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString}
 use crate::cli::files::collect_files;
 use crate::lsp::Kakehashi;
 
+/// Write one line to stderr, tolerating a closed pipe.
+///
+/// `diagnose` ignores `SIGPIPE` (so the bridge can treat a broken pipe as a
+/// recoverable error rather than a process-killing signal). A consequence is
+/// that a plain `eprintln!` to a *closed* stderr — e.g. `kakehashi diagnose
+/// … 2>&1 | head` once `head` exits — returns `BrokenPipe`, and `eprintln!`
+/// panics on a write error (exit 101). Route every stderr line (errors and the
+/// summary) through this so a closed consumer ends cleanly: the write result is
+/// intentionally dropped, since there is nowhere left to report a failure to
+/// report. Mirrors `write_chunk`'s BrokenPipe tolerance for stdout.
+fn eprintln_lossy(args: std::fmt::Arguments) {
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr
+        .write_fmt(args)
+        .and_then(|()| stderr.write_all(b"\n"));
+}
+
+/// `eprintln!` that tolerates a closed stderr pipe — see [`eprintln_lossy`].
+macro_rules! elnln {
+    ($($arg:tt)*) => { eprintln_lossy(format_args!($($arg)*)) };
+}
+
 /// How to render each diagnostic. Derives clap's kebab-case value names:
 /// `default`, `jsonl`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -92,7 +115,7 @@ pub fn run(options: DiagnoseOptions) -> u8 {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("error: failed to start async runtime: {e}");
+            elnln!("error: failed to start async runtime: {e}");
             return EXIT_ERROR;
         }
     };
@@ -103,7 +126,7 @@ async fn run_async(options: DiagnoseOptions) -> u8 {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(e) => {
-            eprintln!("error: cannot determine current directory: {e}");
+            elnln!("error: cannot determine current directory: {e}");
             return EXIT_ERROR;
         }
     };
@@ -184,7 +207,7 @@ impl Report {
 /// File mode: expand `paths`, diagnose each file, and print per `--output-format`.
 async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) -> u8 {
     if options.paths.is_empty() {
-        eprintln!("error: no paths given; pass files/directories or use --stdin-filename");
+        elnln!("error: no paths given; pass files/directories or use --stdin-filename");
         return EXIT_ERROR;
     }
 
@@ -193,7 +216,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     }) {
         Ok(files) => files,
         Err(e) => {
-            eprintln!("error: {e}");
+            elnln!("error: {e}");
             return EXIT_ERROR;
         }
     };
@@ -220,7 +243,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) => {
-                eprintln!("error: cannot read '{display}': {e}");
+                elnln!("error: cannot read '{display}': {e}");
                 report.operational_error = true;
                 continue;
             }
@@ -229,7 +252,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             .cli_diagnose_text(file, &text, SERVER_READY_TIMEOUT)
             .await;
         for failure in &outcome.server_failures {
-            eprintln!("error: {display}: {failure}");
+            elnln!("error: {display}: {failure}");
             report.operational_error = true;
         }
         buf.clear();
@@ -268,13 +291,13 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     let stdin_paths_ok = options.paths.is_empty()
         || (options.paths.len() == 1 && options.paths[0].as_os_str() == "-");
     if !stdin_paths_ok {
-        eprintln!("error: --stdin-filename accepts no paths (optionally a single \"-\")");
+        elnln!("error: --stdin-filename accepts no paths (optionally a single \"-\")");
         return EXIT_ERROR;
     }
 
     let mut text = String::new();
     if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut text) {
-        eprintln!("error: failed to read stdin: {e}");
+        elnln!("error: failed to read stdin: {e}");
         return EXIT_ERROR;
     }
 
@@ -290,7 +313,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     let mut report = Report::default();
     let display = name.display().to_string();
     for failure in &outcome.server_failures {
-        eprintln!("error: {display}: {failure}");
+        elnln!("error: {display}: {failure}");
         report.operational_error = true;
     }
     let mut buf = String::new();
@@ -342,7 +365,7 @@ fn write_chunk(chunk: &str) -> WriteState {
         Ok(()) => WriteState::Open,
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => WriteState::PipeClosed,
         Err(e) => {
-            eprintln!("error: failed to write stdout: {e}");
+            elnln!("error: failed to write stdout: {e}");
             WriteState::Failed
         }
     }
@@ -358,7 +381,7 @@ fn summarize(report: &Report, file_count: usize) -> u8 {
     } else {
         "diagnostics"
     };
-    eprintln!("{} {diag_label} in {file_count} {file_label}", report.total);
+    elnln!("{} {diag_label} in {file_count} {file_label}", report.total);
 
     report.exit_code()
 }
