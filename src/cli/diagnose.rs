@@ -477,11 +477,15 @@ type CodeSortKey<'a> = (u8, i32, Option<&'a str>);
 /// end still sort deterministically.
 type RangeSortKey = (u32, u32, u32, u32);
 
-/// A total-order key for stable output. Ordering: range, then severity (most
-/// severe first), source, code, and message — so a diagnostic with no severity
-/// (ranked as error) and one out-of-spec severity still sort deterministically,
-/// and every field of two otherwise-identical-but-distinct diagnostics
-/// participates in the order.
+/// An ordering key for stable output. Ordering: range, then severity (most
+/// severe first — a diagnostic with no severity, or an out-of-spec one, ranks
+/// as an error), source, code, and message. This keys on the fields a human or
+/// editor actually reads; the remaining `Diagnostic` fields (`tags`, `data`,
+/// `related_information`, `code_description`) are not part of the key — `data`
+/// is an arbitrary JSON value with no `Ord`, and including it would force an
+/// allocation in the hot path (see below). Two diagnostics that match on every
+/// keyed field therefore keep their input order, which `sort_by`'s stability
+/// preserves; in practice a downstream server does not emit such pairs.
 ///
 /// Allocation-free (it borrows from `diagnostic`): `sort_key` is evaluated
 /// twice per comparison across an `O(N log N)` sort, so it must not allocate.
