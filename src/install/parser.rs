@@ -247,9 +247,17 @@ pub fn install_parser(
 
     // Compile the parser directly to the install path
     fs::create_dir_all(&parser_dir)?;
-    match options.compile {
-        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &parser_file)?,
-        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &parser_file)?,
+    let compiled = match options.compile {
+        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &parser_file),
+        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &parser_file),
+    };
+    if let Err(e) = compiled {
+        // A failed or deadline-killed compile can leave a partial/corrupt shared
+        // library at `parser_file`. `parser_file_exists` only checks existence, so
+        // a leftover artifact would make every later run skip reinstall and load a
+        // broken parser. Remove it before surfacing the error.
+        let _ = fs::remove_file(&parser_file);
+        return Err(e);
     }
 
     if options.verbose {
@@ -592,7 +600,11 @@ fn kill_process_group(child: &mut std::process::Child) {
     {
         use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
-        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+        // If the group signal can't be delivered (sandbox/OS limits), still make a
+        // best effort to kill the direct child so it isn't left running.
+        if killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL).is_err() {
+            let _ = child.kill();
+        }
     }
     #[cfg(not(unix))]
     {
