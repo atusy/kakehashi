@@ -86,7 +86,6 @@ impl ConnectionKey {
     }
 
     /// The config server name (the `language_servers` map key).
-    #[cfg(test)]
     pub(crate) fn server(&self) -> &str {
         &self.server
     }

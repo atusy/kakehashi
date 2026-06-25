@@ -22,15 +22,18 @@
 //! - [`DiagnosticSource::Host`] — a downstream `_self` host-layer push for the
 //!   real host document, in host coordinates (passes through unchanged).
 //!
-//! **Known interim overlap (deferred capability gate).** The pull feed fans out
-//! to *every* configured server (region and host) with no capability
-//! classification, so a server that both answers `textDocument/diagnostic`
-//! (landing in `PullLayer`) *and* spontaneously pushes `publishDiagnostics`
-//! (landing in a `Region` or `Host` slot) is counted twice. In practice the two
-//! channels are disjoint — a pull-capable server should not also push (LSP) — so
-//! this only *duplicates*, never *hides*, and only for a misbehaving server. The
-//! deferred `pullFallback` / capability classification removes the overlap by
-//! giving each server one native source.
+//! **One native source per server (#425).** A server that both answers
+//! `textDocument/diagnostic` (landing in `PullLayer`) *and* spontaneously pushes
+//! `publishDiagnostics` (landing in a `Region` or `Host` slot) would be counted
+//! twice. The proactive publisher's
+//! [`filter_pull_driven_push_slots`](crate::lsp::lsp_impl::coordinator) drops a
+//! **pull-driven** server's push slots from the publish whenever a `PullLayer`
+//! blob is present (classification is live via
+//! [`LanguageServerPool::pull_driven_servers`](crate::lsp::bridge::LanguageServerPool)),
+//! so the pull contribution wins and the push is kept only as the proactive
+//! source for genuinely **push-driven** servers. The slot stays cached either
+//! way (so a pull-driven server's spontaneous push still closes #380 when
+//! `pullFallback` is off and no `PullLayer` exists).
 //!
 //! Region-invalidation eviction is implemented (`evict_source`, wired into the
 //! edit path that orphans a region — #424) and crash/server eviction too

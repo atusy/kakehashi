@@ -452,6 +452,38 @@ impl LanguageServerPool {
         self.connections.lock().await
     }
 
+    /// Among `candidates`, the server names that have a **live connection
+    /// advertising pull diagnostics** — `textDocument/diagnostic`, via static
+    /// initialize caps or a dynamic registration — checked WITHOUT creating a
+    /// connection (push-propagation-diagnostic-forwarding "Per-server source and
+    /// fallback", #425). Classification is therefore *live*: a server that
+    /// registers/unregisters pull support mid-session is reclassified by the
+    /// next call.
+    ///
+    /// The proactive publisher uses this to classify which cached push slots
+    /// come from a pull-driven server, so the host-event pull (`PullLayer`) and
+    /// that server's spontaneous push don't double-count it.
+    pub(crate) async fn pull_driven_servers(
+        &self,
+        candidates: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        if candidates.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let connections = self.connections.lock().await;
+        let mut pull_driven = std::collections::HashSet::new();
+        for handle in connections.values() {
+            let server = handle.key().server();
+            if candidates.contains(server)
+                && !pull_driven.contains(server)
+                && handle.has_capability("textDocument/diagnostic")
+            {
+                pull_driven.insert(server.to_string());
+            }
+        }
+        pull_driven
+    }
+
     /// Host-document sync state (host-document-bridge). Used by the host
     /// request path in `text_document/host.rs`.
     pub(super) async fn host_documents(
@@ -4904,5 +4936,58 @@ mod tests {
             Some(2),
             "init_server: opened=1, no didChange, test-increment=2"
         );
+    }
+
+    /// `pull_driven_servers` classifies among `candidates` exactly the servers
+    /// with a live connection advertising `textDocument/diagnostic` (#425):
+    /// a pull-capable server is returned, a push-only one is not, and a name
+    /// with no live connection is dropped — all without creating a connection.
+    #[tokio::test]
+    async fn pull_driven_servers_classifies_by_live_capability() {
+        use std::collections::HashSet;
+        use tower_lsp_server::ls_types::{
+            DiagnosticOptions, DiagnosticServerCapabilities, ServerCapabilities,
+        };
+
+        let pool = LanguageServerPool::new();
+
+        // "ra" advertises pull diagnostics (static capability) → pull-driven.
+        let ra =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("ra")).await;
+        ra.set_server_capabilities(ServerCapabilities {
+            diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                DiagnosticOptions::default(),
+            )),
+            ..Default::default()
+        });
+        pool.insert_connection(ra).await;
+
+        // "linter" has no diagnostic capability → push-driven.
+        let linter =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("linter"))
+                .await;
+        linter.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(linter).await;
+
+        let candidates = HashSet::from([
+            "ra".to_string(),
+            "linter".to_string(),
+            "ghost".to_string(), // no live connection
+        ]);
+        let pull_driven = pool.pull_driven_servers(&candidates).await;
+
+        assert_eq!(
+            pull_driven,
+            HashSet::from(["ra".to_string()]),
+            "only the pull-capable server with a live connection is pull-driven"
+        );
+    }
+
+    /// An empty candidate set short-circuits to empty without touching the pool.
+    #[tokio::test]
+    async fn pull_driven_servers_empty_candidates_returns_empty() {
+        use std::collections::HashSet;
+        let pool = LanguageServerPool::new();
+        assert!(pool.pull_driven_servers(&HashSet::new()).await.is_empty());
     }
 }
