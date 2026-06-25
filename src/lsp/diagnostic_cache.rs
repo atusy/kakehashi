@@ -192,6 +192,73 @@ pub(crate) fn merge_cached_diagnostics(
     merged
 }
 
+/// Every distinct server name with a **push** slot (`Region`/`Host`, never
+/// `PullLayer`) in `snapshot`. Path B's `pushFallback` fold uses this to
+/// classify which cached pushers are push-driven (#425). Takes the snapshot the
+/// caller already holds so the candidate set and the folded slots come from the
+/// **same** read (no TOCTOU window across the classifying `await`).
+pub(crate) fn push_slot_servers(snapshot: &SourceSlots) -> std::collections::HashSet<String> {
+    let mut servers = std::collections::HashSet::new();
+    for (source, slots) in snapshot {
+        if matches!(source, DiagnosticSource::PullLayer) {
+            continue;
+        }
+        servers.extend(slots.keys().cloned());
+    }
+    servers
+}
+
+/// Cached **push** diagnostics from `snapshot`, partitioned by layer, for every
+/// `(source, server)` the `include` predicate accepts — Path B's `pushFallback`
+/// fold (#425). `Region` slots are transformed to host coordinates via
+/// `region_offsets` (a region with no current offset is skipped, like the
+/// proactive merge); `Host` slots are already host-local. The `PullLayer` blob
+/// is never returned — Path B live-pulls pull-driven servers, so folding the
+/// blob would double-count them.
+///
+/// The caller passes the snapshot (rather than re-reading the cache) so the
+/// folded slots match the snapshot its candidate classification was derived
+/// from. Returns `(virt_layer_items, host_layer_items)` so the caller can extend
+/// each layer's live-pull result before the cross-layer combine.
+pub(crate) fn cached_push_diagnostics(
+    host: &Url,
+    snapshot: SourceSlots,
+    region_offsets: &HashMap<String, RegionOffset>,
+    include: impl Fn(&DiagnosticSource, &str) -> bool,
+) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    let host_str = host.as_str();
+    let mut region_items = Vec::new();
+    let mut host_items = Vec::new();
+    for (source, servers) in snapshot {
+        match &source {
+            DiagnosticSource::PullLayer => {}
+            DiagnosticSource::Region(region_id) => {
+                let Some(offset) = region_offsets.get(region_id) else {
+                    continue;
+                };
+                for (server, slot) in servers {
+                    if !include(&source, &server) {
+                        continue;
+                    }
+                    for mut diagnostic in slot.diagnostics {
+                        transform_region_diagnostic(&mut diagnostic, offset, host_str);
+                        region_items.push(diagnostic);
+                    }
+                }
+            }
+            DiagnosticSource::Host => {
+                for (server, slot) in servers {
+                    if !include(&source, &server) {
+                        continue;
+                    }
+                    host_items.extend(slot.diagnostics);
+                }
+            }
+        }
+    }
+    (region_items, host_items)
+}
+
 /// Largest set for which the serialization-free O(n²) match is used; above this, a
 /// noisy server's payload would make the quadratic compare a republish bottleneck,
 /// so we switch to the O(n) serialized-count path.
@@ -427,72 +494,6 @@ impl DiagnosticAggregator {
                     && servers.values().any(|slot| !slot.diagnostics.is_empty())
             })
         })
-    }
-
-    /// Every distinct server name with a cached **push** slot (`Region`/`Host`,
-    /// never `PullLayer`) for `host`. Path B's `pushFallback` fold uses this to
-    /// classify which cached pushers are push-driven (#425).
-    pub(crate) fn push_slot_servers(&self, host: &Url) -> std::collections::HashSet<String> {
-        let cache = self.lock();
-        let mut servers = std::collections::HashSet::new();
-        if let Some(sources) = cache.get(host) {
-            for (source, slots) in sources {
-                if matches!(source, DiagnosticSource::PullLayer) {
-                    continue;
-                }
-                servers.extend(slots.keys().cloned());
-            }
-        }
-        servers
-    }
-
-    /// Cached **push** diagnostics for `host`, partitioned by layer, for every
-    /// `(source, server)` the `include` predicate accepts — Path B's
-    /// `pushFallback` fold (#425). `Region` slots are transformed to host
-    /// coordinates via `region_offsets` (a region with no current offset is
-    /// skipped, like the proactive merge); `Host` slots are already host-local.
-    /// The `PullLayer` blob is never returned — Path B live-pulls pull-driven
-    /// servers, so folding the blob would double-count them.
-    ///
-    /// Returns `(virt_layer_items, host_layer_items)` so the caller can extend
-    /// each layer's live-pull result before the cross-layer combine.
-    pub(crate) fn cached_push_diagnostics(
-        &self,
-        host: &Url,
-        region_offsets: &HashMap<String, RegionOffset>,
-        include: impl Fn(&DiagnosticSource, &str) -> bool,
-    ) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
-        let host_str = host.as_str();
-        let mut region_items = Vec::new();
-        let mut host_items = Vec::new();
-        for (source, servers) in self.snapshot(host) {
-            match &source {
-                DiagnosticSource::PullLayer => {}
-                DiagnosticSource::Region(region_id) => {
-                    let Some(offset) = region_offsets.get(region_id) else {
-                        continue;
-                    };
-                    for (server, slot) in servers {
-                        if !include(&source, &server) {
-                            continue;
-                        }
-                        for mut diagnostic in slot.diagnostics {
-                            transform_region_diagnostic(&mut diagnostic, offset, host_str);
-                            region_items.push(diagnostic);
-                        }
-                    }
-                }
-                DiagnosticSource::Host => {
-                    for (server, slot) in servers {
-                        if !include(&source, &server) {
-                            continue;
-                        }
-                        host_items.extend(slot.diagnostics);
-                    }
-                }
-            }
-        }
-        (region_items, host_items)
     }
 
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
@@ -1004,7 +1005,7 @@ mod tests {
         );
         agg.set_pull_layer(&host(), vec![diag("p")]);
 
-        let servers = agg.push_slot_servers(&host());
+        let servers = push_slot_servers(&agg.snapshot(&host()));
         assert_eq!(
             servers,
             std::collections::HashSet::from(["linter".to_string(), "hostlint".to_string()]),
@@ -1035,8 +1036,12 @@ mod tests {
         let mut offsets = HashMap::new();
         offsets.insert("r1".to_string(), RegionOffset::new(5, 0));
 
-        let (region_items, host_items) =
-            agg.cached_push_diagnostics(&host(), &offsets, |_source, _server| true);
+        let (region_items, host_items) = cached_push_diagnostics(
+            &host(),
+            agg.snapshot(&host()),
+            &offsets,
+            |_source, _server| true,
+        );
 
         assert_eq!(region_items.len(), 1);
         assert_eq!(region_items[0].message, "region");
@@ -1084,8 +1089,12 @@ mod tests {
         let mut offsets = HashMap::new();
         offsets.insert("r1".to_string(), RegionOffset::new(0, 0));
 
-        let (region_items, host_items) =
-            agg.cached_push_diagnostics(&host(), &offsets, |_source, server| server == "linter");
+        let (region_items, host_items) = cached_push_diagnostics(
+            &host(),
+            agg.snapshot(&host()),
+            &offsets,
+            |_source, server| server == "linter",
+        );
 
         assert_eq!(
             region_items

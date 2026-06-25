@@ -42,28 +42,52 @@ impl DiagnosticSnapshot {
     }
 }
 
+/// What the host-event pull collection wants done to the host's `PullLayer`
+/// slot (push-propagation-diagnostic-forwarding). The three states are
+/// distinct: `Skip` ≠ `Clear` (do nothing vs evict).
+pub(crate) enum PullLayerOutcome {
+    /// No snapshot (document gone / can never contribute): do nothing, leave the
+    /// cache untouched.
+    Skip,
+    /// Contributors exist but none can pull this event (every layer is
+    /// `pullFallback`-gated, or there are genuinely none): **evict** the host's
+    /// `PullLayer` so a stale pull blob does not linger AND an absent (not
+    /// merely empty) `PullLayer` lets a pull-driven server's spontaneous push
+    /// publish — the `pullFallback = false` guarantee (#425). Distinct from a
+    /// pull that ran and returned clean (that keeps an empty `PullLayer` present
+    /// so the clean result still suppresses a pull-driven server's stale push).
+    Clear,
+    /// A pull ran; publish its (possibly empty) result as the `PullLayer` blob.
+    Publish(Vec<tower_lsp_server::ls_types::Diagnostic>),
+}
+
 /// Collect diagnostics from every participating layer using priority-aware
 /// aggregation (cross-layer-aggregation).
 ///
 /// Shared logic for both immediate (didSave/didOpen) and debounced (didChange)
-/// push diagnostics. Returns `None` if there's no snapshot data, or
-/// `Some(diagnostics)` (possibly empty to clear previous diagnostics).
+/// push diagnostics. Returns a [`PullLayerOutcome`]: `Skip` when there is no
+/// snapshot, `Clear` when nothing can pull this event (evict a stale pull blob),
+/// or `Publish` with the pull's combined result.
 pub(crate) async fn collect_push_diagnostics(
     snapshot_data: Option<DiagnosticSnapshot>,
     pool: &Arc<LanguageServerPool>,
     uri: &Url,
     log_target: &'static str,
-) -> Option<Vec<tower_lsp_server::ls_types::Diagnostic>> {
-    let snapshot = snapshot_data?;
+) -> PullLayerOutcome {
+    let Some(snapshot) = snapshot_data else {
+        return PullLayerOutcome::Skip;
+    };
 
     if !snapshot.has_contributors() {
         log::debug!(
             target: log_target,
-            "No diagnostic contributors (regions or host servers) for {}",
+            "No diagnostic contributors (regions or host servers) for {}; clearing pull layer",
             uri
         );
-        // Return empty to signal caller should clear diagnostics
-        return Some(Vec::new());
+        // Evict (not publish-empty): an absent PullLayer both clears any stale
+        // pull result and avoids falsely triggering the pull/push double-count
+        // filter against a pull-driven server's spontaneous push (#425).
+        return PullLayerOutcome::Clear;
     }
 
     // Destructure so each future owns exactly the field it needs (the
@@ -111,7 +135,7 @@ pub(crate) async fn collect_push_diagnostics(
 
     let (virt_items, host_items) = tokio::join!(virt_fut, host_fut);
 
-    Some(combine_layer_diagnostics(
+    PullLayerOutcome::Publish(combine_layer_diagnostics(
         &layer_cfg, virt_items, host_items,
     ))
 }

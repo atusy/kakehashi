@@ -19,7 +19,7 @@ use super::bridge::{BridgeCoordinator, LanguageServerPool};
 
 use super::lsp_impl::DiagnosticPublisher;
 use super::lsp_impl::text_document::publish_diagnostic::{
-    DiagnosticSnapshot, collect_push_diagnostics,
+    DiagnosticSnapshot, PullLayerOutcome, collect_push_diagnostics,
 };
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
@@ -235,25 +235,27 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         let diagnostics =
             collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
 
-        let Some(diagnostics) = diagnostics else {
-            log::debug!(
-                target: LOG_TARGET,
-                "No diagnostics to collect for {} (no snapshot data)",
-                uri_clone
-            );
-            return;
-        };
-
-        log::debug!(
-            target: LOG_TARGET,
-            "Collected {} pull-layer diagnostics for {} (debounced)",
-            diagnostics.len(),
-            uri_clone
-        );
-
-        // Feed the host-event pull result into the cache and republish the merged
+        // Feed the host-event pull outcome into the cache and republish the merged
         // set (push-propagation-diagnostic-forwarding) — push slots survive.
-        publisher.publish_pull_layer(&uri_clone, diagnostics).await;
+        match diagnostics {
+            PullLayerOutcome::Skip => {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "No diagnostics to collect for {} (no snapshot data)",
+                    uri_clone
+                );
+            }
+            PullLayerOutcome::Clear => publisher.clear_pull_layer(&uri_clone).await,
+            PullLayerOutcome::Publish(diagnostics) => {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "Collected {} pull-layer diagnostics for {} (debounced)",
+                    diagnostics.len(),
+                    uri_clone
+                );
+                publisher.publish_pull_layer(&uri_clone, diagnostics).await;
+            }
+        }
     });
 
     // Register with SyntheticDiagnosticsManager for superseding

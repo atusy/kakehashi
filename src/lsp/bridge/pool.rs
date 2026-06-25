@@ -463,6 +463,15 @@ impl LanguageServerPool {
     /// The proactive publisher uses this to classify which cached push slots
     /// come from a pull-driven server, so the host-event pull (`PullLayer`) and
     /// that server's spontaneous push don't double-count it.
+    ///
+    /// Classification is **by server name, not by the producing connection**: a
+    /// server with several `(server, root)` connections counts as pull-driven if
+    /// *any* of them advertises the capability. Static initialize caps are
+    /// identical across instances of one binary, so this only diverges if two
+    /// instances hold *different dynamic* diagnostic registrations — an exotic
+    /// case that could misclassify the non-registering instance's push. A precise
+    /// per-`connection_id` classification belongs to the deferred per-source
+    /// fan-in (push-propagation-diagnostic-forwarding); accepted and documented.
     pub(crate) async fn pull_driven_servers(
         &self,
         candidates: &std::collections::HashSet<String>,

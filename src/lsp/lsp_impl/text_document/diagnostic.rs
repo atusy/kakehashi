@@ -27,7 +27,7 @@ use crate::lsp::aggregation::server::{
     dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{LanguageServerPool, RegionOffset};
-use crate::lsp::diagnostic_cache::DiagnosticSource;
+use crate::lsp::diagnostic_cache::{DiagnosticSource, cached_push_diagnostics, push_slot_servers};
 use crate::lsp::lsp_impl::bridge_context::{
     DocumentRequestContext, HostRequestContext, resolve_aggregation_config_from_settings,
 };
@@ -313,7 +313,11 @@ impl Kakehashi {
     /// *appended* after the region's live election rather than competing in it —
     /// consistent with Path A's concatenate-everything merge and the deferred
     /// per-source strategy fan-in (push-propagation-diagnostic-forwarding), not an
-    /// election bug.
+    /// election bug. For the same reason the fold honors only `pushFallback`, not
+    /// the visible walk: it does not re-apply `priorities`/`maxFanOut`, so a
+    /// push-driven server outside the walk is still folded — exactly what Path A's
+    /// proactive merge already publishes, until the deferred fan-in resolves the
+    /// walk for both paths together.
     async fn fold_push_fallback_diagnostics(
         &self,
         host: &Url,
@@ -323,7 +327,11 @@ impl Kakehashi {
         virt_items: &mut Vec<Diagnostic>,
         host_items: &mut Vec<Diagnostic>,
     ) {
-        let candidates = self.diagnostics.push_slot_servers(host);
+        // One snapshot drives both the candidate classification and the fold, so
+        // a push arriving across the classifying `await` below cannot land in the
+        // folded set while skipping classification (no TOCTOU double-count).
+        let snapshot = self.diagnostics.snapshot(host);
+        let candidates = push_slot_servers(&snapshot);
         if candidates.is_empty() {
             return; // no cached pushes for this host
         }
@@ -384,8 +392,7 @@ impl Kakehashi {
             }
         };
         let (region_push, host_push) =
-            self.diagnostics
-                .cached_push_diagnostics(host, &region_offsets, include);
+            cached_push_diagnostics(host, snapshot, &region_offsets, include);
         virt_items.extend(region_push);
         host_items.extend(host_push);
     }

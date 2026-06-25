@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
-    DiagnosticSnapshot, collect_push_diagnostics,
+    DiagnosticSnapshot, PullLayerOutcome, collect_push_diagnostics,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
@@ -75,21 +75,22 @@ impl DiagnosticScheduler {
             let diagnostics =
                 collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
 
-            let Some(diagnostics) = diagnostics else {
-                return;
-            };
-
-            log::debug!(
-                target: LOG_TARGET,
-                "Collected {} pull-layer diagnostics for {}",
-                diagnostics.len(),
-                uri_clone
-            );
-
-            // Feed the host-event pull result into the cache and republish the
+            // Feed the host-event pull outcome into the cache and republish the
             // merged set (push-propagation-diagnostic-forwarding) instead of
             // publishing directly — push slots for the same host survive.
-            publisher.publish_pull_layer(&uri_clone, diagnostics).await;
+            match diagnostics {
+                PullLayerOutcome::Skip => {}
+                PullLayerOutcome::Clear => publisher.clear_pull_layer(&uri_clone).await,
+                PullLayerOutcome::Publish(diagnostics) => {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "Collected {} pull-layer diagnostics for {}",
+                        diagnostics.len(),
+                        uri_clone
+                    );
+                    publisher.publish_pull_layer(&uri_clone, diagnostics).await;
+                }
+            }
         });
 
         self.synthetic_diagnostics
@@ -201,45 +202,55 @@ impl DiagnosticScheduler {
         // layer priorities AND opted in via bridge._self.enabled with a
         // host-capable server. No upstream request id — push tasks are not
         // tied to a client request.
-        let host = if layer_cfg.allows(crate::config::settings::LayerSource::Host) {
+        //
+        // `host_bridging_configured` is that participation *independent of*
+        // `pullFallback`; `host` is the pull context, which `pullFallback` can
+        // gate to `None` while the layer stays configured. The split matters so
+        // an all-gated host still yields a snapshot whose Clear outcome evicts a
+        // stale `PullLayer` (#425) rather than skipping and leaving it to linger.
+        let host_lang_settings = if layer_cfg.allows(crate::config::settings::LayerSource::Host) {
             settings
                 .resolve_host_language_settings(&language_name)
                 .filter(|lang_settings| lang_settings.is_host_bridging_enabled())
-                .and_then(|lang_settings| {
-                    let configs = self
-                        .bridge
-                        .get_host_configs_for_language(&settings, &language_name);
-                    if configs.is_empty() {
-                        return None;
-                    }
-                    let agg =
-                        lang_settings.resolve_host_aggregation("textDocument/publishDiagnostics");
-                    // `pullFallback = false` skips the host-layer pull (Path A,
-                    // #425); a push-driven `_self` server still publishes via its
-                    // cached pushes, and a pull-only `_self` server simply stops
-                    // being pulled on host events.
-                    if !agg.pull_fallback {
-                        return None;
-                    }
-                    Some(HostRequestContext {
-                        uri: uri.clone(),
-                        language_id: language_name.clone(),
-                        text: std::sync::Arc::from(snapshot.text()),
-                        configs,
-                        priorities: agg.priorities,
-                        strategy: agg.strategy,
-                        max_fan_out: agg.max_fan_out,
-                        upstream_request_id: None,
-                    })
-                })
         } else {
             None
         };
+        let mut host_bridging_configured = false;
+        let host = host_lang_settings.and_then(|lang_settings| {
+            let configs = self
+                .bridge
+                .get_host_configs_for_language(&settings, &language_name);
+            if configs.is_empty() {
+                return None;
+            }
+            host_bridging_configured = true;
+            let agg = lang_settings.resolve_host_aggregation("textDocument/publishDiagnostics");
+            // `pullFallback = false` skips the host-layer pull (Path A, #425); a
+            // push-driven `_self` server still publishes via its cached pushes,
+            // and a pull-only `_self` server simply stops being pulled on host
+            // events. The layer stays configured (above), so the snapshot is
+            // still produced and its Clear outcome evicts any stale pull blob.
+            if !agg.pull_fallback {
+                return None;
+            }
+            Some(HostRequestContext {
+                uri: uri.clone(),
+                language_id: language_name.clone(),
+                text: std::sync::Arc::from(snapshot.text()),
+                configs,
+                priorities: agg.priorities,
+                strategy: agg.strategy,
+                max_fan_out: agg.max_fan_out,
+                upstream_request_id: None,
+            })
+        });
 
-        // A document that can never contribute (no injection query, no host
-        // participation) keeps the old skip-publishing behavior.
-        let virt_contexts = match (virt_contexts, &host) {
-            (None, None) => return None,
+        // A document that can never contribute (no injection query AND no
+        // configured host layer) keeps the old skip-publishing behavior. A
+        // configured-but-pull-gated host still produces a snapshot so its stale
+        // `PullLayer` is cleared on this event.
+        let virt_contexts = match (virt_contexts, host.is_some() || host_bridging_configured) {
+            (None, false) => return None,
             (virt, _) => virt.unwrap_or_default(),
         };
 

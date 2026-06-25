@@ -257,6 +257,22 @@ impl DiagnosticPublisher {
         self.republish(host).await;
     }
 
+    /// Evict the host's `PullLayer` blob and republish — the host-event pull had
+    /// no contributors this event (every layer `pullFallback`-gated, or none).
+    ///
+    /// Eviction (vs publishing an empty blob) is deliberate: an **absent**
+    /// `PullLayer` both clears any stale pull result and stops
+    /// [`Self::filter_pull_driven_push_slots`] from treating "no pull ran" as
+    /// "pull present", which would otherwise suppress a pull-driven server's
+    /// spontaneous push under `pullFallback = false` (#425). A pull that ran and
+    /// returned clean keeps its empty `PullLayer` (via [`Self::publish_pull_layer`]),
+    /// so that path still suppresses a stale push — the two empties differ.
+    pub(crate) async fn clear_pull_layer(&self, host: &Url) {
+        self.aggregator
+            .evict_source(host, &DiagnosticSource::PullLayer);
+        self.republish(host).await;
+    }
+
     /// Evict every diagnostic slot a now-exited downstream connection produced and
     /// republish the affected hosts (#469). Called when a connection's reader exits
     /// (crash/respawn); a restart's slots carry a fresh connection id and survive,

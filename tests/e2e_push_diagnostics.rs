@@ -211,6 +211,78 @@ fn e2e_pushfallback_folds_push_driven_server_into_client_pull() {
     client.send_notification("exit", json!(null));
 }
 
+#[test]
+fn e2e_pullfallback_false_still_publishes_a_pull_driven_servers_spontaneous_push() {
+    // #425 guarantee: `pullFallback = false` stops kakehashi from PULLING a
+    // pull-driven server, but its spontaneous publishDiagnostics push must still
+    // reach the editor (#380 stays closed). Regression guard for the
+    // empty-PullLayer-suppresses-the-push bug: with no pull contributors the
+    // host's PullLayer is EVICTED (not stored empty), so the merge's pull/push
+    // dedup does not suppress the pull-driven server's cached push.
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("pullfallback.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-pullcap": {
+                        "cmd": [mock_bin(), "diagnostics-push-pullcap"],
+                        "languages": ["lua"]
+                    }
+                },
+                "languages": {
+                    "markdown": {
+                        "bridge": {
+                            "lua": {
+                                "aggregation": {
+                                    "textDocument/publishDiagnostics": { "pullFallback": false }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    // The pull-driven mock pushes on didOpen. pullFallback = false means the
+    // bridge never pulls it, so the only way its diagnostic reaches the editor is
+    // the spontaneous push surviving the merge — at host line 3.
+    let got = client.wait_for_notification_where(
+        &["textDocument/publishDiagnostics"],
+        Duration::from_secs(15),
+        pushed_diag_at_line(HOST_LINE),
+    );
+    assert!(
+        got.is_some(),
+        "pullFallback = false must still publish a pull-driven server's spontaneous push \
+         (an empty PullLayer must not suppress it)"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
 /// True if the host publish carries the mock's pushed diagnostic at host `line`.
 fn pushed_diag_at_line(line: i64) -> impl Fn(&Value) -> bool {
     move |params: &Value| {
