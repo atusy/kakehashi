@@ -563,15 +563,17 @@ print("hello")
         let did_open = server.did_open_impl(params);
         tokio::pin!(did_open);
 
-        let opened = tokio::select! {
-            // The handler parks at the blocked parse; if it ever returns, do a
-            // final check rather than assuming.
+        tokio::select! {
+            // The whole point of this test is that the host opens *while the parse
+            // is blocked*. If the handler returns instead, the parse wasn't
+            // actually gating (e.g. parsing got skipped) and the old post-parse
+            // attach position would pass too — i.e. the test would no longer
+            // discriminate the hoist. Fail loudly rather than checking vacuously.
             _ = &mut did_open => {
-                server
-                    .bridge
-                    .pool()
-                    .is_host_document_opened(&uri, "rust_ls")
-                    .await
+                panic!(
+                    "did_open_impl returned while the parse was blocked; the parse \
+                     was not gating, so this test cannot discriminate the host-tier hoist"
+                );
             }
             result = timeout(Duration::from_secs(2), async {
                 loop {
@@ -585,14 +587,17 @@ print("hello")
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-            }) => result.is_ok(),
-        };
+            }) => {
+                result.expect(
+                    "host document must attach to the _self server without waiting for the parse",
+                );
+            }
+        }
 
+        // Cleanup: release the lock so the parked parse can finish, then drive
+        // the handler to completion.
         drop(pool_guard);
-        assert!(
-            opened,
-            "host document must attach to the _self server without waiting for the parse"
-        );
+        did_open.await;
     }
 
     /// #425 regression guard: host `pullFallback = false` gates the host **pull**
