@@ -105,8 +105,28 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Compile a Tree-sitter parser from source using tree-sitter-loader.
-fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
+/// Upper bound for a single parser compile.
+///
+/// The loader shells out to `cc` with no timeout of its own; a pathological
+/// toolchain (a hung or wedged compiler) would otherwise block the install — and,
+/// in the LSP server, the in-progress install marker and process exit — forever.
+/// Generous enough not to false-kill a legitimately slow grammar (e.g. a cold
+/// TypeScript build) while still bounding a true hang.
+const PARSER_COMPILE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Compile a Tree-sitter parser from source using tree-sitter-loader, **in
+/// process**.
+///
+/// This is the raw loader call: it shells out to `cc` and, on a pathological
+/// toolchain, can hang with no surfaced child to kill. Production install does
+/// **not** call this directly — it goes through [`compile_parser`], which runs it
+/// inside a killable subprocess. This is `pub` only as the entry point for that
+/// subprocess: the hidden `__compile-parser` subcommand (`src/bin/main.rs`) calls
+/// here.
+pub fn compile_parser_inprocess(
+    grammar_path: &Path,
+    output_path: &Path,
+) -> Result<(), ParserInstallError> {
     let parent_dir = output_path.parent().ok_or_else(|| {
         ParserInstallError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -120,6 +140,40 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
     loader
         .compile_parser_at_path(grammar_path, output_path.to_path_buf(), &[])
         .map_err(|e| ParserInstallError::CompileError(e.to_string()))
+}
+
+/// Compile a Tree-sitter parser under a hard, killable deadline.
+///
+/// The loader's `compile_parser_at_path` shells out to `cc` without surfacing the
+/// child, so a `tokio::time::timeout` cannot kill a hung compiler (the blocking
+/// thread and its `cc` would keep running). Instead we **re-exec** this binary's
+/// hidden `__compile-parser` subcommand inside a killable process group (see the
+/// per-document-parse-actor ADR, "a real install deadline via a killable
+/// subprocess") and bound it with [`PARSER_COMPILE_TIMEOUT`]. Re-exec rather than
+/// `fork`: forking a multithreaded process is unsafe past the child's first
+/// non-async-signal-safe call.
+fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
+    let exe = std::env::current_exe().map_err(|e| {
+        ParserInstallError::CompileError(format!("locating the kakehashi binary: {e}"))
+    })?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("__compile-parser")
+        .arg(grammar_path)
+        .arg(output_path)
+        // Null stdin/stdout: when the parent is the LSP server, stdout is the
+        // JSON-RPC channel and no child output may reach it. stderr stays
+        // inherited so `cc` diagnostics land in the logs.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    let status = run_killable_subprocess(cmd, PARSER_COMPILE_TIMEOUT, "parser compile")?;
+    if !status.success() {
+        return Err(ParserInstallError::CompileError(format!(
+            "parser compile subprocess for '{}' exited with {}",
+            grammar_path.display(),
+            status
+        )));
+    }
+    Ok(())
 }
 
 /// Install a Tree-sitter parser for a language.
@@ -462,6 +516,15 @@ fn run_killable_subprocess(
     timeout: Duration,
     context: &str,
 ) -> Result<std::process::ExitStatus, ParserInstallError> {
+    // Spawn the child as its own process-group leader (pgid == child pid), so a
+    // deadline kill can target the whole group and reap grandchildren (the `cc`
+    // the compile shells out to) rather than orphaning them.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| ParserInstallError::CompileError(format!("{}: {}", context, e)))?;
@@ -471,9 +534,7 @@ fn run_killable_subprocess(
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    // BUG (closed in the GREEN commit): a bare child kill orphans
-                    // the `cc` grandchild.
-                    let _ = child.kill();
+                    kill_process_group(&mut child);
                     let _ = child.wait();
                     return Err(ParserInstallError::CompileError(format!(
                         "{} timed out after {:?}",
@@ -483,7 +544,7 @@ fn run_killable_subprocess(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                let _ = child.kill();
+                kill_process_group(&mut child);
                 let _ = child.wait();
                 return Err(ParserInstallError::CompileError(format!(
                     "{}: {}",
@@ -491,6 +552,23 @@ fn run_killable_subprocess(
                 )));
             }
         }
+    }
+}
+
+/// Kill the child **and** any grandchildren it spawned. The child was started as
+/// its own process-group leader, so its pgid equals its pid and a group-wide
+/// signal reaches the whole tree (`cc`, linkers, etc.). Falls back to a direct
+/// kill on non-unix, where the process-group model differs.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
     }
 }
 
@@ -853,7 +931,12 @@ mod tests {
             .path()
             .join(format!("json.{}", std::env::consts::DLL_EXTENSION));
 
-        compile_parser(&clone_dir, &output_path).expect("compile should succeed");
+        // Exercise the in-process loader call directly: the killable subprocess
+        // path (`compile_parser`) re-execs the kakehashi binary's
+        // `__compile-parser` subcommand, which is not present in the unit-test
+        // harness binary. End-to-end subprocess wiring is covered by
+        // `tests/test_compile_parser_subprocess.rs`.
+        compile_parser_inprocess(&clone_dir, &output_path).expect("compile should succeed");
 
         assert!(
             output_path.exists(),
