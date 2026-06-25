@@ -206,7 +206,7 @@ impl DocumentStore {
     /// same atomic `entry()` operation also closes the check-then-write window
     /// against a concurrent `didChange`: a tree parsed from now-stale text is
     /// dropped rather than associated with the newer text.
-    pub fn update_tree_if_text_unchanged(
+    pub(crate) fn update_tree_if_text_unchanged(
         &self,
         uri: &Url,
         expected_text: &str,
