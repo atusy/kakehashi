@@ -245,19 +245,36 @@ pub fn install_parser(
         eprintln!("Building parser in: {}", source_dir.display());
     }
 
-    // Compile the parser directly to the install path
+    // Compile to a temp path in the install dir, then atomically rename into place
+    // on success. A failed or deadline-killed compile can leave a partial/corrupt
+    // library behind (`parser_file_exists` only checks existence, so a leftover
+    // would make later runs skip reinstall and load a broken parser); writing to a
+    // temp and renaming only on success means a failure never clobbers a
+    // previously-working parser (e.g. a `force` reinstall that fails) and concurrent
+    // readers never observe a half-written file. `std::process::id()` keeps the temp
+    // unique even though the per-language install dedup already serializes installs.
     fs::create_dir_all(&parser_dir)?;
+    let tmp_file = parser_dir.join(format!(
+        ".{}.{}.{}.tmp",
+        language,
+        std::process::id(),
+        std::env::consts::DLL_EXTENSION
+    ));
     let compiled = match options.compile {
-        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &parser_file),
-        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &parser_file),
+        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &tmp_file),
+        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
     };
-    if let Err(e) = compiled {
-        // A failed or deadline-killed compile can leave a partial/corrupt shared
-        // library at `parser_file`. `parser_file_exists` only checks existence, so
-        // a leftover artifact would make every later run skip reinstall and load a
-        // broken parser. Remove it before surfacing the error.
-        let _ = fs::remove_file(&parser_file);
-        return Err(e);
+    match compiled {
+        Ok(()) => {
+            if let Err(e) = fs::rename(&tmp_file, &parser_file) {
+                let _ = fs::remove_file(&tmp_file);
+                return Err(ParserInstallError::IoError(e));
+            }
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_file);
+            return Err(e);
+        }
     }
 
     if options.verbose {
