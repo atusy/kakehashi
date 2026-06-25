@@ -185,12 +185,11 @@ Two derived quantities read off this one pair; the unification is of the
   terminal completion, but no bound is claimed on how quickly a *given* ticket is
   covered under sustained editing — continuous edits can keep the watermark behind
   a reader's target ticket indefinitely. The **hard** guarantee is the reader
-  side:
-  the existing 200 ms bound plus the empty fallback caps any wait, so sustained
-  editing degrades a reader to the empty fallback rather than starving it. A
-  virt/native reader
-  waits — bounded by that 200 ms — until the watermark reaches the tail ticket
-  that preceded it, then reads whatever the store holds (a tree, or empty),
+  side: the existing 200 ms bound plus the empty fallback caps any wait, so
+  sustained editing degrades a reader to the empty fallback rather than starving
+  it. A virt/native reader waits — bounded by that 200 ms — until the watermark
+  reaches the tail ticket that preceded it, then reads whatever the store holds
+  (a tree, or empty),
   instead of waiting on `has_tree`. This is required because, with the handler
   returning at *enqueue*, a bare `has_tree` check would be satisfied while the
   store still holds the **old** tree — reintroducing the #342/#374 stale-tree
@@ -323,7 +322,7 @@ afterward has no actor to hand off to, and any straggler write fails its epoch
 check (the incarnation no longer matches), so **the install/parse resurrection
 path is structurally closed** with no separate supersede machinery — *provided*
 every store-writing path, including the reader on-demand fallback, goes through the
-epoch-checked CAS write below; that fallback is the one residual vector, and it is
+epoch-checked CAS write above; that fallback is the one residual vector, and it is
 closed at the write, not by a check a concurrent close can slip past. A reopen
 creates a fresh actor at a fresh incarnation.
 
