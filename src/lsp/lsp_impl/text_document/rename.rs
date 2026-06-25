@@ -7,7 +7,7 @@
 //! wins (`preferred`).
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{Position, RenameParams, Uri, WorkspaceEdit};
+use tower_lsp_server::ls_types::{NumberOrString, Position, RenameParams, Uri, WorkspaceEdit};
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
@@ -18,11 +18,12 @@ const METHOD: &str = "textDocument/rename";
 impl Kakehashi {
     pub(crate) async fn rename_impl(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        let work_done_token = params.work_done_progress_params.work_done_token;
         let lsp_uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
 
-        let virt = self.rename_virt_layer(&lsp_uri, position, &new_name);
+        let virt = self.rename_virt_layer(&lsp_uri, position, &new_name, work_done_token);
         self.walk_layers(
             &lsp_uri,
             METHOD,
@@ -41,10 +42,12 @@ impl Kakehashi {
         lsp_uri: &Uri,
         position: Position,
         new_name: &str,
+        client_progress_token: Option<NumberOrString>,
     ) -> Result<Option<WorkspaceEdit>> {
-        let Some(ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
+        let Some(mut ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
             return Ok(None);
         };
+        ctx.document.client_progress_token = client_progress_token;
 
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
@@ -70,6 +73,7 @@ impl Kakehashi {
                             &t.virtual_content,
                             &new_name,
                             t.upstream_id,
+                            t.client_progress_token,
                         )
                         .await
                 }

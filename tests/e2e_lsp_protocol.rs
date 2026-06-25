@@ -73,6 +73,7 @@ fn test_advertises_work_done_progress_independent_of_window_capability() {
         "definitionProvider",
         "referencesProvider",
         "declarationProvider",
+        "renameProvider",
     ] {
         assert_eq!(
             caps[provider]["workDoneProgress"],

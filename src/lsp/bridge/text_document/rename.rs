@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{
-    DocumentChangeOperation, DocumentChanges, OneOf, Position, TextDocumentEdit, TextEdit, Uri,
-    WorkspaceEdit,
+    DocumentChangeOperation, DocumentChanges, NumberOrString, OneOf, Position, TextDocumentEdit,
+    TextEdit, Uri, WorkDoneProgressParams, WorkspaceEdit,
 };
 use url::Url;
 
@@ -47,6 +47,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         new_name: &str,
         upstream_request_id: Option<UpstreamId>,
+        client_progress_token: Option<NumberOrString>,
     ) -> io::Result<Option<WorkspaceEdit>> {
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(host_uri))
@@ -65,7 +66,14 @@ impl LanguageServerPool {
             host_position,
             "textDocument/rename",
             |virtual_uri, request_id| {
-                build_rename_request(virtual_uri, host_position, &offset, new_name, request_id)
+                build_rename_request(
+                    virtual_uri,
+                    host_position,
+                    &offset,
+                    new_name,
+                    request_id,
+                    client_progress_token,
+                )
             },
             |response, ctx| {
                 transform_workspace_edit_response_to_host(
@@ -89,6 +97,7 @@ fn build_rename_request(
     offset: &RegionOffset,
     new_name: &str,
     request_id: RequestId,
+    client_progress_token: Option<NumberOrString>,
 ) -> JsonRpcRequest<RenameParams> {
     let params = RenameParams {
         text_document_position: build_text_document_position_params(
@@ -97,7 +106,9 @@ fn build_rename_request(
             offset,
         ),
         new_name: new_name.to_string(),
-        work_done_progress_params: Default::default(),
+        work_done_progress_params: WorkDoneProgressParams {
+            work_done_token: client_progress_token,
+        },
     };
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/rename", params)
 }
@@ -257,6 +268,7 @@ mod tests {
             &RegionOffset::new(3, 0),
             "newName",
             RequestId::new(1),
+            None,
         );
 
         assert_uses_virtual_uri(&request, "lua");
@@ -272,11 +284,51 @@ mod tests {
             &RegionOffset::new(3, 0),
             "renamedVariable",
             test_request_id(),
+            None,
         );
 
         assert_position_request(&request, "textDocument/rename", 2);
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["params"]["newName"], "renamedVariable");
+    }
+
+    #[test]
+    fn rename_request_carries_work_done_token() {
+        // Client-progress wiring (#437): the editor's workDoneToken is threaded
+        // into the downstream rename request so its `$/progress` routes back.
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let request = build_rename_request(
+            &virtual_uri,
+            test_position(),
+            &RegionOffset::new(3, 0),
+            "newName",
+            test_request_id(),
+            Some(NumberOrString::String("wd-1".to_string())),
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["params"]["workDoneToken"],
+            "wd-1"
+        );
+    }
+
+    #[test]
+    fn rename_request_omits_work_done_token_when_absent() {
+        // No editor token → no `workDoneToken` field (non-regressing default).
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let request = build_rename_request(
+            &virtual_uri,
+            test_position(),
+            &RegionOffset::new(3, 0),
+            "newName",
+            test_request_id(),
+            None,
+        );
+        assert!(
+            serde_json::to_value(&request).unwrap()["params"]
+                .get("workDoneToken")
+                .is_none(),
+            "absent token must not serialize a null workDoneToken"
+        );
     }
 
     // ==========================================================================
