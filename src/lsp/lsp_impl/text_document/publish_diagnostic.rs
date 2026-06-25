@@ -91,7 +91,8 @@ pub(crate) async fn collect_push_diagnostics(
     if !snapshot.has_contributors() {
         log::debug!(
             target: log_target,
-            "No diagnostic contributors (regions or host servers) for {}; clearing pull layer",
+            "No pull contributors for {} (no pullable regions, and any host layer is \
+             pullFallback-gated or empty-selection); clearing pull layer",
             uri
         );
         // Evict (not publish-empty): an absent PullLayer both clears any stale

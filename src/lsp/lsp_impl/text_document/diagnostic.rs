@@ -285,7 +285,7 @@ impl Kakehashi {
         self.fold_push_fallback_diagnostics(
             &uri,
             &language_name,
-            &region_meta,
+            region_meta,
             host_ctx.is_some(),
             &mut virt_items,
             &mut host_items,
@@ -322,7 +322,7 @@ impl Kakehashi {
         &self,
         host: &Url,
         language_name: &str,
-        region_meta: &[(String, String, RegionOffset)],
+        region_meta: Vec<(String, String, RegionOffset)>,
         host_layer_participates: bool,
         virt_items: &mut Vec<Diagnostic>,
         host_items: &mut Vec<Diagnostic>,
@@ -352,14 +352,16 @@ impl Kakehashi {
             if resolve_aggregation_config_from_settings(
                 &settings,
                 language_name,
-                injection_language,
+                &injection_language,
                 "textDocument/diagnostic",
             )
             .push_fallback
             {
                 region_push_enabled.insert(region_id.clone());
             }
-            region_offsets.insert(region_id.clone(), offset.clone());
+            // `region_meta` is consumed: move the id + offset (a heap `Vec`) in
+            // rather than cloning per region.
+            region_offsets.insert(region_id, offset);
         }
 
         // Host `pushFallback` gate: the host layer participates AND pushFallback

@@ -25,8 +25,8 @@
 //! **One native source per server (#425).** A server that both answers
 //! `textDocument/diagnostic` (landing in `PullLayer`) *and* spontaneously pushes
 //! `publishDiagnostics` (landing in a `Region` or `Host` slot) would be counted
-//! twice. The proactive publisher's
-//! [`filter_pull_driven_push_slots`](crate::lsp::lsp_impl::coordinator) drops a
+//! twice. The proactive [`DiagnosticPublisher`](crate::lsp::lsp_impl::coordinator)'s
+//! `filter_pull_driven_push_slots` drops a
 //! **pull-driven** server's push slots from the publish whenever a `PullLayer`
 //! blob is present (classification is live via
 //! [`LanguageServerPool::pull_driven_servers`](crate::lsp::bridge::LanguageServerPool)),
@@ -197,13 +197,13 @@ pub(crate) fn merge_cached_diagnostics(
 /// classify which cached pushers are push-driven (#425). Takes the snapshot the
 /// caller already holds so the candidate set and the folded slots come from the
 /// **same** read (no TOCTOU window across the classifying `await`).
-pub(crate) fn push_slot_servers(snapshot: &SourceSlots) -> std::collections::HashSet<String> {
+pub(crate) fn push_slot_servers(snapshot: &SourceSlots) -> std::collections::HashSet<&str> {
     let mut servers = std::collections::HashSet::new();
     for (source, slots) in snapshot {
         if matches!(source, DiagnosticSource::PullLayer) {
             continue;
         }
-        servers.extend(slots.keys().cloned());
+        servers.extend(slots.keys().map(String::as_str));
     }
     servers
 }
@@ -1005,10 +1005,11 @@ mod tests {
         );
         agg.set_pull_layer(&host(), vec![diag("p")]);
 
-        let servers = push_slot_servers(&agg.snapshot(&host()));
+        let snapshot = agg.snapshot(&host());
+        let servers = push_slot_servers(&snapshot);
         assert_eq!(
             servers,
-            std::collections::HashSet::from(["linter".to_string(), "hostlint".to_string()]),
+            std::collections::HashSet::from(["linter", "hostlint"]),
             "the synthetic pull-layer server is never reported as a pusher"
         );
     }

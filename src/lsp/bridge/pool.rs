@@ -474,7 +474,7 @@ impl LanguageServerPool {
     /// fan-in (push-propagation-diagnostic-forwarding); accepted and documented.
     pub(crate) async fn pull_driven_servers(
         &self,
-        candidates: &std::collections::HashSet<String>,
+        candidates: &std::collections::HashSet<&str>,
     ) -> std::collections::HashSet<String> {
         if candidates.is_empty() {
             return std::collections::HashSet::new();
@@ -4979,9 +4979,7 @@ mod tests {
         pool.insert_connection(linter).await;
 
         let candidates = HashSet::from([
-            "ra".to_string(),
-            "linter".to_string(),
-            "ghost".to_string(), // no live connection
+            "ra", "linter", "ghost", // no live connection
         ]);
         let pull_driven = pool.pull_driven_servers(&candidates).await;
 
@@ -4997,6 +4995,10 @@ mod tests {
     async fn pull_driven_servers_empty_candidates_returns_empty() {
         use std::collections::HashSet;
         let pool = LanguageServerPool::new();
-        assert!(pool.pull_driven_servers(&HashSet::new()).await.is_empty());
+        assert!(
+            pool.pull_driven_servers(&HashSet::<&str>::new())
+                .await
+                .is_empty()
+        );
     }
 }

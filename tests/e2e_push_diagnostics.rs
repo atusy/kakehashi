@@ -212,7 +212,7 @@ fn e2e_pushfallback_folds_push_driven_server_into_client_pull() {
 }
 
 #[test]
-fn e2e_pullfallback_false_still_publishes_a_pull_driven_servers_spontaneous_push() {
+fn e2e_pullfallback_false_still_publishes_a_pull_driven_server_spontaneous_push() {
     // #425 guarantee: `pullFallback = false` stops kakehashi from PULLING a
     // pull-driven server, but its spontaneous publishDiagnostics push must still
     // reach the editor (#380 stays closed). Regression guard for the

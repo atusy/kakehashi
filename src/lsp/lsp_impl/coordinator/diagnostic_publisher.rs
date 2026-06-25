@@ -194,18 +194,21 @@ impl DiagnosticPublisher {
             // No pull blob to double-count against.
             return;
         }
-        // Distinct push-server names across the Region/Host sources.
+        // Distinct push-server names across the Region/Host sources, borrowed
+        // from the snapshot (no key clones on this republish hot path).
         let mut push_servers = std::collections::HashSet::new();
         for (source, servers) in snapshot.iter() {
             if matches!(source, DiagnosticSource::PullLayer) {
                 continue;
             }
-            push_servers.extend(servers.keys().cloned());
+            push_servers.extend(servers.keys().map(String::as_str));
         }
         if push_servers.is_empty() {
             return; // PullLayer-only snapshot (the common pull-driven case).
         }
         let pull_driven = self.bridge.pool().pull_driven_servers(&push_servers).await;
+        // Drop the borrow of `snapshot` before the mutable retain below.
+        drop(push_servers);
         retain_non_pull_driven_push_slots(snapshot, &pull_driven);
     }
 
