@@ -69,6 +69,18 @@ enum Commands {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 1)]
         insert_spaces: bool,
     },
+    /// Internal: compile a parser grammar in a killable subprocess.
+    ///
+    /// Re-exec target of `install::parser::compile_parser`, which runs this inside
+    /// a process group it can kill on a deadline (the loader shells out to `cc`
+    /// with no surfaced child). Not for direct use; hidden from `--help`.
+    #[command(name = "__compile-parser", hide = true)]
+    CompileParser {
+        /// Grammar source directory (contains src/parser.c)
+        grammar_dir: PathBuf,
+        /// Output path for the compiled shared library
+        output_path: PathBuf,
+    },
     /// Report diagnostics for files via the configured downstream language servers
     ///
     /// Only pull diagnostics (textDocument/diagnostic) are collected. Push
@@ -321,6 +333,10 @@ fn main() -> ExitCode {
             output_format,
             fail_on_warning,
         }),
+        Some(Commands::CompileParser {
+            grammar_dir,
+            output_path,
+        }) => run_compile_parser(&grammar_dir, &output_path),
         None => {
             // Start LSP server (backward compatible default behavior)
             // Only LSP mode needs a tokio runtime; CLI subcommands are synchronous
@@ -674,6 +690,9 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         force,
         verbose,
         no_cache,
+        // The CLI runs from the kakehashi binary, so the killable subprocess path
+        // is available and a hung cc is deadline-bounded.
+        compile: parser::ParserCompile::KillableSubprocess,
     };
 
     match parser::install_parser(language, &options) {
@@ -715,6 +734,27 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     } else {
         eprintln!("\nPartially installed '{}' language support.", language);
         Err(ExitCode::FAILURE)
+    }
+}
+
+/// Run the hidden `__compile-parser` subprocess entry: compile one grammar
+/// in-process and exit (success → 0, failure → non-zero). Invoked by
+/// `install::parser::compile_parser`, which runs this binary as a killable
+/// subprocess so a hung `cc` can be deadline-killed.
+fn run_compile_parser(
+    grammar_dir: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<(), ExitCode> {
+    // Self-bound the compile so a parent crash mid-compile can't leave us (and a
+    // hung cc) running as an orphan; the parent's deadline is still the usual
+    // trigger.
+    parser::arm_compile_watchdog();
+    match parser::compile_parser_inprocess(grammar_dir, output_path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("parser compile failed: {e}");
+            Err(ExitCode::FAILURE)
+        }
     }
 }
 

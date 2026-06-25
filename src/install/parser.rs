@@ -69,6 +69,7 @@ impl From<MetadataError> for ParserInstallError {
 }
 
 /// Result of installing a parser.
+#[derive(Debug)]
 pub struct ParserInstallResult {
     /// The language that was installed.
     pub language: String,
@@ -76,6 +77,24 @@ pub struct ParserInstallResult {
     pub install_path: PathBuf,
     /// Git revision that was used.
     pub revision: String,
+}
+
+/// How the parser source is compiled.
+///
+/// The killable path re-execs **this** binary's `__compile-parser` subcommand, so
+/// it is only valid when the running executable is the `kakehashi` binary (the LSP
+/// server and the `language install` CLI). A caller whose `current_exe()` is
+/// something else — a test harness binary, an external embedder — must compile
+/// in-process, since that other binary has no `__compile-parser` subcommand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParserCompile {
+    /// Compile inside a killable subprocess (re-exec `__compile-parser`) so a hung
+    /// `cc` can be deadline-killed. The production default.
+    #[default]
+    KillableSubprocess,
+    /// Compile in-process — no killable deadline. For callers whose `current_exe()`
+    /// is not the `kakehashi` binary (e.g. test setup).
+    InProcess,
 }
 
 /// Options for parser installation.
@@ -88,6 +107,8 @@ pub struct InstallOptions {
     pub verbose: bool,
     /// Whether to bypass the metadata cache.
     pub no_cache: bool,
+    /// How to compile the parser source (see [`ParserCompile`]).
+    pub compile: ParserCompile,
 }
 
 /// Check if a parser file exists for the given language.
@@ -105,8 +126,28 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Compile a Tree-sitter parser from source using tree-sitter-loader.
-fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
+/// Upper bound for a single parser compile.
+///
+/// The loader shells out to `cc` with no timeout of its own; a pathological
+/// toolchain (a hung or wedged compiler) would otherwise block the install — and,
+/// in the LSP server, the in-progress install marker and process exit — forever.
+/// Generous enough not to false-kill a legitimately slow grammar (e.g. a cold
+/// TypeScript build) while still bounding a true hang.
+const PARSER_COMPILE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Compile a Tree-sitter parser from source using tree-sitter-loader, **in
+/// process**.
+///
+/// This is the raw loader call: it shells out to `cc` and, on a pathological
+/// toolchain, can hang with no surfaced child to kill. Production install does
+/// **not** call this directly — it goes through [`compile_parser`], which runs it
+/// inside a killable subprocess. This is `pub` only as the entry point for that
+/// subprocess: the hidden `__compile-parser` subcommand (`src/bin/main.rs`) calls
+/// here.
+pub fn compile_parser_inprocess(
+    grammar_path: &Path,
+    output_path: &Path,
+) -> Result<(), ParserInstallError> {
     let parent_dir = output_path.parent().ok_or_else(|| {
         ParserInstallError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -122,11 +163,120 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
         .map_err(|e| ParserInstallError::CompileError(e.to_string()))
 }
 
+/// Arm a self-deadline inside the `__compile-parser` subprocess.
+///
+/// The parent's [`run_killable_subprocess`] normally enforces the deadline and
+/// kills the compile's process group. But if the *parent* (`kakehashi`) dies
+/// mid-compile — editor crash, `SIGTERM`, cancellation — this subprocess is
+/// orphaned and the loader's synchronous `cc` would keep running forever. This
+/// backstop closes that: become our own process-group leader (so the group kill
+/// can only reach us and our `cc`, never a shell that launched us directly), then
+/// spawn a watchdog that group-kills us shortly after [`PARSER_COMPILE_TIMEOUT`].
+///
+/// On a normal/quick compile the process exits first and the watchdog thread is
+/// torn down with it; the grace margin keeps the parent's deadline the usual
+/// trigger. Unix-only (process groups); a no-op elsewhere. The subcommand entry
+/// (`src/bin/main.rs`) calls this before compiling.
+pub fn arm_compile_watchdog() {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::{Pid, getpgrp, getpid, setpgid};
+        // Become our own group leader. When spawned by run_killable_subprocess the
+        // parent already did this via process_group(0) (a harmless repeat); when run
+        // directly it isolates us from the launching shell's group.
+        let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+        // CRITICAL: only arm the group-kill if we are *confirmed* our own group
+        // leader (pgid == pid). If setpgid failed (sandbox, already a session
+        // leader), we're still in the parent's/shell's group, and killpg(0) would
+        // SIGKILL *that* group — terminating the parent (or an interactive shell)
+        // along with us. In that case skip the watchdog: the parent-side deadline
+        // still bounds the compile; we only forgo the orphan backstop.
+        if getpgrp() != getpid() {
+            return;
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(PARSER_COMPILE_TIMEOUT + Duration::from_secs(30));
+            // pgid 0 = our own process group (us + the cc we shelled out).
+            let _ = killpg(Pid::from_raw(0), Signal::SIGKILL);
+        });
+    }
+}
+
+/// Resolve the path to re-exec for the `__compile-parser` subprocess.
+///
+/// On Linux, prefer `/proc/self/exe`: if the running `kakehashi` binary is
+/// replaced (a package upgrade while the LSP server runs), `current_exe()`
+/// resolves to a stale `".../kakehashi (deleted)"` path that no longer spawns,
+/// whereas `execve("/proc/self/exe")` still runs the original image. Elsewhere
+/// `current_exe()` is the portable answer.
+fn self_exe_for_reexec() -> Result<PathBuf, ParserInstallError> {
+    #[cfg(target_os = "linux")]
+    {
+        // Check the symlink with `symlink_metadata` (lstat), NOT `exists()`:
+        // `exists()` follows the link to the target and returns false exactly when
+        // the binary was deleted/replaced — the case this branch exists to handle.
+        // `symlink_metadata` confirms the `/proc/self/exe` link itself is present
+        // (so we fall back to `current_exe()` when `/proc` isn't mounted) without
+        // requiring the target to still exist.
+        let proc_self = Path::new("/proc/self/exe");
+        if std::fs::symlink_metadata(proc_self).is_ok() {
+            return Ok(proc_self.to_path_buf());
+        }
+    }
+    std::env::current_exe().map_err(|e| {
+        ParserInstallError::CompileError(format!("locating the kakehashi binary: {e}"))
+    })
+}
+
+/// Compile a Tree-sitter parser under a hard, killable deadline.
+///
+/// The loader's `compile_parser_at_path` shells out to `cc` without surfacing the
+/// child, so a `tokio::time::timeout` cannot kill a hung compiler (the blocking
+/// thread and its `cc` would keep running). Instead we **re-exec** this binary's
+/// hidden `__compile-parser` subcommand inside a killable process group (see the
+/// per-document-parse-actor ADR, "a real install deadline via a killable
+/// subprocess") and bound it with [`PARSER_COMPILE_TIMEOUT`]. Re-exec rather than
+/// `fork`: forking a multithreaded process is unsafe past the child's first
+/// non-async-signal-safe call.
+fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
+    let mut cmd = Command::new(self_exe_for_reexec()?);
+    cmd.arg("__compile-parser")
+        .arg(grammar_path)
+        .arg(output_path)
+        // Null stdin/stdout: when the parent is the LSP server, stdout is the
+        // JSON-RPC channel and no child output may reach it. stderr stays
+        // inherited so `cc` diagnostics land in the logs.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    let status = run_killable_subprocess(cmd, PARSER_COMPILE_TIMEOUT, "parser compile")?;
+    if !status.success() {
+        return Err(ParserInstallError::CompileError(format!(
+            "parser compile subprocess for '{}' exited with {}",
+            grammar_path.display(),
+            status
+        )));
+    }
+    Ok(())
+}
+
 /// Install a Tree-sitter parser for a language.
 pub fn install_parser(
     language: &str,
     options: &InstallOptions,
 ) -> Result<ParserInstallResult, ParserInstallError> {
+    // `language` becomes path segments (`parser/<language>.<ext>` and the temp
+    // file) and a URL/metadata key, so reject traversal-capable names before
+    // touching the filesystem. Higher-level callers (auto-install) already gate
+    // this, but `install_parser` is a public entry point and must be safe on its
+    // own — a name like `../../evil` would otherwise write outside the data dir.
+    if !super::queries::is_safe_language_name(language) {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe language name '{}'", language.escape_default()),
+        )));
+    }
+
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
@@ -171,9 +321,51 @@ pub fn install_parser(
         eprintln!("Building parser in: {}", source_dir.display());
     }
 
-    // Compile the parser directly to the install path
+    // Compile to a temp path in the install dir, then atomically rename into place
+    // on success. A failed or deadline-killed compile can leave a partial/corrupt
+    // library behind (`parser_file_exists` only checks existence, so a leftover
+    // would make later runs skip reinstall and load a broken parser); writing to a
+    // temp and renaming only on success means a failure never clobbers a
+    // previously-working parser (e.g. a `force` reinstall that fails) and concurrent
+    // readers never observe a half-written file.
+    //
+    // The temp name combines the pid with a process-local counter so two installs
+    // in the same process never collide on it, independent of the per-language
+    // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
+    // by this process still fails at the rename — a loaded DLL can't be removed — a
+    // pre-existing platform limitation this scheme doesn't change.)
     fs::create_dir_all(&parser_dir)?;
-    compile_parser(&source_dir, &parser_file)?;
+    static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp_file = parser_dir.join(format!(
+        ".{}.{}.{}.{}.tmp",
+        language,
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::env::consts::DLL_EXTENSION
+    ));
+    let compiled = match options.compile {
+        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &tmp_file),
+        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
+    };
+    match compiled {
+        Ok(()) => {
+            // On unix `rename` atomically replaces an existing parser. Windows
+            // `rename` instead fails if the destination exists, which would make a
+            // `force` reinstall fail after a good compile — remove the old file
+            // first there (a small non-atomic window, acceptable on the
+            // non-primary platform).
+            #[cfg(windows)]
+            let _ = fs::remove_file(&parser_file);
+            if let Err(e) = fs::rename(&tmp_file, &parser_file) {
+                let _ = fs::remove_file(&tmp_file);
+                return Err(ParserInstallError::IoError(e));
+            }
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_file);
+            return Err(e);
+        }
+    }
 
     if options.verbose {
         eprintln!("Installed to: {}", parser_file.display());
@@ -449,6 +641,105 @@ fn run_with_timeout(
     }
 }
 
+/// Run a subprocess under a hard deadline, killing it on expiry.
+///
+/// Unlike [`run_with_timeout`], this is for a child that itself spawns children
+/// (the parser compile re-execs this binary, which shells out to `cc` as a
+/// *grandchild*). A bare `child.kill()` reaches only the direct child and leaves
+/// the `cc` grandchild running — the very hang this deadline exists to bound. So
+/// the child is spawned as its own **process-group leader** and the deadline kill
+/// targets the whole **group**, terminating grandchildren too (the direct child is
+/// reaped here; the terminated descendants are reaped by init after reparenting).
+fn run_killable_subprocess(
+    mut cmd: Command,
+    timeout: Duration,
+    context: &str,
+) -> Result<std::process::ExitStatus, ParserInstallError> {
+    // Spawn the child as its own process-group leader (pgid == child pid), so a
+    // deadline kill can terminate the whole group (the `cc` the compile shells out
+    // to) rather than orphaning grandchildren.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ParserInstallError::CompileError(format!("{}: {}", context, e)))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    kill_process_group(&mut child);
+                    reap_bounded(&mut child);
+                    return Err(ParserInstallError::CompileError(format!(
+                        "{} timed out after {:?}",
+                        context, timeout
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                kill_process_group(&mut child);
+                reap_bounded(&mut child);
+                return Err(ParserInstallError::CompileError(format!(
+                    "{}: {}",
+                    context, e
+                )));
+            }
+        }
+    }
+}
+
+/// Reap the (already-killed) child, but only for a bounded time. After `SIGKILL`
+/// a child dies at once, so this returns immediately in practice. The bound
+/// matters only in the pathological case where the child can't be killed
+/// (uninterruptible D-state, blocked signals, sandbox limits): rather than
+/// `child.wait()` blocking forever — reintroducing the very unbounded wait this
+/// deadline exists to prevent — we give up after the bound and leave a zombie.
+fn reap_bounded(child: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// Terminate the child **and** every descendant it spawned. The child was started
+/// as its own process-group leader, so its pgid equals its pid and a group-wide
+/// `SIGKILL` reaches the whole tree (`cc`, linkers, etc.). This only *terminates*
+/// descendants; the caller reaps the direct child via `child.wait()`, and the
+/// terminated descendants are reparented to init and reaped there. On non-unix this
+/// falls back to a direct `child.kill()`, which does **not** reach descendants —
+/// the orphaned-`cc` hazard is unmitigated there (kakehashi targets unix in
+/// practice; a Job Object would be the Windows equivalent).
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        // If the group signal can't be delivered (sandbox/OS limits), still make a
+        // best effort to kill the direct child so it isn't left running.
+        if killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL).is_err() {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
 /// Clone a git repository at a specific revision.
 fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
     // First, clone with depth 1 (we'll fetch the specific revision)
@@ -508,6 +799,26 @@ mod tests {
         "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
 
     #[test]
+    fn install_parser_rejects_unsafe_language_name() {
+        let temp = tempdir().expect("temp dir");
+        let options = InstallOptions {
+            data_dir: temp.path().to_path_buf(),
+            force: false,
+            verbose: false,
+            no_cache: false,
+            compile: ParserCompile::InProcess,
+        };
+        // A traversal-capable name must be rejected before any filesystem or
+        // network work — `install_parser` is a public entry point.
+        match install_parser("../../evil", &options) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_dll_extension_is_valid() {
         let ext = std::env::consts::DLL_EXTENSION;
         assert!(ext == "so" || ext == "dylib" || ext == "dll");
@@ -538,6 +849,57 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "stuck child must be killed promptly, not waited out"
+        );
+    }
+
+    /// A deadline kill must terminate the whole process **group**, not just the
+    /// direct child. The parser compiler shells out to `cc` as a *grandchild*; a
+    /// bare `child.kill()` would leave it running — the hang this deadline exists
+    /// to bound. We model it with `sh` (the group leader) backgrounding a
+    /// grandchild that, *if it survives*, creates a marker file 2s out. The
+    /// deadline fires at 700ms, so a group kill must stop the grandchild before it
+    /// can touch the marker. Observing a side effect only a survivor produces is
+    /// robust against orphan-reaping timing and PID reuse (a bare child.kill()
+    /// would orphan the grandchild, which then creates the marker → RED).
+    #[cfg(unix)]
+    #[test]
+    fn run_killable_subprocess_terminates_descendants_on_deadline() {
+        let tmp = tempdir().expect("temp dir");
+        let survived = tmp.path().join("grandchild-survived");
+        let spawned = tmp.path().join("grandchild-spawned");
+        let mut cmd = Command::new("sh");
+        // Background a grandchild that touches `survived` 2s out; `spawned` is
+        // touched right after launching it (proving the descendant was actually
+        // started, so an absent `survived` can't be a vacuous pass from sh dying
+        // before it forked the child). Paths are passed as positional params
+        // ($1/$2), not interpolated, so a temp dir containing a quote can't break
+        // the script.
+        cmd.arg("-c")
+            .arg(r#"( sleep 2; touch "$1" ) & touch "$2"; wait"#)
+            .arg("sh")
+            .arg(&survived)
+            .arg(&spawned);
+
+        let started = std::time::Instant::now();
+        let result = run_killable_subprocess(cmd, Duration::from_millis(700), "test compile");
+        assert!(
+            result.is_err(),
+            "a subprocess that outlives the deadline must error out"
+        );
+        assert!(
+            spawned.exists(),
+            "the grandchild must have been spawned (else the test would pass vacuously)"
+        );
+
+        // Wait past the grandchild's would-be touch time (2s), then assert it
+        // never ran — its group was killed at 700ms.
+        while started.elapsed() < Duration::from_millis(2500) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !survived.exists(),
+            "the backgrounded grandchild created its marker, so it survived the \
+             deadline — it must be terminated with the process group, not orphaned"
         );
     }
 
@@ -760,7 +1122,12 @@ mod tests {
             .path()
             .join(format!("json.{}", std::env::consts::DLL_EXTENSION));
 
-        compile_parser(&clone_dir, &output_path).expect("compile should succeed");
+        // Exercise the in-process loader call directly: the killable subprocess
+        // path (`compile_parser`) re-execs the kakehashi binary's
+        // `__compile-parser` subcommand, which is not present in the unit-test
+        // harness binary. End-to-end subprocess wiring is covered by
+        // `tests/test_compile_parser_subprocess.rs`.
+        compile_parser_inprocess(&clone_dir, &output_path).expect("compile should succeed");
 
         assert!(
             output_path.exists(),

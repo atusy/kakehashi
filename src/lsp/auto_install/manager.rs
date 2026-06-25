@@ -323,7 +323,16 @@ impl AutoInstallManager {
         let task_data_dir = data_dir.clone();
         let install_task = tokio::spawn(async move {
             let _marker = install_marker;
-            crate::install::install_language_async(task_lang, task_data_dir, false).await
+            // Auto-install runs inside the LSP server, whose `current_exe()` is the
+            // kakehashi binary — so the killable subprocess (re-exec
+            // `__compile-parser`) is valid and bounds a hung `cc`.
+            crate::install::install_language_async(
+                task_lang,
+                task_data_dir,
+                false,
+                crate::install::parser::ParserCompile::KillableSubprocess,
+            )
+            .await
         });
         let result = match install_task.await {
             Ok(result) => result,

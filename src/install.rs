@@ -157,6 +157,9 @@ pub mod test_support {
             force: false,
             verbose: false,
             no_cache: false,
+            // Test setup runs from a test-harness binary, whose `current_exe()` has
+            // no `__compile-parser` subcommand — compile in-process.
+            compile: parser::ParserCompile::InProcess,
         };
         let mut all_ok = true;
         for lang in TEST_LANGUAGES {
@@ -234,6 +237,7 @@ fn install_language_blocking(
     data_dir: &std::path::Path,
     force: bool,
     queries_base_url: &str,
+    compile: parser::ParserCompile,
 ) -> InstallResult {
     let mut result = InstallResult {
         parser_path: None,
@@ -259,6 +263,11 @@ fn install_language_blocking(
         force,
         verbose: false,
         no_cache: false,
+        // Caller-chosen: the killable subprocess re-execs this binary's
+        // `__compile-parser`, so it is valid only when `current_exe()` is the
+        // kakehashi binary. The production caller (LSP auto-install) is, and asks
+        // for it; test/embedder callers pass InProcess.
+        compile,
     };
 
     // AlreadyExists means the artifact is present and usable — success,
@@ -306,6 +315,7 @@ pub(crate) async fn install_language_async(
     language: String,
     data_dir: PathBuf,
     force: bool,
+    compile: parser::ParserCompile,
 ) -> InstallResult {
     // Run blocking install operations in a separate thread pool
     tokio::task::spawn_blocking(move || {
@@ -314,6 +324,7 @@ pub(crate) async fn install_language_async(
             &data_dir,
             force,
             queries::NVIM_TREESITTER_QUERIES_URL,
+            compile,
         )
     })
     .await
@@ -454,7 +465,13 @@ mod tests {
             ("/parent_lang/highlights.scm", "(comment) @comment\n"),
         ]);
 
-        let result = install_language_blocking("child_lang", data_dir, false, &base_url);
+        let result = install_language_blocking(
+            "child_lang",
+            data_dir,
+            false,
+            &base_url,
+            parser::ParserCompile::InProcess,
+        );
 
         assert!(
             result.queries_error.is_none(),
@@ -529,8 +546,13 @@ mod tests {
         let data_dir = temp.path().join("nest").join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let result =
-            install_language_blocking("../../evil", &data_dir, false, "http://127.0.0.1:1");
+        let result = install_language_blocking(
+            "../../evil",
+            &data_dir,
+            false,
+            "http://127.0.0.1:1",
+            parser::ParserCompile::InProcess,
+        );
 
         assert!(!result.is_success(), "unsafe name must not install");
         assert!(
@@ -577,8 +599,13 @@ mod tests {
 
         // Everything exists, so no download may happen — point the base URL
         // at a closed port to fail loudly if one is attempted anyway.
-        let result =
-            install_language_blocking("exists_lang", data_dir, false, "http://127.0.0.1:1");
+        let result = install_language_blocking(
+            "exists_lang",
+            data_dir,
+            false,
+            "http://127.0.0.1:1",
+            parser::ParserCompile::InProcess,
+        );
 
         assert!(
             result.is_success(),
