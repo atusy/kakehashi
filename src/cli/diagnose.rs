@@ -296,7 +296,8 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     }
 
     let mut text = String::new();
-    if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut text) {
+    use std::io::Read as _;
+    if let Err(e) = std::io::stdin().lock().read_to_string(&mut text) {
         elnln!("error: failed to read stdin: {e}");
         return EXIT_ERROR;
     }
