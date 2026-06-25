@@ -10,6 +10,12 @@
 //! downstream language-server pool verbatim, so CLI diagnostics can never
 //! drift from editor diagnostics.
 //!
+//! Only **pull** diagnostics (`textDocument/diagnostic`) are collected — the
+//! per-file lifecycle ends at `didClose`, so asynchronous **push** diagnostics
+//! (`textDocument/publishDiagnostics`) a downstream server might emit are never
+//! captured. A downstream server that only publishes diagnostics and does not
+//! answer a pull request therefore contributes nothing to this command.
+//!
 //! Exit codes:
 //! - `0`: no failing diagnostics, and no operational error.
 //! - `1`: a failing diagnostic — any error always, plus any warning when

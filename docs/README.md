@@ -602,6 +602,11 @@ machine-readable format. File selection matches `format` (directories walked
 respecting `.gitignore`, explicit paths win, `--excludes` filters every path
 under the current directory — including explicitly listed ones).
 
+Only **pull** diagnostics (`textDocument/diagnostic`) are reported. **Push**
+diagnostics (`textDocument/publishDiagnostics`) are not collected, so a
+downstream server that only publishes diagnostics — and does not answer a pull
+request — contributes nothing to `kakehashi diagnose`.
+
 ```bash
 # Report diagnostics (default format: file:line:col: severity: message [source])
 kakehashi diagnose README.md docs/

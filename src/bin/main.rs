@@ -71,6 +71,11 @@ enum Commands {
     },
     /// Report diagnostics for files via the configured downstream language servers
     ///
+    /// Only pull diagnostics (textDocument/diagnostic) are collected. Push
+    /// diagnostics (textDocument/publishDiagnostics) are NOT reported, so a
+    /// downstream server that only publishes diagnostics and does not answer a
+    /// pull request will contribute nothing here.
+    ///
     /// Directories are walked recursively respecting .gitignore; explicitly
     /// listed files are diagnosed even when gitignored.
     ///
