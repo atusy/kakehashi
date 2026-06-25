@@ -12,16 +12,26 @@
 //! *before* buffering the returned futures, so this middleware can assign
 //! per-URI sequence tickets at `call` time:
 //!
-//! - **Writers** (`didChange` / `didClose`) take the next ticket and run
-//!   only after the previous writer for the same document finished, so edits
-//!   and closes apply in strict wire order. `didOpen` is deliberately NOT a
-//!   writer: its handler can await downstream-server spawn/initialization,
-//!   which in turn can wait on upstream client interaction — ticketing it
-//!   deadlocks a client that blocks on a gated request (e.g. a readiness
-//!   poll via `textDocument/diagnostic`) while the server waits for that
-//!   same client. The residual open/edit and close/reopen first-poll-order
-//!   races are the pre-gate status quo; gating `didOpen` properly (fast
-//!   handler + spawned downstream work) is tracked in #374.
+//! - **Writers** (`didOpen` / `didChange` / `didClose`) take the next ticket
+//!   and run only after the previous writer for the same document finished,
+//!   so opens, edits, and closes apply in strict wire order. Gating `didOpen`
+//!   (#374) closes the two residual first-poll-order races: a `didChange`
+//!   first-polled before `didOpen` no longer misses the document and discards
+//!   its edit (open→edit), and a reopen no longer inserts ahead of a gated
+//!   `didClose` that then evicts it (close→reopen). The historical deadlock
+//!   rationale for leaving `didOpen` ungated — its handler awaiting
+//!   downstream spawn that itself waits on the client — no longer applies:
+//!   downstream spawn is fire-and-forget and the open path never *awaits* a
+//!   server→client request (its editor-facing awaits are one-way log/show
+//!   notifications, and the one awaited bridge call, `process_injections`,
+//!   only forwards a didChange on the edit path, not on open), so the handler
+//!   can never block on a client response. A slow auto-install still runs
+//!   inside the handler and so holds the writer ticket — its network/git
+//!   stages are timeout-bounded, but parser *compilation* is not, so a
+//!   pathologically hung compiler can hold the ticket indefinitely and wedge
+//!   later same-URI readers/writers. Moving auto-install to a spawned task
+//!   (#480) is therefore a liveness fix, not just a latency one; until then
+//!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
 //!   triple, the edit-producing formatting/rename requests, pull
 //!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
@@ -235,7 +245,7 @@ enum Role {
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
-        "textDocument/didChange" | "textDocument/didClose" => {
+        "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose" => {
             let uri = text_document_uri(req)?;
             Some(Role::Writer {
                 uri,
@@ -518,12 +528,13 @@ mod tests {
         let close = classify(&notification("textDocument/didClose", URI));
         assert!(matches!(close, Some(Role::Writer { close: true, .. })));
 
-        // didOpen passes through: its handler can await downstream spawn
-        // that itself waits on the client, so ticketing it deadlocks
-        // synchronous clients polling readiness behind the gate.
+        // didOpen is a non-close writer (#374): it must serialize ahead of a
+        // following didChange (so the change sees the inserted+parsed document)
+        // and behind a preceding didClose (so a reopen lands after the close).
+        let open = classify(&notification("textDocument/didOpen", URI));
         assert!(
-            classify(&notification("textDocument/didOpen", URI)).is_none(),
-            "didOpen must not be gated"
+            matches!(open, Some(Role::Writer { close: false, .. })),
+            "didOpen must be a non-close writer"
         );
 
         for method in [
@@ -605,11 +616,23 @@ mod tests {
         );
     }
 
-    /// Inner mock: the writer's future stalls on a oneshot; everything else
-    /// resolves immediately. Completion order lands in `log`.
+    /// Inner mock: the call whose method equals `stall_method` parks on a
+    /// oneshot; every other call resolves immediately. Each call logs a label
+    /// derived from its method, so a test can assert completion order.
     struct MockInner {
         log: Arc<std::sync::Mutex<Vec<&'static str>>>,
-        writer_release: Option<tokio::sync::oneshot::Receiver<()>>,
+        stall_method: &'static str,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    /// Map a method to a stable label for completion-order assertions.
+    fn mock_label(method: &str) -> &'static str {
+        match method {
+            "textDocument/didOpen" => "open",
+            "textDocument/didChange" => "change",
+            "textDocument/didClose" => "close",
+            _ => "reader",
+        }
     }
 
     impl Service<Request> for MockInner {
@@ -623,19 +646,17 @@ mod tests {
 
         fn call(&mut self, req: Request) -> Self::Future {
             let log = Arc::clone(&self.log);
-            if req.method() == "textDocument/didChange" {
-                let release = self
-                    .writer_release
-                    .take()
-                    .expect("one writer call expected");
+            let label = mock_label(req.method());
+            if req.method() == self.stall_method {
+                let release = self.release.take().expect("one stalled call expected");
                 Box::pin(async move {
                     let _ = release.await;
-                    log.lock().unwrap().push("writer");
+                    log.lock().recover_poison("MockInner::call").push(label);
                     Ok(None)
                 })
             } else {
                 Box::pin(async move {
-                    log.lock().unwrap().push("reader");
+                    log.lock().recover_poison("MockInner::call").push(label);
                     Ok(None)
                 })
             }
@@ -648,7 +669,8 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let mut gate = IngressOrderGate::new(MockInner {
             log: Arc::clone(&log),
-            writer_release: Some(release_rx),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
         });
 
         // Wire order: didChange, then semanticTokens/full.
@@ -669,6 +691,81 @@ mod tests {
         assert!(reader.is_woken(), "writer completion must wake the reader");
         assert!(reader.poll().is_ready());
 
-        assert_eq!(*log.lock().unwrap(), vec!["writer", "reader"]);
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_change_only_after_preceding_open() {
+        // open→change race (#374): a didChange first-polled before didOpen
+        // misses the document and discards the edit. With didOpen gated as a
+        // writer, the change waits for the open's ticket, so it sees the
+        // inserted + parsed document.
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didOpen",
+            release: Some(release_rx),
+        });
+
+        // Wire order: didOpen, then didChange.
+        let open_fut = gate.call(notification("textDocument/didOpen", URI));
+        let change_fut = gate.call(notification("textDocument/didChange", URI));
+
+        let mut open = tokio_test::task::spawn(open_fut);
+        let mut change = tokio_test::task::spawn(change_fut);
+
+        assert!(change.poll().is_pending(), "change gated behind open");
+        assert!(open.poll().is_pending(), "open stalls on the oneshot");
+        assert!(change.poll().is_pending(), "change still gated");
+
+        release_tx.send(()).expect("open is waiting");
+        assert!(open.poll().is_ready());
+        assert!(change.is_woken(), "open completion must wake the change");
+        assert!(change.poll().is_ready());
+
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["open", "change"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_reopen_only_after_preceding_close() {
+        // close→reopen race (#374): a reopen's insert can land before a gated
+        // didClose removes the document, after which the close evicts the
+        // reopened doc. With didOpen gated as a writer behind didClose, the
+        // reopen runs only after the close completes.
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didClose",
+            release: Some(release_rx),
+        });
+
+        // Wire order: didClose, then didOpen (reopen).
+        let close_fut = gate.call(notification("textDocument/didClose", URI));
+        let reopen_fut = gate.call(notification("textDocument/didOpen", URI));
+
+        let mut close = tokio_test::task::spawn(close_fut);
+        let mut reopen = tokio_test::task::spawn(reopen_fut);
+
+        assert!(reopen.poll().is_pending(), "reopen gated behind close");
+        assert!(close.poll().is_pending(), "close stalls on the oneshot");
+        assert!(reopen.poll().is_pending(), "reopen still gated");
+
+        release_tx.send(()).expect("close is waiting");
+        assert!(close.poll().is_ready());
+        assert!(reopen.is_woken(), "close completion must wake the reopen");
+        assert!(reopen.poll().is_ready());
+
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["close", "open"]
+        );
     }
 }
