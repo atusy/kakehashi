@@ -151,7 +151,12 @@ fn walk_directory(
                 }
             }
             Err(e) => {
-                eprintln!("warning: skipping unreadable entry: {e}");
+                // Discard the write result rather than `eprintln!`: `diagnose`
+                // and `format` ignore SIGPIPE, so writing this warning to a
+                // closed stderr (`… 2>&1 | head`) would panic (exit 101).
+                // There is nowhere to report a failed warning, so drop it.
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "warning: skipping unreadable entry: {e}");
             }
         }
     }
