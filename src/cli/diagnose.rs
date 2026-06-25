@@ -166,6 +166,14 @@ struct Report {
 }
 
 impl Report {
+    /// Count one diagnostic toward the running totals and the failure gate.
+    fn tally(&mut self, diagnostic: &Diagnostic, fail_on_warning: bool) {
+        self.total += 1;
+        if is_failure(diagnostic, fail_on_warning) {
+            self.failure = true;
+        }
+    }
+
     /// Account for one file's diagnostics, appending their rendered lines to
     /// `out`. Diagnostics are sorted for deterministic output.
     fn record_file(
@@ -184,10 +192,17 @@ impl Report {
         for diagnostic in &diagnostics {
             out.push_str(&format_diagnostic(format, display, diagnostic));
             out.push('\n');
-            self.total += 1;
-            if is_failure(diagnostic, fail_on_warning) {
-                self.failure = true;
-            }
+            self.tally(diagnostic, fail_on_warning);
+        }
+    }
+
+    /// Count a file's diagnostics toward the exit code WITHOUT sorting or
+    /// rendering them. Used once the output pipe is closed (`… | head`): we
+    /// still scan every file so the exit code reflects the whole set, but the
+    /// sort and per-diagnostic formatting would be thrown away, so skip them.
+    fn tally_only(&mut self, diagnostics: &[Diagnostic], fail_on_warning: bool) {
+        for diagnostic in diagnostics {
+            self.tally(diagnostic, fail_on_warning);
         }
     }
 
@@ -255,6 +270,12 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             elnln!("error: {display}: {failure}");
             report.operational_error = true;
         }
+        if pipe_closed {
+            // The consumer is gone — still tally for the exit code, but skip the
+            // sort + per-diagnostic formatting whose output nothing will read.
+            report.tally_only(&outcome.diagnostics, options.fail_on_warning);
+            continue;
+        }
         buf.clear();
         report.record_file(
             &display,
@@ -263,7 +284,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             options.fail_on_warning,
             &mut buf,
         );
-        if !pipe_closed && !buf.is_empty() {
+        if !buf.is_empty() {
             match write_chunk(&buf) {
                 WriteState::Open => {}
                 // Consumer closed the pipe (`… | head`): stop writing, but keep
@@ -447,17 +468,17 @@ fn one_line(message: &str) -> String {
     out
 }
 
-/// The lower-case severity word. A diagnostic with no severity is treated as
-/// an error (the conservative choice — see [`effective_severity`]); an
-/// out-of-spec numeric severity renders as `unknown`.
+/// The lower-case severity word. Both an absent severity and an out-of-spec
+/// numeric one render as `error` — the same conservative treatment they get for
+/// gating ([`effective_severity`]) and sorting ([`sort_key`]) — so the printed
+/// word (and the JSONL `severity` field) never disagrees with the exit code.
 fn severity_word(severity: Option<DiagnosticSeverity>) -> &'static str {
     match severity {
-        None => "error",
-        Some(DiagnosticSeverity::ERROR) => "error",
         Some(DiagnosticSeverity::WARNING) => "warning",
         Some(DiagnosticSeverity::INFORMATION) => "info",
         Some(DiagnosticSeverity::HINT) => "hint",
-        Some(_) => "unknown",
+        // Absent, ERROR, or out-of-spec: rendered (and gated) as an error.
+        _ => "error",
     }
 }
 
@@ -661,6 +682,11 @@ mod tests {
         assert!(
             is_failure(&d, true),
             "out-of-spec severity must fail under --fail-on-warning too"
+        );
+        assert_eq!(
+            severity_word(d.severity),
+            "error",
+            "an out-of-spec severity renders as error, matching how it is gated"
         );
     }
 
