@@ -1,5 +1,6 @@
 //! Text document related LSP methods.
 
+mod call_hierarchy;
 mod code_lens;
 #[cfg(feature = "experimental")]
 mod color_presentation;

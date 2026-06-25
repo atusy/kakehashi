@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
-    ColorProviderCapability, DeclarationCapability, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability,
+    CallHierarchyServerCapability, ColorProviderCapability, DeclarationCapability,
+    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
     LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
     TypeDefinitionProviderCapability,
@@ -541,6 +541,16 @@ impl ConnectionHandle {
                     LinkedEditingRangeServerCapabilities::Simple(true)
                         | LinkedEditingRangeServerCapabilities::Options(_)
                         | LinkedEditingRangeServerCapabilities::RegistrationOptions(_)
+                )
+            ),
+            // incomingCalls/outgoingCalls have no capability of their own — they
+            // are only issued if the server registered prepareCallHierarchy, so
+            // all three gate on this single arm (LSP 3.18).
+            "textDocument/prepareCallHierarchy" => matches!(
+                caps.call_hierarchy_provider,
+                Some(
+                    CallHierarchyServerCapability::Simple(true)
+                        | CallHierarchyServerCapability::Options(_)
                 )
             ),
             "textDocument/codeLens" => caps.code_lens_provider.is_some(),
@@ -2384,5 +2394,49 @@ mod tests {
         });
 
         assert!(!handle.has_capability("codeLens/resolve"));
+    }
+
+    // ========================================
+    // prepareCallHierarchy capability tests (#353)
+    // ========================================
+
+    #[tokio::test]
+    async fn call_hierarchy_capability_true_for_simple_true() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+            ..Default::default()
+        });
+        assert!(handle.has_capability("textDocument/prepareCallHierarchy"));
+    }
+
+    #[tokio::test]
+    async fn call_hierarchy_capability_true_for_options() {
+        use tower_lsp_server::ls_types::CallHierarchyOptions;
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            call_hierarchy_provider: Some(CallHierarchyServerCapability::Options(
+                CallHierarchyOptions::default(),
+            )),
+            ..Default::default()
+        });
+        assert!(handle.has_capability("textDocument/prepareCallHierarchy"));
+    }
+
+    #[tokio::test]
+    async fn call_hierarchy_capability_false_for_simple_false() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(false)),
+            ..Default::default()
+        });
+        assert!(!handle.has_capability("textDocument/prepareCallHierarchy"));
+    }
+
+    #[tokio::test]
+    async fn call_hierarchy_capability_false_when_absent() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        assert!(!handle.has_capability("textDocument/prepareCallHierarchy"));
     }
 }
