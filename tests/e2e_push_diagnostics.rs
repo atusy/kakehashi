@@ -164,6 +164,53 @@ fn e2e_push_diagnostic_reaches_editor_in_host_coords_then_clears() {
     client.send_notification("exit", json!(null));
 }
 
+#[test]
+fn e2e_pushfallback_folds_push_driven_server_into_client_pull() {
+    // pushFallback (Path B, #425): a push-driven downstream (the `diagnostics-push`
+    // mock advertises NO `diagnosticProvider`) contributes nothing to a live
+    // `textDocument/diagnostic` fan-out — the capability gate skips it. Its cached
+    // spontaneous push is instead folded into the client-pull response, in host
+    // coordinates. Default `pushFallback = true`.
+    let (mut client, _config_dir) = init_client();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    // Wait for the spontaneous push so the slot is cached (it also reaches the editor).
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("the push-driven mock should push on didOpen");
+
+    // A client pull: the live fan-out skips the push-only mock (no
+    // `diagnosticProvider`), so only `pushFallback` can surface its diagnostic.
+    let response = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let items = response["result"]["items"]
+        .as_array()
+        .expect("the pull answer is a full diagnostic report with an items array");
+    let folded = items.iter().find(|d| is_mock_push(d)).expect(
+        "pushFallback must fold the push-driven server's cached push into the client-pull response",
+    );
+    assert_eq!(
+        folded["range"]["start"]["line"],
+        json!(HOST_LINE),
+        "the folded push must be transformed to host coordinates (host line {HOST_LINE})"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
 /// True if the host publish carries the mock's pushed diagnostic at host `line`.
 fn pushed_diag_at_line(line: i64) -> impl Fn(&Value) -> bool {
     move |params: &Value| {

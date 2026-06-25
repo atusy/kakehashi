@@ -306,6 +306,12 @@ impl Kakehashi {
     /// the method's priorities AND `bridge._self` is opted in with configured
     /// servers (capability is *not* required: a push-only `_self` server yields a
     /// host context whose live pull returns empty, and this fold supplies it).
+    ///
+    /// Under a per-region `strategy = preferred`, the folded push-driven slots are
+    /// *appended* after the region's live election rather than competing in it —
+    /// consistent with Path A's concatenate-everything merge and the deferred
+    /// per-source strategy fan-in (push-propagation-diagnostic-forwarding), not an
+    /// election bug.
     async fn fold_push_fallback_diagnostics(
         &self,
         host: &Url,
