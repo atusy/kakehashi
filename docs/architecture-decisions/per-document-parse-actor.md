@@ -90,14 +90,27 @@ mailbox while either runs, a `Close` (and a queued `SetText`) is processed
 is the liveness fix: no ingress ticket and no mailbox is ever held hostage by
 compilation.
 
+The mailbox is **unbounded**, which is what makes the sends non-blocking. The
+risk that normally argues against unbounded channels — memory growth under fast
+input — does not apply here: `SetText` carries only a small delta, the actor
+applies it to the owned text and drops it, and parse coalescing keeps at most one
+parse in flight regardless of how many `SetText`s queue. So the queued state is
+bounded by the document size, not by edit history. A bounded mailbox would
+instead push backpressure onto the ingress thread, re-creating the stall the
+design removes; it is therefore rejected.
+
 ### Install is shared and global; only the parse is the actor's child
 
 Install is **not** a per-document operation the actor owns. `try_install`
-dedupes per language ("if not already being installed"), and
-`reload_language_after_install` mutates **global** state — it pushes the data
-dir into `search_paths`, re-applies settings, and calls `ensure_language_loaded`
-on the shared registry — *before* the per-document `parse_document`. Two
-documents of the same uninstalled language opening together share one install.
+dedupes per language: the second document of the same uninstalled language gets
+an `AlreadyInstalling` outcome and skips its parse, while only the install
+"winner" re-parses (via `reload_language_after_install`, which mutates **global**
+state — pushing the data dir into `search_paths`, re-applying settings, and
+calling `ensure_language_loaded` on the shared registry — *before* the
+per-document `parse_document`). So install is already a shared, globally-mutating
+operation today; what the actor design *adds* is that every waiting document
+subscribes to its completion and parses on its own, rather than only the winner
+re-parsing.
 
 So the two operations are separated deliberately:
 
@@ -155,13 +168,23 @@ feeding tree-sitter the **accumulated** `InputEdits` since the last parse; with
 no base tree (e.g. just after install) it degrades cleanly to a full parse.
 Incrementality is a performance optimization, never a correctness requirement.
 
-This is what actually removes the `edit_lock`. The lock exists today because the
-read-old-text → resolve-deltas → persist cycle runs in concurrently-dispatched
-handlers against a shared store snapshot. Moving delta application *into* the
-single-consumer actor — the actor, not the handler, owns and mutates the text —
-is what makes that cycle non-interleavable. (A design where the handler resolved
-deltas to text from a store snapshot *before* sending would still race the
-snapshot and still need the lock.)
+This removes the `edit_lock` **from the parse / edit-application path**. The lock
+exists today partly because the read-old-text → resolve-deltas → persist cycle
+runs in concurrently-dispatched handlers against a shared store snapshot. Moving
+delta application *into* the single-consumer actor — the actor, not the handler,
+owns and mutates the text — is what makes that cycle non-interleavable. (A design
+where the handler resolved deltas to text from a store snapshot *before* sending
+would still race the snapshot and still need the lock.)
+
+But the `edit_lock` carries a *second* duty the actor does **not** subsume:
+`did_close_impl` holds it to serialize the captures-lineage clear
+(`captures_cache.retain`) against a concurrent captures `full` reader's
+`store_lineage`, which inserts under the same lock (captures-protocol). Because
+readers bypass the actor, this reader-vs-close ordering is not covered by mailbox
+serialization and needs a named replacement — either keep a dedicated lock for
+the captures lineage, or fold the lineage write into the watermark contract.
+This is a path the actor would otherwise silently orphan, so it is called out in
+the Negative consequences.
 
 ### Reads bypass the mailbox
 
@@ -177,6 +200,39 @@ load/reload — then prompts capable clients to re-request once the actor reache
 `Ready`. This saves only the 200ms bounded wait, so it is optional scope; the
 load-bearing property is simply that the mailbox stays write-only, which keeps
 the blocking problem from migrating to the read path.
+
+### Reader-vs-writer ordering needs a published watermark
+
+This is the subtle part, and it changes the writer-ticket timing, so it must be
+designed explicitly rather than assumed.
+
+Today `IngressOrderGate` completes a writer's ticket only *after* the whole
+handler future resolves (`drop(gate)` follows `inner_fut.await` in
+`ingress_order.rs`), and the `didChange` handler `await`s `parse_document`
+*inside* that window. So a `semanticTokens` reader ticketed right after a
+`didChange` is guaranteed to observe the **parsed** tree — locked down by
+`gate_runs_reader_only_after_preceding_writer`. A reader's
+`wait_for_parse_completion` then sees `has_tree == true` for the *current* tree.
+
+Under the actor, the handler returns at **enqueue**, so the writer ticket
+completes *before* the actor applies the delta or calls `mark_parse_started`. A
+reader's gate barrier is then satisfied while `has_tree` is still true for the
+**old** tree, and `wait_for_parse_completion` returns the stale tree
+immediately. That reintroduces exactly the #342/#374 race. A bare `has_tree`
+check is therefore insufficient.
+
+The replacement: the actor publishes a per-URI **monotonic processed-through
+watermark** keyed to the ingress writer sequence. Each mutation handler stamps
+its enqueued message with the writer ticket it holds; when the actor finishes
+applying-and-parsing the state through ticket *N* (and has written the resulting
+tree into the store), it advances the published watermark to *N*. A reader
+captures the current tail ticket at gate `call` time (it already does, for the
+reader barrier) and waits — bounded by the existing 200ms — until the watermark
+reaches that ticket, instead of waiting on `has_tree`. If an install is pending
+the watermark cannot advance, so the reader simply times out into the empty
+fallback, which is the intended install-pending behaviour. This preserves the
+#374 reader-observes-preceding-writes guarantee without re-coupling the handler
+to parse latency or to the unbounded install.
 
 ### Lifetime equals document lifetime
 
@@ -200,9 +256,14 @@ is complementary to the actor, not a substitute for it.
 
 ### Injection orchestration stays downstream
 
-`process_injections` (which can spawn external bridge servers) is kicked off as
-a fire-and-forget consequence of a completed main parse, not awaited inside the
-actor loop, so injection work never stalls main-document parsing.
+`process_injections` runs as a consequence of a completed main parse, not inside
+the actor loop, so injection work never stalls main-document parsing. It is not
+uniformly fire-and-forget, though: spawning external bridge servers is genuinely
+fire-and-forget, but the `didChange` forwarding to already-opened virtual
+documents is wire-order-sensitive and must be sequenced **after** the parse it
+depends on (it needs the fresh tree) and in writer order — so it is ordered, not
+loosed. The split between the fire-and-forget spawn and the ordered forwarding
+must be preserved when re-homing this step.
 
 ## Considered Options
 
@@ -250,8 +311,10 @@ write-only-mailbox / shared-store-read split is load-bearing.
 - **Liveness.** An unbounded/hung install can no longer wedge same-URI readers
   or writers; the actor loop stays responsive and `Close` always lands.
 - **Serialization by construction.** A single mailbox consumer removes the parse
-  path's reliance on the per-URI `edit_lock`; the read-old-text → reparse →
-  persist cycle is no longer interleavable.
+  / edit-application path's reliance on the per-URI `edit_lock`; the
+  read-old-text → reparse → persist cycle is no longer interleavable. (The
+  lock's *other* duty — reader-vs-close captures-lineage ordering — is not
+  subsumed; see Negative.)
 - **`skip_parse` disappears**, folded into the `Uninstalled/Installing/Ready`
   state machine; the install path stops re-entering parsing from a second call
   site.
@@ -270,29 +333,36 @@ write-only-mailbox / shared-store-read split is load-bearing.
   completion plumbed back as messages, and mailbox backpressure are all new
   surface area to get right.
 - **Carefully tuned races must be preserved**, not regressed: the captures
-  lineage close ordering (captures-protocol), the geometry re-merge / no-op
-  suppression on `didChange` (#422), and the diagnostic teardown ordering in
-  `didClose`.
-- **Injection orchestration must be re-homed** as a downstream consequence of
-  the main parse rather than an inline handler step.
+  lineage close ordering (captures-protocol) — which today rides the `edit_lock`
+  the parse path sheds, so it needs an explicit replacement (a dedicated lock or
+  the watermark contract); the geometry re-merge / no-op suppression on
+  `didChange` (#422); and the diagnostic teardown ordering in `didClose`.
+- **A new read-path coupling** is introduced: readers must wait on the actor's
+  per-URI processed-through watermark instead of `has_tree`. Getting this watermark
+  wrong silently reintroduces the #342/#374 stale-tree race.
+- **Injection orchestration must be re-homed** carefully: the heavy external
+  bridge-server spawn is fire-and-forget, but the bridge `didChange` forwarding
+  to already-opened virtual documents is wire-order-sensitive and must stay
+  ordered after the parse it depends on (or remain in the gated handler), not
+  be loosed as unordered fire-and-forget.
 
 ### Neutral
 
-- `IngressOrderGate`'s writer tickets become partly redundant for the *parse*
-  path (the actor already serializes it), but still govern wire-order for the
-  non-parse side effects that live in the mutation handlers today —
-  diagnostic scheduling, bridge `didChange` forwarding, `process_injections`.
-  The intended relationship (to be confirmed in implementation): handlers
+- `IngressOrderGate` still issues per-URI tickets, but the writer ticket now
+  completes at **enqueue** rather than after parse (see the watermark section),
+  so its old reader-observes-preceding-writes guarantee is no longer carried by
+  the ticket alone — it is carried by the actor's published watermark. Handlers
   **enqueue to the mailbox from within the gated critical section**, so mailbox
-  FIFO equals wire order and `Open`/`SetText`/`Close` reach the actor in the
-  order #374 established. Side effects that must stay wire-ordered either remain
-  in the gated handler (kept as the lightweight, non-blocking part of the
-  handler) or are sequenced by the actor *after* the parse they depend on
-  (e.g. injection orchestration, which needs the fresh tree). Only the
-  parse-state serialization moves into the actor; the gate's per-URI ordering
-  for the rest is retained.
-- Readers keep their existing `wait_for_parse_completion` + fallback contract;
-  the change is *who writes* the tree they read, not how they read it.
+  FIFO still equals wire order and `Open`/`SetText`/`Close` reach the actor in
+  the order #374 established. Non-parse side effects that must stay wire-ordered
+  (diagnostic scheduling, the bridge `didChange` forwarding in
+  `process_injections`) either remain in the gated handler or are sequenced by
+  the actor *after* the parse they depend on; this re-homing is the
+  highest-risk part of the change.
+- Readers keep their existing bounded-wait + fallback contract, but the signal
+  they wait on changes from `has_tree` to the per-URI processed-through
+  watermark. That is the one read-path change the design requires; without it
+  the new writer-ticket timing would let a reader observe a stale tree.
 
 ## Decision–Implementation Gap
 
@@ -300,6 +370,8 @@ Not yet implemented. This ADR records the target design; it runs ahead of the
 code. As of writing, `did_open_impl` still awaits auto-install inline, still
 carries the `skip_parse` flag, `did_change_impl` still serializes via
 `edit_lock`, and `reload_language_after_install` still re-enters the parse path
-on install completion. The actor, its state machine, the child-task model, and
-the install-wide deadline are all unbuilt. A staged rollout may land Option 1
+on install completion, and readers still wait on `has_tree` (there is no
+processed-through watermark, and no install-pending signal in the store). The
+actor, its state machine, the child-task model, the reader watermark, and the
+install-wide deadline are all unbuilt. A staged rollout may land Option 1
 (minimal spawn) first as an interim liveness fix before the full actor.
