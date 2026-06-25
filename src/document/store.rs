@@ -88,6 +88,23 @@ impl DocumentStore {
         sender.send_replace(state);
     }
 
+    /// Set `has_tree = true` only if a parse-state entry already exists.
+    ///
+    /// Unlike [`update_tree_availability`] this does **not** create the entry
+    /// (`get`, not `parse_sender`'s get-or-insert). For a live document the entry
+    /// always exists (created on insert), so this is equivalent; but for the
+    /// non-inserting reader CAS it avoids resurrecting a parse-state for a URI that
+    /// a concurrent `didClose` removed — `remove` drops `parse_states` first, so a
+    /// get-or-insert here would recreate a ghost `has_tree = true` for a closed
+    /// document. Holding the `Ref` serializes against that `remove`.
+    fn mark_tree_available_if_tracked(&self, uri: &Url) {
+        if let Some(sender) = self.parse_states.get(uri) {
+            let mut state = *sender.borrow();
+            state.has_tree = true;
+            sender.send_replace(state);
+        }
+    }
+
     fn parse_sender(&self, uri: &Url) -> watch::Sender<ParseState> {
         match self.parse_states.entry(uri.clone()) {
             Entry::Occupied(entry) => entry.get().clone(),
@@ -203,9 +220,11 @@ impl DocumentStore {
     /// **non-inserting**: a `Vacant` entry — the document was closed while the
     /// parse ran — is left untouched, so a parse completing after a `didClose`
     /// cannot **resurrect** the document. Folding the text-equality check into the
-    /// same atomic `entry()` operation also closes the check-then-write window
-    /// against a concurrent `didChange`: a tree parsed from now-stale text is
-    /// dropped rather than associated with the newer text.
+    /// same atomic `get_mut` lock also closes the check-then-write window against a
+    /// concurrent `didChange`: a tree parsed from now-stale text is dropped rather
+    /// than associated with the newer text. The availability update is likewise
+    /// non-inserting (see `mark_tree_available_if_tracked`), so the parse-state
+    /// isn't resurrected either.
     pub(crate) fn update_tree_if_text_unchanged(
         &self,
         uri: &Url,
@@ -230,7 +249,9 @@ impl DocumentStore {
             false
         };
         if stored {
-            self.update_tree_availability(uri, true);
+            // Non-inserting too: don't recreate a parse-state for a URI a
+            // concurrent didClose may have just dropped.
+            self.mark_tree_available_if_tracked(uri);
         }
         stored
     }
@@ -451,6 +472,31 @@ mod tests {
         assert!(
             store.get(&uri).unwrap().tree().is_none(),
             "the stale tree must not overwrite the current text's (still-absent) tree"
+        );
+    }
+
+    #[test]
+    fn update_tree_if_text_unchanged_does_not_recreate_parse_state_after_close() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///race.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        // `remove` (didClose) drops `parse_states` before `documents`; model the
+        // window where the parse-state is already gone but our in-flight CAS still
+        // sees the document.
+        store.parse_states.remove(&uri);
+
+        let stored =
+            store.update_tree_if_text_unchanged(&uri, "fn main() {}", parse_rust("fn main() {}"));
+        assert!(stored, "the still-present document gets the tree");
+        assert!(
+            store.parse_states.get(&uri).is_none(),
+            "the availability update must not recreate a parse-state for a URI whose \
+             parse-state a concurrent close already removed"
         );
     }
 
