@@ -28,7 +28,9 @@ use crate::lsp::aggregation::server::{
 };
 use crate::lsp::bridge::{LanguageServerPool, RegionOffset};
 use crate::lsp::diagnostic_cache::DiagnosticSource;
-use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
+use crate::lsp::lsp_impl::bridge_context::{
+    DocumentRequestContext, HostRequestContext, resolve_aggregation_config_from_settings,
+};
 use crate::lsp::lsp_impl::text_document::{RequestErrorSink, count_request_errors};
 
 // ============================================================================
@@ -329,17 +331,23 @@ impl Kakehashi {
         // push-driven ones so a pull-driven server is not double-counted.
         let pull_driven = self.bridge.pool().pull_driven_servers(&candidates).await;
 
+        // Load settings once: resolving per-region pushFallback in the loop and
+        // the host gate below otherwise re-reads it N+1 times and could resolve
+        // different regions against different snapshots if config is swapped
+        // mid-request.
+        let settings = self.settings_manager.load_settings();
+
         // Per-region `pushFallback` gate + current offsets for the transform.
         let mut region_offsets = HashMap::new();
         let mut region_push_enabled = HashSet::new();
         for (region_id, injection_language, offset) in region_meta {
-            if self
-                .resolve_aggregation_config(
-                    language_name,
-                    injection_language,
-                    "textDocument/diagnostic",
-                )
-                .push_fallback
+            if resolve_aggregation_config_from_settings(
+                &settings,
+                language_name,
+                injection_language,
+                "textDocument/diagnostic",
+            )
+            .push_fallback
             {
                 region_push_enabled.insert(region_id.clone());
             }
@@ -348,18 +356,24 @@ impl Kakehashi {
 
         // Host `pushFallback` gate: the host layer participates AND pushFallback
         // is on for the host's diagnostic method.
-        let host_push_enabled = host_layer_participates && {
-            let settings = self.settings_manager.load_settings();
-            settings
+        let host_push_enabled = host_layer_participates
+            && settings
                 .resolve_host_language_settings(language_name)
                 .map(|s| {
                     s.resolve_host_aggregation("textDocument/diagnostic")
                         .push_fallback
                 })
-                .unwrap_or(false)
-        };
+                .unwrap_or(false);
 
         let include = |source: &DiagnosticSource, server: &str| {
+            // Pull-driven servers are excluded unconditionally: their native
+            // source is the live pull above, which already gates on the same
+            // capability AND on this method's `priorities`/`maxFanOut`. A
+            // pull-driven server that `priorities` drops from the live fan-out is
+            // therefore also dropped here — config-consistent, not a leak. (The
+            // only lossy corner is a pull-driven server whose live pull times out
+            // this cycle while holding a stale cached push; transient, and it
+            // never hides a current diagnostic.)
             if pull_driven.contains(server) {
                 return false; // covered by the live pull
             }
