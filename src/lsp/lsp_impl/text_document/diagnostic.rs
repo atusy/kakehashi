@@ -346,17 +346,25 @@ impl Kakehashi {
         let settings = self.settings_manager.load_settings();
 
         // Per-region `pushFallback` gate + current offsets for the transform.
+        // `pushFallback` is keyed by injection language, so resolve it once per
+        // distinct language rather than per region (a document can hold many
+        // regions of one language).
         let mut region_offsets = HashMap::new();
         let mut region_push_enabled = HashSet::new();
+        let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset) in region_meta {
-            if resolve_aggregation_config_from_settings(
-                &settings,
-                language_name,
-                &injection_language,
-                "textDocument/diagnostic",
-            )
-            .push_fallback
-            {
+            let push_fallback = *push_fallback_by_lang
+                .entry(injection_language)
+                .or_insert_with_key(|lang| {
+                    resolve_aggregation_config_from_settings(
+                        &settings,
+                        language_name,
+                        lang,
+                        "textDocument/diagnostic",
+                    )
+                    .push_fallback
+                });
+            if push_fallback {
                 region_push_enabled.insert(region_id.clone());
             }
             // `region_meta` is consumed: move the id + offset (a heap `Vec`) in
