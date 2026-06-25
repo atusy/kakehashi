@@ -437,10 +437,21 @@ fn severity_word(severity: Option<DiagnosticSeverity>) -> &'static str {
 }
 
 /// A diagnostic's effective severity for gating. LSP allows an absent
-/// severity (the client decides); we treat it as an error so a server that
-/// omits severity can never silently slip past the failure gate.
+/// severity (the client decides); we treat it — and any out-of-spec value a
+/// downstream server might send over the wire (`DiagnosticSeverity` is a
+/// transparent `i32`) — as an error, so a server that omits or mangles the
+/// severity can never silently slip a diagnostic past the failure gate. Only
+/// the four spec severities order meaningfully against the gate; an unknown
+/// numeric value (e.g. 5) would otherwise compare as "less severe than a
+/// warning" and escape even `--fail-on-warning`.
 fn effective_severity(diagnostic: &Diagnostic) -> DiagnosticSeverity {
-    diagnostic.severity.unwrap_or(DiagnosticSeverity::ERROR)
+    match diagnostic.severity {
+        Some(DiagnosticSeverity::WARNING) => DiagnosticSeverity::WARNING,
+        Some(DiagnosticSeverity::INFORMATION) => DiagnosticSeverity::INFORMATION,
+        Some(DiagnosticSeverity::HINT) => DiagnosticSeverity::HINT,
+        // Absent, ERROR, or any out-of-spec value: treat as an error.
+        _ => DiagnosticSeverity::ERROR,
+    }
 }
 
 /// Whether `diagnostic` should fail the run: an error always, plus a warning
@@ -598,6 +609,25 @@ mod tests {
         assert!(
             is_failure(&d, false),
             "absent severity is treated as an error and always fails"
+        );
+    }
+
+    #[test]
+    fn out_of_spec_severity_is_gated_as_an_error() {
+        // A downstream server can put a severity outside the spec's 1..=4 on
+        // the wire (`DiagnosticSeverity` is `#[serde(transparent)]` over i32).
+        // Such a value must not slip past the gate just because it sorts
+        // "below" a warning — it is treated as an error.
+        let bogus: DiagnosticSeverity =
+            serde_json::from_value(serde_json::json!(99)).expect("transparent i32 severity");
+        let d = diag(0, 0, Some(bogus), "mystery severity");
+        assert!(
+            is_failure(&d, false),
+            "out-of-spec severity must fail the default gate"
+        );
+        assert!(
+            is_failure(&d, true),
+            "out-of-spec severity must fail under --fail-on-warning too"
         );
     }
 
