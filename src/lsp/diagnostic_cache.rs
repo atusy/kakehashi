@@ -25,7 +25,8 @@
 //! **One native source per server (#425).** A server that both answers
 //! `textDocument/diagnostic` (landing in `PullLayer`) *and* spontaneously pushes
 //! `publishDiagnostics` (landing in a `Region` or `Host` slot) would be counted
-//! twice. The proactive [`DiagnosticPublisher`](crate::lsp::lsp_impl::coordinator)'s
+//! twice. The proactive
+//! [`DiagnosticPublisher`](crate::lsp::lsp_impl::coordinator::DiagnosticPublisher)'s
 //! `filter_pull_driven_push_slots` drops a
 //! **pull-driven** server's push slots from the publish whenever a `PullLayer`
 //! blob is present (classification is live via

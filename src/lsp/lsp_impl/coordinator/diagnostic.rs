@@ -1,3 +1,4 @@
+use crate::config::settings::ResolvedAggregationConfig;
 use crate::document::DocumentStore;
 use crate::language::InjectionResolver;
 use crate::language::LanguageCoordinator;
@@ -161,46 +162,51 @@ impl DiagnosticScheduler {
         // Virt layer: `None` = the document can never have virt diagnostics
         // (no injection query), distinct from `Some(vec![])` = gated off or
         // currently no regions (publish-empty-to-clear).
-        let virt_contexts: Option<Vec<DocumentRequestContext>> =
-            if !layer_cfg.allows(crate::config::settings::LayerSource::Virt) {
-                log::debug!(
-                    target: LOG_TARGET,
-                    "virt layer disabled for {} via layers.aggregation priorities",
-                    language_name
-                );
-                Some(Vec::new())
-            } else {
-                self.language
-                    .injection_query(&language_name)
-                    .map(|injection_query| {
-                        let all_regions = InjectionResolver::resolve_all(
-                            &self.language,
-                            self.bridge.node_tracker(),
-                            uri,
-                            snapshot.tree(),
-                            snapshot.text(),
-                            injection_query.as_ref(),
-                        );
+        let virt_contexts: Option<Vec<DocumentRequestContext>> = if !layer_cfg
+            .allows(crate::config::settings::LayerSource::Virt)
+        {
+            log::debug!(
+                target: LOG_TARGET,
+                "virt layer disabled for {} via layers.aggregation priorities",
+                language_name
+            );
+            Some(Vec::new())
+        } else {
+            self.language
+                .injection_query(&language_name)
+                .map(|injection_query| {
+                    let all_regions = InjectionResolver::resolve_all(
+                        &self.language,
+                        self.bridge.node_tracker(),
+                        uri,
+                        snapshot.tree(),
+                        snapshot.text(),
+                        injection_query.as_ref(),
+                    );
 
-                        let mut contexts = Vec::new();
-                        // Configs + aggregation are keyed by injection language, so
-                        // resolve them once per distinct language (a document can
-                        // hold many regions of one language). `None` caches a skipped
-                        // language: no configured server, OR the pull would dispatch
-                        // to none.
-                        let mut resolved_by_lang = std::collections::HashMap::new();
-                        for resolved in all_regions {
-                            let entry = resolved_by_lang
-                                .entry(resolved.injection_language.clone())
-                                .or_insert_with_key(|lang| {
-                                    let configs = self.bridge.get_all_configs_for_language(
-                                        &settings,
-                                        &language_name,
-                                        lang,
-                                    );
-                                    if configs.is_empty() {
-                                        return None;
-                                    }
+                    let mut contexts = Vec::new();
+                    // Configs + aggregation are keyed by injection language, so
+                    // resolve them once per distinct language (a document can
+                    // hold many regions of one language). `None` caches a skipped
+                    // language: no configured server, OR the pull would dispatch
+                    // to none. The key is cloned only on the resolving miss, not
+                    // on every region.
+                    type ResolvedLang =
+                        Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
+                    let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
+                        std::collections::HashMap::new();
+                    for resolved in all_regions {
+                        if !resolved_by_lang.contains_key(&resolved.injection_language) {
+                            let lang = &resolved.injection_language;
+                            let computed: ResolvedLang = {
+                                let configs = self.bridge.get_all_configs_for_language(
+                                    &settings,
+                                    &language_name,
+                                    lang,
+                                );
+                                if configs.is_empty() {
+                                    None
+                                } else {
                                     let agg = resolve_aggregation_config_from_settings(
                                         &settings,
                                         &language_name,
@@ -224,28 +230,33 @@ impl DiagnosticScheduler {
                                             agg.max_fan_out,
                                         )
                                     {
-                                        return None;
+                                        None
+                                    } else {
+                                        Some((configs, agg))
                                     }
-                                    Some((configs, agg))
-                                });
-                            let Some((configs, agg)) = entry.as_ref() else {
-                                continue;
+                                }
                             };
-
-                            contexts.push(DocumentRequestContext {
-                                uri: uri.clone(),
-                                resolved,
-                                configs: configs.clone(),
-                                upstream_request_id: None,
-                                priorities: agg.priorities.clone(),
-                                strategy: agg.strategy,
-                                max_fan_out: agg.max_fan_out,
-                                client_progress_token: None,
-                            });
+                            resolved_by_lang.insert(resolved.injection_language.clone(), computed);
                         }
-                        contexts
-                    })
-            };
+                        let Some((configs, agg)) = &resolved_by_lang[&resolved.injection_language]
+                        else {
+                            continue;
+                        };
+
+                        contexts.push(DocumentRequestContext {
+                            uri: uri.clone(),
+                            resolved,
+                            configs: configs.clone(),
+                            upstream_request_id: None,
+                            priorities: agg.priorities.clone(),
+                            strategy: agg.strategy,
+                            max_fan_out: agg.max_fan_out,
+                            client_progress_token: None,
+                        });
+                    }
+                    contexts
+                })
+        };
 
         // Host layer (host-document-bridge): participates when listed in the
         // layer priorities AND opted in via bridge._self.enabled with a

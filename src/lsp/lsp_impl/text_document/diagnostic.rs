@@ -7,7 +7,7 @@
 //! `JoinSet` aborts all downstream tasks, and cancels are also forwarded
 //! downstream fire-and-forget via middleware.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -345,12 +345,13 @@ impl Kakehashi {
         // mid-request.
         let settings = self.settings_manager.load_settings();
 
-        // Per-region `pushFallback` gate + current offsets for the transform.
-        // `pushFallback` is keyed by injection language, so resolve it once per
-        // distinct language rather than per region (a document can hold many
-        // regions of one language).
+        // Current offsets for the transform, keyed by region — built ONLY for
+        // regions whose `pushFallback` is on (resolved once per distinct
+        // injection language, since a document can hold many regions of one
+        // language). A region without an offset is skipped by
+        // `cached_push_diagnostics`, so this map doubles as the per-region
+        // pushFallback gate — no separate set, no `region_id` clone.
         let mut region_offsets = HashMap::new();
-        let mut region_push_enabled = HashSet::new();
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset) in region_meta {
             let push_fallback = *push_fallback_by_lang
@@ -365,11 +366,8 @@ impl Kakehashi {
                     .push_fallback
                 });
             if push_fallback {
-                region_push_enabled.insert(region_id.clone());
+                region_offsets.insert(region_id, offset);
             }
-            // `region_meta` is consumed: move the id + offset (a heap `Vec`) in
-            // rather than cloning per region.
-            region_offsets.insert(region_id, offset);
         }
 
         // Host `pushFallback` gate: the host layer participates AND pushFallback
@@ -396,7 +394,10 @@ impl Kakehashi {
                 return false; // covered by the live pull
             }
             match source {
-                DiagnosticSource::Region(id) => region_push_enabled.contains(id),
+                // A `Region` slot only reaches `include` when `region_offsets`
+                // has its offset, i.e. its `pushFallback` is on — so the gate is
+                // already applied; nothing more to check beyond `pull_driven`.
+                DiagnosticSource::Region(_) => true,
                 DiagnosticSource::Host => host_push_enabled,
                 DiagnosticSource::PullLayer => false,
             }
