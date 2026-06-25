@@ -76,15 +76,17 @@ couples concerns that are hard to reason about independently:
   (`try_parse_and_update_document` and analogues) that *writes the store*, and
   `update_document` **inserts on vacancy** — a second resurrection vector.
 
-Underneath, the store already keeps **two** monotonic counters that are really
-the same idea pulled in different directions: `open_generations` (used by the
-captures lineage to detect close-then-reopen) and `ParseState.generation` (whose
-`mark_parse_finished` stale-check already refuses to record a superseded parse).
-Neither gates the tree write itself. The ingress writer ticket
-(`IngressOrderGate`, `src/lsp/ingress_order.rs`) is a *third* per-document
-sequence, and the reader-ordering watermark this design needs would be a
-*fourth*. They are four implementations of one concept: a per-document logical
-version.
+Underneath, the store already keeps **two** monotonic counters that are two
+**axes** of one idea: `open_generations` (process-wide, used by the captures
+lineage to detect close-then-reopen — an *incarnation* counter) and
+`ParseState.generation` (per-lifetime, whose `mark_parse_finished` stale-check
+already refuses to record a superseded parse). Neither gates the tree write
+itself. The ingress writer ticket (`IngressOrderGate`,
+`src/lsp/ingress_order.rs`) is a *third* per-document sequence — intra-lifetime
+wire order, which restarts on reopen — and the reader-ordering watermark this
+design needs would be a *fourth*. They are four implementations of two axes:
+*which lifetime* (incarnation) and *where in that lifetime's wire order*
+(ticket).
 
 The common root is that a document's text, parser readiness, and parse
 scheduling have **no single owner**.
@@ -93,12 +95,13 @@ scheduling have **no single owner**.
 
 Introduce a **per-document parse actor**: one actor task per open document that
 exclusively owns that document's text, parser-readiness state, and parse
-scheduling, and a **single per-document epoch** — the ingress writer ticket made
-authoritative — that is the one source of truth for ordering, resurrection-safety,
-and parse-staleness. It absorbs the three other per-document version-sequences
-(`open_generations`, `ParseState.generation`, and the otherwise-new reader
-watermark), and its per-write check additionally takes over the `edit_lock`'s
-resurrection-guard duty.
+scheduling, and a **single per-document epoch** — the pair
+`(incarnation, ticket)` — that is the one source of truth for ordering,
+resurrection-safety, and parse-staleness. It pairs the retained process-wide open
+generation (the incarnation, monotonic across reopen) with the ingress writer
+ticket (intra-lifetime wire order), folds `ParseState.generation` and the
+otherwise-new reader watermark into those two axes, and its per-write check
+additionally takes over the `edit_lock`'s resurrection-guard duty.
 
 ### Writes are messages; the loop never blocks on the slow op
 
@@ -149,46 +152,76 @@ policy.
 
 ### One epoch for ordering, resurrection, and staleness
 
-A single monotonic per-document **epoch** — the ingress writer-ticket sequence,
-made authoritative — becomes the one version-sequence the other three collapse
-into. The unification is of the *source*, not of a single scalar: two derived
-quantities read off the same ticket sequence. The actor publishes a **processed-through watermark** (the
-highest ticket whose state has fully resolved) that readers wait on, and stamps
-each store write with the **epoch at which it was scheduled** that the CAS write
-compares before committing. Everything keys on that one sequence:
+The four ad-hoc sequences are really **two axes** of one idea: an *incarnation*
+(which open→close lifetime this is) and an *intra-lifetime ticket* (wire order
+within one open document). The design makes the per-document **epoch** the pair
+`(incarnation, ticket)`:
+
+- the **incarnation** is the retained process-wide open generation
+  (`open_counter` / `open_generations`), drawn fresh on every `didOpen`. It is
+  deliberately **not** the ingress ticket: `IngressOrderGate::finish_close`
+  removes a URI's sequencing state on close, so the ticket **restarts at 1 on
+  reopen** and is not monotonic across lifetimes. Were the epoch the ticket
+  alone, a straggler write from a previous lifetime could match the reopened
+  document's ticket. The incarnation is the high half precisely to close that
+  gap.
+- the **ticket** is the ingress writer sequence within the current lifetime,
+  plumbed to the handler from the gate.
+
+Two derived quantities read off this one pair; the unification is of the
+*source*, not of a single scalar:
 
 - **Wire order / readiness (reader watermark).** Each mutation handler stamps its
-  enqueued message with the ingress writer ticket plumbed to it from the gate.
-  When the actor brings the document's state through ticket *N* to a **terminal
-  outcome** — `Parsed` (tree written), `NoTree` (parsed to nothing), or
-  `InstallFailed` — it advances the *published* epoch to *N*. The watermark must
-  advance on **resolution**, not only on a successful tree write, or a
-  parse/install failure would never advance it and readers would burn the full
-  timeout. A virt/native reader waits — bounded by the existing 200 ms — until
-  the epoch reaches the tail ticket that preceded it, then reads whatever the
-  store holds (a tree, or empty), instead of waiting on `has_tree`. This is
-  required because, with the handler returning at *enqueue*, a bare `has_tree`
-  check would be satisfied while the store still holds the **old** tree —
-  reintroducing the #342/#374 stale-tree race.
-- **Resurrection-safety (generation-checked CAS writes).** Every tree write
-  becomes an **atomic, non-inserting, epoch-checked** store update: it no-ops if
-  the document is gone (`Vacant`) or the epoch has moved. This generalizes the
-  existing `mark_parse_finished` stale-check from the parse-state to the tree
-  itself. The actor's own parse is one writer; the reader on-demand fallback is
-  the other (see below). The unguarded site today is
-  `kakehashi/node`'s `ensure_parsed_for_node_lookup` (`entry.rs`); the
-  `semanticTokens` and `selectionRange` fallbacks are already `edit_lock`-guarded
-  but switch to the same CAS write.
-- **Close-then-reopen detection** (today `open_generations`) is the same epoch:
-  a reopen draws a fresh epoch, so a stale lineage insert or a late parse
-  naturally fails its epoch check.
+  enqueued message with `(incarnation, ticket)`. The actor publishes a
+  **processed-through watermark**: the highest ticket (within the current
+  incarnation) whose state has reached a terminal outcome — `Parsed`, `NoTree`
+  (parsed to nothing), or `InstallFailed`. It advances on **resolution**, not
+  only on a successful tree write, or a parse/install failure would never advance
+  it and readers would burn the full timeout. Because the actor **coalesces**, a
+  single parse covers a contiguous run of tickets; the watermark advances to the
+  highest ticket that parse **covered**, and a parse superseded by a newer edit
+  before it completes does not strand its tickets — they are carried into the
+  next (covering) parse. The watermark never regresses and advances on a covering
+  terminal completion, but no bound is claimed on how quickly a *given* ticket is
+  covered under sustained editing — continuous edits can keep the watermark behind
+  a reader's target ticket indefinitely. The **hard** guarantee is the reader
+  side:
+  the existing 200 ms bound plus the empty fallback caps any wait, so sustained
+  editing degrades a reader to the empty fallback rather than starving it. A
+  virt/native reader
+  waits — bounded by that 200 ms — until the watermark reaches the tail ticket
+  that preceded it, then reads whatever the store holds (a tree, or empty),
+  instead of waiting on `has_tree`. This is required because, with the handler
+  returning at *enqueue*, a bare `has_tree` check would be satisfied while the
+  store still holds the **old** tree — reintroducing the #342/#374 stale-tree
+  race.
+- **Resurrection-safety (epoch-checked CAS writes).** Every tree write becomes an
+  **atomic, non-inserting** store update checked against the full
+  `(incarnation, ticket)` pair: it no-ops if the document is gone (`Vacant`), the
+  incarnation differs (a reopen happened), or the ticket moved. This folds both
+  `open_generations` (incarnation mismatch) and `ParseState.generation` (ticket
+  mismatch) into one comparison, generalizing the existing `mark_parse_finished`
+  stale-check from the parse-state to the tree itself. The actor's own parse is
+  one writer; the reader on-demand fallback is the other (see below). The
+  unguarded site today is `kakehashi/node`'s `ensure_parsed_for_node_lookup`
+  (`entry.rs`); the `semanticTokens` and `selectionRange` fallbacks are already
+  `edit_lock`-guarded but switch to the same CAS write.
+- **Close-then-reopen detection** is the incarnation half: a reopen draws a fresh
+  incarnation, so a stale lineage insert or a late parse from the previous
+  lifetime fails the incarnation check even though the reopened lifetime's
+  tickets restart at 1.
 
 This requires new plumbing in `IngressOrderGate`: today the ticket is
 middleware-private — a writer handler does not receive `gate.ticket()`, and a
 reader handler does not receive the tail ticket the `ReaderBarrier` snapshots at
 `call` time. Both must be exposed (via a task-local, a request extension, or by
-moving the enqueue into the middleware) so the writer can stamp its message and
-the reader can name the epoch it waits on. The ingress middleware is part of the
+moving the enqueue into the middleware). Crucially, because the epoch is the pair
+`(incarnation, ticket)` and tickets restart on reopen, the **incarnation must be
+plumbed alongside the ticket** — to both the writer (so its stamped message names
+the right lifetime) and the reader (so the tail it waits on names
+`(incarnation, ticket)`, not a bare ticket that a reopen's restarted sequence
+could ambiguate). Equivalently, the reader can hold an incarnation-bound watermark
+handle that is invalidated on close. The ingress middleware is part of the
 refactor surface.
 
 ### Install is shared and global; only the parse is the actor's child
@@ -287,12 +320,12 @@ in-flight **parse** (the store-writing child), unsubscribes from the shared
 install, advances the epoch, and terminates the actor; the store entry is
 removed. The shared install itself is *not* aborted. A late install completing
 afterward has no actor to hand off to, and any straggler write fails its epoch
-check, so **the install/parse resurrection path is structurally closed** with no
-separate supersede machinery — *provided* every store-writing path, including the
-reader on-demand fallback, goes through the epoch-checked CAS write below; that
-fallback is the one residual vector, and it is closed at the write, not by a
-check a concurrent close can slip past. A reopen creates a fresh actor at a fresh
-epoch.
+check (the incarnation no longer matches), so **the install/parse resurrection
+path is structurally closed** with no separate supersede machinery — *provided*
+every store-writing path, including the reader on-demand fallback, goes through the
+epoch-checked CAS write below; that fallback is the one residual vector, and it is
+closed at the write, not by a check a concurrent close can slip past. A reopen
+creates a fresh actor at a fresh incarnation.
 
 Teardown must also wake any reader blocked on an epoch that will now never be
 reached: dropping the epoch channel on actor termination signals those waiters to
@@ -400,11 +433,13 @@ write-only-mailbox / shared-store-read split is load-bearing.
 - **Burst coalescing.** A run of edits collapses to one parse over the
   accumulated text, saving the measured per-edit reparse cost on injection-heavy
   documents.
-- **One epoch, not four.** Wire-order readiness, resurrection-safety, and
-  parse-staleness key on a single per-document counter — the ingress ticket made
-  authoritative — into which the other three version-sequences
-  (`open_generations`, `ParseState.generation`, the reader watermark) collapse,
-  and which additionally takes over the `edit_lock`'s resurrection-guard duty.
+- **One epoch, two axes, not four sequences.** Wire-order readiness,
+  resurrection-safety, and parse-staleness key on a single composite epoch
+  `(incarnation, ticket)` — the retained process-wide open generation paired with
+  the ingress ticket — into which `ParseState.generation` and the reader watermark
+  fold, and whose per-write check additionally takes over the `edit_lock`'s
+  resurrection-guard duty. The incarnation half keeps the epoch monotonic across a
+  reopen even though tickets restart.
 - **`skip_parse` disappears**, folded into the `Uninstalled/Installing/Ready`
   state machine; the install path stops re-entering parsing from a second call
   site.

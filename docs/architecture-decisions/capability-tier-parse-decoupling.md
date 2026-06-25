@@ -127,6 +127,17 @@ This invariant is stated explicitly here because it is what makes the
 reordering safe; see ls-bridge-message-ordering for the connection-level
 contract.
 
+The invariant is about message **type** ordering (an open always precedes a
+change for the same document), not text-**version** ordering. Whether a later
+sync can carry *older* text than an earlier one — e.g. a delayed open-time task
+emitting `didChange` with stale text after a newer sync already opened the
+document — is a separate, **already-unresolved** concern: the content-version /
+`content_epoch` stale-overwrite window (push-propagation-diagnostic-forwarding,
+the #422 race). The `sync_host_document` fingerprint check only suppresses a
+re-sync when the text is *unchanged*; it does not reject text that differs but is
+older, so it does not close this race. Hoisting neither introduces nor fixes it;
+this ADR's reordering is orthogonal to it.
+
 ### Virt and native tiers stay parse-gated
 
 Virt-tier requests still wait on the parse, because region location needs the
