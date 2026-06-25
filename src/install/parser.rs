@@ -449,6 +449,51 @@ fn run_with_timeout(
     }
 }
 
+/// Run a subprocess under a hard deadline, killing it on expiry.
+///
+/// Unlike [`run_with_timeout`], this is for a child that itself spawns children
+/// (the parser compile re-execs this binary, which shells out to `cc` as a
+/// *grandchild*). A bare `child.kill()` reaches only the direct child and leaves
+/// the `cc` grandchild running — the very hang this deadline exists to bound. So
+/// the child is spawned as its own **process-group leader** and the deadline kill
+/// targets the whole **group**, reaping grandchildren too.
+fn run_killable_subprocess(
+    mut cmd: Command,
+    timeout: Duration,
+    context: &str,
+) -> Result<std::process::ExitStatus, ParserInstallError> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ParserInstallError::CompileError(format!("{}: {}", context, e)))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // BUG (closed in the GREEN commit): a bare child kill orphans
+                    // the `cc` grandchild.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ParserInstallError::CompileError(format!(
+                        "{} timed out after {:?}",
+                        context, timeout
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ParserInstallError::CompileError(format!(
+                    "{}: {}",
+                    context, e
+                )));
+            }
+        }
+    }
+}
+
 /// Clone a git repository at a specific revision.
 fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
     // First, clone with depth 1 (we'll fetch the specific revision)
@@ -538,6 +583,54 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "stuck child must be killed promptly, not waited out"
+        );
+    }
+
+    /// A deadline kill must reap the whole process **group**, not just the direct
+    /// child. The parser compiler shells out to `cc` as a *grandchild*; a bare
+    /// `child.kill()` would leave it running — the hang this deadline exists to
+    /// bound. We model it with `sh` (the group leader) backgrounding a long-lived
+    /// grandchild, and assert the grandchild dies when the deadline fires.
+    #[cfg(unix)]
+    #[test]
+    fn run_killable_subprocess_reaps_grandchildren_on_deadline() {
+        use nix::sys::signal::Signal;
+
+        let tmp = tempdir().expect("temp dir");
+        let pidfile = tmp.path().join("grandchild.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 60 & printf %s \"$!\" > '{}'; wait",
+            pidfile.display()
+        ));
+
+        let result = run_killable_subprocess(cmd, Duration::from_millis(300), "test compile");
+        assert!(
+            result.is_err(),
+            "a subprocess that outlives the deadline must error out"
+        );
+
+        let pid_raw: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild recorded its pid")
+            .trim()
+            .parse()
+            .expect("valid pid");
+        let pid = nix::unistd::Pid::from_raw(pid_raw);
+
+        // Poll for the group kill to land (and the grandchild to be reaped by init).
+        let mut alive = true;
+        for _ in 0..100 {
+            match nix::sys::signal::kill(pid, None::<Signal>) {
+                Err(nix::errno::Errno::ESRCH) => {
+                    alive = false;
+                    break;
+                }
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            !alive,
+            "the backgrounded grandchild must be killed with the process group, not orphaned"
         );
     }
 
