@@ -508,6 +508,19 @@ because the #380 benefit now outweighs it:
   servers, so a push-only host server (skipped by the capability-gated pull)
   re-analyzes current text. Runs at the debounce cadence (after typing settles),
   not per-keystroke; pull-capable servers fingerprint-dedup the extra sync.
+- The `pullFallback` / `pushFallback` config toggles and capability
+  classification (#425). `pullFallback` / `pushFallback` are `Option<bool>` on
+  `AggregationConfig` (camelCase serde, default `true`), merged field-by-field
+  (`merge.rs`). `pullFallback` gates the host-event pull per region/host in
+  `prepare_diagnostic_snapshot` (Path A); `pushFallback` folds push-driven
+  servers' cached pushes into the client-pull response in `diagnostic_impl`
+  (Path B). Servers are classified **live and non-creating** by
+  `LanguageServerPool::pull_driven_servers` (static initialize caps + dynamic
+  registrations). The pull/push double-count is removed by the publisher's
+  `filter_pull_driven_push_slots`, which drops a pull-driven server's push slot
+  from the publish whenever a `PullLayer` blob is present, so each server has one
+  native source while its slot stays cached (a spontaneous push from a
+  pull-driven server still publishes when no `PullLayer` exists).
 
 **Deferred** (staged follow-ups; the code documents each at its site):
 
@@ -516,7 +529,10 @@ because the #380 benefit now outweighs it:
   (lazy re-anchor still keeps *positions* current via the retained pull trigger).
 - Per-source strategy fan-in (`preferred` sticky / `concatenated` visible-walk);
   the staged merge concatenates, with HashMap-nondeterministic cross-source order.
+  This also subsumes the **interim `pullFallback` dedup limitation**: because
+  `PullLayer` is one host-wide blob with no per-server identity,
+  `filter_pull_driven_push_slots` triggers on "any `PullLayer` present" rather
+  than "this exact server was pulled", so a *mixed* per-region `pullFallback`
+  (one region's pull-driven server pulled, a sibling's not) can over-suppress.
+  Per-`(source, server)` pull slots remove it.
 - Region-invalidation and crash cache eviction.
-- The `pullFallback` / `pushFallback` config toggles and the capability
-  classification — without the latter the pull feed and a server's spontaneous
-  push can double-count that server (documented in `diagnostic_cache.rs`).
