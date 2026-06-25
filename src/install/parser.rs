@@ -69,6 +69,7 @@ impl From<MetadataError> for ParserInstallError {
 }
 
 /// Result of installing a parser.
+#[derive(Debug)]
 pub struct ParserInstallResult {
     /// The language that was installed.
     pub language: String,
@@ -167,14 +168,20 @@ pub fn compile_parser_inprocess(
 /// On Linux, prefer `/proc/self/exe`: if the running `kakehashi` binary is
 /// replaced (a package upgrade while the LSP server runs), `current_exe()`
 /// resolves to a stale `".../kakehashi (deleted)"` path that no longer spawns,
-/// whereas `/proc/self/exe` still execs the original image. Elsewhere
+/// whereas `execve("/proc/self/exe")` still runs the original image. Elsewhere
 /// `current_exe()` is the portable answer.
 fn self_exe_for_reexec() -> Result<PathBuf, ParserInstallError> {
     #[cfg(target_os = "linux")]
     {
-        let proc_self = PathBuf::from("/proc/self/exe");
-        if proc_self.exists() {
-            return Ok(proc_self);
+        // Check the symlink with `symlink_metadata` (lstat), NOT `exists()`:
+        // `exists()` follows the link to the target and returns false exactly when
+        // the binary was deleted/replaced — the case this branch exists to handle.
+        // `symlink_metadata` confirms the `/proc/self/exe` link itself is present
+        // (so we fall back to `current_exe()` when `/proc` isn't mounted) without
+        // requiring the target to still exist.
+        let proc_self = Path::new("/proc/self/exe");
+        if std::fs::symlink_metadata(proc_self).is_ok() {
+            return Ok(proc_self.to_path_buf());
         }
     }
     std::env::current_exe().map_err(|e| {
@@ -218,6 +225,18 @@ pub fn install_parser(
     language: &str,
     options: &InstallOptions,
 ) -> Result<ParserInstallResult, ParserInstallError> {
+    // `language` becomes path segments (`parser/<language>.<ext>` and the temp
+    // file) and a URL/metadata key, so reject traversal-capable names before
+    // touching the filesystem. Higher-level callers (auto-install) already gate
+    // this, but `install_parser` is a public entry point and must be safe on its
+    // own — a name like `../../evil` would otherwise write outside the data dir.
+    if !super::queries::is_safe_language_name(language) {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe language name '{}'", language.escape_default()),
+        )));
+    }
+
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
@@ -738,6 +757,26 @@ mod tests {
 
     const TREE_SITTER_JSON_URL: &str =
         "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
+
+    #[test]
+    fn install_parser_rejects_unsafe_language_name() {
+        let temp = tempdir().expect("temp dir");
+        let options = InstallOptions {
+            data_dir: temp.path().to_path_buf(),
+            force: false,
+            verbose: false,
+            no_cache: false,
+            compile: ParserCompile::InProcess,
+        };
+        // A traversal-capable name must be rejected before any filesystem or
+        // network work — `install_parser` is a public entry point.
+        match install_parser("../../evil", &options) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_dll_extension_is_valid() {
