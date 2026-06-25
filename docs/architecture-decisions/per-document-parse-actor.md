@@ -286,10 +286,12 @@ install itself is *not* aborted — a sibling may still need it. A late install
 completing afterward has no actor to hand off to, so the abortable per-actor
 parse can no longer re-insert the closed document — **the install/parse
 resurrection path is structurally closed**, with no separate supersede machinery.
-This holds *provided* the reader-fallback store write noted above is also
-lifetime-guarded; that on-demand path is the only other writer that could
-resurrect a closed document, and it must keep its "document still present"
-guard (or stop writing the store entirely). A reopen creates a fresh actor.
+This holds *provided* the reader-fallback store write noted above is made
+resurrection-safe; that on-demand path is the only other writer that could
+re-insert a closed document, and — because its present-and-unchanged check is
+check-then-write over a store that inserts on vacancy — it must either stop
+writing the store entirely (return a private tree) or persist through an atomic,
+non-inserting, generation-checked update. A reopen creates a fresh actor.
 
 Teardown must also wake any reader blocked on a watermark ticket that will now
 never be processed: dropping the watermark channel on actor termination signals
@@ -364,9 +366,10 @@ not an alternative.
 
 ### 3. Per-document parse actor (chosen)
 
-Serializes by construction, folds `skip_parse` into state, makes resurrection
-impossible, and keeps install/parse off the ingress path — at the cost of an
-ADR-sized refactor.
+Serializes by construction, folds `skip_parse` into state, closes the
+install/parse resurrection path (with the reader-fallback write made private or
+atomically generation-guarded), and keeps install/parse off the ingress path — at
+the cost of an ADR-sized refactor.
 
 ### 4. Actor answers read requests directly (mailbox-query reads)
 
