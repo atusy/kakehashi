@@ -453,6 +453,81 @@ languages = ["markdown"]
 }
 
 #[test]
+fn e2e_diagnose_preferred_non_winning_failure_is_not_counted() {
+    // Under the non-default `preferred` strategy the winning server is
+    // authoritative, so a non-winning server's request failure must NOT surface
+    // as exit 2 (#487). `mock-win` (higher priority) answers with a warning for
+    // the lua region and wins; `mock-fail` errors but is a loser. The run must
+    // exit 0 deterministically (the warning is benign without --fail-on-warning,
+    // the loser's failure is ignored) — never 2.
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."textDocument/diagnostic"]
+strategy = "preferred"
+priorities = ["mock-win", "mock-fail"]
+
+[languageServers.mock-win]
+cmd = ['{bin}', 'diagnostics']
+languages = ["lua"]
+
+[languageServers.mock-fail]
+cmd = ['{bin}', 'diagnostics-fail']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "preferred winner is authoritative; a non-winning server's failure must \
+         not exit 2; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn e2e_diagnose_preferred_all_servers_fail_exits_two() {
+    // No server wins under `preferred` (both error) → the fan-in drains to
+    // `NoResult` and the failure count is decisive, so the run exits 2. Guards
+    // that #487's "don't count non-winning failures" does not suppress the
+    // genuine all-failed case.
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."textDocument/diagnostic"]
+strategy = "preferred"
+priorities = ["mock-fail-a", "mock-fail-b"]
+
+[languageServers.mock-fail-a]
+cmd = ['{bin}', 'diagnostics-fail']
+languages = ["lua"]
+
+[languageServers.mock-fail-b]
+cmd = ['{bin}', 'diagnostics-fail']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "all preferred servers failing (no winner) must exit 2; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn e2e_diagnose_directory_walk_respects_gitignore_but_explicit_path_wins() {
     let ws = workspace_with(
         &config_toml(),
