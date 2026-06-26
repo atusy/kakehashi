@@ -25,19 +25,18 @@ use std::time::{Duration, Instant};
 /// avoid re-downloading.
 ///
 /// The expensive, idempotent setup (dir creation + parser/query install) is
-/// cached once per process via `OnceLock`. The transient crash-recovery files
-/// (`parsing_in_progress`, `failed_parsers`), however, are cleared on **every**
-/// call — i.e. before every client spawn — not just the first: an E2E binary
-/// spawns several clients in one process, and a client that shuts down
-/// mid-parse leaves those files behind, which would otherwise poison later
-/// clients in the same binary.
+/// cached once per process via `OnceLock`. The directory is treated as
+/// read-only after install so independent test processes can share it; the
+/// transient crash-recovery files that the server would otherwise write here
+/// are redirected to a per-process [`isolated_state_dir`] (see
+/// [`clear_crash_recovery_state`]).
 ///
 /// We always set `KAKEHASHI_DATA_DIR` on the spawned binary to this
 /// path — the binary itself runs without `cfg(test)`, so it cannot
 /// auto-redirect like lib unit tests do.
 fn test_data_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
-    let dir = DIR.get_or_init(|| {
+    DIR.get_or_init(|| {
         // Shares the same path and install logic as the lib-side
         // `kakehashi::install::test_data_dir` so unit tests and
         // E2E-spawned binaries reuse one cached parser/query install.
@@ -45,11 +44,40 @@ fn test_data_dir() -> &'static Path {
         let _ = std::fs::create_dir_all(&dir);
         let _ = kakehashi::install::test_support::ensure_test_languages_installed(&dir);
         dir
-    });
-    // Clear crash-recovery state before every spawn, not just the first.
+    })
+    .as_path()
+}
+
+/// Per-process directory for the spawned server's crash-recovery state
+/// (`parsing_in_progress`, `failed_parsers`), passed via `KAKEHASHI_STATE_DIR`.
+///
+/// Kept OUT of the shared [`test_data_dir`] so independent test *processes* can
+/// run concurrently without poisoning each other: the server's
+/// `FailedParserRegistry::init()` reads a leftover `parsing_in_progress` as a
+/// crash and marks that parser failed, which would flake every later server in
+/// any process sharing the dir. The expensive parser/query install stays shared
+/// (read-only) in `test_data_dir`; only this ephemeral state is isolated.
+///
+/// Like [`isolated_config_dir`], a per-process [`tempfile::TempDir`] parked in a
+/// `static` that outlives every spawned server and is never dropped.
+fn isolated_state_dir() -> &'static Path {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::tempdir().expect("create temp dir for KAKEHASHI_STATE_DIR isolation")
+    })
+    .path()
+}
+
+/// Clear the transient crash-recovery files before a spawn.
+///
+/// Cross-process poisoning is already prevented by the per-process
+/// [`isolated_state_dir`]; this guards the INTRA-process case the way the old
+/// code did — a client that shut down mid-parse leaves these files behind, which
+/// would otherwise poison later clients spawned by the same E2E binary.
+fn clear_crash_recovery_state() {
+    let dir = isolated_state_dir();
     let _ = std::fs::remove_file(dir.join("parsing_in_progress"));
     let _ = std::fs::remove_file(dir.join("failed_parsers"));
-    dir.as_path()
 }
 
 /// Empty `XDG_CONFIG_HOME` for the spawned server, so it never reads the
@@ -191,10 +219,12 @@ impl LspClientBuilder {
         }
         cmd.env("KAKEHASHI_DATA_DIR", test_data_dir());
         cmd.env("XDG_CONFIG_HOME", isolated_config_dir());
+        cmd.env("KAKEHASHI_STATE_DIR", isolated_state_dir());
         for (key, value) in &self.envs {
             cmd.env(key, value);
         }
 
+        clear_crash_recovery_state();
         let child = cmd.spawn().expect("Failed to spawn kakehashi binary");
         LspClient::from_child(child)
     }
@@ -334,6 +364,7 @@ impl LspClient {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
         cmd.env("KAKEHASHI_DATA_DIR", test_data_dir())
             .env("XDG_CONFIG_HOME", isolated_config_dir())
+            .env("KAKEHASHI_STATE_DIR", isolated_state_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -342,6 +373,7 @@ impl LspClient {
             cmd.env("RUST_LOG", "debug");
         }
 
+        clear_crash_recovery_state();
         let child = cmd.spawn().expect("Failed to spawn kakehashi binary");
         Self::from_child(child)
     }
