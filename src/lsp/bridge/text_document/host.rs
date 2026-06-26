@@ -86,12 +86,19 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
     docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
     doc: &HostDocument<'_>,
-    _live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
+    live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
     connection_key: &ConnectionKey,
 ) -> io::Result<()> {
     let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
     let key = (doc.uri.to_string(), connection_key.clone());
-    let fp = fingerprint(doc.text);
+    // With a live reader, read the document's CURRENT text under this lock so a
+    // late-unparking eager re-sync sends the latest text, not the snapshot it was
+    // spawned with (#422); a `None` read (closed mid-sync) falls back to the
+    // snapshot. The effective text drives both the fingerprint dedup and the sent
+    // content, so re-syncing the same current text stays a no-op.
+    let live = live_text_reader.and_then(|read| read());
+    let text: &str = live.as_deref().unwrap_or(doc.text);
+    let fp = fingerprint(text);
 
     match docs.entry(key) {
         Entry::Vacant(entry) => {
@@ -102,7 +109,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
                         uri_lsp,
                         doc.language_id.to_string(),
                         1,
-                        doc.text.to_string(),
+                        text.to_string(),
                     ),
                 },
             );
@@ -122,7 +129,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
                         content_changes: vec![TextDocumentContentChangeEvent {
                             range: None,
                             range_length: None,
-                            text: doc.text.to_string(),
+                            text: text.to_string(),
                         }],
                     },
                 );
