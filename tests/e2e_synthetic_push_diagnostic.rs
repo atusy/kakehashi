@@ -332,9 +332,14 @@ print(((
     // Wait for lua-ls to be ready
     wait_for_server_ready(&mut client, markdown_uri, 5, 100);
 
-    // Wait for publishDiagnostics
+    // Unlike the optional-push tests above, this one's POINT is the
+    // position-transform assertion below, which only runs when diagnostics
+    // actually arrive (invalid Lua => lua-ls reports an error, so they do).
+    // Keep a generous timeout: it returns as soon as the push arrives (no wall
+    // cost in the common case) but still exercises the assertion under load,
+    // rather than degrading to the "tested in unit tests" no-op branch.
     let notification =
-        client.wait_for_notification("textDocument/publishDiagnostics", OPTIONAL_PUSH_WAIT);
+        client.wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(10));
 
     if let Some(params) = notification {
         println!(

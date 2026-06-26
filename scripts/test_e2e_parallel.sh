@@ -47,7 +47,7 @@ DEFAULT_JOBS=$(( (CORES * 3 + 3) / 4 ))
 [ "$DEFAULT_JOBS" -lt 2 ] && DEFAULT_JOBS=2
 JOBS="${E2E_JOBS:-$DEFAULT_JOBS}"
 INNER="${E2E_INNER_THREADS:-2}"
-BIN_TIMEOUT="${E2E_BIN_TIMEOUT:-240}"
+BIN_TIMEOUT="${E2E_BIN_TIMEOUT:-600}"
 
 # A `timeout` command (GNU coreutils, or gtimeout via Homebrew) lets us cap each
 # binary so one stuck test can't stall the whole pool. Optional — skipped if
@@ -66,6 +66,16 @@ BINS=$(printf '%s\n' "$BUILD_OUT" \
        | sed -n 's/^[[:space:]]*Executable tests\/[^ ]* (\(.*\))$/\1/p' | sort -u)
 N=$(printf '%s\n' "$BINS" | grep -c .)
 [ "$N" -eq 0 ] && { echo "error: found no integration-test binaries"; exit 1; }
+# Independent expected count: every top-level tests/*.rs is one integration
+# binary (helpers/ is a subdir module, not a binary). If the Executable-line
+# parse ever silently under-counts (a cargo output format change), N drops below
+# this and we fail loudly instead of running a smaller-but-green subset.
+EXPECTED=$(ls tests/*.rs 2>/dev/null | wc -l | tr -d ' ')
+if [ "$N" -ne "$EXPECTED" ]; then
+  echo "error: parsed $N test binaries but tests/ has $EXPECTED .rs files — the"
+  echo "       Executable-line parse may be under-counting; refusing a partial run."
+  exit 1
+fi
 
 RESDIR="$(mktemp -d)"
 # On exit OR interrupt: drop the temp dir and kill any of THIS repo's test
@@ -78,7 +88,10 @@ RESDIR="$(mktemp -d)"
 # own; their lua-language-server grandchildren may briefly orphan to PID 1 on a
 # hard Ctrl-C (pkill them by name manually if needed — but that also hits an
 # editor's lua-ls, so it's left to the user).
-REPO="$(pwd)"
+# Escape regex metacharacters in the path (it contains '.' from "github.com")
+# so `pkill -f` matches it literally — the `deps/e2e_`/`deps/test_` anchor keeps
+# this safe regardless, but a literal path avoids any accidental over-match.
+REPO="$(pwd | sed 's/[.[\*^$]/\\&/g')"
 cleanup() {
   pkill -f "$REPO/target/.*/deps/e2e_" 2>/dev/null
   pkill -f "$REPO/target/.*/deps/test_" 2>/dev/null
@@ -118,11 +131,19 @@ WALL=$SECONDS
 PASSED=$(grep -hoE "result: ok\. [0-9]+ passed" "$RESDIR"/*.log 2>/dev/null \
          | grep -oE "[0-9]+" | paste -sd+ - | bc)
 FAILS=$(grep -lvx 0 "$RESDIR"/*.status 2>/dev/null | wc -l | tr -d ' ')
+RAN=$(ls "$RESDIR"/*.status 2>/dev/null | wc -l | tr -d ' ')
 
 echo
 echo "----------------------------------------------------------------"
 echo "  binaries: $N    wall: ${WALL}s    tests passed: ${PASSED:-0}    failing binaries: $FAILS"
 echo "----------------------------------------------------------------"
+# Guard against a binary being silently dropped (e.g. a future cargo output
+# change defeating the Executable-line parse): every discovered binary must have
+# produced a status file, else coverage shrank without any binary "failing".
+if [ "$RAN" -ne "$N" ]; then
+  echo "error: only $RAN/$N binaries ran — some were dropped before execution"
+  exit 1
+fi
 if [ "$FAILS" -gt 0 ]; then
   echo "--- output of failing/timed-out binaries ---"
   for s in $(grep -lvx 0 "$RESDIR"/*.status 2>/dev/null); do

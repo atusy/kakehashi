@@ -151,7 +151,8 @@ impl AutoInstallManager {
     /// Initialize the failed parser registry with crash detection.
     ///
     /// State storage location: `KAKEHASHI_STATE_DIR` if set, else the default
-    /// data directory. Crash-recovery state (`parsing_in_progress`,
+    /// data directory, falling back to `/tmp/kakehashi` if neither resolves.
+    /// Crash-recovery state (`parsing_in_progress`,
     /// `failed_parsers`) is ephemeral and conceptually distinct from the
     /// persistent parser/query install assets in the data dir; the override
     /// lets it live elsewhere — e.g. so concurrent test processes that share one
