@@ -475,6 +475,13 @@ fn filter_by_injection_regions(
 /// regions in `map[L]`, turning the per-token region checks in
 /// [`filter_by_injection_regions`] from O(regions) into O(regions-on-line)
 /// — amortized O(1) for the common case of few regions per line.
+// NOTE (vs `build_region_intervals_map`'s `line_idx >= lines.len()` guard):
+// this map is keyed purely by line NUMBER and never indexes the `lines` slice,
+// so it must index EVERY line a region spans regardless of `lines.len()`. Tokens
+// are matched by line number here; clamping to `lines.len()` would drop region
+// lines that tokens still fall on (a finalize test exercises exactly this with
+// an empty `lines` slice). Active regions are document-bounded in practice, so
+// the range is not actually unbounded.
 fn build_regions_by_line(regions: &[ActiveInjectionBounds]) -> HashMap<usize, Vec<usize>> {
     let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, r) in regions.iter().enumerate() {

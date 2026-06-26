@@ -88,10 +88,12 @@ RESDIR="$(mktemp -d)"
 # own; their lua-language-server grandchildren may briefly orphan to PID 1 on a
 # hard Ctrl-C (pkill them by name manually if needed — but that also hits an
 # editor's lua-ls, so it's left to the user).
-# Escape regex metacharacters in the path (it contains '.' from "github.com")
-# so `pkill -f` matches it literally — the `deps/e2e_`/`deps/test_` anchor keeps
-# this safe regardless, but a literal path avoids any accidental over-match.
-REPO="$(pwd | sed 's/[.[\*^$]/\\&/g')"
+# Escape every ERE metacharacter in the path so `pkill -f` matches it literally.
+# (Typical paths only hit '.' from "github.com", but a checkout under a path with
+# +, ?, (), {}, |, etc. would otherwise broaden the pattern.) The `deps/e2e_`/
+# `deps/test_` anchor keeps the kill scoped regardless; this just removes any
+# accidental over-match. The char class lists ']' first so it's literal.
+REPO="$(pwd | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
 cleanup() {
   pkill -f "$REPO/target/.*/deps/e2e_" 2>/dev/null
   pkill -f "$REPO/target/.*/deps/test_" 2>/dev/null
