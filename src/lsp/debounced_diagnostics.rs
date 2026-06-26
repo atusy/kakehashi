@@ -46,6 +46,10 @@ struct DebouncedDiagnosticData {
     /// Bridge coordinator — used to eager re-sync the host document to `_self`
     /// host servers at the debounced cadence (#431).
     bridge: Arc<BridgeCoordinator>,
+    /// Document store — lets the eager re-sync read the host document's *current*
+    /// text at sync time (under the bridge's `host_documents` lock) so a late
+    /// re-sync sends the latest text rather than this fire's snapshot (#422).
+    documents: Arc<crate::document::DocumentStore>,
     /// Reference to synthetic diagnostics manager for task registration
     synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: feeds the pull result into the cache and
@@ -100,6 +104,7 @@ impl DebouncedDiagnosticsManager {
         bridge: Arc<BridgeCoordinator>,
         synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
         publisher: Arc<DiagnosticPublisher>,
+        documents: Arc<crate::document::DocumentStore>,
     ) {
         // Opportunistic cleanup: remove finished timers to prevent unbounded growth.
         // This is O(n) but runs infrequently and keeps the map from accumulating
@@ -126,6 +131,7 @@ impl DebouncedDiagnosticsManager {
             bridge,
             synthetic_diagnostics,
             publisher,
+            documents,
         };
 
         let duration = self.debounce_duration;
@@ -207,6 +213,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         bridge,
         synthetic_diagnostics,
         publisher,
+        documents,
     } = data;
 
     // #431: re-sync the host document to its `_self` host servers at this debounced
@@ -220,11 +227,27 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         // outer scheduled `uri` — they're equal today, but keying off the host
         // context keeps the sync correct if a scheduled URI ever differs from its
         // host document.
+        //
+        // The live reader lets the sync read the document's *current* text under
+        // the bridge's `host_documents` lock, so when several debounce fires race
+        // (rapid edits with pauses), the task that syncs last sends the latest
+        // text — not this fire's `host.text` snapshot, which a newer edit may have
+        // superseded. That closes the eager-sync stale-overwrite that left a
+        // push-only host server analyzing rolled-back text (#422). `host.text`
+        // stays the fallback if the document is closed mid-sync.
+        let host_uri = host.uri.clone();
+        let documents = Arc::clone(&documents);
+        let live_text_reader: crate::lsp::bridge::HostTextReader = Arc::new(move || {
+            documents
+                .get(&host_uri)
+                .map(|doc| Arc::<str>::from(doc.text()))
+        });
         bridge.eager_sync_host_document_on_servers(
             &host.uri,
             &host.language_id,
             host.text.clone(),
             host.configs.clone(),
+            Some(live_text_reader),
         );
     }
 

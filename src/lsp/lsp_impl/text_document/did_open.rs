@@ -372,6 +372,7 @@ print("hello")
             "rust",
             std::sync::Arc::from("fn main() {}"),
             configs.clone(),
+            None,
         );
         timeout(Duration::from_secs(1), async {
             loop {
@@ -396,6 +397,7 @@ print("hello")
             "rust",
             std::sync::Arc::from("fn other() {}"),
             configs,
+            None,
         );
         timeout(Duration::from_secs(1), async {
             loop {
@@ -469,6 +471,7 @@ print("hello")
             std::sync::Arc::clone(&server.bridge),
             std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             std::sync::Arc::new(DiagnosticPublisher::new(server)),
+            std::sync::Arc::clone(&server.documents),
         );
 
         timeout(Duration::from_secs(1), async {

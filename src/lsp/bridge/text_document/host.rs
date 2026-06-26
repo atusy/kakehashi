@@ -54,6 +54,13 @@ fn fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// Owned reader of a host document's current text, shared across the eager
+/// re-sync's per-server tasks. The eager on-edit re-sync builds one (capturing
+/// the document store + URI) and hands a clone to each task; the task passes it
+/// to [`sync_host_document`], which evaluates it under the `host_documents` lock
+/// so a late task sends the latest text rather than a stale snapshot (#422).
+pub(crate) type HostTextReader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
+
 /// Open or re-sync the host document on a downstream server, mutating the
 /// pool's sync-state map in place.
 ///
