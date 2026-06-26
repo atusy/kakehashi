@@ -237,6 +237,15 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         // stays the fallback if the document is closed mid-sync.
         let host_uri = host.uri.clone();
         let documents = Arc::clone(&documents);
+        // Lock-ordering: this runs inside `sync_host_document`, i.e. under the
+        // bridge `host_documents` lock — so the `DocumentStore` shard read below is
+        // taken in the order `host_documents -> DocumentStore`. That is deadlock-free
+        // because the *inverse* order never occurs: every host-request path
+        // (`resolve_host_bridge_context`, formatting, the diagnostic pull, `did_change`)
+        // resolves an OWNED snapshot/text and drops its `DocumentStore` ref BEFORE
+        // calling any bridge method that acquires `host_documents`. The `Ref` taken
+        // here is dropped within the closure (`doc.text()` is copied into an owned
+        // `Arc<str>`), so it never crosses an `.await`.
         let live_text_reader: crate::lsp::bridge::HostTextReader = Arc::new(move || {
             documents
                 .get(&host_uri)
