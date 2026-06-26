@@ -88,18 +88,42 @@ RESDIR="$(mktemp -d)"
 # own; their lua-language-server grandchildren may briefly orphan to PID 1 on a
 # hard Ctrl-C (pkill them by name manually if needed — but that also hits an
 # editor's lua-ls, so it's left to the user).
-# Escape every ERE metacharacter in the path so `pkill -f` matches it literally.
+# Where the test binaries actually live — honor CARGO_TARGET_DIR (the README/PR
+# even suggests a separate one to dodge rust-analyzer's lock), resolving a
+# relative value against the repo root, so the cleanup below still finds them.
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$(pwd)/$TARGET_DIR" ;; esac
+# Escape every ERE metacharacter so `pkill -f` matches the path literally.
 # (Typical paths only hit '.' from "github.com", but a checkout under a path with
 # +, ?, (), {}, |, etc. would otherwise broaden the pattern.) The `deps/e2e_`/
-# `deps/test_` anchor keeps the kill scoped regardless; this just removes any
-# accidental over-match. The char class lists ']' first so it's literal.
-REPO="$(pwd | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
+# `deps/test_` anchor keeps the kill scoped to THIS run's test binaries — never a
+# bare `kakehashi` a dev might run as their editor LSP. The char class lists ']'
+# first so it's literal.
+TARGET_RE="$(printf '%s' "$TARGET_DIR" | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
 cleanup() {
-  pkill -f "$REPO/target/.*/deps/e2e_" 2>/dev/null
-  pkill -f "$REPO/target/.*/deps/test_" 2>/dev/null
+  pkill -f "$TARGET_RE/.*/deps/e2e_" 2>/dev/null
+  pkill -f "$TARGET_RE/.*/deps/test_" 2>/dev/null
   rm -rf "$RESDIR"
 }
 trap cleanup EXIT INT TERM
+
+# Fresh checkout: the shared parser/query install (deps/test/kakehashi) does not
+# exist yet. The test binaries create it lazily on first server spawn, so the
+# parallel pool below would have many processes race to populate one dir — one
+# reading another's half-written parser/query files (corrupt-cache flakiness, an
+# early `.installed`). Seed it ONCE, serially, with a single binary first; the
+# marker then short-circuits every later run (and the rest of this run's pool).
+# Bounded to one binary on purpose: grinding through all of them silently would
+# reintroduce the "looks hung" problem this runner exists to avoid.
+INSTALL_MARKER="deps/test/kakehashi/.installed"
+if [ ! -f "$INSTALL_MARKER" ]; then
+  echo "==> First run: seeding shared parser/query install (serial, one binary)…"
+  seed="$(printf '%s\n' "$BINS" | head -1)"
+  if [ -n "$seed" ]; then
+    "$seed" --test-threads=1 >/dev/null 2>&1 || true
+  fi
+  [ -f "$INSTALL_MARKER" ] || echo "    warning: install marker still absent; the pool may briefly race to populate it"
+fi
 
 echo "==> Running $N binaries  (JOBS=$JOBS, INNER=$INNER, ~$((JOBS * INNER)) concurrent on ${CORES} cores${TIMEOUT_BIN:+, ${BIN_TIMEOUT}s/binary})"
 echo "    (progress streams below as each binary finishes)"
@@ -130,8 +154,9 @@ printf '%s\n' "$BINS" | xargs -P "$JOBS" -I{} sh -c '
 ' _ {}
 WALL=$SECONDS
 
+# Sum with awk (no `bc` dependency — not installed on minimal environments).
 PASSED=$(grep -hoE "result: ok\. [0-9]+ passed" "$RESDIR"/*.log 2>/dev/null \
-         | grep -oE "[0-9]+" | paste -sd+ - | bc)
+         | grep -oE "[0-9]+" | awk '{s += $1} END {print s + 0}')
 FAILS=$(grep -lvx 0 "$RESDIR"/*.status 2>/dev/null | wc -l | tr -d ' ')
 RAN=$(ls "$RESDIR"/*.status 2>/dev/null | wc -l | tr -d ' ')
 
