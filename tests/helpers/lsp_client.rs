@@ -28,8 +28,7 @@ use std::time::{Duration, Instant};
 /// cached once per process via `OnceLock`. The directory is treated as
 /// read-only after install so independent test processes can share it; the
 /// transient crash-recovery files that the server would otherwise write here
-/// are redirected to a per-process [`isolated_state_dir`] (see
-/// [`clear_crash_recovery_state`]).
+/// are redirected to a per-spawn [`isolated_state_dir`].
 ///
 /// We always set `KAKEHASHI_DATA_DIR` on the spawned binary to this
 /// path — the binary itself runs without `cfg(test)`, so it cannot
@@ -48,36 +47,33 @@ fn test_data_dir() -> &'static Path {
     .as_path()
 }
 
-/// Per-process directory for the spawned server's crash-recovery state
+/// A fresh, unique directory for ONE spawned server's crash-recovery state
 /// (`parsing_in_progress`, `failed_parsers`), passed via `KAKEHASHI_STATE_DIR`.
 ///
-/// Kept OUT of the shared [`test_data_dir`] so independent test *processes* can
-/// run concurrently without poisoning each other: the server's
-/// `FailedParserRegistry::init()` reads a leftover `parsing_in_progress` as a
-/// crash and marks that parser failed, which would flake every later server in
-/// any process sharing the dir. The expensive parser/query install stays shared
-/// (read-only) in `test_data_dir`; only this ephemeral state is isolated.
+/// Kept OUT of the shared [`test_data_dir`] so servers never poison each other:
+/// the server's `FailedParserRegistry::init()` reads a leftover
+/// `parsing_in_progress` as a crash and marks that parser failed. A per-SPAWN
+/// (not per-process) dir is what makes the test suite safe under both
+/// cross-process AND intra-process concurrency (parallel test threads in one
+/// binary): no two concurrently-running servers ever share these files, so a
+/// server that persists state on a shutdown-while-parsing can't be read as a
+/// crash by another — and no pre-spawn clearing is needed. The expensive
+/// parser/query install stays shared (read-only) in `test_data_dir`.
 ///
-/// Like [`isolated_config_dir`], a per-process [`tempfile::TempDir`] parked in a
-/// `static` that outlives every spawned server and is never dropped.
-fn isolated_state_dir() -> &'static Path {
-    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-    DIR.get_or_init(|| {
-        tempfile::tempdir().expect("create temp dir for KAKEHASHI_STATE_DIR isolation")
-    })
-    .path()
-}
-
-/// Clear the transient crash-recovery files before a spawn.
-///
-/// Cross-process poisoning is already prevented by the per-process
-/// [`isolated_state_dir`]; this guards the INTRA-process case the way the old
-/// code did — a client that shut down mid-parse leaves these files behind, which
-/// would otherwise poison later clients spawned by the same E2E binary.
-fn clear_crash_recovery_state() {
-    let dir = isolated_state_dir();
-    let _ = std::fs::remove_file(dir.join("parsing_in_progress"));
-    let _ = std::fs::remove_file(dir.join("failed_parsers"));
+/// All per-spawn dirs live under one base [`tempfile::TempDir`] parked in a
+/// `static` and — like [`isolated_config_dir`] — intentionally never dropped
+/// (statics aren't), so the small tree is left in the OS temp dir when the
+/// process exits (one tree per test process; the same accepted leak).
+fn isolated_state_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BASE: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = BASE
+        .get_or_init(|| tempfile::tempdir().expect("create base dir for KAKEHASHI_STATE_DIR"))
+        .path();
+    let dir = base.join(format!("spawn-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).expect("create per-spawn KAKEHASHI_STATE_DIR");
+    dir
 }
 
 /// Empty `XDG_CONFIG_HOME` for the spawned server, so it never reads the
@@ -224,7 +220,6 @@ impl LspClientBuilder {
             cmd.env(key, value);
         }
 
-        clear_crash_recovery_state();
         let child = cmd.spawn().expect("Failed to spawn kakehashi binary");
         LspClient::from_child(child)
     }
@@ -373,7 +368,6 @@ impl LspClient {
             cmd.env("RUST_LOG", "debug");
         }
 
-        clear_crash_recovery_state();
         let child = cmd.spawn().expect("Failed to spawn kakehashi binary");
         Self::from_child(child)
     }

@@ -162,6 +162,10 @@ impl AutoInstallManager {
     /// If initialization fails, returns an empty registry.
     pub fn init_failed_parser_registry() -> FailedParserRegistry {
         let state_dir = std::env::var_os("KAKEHASHI_STATE_DIR")
+            // An empty value resolves to the process cwd (writing crash files
+            // wherever it was started), so treat it as unset — matching how
+            // `resolve_data_dir` handles an empty `KAKEHASHI_DATA_DIR`.
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(crate::install::default_data_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp/kakehashi"));
