@@ -53,7 +53,6 @@ pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
 pub(crate) use inbound_request_registry::InboundRequestRegistry;
 pub(crate) use pool::ConnectionKey;
-pub(crate) use pool::ConnectionReadiness;
 pub use pool::LanguageServerPool;
 pub(crate) use pool::UpstreamId;
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};

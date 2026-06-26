@@ -477,11 +477,6 @@ pub(crate) async fn collect_host_diagnostics(
                     "textDocument/diagnostic",
                     serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
                     t.upstream_id,
-                    // Wait through server initialization — the first
-                    // didOpen-triggered pull would otherwise hit an Initializing
-                    // server and silently lose the host layer. The outer timeout
-                    // bounds the wait.
-                    crate::lsp::bridge::ConnectionReadiness::WaitReady,
                 ),
             )
             .await

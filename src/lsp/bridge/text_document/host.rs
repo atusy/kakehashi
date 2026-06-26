@@ -258,7 +258,11 @@ impl LanguageServerPool {
     /// `partialResultToken` would stream its results into the void and could
     /// legally return an empty final result; `workDoneToken` would likewise
     /// report progress nowhere.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Fails fast on an initializing server (an empty layer for this request;
+    /// the next request gets it) — the policy every interactive host-bridged
+    /// method wants. The diagnostic path, which must instead wait through
+    /// initialization, uses the dedicated [`Self::send_host_diagnostic_request`].
     pub(crate) async fn send_host_raw_request(
         &self,
         server_name: &str,
@@ -267,29 +271,11 @@ impl LanguageServerPool {
         method: &'static str,
         mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
-        readiness: super::super::pool::ConnectionReadiness,
     ) -> io::Result<Option<serde_json::Value>> {
         strip_progress_tokens(&mut params);
-        let handle = match readiness {
-            // Fail-fast (interactive requests): an Initializing server is an
-            // empty layer for this request; the next request gets it.
-            super::super::pool::ConnectionReadiness::FailFast => {
-                self.get_or_create_connection(server_name, server_config, Some(doc.uri))
-                    .await?
-            }
-            // Diagnostics wait through initialization — same policy as the
-            // virt diagnostic path (waiting beats returning empty results);
-            // the caller's request timeout bounds the wait.
-            super::super::pool::ConnectionReadiness::WaitReady => {
-                self.get_or_create_connection_wait_ready(
-                    server_name,
-                    server_config,
-                    Some(doc.uri),
-                    std::time::Duration::from_secs(super::super::pool::INIT_TIMEOUT_SECS),
-                )
-                .await?
-            }
-        };
+        let handle = self
+            .get_or_create_connection(server_name, server_config, Some(doc.uri))
+            .await?;
         if !handle.has_capability(method) {
             return Ok(None);
         }
@@ -357,12 +343,9 @@ impl LanguageServerPool {
     /// `Ok(vec![])`. The dedicated method keeps that strictness out of the
     /// shared raw path that other host methods rely on.
     ///
-    /// `readiness` matches [`Self::send_host_raw_request`]: the diagnostic
-    /// caller passes `WaitReady` so the request waits through server
-    /// initialization (the caller's request timeout bounds the wait) —
-    /// returning empty while a server initializes would silently lose the host
-    /// layer on the first pull.
-    #[allow(clippy::too_many_arguments)]
+    /// Waits through server initialization (the caller's request timeout bounds
+    /// the wait) — returning empty while a server initializes would silently
+    /// lose the host layer on the first pull, like the virt diagnostic path.
     pub(crate) async fn send_host_diagnostic_request(
         &self,
         server_name: &str,
@@ -371,23 +354,15 @@ impl LanguageServerPool {
         method: &'static str,
         params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
-        readiness: super::super::pool::ConnectionReadiness,
     ) -> io::Result<Vec<Diagnostic>> {
-        let handle = match readiness {
-            super::super::pool::ConnectionReadiness::FailFast => {
-                self.get_or_create_connection(server_name, server_config, Some(doc.uri))
-                    .await?
-            }
-            super::super::pool::ConnectionReadiness::WaitReady => {
-                self.get_or_create_connection_wait_ready(
-                    server_name,
-                    server_config,
-                    Some(doc.uri),
-                    std::time::Duration::from_secs(super::super::pool::INIT_TIMEOUT_SECS),
-                )
-                .await?
-            }
-        };
+        let handle = self
+            .get_or_create_connection_wait_ready(
+                server_name,
+                server_config,
+                Some(doc.uri),
+                std::time::Duration::from_secs(super::super::pool::INIT_TIMEOUT_SECS),
+            )
+            .await?;
         if !handle.has_capability(method) {
             // No capability — the lenient empty layer (kept, unlike a malformed
             // payload), so a host server that simply does not pull contributes
