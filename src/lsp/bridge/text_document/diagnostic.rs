@@ -17,7 +17,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::config::settings::BridgeServerConfig;
-use tower_lsp_server::ls_types::Diagnostic;
+use tower_lsp_server::ls_types::{Diagnostic, DocumentDiagnosticReport};
 use url::Url;
 
 use super::super::pool::{INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId};
@@ -135,9 +135,11 @@ fn build_diagnostic_request(
 /// JSON-RPC *error* response separately (it propagates as `Err`), so this only
 /// inspects the `result`. Mirroring [`transform_formatting_response_to_host`],
 /// a present-but-malformed payload is a request **failure** (`Err`): an absent
-/// `result` member (protocol violation), a report with no `kind` or an unknown
-/// report `kind`, a `full` report missing `items`, or `items` that fail to
-/// deserialize as `Diagnostic[]`. A `null` result or an `unchanged` report is the
+/// `result` member (protocol violation), or a non-null `result` that does not
+/// deserialize as a `DocumentDiagnosticReport` (no/unknown `kind`, a `full`
+/// report missing `items`, a malformed `unchanged` report, or `items` that
+/// aren't `Diagnostic[]`) — validated by the same typed deserialize the host
+/// parser uses. A `null` result or a valid `unchanged` report is the
 /// authoritative "no diagnostics" answer and stays an empty `Vec` (`Ok`).
 /// Collapsing a malformed payload into the same empty value as "no
 /// capability" would let a broken downstream server pass as "nothing wrong" —
@@ -151,7 +153,7 @@ fn transform_diagnostic_response_to_host(
 ) -> io::Result<Vec<Diagnostic>> {
     // Absent `result` with no error (the caller already promoted an error
     // response to `Err`) is a protocol violation — a request failure.
-    let Some(mut result) = response.get_mut("result").map(serde_json::Value::take) else {
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
         return Err(io::Error::other(
             "diagnostic response carries neither result nor error (protocol violation)",
         ));
@@ -161,47 +163,21 @@ fn transform_diagnostic_response_to_host(
         return Ok(Vec::new());
     }
 
-    // Check report kind: `unchanged` is an authoritative empty; `full`
-    // proceeds; an unknown kind, or an absent/non-string `kind` (the LSP report
-    // tag is required), is a malformed payload (request failure). This matches
-    // the host parser's tagged-enum deserialize so the two paths reject the
-    // same shapes.
-    match result.get("kind").and_then(|k| k.as_str()) {
-        Some("unchanged") => return Ok(Vec::new()),
-        Some("full") => {}
-        Some(other) => {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "Unknown diagnostic report kind: {}",
-                other
-            );
-            return Err(io::Error::other(format!(
-                "malformed diagnostic result from downstream server: unknown report kind '{other}'"
-            )));
-        }
-        None => {
-            return Err(io::Error::other(
-                "malformed diagnostic result from downstream server: report has no 'kind'",
-            ));
-        }
-    }
-
-    // A `full` report MUST carry `items`; a missing `items` member is a
-    // malformed payload (request failure).
-    let Some(items) = result.get_mut("items").map(serde_json::Value::take) else {
-        return Err(io::Error::other(
-            "malformed diagnostic result from downstream server: full report missing 'items'",
-        ));
-    };
-    // `items` that do not deserialize as `Diagnostic[]` (wrong shape, missing
-    // fields, etc.) is likewise a request failure; the log keeps the
-    // misbehaving downstream diagnosable.
-    let mut diagnostics: Vec<Diagnostic> = match serde_json::from_value(items) {
-        Ok(diagnostics) => diagnostics,
+    // Validate the whole report via the typed `DocumentDiagnosticReport`
+    // (identical to the host parser, `parse_host_diagnostic_response`, so the
+    // two paths reject the same shapes): an absent/unknown `kind`, a `full`
+    // report missing `items`, a malformed `unchanged` report or
+    // `relatedDocuments`, or `items` that don't deserialize as `Diagnostic[]`
+    // is a malformed payload (request failure). A valid `unchanged` report is
+    // the authoritative empty. `relatedDocuments` (diagnostics for OTHER
+    // documents) are dropped — they have no place in this region's report.
+    let mut diagnostics = match serde_json::from_value::<DocumentDiagnosticReport>(result) {
+        Ok(DocumentDiagnosticReport::Full(report)) => report.full_document_diagnostic_report.items,
+        Ok(DocumentDiagnosticReport::Unchanged(_)) => return Ok(Vec::new()),
         Err(err) => {
             log::warn!(
                 target: "kakehashi::bridge",
-                "Failed to deserialize diagnostic items as Diagnostic[]: {err}"
+                "Failed to deserialize diagnostic report: {err}"
             );
             return Err(io::Error::other(format!(
                 "malformed diagnostic result from downstream server: {err}"
@@ -497,6 +473,23 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 42,
             "result": { "items": [] }
+        });
+
+        let transformed =
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
+        assert!(transformed.is_err());
+    }
+
+    #[test]
+    fn diagnostic_response_unchanged_without_result_id_is_request_failure() {
+        // An `unchanged` report MUST carry a `resultId`; its absence is
+        // malformed. The whole-report typed deserialize rejects it, keeping the
+        // region path's strictness identical to the host parser (a hand-rolled
+        // `kind`-only check would have wrongly accepted it as an empty result).
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "kind": "unchanged" }
         });
 
         let transformed =
