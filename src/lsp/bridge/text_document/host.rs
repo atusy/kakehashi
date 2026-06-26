@@ -23,9 +23,9 @@ use std::io;
 use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Location, LocationLink,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextEdit, Uri,
-    VersionedTextDocumentIdentifier,
+    Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticReport,
+    Location, LocationLink, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextEdit, Uri, VersionedTextDocumentIdentifier,
 };
 use url::Url;
 
@@ -345,6 +345,65 @@ impl LanguageServerPool {
         .await?
     }
 
+    /// Send a host `textDocument/diagnostic` request with diagnostics' strict
+    /// semantics. Unlike [`Self::send_host_raw_request`] (which collapses an
+    /// absent `result`, a `null` result, and a missing capability into the same
+    /// `Ok(None)`), this distinguishes them: a present-but-malformed report
+    /// (error response, absent `result` member, unknown `kind`, a `full` report
+    /// missing `items`, or items that fail to deserialize) is a counted request
+    /// failure (`Err`), mirroring [`Self::send_host_formatting_request`]; a
+    /// `null`/`unchanged` result is the authoritative empty `Ok(vec![])`; and a
+    /// server that does not advertise the capability stays the lenient empty
+    /// `Ok(vec![])`. The dedicated method keeps that strictness out of the
+    /// shared raw path that other host methods rely on.
+    ///
+    /// `readiness` matches [`Self::send_host_raw_request`]: the diagnostic
+    /// caller passes `WaitReady` so the request waits through server
+    /// initialization (the caller's request timeout bounds the wait) —
+    /// returning empty while a server initializes would silently lose the host
+    /// layer on the first pull.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_host_diagnostic_request(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        method: &'static str,
+        params: serde_json::Value,
+        upstream_request_id: Option<UpstreamId>,
+        readiness: super::super::pool::ConnectionReadiness,
+    ) -> io::Result<Vec<Diagnostic>> {
+        let handle = match readiness {
+            super::super::pool::ConnectionReadiness::FailFast => {
+                self.get_or_create_connection(server_name, server_config, Some(doc.uri))
+                    .await?
+            }
+            super::super::pool::ConnectionReadiness::WaitReady => {
+                self.get_or_create_connection_wait_ready(
+                    server_name,
+                    server_config,
+                    Some(doc.uri),
+                    std::time::Duration::from_secs(super::super::pool::INIT_TIMEOUT_SECS),
+                )
+                .await?
+            }
+        };
+        if !handle.has_capability(method) {
+            // No capability — the lenient empty layer (kept, unlike a malformed
+            // payload), so a host server that simply does not pull contributes
+            // nothing without looking like a failure.
+            return Ok(Vec::new());
+        }
+        self.execute_host_request(
+            handle,
+            doc,
+            upstream_request_id,
+            |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
+            move |response| parse_host_diagnostic_response(response, method),
+        )
+        .await?
+    }
+
     /// Drive a host bridge request end-to-end: register for cancel
     /// forwarding, sync the host document, send, await, transform.
     ///
@@ -537,6 +596,51 @@ fn parse_host_formatting_response(
     }
 }
 
+/// Parse a host `textDocument/diagnostic` response with diagnostics' strict
+/// semantics, mirroring [`parse_host_formatting_response`]. An error response,
+/// a success without a `result` member (protocol violation), or a present-but-
+/// malformed report (an unknown `kind`, a `full` report missing `items`, or
+/// `items` that fail to deserialize) is a request failure (`Err`) — collapsing
+/// it into the empty layer would let a broken host server pass as "nothing
+/// wrong". A `null` result or an `unchanged` report (a server should not send
+/// `unchanged` — we never supply `previousResultId` — but honor it) is the
+/// authoritative empty `Ok(vec![])`. `relatedDocuments` entries are dropped:
+/// diagnostics for OTHER documents have no place in this document's report.
+fn parse_host_diagnostic_response(
+    mut response: serde_json::Value,
+    method: &'static str,
+) -> io::Result<Vec<Diagnostic>> {
+    if response_has_jsonrpc_error(&response, method) {
+        return Err(io::Error::other(format!(
+            "downstream server answered {method} with an error response: {}",
+            jsonrpc_error_summary(&response)
+        )));
+    }
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        return Err(io::Error::other(format!(
+            "{method} response carries neither result nor error (protocol violation)"
+        )));
+    };
+    if result.is_null() {
+        return Ok(Vec::new());
+    }
+    match serde_json::from_value::<DocumentDiagnosticReport>(result) {
+        Ok(DocumentDiagnosticReport::Full(report)) => {
+            Ok(report.full_document_diagnostic_report.items)
+        }
+        Ok(DocumentDiagnosticReport::Unchanged(_)) => Ok(Vec::new()),
+        Err(e) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "host diagnostic report failed to deserialize: {e}"
+            );
+            Err(io::Error::other(format!(
+                "malformed {method} result from downstream server: {e}"
+            )))
+        }
+    }
+}
+
 /// Normalize a goto result (`Location | Location[] | LocationLink[]`) to
 /// `Vec<LocationLink>` **without** any URI or range rewriting — host
 /// responses already speak real-document coordinates.
@@ -711,6 +815,101 @@ mod tests {
             parse_host_formatting_response(response, "textDocument/formatting").is_err(),
             "errors must be a counted request failure, unlike null"
         );
+    }
+
+    #[test]
+    fn host_diagnostic_full_report_yields_items() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "kind": "full",
+                "items": [{
+                    "range": { "start": { "line": 2, "character": 0 },
+                               "end": { "line": 2, "character": 5 } },
+                    "message": "host says hi"
+                }]
+            }
+        });
+        let items = parse_host_diagnostic_response(response, "textDocument/diagnostic")
+            .expect("a full report is a valid response");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message, "host says hi");
+        assert_eq!(
+            items[0].range.start.line, 2,
+            "no translation on the host path"
+        );
+    }
+
+    #[test]
+    fn host_diagnostic_null_and_unchanged_are_authoritative_empty() {
+        // `null` and an `unchanged` report are handled responses meaning "no
+        // diagnostics" — `Ok(vec![])`, not a failure. (We never send a
+        // `previousResultId`, but honor `unchanged` if a server volunteers it.)
+        let null = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null });
+        assert!(
+            parse_host_diagnostic_response(null, "textDocument/diagnostic")
+                .expect("null is authoritative empty")
+                .is_empty()
+        );
+
+        let unchanged = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "kind": "unchanged", "resultId": "x" }
+        });
+        assert!(
+            parse_host_diagnostic_response(unchanged, "textDocument/diagnostic")
+                .expect("unchanged is authoritative empty")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_diagnostic_error_response_is_a_request_failure() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32603, "message": "boom" }
+        });
+        assert!(
+            parse_host_diagnostic_response(response, "textDocument/diagnostic").is_err(),
+            "an error response must be a counted request failure, unlike null"
+        );
+    }
+
+    #[test]
+    fn host_diagnostic_missing_result_is_a_request_failure() {
+        // Neither `result` nor `error` — a protocol violation, not the lenient
+        // empty that the shared raw path keeps for non-diagnostic methods.
+        let response = serde_json::json!({ "jsonrpc": "2.0", "id": 1 });
+        assert!(parse_host_diagnostic_response(response, "textDocument/diagnostic").is_err());
+    }
+
+    #[test]
+    fn host_diagnostic_malformed_payload_is_a_request_failure() {
+        // A present, non-null `result` that is not a diagnostic report at all.
+        let response = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": "nonsense" });
+        assert!(parse_host_diagnostic_response(response, "textDocument/diagnostic").is_err());
+    }
+
+    #[test]
+    fn host_diagnostic_unknown_kind_is_a_request_failure() {
+        // The exit-2 behavior hinges on the tagged-enum deserialize REJECTING
+        // an unrecognized report `kind` — assert it rather than infer it.
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "kind": "partial", "items": [] }
+        });
+        assert!(parse_host_diagnostic_response(response, "textDocument/diagnostic").is_err());
+    }
+
+    #[test]
+    fn host_diagnostic_full_report_missing_items_is_a_request_failure() {
+        // Likewise, a `full` report MUST carry `items`; the deserialize must
+        // reject its absence.
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "kind": "full" }
+        });
+        assert!(parse_host_diagnostic_response(response, "textDocument/diagnostic").is_err());
     }
 
     #[test]

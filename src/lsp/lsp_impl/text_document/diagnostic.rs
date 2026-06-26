@@ -457,13 +457,16 @@ pub(crate) async fn collect_host_diagnostics(
     let send = |t: HostFanOutTask| {
         // Cloned per call so the returned future is `'static`, and so a
         // request-time host failure (timeout, crash, error response after the
-        // server is ready) is counted — letting CLI mode surface it as exit 2
-        // instead of silently losing the host layer.
+        // server is ready, or a present-but-malformed report payload) is
+        // counted — letting CLI mode surface it as exit 2 instead of silently
+        // losing the host layer. `send_host_diagnostic_request` keeps a
+        // `null`/`unchanged`/no-capability result a lenient empty (not an
+        // error); only a malformed payload is `Err`.
         let sink = request_error_sink.clone();
         async move {
             let result = tokio::time::timeout(
                 DIAGNOSTIC_REQUEST_TIMEOUT,
-                t.pool.send_host_raw_request(
+                t.pool.send_host_diagnostic_request(
                     &t.server_name,
                     &t.server_config,
                     &crate::lsp::bridge::HostDocument {
@@ -474,10 +477,10 @@ pub(crate) async fn collect_host_diagnostics(
                     "textDocument/diagnostic",
                     serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
                     t.upstream_id,
-                    // Same policy as the virt diagnostic path: wait through
-                    // server initialization — the first didOpen-triggered pull
-                    // would otherwise hit an Initializing server and silently
-                    // lose the host layer. The outer timeout bounds the wait.
+                    // Wait through server initialization — the first
+                    // didOpen-triggered pull would otherwise hit an Initializing
+                    // server and silently lose the host layer. The outer timeout
+                    // bounds the wait.
                     crate::lsp::bridge::ConnectionReadiness::WaitReady,
                 ),
             )
@@ -488,13 +491,10 @@ pub(crate) async fn collect_host_diagnostics(
                     t.server_name
                 )))
             });
-            match result {
-                Ok(value) => Ok(parse_host_diagnostic_report(value)),
-                Err(e) => {
-                    count_request_errors(&sink, 1);
-                    Err(e)
-                }
+            if result.is_err() {
+                count_request_errors(&sink, 1);
             }
+            result
         }
     };
 
@@ -521,30 +521,6 @@ pub(crate) async fn collect_host_diagnostics(
                 FanInResult::Done(diagnostics) => diagnostics,
                 FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
             }
-        }
-    }
-}
-
-/// Parse a raw `textDocument/diagnostic` result from a host server into its
-/// diagnostic items: a `full` report yields its items (`relatedDocuments`
-/// entries are dropped — diagnostics for OTHER documents have no place in
-/// this document's report); `unchanged` (which a server should not send —
-/// we never supply `previousResultId`) and `null` / unparsable results
-/// yield nothing.
-fn parse_host_diagnostic_report(result: Option<serde_json::Value>) -> Vec<Diagnostic> {
-    let Some(value) = result else {
-        return Vec::new();
-    };
-    match serde_json::from_value::<DocumentDiagnosticReport>(value) {
-        Ok(DocumentDiagnosticReport::Full(report)) => report.full_document_diagnostic_report.items,
-        Ok(DocumentDiagnosticReport::Unchanged(_)) => Vec::new(),
-        Err(e) => {
-            log::debug!(
-                target: "kakehashi::diagnostic",
-                "host diagnostic report did not parse: {}",
-                e
-            );
-            Vec::new()
         }
     }
 }
@@ -680,7 +656,6 @@ fn empty_diagnostic_report() -> DocumentDiagnosticReportResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use tower_lsp_server::ls_types::{Position, Range};
 
     fn diag(message: &str) -> Diagnostic {
@@ -746,30 +721,5 @@ mod tests {
     fn combine_empty_priorities_yields_nothing() {
         let cfg = layer_cfg(vec![], AggregationStrategy::Concatenated);
         assert!(combine_layer_diagnostics(&cfg, vec![diag("virt")], vec![diag("host")]).is_empty());
-    }
-
-    #[test]
-    fn parse_host_report_full_yields_items() {
-        let value = json!({
-            "kind": "full",
-            "items": [{
-                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
-                "message": "host says hi"
-            }]
-        });
-        let items = parse_host_diagnostic_report(Some(value));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].message, "host says hi");
-    }
-
-    #[test]
-    fn parse_host_report_unchanged_none_and_garbage_yield_nothing() {
-        assert!(parse_host_diagnostic_report(None).is_empty());
-        assert!(
-            parse_host_diagnostic_report(Some(json!({"kind": "unchanged", "resultId": "x"})))
-                .is_empty()
-        );
-        assert!(parse_host_diagnostic_report(Some(json!("nonsense"))).is_empty());
-        assert!(parse_host_diagnostic_report(Some(serde_json::Value::Null)).is_empty());
     }
 }
