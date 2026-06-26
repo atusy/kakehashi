@@ -14,21 +14,35 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 /// Shared persistent data dir with markdown/lua parsers preinstalled (same
-/// one the LSP e2e suite uses; see `tests/helpers/lsp_client.rs`).
+/// one the LSP e2e suite uses; see `tests/helpers/lsp_client.rs`). Treated as
+/// read-only after install so concurrent test processes can share it.
 fn data_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
-    let dir = DIR.get_or_init(|| {
+    DIR.get_or_init(|| {
         let dir = kakehashi::install::test_support::test_data_dir_path();
         std::fs::create_dir_all(&dir).expect("create shared test data dir");
         kakehashi::install::test_support::ensure_test_languages_installed(&dir)
             .expect("install test parsers into the shared data dir");
         dir
-    });
-    // Clear crash-recovery state before every spawn so an earlier test's
-    // mid-parse shutdown can't poison this one.
+    })
+    .as_path()
+}
+
+/// Per-process dir for the spawned server's crash-recovery state, passed via
+/// `KAKEHASHI_STATE_DIR`. `kakehashi format` builds the in-process LSP service
+/// (`Kakehashi::new` -> `FailedParserRegistry`), so without this it would read
+/// and write `parsing_in_progress`/`failed_parsers` in the SHARED `data_dir()`,
+/// which the parallel test runner makes a cross-process poisoning hazard. Keep
+/// it out of the shared install (read-only) and clear the transient files on
+/// each spawn for the intra-process case — mirrors `lsp_client.rs`.
+fn state_dir() -> &'static Path {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let dir = DIR
+        .get_or_init(|| tempfile::tempdir().expect("create temp KAKEHASHI_STATE_DIR"))
+        .path();
     let _ = std::fs::remove_file(dir.join("parsing_in_progress"));
     let _ = std::fs::remove_file(dir.join("failed_parsers"));
-    dir.as_path()
+    dir
 }
 
 /// Workspace config bridging lua injections to the uppercasing mock server.
@@ -72,6 +86,7 @@ fn run_format(workspace: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(workspace)
         .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_STATE_DIR", state_dir())
         .env("RUST_LOG", "kakehashi=debug")
         .output()
         .expect("spawn kakehashi format")
@@ -178,6 +193,7 @@ fn run_format_stdin(workspace: &Path, extra_args: &[&str]) -> Output {
         .args(extra_args)
         .current_dir(workspace)
         .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_STATE_DIR", state_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
