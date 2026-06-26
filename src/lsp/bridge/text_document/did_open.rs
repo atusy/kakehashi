@@ -113,7 +113,7 @@ impl LanguageServerPool {
         host_uri: &url::Url,
         language_id: &str,
         text: &str,
-        live_text_reader: Option<&super::host::HostTextReader>,
+        live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
     ) {
         let handle = match self
             .get_or_create_connection_wait_ready(
@@ -164,7 +164,7 @@ impl LanguageServerPool {
             &mut sender,
             &mut docs,
             &doc,
-            live_text_reader.map(|reader| reader.as_ref()),
+            live_text_reader,
             connection_key,
         )
         .await

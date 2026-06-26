@@ -663,7 +663,7 @@ impl BridgeCoordinator {
                         &host_uri_owned,
                         &language_id,
                         &text,
-                        live_text_reader.as_ref(),
+                        live_text_reader.as_deref(),
                     ) => {}
                 }
             });
