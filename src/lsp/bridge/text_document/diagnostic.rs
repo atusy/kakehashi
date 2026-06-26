@@ -97,11 +97,10 @@ impl LanguageServerPool {
                         jsonrpc_error_summary(&response)
                     )));
                 }
-                Ok(transform_diagnostic_response_to_host(
-                    response,
-                    ctx.offset,
-                    host_uri.as_str(),
-                ))
+                // A present-but-malformed payload (absent `result`, unknown
+                // report kind, missing/garbled `items`) is likewise a request
+                // failure; only `null`/`unchanged` stays an empty layer.
+                transform_diagnostic_response_to_host(response, ctx.offset, host_uri.as_str())
             },
         )
         .await?
@@ -134,24 +133,38 @@ fn build_diagnostic_request(
 ///
 /// The caller ([`LanguageServerPool::send_diagnostic_request`]) handles a
 /// JSON-RPC *error* response separately (it propagates as `Err`), so this only
-/// extracts the `result`: an empty `Vec` for a null/absent result, an unchanged
-/// report, missing items, or a deserialization failure. Only related info
-/// matching `host_uri` is transformed.
+/// inspects the `result`. Mirroring [`transform_formatting_response_to_host`],
+/// a present-but-malformed payload is a request **failure** (`Err`): an absent
+/// `result` member (protocol violation), an unknown report `kind`, a `full`
+/// report missing `items`, or `items` that fail to deserialize as
+/// `Diagnostic[]`. A `null` result or an `unchanged` report is the
+/// authoritative "no diagnostics" answer and stays an empty `Vec` (`Ok`).
+/// Collapsing a malformed payload into the same empty value as "no
+/// capability" would let a broken downstream server pass as "nothing wrong" —
+/// the fan-in counts `Err`s, which CLI mode maps onto its `2` exit code and
+/// the editor path logs at WARNING. Only related info matching `host_uri` is
+/// transformed.
 fn transform_diagnostic_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     host_uri: &str,
-) -> Vec<Diagnostic> {
+) -> io::Result<Vec<Diagnostic>> {
+    // Absent `result` with no error (the caller already promoted an error
+    // response to `Err`) is a protocol violation — a request failure.
     let Some(mut result) = response.get_mut("result").map(serde_json::Value::take) else {
-        return Vec::new();
+        return Err(io::Error::other(
+            "diagnostic response carries neither result nor error (protocol violation)",
+        ));
     };
     if result.is_null() {
-        return Vec::new();
+        // Authoritative "no diagnostics" — a handled response, not a failure.
+        return Ok(Vec::new());
     }
 
-    // Check report kind
+    // Check report kind: `unchanged` is an authoritative empty; `full`/absent
+    // proceeds; an unknown kind is a malformed payload (request failure).
     match result.get("kind").and_then(|k| k.as_str()) {
-        Some("unchanged") => return Vec::new(),
+        Some("unchanged") => return Ok(Vec::new()),
         Some("full") | None => {}
         Some(other) => {
             log::warn!(
@@ -159,16 +172,33 @@ fn transform_diagnostic_response_to_host(
                 "Unknown diagnostic report kind: {}",
                 other
             );
-            return Vec::new();
+            return Err(io::Error::other(format!(
+                "malformed diagnostic result from downstream server: unknown report kind '{other}'"
+            )));
         }
     }
 
-    // Deserialize items, taking ownership to avoid clones
+    // A `full` report MUST carry `items`; a missing `items` member is a
+    // malformed payload (request failure).
     let Some(items) = result.get_mut("items").map(serde_json::Value::take) else {
-        return Vec::new();
+        return Err(io::Error::other(
+            "malformed diagnostic result from downstream server: full report missing 'items'",
+        ));
     };
-    let Ok(mut diagnostics) = serde_json::from_value::<Vec<Diagnostic>>(items) else {
-        return Vec::new();
+    // `items` that do not deserialize as `Diagnostic[]` (wrong shape, missing
+    // fields, etc.) is likewise a request failure; the log keeps the
+    // misbehaving downstream diagnosable.
+    let mut diagnostics: Vec<Diagnostic> = match serde_json::from_value(items) {
+        Ok(diagnostics) => diagnostics,
+        Err(err) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to deserialize diagnostic items as Diagnostic[]: {err}"
+            );
+            return Err(io::Error::other(format!(
+                "malformed diagnostic result from downstream server: {err}"
+            )));
+        }
     };
 
     // Transform coordinates on typed structs
@@ -176,7 +206,7 @@ fn transform_diagnostic_response_to_host(
         transform_diagnostic(diag, offset, host_uri);
     }
 
-    diagnostics
+    Ok(diagnostics)
 }
 
 /// Transform a single typed Diagnostic by applying the region offset to its range.
@@ -242,7 +272,8 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused")
+                .unwrap();
 
         assert_eq!(diagnostics.len(), 2);
 
@@ -292,7 +323,8 @@ mod tests {
             response,
             &RegionOffset::new(3, 0),
             "file:///test.md",
-        );
+        )
+        .unwrap();
 
         assert_eq!(diagnostics.len(), 1);
 
@@ -341,7 +373,8 @@ mod tests {
             response,
             &RegionOffset::new(3, 0),
             "file:///test.md",
-        );
+        )
+        .unwrap();
 
         assert_eq!(diagnostics.len(), 1);
 
@@ -368,7 +401,8 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused")
+                .expect("unchanged is an authoritative empty result, not a failure");
         assert!(diagnostics.is_empty());
     }
 
@@ -377,21 +411,31 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused")
+                .expect("null is an authoritative empty result, not a failure");
         assert!(diagnostics.is_empty());
     }
 
     #[test]
-    fn diagnostic_response_missing_result_returns_empty() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "error": { "code": -32603, "message": "internal error" } });
+    fn diagnostic_response_missing_result_is_request_failure() {
+        // Neither `result` nor `error` member — a protocol violation. (An
+        // *error* response is promoted to `Err` by the caller before transform
+        // runs, so transform only ever sees the no-result-no-error shape here.)
+        let response = json!({ "jsonrpc": "2.0", "id": 42 });
 
-        let diagnostics =
+        let transformed =
             transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
-        assert!(diagnostics.is_empty());
+        assert!(
+            transformed.is_err(),
+            "a response with neither result nor error must be a request failure"
+        );
     }
 
     #[test]
-    fn diagnostic_response_malformed_items_returns_empty() {
+    fn diagnostic_response_malformed_items_is_request_failure() {
+        // A non-`Diagnostic[]` `items` is a malformed payload — must be `Err`
+        // (request failure), not the lenient empty, so CLI mode can exit 2 for
+        // a broken downstream server.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -401,9 +445,38 @@ mod tests {
             }
         });
 
-        let diagnostics =
+        let transformed =
             transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
-        assert!(diagnostics.is_empty());
+        assert!(transformed.is_err());
+    }
+
+    #[test]
+    fn diagnostic_response_unknown_kind_is_request_failure() {
+        // An unrecognized report `kind` is a malformed payload — `Err`, not the
+        // lenient empty.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "kind": "partial", "items": [] }
+        });
+
+        let transformed =
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
+        assert!(transformed.is_err());
+    }
+
+    #[test]
+    fn diagnostic_response_full_report_missing_items_is_request_failure() {
+        // A `full` report MUST carry `items`; its absence is malformed → `Err`.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "kind": "full" }
+        });
+
+        let transformed =
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
+        assert!(transformed.is_err());
     }
 
     #[test]
@@ -418,7 +491,8 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused")
+                .expect("an empty items array is an authoritative empty result, not a failure");
         assert!(diagnostics.is_empty());
     }
 
@@ -464,7 +538,8 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, &RegionOffset::new(3, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(3, 0), "unused")
+                .unwrap();
 
         assert_eq!(diagnostics.len(), 1);
         let related = diagnostics[0].related_information.as_ref().unwrap();
@@ -518,7 +593,8 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, &RegionOffset::new(3, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(3, 0), "unused")
+                .unwrap();
 
         assert_eq!(diagnostics.len(), 1);
         let related = diagnostics[0].related_information.as_ref().unwrap();
@@ -586,7 +662,8 @@ mod tests {
 
         // This should not panic due to overflow
         let diagnostics =
-            transform_diagnostic_response_to_host(response, &RegionOffset::new(100, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(100, 0), "unused")
+                .unwrap();
 
         // Values should saturate at u32::MAX
         assert_eq!(diagnostics.len(), 1);
