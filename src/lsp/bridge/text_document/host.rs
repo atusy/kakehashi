@@ -70,10 +70,23 @@ fn fingerprint(text: &str) -> u64 {
 /// (ls-bridge-message-ordering) guarantees wire order matches enqueue order.
 /// Generic over [`MessageSender`] so tests can observe the notifications via
 /// a channel.
+///
+/// `live_text_reader`, when `Some`, supplies the document's **current** text,
+/// read here under the `host_documents` lock instead of trusting `doc.text`.
+/// The eager on-edit re-sync passes it so a sync task that unparked late sends
+/// the *latest* text rather than the schedule-time snapshot it was spawned with
+/// — a snapshot a newer edit may have superseded (host-sync-stale-overwrite,
+/// #422). Reading under the same lock that gates the fingerprint compare and the
+/// send means the last task to take the lock observes the newest text, so
+/// concurrent re-syncs can no longer roll a host server back to stale content; a
+/// `None` return (document closed mid-sync) falls back to `doc.text`. Interactive
+/// requests, the formatting pipeline's speculative scratch text, and the initial
+/// `didOpen` pass `None` and are synced verbatim.
 pub(super) async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
     docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
     doc: &HostDocument<'_>,
+    _live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
     connection_key: &ConnectionKey,
 ) -> io::Result<()> {
     let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
@@ -387,7 +400,9 @@ impl LanguageServerPool {
 
             let mut docs = self.host_documents().await;
             let mut sender = ConnectionHandleSender(&handle);
-            if let Err(e) = sync_host_document(&mut sender, &mut docs, doc, connection_key).await {
+            if let Err(e) =
+                sync_host_document(&mut sender, &mut docs, doc, None, connection_key).await
+            {
                 drop(docs);
                 drop(connections);
                 if let Some(ref id) = upstream_request_id {
@@ -720,6 +735,7 @@ mod tests {
             &mut sender,
             &mut docs,
             &host_doc(&uri, "v1"),
+            None,
             &ConnectionKey::for_server("srv"),
         )
         .await
@@ -737,6 +753,7 @@ mod tests {
             &mut sender,
             &mut docs,
             &host_doc(&uri, "v1"),
+            None,
             &ConnectionKey::for_server("srv"),
         )
         .await
@@ -748,6 +765,7 @@ mod tests {
             &mut sender,
             &mut docs,
             &host_doc(&uri, "v2"),
+            None,
             &ConnectionKey::for_server("srv"),
         )
         .await
@@ -765,6 +783,7 @@ mod tests {
             &mut sender,
             &mut docs,
             &host_doc(&uri, "v3"),
+            None,
             &ConnectionKey::for_server("srv"),
         )
         .await

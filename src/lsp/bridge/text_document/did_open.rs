@@ -160,7 +160,8 @@ impl LanguageServerPool {
             text,
         };
         if let Err(e) =
-            super::host::sync_host_document(&mut sender, &mut docs, &doc, connection_key).await
+            super::host::sync_host_document(&mut sender, &mut docs, &doc, None, connection_key)
+                .await
         {
             log::debug!(
                 target: "kakehashi::bridge",
