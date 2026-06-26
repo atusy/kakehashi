@@ -1,7 +1,11 @@
 //! End-to-end test for synthetic push diagnostics (pull-first-diagnostic-forwarding Phase 2).
 //!
-//! This test verifies that `textDocument/publishDiagnostics` notifications
-//! are sent automatically on `didSave` and `didOpen` events.
+//! This test verifies the `textDocument/publishDiagnostics` push path on
+//! `didSave`/`didOpen`. Note the two flavours below: tests gated by a real
+//! downstream (lua-ls) treat the push as OPTIONAL — they only assert structure
+//! IF one arrives within `OPTIONAL_PUSH_WAIT` (valid Lua may produce none), and
+//! otherwise just require the server not to crash. The layers-gate test, whose
+//! empty publish is deterministic (no downstream), DOES require the push.
 //!
 //! Run with: `cargo test --test e2e_synthetic_push_diagnostic --features e2e`
 //!

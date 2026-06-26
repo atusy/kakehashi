@@ -151,8 +151,8 @@ impl AutoInstallManager {
     /// Initialize the failed parser registry with crash detection.
     ///
     /// State storage location: `KAKEHASHI_STATE_DIR` if set, else the default
-    /// data directory, falling back to `/tmp/kakehashi` if neither resolves.
-    /// Crash-recovery state (`parsing_in_progress`,
+    /// data directory, falling back to a `kakehashi` dir under the OS temp dir
+    /// if neither resolves. Crash-recovery state (`parsing_in_progress`,
     /// `failed_parsers`) is ephemeral and conceptually distinct from the
     /// persistent parser/query install assets in the data dir; the override
     /// lets it live elsewhere — e.g. so concurrent test processes that share one
@@ -168,7 +168,9 @@ impl AutoInstallManager {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(crate::install::default_data_dir)
-            .unwrap_or_else(|| PathBuf::from("/tmp/kakehashi"));
+            // Platform-aware last resort (not a hard-coded `/tmp`, which doesn't
+            // exist on Windows); only reached if the data dir can't resolve.
+            .unwrap_or_else(|| std::env::temp_dir().join("kakehashi"));
 
         let registry = FailedParserRegistry::new(&state_dir);
 
