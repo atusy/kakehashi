@@ -44,7 +44,7 @@ test:
 # timing-sensitive tests without cross-binary load.
 .PHONY: test_e2e
 test_e2e:
-	scripts/test_e2e_parallel.sh
+	CARGO="$(CARGO)" scripts/test_e2e_parallel.sh
 
 .PHONY: test_e2e_sequential
 test_e2e_sequential:

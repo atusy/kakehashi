@@ -58,11 +58,15 @@ if [ "$BIN_TIMEOUT" -gt 0 ]; then
   TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 fi
 
-echo "==> Building test binaries (cargo test --no-run)"
+# Honor the Makefile's `CARGO` override (toolchain selector / cargo wrapper),
+# the way the other targets do — `make test_e2e` passes it through.
+CARGO="${CARGO:-cargo}"
+
+echo "==> Building test binaries ($CARGO test --no-run)"
 # `cargo test --no-run` prints an `Executable tests/<file> (<path>)` line for
 # every integration-test binary even when fully cached, so parse those paths.
 # (--message-format=json only emits artifacts when something recompiles.)
-BUILD_OUT="$(cargo test --features e2e --no-run 2>&1)" || { echo "$BUILD_OUT"; exit 1; }
+BUILD_OUT="$("$CARGO" test --features e2e --no-run 2>&1)" || { echo "$BUILD_OUT"; exit 1; }
 BINS=$(printf '%s\n' "$BUILD_OUT" \
        | sed -n 's/^[[:space:]]*Executable tests\/[^ ]* (\(.*\))$/\1/p' | sort -u)
 N=$(printf '%s\n' "$BINS" | grep -c .)
