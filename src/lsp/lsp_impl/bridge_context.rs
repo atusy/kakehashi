@@ -697,7 +697,7 @@ impl Kakehashi {
 
         Some(HostRequestContext {
             uri,
-            text: std::sync::Arc::from(snapshot.text()),
+            text: snapshot.text_arc(),
             language_id: language_name,
             configs,
             priorities: agg.priorities,

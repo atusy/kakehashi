@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use tree_sitter::Tree;
 
 /// Immutable snapshot of document state for lock-free processing
 pub(crate) struct DocumentSnapshot {
-    text: String,
+    text: Arc<str>,
     tree: Tree,
 }
 
@@ -10,6 +12,13 @@ impl DocumentSnapshot {
     /// Get the text content
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Cheaply clone the text as a shared `Arc<str>` (a refcount bump, no copy)
+    /// — for callers that need an owned handle to the snapshot's text, e.g. the
+    /// host bridge's `HostRequestContext` (#498).
+    pub(crate) fn text_arc(&self) -> Arc<str> {
+        Arc::clone(&self.text)
     }
 
     /// Get the parse tree
@@ -20,20 +29,24 @@ impl DocumentSnapshot {
 
 /// Unified document structure combining text, parsing, and LSP state
 pub struct Document {
-    text: String,
+    /// Stored as `Arc<str>` so cloning the text — on every `snapshot()` and on
+    /// each host-bridge live read — is a refcount bump rather than a full copy
+    /// (#498). The cost is one `String → Arc<str>` reallocation per construct /
+    /// edit, paid back by the many cheap clones per edit.
+    text: Arc<str>,
     language_id: Option<String>,
     tree: Option<Tree>,
     /// Previous tree for changed_ranges comparison during incremental parsing
     previous_tree: Option<Tree>,
     /// Previous text for line delta calculation during incremental tokenization
-    previous_text: Option<String>,
+    previous_text: Option<Arc<str>>,
 }
 
 impl Document {
     /// Create a new document with just text
     pub(crate) fn new(text: String) -> Self {
         Self {
-            text,
+            text: Arc::from(text),
             language_id: None,
             tree: None,
             previous_tree: None,
@@ -44,7 +57,7 @@ impl Document {
     /// Create with language but no tree yet (for early document registration)
     pub(crate) fn with_language(text: String, language_id: String) -> Self {
         Self {
-            text,
+            text: Arc::from(text),
             language_id: Some(language_id),
             tree: None,
             previous_tree: None,
@@ -55,7 +68,7 @@ impl Document {
     /// Create with language and tree
     pub(crate) fn with_tree(text: String, language_id: String, tree: Tree) -> Self {
         Self {
-            text,
+            text: Arc::from(text),
             language_id: Some(language_id),
             tree: Some(tree),
             previous_tree: None,
@@ -66,6 +79,13 @@ impl Document {
     /// Get the text content
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Cheaply clone the text as a shared `Arc<str>` (a refcount bump, no copy).
+    /// Used by the host-bridge live read so reading the document's current text
+    /// under the lock no longer full-copies it (#498).
+    pub(crate) fn text_arc(&self) -> Arc<str> {
+        Arc::clone(&self.text)
     }
 
     /// Get the language ID
@@ -104,7 +124,7 @@ impl Document {
     /// which accepts the edited previous tree (after `tree.edit()` was called).
     pub(crate) fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
         self.previous_tree = self.tree.take();
-        self.previous_text = Some(std::mem::replace(&mut self.text, new_text));
+        self.previous_text = Some(std::mem::replace(&mut self.text, Arc::from(new_text)));
         self.tree = Some(new_tree);
     }
 
@@ -120,7 +140,7 @@ impl Document {
         edited_previous_tree: Tree,
     ) {
         self.previous_tree = Some(edited_previous_tree);
-        self.previous_text = Some(std::mem::replace(&mut self.text, new_text));
+        self.previous_text = Some(std::mem::replace(&mut self.text, Arc::from(new_text)));
         self.tree = Some(new_tree);
     }
 
@@ -136,7 +156,7 @@ impl Document {
 
     /// Update text and clear layers/state
     pub(crate) fn update_text(&mut self, text: String) {
-        self.text = text;
+        self.text = Arc::from(text);
         // Note: Tree needs to be rebuilt after text change
         self.tree = None;
         self.previous_tree = None;
@@ -269,11 +289,55 @@ mod tests {
         // Create snapshot
         let snapshot = doc.snapshot().unwrap();
 
-        // Verify snapshot is independent (different addresses would be ideal, but we can verify content)
+        // Snapshot content matches the document. The text now shares the
+        // document's `Arc<str>` allocation (a cheap clone — see
+        // `snapshot_text_shares_the_document_allocation`); it stays a valid
+        // immutable snapshot because any edit installs a *new* `Arc` on the
+        // document rather than mutating this one.
         assert_eq!(snapshot.text(), doc.text());
         assert_eq!(
             snapshot.tree().root_node().kind(),
             doc.tree().unwrap().root_node().kind()
         );
+    }
+
+    #[test]
+    fn text_arc_is_a_cheap_shared_clone() {
+        let doc = Document::new("shared text".to_string());
+        let a = doc.text_arc();
+        let b = doc.text_arc();
+        // Both handles point to the SAME allocation — a refcount bump, not a
+        // copy (#498).
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(&*a, "shared text");
+    }
+
+    #[test]
+    fn snapshot_text_shares_the_document_allocation() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+
+        let snapshot = doc.snapshot().unwrap();
+
+        // `snapshot()` clones the text `Arc` (refcount bump) rather than copying
+        // the bytes — the whole point of #498.
+        assert!(Arc::ptr_eq(&doc.text_arc(), &snapshot.text_arc()));
+    }
+
+    #[test]
+    fn update_text_installs_a_fresh_allocation() {
+        // An edit replaces the `Arc` (so prior snapshots keep their bytes); the
+        // new text is correct.
+        let mut doc = Document::new("v1".to_string());
+        let before = doc.text_arc();
+        doc.update_text("v2".to_string());
+        let after = doc.text_arc();
+        assert_eq!(&*after, "v2");
+        assert!(!Arc::ptr_eq(&before, &after), "edit installs a new Arc");
+        assert_eq!(&*before, "v1", "the prior Arc still holds the old text");
     }
 }
