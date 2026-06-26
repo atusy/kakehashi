@@ -606,12 +606,13 @@ async fn dispatch_concatenated_diagnostics(
 /// Under preferred the winning server's result is authoritative, so a
 /// non-winning server's request failure is **not** counted toward CLI exit 2:
 /// failures are recorded only when no server won, via [`count_no_winner_errors`]
-/// on the fan-in result. This is deterministic — `NoResult` (all servers
-/// failed) drains every task, whereas the racy in-task counting it replaces
-/// could miss or catch a loser depending on when the fan-in `abort_all`ed it
-/// (#487). The default `concatenated` strategy still counts every failure
-/// in-task (each is a missing merge contribution). The same fix applies to the
-/// formatting preferred path (tracked separately).
+/// on the fan-in result. This is deterministic — `NoResult` (no winner emerged)
+/// drains every task, so its `errors` is the exhaustive count of the actual
+/// failures (zero if the non-winners merely returned empty), whereas the racy
+/// in-task counting it replaces could miss or catch a loser depending on when
+/// the fan-in `abort_all`ed it (#487). The default `concatenated` strategy
+/// still counts every failure in-task (each is a missing merge contribution).
+/// The same fix applies to the formatting preferred path (tracked separately).
 async fn dispatch_preferred_diagnostics(
     region_ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,

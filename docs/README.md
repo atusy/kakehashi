@@ -638,9 +638,9 @@ surfaces a broken run rather than looking clean to CI.
 
 > Under the non-default `preferred` aggregation strategy, the winning server's
 > result is authoritative, so a *non-winning* server's request-time failure is
-> deliberately **not** counted toward exit `2` — only a failure with no winner
-> at all (every server failed) does. The default `concatenated` strategy counts
-> every server's failure.
+> deliberately **not** counted toward exit `2` — a failure surfaces only when
+> no server won (no non-empty result) *and* a contender actually failed. The
+> default `concatenated` strategy counts every server's failure.
 
 Diagnostics stream to stdout as each file is processed. Every file is always
 scanned so the exit code reflects the whole set; if stdout is closed before the

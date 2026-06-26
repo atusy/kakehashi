@@ -70,9 +70,12 @@ pub(crate) fn count_request_errors(sink: &RequestErrorSink, n: usize) {
 /// the preferred fan-in `abort_all`s the losers without joining them, so a
 /// loser's in-task `fetch_add` can land after the CLI has read the counter
 /// (#487). Counting from the fan-in result instead is deterministic: only
-/// `NoResult` (every server failed → no winner) carries a decisive,
-/// fully-drained `errors` count; `Done`/`Cancelled` count nothing. Shared so
-/// the preferred diagnose and (future) formatting dispatches stay consistent.
+/// `NoResult` (no server won — every contender failed or returned empty)
+/// carries a decisive, fully-drained `errors` count, and `errors` counts only
+/// the actual failures (it is `0` when the non-winners merely returned empty),
+/// so an all-empty run is not a failure. `Done`/`Cancelled` count nothing.
+/// Shared so the preferred diagnose and (future) formatting dispatches stay
+/// consistent.
 pub(crate) fn count_no_winner_errors<T>(
     result: &crate::lsp::aggregation::server::FanInResult<T>,
     sink: &RequestErrorSink,
