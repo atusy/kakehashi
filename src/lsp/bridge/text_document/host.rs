@@ -346,15 +346,20 @@ impl LanguageServerPool {
     /// Waits through server initialization (the caller's request timeout bounds
     /// the wait) — returning empty while a server initializes would silently
     /// lose the host layer on the first pull, like the virt diagnostic path.
+    ///
+    /// The method is fixed to `textDocument/diagnostic`: this path is dedicated
+    /// to the diagnostic-only parser and capability check, so it takes no
+    /// `method` argument — a caller cannot accidentally route another method
+    /// through it (the generic [`Self::send_host_raw_request`] is for that).
     pub(crate) async fn send_host_diagnostic_request(
         &self,
         server_name: &str,
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
-        method: &'static str,
         params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Vec<Diagnostic>> {
+        let method = "textDocument/diagnostic";
         let handle = self
             .get_or_create_connection_wait_ready(
                 server_name,

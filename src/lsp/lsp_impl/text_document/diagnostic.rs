@@ -474,7 +474,6 @@ pub(crate) async fn collect_host_diagnostics(
                         language_id: &t.language_id,
                         text: &t.text,
                     },
-                    "textDocument/diagnostic",
                     serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
                     t.upstream_id,
                 ),
