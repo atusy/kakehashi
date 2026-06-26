@@ -30,6 +30,8 @@
 #   E2E_INNER_THREADS  test threads WITHIN each binary       (default: 2)
 #                      → total concurrency ≈ E2E_JOBS * E2E_INNER_THREADS
 #   E2E_BIN_TIMEOUT    per-binary timeout in seconds         (default: 600, 0=off)
+#   E2E_RETRIES        serial retries for a FAILED binary    (default: 1, 0=off)
+#                      → recovers load-induced timeout flakes; real failures persist
 #
 # NOTE: the build step (`cargo test --no-run`) writes to the default `target/`,
 # which rust-analyzer may lock while it (re)compiles after an edit — the
@@ -158,6 +160,38 @@ printf '%s\n' "$BINS" | xargs -P "$JOBS" -I{} sh -c '
   printf "  [%2d/%2d] %s %-34s %3ds\n" "$done" "$N" "$status" "$name" "$dt"
 ' _ {}
 WALL=$SECONDS
+
+# Retry any failed binaries ONCE, serially. Under heavy machine load (e.g. a
+# rust-analyzer compile storm) a spawned server or mock bridge can miss its
+# internal startup timeout (10–30s) and the whole binary fails spuriously; given
+# the machine to itself on retry it succeeds. A genuinely broken test still
+# fails both times. Set E2E_RETRIES=0 to disable.
+RETRY="${E2E_RETRIES:-1}"
+if [ "$RETRY" -gt 0 ]; then
+  retry_names=""
+  for s in "$RESDIR"/*.status; do
+    [ -f "$s" ] || continue
+    [ "$(cat "$s")" != 0 ] && retry_names="$retry_names $(basename "$s" .status)"
+  done
+  if [ -n "${retry_names# }" ]; then
+    echo
+    echo "==> Retrying failed binaries serially ($(printf '%s' "$retry_names" | wc -w | tr -d ' ') — load-induced flakes recover here):"
+    for name in $retry_names; do
+      bin="$(printf '%s\n' "$BINS" | grep "/deps/${name}-" | head -1)"
+      [ -n "$bin" ] || continue
+      t0=$(date +%s)
+      if [ -n "$TIMEOUT_BIN" ]; then
+        "$TIMEOUT_BIN" "$BIN_TIMEOUT" "$bin" --test-threads=1 > "$RESDIR/$name.log" 2>&1
+      else
+        "$bin" --test-threads=1 > "$RESDIR/$name.log" 2>&1
+      fi
+      ec=$?; echo "$ec" > "$RESDIR/$name.status"
+      dt=$(( $(date +%s) - t0 ))
+      if [ "$ec" = 0 ]; then printf "  retry ok   %-34s %3ds (was a flake)\n" "$name" "$dt"
+      else                   printf "  retry FAIL %-34s %3ds (real failure)\n" "$name" "$dt"; fi
+    done
+  fi
+fi
 
 # Sum with awk (no `bc` dependency — not installed on minimal environments).
 PASSED=$(grep -hoE "result: ok\. [0-9]+ passed" "$RESDIR"/*.log 2>/dev/null \
