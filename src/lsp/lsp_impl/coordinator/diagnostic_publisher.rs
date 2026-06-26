@@ -405,17 +405,35 @@ impl DiagnosticPublisher {
     ///
     /// Emitted **off** the per-host republish lock and **only** from the
     /// push-origin paths ([`Self::publish_host_push`], [`Self::publish_region_push`]),
-    /// never from the pull-origin republish ([`Self::publish_pull_layer`]) — a
-    /// refresh triggers a pull, which would re-enter the pull-origin republish, so
-    /// refreshing there too could ping-pong.
+    /// never from the pull-origin republish ([`Self::publish_pull_layer`]) nor the
+    /// edit-origin re-merge (`did_change`): those carry no *new* result the editor
+    /// is unaware of — a pull-origin set is already the answer to a pull the editor
+    /// made, and an edit-origin re-merge is covered by the editor's own `didChange`
+    /// re-pull — so a refresh there would be redundant. (No tight loop forms: a
+    /// refresh-induced pull is answered inline by `diagnostic_impl`, which never
+    /// republishes, so a refresh cannot directly beget another; the indirect
+    /// push→refresh→re-pull→downstream-re-push→here path is bounded by
+    /// `published_set_changed`, converging once the re-pushed set stabilizes.)
     ///
     /// **Spawned, not awaited:** `workspace/diagnostic/refresh` is a request whose
     /// future resolves only when the editor answers, so awaiting it inline would
     /// block the push path on the client round-trip (and never resolve in a test
     /// that doesn't answer). Detaching it keeps the push path non-blocking and
-    /// avoids the upstream-notification loop's inline-await head-of-line block. A
-    /// client without refresh support just errors (logged).
+    /// avoids the upstream-notification loop's inline-await head-of-line block.
+    ///
+    /// Gated on the client advertising `workspace.diagnostics.refreshSupport`: a
+    /// client that supports pull but not refresh would silently ignore the request,
+    /// leaking a tower-lsp pending-request entry plus a parked task — the same gate
+    /// the `semantic_tokens_refresh` path uses.
     fn request_pull_diagnostic_refresh(&self) {
+        let supported = self
+            .settings_manager
+            .client_capabilities_lock()
+            .get()
+            .is_some_and(crate::lsp::client::check_diagnostic_refresh_support);
+        if !supported {
+            return;
+        }
         let client = self.client.clone();
         tokio::spawn(async move {
             if let Err(e) = client.workspace_diagnostic_refresh().await {

@@ -498,13 +498,18 @@ print("hello")
 
     /// On-edit re-sync wiring (#431): when the debounced diagnostic *fires*,
     /// `execute_debounced_diagnostic` re-syncs the host doc to its `_self` servers
-    /// via the coordinator. Drives `DebouncedDiagnosticsManager::schedule` with a
-    /// zero debounce and a host snapshot, then asserts the host doc gets synced.
-    /// The test `rust_ls` connection advertises no `diagnosticProvider`, so the
-    /// capability-gated pull skips it — only the eager-sync hook can sync it, which
-    /// isolates the wiring (removing the hook would fail this test).
+    /// via the coordinator. The test `rust_ls` connection advertises no
+    /// `diagnosticProvider`, so the capability-gated pull skips it — only the
+    /// eager-sync hook can sync it, which isolates the wiring (removing the hook
+    /// would fail this test).
+    ///
+    /// It also locks the #422 live reader: the debounce carries a CONSTANT snapshot
+    /// text while the document's live text in the store changes between fires. Only
+    /// reading the store (the live reader the debounce builds) makes the second fire
+    /// send new text and advance the host version — a snapshot-only / `None`-reader
+    /// sync would fingerprint-dedup and stay at version 1.
     #[tokio::test]
-    async fn debounced_fire_resyncs_host_document() {
+    async fn debounced_fire_resyncs_host_document_from_live_store_text() {
         use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
         use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
         use crate::lsp::lsp_impl::DiagnosticPublisher;
@@ -523,14 +528,15 @@ print("hello")
             .bridge
             .get_host_configs_for_language(&settings, "rust");
 
-        let snapshot = DiagnosticSnapshot {
+        // Snapshot text is CONSTANT across both fires; only the store text changes.
+        let snapshot = || DiagnosticSnapshot {
             virt_contexts: vec![],
             host_pull_enabled: true,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
-                text: std::sync::Arc::from("fn main() {}"),
-                configs,
+                text: std::sync::Arc::from("fn debounce_snapshot() {}"),
+                configs: configs.clone(),
                 priorities: vec![],
                 strategy: AggregationStrategy::Concatenated,
                 max_fan_out: None,
@@ -541,34 +547,71 @@ print("hello")
                 strategy: AggregationStrategy::Concatenated,
             },
         };
+        let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);
 
-        // Fire immediately (zero debounce) and assert the host doc was synced.
-        DebouncedDiagnosticsManager::with_duration(Duration::ZERO).schedule(
+        let wait_version = |want: i32| {
+            let server = server;
+            let uri = &uri;
+            async move {
+                timeout(Duration::from_secs(1), async {
+                    loop {
+                        if server
+                            .bridge
+                            .pool()
+                            .host_document_version(uri, "rust_ls")
+                            .await
+                            == Some(want)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+            }
+        };
+
+        // Live text v1 (≠ snapshot) — first fire opens the doc at version 1.
+        server.documents.insert(
             uri.clone(),
-            Some(snapshot),
+            "fn live_v1() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        manager.schedule(
+            uri.clone(),
+            Some(snapshot()),
             server.bridge.pool_arc(),
             std::sync::Arc::clone(&server.bridge),
             std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             std::sync::Arc::new(DiagnosticPublisher::new(server)),
             std::sync::Arc::clone(&server.documents),
         );
+        wait_version(1)
+            .await
+            .expect("first debounce fire should re-sync the host doc at version 1");
 
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if server
-                    .bridge
-                    .pool()
-                    .host_document_version(&uri, "rust_ls")
-                    .await
-                    .is_some()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("debounce fire should re-sync the host document to the _self server");
+        // Change ONLY the store; the debounce snapshot text stays constant. A live
+        // read advances to version 2; a snapshot/None sync would dedup at version 1.
+        server.documents.insert(
+            uri.clone(),
+            "fn live_v2() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        manager.schedule(
+            uri.clone(),
+            Some(snapshot()),
+            server.bridge.pool_arc(),
+            std::sync::Arc::clone(&server.bridge),
+            std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
+            std::sync::Arc::new(DiagnosticPublisher::new(server)),
+            std::sync::Arc::clone(&server.documents),
+        );
+        wait_version(2).await.expect(
+            "second debounce fire must re-read the updated store text and advance to version 2 \
+             (a snapshot-only sync would dedup at version 1)",
+        );
     }
 
     /// Locks the load-bearing property behind #431: `prepare_diagnostic_snapshot`
