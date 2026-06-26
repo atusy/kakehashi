@@ -388,6 +388,71 @@ languages = ["markdown"]
 }
 
 #[test]
+fn e2e_diagnose_malformed_payload_exits_two() {
+    // The server handshakes fine and answers the diagnostic request with a
+    // SUCCESS response whose `result` is present, non-null, but unparsable
+    // (unknown report `kind`) — distinct from an error response and from a
+    // `null`/no-capability "no diagnostics". The region (virt) parser must
+    // count it as a request failure so the CLI exits 2, mirroring `format`
+    // (#488); collapsing it into an empty report would look clean to CI.
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languageServers.mock-diag-malformed]
+cmd = ['{}', 'diagnostics-malformed']
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a present-but-malformed diagnostic payload must exit 2; stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("operation(s) failed"),
+        "stderr should report the failed request; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn e2e_diagnose_host_layer_malformed_payload_exits_two() {
+    // Same present-but-malformed payload through the HOST layer
+    // (bridge._self.enabled): the dedicated host diagnostic parser must also
+    // count it so the CLI exits 2 rather than silently losing the host layer.
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge._self]
+enabled = true
+
+[languageServers.mock-host-malformed]
+cmd = ['{}', 'diagnostics-malformed']
+languages = ["markdown"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a host-layer malformed payload must exit 2; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn e2e_diagnose_directory_walk_respects_gitignore_but_explicit_path_wins() {
     let ws = workspace_with(
         &config_toml(),
