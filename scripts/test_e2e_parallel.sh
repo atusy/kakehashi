@@ -84,7 +84,11 @@ if [ "$N" -ne "$EXPECTED" ]; then
   exit 1
 fi
 
-RESDIR="$(mktemp -d)"
+# Fail fast if the temp dir can't be made — otherwise an empty RESDIR would send
+# logs/status to bogus absolute paths (`/$name.log`). `mktemp -d` (no template)
+# works on GNU and modern macOS/BSD; fall back to an explicit template if not.
+RESDIR="$(mktemp -d 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/e2e-parallel.XXXXXX")"
+[ -n "$RESDIR" ] && [ -d "$RESDIR" ] || { echo "error: could not create a temp dir (mktemp -d failed)"; exit 1; }
 # On exit OR interrupt: drop the temp dir and kill any of THIS repo's test
 # binaries still running (Ctrl-C otherwise leaves them as a pool of orphans).
 # We deliberately kill ONLY the `deps/e2e_*` / `deps/test_*` binaries, never a

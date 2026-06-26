@@ -40,8 +40,12 @@ fn test_data_dir() -> &'static Path {
         // `kakehashi::install::test_data_dir` so unit tests and
         // E2E-spawned binaries reuse one cached parser/query install.
         let dir = kakehashi::install::test_support::test_data_dir_path();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = kakehashi::install::test_support::ensure_test_languages_installed(&dir);
+        // Fail fast with a clear message on a broken setup (permissions, disk
+        // full, corrupt cache) rather than letting every later test fail with a
+        // murky downstream error. Matches the CLI helpers' `data_dir()`.
+        std::fs::create_dir_all(&dir).expect("create shared test data dir");
+        kakehashi::install::test_support::ensure_test_languages_installed(&dir)
+            .expect("install test parsers/queries into the shared data dir");
         dir
     })
     .as_path()
