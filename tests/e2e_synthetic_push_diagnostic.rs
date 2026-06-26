@@ -1,7 +1,11 @@
 //! End-to-end test for synthetic push diagnostics (pull-first-diagnostic-forwarding Phase 2).
 //!
-//! This test verifies that `textDocument/publishDiagnostics` notifications
-//! are sent automatically on `didSave` and `didOpen` events.
+//! This test verifies the `textDocument/publishDiagnostics` push path on
+//! `didSave`/`didOpen`. Note the two flavours below: tests gated by a real
+//! downstream (lua-ls) treat the push as OPTIONAL — they only assert structure
+//! IF one arrives within `OPTIONAL_PUSH_WAIT` (valid Lua may produce none), and
+//! otherwise just require the server not to crash. The layers-gate test, whose
+//! empty publish is deterministic (no downstream), DOES require the push.
 //!
 //! Run with: `cargo test --test e2e_synthetic_push_diagnostic --features e2e`
 //!
@@ -15,6 +19,17 @@ use helpers::lsp_polling::wait_for_server_ready;
 use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
 use serde_json::json;
 use std::time::Duration;
+
+/// Bounded wait for an *optional* `publishDiagnostics` push.
+///
+/// Several tests below accept the notification's absence (the server only has to
+/// not crash) — e.g. valid Lua produces no diagnostics, so no push may ever
+/// arrive. A long timeout there just burns wall time waiting for something that
+/// will not come, which is especially costly under parallel test execution. Kept
+/// short: a push that *is* coming arrives well within this window after the
+/// server is ready. Tests that *require* a deterministic push keep their own
+/// longer, explicit timeout.
+const OPTIONAL_PUSH_WAIT: Duration = Duration::from_secs(3);
 
 /// E2E test: publishDiagnostics is sent on didOpen
 ///
@@ -55,7 +70,7 @@ print(x)
     // Wait for publishDiagnostics notification
     // The synthetic push happens after initialization, so we need to wait a bit
     let notification =
-        client.wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(10));
+        client.wait_for_notification("textDocument/publishDiagnostics", OPTIONAL_PUSH_WAIT);
 
     if let Some(params) = notification {
         println!(
@@ -142,7 +157,7 @@ local x = 1
 
     // Wait for publishDiagnostics notification from didSave
     let notification =
-        client.wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(10));
+        client.wait_for_notification("textDocument/publishDiagnostics", OPTIONAL_PUSH_WAIT);
 
     if let Some(params) = notification {
         println!(
@@ -239,7 +254,7 @@ local x = 1
 
     // First, wait a reasonable time for the first notification
     if let Some(params) =
-        client.wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(10))
+        client.wait_for_notification("textDocument/publishDiagnostics", OPTIONAL_PUSH_WAIT)
     {
         notification_count += 1;
         println!(
@@ -321,7 +336,12 @@ print(((
     // Wait for lua-ls to be ready
     wait_for_server_ready(&mut client, markdown_uri, 5, 100);
 
-    // Wait for publishDiagnostics
+    // Unlike the optional-push tests above, this one's POINT is the
+    // position-transform assertion below, which only runs when diagnostics
+    // actually arrive (invalid Lua => lua-ls reports an error, so they do).
+    // Keep a generous timeout: it returns as soon as the push arrives (no wall
+    // cost in the common case) but still exercises the assertion under load,
+    // rather than degrading to the "tested in unit tests" no-op branch.
     let notification =
         client.wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(10));
 
@@ -419,6 +439,8 @@ fn e2e_synthetic_push_respects_layers_gate() {
         }),
     );
 
+    // Required, deterministic push (no downstream dependency) — keep a generous
+    // timeout so a busy/parallel machine can't spuriously miss it.
     let notification =
         client.wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(10));
 

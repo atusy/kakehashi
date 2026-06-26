@@ -26,6 +26,27 @@ inherits = "release"
 debug = true
 strip = false
 
+# Optimize the tree-sitter query engine (and the regex crate used by query
+# predicates) in dev/test builds. Tree-sitter query compilation
+# (`ts_query__perform_analysis`, bundled C in the `tree-sitter` crate) runs at
+# every server spawn; unoptimized it dominates per-spawn latency (~160ms for the
+# first semantic-tokens response in a debug build). The E2E suite spawns the
+# binary hundreds of times, so this repeated tax is large. Scoped to these
+# specific crates (not all deps) so the one-time clean-build cost stays small
+# while THIS crate stays unoptimized for fast incremental compiles. Applied to
+# both dev and test profiles so `cargo build` and `cargo test` both benefit.
+[profile.dev.package.tree-sitter]
+opt-level = 3
+
+[profile.dev.package.regex]
+opt-level = 3
+
+[profile.test.package.tree-sitter]
+opt-level = 3
+
+[profile.test.package.regex]
+opt-level = 3
+
 [dependencies]
 arc-swap = "1"
 clap = { version = "4", features = ["derive"] }

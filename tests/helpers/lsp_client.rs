@@ -25,31 +25,59 @@ use std::time::{Duration, Instant};
 /// avoid re-downloading.
 ///
 /// The expensive, idempotent setup (dir creation + parser/query install) is
-/// cached once per process via `OnceLock`. The transient crash-recovery files
-/// (`parsing_in_progress`, `failed_parsers`), however, are cleared on **every**
-/// call — i.e. before every client spawn — not just the first: an E2E binary
-/// spawns several clients in one process, and a client that shuts down
-/// mid-parse leaves those files behind, which would otherwise poison later
-/// clients in the same binary.
+/// cached once per process via `OnceLock`. The directory is treated as
+/// read-only after install so independent test processes can share it; the
+/// transient crash-recovery files that the server would otherwise write here
+/// are redirected to a per-spawn [`isolated_state_dir`].
 ///
 /// We always set `KAKEHASHI_DATA_DIR` on the spawned binary to this
 /// path — the binary itself runs without `cfg(test)`, so it cannot
 /// auto-redirect like lib unit tests do.
 fn test_data_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
-    let dir = DIR.get_or_init(|| {
+    DIR.get_or_init(|| {
         // Shares the same path and install logic as the lib-side
         // `kakehashi::install::test_data_dir` so unit tests and
         // E2E-spawned binaries reuse one cached parser/query install.
         let dir = kakehashi::install::test_support::test_data_dir_path();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = kakehashi::install::test_support::ensure_test_languages_installed(&dir);
+        // Fail fast with a clear message on a broken setup (permissions, disk
+        // full, corrupt cache) rather than letting every later test fail with a
+        // murky downstream error. Matches the CLI helpers' `data_dir()`.
+        std::fs::create_dir_all(&dir).expect("create shared test data dir");
+        kakehashi::install::test_support::ensure_test_languages_installed(&dir)
+            .expect("install test parsers/queries into the shared data dir");
         dir
-    });
-    // Clear crash-recovery state before every spawn, not just the first.
-    let _ = std::fs::remove_file(dir.join("parsing_in_progress"));
-    let _ = std::fs::remove_file(dir.join("failed_parsers"));
-    dir.as_path()
+    })
+    .as_path()
+}
+
+/// A fresh, unique directory for ONE spawned server's crash-recovery state
+/// (`parsing_in_progress`, `failed_parsers`), passed via `KAKEHASHI_STATE_DIR`.
+///
+/// Kept OUT of the shared [`test_data_dir`] so servers never poison each other:
+/// the server's `FailedParserRegistry::init()` reads a leftover
+/// `parsing_in_progress` as a crash and marks that parser failed. A per-SPAWN
+/// (not per-process) dir is what makes the test suite safe under both
+/// cross-process AND intra-process concurrency (parallel test threads in one
+/// binary): no two concurrently-running servers ever share these files, so a
+/// server that persists state on a shutdown-while-parsing can't be read as a
+/// crash by another — and no pre-spawn clearing is needed. The expensive
+/// parser/query install stays shared (read-only) in `test_data_dir`.
+///
+/// All per-spawn dirs live under one base [`tempfile::TempDir`] parked in a
+/// `static` and — like [`isolated_config_dir`] — intentionally never dropped
+/// (statics aren't), so the small tree is left in the OS temp dir when the
+/// process exits (one tree per test process; the same accepted leak).
+fn isolated_state_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BASE: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = BASE
+        .get_or_init(|| tempfile::tempdir().expect("create base dir for KAKEHASHI_STATE_DIR"))
+        .path();
+    let dir = base.join(format!("spawn-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).expect("create per-spawn KAKEHASHI_STATE_DIR");
+    dir
 }
 
 /// Empty `XDG_CONFIG_HOME` for the spawned server, so it never reads the
@@ -191,6 +219,7 @@ impl LspClientBuilder {
         }
         cmd.env("KAKEHASHI_DATA_DIR", test_data_dir());
         cmd.env("XDG_CONFIG_HOME", isolated_config_dir());
+        cmd.env("KAKEHASHI_STATE_DIR", isolated_state_dir());
         for (key, value) in &self.envs {
             cmd.env(key, value);
         }
@@ -334,6 +363,7 @@ impl LspClient {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
         cmd.env("KAKEHASHI_DATA_DIR", test_data_dir())
             .env("XDG_CONFIG_HOME", isolated_config_dir())
+            .env("KAKEHASHI_STATE_DIR", isolated_state_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
