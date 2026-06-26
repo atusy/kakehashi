@@ -178,10 +178,15 @@ printf '%s\n' "$BINS" | xargs -P "$JOBS" -I{} sh -c '
   # corrupted [0/N] counter when stragglers outlived a previous run.
   [ -d "$RESDIR" ] || exit 0
   t0=$(date +%s)
+  # The `> "$RESDIR/$name.log"` open can still lose a race with cleanup renaming
+  # RESDIR away after the guard above. Wrap each run in a group whose stderr is
+  # /dev/null so that a redirection-open failure stays quiet (the `2>&1` on the
+  # command itself is never reached when opening stdout fails); the post-run
+  # guard below then records nothing for this aborted worker.
   if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$BIN_TIMEOUT" "$bin" --test-threads="$INNER" > "$RESDIR/$name.log" 2>&1
+    { "$TIMEOUT_BIN" "$BIN_TIMEOUT" "$bin" --test-threads="$INNER" > "$RESDIR/$name.log" 2>&1; } 2>/dev/null
   else
-    "$bin" --test-threads="$INNER" > "$RESDIR/$name.log" 2>&1
+    { "$bin" --test-threads="$INNER" > "$RESDIR/$name.log" 2>&1; } 2>/dev/null
   fi
   ec=$?
   dt=$(( $(date +%s) - t0 ))
