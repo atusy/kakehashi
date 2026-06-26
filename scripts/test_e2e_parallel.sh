@@ -112,19 +112,37 @@ case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$(pwd)/$TARGET_DIR" ;; esac
 # first so it's literal.
 TARGET_RE="$(printf '%s' "$TARGET_DIR" | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
 cleanup() {
-  # Kill this run's test binaries. SIGTERM first; a binary blocked waiting on a
-  # hung child (server/lua-ls) can ignore it, so SIGKILL the survivors after a
-  # beat — otherwise a Ctrl-C'd run leaks binaries that keep running into the
-  # NEXT run (and write to this run's now-deleted RESDIR). `timeout`-wrapped
-  # invocations carry the same path, so they're matched too.
+  # Mark the run aborted FIRST by making the RESDIR path vanish: every queued/
+  # in-flight worker guards on `[ -d "$RESDIR" ]`, so once it's gone xargs can no
+  # longer launch a fresh test binary — closing the window where a job spawned
+  # between the kill and the removal would escape the pkill below. Use rename(2)
+  # (mv), not `rm -rf`: `rm -rf` deletes the directory LAST, after walking it, so
+  # a worker writing a status file mid-walk could leave the dir (and the guard)
+  # alive; a rename makes the guarded path disappear atomically with no window.
+  aborting="$RESDIR"
+  if [ -n "$RESDIR" ] && [ -d "$RESDIR" ]; then
+    aborting="${RESDIR}.aborting.$$"
+    mv "$RESDIR" "$aborting" 2>/dev/null || aborting="$RESDIR"
+  fi
+  # Then kill this run's test binaries. SIGTERM first; a binary blocked waiting
+  # on a hung child (server/lua-ls) can ignore it, so SIGKILL the survivors after
+  # a beat — otherwise a Ctrl-C'd run leaks binaries that keep running into the
+  # NEXT run. `timeout`-wrapped invocations carry the same path, so they match.
   pkill -TERM -f "$TARGET_RE/.*/deps/(e2e_|test_)" 2>/dev/null
   if pgrep -f "$TARGET_RE/.*/deps/(e2e_|test_)" >/dev/null 2>&1; then
     sleep 1
     pkill -KILL -f "$TARGET_RE/.*/deps/(e2e_|test_)" 2>/dev/null
   fi
-  rm -rf "$RESDIR"
+  # Now that workers are dead, remove the moved dir (no one races us for it).
+  [ -n "$aborting" ] && rm -rf "$aborting"
 }
-trap cleanup EXIT INT TERM
+# On a signal, clean up and exit NON-ZERO (130/143) — never fall through to the
+# summary, which could otherwise print "All E2E binaries passed" if the signal
+# landed after the pass counts were computed. `trap - EXIT` first so the EXIT
+# handler doesn't re-run cleanup (it's idempotent, but this keeps it tidy).
+trap 'cleanup' EXIT
+trap 'trap - EXIT; cleanup; exit 130' INT
+trap 'trap - EXIT; cleanup; exit 143' TERM
 
 # Fresh checkout: the shared parser/query install (deps/test/kakehashi) does not
 # exist yet. The test binaries create it lazily on first server spawn, so the
@@ -173,7 +191,11 @@ printf '%s\n' "$BINS" | xargs -P "$JOBS" -I{} sh -c '
     124) status="TIME" ;;   # killed by timeout
     *)   status="FAIL" ;;
   esac
-  echo "$ec" > "$RESDIR/$name.status"
+  # The -d recheck above leaves a microsecond TOCTOU window: cleanup() can still
+  # delete RESDIR between it and this write on a hard abort. Swallow that stray
+  # error so the abort stays silent (the write no-ops; the drop-guard reports the
+  # abort via the missing status files).
+  echo "$ec" > "$RESDIR/$name.status" 2>/dev/null || exit 0
   done=$(ls "$RESDIR"/*.status 2>/dev/null | wc -l | tr -d " ")
   printf "  [%2d/%2d] %s %-34s %3ds\n" "$done" "$N" "$status" "$name" "$dt"
 ' _ {}
