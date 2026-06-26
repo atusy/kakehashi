@@ -417,6 +417,85 @@ print("hello")
         .expect("re-sync with changed text should send a didChange advancing to version 2");
     }
 
+    /// Live-reader wiring (#422): the on-edit eager re-sync syncs the reader's
+    /// CURRENT text, not its `text` snapshot. With the snapshot held *constant*
+    /// across two re-syncs but the reader returning different text, the host
+    /// server still advances to version 2 — so a stale snapshot can neither
+    /// suppress a real update nor roll the server back, which is what closes the
+    /// eager-sync stale-overwrite.
+    #[tokio::test]
+    async fn eager_sync_syncs_live_reader_text_not_the_snapshot() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_reader.rs").unwrap();
+        let settings = server.settings_manager.load_settings();
+        let configs = server
+            .bridge
+            .get_host_configs_for_language(&settings, "rust");
+
+        // The snapshot is the SAME both times; only the live reader changes.
+        let snapshot: std::sync::Arc<str> = std::sync::Arc::from("fn snapshot() {}");
+        let reader_v1: crate::lsp::bridge::HostTextReader =
+            std::sync::Arc::new(|| Some(std::sync::Arc::from("fn live_v1() {}")));
+        let reader_v2: crate::lsp::bridge::HostTextReader =
+            std::sync::Arc::new(|| Some(std::sync::Arc::from("fn live_v2() {}")));
+
+        server.bridge.eager_sync_host_document_on_servers(
+            &uri,
+            "rust",
+            std::sync::Arc::clone(&snapshot),
+            configs.clone(),
+            Some(reader_v1),
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    == Some(1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first eager-sync should didOpen at version 1 using the reader's text");
+
+        // Same snapshot, different reader text: must advance to version 2. If the
+        // sync trusted the (unchanged) snapshot it would fingerprint-dedup and stay
+        // at version 1 — so reaching version 2 proves the reader drove the sync.
+        server.bridge.eager_sync_host_document_on_servers(
+            &uri,
+            "rust",
+            snapshot,
+            configs,
+            Some(reader_v2),
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    == Some(2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("changed reader text (constant snapshot) should advance to version 2");
+    }
+
     /// On-edit re-sync wiring (#431): when the debounced diagnostic *fires*,
     /// `execute_debounced_diagnostic` re-syncs the host doc to its `_self` servers
     /// via the coordinator. Drives `DebouncedDiagnosticsManager::schedule` with a
