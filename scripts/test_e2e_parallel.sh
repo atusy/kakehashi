@@ -112,8 +112,16 @@ case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$(pwd)/$TARGET_DIR" ;; esac
 # first so it's literal.
 TARGET_RE="$(printf '%s' "$TARGET_DIR" | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
 cleanup() {
-  pkill -f "$TARGET_RE/.*/deps/e2e_" 2>/dev/null
-  pkill -f "$TARGET_RE/.*/deps/test_" 2>/dev/null
+  # Kill this run's test binaries. SIGTERM first; a binary blocked waiting on a
+  # hung child (server/lua-ls) can ignore it, so SIGKILL the survivors after a
+  # beat — otherwise a Ctrl-C'd run leaks binaries that keep running into the
+  # NEXT run (and write to this run's now-deleted RESDIR). `timeout`-wrapped
+  # invocations carry the same path, so they're matched too.
+  pkill -TERM -f "$TARGET_RE/.*/deps/(e2e_|test_)" 2>/dev/null
+  if pgrep -f "$TARGET_RE/.*/deps/(e2e_|test_)" >/dev/null 2>&1; then
+    sleep 1
+    pkill -KILL -f "$TARGET_RE/.*/deps/(e2e_|test_)" 2>/dev/null
+  fi
   rm -rf "$RESDIR"
 }
 trap cleanup EXIT INT TERM
@@ -146,6 +154,11 @@ SECONDS=0
 # (so the user sees the suite advancing) and records its status for the summary.
 printf '%s\n' "$BINS" | xargs -P "$JOBS" -I{} sh -c '
   bin="$1"; name=$(basename "$bin" | sed "s/-[0-9a-f]*$//")
+  # If the run was aborted (Ctrl-C removed RESDIR via the cleanup trap), do not
+  # start a still-queued binary or write into the deleted dir — that is what
+  # produced the "<RESDIR>/<name>.status: No such file or directory" spew and a
+  # corrupted [0/N] counter when stragglers outlived a previous run.
+  [ -d "$RESDIR" ] || exit 0
   t0=$(date +%s)
   if [ -n "$TIMEOUT_BIN" ]; then
     "$TIMEOUT_BIN" "$BIN_TIMEOUT" "$bin" --test-threads="$INNER" > "$RESDIR/$name.log" 2>&1
@@ -154,6 +167,7 @@ printf '%s\n' "$BINS" | xargs -P "$JOBS" -I{} sh -c '
   fi
   ec=$?
   dt=$(( $(date +%s) - t0 ))
+  [ -d "$RESDIR" ] || exit 0   # aborted mid-run — record nothing, print nothing
   case $ec in
     0)   status="ok  " ;;
     124) status="TIME" ;;   # killed by timeout
