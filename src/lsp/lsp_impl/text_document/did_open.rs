@@ -152,7 +152,7 @@ mod tests {
                 if condition() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -341,7 +341,7 @@ print("hello")
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -385,7 +385,7 @@ print("hello")
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -410,7 +410,7 @@ print("hello")
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -462,7 +462,7 @@ print("hello")
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -489,7 +489,7 @@ print("hello")
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -564,7 +564,7 @@ print("hello")
                         {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        tokio::task::yield_now().await;
                     }
                 })
                 .await
@@ -710,7 +710,7 @@ print("hello")
                     {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::task::yield_now().await;
                 }
             }) => {
                 result.expect(
