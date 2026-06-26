@@ -113,6 +113,7 @@ impl LanguageServerPool {
         host_uri: &url::Url,
         language_id: &str,
         text: &str,
+        live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
     ) {
         let handle = match self
             .get_or_create_connection_wait_ready(
@@ -159,8 +160,14 @@ impl LanguageServerPool {
             language_id,
             text,
         };
-        if let Err(e) =
-            super::host::sync_host_document(&mut sender, &mut docs, &doc, connection_key).await
+        if let Err(e) = super::host::sync_host_document(
+            &mut sender,
+            &mut docs,
+            &doc,
+            live_text_reader,
+            connection_key,
+        )
+        .await
         {
             log::debug!(
                 target: "kakehashi::bridge",

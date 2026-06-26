@@ -111,7 +111,12 @@ impl DiagnosticPublisher {
             Some(connection_id),
             diagnostics,
         );
-        self.republish(&host).await;
+        // A host `_self` push is spontaneous and asynchronous; a pull-mode client
+        // won't know to re-pull, so nudge it when the merged set actually changed
+        // (push/pull-divergence, #422).
+        if self.republish(&host).await {
+            self.request_pull_diagnostic_refresh();
+        }
     }
 
     /// Detect the language of an *open* document, or `None` if it isn't open.
@@ -234,7 +239,12 @@ impl DiagnosticPublisher {
             Some(connection_id),
             diagnostics,
         );
-        self.republish(&host).await;
+        // A region push is spontaneous and asynchronous (a push-only injected-
+        // language server); like the host push, nudge a pull-mode client to
+        // re-pull when the merged set actually changed (push/pull-divergence, #422).
+        if self.republish(&host).await {
+            self.request_pull_diagnostic_refresh();
+        }
     }
 
     /// Feed the host-event pull's combined result into the cache and republish.
@@ -299,7 +309,13 @@ impl DiagnosticPublisher {
     /// Merge the host's cached slots and publish the cumulative result. Region
     /// slots are transformed against the host document's *current* injection
     /// offsets; an empty merge clears the editor's diagnostics for the host.
-    pub(crate) async fn republish(&self, host: &Url) {
+    ///
+    /// Returns `true` when a *changed* set was published to the editor, `false`
+    /// when nothing was sent (bad URI, or the merged set was identical to the
+    /// last publish). Push-origin callers ([`Self::publish_host_push`],
+    /// [`Self::publish_region_push`]) use this to decide whether to also nudge
+    /// pull-mode clients with [`Self::request_pull_diagnostic_refresh`].
+    pub(crate) async fn republish(&self, host: &Url) -> bool {
         // Serialize the whole snapshot→merge→publish so concurrent republishes
         // (region push vs host-event pull) emit in order and a stale snapshot can
         // never publish after a fresh one (push-propagation-diagnostic-forwarding).
@@ -345,7 +361,7 @@ impl DiagnosticPublisher {
             Ok(uri) => uri,
             Err(e) => {
                 log::warn!(target: LOG_TARGET, "skip publish, bad host URI {host}: {e}");
-                return;
+                return false;
             }
         };
 
@@ -359,7 +375,7 @@ impl DiagnosticPublisher {
                 "skip republish for {host}: merged set unchanged ({} diagnostics)",
                 diagnostics.len()
             );
-            return;
+            return false;
         }
 
         log::debug!(
@@ -371,6 +387,62 @@ impl DiagnosticPublisher {
         self.client
             .publish_diagnostics(lsp_uri, diagnostics, None)
             .await;
+        true
+    }
+
+    /// Ask pull-mode clients to re-pull diagnostics (`workspace/diagnostic/refresh`)
+    /// after a **spontaneous downstream push** changed the merged set.
+    ///
+    /// kakehashi advertises `diagnosticProvider`, so a pull-mode editor (e.g.
+    /// Neovim) displays the diagnostics it *pulled* and ignores our
+    /// `publishDiagnostics`. A push-only `_self` host server (e.g. panache)
+    /// analyzes the latest text **asynchronously**, lands its push after the
+    /// editor's last pull, and updates our cache — but the editor never re-pulls,
+    /// so its displayed (pull-namespace) diagnostics rot until the next
+    /// edit-triggered pull (the "stays stale until you edit another line"
+    /// symptom). This refresh closes that gap: it tells the client to re-pull,
+    /// which returns the now-current merged set.
+    ///
+    /// Emitted **off** the per-host republish lock and **only** from the
+    /// push-origin paths ([`Self::publish_host_push`], [`Self::publish_region_push`]),
+    /// never from the pull-origin republish ([`Self::publish_pull_layer`]) nor the
+    /// edit-origin re-merge (`did_change`): those carry no *new* result the editor
+    /// is unaware of — a pull-origin set is already the answer to a pull the editor
+    /// made, and an edit-origin re-merge is covered by the editor's own `didChange`
+    /// re-pull — so a refresh there would be redundant. (No tight loop forms: a
+    /// refresh-induced pull is answered inline by `diagnostic_impl`, which never
+    /// republishes, so a refresh cannot directly beget another; the indirect
+    /// push→refresh→re-pull→downstream-re-push→here path is bounded by
+    /// `published_set_changed`, converging once the re-pushed set stabilizes.)
+    ///
+    /// **Spawned, not awaited:** `workspace/diagnostic/refresh` is a request whose
+    /// future resolves only when the editor answers, so awaiting it inline would
+    /// block the push path on the client round-trip (and never resolve in a test
+    /// that doesn't answer). Detaching it keeps the push path non-blocking and
+    /// avoids the upstream-notification loop's inline-await head-of-line block.
+    ///
+    /// Gated on the client advertising `workspace.diagnostics.refreshSupport`: a
+    /// client that supports pull but not refresh would silently ignore the request,
+    /// leaking a tower-lsp pending-request entry plus a parked task — the same gate
+    /// the `semantic_tokens_refresh` path uses.
+    fn request_pull_diagnostic_refresh(&self) {
+        let supported = self
+            .settings_manager
+            .client_capabilities_lock()
+            .get()
+            .is_some_and(crate::lsp::client::check_diagnostic_refresh_support);
+        if !supported {
+            return;
+        }
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.workspace_diagnostic_refresh().await {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "workspace/diagnostic/refresh after push failed: {e}"
+                );
+            }
+        });
     }
 
     /// Map each currently-resolvable injection region of the host document to its
@@ -538,6 +610,45 @@ mod tests {
             .expect("a Host slot should be recorded for an open _self-bridged doc");
         assert_eq!(host_slots["rust_ls"].diagnostics.len(), 1);
         assert_eq!(host_slots["rust_ls"].diagnostics[0].message, "boom");
+    }
+
+    #[tokio::test]
+    async fn republish_reports_whether_the_published_set_changed() {
+        // `republish` returns whether it published a *changed* set — the gate the
+        // push-origin paths use to decide whether to also emit
+        // `workspace/diagnostic/refresh` (so a pull-mode editor re-pulls and sees an
+        // async host push; push/pull-divergence, #422). A non-empty first publish is
+        // a change; re-publishing the identical cache is not (so a no-op push won't
+        // spam refreshes). Driven directly (no socket/init) so it stays fast.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/host_changed.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let publisher = DiagnosticPublisher::new(server);
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("boom")],
+        );
+        assert!(
+            publisher.republish(&uri).await,
+            "first publish of a non-empty host set must report a change (drives the refresh)"
+        );
+        assert!(
+            !publisher.republish(&uri).await,
+            "re-publishing the identical set must report unchanged (no redundant refresh)"
+        );
     }
 
     #[tokio::test]

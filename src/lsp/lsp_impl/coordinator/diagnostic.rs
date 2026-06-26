@@ -85,6 +85,7 @@ impl DiagnosticScheduler {
             std::sync::Arc::clone(&self.bridge),
             std::sync::Arc::clone(&self.synthetic_diagnostics),
             std::sync::Arc::clone(&self.publisher),
+            std::sync::Arc::clone(&self.documents),
         );
     }
 

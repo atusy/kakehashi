@@ -30,6 +30,20 @@ pub(crate) fn check_semantic_tokens_refresh_support(caps: &ClientCapabilities) -
         .unwrap_or(false)
 }
 
+/// Whether the client advertises `workspace.diagnostics.refreshSupport`
+/// (LSP @since 3.17.0): it will honor a `workspace/diagnostic/refresh` by
+/// re-pulling. Returns `false` for any missing/null capability in the chain, so
+/// we never send a refresh a client would silently ignore — which would leak a
+/// tower-lsp pending-request entry plus a parked task (the same hazard the
+/// [`check_semantic_tokens_refresh_support`] gate guards against).
+pub(crate) fn check_diagnostic_refresh_support(caps: &ClientCapabilities) -> bool {
+    caps.workspace
+        .as_ref()
+        .and_then(|w| w.diagnostics.as_ref())
+        .and_then(|d| d.refresh_support)
+        .unwrap_or(false)
+}
+
 /// Server→client notifier: logging, progress, semantic-token refresh. `Clone`
 /// and thread-safe (the underlying `Client` synchronizes internally, and
 /// `client_capabilities` is a shared `OnceLock`).
@@ -202,7 +216,8 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use tower_lsp_server::ls_types::{
-        SemanticTokensWorkspaceClientCapabilities, WorkspaceClientCapabilities,
+        DiagnosticWorkspaceClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
+        WorkspaceClientCapabilities,
     };
 
     /// Tests for check_semantic_tokens_refresh_support pure function.
@@ -250,5 +265,40 @@ mod tests {
         // Keep as separate test to explicitly document Default behavior
         let caps = ClientCapabilities::default();
         assert!(!check_semantic_tokens_refresh_support(&caps));
+    }
+
+    /// Tests for `check_diagnostic_refresh_support` — same shape as the
+    /// semantic-tokens gate, but against `workspace.diagnostics.refreshSupport`.
+    /// This is the gate `request_pull_diagnostic_refresh` uses, so a missing
+    /// capability anywhere in the chain must read as `false` (don't send a refresh
+    /// the client would silently ignore).
+    #[rstest]
+    #[case::refresh_support_true(true, true, Some(true), true)]
+    #[case::refresh_support_false(true, true, Some(false), false)]
+    #[case::refresh_support_none(true, true, None, false)]
+    #[case::diagnostics_none(true, false, None, false)]
+    #[case::workspace_none(false, false, None, false)]
+    fn test_check_diagnostic_refresh_support(
+        #[case] workspace: bool,
+        #[case] diagnostics: bool,
+        #[case] refresh_support: Option<bool>,
+        #[case] expected: bool,
+    ) {
+        let caps = ClientCapabilities {
+            workspace: if workspace {
+                Some(WorkspaceClientCapabilities {
+                    diagnostics: if diagnostics {
+                        Some(DiagnosticWorkspaceClientCapabilities { refresh_support })
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
+            ..Default::default()
+        };
+        assert_eq!(check_diagnostic_refresh_support(&caps), expected);
     }
 }

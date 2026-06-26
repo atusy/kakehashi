@@ -54,6 +54,13 @@ fn fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// Owned reader of a host document's current text, shared across the eager
+/// re-sync's per-server tasks. The eager on-edit re-sync builds one (capturing
+/// the document store + URI) and hands a clone to each task; the task passes it
+/// to [`sync_host_document`], which evaluates it under the `host_documents` lock
+/// so a late task sends the latest text rather than a stale snapshot (#422).
+pub(crate) type HostTextReader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
+
 /// Open or re-sync the host document on a downstream server, mutating the
 /// pool's sync-state map in place.
 ///
@@ -70,15 +77,35 @@ fn fingerprint(text: &str) -> u64 {
 /// (ls-bridge-message-ordering) guarantees wire order matches enqueue order.
 /// Generic over [`MessageSender`] so tests can observe the notifications via
 /// a channel.
+///
+/// `live_text_reader`, when `Some`, supplies the document's **current** text,
+/// read here under the `host_documents` lock instead of trusting `doc.text`.
+/// The eager on-edit re-sync passes it so a sync task that unparked late sends
+/// the *latest* text rather than the schedule-time snapshot it was spawned with
+/// — a snapshot a newer edit may have superseded (host-sync-stale-overwrite,
+/// #422). Reading under the same lock that gates the fingerprint compare and the
+/// send means the last task to take the lock observes the newest text, so
+/// concurrent re-syncs can no longer roll a host server back to stale content; a
+/// `None` return (document closed mid-sync) falls back to `doc.text`. Interactive
+/// requests, the formatting pipeline's speculative scratch text, and the initial
+/// `didOpen` pass `None` and are synced verbatim.
 pub(super) async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
     docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
     doc: &HostDocument<'_>,
+    live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
     connection_key: &ConnectionKey,
 ) -> io::Result<()> {
     let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
     let key = (doc.uri.to_string(), connection_key.clone());
-    let fp = fingerprint(doc.text);
+    // With a live reader, read the document's CURRENT text under this lock so a
+    // late-unparking eager re-sync sends the latest text, not the snapshot it was
+    // spawned with (#422); a `None` read (closed mid-sync) falls back to the
+    // snapshot. The effective text drives both the fingerprint dedup and the sent
+    // content, so re-syncing the same current text stays a no-op.
+    let live = live_text_reader.and_then(|read| read());
+    let text: &str = live.as_deref().unwrap_or(doc.text);
+    let fp = fingerprint(text);
 
     match docs.entry(key) {
         Entry::Vacant(entry) => {
@@ -89,7 +116,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
                         uri_lsp,
                         doc.language_id.to_string(),
                         1,
-                        doc.text.to_string(),
+                        text.to_string(),
                     ),
                 },
             );
@@ -109,7 +136,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
                         content_changes: vec![TextDocumentContentChangeEvent {
                             range: None,
                             range_length: None,
-                            text: doc.text.to_string(),
+                            text: text.to_string(),
                         }],
                     },
                 );
@@ -387,7 +414,9 @@ impl LanguageServerPool {
 
             let mut docs = self.host_documents().await;
             let mut sender = ConnectionHandleSender(&handle);
-            if let Err(e) = sync_host_document(&mut sender, &mut docs, doc, connection_key).await {
+            if let Err(e) =
+                sync_host_document(&mut sender, &mut docs, doc, None, connection_key).await
+            {
                 drop(docs);
                 drop(connections);
                 if let Some(ref id) = upstream_request_id {
@@ -720,6 +749,7 @@ mod tests {
             &mut sender,
             &mut docs,
             &host_doc(&uri, "v1"),
+            None,
             &ConnectionKey::for_server("srv"),
         )
         .await
@@ -737,6 +767,7 @@ mod tests {
             &mut sender,
             &mut docs,
             &host_doc(&uri, "v1"),
+            None,
             &ConnectionKey::for_server("srv"),
         )
         .await
@@ -748,6 +779,7 @@ mod tests {
             &mut sender,
             &mut docs,
             &host_doc(&uri, "v2"),
+            None,
             &ConnectionKey::for_server("srv"),
         )
         .await
@@ -765,6 +797,7 @@ mod tests {
             &mut sender,
             &mut docs,
             &host_doc(&uri, "v3"),
+            None,
             &ConnectionKey::for_server("srv"),
         )
         .await
@@ -774,6 +807,83 @@ mod tests {
             panic!("expected a notification");
         };
         assert_eq!(payload["params"]["textDocument"]["version"], 3);
+    }
+
+    #[tokio::test]
+    async fn sync_with_live_reader_sends_current_text_not_stale_snapshot() {
+        use crate::lsp::bridge::actor::OutboundMessage;
+
+        // The eager on-edit re-sync passes a live reader. sync_host_document must
+        // send the reader's CURRENT text, not the (possibly superseded) snapshot
+        // the task was spawned with — otherwise a late-unparking task rolls the
+        // host server back to stale content (host-sync-stale-overwrite, #422).
+        let mut docs = std::collections::HashMap::new();
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(16);
+        let uri = Url::parse("file:///test/host.md").unwrap();
+
+        let reader = || Some(Arc::<str>::from("fresh"));
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "stale-snapshot"),
+            Some(&reader),
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap();
+
+        let OutboundMessage::Untracked(payload) = rx.try_recv().expect("didOpen must be queued")
+        else {
+            panic!("expected a notification");
+        };
+        assert_eq!(payload["method"], "textDocument/didOpen");
+        assert_eq!(
+            payload["params"]["textDocument"]["text"], "fresh",
+            "the live reader's current text must win over the stale snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_with_live_reader_dedups_unchanged_current_text() {
+        use crate::lsp::bridge::actor::OutboundMessage;
+
+        // Two re-syncs whose live reader returns the SAME current text: only the
+        // first sends; the second is a fingerprint no-op. This is the user's
+        // concern — multiple debounce fires must not each re-send the latest text.
+        let mut docs = std::collections::HashMap::new();
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(16);
+        let uri = Url::parse("file:///test/host.md").unwrap();
+        let reader = || Some(Arc::<str>::from("current"));
+
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "ignored"),
+            Some(&reader),
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap();
+        let OutboundMessage::Untracked(payload) = rx.try_recv().expect("first sync must didOpen")
+        else {
+            panic!("expected a notification");
+        };
+        assert_eq!(payload["params"]["textDocument"]["text"], "current");
+
+        // Second sync, same current text from the reader: fingerprint no-op.
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "ignored"),
+            Some(&reader),
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "re-sync of the same current text must be a no-op (no redundant send)"
+        );
     }
 
     #[tokio::test]

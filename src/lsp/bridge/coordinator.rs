@@ -572,7 +572,15 @@ impl BridgeCoordinator {
         text: &str,
     ) {
         let configs = self.get_host_configs_for_language(settings, host_language);
-        self.eager_sync_host_document_on_servers(host_uri, host_language, Arc::from(text), configs);
+        // Initial open: the snapshot text is current and there is no concurrent
+        // re-sync to race, so no live reader is needed.
+        self.eager_sync_host_document_on_servers(
+            host_uri,
+            host_language,
+            Arc::from(text),
+            configs,
+            None,
+        );
     }
 
     /// Sync the real host document to a resolved set of `_self` host servers
@@ -595,6 +603,7 @@ impl BridgeCoordinator {
         language_id: &str,
         text: Arc<str>,
         configs: Vec<ResolvedServerConfig>,
+        live_text_reader: Option<crate::lsp::bridge::HostTextReader>,
     ) {
         if configs.is_empty() {
             // Host bridging off / no host server for this language — drop any
@@ -614,18 +623,15 @@ impl BridgeCoordinator {
         // cancel it.
         //
         // On-edit re-sync carries *different* text per fire, so a superseded task
-        // emitting after a newer one could in principle roll the host server back to
-        // older text (a higher version with stale content). The supersede above
-        // closes the common case: each task's only blocking point before the sync is
-        // `get_or_create_connection_wait_ready` (an `.await` on `wait_for_ready`), so
-        // `abort()` cancels a parked older task *there*, before it reaches
-        // `sync_host_document`; and debounce fires are ≥500ms apart, far wider than
-        // the µs spawn→register window, so the prior fire's handle is already
-        // registered (hence abortable) when the next fire supersedes. The only
-        // residual is a µs alignment — an older task unblocking from wait-ready at
-        // the exact instant a newer fire's task reaches the (await-free) sync — which
-        // is the deferred `content_epoch` stale-overwrite window (#422), not a new
-        // bug class; it self-heals on the next edit.
+        // emitting after a newer one could otherwise roll the host server back to
+        // older text. The supersede above aborts a task still parked at
+        // `get_or_create_connection_wait_ready`, closing the common case; the µs
+        // residual — an older task unblocking from wait-ready at the instant a newer
+        // task reaches the (await-free) sync — is closed by `live_text_reader`:
+        // `sync_host_document` reads the document's *current* text under the
+        // `host_documents` lock, so whichever task syncs last sends the latest text,
+        // not the snapshot it was spawned with (#422). The `text` snapshot remains
+        // the fallback when no reader is supplied (initial open) or it yields `None`.
         let (generation, cancel) = self.supersede_host_eager_open(host_uri);
 
         // Share the text + languageId across per-server tasks via `Arc<str>` rather
@@ -641,6 +647,10 @@ impl BridgeCoordinator {
             let server_name = config.server_name.clone();
             let server_config = config.config.clone();
             let cancel = cancel.clone();
+            // Each task shares the same live reader (cheap `Arc` clone) — it is
+            // evaluated inside `sync_host_document`'s lock, so the last task to sync
+            // sends the latest text regardless of which snapshot it was spawned with.
+            let live_text_reader = live_text_reader.clone();
             let task = tokio::spawn(async move {
                 tokio::select! {
                     biased;
@@ -653,6 +663,7 @@ impl BridgeCoordinator {
                         &host_uri_owned,
                         &language_id,
                         &text,
+                        live_text_reader.as_deref(),
                     ) => {}
                 }
             });
