@@ -60,4 +60,72 @@ pub(crate) fn count_request_errors(sink: &RequestErrorSink, n: usize) {
     }
 }
 
+/// Record a `preferred`-strategy fan-in's failures into `sink`, counting them
+/// **only when no server won** (`NoResult`).
+///
+/// Under `preferred`, the winning server's result is authoritative, so a
+/// non-winning server's failure is irrelevant — it must not surface as a CLI
+/// exit-2 (the same intent [`RequestErrorSink`] documents: an abandoned
+/// loser was *cancelled*, not failed). Counting losers in-task is also **racy**:
+/// the preferred fan-in `abort_all`s the losers without joining them, so a
+/// loser's in-task `fetch_add` can land after the CLI has read the counter
+/// (#487). Counting from the fan-in result instead is deterministic: only
+/// `NoResult` (no server won — every contender failed or returned empty)
+/// carries a decisive, fully-drained `errors` count, and `errors` counts only
+/// the actual failures (it is `0` when the non-winners merely returned empty),
+/// so an all-empty run is not a failure. `Done`/`Cancelled` count nothing.
+/// Shared so the preferred diagnose and (future) formatting dispatches stay
+/// consistent.
+pub(crate) fn count_no_winner_errors<T>(
+    result: &crate::lsp::aggregation::server::FanInResult<T>,
+    sink: &RequestErrorSink,
+) {
+    if let crate::lsp::aggregation::server::FanInResult::NoResult { errors } = result {
+        count_request_errors(sink, *errors);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::aggregation::server::FanInResult;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn sink_value(sink: &RequestErrorSink) -> usize {
+        sink.as_ref().unwrap().load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn count_no_winner_errors_counts_only_when_no_server_won() {
+        let sink: RequestErrorSink = Some(Arc::new(AtomicUsize::new(0)));
+
+        // No winner (every server failed) → the drained failure count is
+        // decisive and is recorded, so an all-failed `preferred` run still
+        // surfaces as exit 2.
+        count_no_winner_errors(&FanInResult::<()>::NoResult { errors: 3 }, &sink);
+        assert_eq!(sink_value(&sink), 3);
+
+        // A winner emerged → non-winning failures are irrelevant and MUST NOT
+        // be counted (the heart of #487).
+        count_no_winner_errors(&FanInResult::Done(()), &sink);
+        assert_eq!(
+            sink_value(&sink),
+            3,
+            "Done must not count non-winning failures"
+        );
+
+        // Cancelled → nothing decisive happened; count nothing.
+        count_no_winner_errors(&FanInResult::<()>::Cancelled, &sink);
+        assert_eq!(sink_value(&sink), 3, "Cancelled must not count");
+    }
+
+    #[test]
+    fn count_no_winner_errors_is_a_noop_without_a_sink() {
+        // LSP mode installs no sink; the helper must not panic.
+        let sink: RequestErrorSink = None;
+        count_no_winner_errors(&FanInResult::<()>::NoResult { errors: 5 }, &sink);
+    }
+}
+
 // Re-export the methods (they are implemented as impl blocks on Kakehashi)
