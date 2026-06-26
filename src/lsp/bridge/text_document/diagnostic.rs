@@ -135,9 +135,9 @@ fn build_diagnostic_request(
 /// JSON-RPC *error* response separately (it propagates as `Err`), so this only
 /// inspects the `result`. Mirroring [`transform_formatting_response_to_host`],
 /// a present-but-malformed payload is a request **failure** (`Err`): an absent
-/// `result` member (protocol violation), an unknown report `kind`, a `full`
-/// report missing `items`, or `items` that fail to deserialize as
-/// `Diagnostic[]`. A `null` result or an `unchanged` report is the
+/// `result` member (protocol violation), a report with no `kind` or an unknown
+/// report `kind`, a `full` report missing `items`, or `items` that fail to
+/// deserialize as `Diagnostic[]`. A `null` result or an `unchanged` report is the
 /// authoritative "no diagnostics" answer and stays an empty `Vec` (`Ok`).
 /// Collapsing a malformed payload into the same empty value as "no
 /// capability" would let a broken downstream server pass as "nothing wrong" —
@@ -161,11 +161,14 @@ fn transform_diagnostic_response_to_host(
         return Ok(Vec::new());
     }
 
-    // Check report kind: `unchanged` is an authoritative empty; `full`/absent
-    // proceeds; an unknown kind is a malformed payload (request failure).
+    // Check report kind: `unchanged` is an authoritative empty; `full`
+    // proceeds; an unknown kind, or an absent/non-string `kind` (the LSP report
+    // tag is required), is a malformed payload (request failure). This matches
+    // the host parser's tagged-enum deserialize so the two paths reject the
+    // same shapes.
     match result.get("kind").and_then(|k| k.as_str()) {
         Some("unchanged") => return Ok(Vec::new()),
-        Some("full") | None => {}
+        Some("full") => {}
         Some(other) => {
             log::warn!(
                 target: "kakehashi::bridge",
@@ -175,6 +178,11 @@ fn transform_diagnostic_response_to_host(
             return Err(io::Error::other(format!(
                 "malformed diagnostic result from downstream server: unknown report kind '{other}'"
             )));
+        }
+        None => {
+            return Err(io::Error::other(
+                "malformed diagnostic result from downstream server: report has no 'kind'",
+            ));
         }
     }
 
@@ -472,6 +480,23 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 42,
             "result": { "kind": "full" }
+        });
+
+        let transformed =
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
+        assert!(transformed.is_err());
+    }
+
+    #[test]
+    fn diagnostic_response_report_without_kind_is_request_failure() {
+        // The LSP report `kind` tag is required; a present report that omits it
+        // (e.g. `{ "items": [] }`) is malformed → `Err`, matching the host
+        // parser's tagged-enum deserialize. Without this the region path would
+        // wrongly read it as an empty `full` report and miss the exit-2 failure.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "items": [] }
         });
 
         let transformed =
