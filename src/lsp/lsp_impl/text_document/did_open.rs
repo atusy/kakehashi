@@ -86,6 +86,7 @@ impl Kakehashi {
                     // watermark so a gated reader is not stranded.
                     let install = self.install_coordinator();
                     let injection = self.injection_coordinator();
+                    let documents = std::sync::Arc::clone(&self.documents);
                     let lang = lang.clone();
                     let install_uri = uri.clone();
                     tokio::spawn(async move {
@@ -94,11 +95,21 @@ impl Kakehashi {
                             .await;
                         // The skipped inline parse meant the handler's
                         // process_injections (below) ran with no tree. Now that the
-                        // off-ingress reparse has produced one, run the normal
+                        // off-ingress reparse may have produced one, run the normal
                         // post-parse injection workflow — injected-language install
                         // and eager bridge spawn — which also keeps that injected
                         // install off the ingress ticket. forward=false: open path.
-                        injection.process_injections(&install_uri, false).await;
+                        //
+                        // Gate on the document actually having a tree: install can
+                        // fail or be deduped (AlreadyInstalling) with no reparse, and
+                        // process_injections would otherwise cancel the eager-open
+                        // for a still-tree-less document.
+                        let has_tree = documents
+                            .get(&install_uri)
+                            .is_some_and(|doc| doc.tree().is_some());
+                        if has_tree {
+                            injection.process_injections(&install_uri, false).await;
+                        }
                     });
                     skip_parse = true;
                 } else {

@@ -296,17 +296,22 @@ impl ParseCoordinator {
         /// the install completes); past this the reader on-demand parse covers it.
         const MAX_REPARSE_ATTEMPTS: usize = 8;
 
-        // Resolve the language once from the current text; a missing document means
-        // a `didClose` ran during the install — do not resurrect it. Detect while
-        // borrowing the stored text (a synchronous call, no `.await` and no
-        // document write under the `Ref`) rather than cloning it.
-        let Some(language_name) = ({
+        // Resolve the language under one read guard, short-circuiting if the
+        // document is gone (a `didClose` ran during the install — do not
+        // resurrect it) or already parsed (a concurrent parse won — nothing to do,
+        // and skip the `ensure_language_loaded` work). Detection borrows the stored
+        // text (synchronous, no `.await` and no document write under the `Ref`).
+        let language_name = {
             let Some(doc) = self.documents.get(&uri) else {
                 return;
             };
+            if doc.tree().is_some() {
+                return;
+            }
             self.language
                 .detect_language(uri.path(), doc.text(), None, language_id.as_deref())
-        }) else {
+        };
+        let Some(language_name) = language_name else {
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
@@ -328,19 +333,21 @@ impl ParseCoordinator {
                 doc.text().to_string()
             };
 
-            let text_clone = text.clone();
+            let text_len = text.len();
             let auto_install = self.auto_install.clone();
             let language_name_clone = language_name.clone();
-            let parsed_tree = self
-                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
+            // Move the owned `text` into the blocking closure and hand it back with
+            // the tree, so the (potentially large) document text is never cloned.
+            let parsed = self
+                .parse_with_pool(&language_name, &uri, text_len, move |mut parser| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
-                    let result = parser.parse(&text_clone, None);
+                    let result = parser.parse(&text, None);
                     let _ = auto_install.end_parsing(&language_name_clone);
-                    (parser, result)
+                    (parser, result.map(|tree| (tree, text)))
                 })
                 .await;
 
-            let Some(tree) = parsed_tree else { break };
+            let Some((tree, text)) = parsed else { break };
 
             // Persist FIRST through the non-inserting CAS: a closed (Vacant)
             // document or one whose text moved on (a concurrent `didChange`) drops
