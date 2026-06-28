@@ -631,8 +631,10 @@ error (so it can never silently slip past the gate). Exit codes: `0` no failing
 diagnostic; `1` a failing diagnostic — any error always, plus warnings with
 `--fail-on-warning` (info/hint never fail); `2` an operational error (a file
 could not be read, a path could not be opened, or a configured downstream
-server failed) — independent of the diagnostics, so it surfaces a broken run
-rather than looking clean to CI.
+server failed — including one that answered the `textDocument/diagnostic` pull
+with an error response or a present-but-malformed payload, matching
+`kakehashi format`'s strictness) — independent of the diagnostics, so it
+surfaces a broken run rather than looking clean to CI.
 
 > The `2` exit on a downstream failure is exact under the default
 > `concatenated` aggregation strategy. Under the non-default `preferred`

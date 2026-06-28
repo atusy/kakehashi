@@ -736,7 +736,6 @@ impl Kakehashi {
                             request_method,
                             params,
                             t.upstream_id,
-                            crate::lsp::bridge::ConnectionReadiness::FailFast,
                         )
                         .await
                 }

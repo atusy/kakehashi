@@ -44,6 +44,11 @@
 //!   that echoes the requested URI, but only for documents it received via
 //!   `didOpen`. Used to prove cross-layer diagnostic aggregation merges the
 //!   host layer in (cross-layer-aggregation).
+//! - `diagnostics-malformed` — advertises `diagnosticProvider`; answers
+//!   `textDocument/diagnostic` with a successful response whose `result` is a
+//!   present, non-null but unparsable report (unknown `kind`). Exercises the
+//!   present-but-malformed-payload path (#488): CLI mode must count it as a
+//!   request failure (exit 2), not read it as "no diagnostics".
 //! - `diagnostics-push` — spontaneously **pushes** `textDocument/publishDiagnostics`
 //!   on `didOpen` (one diagnostic on virtual line 0, no pull) and an empty list on
 //!   `didChange`. Used by `tests/e2e_push_diagnostics.rs` to prove a downstream's
@@ -151,7 +156,10 @@ fn main() {
                     // `diagnosticProvider` (pull-driven) AND pushes on didOpen
                     // (below). Used to prove `pullFallback = false` still
                     // publishes a pull-driven server's spontaneous push (#425).
-                    "diagnostics" | "diagnostics-fail" | "diagnostics-push-pullcap" => json!({
+                    "diagnostics"
+                    | "diagnostics-fail"
+                    | "diagnostics-malformed"
+                    | "diagnostics-push-pullcap" => json!({
                         "diagnosticProvider": {
                             "interFileDependencies": false,
                             "workspaceDiagnostics": false
@@ -444,6 +452,15 @@ fn main() {
                     // path (vs. a server that never starts), which CLI mode
                     // must not read as "no diagnostics".
                     respond_error(&mut writer, id, -32603, "mock diagnostic request failure");
+                    continue;
+                }
+                if mode == "diagnostics-malformed" {
+                    // Healthy handshake, successful response, but a present,
+                    // non-null `result` that is not a valid diagnostic report
+                    // (unknown report `kind`). Exercises the present-but-
+                    // malformed-payload path (#488): CLI mode must count it as a
+                    // request failure (exit 2), NOT read it as "no diagnostics".
+                    respond(&mut writer, id, json!({ "kind": "borked" }));
                     continue;
                 }
                 // One deterministic diagnostic echoing the requested URI —
