@@ -281,46 +281,71 @@ impl ParseCoordinator {
     ///
     /// No watermark advance: the originating `didOpen`'s skip-parse branch already
     /// resolved that ticket's watermark, and this reparse carries no ticket.
+    ///
+    /// Because the install is now off-ingress, a `didChange` can run *concurrently*
+    /// with this reparse (it is no longer gated behind the install). A `didChange`
+    /// that lands while the parser is still loading stores its new text with **no
+    /// tree** (the parser wasn't available), and would then CAS-reject this
+    /// reparse's now-stale tree — leaving the document tree-less. To converge, this
+    /// re-reads the latest text and retries a bounded number of times until the
+    /// tree lands (or another parse wins). Sustained editing falls back to the
+    /// reader's on-demand parse; the parse actor replaces this with a proper
+    /// coalescing loop.
     pub(crate) async fn reparse_installed_document(&self, uri: Url, language_id: Option<String>) {
-        // Snapshot the latest text. A missing document means a `didClose` ran
-        // during the install — do not resurrect it.
-        let Some(text) = self.documents.get(&uri).map(|doc| doc.text().to_string()) else {
+        /// Bound on the convergence retries (a burst of edits landing exactly as
+        /// the install completes); past this the reader on-demand parse covers it.
+        const MAX_REPARSE_ATTEMPTS: usize = 8;
+
+        // Resolve the language once from the current text; a missing document means
+        // a `didClose` ran during the install — do not resurrect it.
+        let Some(first_text) = self.documents.get(&uri).map(|doc| doc.text().to_string()) else {
             return;
         };
-
         let Some(language_name) =
             self.language
-                .detect_language(uri.path(), &text, None, language_id.as_deref())
+                .detect_language(uri.path(), &first_text, None, language_id.as_deref())
         else {
             return;
         };
-
         if self.auto_install.is_parser_failed(&language_name) {
             return;
         }
-
         let load_result = self.language.ensure_language_loaded(&language_name);
         let events = load_result.events;
 
-        let text_clone = text.clone();
-        let auto_install = self.auto_install.clone();
-        let language_name_clone = language_name.clone();
-        let parsed_tree = self
-            .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
-                let _ = auto_install.begin_parsing(&language_name_clone);
-                let result = parser.parse(&text_clone, None);
-                let _ = auto_install.end_parsing(&language_name_clone);
-                (parser, result)
-            })
-            .await;
+        for _ in 0..MAX_REPARSE_ATTEMPTS {
+            // Re-read the latest text each attempt. Gone => closed (no resurrect);
+            // already has a tree => a concurrent parse won, nothing to do.
+            let text = {
+                let Some(doc) = self.documents.get(&uri) else {
+                    break;
+                };
+                if doc.tree().is_some() {
+                    break;
+                }
+                doc.text().to_string()
+            };
 
-        if let Some(tree) = parsed_tree {
+            let text_clone = text.clone();
+            let auto_install = self.auto_install.clone();
+            let language_name_clone = language_name.clone();
+            let parsed_tree = self
+                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
+                    let _ = auto_install.begin_parsing(&language_name_clone);
+                    let result = parser.parse(&text_clone, None);
+                    let _ = auto_install.end_parsing(&language_name_clone);
+                    (parser, result)
+                })
+                .await;
+
+            let Some(tree) = parsed_tree else { break };
+
             // Persist FIRST through the non-inserting CAS: a closed (Vacant)
             // document or one whose text moved on (a concurrent `didChange`) drops
-            // the tree rather than writing it. Only populate the injection caches
-            // when the tree actually landed, so a `didClose` racing this reparse
-            // can't leave stale injection entries for a gone document. (`Tree`
-            // clone is a cheap refcount bump.)
+            // the tree. Only populate the injection caches when the tree actually
+            // landed, so a `didClose` racing this reparse can't leave stale
+            // injection entries for a gone document. (`Tree` clone is a cheap
+            // refcount bump.)
             let stored = self
                 .documents
                 .update_tree_if_text_unchanged(&uri, &text, tree.clone());
@@ -333,7 +358,10 @@ impl ParseCoordinator {
                     &self.language,
                     self.bridge.node_tracker(),
                 );
+                break;
             }
+            // CAS rejected: the text moved under us (a concurrent `didChange`).
+            // Loop to re-read the latest text and try again.
         }
 
         self.notifier().log_language_events(&events).await;
