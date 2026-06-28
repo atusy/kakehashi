@@ -190,6 +190,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concatenated_excludes_cancelled_join_errors_from_panic_sink() {
+        // A task aborted before completion yields a *cancelled* `JoinError`
+        // (`is_panic() == false`), which must NOT feed the panic sink: an
+        // aborted task was cancelled, not failed, so it must not drive exit 2.
+        // It still counts toward the local `errors` tally (log severity only).
+        let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
+        let handle = join_set.spawn(async {
+            std::future::pending::<()>().await;
+            TaggedResult {
+                server_name: "aborted".to_string(),
+                value: Ok(1),
+            }
+        });
+        handle.abort();
+
+        let sink = AtomicUsize::new(0);
+        let result = concatenated(&mut join_set, &[], None, None, Some(&sink)).await;
+
+        assert_eq!(assert_no_result(result), 1);
+        assert_eq!(
+            sink.load(Ordering::Relaxed),
+            0,
+            "a cancelled JoinError must not feed the panic sink"
+        );
+    }
+
+    #[tokio::test]
     async fn concatenated_handles_panic_without_a_sink() {
         // The `panic_sink = None` path (the configuration LSP-mode callers use)
         // must still drain the panicking task to `NoResult` without itself
