@@ -65,6 +65,10 @@ pub(crate) async fn dispatch_host_concatenated<T, F, Fut>(
     f: F,
     cancel_rx: Option<CancelReceiver>,
     log_target: Option<&str>,
+    // Counts panicking tasks even on partial-success `Done`, so a panicking
+    // host server still drives CLI exit 2 (#506). The caller still counts I/O
+    // failures in-task; only panics feed this.
+    panic_sink: Option<&std::sync::atomic::AtomicUsize>,
 ) -> FanInResult<Vec<T>>
 where
     T: Send + 'static,
@@ -73,7 +77,7 @@ where
 {
     let (mut join_set, entries) = host_fan_out(ctx, pool, f);
     let ordering = entry_names(&entries);
-    concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target).await
+    concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target, panic_sink).await
 }
 
 /// Shared host fan-out: allowlist + `"*"` expansion against `ctx.configs`,
