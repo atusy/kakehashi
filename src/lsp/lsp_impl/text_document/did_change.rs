@@ -62,8 +62,9 @@ impl Kakehashi {
         // Use InputEdits directly for precise invalidation when available,
         // fall back to diff-based approach for full document sync.
         //
-        // This must be called AFTER content changes are applied (so we have new text)
-        // but BEFORE parse_document (so position sync happens before new tree is built).
+        // This must be called AFTER content changes are applied (so we have new
+        // text) but BEFORE the tree is cleared and the off-ingress reparse is
+        // scheduled (so node-position sync happens against the pre-edit state).
         let invalidated_ulids = if edits.is_empty() {
             // Full document sync: no InputEdits available, reconstruct from diff
             self.bridge.apply_text_diff(&uri, &old_text, &text)
@@ -73,8 +74,9 @@ impl Kakehashi {
             self.bridge.apply_input_edits(&uri, &edit_infos)
         };
 
-        // Invalidate injection caches for regions overlapping with edits.
-        // Must be called BEFORE parse_document which updates the injection_map.
+        // Invalidate injection caches for regions overlapping with edits. Must run
+        // here (pre-edit invalidation) before the off-ingress reparse loop
+        // repopulates the injection map from the freshly parsed tree.
         self.cache.invalidate_for_edits(&uri, &edits);
 
         // Apply the edit to the store and CLEAR the tree synchronously, here under

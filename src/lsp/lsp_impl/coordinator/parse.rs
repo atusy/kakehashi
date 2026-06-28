@@ -273,7 +273,7 @@ impl ParseCoordinator {
     ///
     /// - re-reads the **latest** store text rather than the open-time text (a
     ///   `didChange` may have landed while the install ran), and
-    /// - persists through the **non-inserting** `update_tree_if_text_unchanged`
+    /// - persists through the **non-inserting**, tree-absent `attach_tree_if_absent`
     ///   CAS, so a `didClose` during the install leaves the document gone instead
     ///   of resurrecting it (the install/parse resurrection vector the actor ADR
     ///   calls out), and a `didChange` between the read and the write drops the
@@ -384,10 +384,12 @@ impl ParseCoordinator {
     /// `did_change` clears the tree synchronously and schedules this; it runs in a
     /// spawned loop, *not* on the writer ticket. A **full** parse (no incremental
     /// seed — the tree was cleared, which also keeps #348 closed). The tree write
-    /// is the non-inserting text CAS [`update_tree_if_text_unchanged`]: a closed
-    /// (Vacant) document is left gone (resurrection-safe), and a text that moved on
-    /// (a `didChange` landed while parsing) is dropped — the scheduler's `dirty`
-    /// loop then reparses the newer text. On **every** resolution path the parse
+    /// is the non-inserting text **and language** CAS
+    /// [`update_tree_if_text_and_language_unchanged`]: a closed (Vacant) document is
+    /// left gone (resurrection-safe), a text that moved on (a `didChange` landed
+    /// while parsing) is dropped — the scheduler's `dirty` loop then reparses the
+    /// newer text — and a reopen that changed the language is rejected (no
+    /// wrong-grammar tree). On **every** resolution path the parse
     /// advances the store watermark to `ticket`, so a virt/native reader gated
     /// behind the originating edit is released once its parse resolved.
     ///
