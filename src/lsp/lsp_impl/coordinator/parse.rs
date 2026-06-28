@@ -297,14 +297,16 @@ impl ParseCoordinator {
         const MAX_REPARSE_ATTEMPTS: usize = 8;
 
         // Resolve the language once from the current text; a missing document means
-        // a `didClose` ran during the install — do not resurrect it.
-        let Some(first_text) = self.documents.get(&uri).map(|doc| doc.text().to_string()) else {
-            return;
-        };
-        let Some(language_name) =
+        // a `didClose` ran during the install — do not resurrect it. Detect while
+        // borrowing the stored text (a synchronous call, no `.await` and no
+        // document write under the `Ref`) rather than cloning it.
+        let Some(language_name) = ({
+            let Some(doc) = self.documents.get(&uri) else {
+                return;
+            };
             self.language
-                .detect_language(uri.path(), &first_text, None, language_id.as_deref())
-        else {
+                .detect_language(uri.path(), doc.text(), None, language_id.as_deref())
+        }) else {
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
