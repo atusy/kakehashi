@@ -54,18 +54,20 @@ fn order_by_priority<T>(tagged: Vec<(String, T)>, priorities: &[String]) -> Vec<
 /// to clean up entries left behind by aborted tasks.
 ///
 /// `panic_sink`, when set, is incremented once per task that **panicked**
-/// (`JoinError`). This is surfaced even on `Done` — unlike the local `errors`
-/// tally, which the partial-success `Done` arm discards — because a concatenated
-/// caller counts I/O failures in-task but a panic unwinds before that runs, so
-/// the sink is the only path that lets a panicking server drive CLI exit 2
-/// (#506). Only panics feed it: I/O `Err`s are left to the caller's in-task
-/// counting, so they are never double-counted here.
+/// (a `JoinError` with `is_panic()`). This is surfaced even on `Done` — unlike
+/// the local `errors` tally, which the partial-success `Done` arm discards —
+/// because a concatenated caller counts I/O failures in-task but a panic unwinds
+/// before that runs, so the sink is the only path that lets a panicking server
+/// drive CLI exit 2 (#506). Only panics feed it: I/O `Err`s are left to the
+/// caller's in-task counting, and a cancellation `JoinError` (`is_cancelled()`)
+/// is deliberately excluded — an aborted task was cancelled, not failed, and
+/// must not drive exit 2 (matching `RequestErrorSink`'s contract).
 pub(crate) async fn concatenated<T: Send + 'static>(
     join_set: &mut JoinSet<TaggedResult<T>>,
     priorities: &[String],
     cancel_rx: Option<CancelReceiver>,
     log_target: Option<&str>,
-    panic_sink: Option<&std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    panic_sink: Option<&std::sync::atomic::AtomicUsize>,
 ) -> FanInResult<Vec<T>> {
     let log_target = log_target.unwrap_or(module_path!());
     let mut results: Vec<(String, T)> = Vec::new();
@@ -89,16 +91,20 @@ pub(crate) async fn concatenated<T: Send + 'static>(
                     None => break,
                     Some(Err(join_err)) => {
                         errors += 1;
-                        // Surface the panic to the caller's sink even though a
+                        // Surface a PANIC to the caller's sink even though a
                         // partial-success run returns `Done` and drops `errors`.
-                        // ONLY panics feed the sink: a panicking task unwinds
+                        // Only panics feed the sink: a panicking task unwinds
                         // before the dispatch's in-task error counting runs,
                         // whereas an I/O `Err` is already counted in-task — so
-                        // adding I/O errors here too would double-count (#506).
-                        if let Some(sink) = panic_sink {
+                        // adding I/O errors here too would double-count (#506). A
+                        // cancellation `JoinError` is excluded: an aborted task
+                        // was cancelled, not failed, and must not drive exit 2.
+                        if join_err.is_panic()
+                            && let Some(sink) = panic_sink
+                        {
                             sink.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        log::warn!(target: log_target, "bridge task panicked: {join_err}");
+                        log::warn!(target: log_target, "bridge task did not complete: {join_err}");
                     }
                     Some(Ok(tagged)) => match tagged.value {
                         Err(io_err) => {
@@ -122,7 +128,6 @@ pub(crate) async fn concatenated<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -138,7 +143,7 @@ mod tests {
         spawn_tagged(&mut join_set, Ok(42));
         spawn_panicking(&mut join_set);
 
-        let sink = Arc::new(AtomicUsize::new(0));
+        let sink = AtomicUsize::new(0);
         let result = concatenated(&mut join_set, &[], None, None, Some(&sink)).await;
 
         // Partial success: the surviving result is still returned...
@@ -157,7 +162,7 @@ mod tests {
         spawn_tagged(&mut join_set, Ok(42));
         spawn_tagged(&mut join_set, Err(io::Error::other("io fail")));
 
-        let sink = Arc::new(AtomicUsize::new(0));
+        let sink = AtomicUsize::new(0);
         let result = concatenated(&mut join_set, &[], None, None, Some(&sink)).await;
 
         assert_eq!(assert_done(result), vec![42]);
@@ -177,11 +182,23 @@ mod tests {
         spawn_panicking(&mut join_set);
         spawn_panicking(&mut join_set);
 
-        let sink = Arc::new(AtomicUsize::new(0));
+        let sink = AtomicUsize::new(0);
         let result = concatenated(&mut join_set, &[], None, None, Some(&sink)).await;
 
         assert_eq!(assert_no_result(result), 2);
         assert_eq!(sink.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn concatenated_handles_panic_without_a_sink() {
+        // The `panic_sink = None` path (the configuration LSP-mode callers use)
+        // must still drain the panicking task to `NoResult` without itself
+        // panicking.
+        let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
+        spawn_panicking(&mut join_set);
+
+        let result = concatenated(&mut join_set, &[], None, None, None).await;
+        assert_eq!(assert_no_result(result), 1);
     }
 
     #[tokio::test]

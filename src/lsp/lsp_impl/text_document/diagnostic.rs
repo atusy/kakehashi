@@ -482,7 +482,7 @@ pub(crate) async fn collect_host_diagnostics(
                 Some("kakehashi::diagnostic"),
                 // Surface panic failures (the in-task `send` counts I/O errors
                 // only, and `Done` drops the fan-in's own tally) (#506).
-                request_error_sink.as_ref(),
+                request_error_sink.as_deref(),
             )
             .await
             {
@@ -604,7 +604,7 @@ async fn dispatch_concatenated_diagnostics(
         // Panics unwind before the in-task counting above runs, and a
         // partial-success `Done` discards the fan-in's own tally, so surface
         // panic failures through the sink to keep exit 2 honest (#506).
-        sink.as_ref(),
+        sink.as_deref(),
     )
     .await;
 
