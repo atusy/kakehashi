@@ -379,6 +379,7 @@ impl Kakehashi {
         let publisher = DiagnosticPublisher::new(self);
         let diagnostic_scheduler = self.diagnostic_scheduler();
         let diagnostics = std::sync::Arc::clone(&self.diagnostics);
+        let documents = std::sync::Arc::clone(&self.documents);
         let scheduler = std::sync::Arc::clone(&self.parse_scheduler);
         let shutdown = self.shutdown_token.clone();
 
@@ -392,11 +393,21 @@ impl Kakehashi {
                 uri.clone(),
             );
 
+            // Stop the loop and clear the scheduler entry so a later edit re-spawns
+            // (leaving the entry at `parsing: true` would wedge the URI — the same
+            // failure the panic guard prevents). Used by the shutdown and
+            // closed-document early exits, which bypass the normal `finish()`.
+            let stop = |scheduler: &parse_scheduler::ParseScheduler,
+                        guard: &mut parse_scheduler::ParseLoopGuard| {
+                scheduler.clear(&uri);
+                guard.disarm();
+            };
+
             loop {
                 // Stop promptly on server shutdown rather than running another
                 // parse + injection/bridge round into a tearing-down bridge.
                 if shutdown.is_cancelled() {
-                    guard.disarm();
+                    stop(&scheduler, &mut guard);
                     break;
                 }
 
@@ -407,12 +418,21 @@ impl Kakehashi {
                 let ticket = scheduler.start_pass(&uri).flatten();
                 parse.reparse_latest(&uri, ticket).await;
 
+                // If the document was closed during the parse, skip ALL downstream
+                // work: process_injections / republish on a gone URI could re-publish
+                // diagnostics that `didClose` just cleared (resurrecting them in the
+                // editor) and act on removed state.
+                if documents.get(&uri).is_none() {
+                    stop(&scheduler, &mut guard);
+                    break;
+                }
+
                 // Re-check shutdown after the (awaited) parse and BEFORE the
                 // downstream work: shutdown could have been requested while parsing,
                 // and process_injections can spawn fresh eager bridge connections
                 // that would escape `shutdown_all`'s snapshot.
                 if shutdown.is_cancelled() {
-                    guard.disarm();
+                    stop(&scheduler, &mut guard);
                     break;
                 }
 

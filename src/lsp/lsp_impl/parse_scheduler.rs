@@ -111,22 +111,34 @@ impl ParseScheduler {
     /// continue) or after the removal (entry re-created → it spawns a fresh loop).
     /// A `get_mut`-then-`remove` split would instead let `schedule` set `dirty`
     /// between the two and then be deleted — a lost wakeup. `remove_if` also borrows
-    /// the key (no `Url` clone). The loop's entry is always present when this runs
-    /// (nothing else removes scheduler entries), so a non-removal means it was kept
-    /// for `dirty` → continue.
+    /// the key (no `Url` clone).
+    ///
+    /// `continue_loop` is set **inside** the predicate so it distinguishes
+    /// kept-because-dirty (continue) from a missing entry (stop). A bare
+    /// `remove_if(...).is_none()` would return `true` for a missing entry too,
+    /// trapping the loop in an infinite, CPU-burning cycle.
     pub(crate) fn finish(&self, uri: &Url) -> bool {
-        // `Some` = removed because it was clean → stop; `None` = kept (dirty) → loop.
-        self.states
-            .remove_if(uri, |_, state| !state.dirty)
-            .is_none()
+        let mut continue_loop = false;
+        self.states.remove_if(uri, |_, state| {
+            if state.dirty {
+                // Keep the entry and loop again; the next `start_pass` clears dirty.
+                continue_loop = true;
+                false
+            } else {
+                // Nothing pending — remove the entry and stop.
+                true
+            }
+        });
+        continue_loop
     }
 
-    /// Clear `uri`'s scheduling entry unconditionally. Used by [`ParseLoopGuard`]
-    /// when the spawned parse loop exits **abnormally** (a panic): the entry is
-    /// stuck at `parsing: true`, and without clearing it every later `did_change`
-    /// would only mark it `dirty` and never re-spawn, wedging the document
-    /// tree-less forever. Clearing lets the next edit spawn a fresh loop.
-    fn abort(&self, uri: &Url) {
+    /// Clear `uri`'s scheduling entry unconditionally, leaving the next
+    /// `did_change` free to spawn a fresh loop. Used when a parse loop stops
+    /// **without** the normal `finish()` removal — a panic (via [`ParseLoopGuard`]),
+    /// a server shutdown, or the document being closed mid-parse — all of which
+    /// would otherwise leave the entry stuck at `parsing: true` and wedge the URI
+    /// (every later edit only marks it `dirty`, never re-spawning).
+    pub(crate) fn clear(&self, uri: &Url) {
         self.states.remove(uri);
     }
 }
@@ -162,7 +174,7 @@ impl ParseLoopGuard {
 impl Drop for ParseLoopGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.scheduler.abort(&self.uri);
+            self.scheduler.clear(&self.uri);
             log::warn!(
                 target: "kakehashi::parse_actor",
                 "parse loop for {} aborted abnormally; cleared its schedule so the next edit re-spawns",
@@ -276,6 +288,33 @@ mod tests {
         assert!(
             !scheduler.schedule(&u, Some(3)),
             "the fresh entry survived the disarmed guard's drop (still parsing)"
+        );
+    }
+
+    #[test]
+    fn finish_on_a_missing_entry_stops_the_loop() {
+        let s = ParseScheduler::default();
+        let u = uri();
+        // No entry present (e.g. it was already removed). `finish` must return
+        // false (stop) — a `true` here would spin the parse loop forever.
+        assert!(
+            !s.finish(&u),
+            "finish on a missing entry must stop the loop, not continue"
+        );
+    }
+
+    #[test]
+    fn schedule_keeps_the_highest_ticket() {
+        let s = ParseScheduler::default();
+        let u = uri();
+        assert!(s.schedule(&u, Some(5)));
+        // A later schedule with no ticket (or a lower one) must not regress it.
+        assert!(!s.schedule(&u, None));
+        assert!(!s.schedule(&u, Some(2)));
+        assert_eq!(
+            s.start_pass(&u),
+            Some(Some(5)),
+            "the highest ticket is kept"
         );
     }
 
