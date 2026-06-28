@@ -264,6 +264,74 @@ impl ParseCoordinator {
         self.notifier().log_language_events(&events).await;
     }
 
+    /// Re-parse a document after its parser finished installing, **off the
+    /// ingress path** and **resurrection-safely**.
+    ///
+    /// Called from the spawned auto-install task (see `did_open`), so by the time
+    /// it runs the originating `didOpen` writer ticket has already completed.
+    /// Unlike [`parse_document`](Self::parse_document) it:
+    ///
+    /// - re-reads the **latest** store text rather than the open-time text (a
+    ///   `didChange` may have landed while the install ran), and
+    /// - persists through the **non-inserting** `update_tree_if_text_unchanged`
+    ///   CAS, so a `didClose` during the install leaves the document gone instead
+    ///   of resurrecting it (the install/parse resurrection vector the actor ADR
+    ///   calls out), and a `didChange` between the read and the write drops the
+    ///   now-stale tree.
+    ///
+    /// No watermark advance: the originating `didOpen`'s skip-parse branch already
+    /// resolved that ticket's watermark, and this reparse carries no ticket.
+    pub(crate) async fn reparse_installed_document(&self, uri: Url, language_id: Option<String>) {
+        // Snapshot the latest text. A missing document means a `didClose` ran
+        // during the install — do not resurrect it.
+        let Some(text) = self.documents.get(&uri).map(|doc| doc.text().to_string()) else {
+            return;
+        };
+
+        let Some(language_name) =
+            self.language
+                .detect_language(uri.path(), &text, None, language_id.as_deref())
+        else {
+            return;
+        };
+
+        if self.auto_install.is_parser_failed(&language_name) {
+            return;
+        }
+
+        let load_result = self.language.ensure_language_loaded(&language_name);
+        let events = load_result.events;
+
+        let text_clone = text.clone();
+        let auto_install = self.auto_install.clone();
+        let language_name_clone = language_name.clone();
+        let parsed_tree = self
+            .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
+                let _ = auto_install.begin_parsing(&language_name_clone);
+                let result = parser.parse(&text_clone, None);
+                let _ = auto_install.end_parsing(&language_name_clone);
+                (parser, result)
+            })
+            .await;
+
+        if let Some(tree) = parsed_tree {
+            self.cache.populate_injections(
+                &uri,
+                &text,
+                &tree,
+                &language_name,
+                &self.language,
+                self.bridge.node_tracker(),
+            );
+            // Non-inserting CAS: a closed (Vacant) document or one whose text moved
+            // on (a concurrent `didChange`) drops the tree rather than writing it.
+            self.documents
+                .update_tree_if_text_unchanged(&uri, &text, tree);
+        }
+
+        self.notifier().log_language_events(&events).await;
+    }
+
     fn notifier(&self) -> ClientNotifier<'_> {
         build_notifier(&self.client, &self.settings_manager)
     }

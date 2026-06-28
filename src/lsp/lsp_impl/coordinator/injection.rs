@@ -180,13 +180,10 @@ impl InjectionCoordinator {
         let install = self.install_coordinator();
         let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
 
-        let (text, reason) = if auto_install_enabled {
-            (
-                self.documents.get(uri).map(|doc| doc.text().to_string()),
-                String::new(),
-            )
+        let reason = if auto_install_enabled {
+            String::new()
         } else {
-            (None, install.auto_install_disabled_reason())
+            install.auto_install_disabled_reason()
         };
 
         for lang in languages {
@@ -208,9 +205,12 @@ impl InjectionCoordinator {
                 continue;
             }
 
-            if let Some(ref text) = text {
+            // Only attempt the (injected-language) install while the host document
+            // is still open. `maybe_auto_install_language` re-reads the latest text
+            // itself, so no text is threaded here.
+            if self.documents.get(uri).is_some() {
                 let _ = install
-                    .maybe_auto_install_language(&resolved_lang, uri.clone(), text.clone(), true)
+                    .maybe_auto_install_language(&resolved_lang, uri.clone(), true)
                     .await;
             }
         }
