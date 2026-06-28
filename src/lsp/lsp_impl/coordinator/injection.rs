@@ -206,8 +206,8 @@ impl InjectionCoordinator {
             }
 
             // Only attempt the (injected-language) install while the host document
-            // is still open. `maybe_auto_install_language` re-reads the latest text
-            // itself, so no text is threaded here.
+            // is still open. The injected-language install does not reparse the
+            // host document (is_injection=true), so no host text is needed here.
             if self.documents.get(uri).is_some() {
                 let _ = install
                     .maybe_auto_install_language(&resolved_lang, uri.clone(), true)

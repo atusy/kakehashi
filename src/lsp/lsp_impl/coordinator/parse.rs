@@ -349,15 +349,17 @@ impl ParseCoordinator {
 
             let Some((tree, text)) = parsed else { break };
 
-            // Persist FIRST through the non-inserting CAS: a closed (Vacant)
-            // document or one whose text moved on (a concurrent `didChange`) drops
-            // the tree. Only populate the injection caches when the tree actually
-            // landed, so a `didClose` racing this reparse can't leave stale
-            // injection entries for a gone document. (`Tree` clone is a cheap
-            // refcount bump.)
+            // Persist FIRST through the non-inserting, tree-absent CAS: a closed
+            // (Vacant) document, one whose text moved (a concurrent `didChange`),
+            // or one a concurrent parse already gave a tree all drop this tree —
+            // the tree-absent check makes the "don't clobber a concurrent parse"
+            // guard atomic with the write. Only populate the injection caches when
+            // the tree actually landed, so a `didClose` racing this reparse can't
+            // leave stale injection entries for a gone document. (`Tree` clone is a
+            // cheap refcount bump.)
             let stored = self
                 .documents
-                .update_tree_if_text_unchanged(&uri, &text, tree.clone());
+                .attach_tree_if_absent(&uri, &text, tree.clone());
             if stored {
                 self.cache.populate_injections(
                     &uri,
