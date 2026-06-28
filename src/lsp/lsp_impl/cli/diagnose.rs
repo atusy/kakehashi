@@ -1,16 +1,10 @@
-//! In-process driving of the LSP handlers for `kakehashi diagnose` (CLI mode).
+//! `kakehashi diagnose` per-file wrapper (CLI mode).
 //!
-//! Mirrors [`super::cli_format`]: the CLI runs the same `Kakehashi` instance
-//! an editor would talk to, but calls the handler implementations directly
-//! instead of going through JSON-RPC framing. This wrapper packages the
-//! per-file lifecycle — `didOpen` → wait for downstream servers →
-//! `textDocument/diagnostic` → `didClose` — so `crate::cli::diagnose` never
-//! touches server internals.
-//!
-//! Lives under `lsp_impl` (not `crate::cli`) because it relies on the
-//! `pub(crate)` lifecycle helpers (`wait_bridge_servers_ready`,
-//! `wait_eager_open_finished`) that need the private `language` / `documents`
-//! / `bridge` fields.
+//! Mirrors [`super::format`]: packages the per-file lifecycle — `didOpen` →
+//! wait for downstream servers → `textDocument/diagnostic` → `didClose` — so
+//! `crate::cli::diagnose` never touches server internals. The shared CLI
+//! lifecycle helpers (`wait_bridge_servers_ready`, `wait_eager_open_finished`,
+//! …) live in the parent [`super`] module.
 
 use std::path::Path;
 use std::time::Duration;
@@ -22,7 +16,7 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::{Kakehashi, url_to_uri};
+use super::super::{Kakehashi, url_to_uri};
 
 /// Result of one CLI diagnostic attempt ([`Kakehashi::cli_diagnose_text`]).
 pub(crate) struct CliDiagnoseOutcome {
