@@ -31,7 +31,9 @@ use crate::lsp::diagnostic_cache::{DiagnosticSource, cached_push_diagnostics, pu
 use crate::lsp::lsp_impl::bridge_context::{
     DocumentRequestContext, HostRequestContext, resolve_aggregation_config_from_settings,
 };
-use crate::lsp::lsp_impl::text_document::{RequestErrorSink, count_request_errors};
+use crate::lsp::lsp_impl::text_document::{
+    RequestErrorSink, count_no_winner_errors, count_request_errors,
+};
 
 // ============================================================================
 // Shared diagnostic utilities (used by both pull and push diagnostics)
@@ -454,47 +456,24 @@ pub(crate) async fn collect_host_diagnostics(
     pool: Arc<LanguageServerPool>,
     request_error_sink: &RequestErrorSink,
 ) -> Vec<Diagnostic> {
-    let send = |t: HostFanOutTask| {
-        // Cloned per call so the returned future is `'static`, and so a
-        // request-time host failure (timeout, crash, error response after the
-        // server is ready, or a present-but-malformed report payload) is
-        // counted — letting CLI mode surface it as exit 2 instead of silently
-        // losing the host layer. `send_host_diagnostic_request` keeps a
-        // `null`/`unchanged`/no-capability result a lenient empty (not an
-        // error); only a malformed payload is `Err`.
-        let sink = request_error_sink.clone();
-        async move {
-            let result = tokio::time::timeout(
-                DIAGNOSTIC_REQUEST_TIMEOUT,
-                t.pool.send_host_diagnostic_request(
-                    &t.server_name,
-                    &t.server_config,
-                    &crate::lsp::bridge::HostDocument {
-                        uri: &t.uri,
-                        language_id: &t.language_id,
-                        text: &t.text,
-                    },
-                    serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
-                    t.upstream_id,
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(std::io::Error::other(format!(
-                    "host diagnostic request timed out for {}",
-                    t.server_name
-                )))
-            });
-            if result.is_err() {
-                count_request_errors(&sink, 1);
-            }
-            result
-        }
-    };
-
     // Cancellation is handled by the caller dropping this future.
     match ctx.strategy {
         AggregationStrategy::Concatenated => {
+            // Concatenated merges every layer, so a crashed/timed-out server is
+            // a missing contribution — count each failure in-task. A partial
+            // failure still yields `Done` (which discards the fan-in's own
+            // count), and the drain is exhaustive, so in-task counting is both
+            // necessary and deterministic here.
+            let send = |t: HostFanOutTask| {
+                let sink = request_error_sink.clone();
+                async move {
+                    let result = send_host_diagnostic_fan_out_request(t).await;
+                    if result.is_err() {
+                        count_request_errors(&sink, 1);
+                    }
+                    result
+                }
+            };
             match dispatch_host_concatenated(ctx, pool, send, None, Some("kakehashi::diagnostic"))
                 .await
             {
@@ -503,15 +482,21 @@ pub(crate) async fn collect_host_diagnostics(
             }
         }
         AggregationStrategy::Preferred => {
-            match dispatch_host_preferred(
+            // Preferred: the winning server is authoritative, so a non-winning
+            // server's failure is irrelevant and must NOT be counted (counting
+            // it in-task is also racy — the fan-in aborts losers without joining
+            // them). Count only when no server won, from the fan-in result
+            // (#487).
+            let result = dispatch_host_preferred(
                 ctx,
                 pool,
-                send,
+                send_host_diagnostic_fan_out_request,
                 |v: &Vec<Diagnostic>| !v.is_empty(),
                 None,
             )
-            .await
-            {
+            .await;
+            count_no_winner_errors(&result, request_error_sink);
+            match result {
                 FanInResult::Done(diagnostics) => diagnostics,
                 FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
             }
@@ -542,6 +527,36 @@ async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<D
     .unwrap_or_else(|_| {
         Err(std::io::Error::other(format!(
             "diagnostic request timed out for region {rid}"
+        )))
+    })
+}
+
+/// Send a host diagnostic request for a single fan-out task with timeout, with
+/// **no** error counting. The caller counts per strategy: concatenated counts
+/// every failure in-task (a missing merge contribution); preferred counts only
+/// the no-winner case via [`count_no_winner_errors`] (#487).
+async fn send_host_diagnostic_fan_out_request(
+    t: HostFanOutTask,
+) -> std::io::Result<Vec<Diagnostic>> {
+    tokio::time::timeout(
+        DIAGNOSTIC_REQUEST_TIMEOUT,
+        t.pool.send_host_diagnostic_request(
+            &t.server_name,
+            &t.server_config,
+            &crate::lsp::bridge::HostDocument {
+                uri: &t.uri,
+                language_id: &t.language_id,
+                text: &t.text,
+            },
+            serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
+            t.upstream_id,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::other(format!(
+            "host diagnostic request timed out for {}",
+            t.server_name
         )))
     })
 }
@@ -588,19 +603,16 @@ async fn dispatch_concatenated_diagnostics(
 
 /// Dispatch diagnostics using the preferred strategy (first non-empty response wins).
 ///
-/// KNOWN LIMITATION (CLI exit codes, tracked in #487): when a winner is
-/// decided, the preferred fan-in (`aggregation::server::fan_in::preferred`)
-/// `abort_all()`s the losing tasks WITHOUT joining them, so a
-/// losing server that fails its request can run `count_request_errors` after
-/// this returns and after the CLI has loaded `sink`. Such a non-winning
-/// failure may therefore not surface as `kakehashi diagnose` exit 2. The
-/// default `concatenated` strategy drains every task (`join_next` to `None`)
-/// and is exact; the all-servers-fail case yields `NoResult` with no winner,
-/// hence no abort and a deterministic count. Only "preferred + a winner + a
-/// non-winning failure" is racy — and under preferred semantics the winner's
-/// result is authoritative, so whether that should be exit 2 at all is a
-/// product question. See #487 for the fix options (shared with the formatting
-/// preferred path).
+/// Under preferred the winning server's result is authoritative, so a
+/// non-winning server's request failure is **not** counted toward CLI exit 2:
+/// failures are recorded only when no server won, via [`count_no_winner_errors`]
+/// on the fan-in result. This is deterministic — `NoResult` (no winner emerged)
+/// drains every task, so its `errors` is the exhaustive count of the actual
+/// failures (zero if the non-winners merely returned empty), whereas the racy
+/// in-task counting it replaces could miss or catch a loser depending on when
+/// the fan-in `abort_all`ed it (#487). The default `concatenated` strategy
+/// still counts every failure in-task (each is a missing merge contribution).
+/// The same fix applies to the formatting preferred path (tracked separately).
 async fn dispatch_preferred_diagnostics(
     region_ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
@@ -609,11 +621,12 @@ async fn dispatch_preferred_diagnostics(
     let result = dispatch_preferred(
         region_ctx,
         pool,
-        |t| send_diagnostic_request_counting_errors(t, sink.clone()),
+        send_diagnostic_fan_out_request,
         |v: &Vec<Diagnostic>| !v.is_empty(),
         None, // cancel handled at outer level
     )
     .await;
+    count_no_winner_errors(&result, sink);
 
     match result {
         FanInResult::Done(diagnostics) => diagnostics,
