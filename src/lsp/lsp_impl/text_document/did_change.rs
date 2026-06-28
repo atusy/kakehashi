@@ -41,7 +41,9 @@ impl Kakehashi {
         let old_text = {
             let doc = self.documents.get(&uri);
             match doc {
-                Some(d) => d.text().to_string(),
+                // `text_arc()` is a refcount bump, not a full copy of the pre-edit
+                // text — cheap on every keystroke (#498).
+                Some(d) => d.text_arc(),
                 None => {
                     self.notifier()
                         .log_warning("Document not found for change event")
@@ -122,7 +124,7 @@ impl Kakehashi {
         // snapshot makes the debounce a no-op, skipping the on-edit host re-sync
         // (#431) that keeps a push-only `_self` host server's diagnostics following
         // edits. The handler returns without waiting on the parse.
-        self.schedule_reparse(uri.clone(), ticket);
+        self.schedule_reparse(uri, ticket);
 
         // NOTE: We intentionally do NOT call semantic_tokens_refresh() here.
         // LSP clients already request new tokens after didChange (via semanticTokens/full/delta).

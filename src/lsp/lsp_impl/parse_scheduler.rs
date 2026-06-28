@@ -47,7 +47,11 @@ impl ParseScheduler {
         // Hot path (a live document being edited): `get_mut` borrows the key, so no
         // `Url` clone; only a first-edit miss pays for the owned key via `entry`.
         if let Some(mut state) = self.states.get_mut(uri) {
-            state.ticket = ticket;
+            // Keep the highest ticket: writer tickets are monotonic, and a later
+            // schedule carrying `None` (or, defensively, an out-of-order lower one)
+            // must not regress the watermark target. `None < Some(_)` in `Option`'s
+            // ordering, so `max` keeps any real ticket.
+            state.ticket = state.ticket.max(ticket);
             return if state.parsing {
                 state.dirty = true;
                 false
@@ -62,7 +66,7 @@ impl ParseScheduler {
             // `get_mut` miss and here.
             Entry::Occupied(mut entry) => {
                 let state = entry.get_mut();
-                state.ticket = ticket;
+                state.ticket = state.ticket.max(ticket);
                 if state.parsing {
                     state.dirty = true;
                     false

@@ -413,8 +413,10 @@ impl ParseCoordinator {
                 advance_watermark();
                 return;
             };
-            let text = doc.text().to_string();
-            let language_id = doc.language_id().map(str::to_string);
+            // `text_arc()` is a refcount bump, not a full copy of the document text
+            // (#498) — cheap on this reparse hot path.
+            let text = doc.text_arc();
+            let language_id = doc.language_id().map(|s| s.to_string());
             let language_name =
                 self.language
                     .detect_language(uri.path(), &text, None, language_id.as_deref());
@@ -434,18 +436,19 @@ impl ParseCoordinator {
         let text_len = text.len();
         let auto_install = self.auto_install.clone();
         let language_name_clone = language_name.clone();
-        // Move the owned `text` into the blocking closure and hand it back with the
-        // tree, so the document text is never cloned.
+        // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure; the
+        // original stays here for the CAS + injection populate below.
+        let text_for_parse = text.clone();
         let parsed = self
             .parse_with_pool(&language_name, uri, text_len, move |mut parser| {
                 let _ = auto_install.begin_parsing(&language_name_clone);
-                let result = parser.parse(&text, None);
+                let result = parser.parse(&*text_for_parse, None);
                 let _ = auto_install.end_parsing(&language_name_clone);
-                (parser, result.map(|tree| (tree, text)))
+                (parser, result)
             })
             .await;
 
-        if let Some((tree, text)) = parsed {
+        if let Some(tree) = parsed {
             // Text + language CAS (non-inserting). Rejecting on a changed
             // `language_id` closes the close→reopen-with-different-language race
             // (a tree parsed by the old grammar must not attach to a relabelled
