@@ -403,6 +403,15 @@ impl Kakehashi {
                 }
                 parse.reparse_latest(&uri, ticket).await;
 
+                // Re-check shutdown after the (awaited) parse and BEFORE the
+                // downstream work: shutdown could have been requested while parsing,
+                // and process_injections can spawn fresh eager bridge connections
+                // that would escape `shutdown_all`'s snapshot.
+                if shutdown.is_cancelled() {
+                    guard.disarm();
+                    break;
+                }
+
                 // Tree-dependent downstream, in the order did_change ran it inline:
                 // injected-language processing + forwarding, then geometry re-merge
                 // (which re-anchors region push slots against the now-current

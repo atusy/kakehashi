@@ -404,17 +404,19 @@ impl ParseCoordinator {
 
         // Re-read the latest text + detect the language under one read guard. A
         // missing document means a `didClose` ran — resolve the watermark and stop
-        // (no resurrection).
-        let (language_name, text) = {
+        // (no resurrection). `language_id` is captured so the tree write can reject
+        // a reopen that changed the language while this parse was in flight.
+        let (language_name, language_id, text) = {
             let Some(doc) = self.documents.get(uri) else {
                 advance_watermark();
                 return;
             };
             let text = doc.text().to_string();
+            let language_id = doc.language_id().map(str::to_string);
             let language_name =
                 self.language
-                    .detect_language(uri.path(), &text, None, doc.language_id());
-            (language_name, text)
+                    .detect_language(uri.path(), &text, None, language_id.as_deref());
+            (language_name, language_id, text)
         };
 
         let Some(language_name) = language_name else {
@@ -442,17 +444,21 @@ impl ParseCoordinator {
             .await;
 
         if let Some((tree, text)) = parsed {
-            // Text-CAS, not the full `(incarnation, ticket)` epoch CAS. The
-            // incarnation half is deferred (see #508): a close→reopen with
-            // *identical* text while this parse is in flight can let the CAS attach
-            // this tree to the reopened lifetime. That is benign — the text is
-            // identical, so the tree is a correct parse of it — only the watermark
-            // ticket is from the old lifetime; reads stay correct because the tree
-            // matches the text. The strict epoch CAS (incarnation stored on the
-            // Document so the check is atomic with the write) is the follow-up.
-            let stored = self
-                .documents
-                .update_tree_if_text_unchanged(uri, &text, tree.clone());
+            // Text + language CAS (non-inserting). Rejecting on a changed
+            // `language_id` closes the close→reopen-with-different-language race
+            // (a tree parsed by the old grammar must not attach to a relabelled
+            // document). The remaining residual — a same-language reopen with
+            // *identical* text — is benign (the tree is a correct parse of that
+            // text); only the watermark ticket is from the old lifetime, and reads
+            // stay correct. The strict `(incarnation, ticket)` epoch CAS
+            // (incarnation stored on the Document, atomic with the write) is the
+            // follow-up that closes even that.
+            let stored = self.documents.update_tree_if_text_and_language_unchanged(
+                uri,
+                &text,
+                language_id.as_deref(),
+                tree.clone(),
+            );
             if stored {
                 self.cache.populate_injections(
                     uri,
