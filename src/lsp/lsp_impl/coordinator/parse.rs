@@ -315,18 +315,25 @@ impl ParseCoordinator {
             .await;
 
         if let Some(tree) = parsed_tree {
-            self.cache.populate_injections(
-                &uri,
-                &text,
-                &tree,
-                &language_name,
-                &self.language,
-                self.bridge.node_tracker(),
-            );
-            // Non-inserting CAS: a closed (Vacant) document or one whose text moved
-            // on (a concurrent `didChange`) drops the tree rather than writing it.
-            self.documents
-                .update_tree_if_text_unchanged(&uri, &text, tree);
+            // Persist FIRST through the non-inserting CAS: a closed (Vacant)
+            // document or one whose text moved on (a concurrent `didChange`) drops
+            // the tree rather than writing it. Only populate the injection caches
+            // when the tree actually landed, so a `didClose` racing this reparse
+            // can't leave stale injection entries for a gone document. (`Tree`
+            // clone is a cheap refcount bump.)
+            let stored = self
+                .documents
+                .update_tree_if_text_unchanged(&uri, &text, tree.clone());
+            if stored {
+                self.cache.populate_injections(
+                    &uri,
+                    &text,
+                    &tree,
+                    &language_name,
+                    &self.language,
+                    self.bridge.node_tracker(),
+                );
+            }
         }
 
         self.notifier().log_language_events(&events).await;
