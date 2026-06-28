@@ -63,6 +63,12 @@ tokio::task_local! {
     /// publish the watermark from inside the per-document actor task later, where
     /// this task-local is no longer in scope.
     static WRITER_TICKET: u64;
+
+    /// The tail writer ticket a reader must observe — the highest ticket issued
+    /// for the document at the reader's `call` time. Scoped around the gated
+    /// reader handler so it can wait for the parse watermark to reach this ticket.
+    /// Read via [`current_reader_tail`].
+    static READER_TAIL: u64;
 }
 
 /// The ingress writer ticket of the currently-running gated writer handler, or
@@ -70,6 +76,13 @@ tokio::task_local! {
 /// handler directly without the middleware).
 pub(crate) fn current_writer_ticket() -> Option<u64> {
     WRITER_TICKET.try_with(|ticket| *ticket).ok()
+}
+
+/// The tail writer ticket the currently-running gated reader handler must
+/// observe, or `None` outside a gated reader or when no writer has been issued
+/// for the document (nothing to wait for).
+pub(crate) fn current_reader_tail() -> Option<u64> {
+    READER_TAIL.try_with(|ticket| *ticket).ok()
 }
 
 /// Per-document sequencing state.
@@ -177,6 +190,18 @@ impl DocumentSequencer {
         let rx = entry.completion.done.subscribe();
         drop(entry);
         Some(ReaderBarrier { target, rx })
+    }
+
+    /// The tail writer ticket a reader of `uri` must observe: the highest ticket
+    /// issued at call time, regardless of completion. `None` when no writer was
+    /// ever ticketed for the document (so there is nothing for the reader to wait
+    /// on). Unlike [`reader_barrier`](Self::reader_barrier) this reports the tail
+    /// even when every writer has already completed, because the reader waits on
+    /// the parse **watermark** (which a completed ticket has already advanced),
+    /// not on ticket completion.
+    pub(crate) fn reader_tail(&self, uri: &str) -> Option<u64> {
+        let entry = self.docs.get(uri)?;
+        (entry.tail > 0).then_some(entry.tail)
     }
 
     /// Drop `uri`'s sequencing state after a close completed, unless later
@@ -374,11 +399,20 @@ where
             }
             Some(Role::Reader { uri }) => {
                 let barrier = self.sequencer.reader_barrier(&uri);
+                // Snapshot the tail ticket at `call` time (wire order), exposing
+                // it to the handler so a virt/native reader can wait for the parse
+                // watermark to reach it. `reader_barrier` only reports a pending
+                // writer; the tail is needed even when all writers completed,
+                // because the watermark — not ticket completion — gates the read.
+                let tail = self.sequencer.reader_tail(&uri);
                 Box::pin(async move {
                     if let Some(barrier) = barrier {
                         barrier.wait().await;
                     }
-                    inner_fut.await
+                    match tail {
+                        Some(tail) => READER_TAIL.scope(tail, inner_fut).await,
+                        None => inner_fut.await,
+                    }
                 })
             }
         }
@@ -451,6 +485,31 @@ mod tests {
         assert!(
             seq.reader_barrier(URI).is_none(),
             "all tickets done means no waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_tail_reports_highest_ticket_even_after_completion() {
+        let seq = DocumentSequencer::default();
+        assert_eq!(seq.reader_tail(URI), None, "no writer issued → nothing to wait on");
+
+        let first = seq.issue_writer_ticket(URI);
+        let second = seq.issue_writer_ticket(URI);
+        assert_eq!(seq.reader_tail(URI), Some(2), "tail is the highest issued ticket");
+
+        // Unlike `reader_barrier`, the tail is still reported once every writer
+        // has completed — the reader waits on the parse watermark, which a
+        // completed ticket has already advanced.
+        drop(first);
+        drop(second);
+        assert!(
+            seq.reader_barrier(URI).is_none(),
+            "all writers done → no barrier"
+        );
+        assert_eq!(
+            seq.reader_tail(URI),
+            Some(2),
+            "but the tail is still observable for the watermark wait"
         );
     }
 
@@ -787,6 +846,100 @@ mod tests {
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["close", "open"]
+        );
+    }
+
+    /// Inner mock that records the ingress task-locals **as observed inside the
+    /// gated handler future** — the only place they are in scope. This is the
+    /// discriminator the behavior-preservation tests cannot give: because the
+    /// watermark wait is instantly satisfied in the sync world, an inert
+    /// plumbing (task-local never propagating, so the handlers read `None` and
+    /// silently skip publish/consume) produces identical observable behavior. A
+    /// direct assertion that the handler sees `Some(expected)` is what proves the
+    /// plumbing is effective rather than dead scaffolding.
+    struct TaskLocalProbe {
+        writer_ticket: Arc<std::sync::Mutex<Option<u64>>>,
+        reader_tail: Arc<std::sync::Mutex<Option<u64>>>,
+    }
+
+    impl Service<Request> for TaskLocalProbe {
+        type Response = Option<Response>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request) -> Self::Future {
+            let writer_ticket = Arc::clone(&self.writer_ticket);
+            let reader_tail = Arc::clone(&self.reader_tail);
+            // Read the task-locals *inside* the returned future: the gate scopes
+            // them around this future when it is awaited, not around `call`.
+            Box::pin(async move {
+                *writer_ticket.lock().recover_poison("TaskLocalProbe") = current_writer_ticket();
+                *reader_tail.lock().recover_poison("TaskLocalProbe") = current_reader_tail();
+                Ok(None)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_propagates_writer_ticket_into_the_handler() {
+        let writer_ticket = Arc::new(std::sync::Mutex::new(None));
+        let reader_tail = Arc::new(std::sync::Mutex::new(None));
+        let mut gate = IngressOrderGate::new(TaskLocalProbe {
+            writer_ticket: Arc::clone(&writer_ticket),
+            reader_tail: Arc::clone(&reader_tail),
+        });
+
+        // The first writer for the document is ticket 1; the handler must see it.
+        gate
+            .call(notification("textDocument/didChange", URI))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *writer_ticket.lock().recover_poison("ingress_order::tests"),
+            Some(1),
+            "the writer handler must observe its ingress ticket, not None (inert plumbing)"
+        );
+        assert_eq!(
+            *reader_tail.lock().recover_poison("ingress_order::tests"),
+            None,
+            "a writer handler is not a reader and sees no reader tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_propagates_reader_tail_into_the_handler() {
+        let writer_ticket = Arc::new(std::sync::Mutex::new(None));
+        let reader_tail = Arc::new(std::sync::Mutex::new(None));
+        let mut gate = IngressOrderGate::new(TaskLocalProbe {
+            writer_ticket: Arc::clone(&writer_ticket),
+            reader_tail: Arc::clone(&reader_tail),
+        });
+
+        // A writer issues ticket 1, then a reader follows on the wire: the reader
+        // handler must observe tail ticket 1 (so it can wait the watermark to it).
+        gate
+            .call(notification("textDocument/didChange", URI))
+            .await
+            .unwrap();
+        gate
+            .call(notification("textDocument/semanticTokens/full", URI))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *reader_tail.lock().recover_poison("ingress_order::tests"),
+            Some(1),
+            "the reader handler must observe the tail ticket, not None (inert plumbing)"
+        );
+        assert_eq!(
+            *writer_ticket.lock().recover_poison("ingress_order::tests"),
+            None,
+            "a reader handler is not a writer and sees no writer ticket"
         );
     }
 }

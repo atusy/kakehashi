@@ -363,6 +363,39 @@ impl DocumentStore {
         });
     }
 
+    /// Wait until the parse watermark for `uri` reaches `target` — the tail
+    /// ingress ticket a virt/native reader must observe — bounded by `timeout`.
+    ///
+    /// Returns early (proceed into the empty/`null` reader fallback) when the
+    /// watermark already covers `target`, when there is no watermark entry
+    /// (nothing has been published, or a `didClose` removed it — so there is
+    /// nothing to wait for), or when the entry is dropped while waiting (a
+    /// concurrent `didClose`). Non-inserting on the missing-entry path so it never
+    /// resurrects a watermark for a closed URI.
+    pub(crate) async fn wait_for_epoch(
+        &self,
+        uri: &Url,
+        target: u64,
+        timeout: std::time::Duration,
+    ) {
+        // Subscribe under the shard read lock, then drop the `Ref` *before*
+        // awaiting — never hold a DashMap guard across `.await`.
+        let mut receiver = {
+            let Some(sender) = self.watermarks.get(uri) else {
+                return;
+            };
+            sender.subscribe()
+        };
+
+        let wait_future = async {
+            // Err => the sender was dropped (entry removed after a close): every
+            // parse that will ever run for this lifetime has, so proceed.
+            let _ = receiver.wait_for(|watermark| *watermark >= target).await;
+        };
+
+        let _ = tokio::time::timeout(timeout, wait_future).await;
+    }
+
     // Lock safety: Single remove() call - no read lock held before or during write
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
@@ -591,6 +624,109 @@ mod tests {
             None,
             "closing the document drops its watermark so a reopen starts fresh"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_returns_immediately_when_already_reached() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        store.advance_watermark(&uri, 5);
+
+        // target below the watermark resolves without blocking.
+        timeout(
+            Duration::from_millis(100),
+            store.wait_for_epoch(&uri, 3, Duration::from_secs(10)),
+        )
+        .await
+        .expect("a watermark already past the target must not block");
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_returns_immediately_when_no_entry() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///absent.rs").unwrap();
+        // No publish has happened: nothing is pending, so the reader proceeds.
+        timeout(
+            Duration::from_millis(100),
+            store.wait_for_epoch(&uri, 1, Duration::from_secs(10)),
+        )
+        .await
+        .expect("a missing watermark entry means nothing to wait for");
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_blocks_until_watermark_reaches_target() {
+        let store = Arc::new(DocumentStore::new());
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        // Entry exists at ticket 1, below the reader's target of 3.
+        store.advance_watermark(&uri, 1);
+
+        let waiter = {
+            let store = Arc::clone(&store);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                store.wait_for_epoch(&uri, 3, Duration::from_secs(10)).await;
+            })
+        };
+
+        // The intermediate ticket 2 must not release a reader waiting for 3.
+        store.advance_watermark(&uri, 2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "reader must keep waiting until the watermark covers its target ticket"
+        );
+
+        store.advance_watermark(&uri, 3);
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("reaching the target must wake the reader")
+            .expect("waiter task panicked");
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_proceeds_when_entry_removed_mid_wait() {
+        let store = Arc::new(DocumentStore::new());
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        store.advance_watermark(&uri, 1);
+
+        let waiter = {
+            let store = Arc::clone(&store);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                store.wait_for_epoch(&uri, 9, Duration::from_secs(10)).await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "reader is waiting for an unreached target"
+        );
+
+        // A didClose drops the watermark entry: the blocked reader must proceed
+        // (into the empty fallback) rather than stall to the timeout.
+        store.remove(&uri);
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("dropping the watermark sender must wake the reader")
+            .expect("waiter task panicked");
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_times_out_when_target_unreached() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        store.advance_watermark(&uri, 1);
+
+        // The watermark never reaches 9; the bounded wait returns after the
+        // timeout rather than hanging.
+        timeout(
+            Duration::from_secs(5),
+            store.wait_for_epoch(&uri, 9, Duration::from_millis(80)),
+        )
+        .await
+        .expect("wait_for_epoch must return after its own timeout even if unreached");
     }
 
     #[test]

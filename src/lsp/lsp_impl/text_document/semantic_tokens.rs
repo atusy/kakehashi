@@ -102,6 +102,22 @@ impl Kakehashi {
             return None;
         }
 
+        // Wait for the parse covering this reader's tail edit to resolve, keyed
+        // on the ingress parse **watermark** (per-document-parse-actor ADR). Today
+        // the parse runs inline within the writer's gated critical section, so by
+        // the time the gate releases this reader the watermark has already reached
+        // the tail ticket and this returns immediately — behavior-preserving. Once
+        // the per-document parse actor runs the parse off the ingress ticket, a
+        // bare `has_tree` check would pass while the store still holds the *old*
+        // tree (the #342/#374 stale-tree race); this watermark wait is what closes
+        // that, the first reader migrated to it. Bounded by the same 200ms as the
+        // has-tree wait below, which still backstops the empty fallback.
+        if let Some(tail) = crate::lsp::current_reader_tail() {
+            self.documents
+                .wait_for_epoch(uri, tail, Duration::from_millis(200))
+                .await;
+        }
+
         // Wait for any in-flight parse to complete
         self.documents
             .wait_for_parse_completion(uri, Duration::from_millis(200))
