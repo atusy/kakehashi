@@ -302,7 +302,7 @@ impl DiagnosticScheduler {
             Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: language_name.clone(),
-                text: std::sync::Arc::from(snapshot.text()),
+                text: snapshot.text_arc(),
                 configs,
                 priorities: agg.priorities,
                 strategy: agg.strategy,

@@ -244,13 +244,11 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         // (`resolve_host_bridge_context`, formatting, the diagnostic pull, `did_change`)
         // resolves an OWNED snapshot/text and drops its `DocumentStore` ref BEFORE
         // calling any bridge method that acquires `host_documents`. The `Ref` taken
-        // here is dropped within the closure (`doc.text()` is copied into an owned
-        // `Arc<str>`), so it never crosses an `.await`.
-        let live_text_reader: crate::lsp::bridge::HostTextReader = Arc::new(move || {
-            documents
-                .get(&host_uri)
-                .map(|doc| Arc::<str>::from(doc.text()))
-        });
+        // here is dropped within the closure (`text_arc()` cheaply clones the
+        // document's `Arc<str>` — a refcount bump, no copy — #498), so it never
+        // crosses an `.await`.
+        let live_text_reader: crate::lsp::bridge::HostTextReader =
+            Arc::new(move || documents.get(&host_uri).map(|doc| doc.text_arc()));
         bridge.eager_sync_host_document_on_servers(
             &host.uri,
             &host.language_id,
