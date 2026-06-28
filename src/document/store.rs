@@ -347,9 +347,14 @@ impl DocumentStore {
     /// document's — it exists exactly while the document is open and is dropped by
     /// [`remove`](Self::remove) on close.
     fn ensure_watermark_entry(&self, uri: &Url) {
-        self.watermarks
-            .entry(uri.clone())
-            .or_insert_with(|| watch::channel(0).0);
+        // `insert()` runs on every didChange; the entry almost always already
+        // exists. Probe with a borrowed `get` first so the common hit path takes
+        // no `Url` clone, paying the clone only on the (rare) first registration.
+        if self.watermarks.get(uri).is_none() {
+            self.watermarks
+                .entry(uri.clone())
+                .or_insert_with(|| watch::channel(0).0);
+        }
     }
 
     /// Publish that the parse covering ingress writer `ticket` for `uri` has
@@ -384,11 +389,12 @@ impl DocumentStore {
     /// ingress ticket a virt/native reader must observe — bounded by `timeout`.
     ///
     /// Returns early (proceed into the empty/`null` reader fallback) when the
-    /// watermark already covers `target`, when there is no watermark entry
-    /// (nothing has been published, or a `didClose` removed it — so there is
-    /// nothing to wait for), or when the entry is dropped while waiting (a
-    /// concurrent `didClose`). Non-inserting on the missing-entry path so it never
-    /// resurrects a watermark for a closed URI.
+    /// watermark already covers `target`, when there is no watermark entry — the
+    /// document is not registered (never opened, or a `didClose` removed it), as
+    /// `insert` seeds the entry at 0 for every live document, so there is nothing
+    /// to wait for — or when the entry is dropped while waiting (a concurrent
+    /// `didClose`). Non-inserting on the missing-entry path so it never resurrects
+    /// a watermark for a closed URI.
     pub(crate) async fn wait_for_epoch(
         &self,
         uri: &Url,
@@ -729,7 +735,9 @@ mod tests {
 
         // The intermediate ticket 2 must not release a reader waiting for 3.
         store.advance_watermark(&uri, 2);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Let the spawned waiter run to its park point (deterministic on the
+        // current-thread test runtime — no wall-clock dependency).
+        tokio::task::yield_now().await;
         assert!(
             !waiter.is_finished(),
             "reader must keep waiting until the watermark covers its target ticket"
@@ -757,7 +765,7 @@ mod tests {
             })
         };
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
         assert!(
             !waiter.is_finished(),
             "reader is waiting for an unreached target"

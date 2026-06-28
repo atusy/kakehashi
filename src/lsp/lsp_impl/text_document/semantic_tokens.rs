@@ -103,17 +103,19 @@ impl Kakehashi {
         }
 
         // Wait for the parse covering this reader's tail edit to resolve, keyed
-        // on the ingress parse **watermark** (per-document-parse-actor ADR). Today
-        // the parse runs inline within the writer's gated critical section, so by
-        // the time the gate releases this reader the watermark has already reached
-        // the tail ticket and this returns immediately — behavior-preserving (it
-        // adds no latency to the existing has-tree wait below, which keeps its
-        // full budget). It cannot stall here: the document is present (checked
-        // above), and every present document's writer advances its ticket's
-        // watermark. Once the per-document parse actor runs the parse off the
-        // ingress ticket, a bare `has_tree` check would instead pass while the
-        // store still holds the *old* tree (the #342/#374 stale-tree race); this
-        // watermark wait is what closes that — the first reader migrated to it.
+        // on the ingress parse **watermark** (per-document-parse-actor ADR),
+        // bounded by 200ms. In the current inline-parse world this returns
+        // effectively immediately: the parse runs within the writer's gated
+        // critical section, so by the time the gate releases this reader the
+        // watermark has already reached the tail ticket — so today it adds no
+        // measurable latency over the existing has-tree wait below. (The
+        // document is present — checked above — and every present document's
+        // writer advances its ticket's watermark, so the wait isn't expected to
+        // approach the 200ms bound under the inline model.) Once the per-document
+        // parse actor runs the parse off the ingress ticket this genuinely waits
+        // — that is the point: a bare `has_tree` check would instead pass while
+        // the store still holds the *old* tree (the #342/#374 stale-tree race),
+        // and this watermark wait is what closes it (the first reader migrated).
         if let Some(tail) = crate::lsp::current_reader_tail() {
             self.documents
                 .wait_for_epoch(uri, tail, Duration::from_millis(200))
