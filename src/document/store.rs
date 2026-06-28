@@ -229,6 +229,11 @@ impl DocumentStore {
             }
         };
         self.update_tree_availability(&uri, has_tree);
+        // Keep the "live document ⟺ watermark entry" invariant: `update_document`
+        // can insert on its `Vacant` branch, and a present document with no
+        // watermark entry would make `wait_for_epoch` treat it as unregistered.
+        // Idempotent on the (common) update-in-place path.
+        self.ensure_watermark_entry(&uri);
     }
 
     /// Store `new_tree` for an **existing** document, but only if its current text
@@ -626,6 +631,20 @@ mod tests {
             watermark_of(&store, &uri),
             Some(0),
             "registering the document seeds a watermark at 0"
+        );
+    }
+
+    #[test]
+    fn update_document_seeds_a_watermark_entry_when_it_inserts() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        // `update_document` (a reader on-demand fallback) inserts on its vacant
+        // branch; the watermark invariant must hold for the resulting document.
+        store.update_document(uri.clone(), "x".to_string(), None);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(0),
+            "a document created via update_document must still get a watermark entry"
         );
     }
 

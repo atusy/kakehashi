@@ -102,29 +102,33 @@ impl Kakehashi {
             return None;
         }
 
-        // Wait for the parse covering this reader's tail edit to resolve, keyed
-        // on the ingress parse **watermark** (per-document-parse-actor ADR),
-        // bounded by 200ms. In the current inline-parse world this returns
-        // effectively immediately: the parse runs within the writer's gated
-        // critical section, so by the time the gate releases this reader the
-        // watermark has already reached the tail ticket — so today it adds no
-        // measurable latency over the existing has-tree wait below. (The
-        // document is present — checked above — and every present document's
-        // writer advances its ticket's watermark, so the wait isn't expected to
-        // approach the 200ms bound under the inline model.) Once the per-document
-        // parse actor runs the parse off the ingress ticket this genuinely waits
-        // — that is the point: a bare `has_tree` check would instead pass while
-        // the store still holds the *old* tree (the #342/#374 stale-tree race),
-        // and this watermark wait is what closes it (the first reader migrated).
+        // Settle the in-flight parse before snapshotting, under a SINGLE 200ms
+        // budget shared across both waits so the `edit_lock` held here is never
+        // pinned longer than the pre-existing has-tree budget (the two waits do
+        // not stack to ~400ms).
+        //
+        // First wait on the parse **watermark** for this reader's tail edit
+        // (per-document-parse-actor ADR). In the current inline-parse world this
+        // returns effectively immediately — the parse runs within the writer's
+        // gated critical section, so by the time the gate releases this reader the
+        // watermark already covers the tail ticket — leaving the full budget for
+        // the has-tree wait below (so today this adds no measurable latency). Once
+        // the per-document parse actor runs the parse off the ingress ticket this
+        // genuinely waits — that is the point: a bare `has_tree` check would
+        // instead pass while the store still holds the *old* tree (the #342/#374
+        // stale-tree race), and this watermark wait is what closes it.
+        let settle_budget = Duration::from_millis(200);
+        let settle_start = std::time::Instant::now();
         if let Some(tail) = crate::lsp::current_reader_tail() {
             self.documents
-                .wait_for_epoch(uri, tail, Duration::from_millis(200))
+                .wait_for_epoch(uri, tail, settle_budget)
                 .await;
         }
 
-        // Wait for any in-flight parse to complete
+        // Wait for any in-flight parse to complete with whatever budget remains.
+        let remaining = settle_budget.saturating_sub(settle_start.elapsed());
         self.documents
-            .wait_for_parse_completion(uri, Duration::from_millis(200))
+            .wait_for_parse_completion(uri, remaining)
             .await;
 
         // First, try to use the tree from the document store.
