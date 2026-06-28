@@ -712,6 +712,74 @@ print("hello")
         );
     }
 
+    /// Regression (parse-actor flip): the debounced diagnostic — which drives the
+    /// on-edit host re-sync (#431) that keeps a push host's diagnostics following
+    /// edits — must be scheduled AFTER the off-ingress reparse, not in the
+    /// `did_change` handler. The handler clears the tree, and
+    /// `prepare_diagnostic_snapshot` returns `None` without a tree, so scheduling
+    /// the debounce there would capture a `None` snapshot and silently skip the
+    /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
+    /// the snapshot is `None` with the tree cleared and valid again once the
+    /// reparse restores it.
+    #[tokio::test]
+    async fn diagnostic_snapshot_needs_the_reparsed_tree_not_the_cleared_one() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/diag_follow.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust"),
+                vec![],
+                None,
+            )
+            .await;
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_some(),
+            "a parsed self-host doc yields a diagnostic snapshot"
+        );
+
+        // What did_change does synchronously: apply the edit and CLEAR the tree.
+        server
+            .documents
+            .update_document(uri.clone(), "fn changed() {}".to_string(), None);
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_none(),
+            "with the tree cleared, the snapshot is None — scheduling the debounce \
+             here (as the handler used to) would skip the on-edit host re-sync"
+        );
+
+        // The off-ingress reparse restores the tree → the snapshot is valid again,
+        // which is exactly why the debounce is scheduled from the reparse loop.
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_some(),
+            "after the reparse the snapshot is valid again (the debounce is scheduled here)"
+        );
+    }
+
     /// Resurrection safety (#480 off-ingress install): a `didClose` landing while
     /// the spawned auto-install runs removes the document; the late
     /// `reparse_installed_document` must NOT recreate it.

@@ -377,6 +377,7 @@ impl Kakehashi {
         let parse = self.parse_coordinator();
         let injection = self.injection_coordinator();
         let publisher = DiagnosticPublisher::new(self);
+        let diagnostic_scheduler = self.diagnostic_scheduler();
         let diagnostics = std::sync::Arc::clone(&self.diagnostics);
         let scheduler = std::sync::Arc::clone(&self.parse_scheduler);
         let shutdown = self.shutdown_token.clone();
@@ -423,6 +424,16 @@ impl Kakehashi {
                 if diagnostics.has_region_slots(&uri) {
                     publisher.republish(&uri).await;
                 }
+
+                // Schedule the debounced diagnostic HERE, after the reparse restored
+                // the tree — NOT in the did_change handler, where the tree has just
+                // been cleared. `prepare_diagnostic_snapshot` returns `None` without
+                // a tree (`Document::snapshot()` requires one), and a `None` snapshot
+                // makes the debounce a no-op — skipping the on-edit host re-sync
+                // (#431) that keeps a push-only `_self` host server's diagnostics
+                // following edits. Running it post-parse captures a snapshot with the
+                // fresh tree; the debounce coalesces across loop iterations.
+                diagnostic_scheduler.schedule_debounced_diagnostic(uri.clone());
 
                 if !scheduler.finish(&uri) {
                     // Normal exit: finish() removed the entry.

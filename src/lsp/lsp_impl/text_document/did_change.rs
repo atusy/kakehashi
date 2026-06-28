@@ -112,17 +112,17 @@ impl Kakehashi {
 
         // Schedule the OFF-INGRESS reparse: this replaces the inline parse_document,
         // the post-parse process_injections (didChange forwarding + injected-language
-        // processing + eager bridge spawn), and the geometry re-merge republish —
-        // all of which need the fresh tree and so run in the spawned, coalescing
-        // parse loop instead of holding the writer ticket. The handler returns
-        // without waiting on the parse.
+        // processing + eager bridge spawn), the geometry re-merge republish, AND the
+        // debounced diagnostic — all of which need the fresh tree and so run in the
+        // spawned, coalescing parse loop instead of holding the writer ticket.
+        //
+        // The debounced diagnostic in particular MUST run post-parse, not here: this
+        // handler just cleared the tree, and `prepare_diagnostic_snapshot` returns
+        // `None` without one (`Document::snapshot()` requires a tree). A `None`
+        // snapshot makes the debounce a no-op, skipping the on-edit host re-sync
+        // (#431) that keeps a push-only `_self` host server's diagnostics following
+        // edits. The handler returns without waiting on the parse.
         self.schedule_reparse(uri.clone(), ticket);
-
-        // pull-first-diagnostic-forwarding Phase 3: Schedule debounced diagnostic push on didChange.
-        // After 500ms of no changes, diagnostics will be collected and published.
-        // This provides near-real-time feedback while avoiding excessive requests during typing.
-        self.diagnostic_scheduler()
-            .schedule_debounced_diagnostic(uri);
 
         // NOTE: We intentionally do NOT call semantic_tokens_refresh() here.
         // LSP clients already request new tokens after didChange (via semanticTokens/full/delta).
