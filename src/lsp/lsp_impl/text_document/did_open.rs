@@ -90,6 +90,12 @@ impl Kakehashi {
             }
         }
 
+        // This didOpen's ingress writer ticket (plumbed from IngressOrderGate),
+        // used to stamp the store watermark so a reader gated behind this open is
+        // released once its parse — or the decision to defer parsing to install —
+        // has resolved.
+        let ticket = crate::lsp::current_writer_ticket();
+
         // Only parse if auto-install was NOT triggered
         // If auto-install was triggered, reload_language_after_install will call parse_document
         // after the parser file is completely written, preventing race condition
@@ -100,8 +106,17 @@ impl Kakehashi {
                     params.text_document.text,
                     Some(&language_id),
                     vec![], // No edits for initial document open
+                    ticket,
                 )
                 .await;
+        } else if let Some(ticket) = ticket {
+            // Parsing is deferred to reload_language_after_install. Advance the
+            // watermark now so a reader gated behind this open does not stall to
+            // its timeout waiting for a parse that won't run on the ingress path;
+            // it proceeds and observes the (still tree-less) install-pending
+            // document via its existing has-tree wait, exactly as before this
+            // signal existed.
+            self.documents.advance_watermark(&uri, ticket);
         }
 
         // Now handle deferred SemanticTokensRefresh events after document is parsed
@@ -642,7 +657,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), text, Some("rust"), vec![])
+            .parse_document(uri.clone(), text, Some("rust"), vec![], None)
             .await;
 
         let snapshot = server
@@ -775,7 +790,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), text, Some("rust"), vec![])
+            .parse_document(uri.clone(), text, Some("rust"), vec![], None)
             .await;
 
         let snapshot = server

@@ -53,6 +53,25 @@ use tower_lsp_server::jsonrpc::{Request, Response};
 
 use crate::error::LockResultExt;
 
+tokio::task_local! {
+    /// The current writer's ingress ticket, scoped around the gated handler
+    /// future so the `didOpen` / `didChange` handler can stamp the parse it
+    /// schedules with the wire-order ticket. Read via [`current_writer_ticket`].
+    ///
+    /// Deliberately bridges gate→handler only: the handler reads it and threads
+    /// the ticket down to `parse_document` as an explicit value, so the parse can
+    /// publish the watermark from inside the per-document actor task later, where
+    /// this task-local is no longer in scope.
+    static WRITER_TICKET: u64;
+}
+
+/// The ingress writer ticket of the currently-running gated writer handler, or
+/// `None` when called outside a gated writer (e.g. a unit test invoking a
+/// handler directly without the middleware).
+pub(crate) fn current_writer_ticket() -> Option<u64> {
+    WRITER_TICKET.try_with(|ticket| *ticket).ok()
+}
+
 /// Per-document sequencing state.
 struct DocSeq {
     /// Last issued writer ticket (tickets start at 1; 0 = none issued).
@@ -339,10 +358,12 @@ where
             Some(Role::Writer { uri, close }) => {
                 let sequencer = Arc::clone(&self.sequencer);
                 let mut gate = sequencer.issue_writer_ticket(&uri);
+                let ticket = gate.ticket();
                 Box::pin(async move {
                     gate.wait_turn().await;
-                    let result = inner_fut.await;
-                    let ticket = gate.ticket();
+                    // Scope the ticket around the handler so it can stamp its
+                    // scheduled parse with this wire-order ticket.
+                    let result = WRITER_TICKET.scope(ticket, inner_fut).await;
                     // Mark done before any cleanup decision.
                     drop(gate);
                     if close {

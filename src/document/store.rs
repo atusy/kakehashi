@@ -35,6 +35,21 @@ pub struct DocumentStore {
     /// `Kakehashi::store_lineage` (captures-protocol §"Delta semantics").
     open_generations: DashMap<Url, u64>,
     open_counter: std::sync::atomic::AtomicU64,
+    /// Per-document **parse watermark**: the highest ingress writer ticket whose
+    /// parse has reached a terminal outcome (a tree, or parsed-to-nothing). It is
+    /// monotonic per document and published by the parse path on resolution.
+    ///
+    /// This is deliberately a signal **distinct** from the `IngressOrderGate`
+    /// completion channel. Today the parse resolves *inline*, before its writer
+    /// ticket completes, so the watermark and ticket-completion move in lockstep;
+    /// a reader gated behind the ticket already observes a fresh tree. The
+    /// per-document parse actor (see `per-document-parse-actor` ADR) will run the
+    /// parse *off* the ingress ticket, at which point ticket-completion no longer
+    /// implies a fresh tree and this watermark — not the completion channel — is
+    /// what tells a virt/native reader the store reflects its tail edit. Keyed on
+    /// the ticket (the intra-lifetime wire order); the incarnation half of the
+    /// eventual `(incarnation, ticket)` epoch is not folded in yet.
+    watermarks: DashMap<Url, watch::Sender<u64>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,6 +85,7 @@ impl Default for DocumentStore {
             edit_locks: DashMap::new(),
             open_generations: DashMap::new(),
             open_counter: std::sync::atomic::AtomicU64::new(0),
+            watermarks: DashMap::new(),
         }
     }
 }
@@ -322,11 +338,40 @@ impl DocumentStore {
         self.edit_locks.remove(uri);
     }
 
+    /// Publish that the parse covering ingress writer `ticket` for `uri` has
+    /// reached a terminal outcome. The watermark only ever advances — a later
+    /// resolution for an earlier ticket (a parse superseded then completed out of
+    /// order) cannot regress it — so a reader's `>= target` wait is stable. The
+    /// entry is created on first publish (a live document always parses before any
+    /// reader needs it) and dropped by [`remove`](Self::remove) on close.
+    pub(crate) fn advance_watermark(&self, uri: &Url, ticket: u64) {
+        let sender = match self.watermarks.entry(uri.clone()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let (sender, _receiver) = watch::channel(0);
+                entry.insert(sender.clone());
+                sender
+            }
+        };
+        sender.send_if_modified(|watermark| {
+            if ticket > *watermark {
+                *watermark = ticket;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     // Lock safety: Single remove() call - no read lock held before or during write
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
         self.edit_locks.remove(uri);
         self.open_generations.remove(uri);
+        // Dropping the watermark sender wakes any reader still blocked on
+        // `wait_for_epoch` for this document, so a reader racing the close
+        // proceeds into the empty fallback instead of stalling to the timeout.
+        self.watermarks.remove(uri);
         self.documents.remove(uri).map(|(_, doc)| doc)
     }
 
@@ -497,6 +542,54 @@ mod tests {
             store.parse_states.get(&uri).is_none(),
             "the availability update must not recreate a parse-state for a URI whose \
              parse-state a concurrent close already removed"
+        );
+    }
+
+    /// Read the published watermark for a URI (test-only; the field is private).
+    fn watermark_of(store: &DocumentStore, uri: &Url) -> Option<u64> {
+        store.watermarks.get(uri).map(|s| *s.borrow())
+    }
+
+    #[test]
+    fn advance_watermark_publishes_the_ticket() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        assert_eq!(watermark_of(&store, &uri), None, "no entry before any publish");
+
+        store.advance_watermark(&uri, 7);
+        assert_eq!(watermark_of(&store, &uri), Some(7), "publish records the ticket");
+    }
+
+    #[test]
+    fn advance_watermark_is_monotonic() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        store.advance_watermark(&uri, 5);
+        // An out-of-order resolution for an earlier ticket must not regress it.
+        store.advance_watermark(&uri, 3);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(5),
+            "a later-but-lower publish must not regress the watermark"
+        );
+
+        store.advance_watermark(&uri, 8);
+        assert_eq!(watermark_of(&store, &uri), Some(8), "a higher ticket advances it");
+    }
+
+    #[test]
+    fn remove_drops_the_watermark_entry() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        store.insert(uri.clone(), "x".to_string(), Some("rust".to_string()), None);
+        store.advance_watermark(&uri, 4);
+        assert_eq!(watermark_of(&store, &uri), Some(4));
+
+        store.remove(&uri);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            None,
+            "closing the document drops its watermark so a reopen starts fresh"
         );
     }
 

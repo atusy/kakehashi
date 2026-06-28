@@ -139,15 +139,35 @@ impl ParseCoordinator {
         }
     }
 
+    /// Parse `uri`'s text and publish the result into the store.
+    ///
+    /// `ticket` is the ingress writer ticket of the mutation that scheduled this
+    /// parse (plumbed from `IngressOrderGate` via the handler), or `None` for a
+    /// caller outside the ingress sequence (a post-install reparse, or a test
+    /// driving the coordinator directly). On every resolution path — a tree, a
+    /// parsed-to-nothing, a previously-crashed parser, or no detectable language —
+    /// the parse advances the store's per-document **watermark** to `ticket`, so a
+    /// virt/native reader waiting on the watermark is released once the parse
+    /// covering its tail edit has resolved. Threading the ticket as an explicit
+    /// value (rather than reading a task-local here) keeps this signature stable
+    /// when the per-document parse actor later runs this off the ingress task.
     pub(crate) async fn parse_document(
         &self,
         uri: Url,
         text: String,
         language_id: Option<&str>,
         edits: Vec<InputEdit>,
+        ticket: Option<u64>,
     ) {
         let parse_generation = self.documents.mark_parse_started(&uri);
         let mut events = Vec::new();
+
+        // Publish the watermark on whichever path resolves the parse below.
+        let advance_watermark = || {
+            if let Some(ticket) = ticket {
+                self.documents.advance_watermark(&uri, ticket);
+            }
+        };
 
         let language_name = self
             .language
@@ -164,6 +184,7 @@ impl ParseCoordinator {
                     .insert(uri.clone(), text, Some(language_name), None);
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, false);
+                advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 return;
             }
@@ -230,6 +251,7 @@ impl ParseCoordinator {
 
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, true);
+                advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 return;
             }
@@ -238,6 +260,7 @@ impl ParseCoordinator {
         self.documents.insert(uri.clone(), text, None, None);
         self.documents
             .mark_parse_finished(&uri, parse_generation, false);
+        advance_watermark();
         self.notifier().log_language_events(&events).await;
     }
 

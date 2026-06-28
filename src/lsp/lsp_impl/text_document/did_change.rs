@@ -75,9 +75,16 @@ impl Kakehashi {
         // Must be called BEFORE parse_document which updates the injection_map.
         self.cache.invalidate_for_edits(&uri, &edits);
 
-        // Parse the updated document with edit information
+        // Parse the updated document with edit information. The parse stamps the
+        // store watermark with this didChange's ingress ticket on resolution.
         self.parse_coordinator()
-            .parse_document(uri.clone(), text, language_id.as_deref(), edits)
+            .parse_document(
+                uri.clone(),
+                text,
+                language_id.as_deref(),
+                edits,
+                crate::lsp::current_writer_ticket(),
+            )
             .await;
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.
