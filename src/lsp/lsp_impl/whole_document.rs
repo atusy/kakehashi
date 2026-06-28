@@ -65,14 +65,13 @@ impl Kakehashi {
             log::debug!("{} called for {}", method_name, uri);
 
             // Tower-LSP runs requests concurrently, so a whole-document request can
-            // arrive before didOpen/didChange has finished parsing. Wait briefly
-            // for any in-flight parse to land a tree before snapshotting, matching
-            // the read-handler pattern (semantic tokens, rangeFormatting, node
-            // lookups); otherwise an otherwise-valid request would degrade to
-            // `Ok(None)` purely due to a parse race.
-            self.documents
-                .wait_for_parse_completion(&uri, std::time::Duration::from_millis(200))
-                .await;
+            // arrive before didOpen/didChange has finished parsing, and didChange
+            // now reparses off-ingress. Use the shared post-edit freshness helper
+            // (wait for the reparse, then parse on demand) before snapshotting —
+            // matching the other read handlers (semantic tokens, formatting, node
+            // lookups) — so an otherwise-valid request doesn't degrade to `Ok(None)`
+            // on a parse race or a reparse slower than the bounded wait.
+            self.ensure_document_parsed(&uri).await;
 
             // Get document snapshot (minimizes lock duration)
             let snapshot = match self.documents.get(&uri) {

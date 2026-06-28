@@ -66,6 +66,12 @@ impl Kakehashi {
 
         log::debug!("documentSymbol called for {}", uri);
 
+        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
+        // reparses off-ingress, so without this the virt layer drops injection-region
+        // symbols for the whole reparse window after every edit (the host layer is
+        // unaffected — it needs no tree).
+        self.ensure_document_parsed(&uri).await;
+
         // Get document snapshot (minimizes lock duration)
         let snapshot = match self.documents.get(&uri) {
             None => {
