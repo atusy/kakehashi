@@ -48,7 +48,10 @@ impl Kakehashi {
         ch: &str,
         options: FormattingOptions,
     ) -> Result<Option<Vec<TextEdit>>> {
-        let Some(ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
+        let Some(ctx) = self
+            .resolve_bridge_contexts(lsp_uri, position, METHOD)
+            .await
+        else {
             return Ok(None);
         };
 

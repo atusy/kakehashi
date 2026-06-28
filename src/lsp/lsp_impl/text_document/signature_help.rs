@@ -47,7 +47,10 @@ impl Kakehashi {
         position: Position,
     ) -> Result<Option<SignatureHelp>> {
         // Use shared preamble to resolve injection context with ALL matching servers
-        let Some(ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
+        let Some(ctx) = self
+            .resolve_bridge_contexts(lsp_uri, position, METHOD)
+            .await
+        else {
             return Ok(None);
         };
 

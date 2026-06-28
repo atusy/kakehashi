@@ -70,7 +70,7 @@ impl Kakehashi {
         // Ensure the document is parsed before snapshotting — same race as in
         // `kakehashi/node`: didOpen schedules an async parse, a client that
         // immediately follows up with `parent` must not see `tree: None`.
-        self.ensure_parsed_for_node_lookup(&uri).await;
+        self.ensure_document_parsed(&uri).await;
 
         // Snapshot the document so we operate on a consistent (text, tree) pair.
         let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {

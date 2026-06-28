@@ -44,7 +44,10 @@ impl Kakehashi {
         new_name: &str,
         client_progress_token: Option<NumberOrString>,
     ) -> Result<Option<WorkspaceEdit>> {
-        let Some(mut ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
+        let Some(mut ctx) = self
+            .resolve_bridge_contexts(lsp_uri, position, METHOD)
+            .await
+        else {
             return Ok(None);
         };
         ctx.document.client_progress_token = client_progress_token;

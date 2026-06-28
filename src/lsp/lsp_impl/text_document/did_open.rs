@@ -86,6 +86,7 @@ impl Kakehashi {
                     // watermark so a gated reader is not stranded.
                     let install = self.install_coordinator();
                     let injection = self.injection_coordinator();
+                    let diagnostic_scheduler = self.diagnostic_scheduler();
                     let documents = std::sync::Arc::clone(&self.documents);
                     let lang = lang.clone();
                     let install_uri = uri.clone();
@@ -109,6 +110,12 @@ impl Kakehashi {
                             .is_some_and(|doc| doc.tree().is_some());
                         if has_tree {
                             injection.process_injections(&install_uri, false).await;
+                            // Re-fire the proactive synthetic diagnostic now that a
+                            // tree exists: the handler's spawn (below) ran in the
+                            // skip-parse path with no tree, so its snapshot was None
+                            // and the pull-layer diagnostics were skipped on this
+                            // first open of a just-installed parser.
+                            diagnostic_scheduler.spawn_synthetic_diagnostic_task(install_uri);
                         }
                     });
                     skip_parse = true;
@@ -709,6 +716,105 @@ print("hello")
         assert!(
             host.configs.iter().any(|c| c.server_name == "rust_ls"),
             "the push-only rust_ls must be in the host context so the debounce re-sync reaches it"
+        );
+    }
+
+    /// Regression (parse-actor flip): the host bridge context needs only the
+    /// document text, never the parse tree (parse-decoupled ADR), so it must keep
+    /// resolving after `did_change` clears the tree — otherwise every host-bridged
+    /// request (hover / definition / formatting / diagnostics) would bail for the
+    /// whole reparse window after each edit.
+    #[tokio::test]
+    async fn resolve_host_bridge_context_survives_a_cleared_tree() {
+        use std::str::FromStr;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/host_cleared.rs").unwrap();
+        let lsp_uri = tower_lsp_server::ls_types::Uri::from_str(uri.as_str()).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust"),
+                vec![],
+                None,
+            )
+            .await;
+        assert!(
+            server
+                .resolve_host_bridge_context(&lsp_uri, "textDocument/diagnostic")
+                .is_some(),
+            "sanity: host context resolves with a tree present"
+        );
+
+        // did_change clears the tree synchronously.
+        server
+            .documents
+            .update_document(uri.clone(), "fn changed() {}".to_string(), None);
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_none(),
+            "precondition: the tree is cleared"
+        );
+        assert!(
+            server
+                .resolve_host_bridge_context(&lsp_uri, "textDocument/diagnostic")
+                .is_some(),
+            "host context must survive a cleared tree (it needs only text, not the tree)"
+        );
+    }
+
+    /// Regression (parse-actor flip): `ensure_document_parsed` — the shared
+    /// post-edit freshness helper that every snapshot-reading handler (pull
+    /// diagnostics, the position/range bridge preamble, formatting, node/captures)
+    /// now calls — must restore a tree that `did_change` cleared, so those handlers
+    /// don't return empty/null after every edit while the off-ingress reparse is
+    /// still pending. (Without it, a request racing the reparse sees
+    /// `snapshot() == None`.)
+    #[tokio::test]
+    async fn ensure_document_parsed_restores_a_cleared_tree() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/ensure_fresh.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust"),
+                vec![],
+                None,
+            )
+            .await;
+
+        // did_change applies the edit and CLEARS the tree synchronously.
+        server
+            .documents
+            .update_document(uri.clone(), "fn changed() {}".to_string(), None);
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+
+        // A reader's freshness call restores the tree (here via on-demand parse,
+        // since no off-ingress reparse is running in this unit test).
+        server.ensure_document_parsed(&uri).await;
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_some(),
+            "the freshness helper must restore the tree so post-edit readers aren't empty"
         );
     }
 

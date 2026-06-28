@@ -200,7 +200,7 @@ impl Kakehashi {
 
         // Same race as the other handlers: didOpen schedules an async parse, so
         // a request issued immediately after must not see `tree: None`.
-        self.ensure_parsed_for_node_lookup(&uri).await;
+        self.ensure_document_parsed(&uri).await;
 
         // Snapshot so we operate on a consistent (text, tree) pair.
         let snapshot = self.documents.get(&uri).and_then(|doc| doc.snapshot())?;
@@ -351,7 +351,7 @@ impl Kakehashi {
         }
 
         // Same didOpen race guard as the single-id prelude.
-        self.ensure_parsed_for_node_lookup(&uri).await;
+        self.ensure_document_parsed(&uri).await;
         let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
             return Value::Null;
         };

@@ -93,6 +93,12 @@ impl Kakehashi {
 
         log::debug!("formatting called for {}", uri);
 
+        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
+        // reparses off-ingress, so a format-on-save batched right after an edit
+        // would otherwise snapshot `None` and return no edits. (range_formatting
+        // uses the same helper — keep them from drifting.)
+        self.ensure_document_parsed(&uri).await;
+
         let snapshot = match self.documents.get(&uri) {
             None => {
                 log::debug!("formatting: No document found for {}", uri);

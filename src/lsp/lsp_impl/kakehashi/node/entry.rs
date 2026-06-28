@@ -166,7 +166,7 @@ impl Kakehashi {
         // Ensure the document is parsed before snapshotting. `didOpen` inserts the
         // document with `tree: None` and schedules an async parse; a client that
         // calls `kakehashi/node` quickly afterwards must not race with that parse.
-        self.ensure_parsed_for_node_lookup(&uri).await;
+        self.ensure_document_parsed(&uri).await;
 
         // Snapshot the document so we hold the read lock for as short as possible.
         let snapshot = match self.documents.get(&uri).and_then(|doc| doc.snapshot()) {
@@ -388,7 +388,18 @@ impl Kakehashi {
         }
     }
 
-    /// Parse the document on-demand if its tree has not been built yet.
+    /// Ensure the store holds a **fresh** parse tree for `uri`, parsing on demand
+    /// if needed. The shared post-edit freshness helper for every request handler
+    /// that snapshots the document tree.
+    ///
+    /// Since the per-document parse actor flip, `didChange` clears the tree and
+    /// reparses **off-ingress**, so a request arriving in the reparse window finds
+    /// `Document::snapshot()` returning `None`. Any tree-reading handler must call
+    /// this first: it waits the bounded `wait_for_parse_completion` for the
+    /// off-ingress reparse to land and, failing that, parses on demand and writes
+    /// the tree through the non-inserting CAS — so the caller's subsequent
+    /// `snapshot()` sees a current `(text, tree)` pair instead of empty/stale.
+    /// Without it the handler degrades to empty results after every edit.
     ///
     /// `didOpen` inserts the document immediately with `tree: None` and
     /// schedules an asynchronous parse. `kakehashi/node` requests issued
@@ -404,10 +415,7 @@ impl Kakehashi {
     /// not a stale combination produced mid-parse. The timeout matches the
     /// `semantic_tokens` budget so this helper stays responsive even if the
     /// parser hangs on a pathological input.
-    pub(in crate::lsp::lsp_impl::kakehashi) async fn ensure_parsed_for_node_lookup(
-        &self,
-        uri: &Url,
-    ) {
+    pub(crate) async fn ensure_document_parsed(&self, uri: &Url) {
         self.documents
             .wait_for_parse_completion(uri, std::time::Duration::from_millis(200))
             .await;
