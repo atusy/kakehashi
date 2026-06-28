@@ -52,11 +52,20 @@ fn order_by_priority<T>(tagged: Vec<(String, T)>, priorities: &[String]) -> Vec<
 /// `NoResult{errors}` when every task fails, `Cancelled` if a cancel arrives
 /// first. Callers MUST follow up with `pool.unregister_all_for_upstream_id()`
 /// to clean up entries left behind by aborted tasks.
+///
+/// `panic_sink`, when set, is incremented once per task that **panicked**
+/// (`JoinError`). This is surfaced even on `Done` — unlike the local `errors`
+/// tally, which the partial-success `Done` arm discards — because a concatenated
+/// caller counts I/O failures in-task but a panic unwinds before that runs, so
+/// the sink is the only path that lets a panicking server drive CLI exit 2
+/// (#506). Only panics feed it: I/O `Err`s are left to the caller's in-task
+/// counting, so they are never double-counted here.
 pub(crate) async fn concatenated<T: Send + 'static>(
     join_set: &mut JoinSet<TaggedResult<T>>,
     priorities: &[String],
     cancel_rx: Option<CancelReceiver>,
     log_target: Option<&str>,
+    panic_sink: Option<&std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 ) -> FanInResult<Vec<T>> {
     let log_target = log_target.unwrap_or(module_path!());
     let mut results: Vec<(String, T)> = Vec::new();
@@ -80,6 +89,15 @@ pub(crate) async fn concatenated<T: Send + 'static>(
                     None => break,
                     Some(Err(join_err)) => {
                         errors += 1;
+                        // Surface the panic to the caller's sink even though a
+                        // partial-success run returns `Done` and drops `errors`.
+                        // ONLY panics feed the sink: a panicking task unwinds
+                        // before the dispatch's in-task error counting runs,
+                        // whereas an I/O `Err` is already counted in-task — so
+                        // adding I/O errors here too would double-count (#506).
+                        if let Some(sink) = panic_sink {
+                            sink.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         log::warn!(target: log_target, "bridge task panicked: {join_err}");
                     }
                     Some(Ok(tagged)) => match tagged.value {
@@ -104,9 +122,67 @@ pub(crate) async fn concatenated<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::lsp::aggregation::server::fan_in::test_helpers::*;
+
+    #[tokio::test]
+    async fn concatenated_surfaces_panic_count_to_sink_even_on_partial_success() {
+        // A downstream-request task that PANICS unwinds before its in-task
+        // error counting runs, and a partial-success run returns `Done`
+        // (dropping the local `errors` tally), so without the panic sink a
+        // panicking server is invisible to CLI exit-2 accounting (#506).
+        let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Ok(42));
+        spawn_panicking(&mut join_set);
+
+        let sink = Arc::new(AtomicUsize::new(0));
+        let result = concatenated(&mut join_set, &[], None, None, Some(&sink)).await;
+
+        // Partial success: the surviving result is still returned...
+        let values = assert_done(result);
+        assert_eq!(values, vec![42]);
+        // ...and the panic is surfaced to the sink so it can drive exit 2.
+        assert_eq!(sink.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn concatenated_panic_sink_counts_only_panics_not_io_errors() {
+        // The panic sink is fed ONLY by `JoinError` panics. I/O failures are
+        // counted in-task by the concatenated dispatch's send closure, so the
+        // fan-in must not double-count them here.
+        let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Ok(42));
+        spawn_tagged(&mut join_set, Err(io::Error::other("io fail")));
+
+        let sink = Arc::new(AtomicUsize::new(0));
+        let result = concatenated(&mut join_set, &[], None, None, Some(&sink)).await;
+
+        assert_eq!(assert_done(result), vec![42]);
+        assert_eq!(
+            sink.load(Ordering::Relaxed),
+            0,
+            "I/O errors are counted in-task, never via the panic sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn concatenated_surfaces_panic_count_to_sink_when_all_fail() {
+        // All tasks panic → `NoResult`. The concatenated dispatch does not
+        // count `NoResult.errors`, so the panic sink is the only path that
+        // surfaces an all-panic run as exit 2.
+        let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
+        spawn_panicking(&mut join_set);
+        spawn_panicking(&mut join_set);
+
+        let sink = Arc::new(AtomicUsize::new(0));
+        let result = concatenated(&mut join_set, &[], None, None, Some(&sink)).await;
+
+        assert_eq!(assert_no_result(result), 2);
+        assert_eq!(sink.load(Ordering::Relaxed), 2);
+    }
 
     #[tokio::test]
     async fn concatenated_returns_all_successful_results() {
@@ -115,7 +191,7 @@ mod tests {
         spawn_tagged(&mut join_set, Ok(2));
         spawn_tagged(&mut join_set, Ok(3));
 
-        let result = concatenated(&mut join_set, &[], None, None).await;
+        let result = concatenated(&mut join_set, &[], None, None, None).await;
         let mut values = assert_done(result);
         values.sort();
         assert_eq!(values, vec![1, 2, 3]);
@@ -128,7 +204,7 @@ mod tests {
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 2")));
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 3")));
 
-        let result = concatenated(&mut join_set, &[], None, None).await;
+        let result = concatenated(&mut join_set, &[], None, None, None).await;
         assert_eq!(
             assert_no_result(result),
             3,
@@ -143,7 +219,7 @@ mod tests {
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 1")));
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 2")));
 
-        let result = concatenated(&mut join_set, &[], None, None).await;
+        let result = concatenated(&mut join_set, &[], None, None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![42]);
     }
@@ -152,7 +228,7 @@ mod tests {
     async fn concatenated_returns_done_empty_for_empty_join_set() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
 
-        let result = concatenated(&mut join_set, &[], None, None).await;
+        let result = concatenated(&mut join_set, &[], None, None, None).await;
         let values = assert_done(result);
         assert!(
             values.is_empty(),
@@ -174,7 +250,7 @@ mod tests {
 
         tx.send(()).unwrap();
 
-        let result = concatenated(&mut join_set, &[], Some(rx), None).await;
+        let result = concatenated(&mut join_set, &[], Some(rx), None, None).await;
         assert_cancelled(result);
     }
 
@@ -184,7 +260,7 @@ mod tests {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged(&mut join_set, Ok(42));
 
-        let result = concatenated(&mut join_set, &[], Some(rx), None).await;
+        let result = concatenated(&mut join_set, &[], Some(rx), None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![42]);
     }
@@ -201,7 +277,7 @@ mod tests {
             "server_b".to_string(),
             "server_c".to_string(),
         ];
-        let result = concatenated(&mut join_set, &priorities, None, None).await;
+        let result = concatenated(&mut join_set, &priorities, None, None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![1, 2, 3]);
     }
@@ -215,7 +291,7 @@ mod tests {
 
         // Only server_a and server_b are prioritized; server_x is unlisted
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = concatenated(&mut join_set, &priorities, None, None).await;
+        let result = concatenated(&mut join_set, &priorities, None, None, None).await;
         let values = assert_done(result);
         // Prioritized servers first in order, then unlisted
         assert_eq!(&values[..2], &[1, 2]);
@@ -231,7 +307,7 @@ mod tests {
 
         // server_a is prioritized but fails; server_b succeeds; server_x is unlisted
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = concatenated(&mut join_set, &priorities, None, None).await;
+        let result = concatenated(&mut join_set, &priorities, None, None, None).await;
         let values = assert_done(result);
         // server_b (prioritized, succeeded) first, then server_x (unlisted)
         assert_eq!(values, vec![2, 99]);
@@ -244,7 +320,7 @@ mod tests {
 
         // server_a is in priorities but has no task in the JoinSet
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = concatenated(&mut join_set, &priorities, None, None).await;
+        let result = concatenated(&mut join_set, &priorities, None, None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![2]);
     }

@@ -61,4 +61,14 @@ pub(super) mod test_helpers {
             }
         });
     }
+
+    /// Spawn a task that panics, so `join_next` yields a `JoinError` — the
+    /// shape of a downstream-request task that unwound instead of returning
+    /// `Err` (the case the panic sink must surface, #506).
+    pub(super) fn spawn_panicking<T: Send + 'static>(join_set: &mut JoinSet<TaggedResult<T>>) {
+        async fn panicking_task<T>() -> TaggedResult<T> {
+            panic!("simulated bridge task panic");
+        }
+        join_set.spawn(panicking_task::<T>());
+    }
 }

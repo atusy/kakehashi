@@ -233,6 +233,10 @@ pub(crate) async fn dispatch_concatenated<T, F, Fut>(
     f: F,
     cancel_rx: Option<CancelReceiver>,
     log_target: Option<&str>,
+    // Counts panicking tasks (`JoinError`) even on partial-success `Done`, so a
+    // panicking server still drives CLI exit 2 (#506). The caller still counts
+    // I/O failures in-task; only panics feed this.
+    panic_sink: Option<&std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 ) -> FanInResult<Vec<T>>
 where
     T: Send + 'static,
@@ -245,7 +249,7 @@ where
     // Client progress under concatenated is a later stage; pass no tokens so
     // downstream `$/progress` is dropped (non-regressing).
     let mut join_set = fan_out(ctx, pool, f, &selected, None);
-    concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target).await
+    concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target, panic_sink).await
 }
 
 #[cfg(test)]

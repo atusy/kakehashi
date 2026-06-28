@@ -474,8 +474,17 @@ pub(crate) async fn collect_host_diagnostics(
                     result
                 }
             };
-            match dispatch_host_concatenated(ctx, pool, send, None, Some("kakehashi::diagnostic"))
-                .await
+            match dispatch_host_concatenated(
+                ctx,
+                pool,
+                send,
+                None,
+                Some("kakehashi::diagnostic"),
+                // Surface panic failures (the in-task `send` counts I/O errors
+                // only, and `Done` drops the fan-in's own tally) (#506).
+                request_error_sink.as_ref(),
+            )
+            .await
             {
                 FanInResult::Done(vecs) => vecs.into_iter().flatten().collect(),
                 FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
@@ -592,6 +601,10 @@ async fn dispatch_concatenated_diagnostics(
         |t| send_diagnostic_request_counting_errors(t, sink.clone()),
         None, // cancel handled at outer level
         None, // no custom log_target
+        // Panics unwind before the in-task counting above runs, and a
+        // partial-success `Done` discards the fan-in's own tally, so surface
+        // panic failures through the sink to keep exit 2 honest (#506).
+        sink.as_ref(),
     )
     .await;
 
