@@ -192,17 +192,21 @@ impl DocumentSequencer {
         let Some(entry) = self.docs.get(uri) else {
             return (None, None);
         };
-        let barrier = if *entry.completion.done.borrow() < entry.tail {
-            let rx = entry.completion.done.subscribe();
+        let done = *entry.completion.done.borrow();
+        let tail = entry.tail;
+        let barrier = if done < tail {
             Some(ReaderBarrier {
-                target: entry.tail,
-                rx,
+                target: tail,
+                rx: entry.completion.done.subscribe(),
             })
         } else {
             None
         };
-        let tail = (entry.tail > 0).then_some(entry.tail);
-        (barrier, tail)
+        // Release the `docs` read-lock shard before the cheap tail check: this is
+        // the reader hot path, and holding it would needlessly contend with
+        // writers taking the shard's write lock (issue_writer_ticket / finish_close).
+        drop(entry);
+        (barrier, (tail > 0).then_some(tail))
     }
 
     /// Drop `uri`'s sequencing state after a close completed, unless later
