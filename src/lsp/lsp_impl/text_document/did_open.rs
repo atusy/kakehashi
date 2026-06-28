@@ -117,8 +117,16 @@ impl Kakehashi {
 
         // pull-first-diagnostic-forwarding Phase 2: Trigger synthetic diagnostic push on didOpen
         // This provides proactive diagnostics for clients that don't support pull diagnostics.
-        self.diagnostic_scheduler()
-            .spawn_synthetic_diagnostic_task(uri);
+        //
+        // Skipped in one-shot CLI mode (#489): no editor consumes the proactive
+        // `publishDiagnostics` (the stub client pump discards it), so the task is
+        // pure wasted downstream work, and its abort-without-join on `didClose`
+        // races the bridge-state sweep. The CLI's reported diagnostics come from the
+        // explicit `diagnostic_impl` pull, which is unaffected.
+        if !self.is_cli_mode() {
+            self.diagnostic_scheduler()
+                .spawn_synthetic_diagnostic_task(uri);
+        }
 
         // NOTE: No semantic_tokens_refresh() on didOpen.
         // Capable LSP clients should request by themselves.
@@ -781,6 +789,80 @@ print("hello")
         assert!(
             !snapshot.host_pull_enabled,
             "pullFallback = false disables the host pull (host_pull_enabled = false)"
+        );
+    }
+
+    /// #489: in one-shot CLI mode no editor consumes a proactive
+    /// `publishDiagnostics`, so `did_open_impl` must NOT schedule the synthetic
+    /// diagnostic task — that avoids the wasted downstream pull and the
+    /// abort-vs-`didClose` race. The LSP-mode control below proves the assertion
+    /// discriminates (the task IS scheduled when not in CLI mode), so a gate that
+    /// suppressed it unconditionally would fail the control.
+    #[tokio::test]
+    async fn cli_mode_did_open_does_not_schedule_synthetic_diagnostic_task() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        });
+        server.mark_cli_mode();
+
+        let uri = Url::parse("file:///test/cli_no_synthetic.md").unwrap();
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri,
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    text: "# hi\n".to_string(),
+                },
+            })
+            .await;
+
+        assert!(
+            !server.synthetic_diagnostics.has_active_task(&uri),
+            "CLI-mode didOpen must not schedule a synthetic diagnostic task (#489)"
+        );
+    }
+
+    /// Control for the test above: in LSP mode (the default) `did_open_impl` DOES
+    /// schedule the synthetic diagnostic task. Without this, a no-op gate would let
+    /// the CLI-suppression test pass vacuously.
+    #[tokio::test]
+    async fn lsp_mode_did_open_schedules_synthetic_diagnostic_task() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        });
+
+        let uri = Url::parse("file:///test/lsp_synthetic.md").unwrap();
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri,
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    text: "# hi\n".to_string(),
+                },
+            })
+            .await;
+
+        assert!(
+            server.synthetic_diagnostics.has_active_task(&uri),
+            "LSP-mode didOpen schedules the synthetic diagnostic task"
         );
     }
 }

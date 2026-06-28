@@ -175,6 +175,12 @@ pub struct Kakehashi {
     /// is live (unambiguous), otherwise `null`.
     #[allow(clippy::type_complexity)]
     captures_cache: dashmap::DashMap<(Url, String), [Option<(String, Vec<serde_json::Value>)>; 2]>,
+    /// True when the process runs as a one-shot CLI (`kakehashi diagnose`/`format`)
+    /// rather than a long-lived LSP server. Set once by `cli_initialize`. No editor
+    /// consumes a proactive `publishDiagnostics` in CLI mode (the stub client pump
+    /// discards it), so `did_open_impl` skips the synthetic diagnostic task — that
+    /// avoids both the wasted downstream pull and the abort-vs-`didClose` race (#489).
+    cli_mode: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Kakehashi {
@@ -244,7 +250,20 @@ impl Kakehashi {
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
+            cli_mode: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Mark this instance as running in one-shot CLI mode. Called by
+    /// `cli_initialize`; see the `cli_mode` field.
+    pub(crate) fn mark_cli_mode(&self) {
+        self.cli_mode
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this instance runs as a one-shot CLI rather than an LSP server.
+    pub(crate) fn is_cli_mode(&self) -> bool {
+        self.cli_mode.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Create a `ClientNotifier` for centralized client communication.
