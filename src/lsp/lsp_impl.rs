@@ -391,9 +391,6 @@ impl Kakehashi {
                 uri.clone(),
             );
 
-            // Cover the latest edit on the first pass too (an edit can raise the
-            // ticket between this spawn and the first parse).
-            let mut ticket = scheduler.latest_ticket(&uri);
             loop {
                 // Stop promptly on server shutdown rather than running another
                 // parse + injection/bridge round into a tearing-down bridge.
@@ -401,6 +398,12 @@ impl Kakehashi {
                     guard.disarm();
                     break;
                 }
+
+                // Start the pass: clear `dirty` and take the latest ticket, so an
+                // edit folded into this text doesn't trigger a redundant reparse and
+                // a later edit still loops. (`flatten`: outer = entry present, inner
+                // = the ticket.)
+                let ticket = scheduler.start_pass(&uri).flatten();
                 parse.reparse_latest(&uri, ticket).await;
 
                 // Re-check shutdown after the (awaited) parse and BEFORE the
@@ -421,13 +424,10 @@ impl Kakehashi {
                     publisher.republish(&uri).await;
                 }
 
-                match scheduler.next(&uri) {
-                    Some(next_ticket) => ticket = next_ticket,
-                    None => {
-                        // Normal exit: next() already removed the entry.
-                        guard.disarm();
-                        break;
-                    }
+                if !scheduler.finish(&uri) {
+                    // Normal exit: finish() removed the entry.
+                    guard.disarm();
+                    break;
                 }
             }
         });

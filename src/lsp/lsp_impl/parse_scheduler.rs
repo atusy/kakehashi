@@ -44,7 +44,22 @@ impl ParseScheduler {
     /// `entry` holds the shard write lock across the whole decision, so two racing
     /// `did_change`s can never both spawn nor drop the `dirty` bit.
     pub(crate) fn schedule(&self, uri: &Url, ticket: Option<u64>) -> bool {
+        // Hot path (a live document being edited): `get_mut` borrows the key, so no
+        // `Url` clone; only a first-edit miss pays for the owned key via `entry`.
+        if let Some(mut state) = self.states.get_mut(uri) {
+            state.ticket = ticket;
+            return if state.parsing {
+                state.dirty = true;
+                false
+            } else {
+                state.parsing = true;
+                state.dirty = false;
+                true
+            };
+        }
         match self.states.entry(uri.clone()) {
+            // Re-check: a concurrent `schedule` may have inserted between the
+            // `get_mut` miss and here.
             Entry::Occupied(mut entry) => {
                 let state = entry.get_mut();
                 state.ticket = ticket;
@@ -68,37 +83,40 @@ impl ParseScheduler {
         }
     }
 
-    /// Peek the highest ticket scheduled for `uri` so the loop's *first* reparse
-    /// covers the latest edit (an edit can land between the spawn and the first
-    /// parse, raising the ticket past the one the spawn was created with). `None`
-    /// if there is no pending entry.
-    pub(crate) fn latest_ticket(&self, uri: &Url) -> Option<u64> {
-        self.states.get(uri).and_then(|state| state.ticket)
+    /// Start a parse pass: **clear `dirty`** and return the latest ticket. Called
+    /// at the top of each loop iteration, *before* reading the document text, so an
+    /// edit arriving after this re-sets `dirty` and [`finish`](Self::finish) loops
+    /// again — while an edit already folded into this pass's text does **not**
+    /// trigger a redundant reparse of the same text. The outer `Option` is `None`
+    /// only if the entry is somehow gone (defensive); the inner is the ticket.
+    pub(crate) fn start_pass(&self, uri: &Url) -> Option<Option<u64>> {
+        self.states.get_mut(uri).map(|mut state| {
+            state.dirty = false;
+            state.ticket
+        })
     }
 
-    /// Called by the parse loop after one parse completes, to decide whether to
-    /// loop again. Returns `Some(ticket)` when an edit landed during the parse
-    /// (`dirty`) — the loop keeps running and reparses the latest text at `ticket`
-    /// (itself `Option<u64>`, since a reparse may carry no ingress ticket); `None`
-    /// when nothing is pending — the entry is removed and the loop exits. The outer
-    /// `Option` is the continue/stop signal, distinct from the inner ticket, so a
-    /// pending reparse whose ticket is `None` still continues the loop. Atomic
-    /// under the shard write lock so it cannot race a concurrent `schedule`: a
-    /// `schedule` arriving just before this either set `dirty` (we continue) or
-    /// finds no entry afterward and spawns a fresh loop.
-    pub(crate) fn next(&self, uri: &Url) -> Option<Option<u64>> {
+    /// Called by the parse loop after one pass (parse + downstream) completes, to
+    /// decide whether to loop again. Returns `true` when an edit landed during the
+    /// pass (`dirty`) — keep the entry and loop (the next [`start_pass`] clears it);
+    /// `false` when nothing is pending — the entry is removed and the loop exits.
+    ///
+    /// **Atomic via `entry`** (the whole check-and-remove under one shard write
+    /// lock): a `get_mut`-then-`remove` split would let a concurrent `schedule` set
+    /// `dirty` between the check and the removal and then be deleted — a lost
+    /// wakeup that wedges the document until the next edit. So this is deliberately
+    /// not micro-optimized to avoid the `Url` clone.
+    pub(crate) fn finish(&self, uri: &Url) -> bool {
         match self.states.entry(uri.clone()) {
-            Entry::Occupied(mut entry) => {
+            Entry::Occupied(entry) => {
                 if entry.get().dirty {
-                    let state = entry.get_mut();
-                    state.dirty = false;
-                    Some(state.ticket)
+                    true
                 } else {
                     entry.remove();
-                    None
+                    false
                 }
             }
-            Entry::Vacant(_) => None,
+            Entry::Vacant(_) => false,
         }
     }
 
@@ -116,7 +134,7 @@ impl ParseScheduler {
 /// normally — i.e. a panic in the loop glue (`reparse_latest` / `process_injections`
 /// / `republish`; the blocking parse itself is already panic-isolated by
 /// `spawn_blocking`). On a clean exit the loop calls [`disarm`](Self::disarm) (its
-/// `next()` already removed the entry); on a panic the guard's `Drop` runs during
+/// `finish()` already removed the entry); on a panic the guard's `Drop` runs during
 /// unwind and clears the stuck entry so the next `did_change` re-spawns.
 pub(crate) struct ParseLoopGuard {
     scheduler: Arc<ParseScheduler>,
@@ -134,7 +152,7 @@ impl ParseLoopGuard {
     }
 
     /// Mark a normal loop exit so `Drop` does not clear the entry (the loop's
-    /// final `next()` already removed it, and a fresh loop may have been spawned).
+    /// final `finish()` already removed it, and a fresh loop may have been spawned).
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
@@ -173,19 +191,40 @@ mod tests {
     }
 
     #[test]
-    fn next_continues_when_dirty_with_latest_ticket_then_exits() {
+    fn start_pass_clears_dirty_and_finish_continues_then_exits() {
         let s = ParseScheduler::default();
         let u = uri();
         assert!(s.schedule(&u, Some(1)));
-        assert!(
-            !s.schedule(&u, Some(5)),
-            "edit during parse marks dirty, ticket=5"
-        );
 
-        // Loop finishes its first parse: dirty was set → continue at the latest ticket.
-        assert_eq!(s.next(&u), Some(Some(5)));
-        // Nothing more pending → loop exits and the entry is cleared.
-        assert_eq!(s.next(&u), None);
+        // Pass 1 starts: clears dirty, takes the latest ticket (1).
+        assert_eq!(s.start_pass(&u), Some(Some(1)));
+        // An edit lands during the pass → dirty, ticket=5.
+        assert!(!s.schedule(&u, Some(5)), "edit during parse marks dirty");
+        // finish() sees dirty → continue (entry kept).
+        assert!(s.finish(&u), "dirty during the pass → loop continues");
+
+        // Pass 2 starts: clears dirty, takes the latest ticket (5).
+        assert_eq!(s.start_pass(&u), Some(Some(5)));
+        // No edit during pass 2 → finish() removes the entry and stops.
+        assert!(!s.finish(&u), "no dirty → loop exits and entry removed");
+        assert_eq!(s.start_pass(&u), None, "entry removed after exit");
+    }
+
+    #[test]
+    fn no_redundant_pass_when_edit_arrived_before_the_first_start_pass() {
+        let s = ParseScheduler::default();
+        let u = uri();
+        // Edit 1 spawns; edit 2 lands before the loop's first start_pass (marks
+        // dirty). The first start_pass clears that dirty (its text already covers
+        // edit 2), so finish() does NOT trigger a redundant same-text pass.
+        assert!(s.schedule(&u, Some(1)));
+        assert!(!s.schedule(&u, Some(2)));
+
+        assert_eq!(s.start_pass(&u), Some(Some(2)), "first pass covers edit 2");
+        assert!(
+            !s.finish(&u),
+            "dirty was cleared by start_pass → no redundant pass"
+        );
     }
 
     #[test]
@@ -193,7 +232,8 @@ mod tests {
         let s = ParseScheduler::default();
         let u = uri();
         assert!(s.schedule(&u, Some(1)));
-        assert_eq!(s.next(&u), None, "no dirty → exit");
+        let _ = s.start_pass(&u);
+        assert!(!s.finish(&u), "no dirty → exit");
         assert!(
             s.schedule(&u, Some(2)),
             "a fresh edit after the loop exited spawns a new loop"
@@ -224,10 +264,11 @@ mod tests {
         let u = uri();
         assert!(scheduler.schedule(&u, Some(1)));
 
-        // Normal exit: next() removed the entry, guard disarmed. A new loop may
+        // Normal exit: finish() removed the entry, guard disarmed. A new loop may
         // have been spawned meanwhile; the disarmed guard's Drop must NOT clear it.
         let mut guard = ParseLoopGuard::new(Arc::clone(&scheduler), u.clone());
-        assert_eq!(scheduler.next(&u), None, "no dirty → entry removed");
+        let _ = scheduler.start_pass(&u);
+        assert!(!scheduler.finish(&u), "no dirty → entry removed");
         guard.disarm();
         assert!(scheduler.schedule(&u, Some(2)), "a fresh loop is spawned");
         drop(guard); // disarmed → must not abort the fresh entry
