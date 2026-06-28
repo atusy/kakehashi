@@ -35,6 +35,21 @@ pub struct DocumentStore {
     /// `Kakehashi::store_lineage` (captures-protocol §"Delta semantics").
     open_generations: DashMap<Url, u64>,
     open_counter: std::sync::atomic::AtomicU64,
+    /// Per-document **parse watermark**: the highest ingress writer ticket whose
+    /// parse has reached a terminal outcome (a tree, or parsed-to-nothing). It is
+    /// monotonic per document and published by the parse path on resolution.
+    ///
+    /// This is deliberately a signal **distinct** from the `IngressOrderGate`
+    /// completion channel. Today the parse resolves *inline*, before its writer
+    /// ticket completes, so the watermark and ticket-completion move in lockstep;
+    /// a reader gated behind the ticket already observes a fresh tree. The
+    /// per-document parse actor (see `per-document-parse-actor` ADR) will run the
+    /// parse *off* the ingress ticket, at which point ticket-completion no longer
+    /// implies a fresh tree and this watermark — not the completion channel — is
+    /// what tells a virt/native reader the store reflects its tail edit. Keyed on
+    /// the ticket (the intra-lifetime wire order); the incarnation half of the
+    /// eventual `(incarnation, ticket)` epoch is not folded in yet.
+    watermarks: DashMap<Url, watch::Sender<u64>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,6 +85,7 @@ impl Default for DocumentStore {
             edit_locks: DashMap::new(),
             open_generations: DashMap::new(),
             open_counter: std::sync::atomic::AtomicU64::new(0),
+            watermarks: DashMap::new(),
         }
     }
 }
@@ -171,6 +187,9 @@ impl DocumentStore {
 
         self.documents.insert(uri.clone(), document);
         self.update_tree_availability(&uri, has_tree);
+        // Seed the watermark so its lifetime tracks the document's; `advance_watermark`
+        // is non-inserting and relies on this entry being present.
+        self.ensure_watermark_entry(&uri);
     }
 
     // Lock safety: Returns DocumentHandle wrapping Ref - caller holds read lock until drop
@@ -210,6 +229,11 @@ impl DocumentStore {
             }
         };
         self.update_tree_availability(&uri, has_tree);
+        // Keep the "live document ⟺ watermark entry" invariant: `update_document`
+        // can insert on its `Vacant` branch, and a present document with no
+        // watermark entry would make `wait_for_epoch` treat it as unregistered.
+        // Idempotent on the (common) update-in-place path.
+        self.ensure_watermark_entry(&uri);
     }
 
     /// Store `new_tree` for an **existing** document, but only if its current text
@@ -322,11 +346,93 @@ impl DocumentStore {
         self.edit_locks.remove(uri);
     }
 
+    /// Ensure a watermark entry exists for `uri`, created at ticket 0. Idempotent:
+    /// an already-advanced watermark is left untouched. Called when a document is
+    /// registered ([`insert`](Self::insert)) so the watermark's lifetime tracks the
+    /// document's — it exists exactly while the document is open and is dropped by
+    /// [`remove`](Self::remove) on close.
+    fn ensure_watermark_entry(&self, uri: &Url) {
+        // `insert()` runs on every didChange; the entry almost always already
+        // exists. Probe with a borrowed `get` first so the common hit path takes
+        // no `Url` clone, paying the clone only on the (rare) first registration.
+        if self.watermarks.get(uri).is_none() {
+            self.watermarks
+                .entry(uri.clone())
+                .or_insert_with(|| watch::channel(0).0);
+        }
+    }
+
+    /// Publish that the parse covering ingress writer `ticket` for `uri` has
+    /// reached a terminal outcome. The watermark only ever advances — a later
+    /// resolution for an earlier ticket (a parse superseded then completed out of
+    /// order) cannot regress it — so a reader's `>= target` wait is stable.
+    ///
+    /// **Non-inserting**: it advances an existing entry but never creates one. The
+    /// entry is seeded by [`insert`](Self::insert) when the document is registered
+    /// and dropped on close, so a straggler parse that resolves *after* a
+    /// `didClose` (its epoch now stale) finds no entry and no-ops, rather than
+    /// resurrecting a ghost watermark for a closed URI. Every live mutation that
+    /// schedules a parse has registered the document first, so the entry is always
+    /// present when a legitimate publish runs.
+    pub(crate) fn advance_watermark(&self, uri: &Url, ticket: u64) {
+        // Clone the sender out of the `Ref` (so the DashMap guard is dropped
+        // before `send_if_modified`); a missing entry means a closed document.
+        let Some(sender) = self.watermarks.get(uri).map(|sender| sender.clone()) else {
+            return;
+        };
+        sender.send_if_modified(|watermark| {
+            if ticket > *watermark {
+                *watermark = ticket;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Wait until the parse watermark for `uri` reaches `target` — the tail
+    /// ingress ticket a virt/native reader must observe — bounded by `timeout`.
+    ///
+    /// Returns early (proceed into the empty/`null` reader fallback) when the
+    /// watermark already covers `target`, when there is no watermark entry — the
+    /// document is not registered (never opened, or a `didClose` removed it), as
+    /// `insert` seeds the entry at 0 for every live document, so there is nothing
+    /// to wait for — or when the entry is dropped while waiting (a concurrent
+    /// `didClose`). Non-inserting on the missing-entry path so it never resurrects
+    /// a watermark for a closed URI.
+    pub(crate) async fn wait_for_epoch(
+        &self,
+        uri: &Url,
+        target: u64,
+        timeout: std::time::Duration,
+    ) {
+        // Subscribe under the shard read lock, then drop the `Ref` *before*
+        // awaiting — never hold a DashMap guard across `.await`.
+        let mut receiver = {
+            let Some(sender) = self.watermarks.get(uri) else {
+                return;
+            };
+            sender.subscribe()
+        };
+
+        let wait_future = async {
+            // Err => the sender was dropped (entry removed after a close): every
+            // parse that will ever run for this lifetime has, so proceed.
+            let _ = receiver.wait_for(|watermark| *watermark >= target).await;
+        };
+
+        let _ = tokio::time::timeout(timeout, wait_future).await;
+    }
+
     // Lock safety: Single remove() call - no read lock held before or during write
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
         self.edit_locks.remove(uri);
         self.open_generations.remove(uri);
+        // Dropping the watermark sender wakes any reader still blocked on
+        // `wait_for_epoch` for this document, so a reader racing the close
+        // proceeds into the empty fallback instead of stalling to the timeout.
+        self.watermarks.remove(uri);
         self.documents.remove(uri).map(|(_, doc)| doc)
     }
 
@@ -498,6 +604,228 @@ mod tests {
             "the availability update must not recreate a parse-state for a URI whose \
              parse-state a concurrent close already removed"
         );
+    }
+
+    /// Read the published watermark for a URI (test-only; the field is private).
+    fn watermark_of(store: &DocumentStore, uri: &Url) -> Option<u64> {
+        store.watermarks.get(uri).map(|s| *s.borrow())
+    }
+
+    /// Register a document so its watermark entry is seeded (mirrors a didOpen).
+    fn seed_document(store: &DocumentStore, uri: &Url) {
+        store.insert(uri.clone(), "x".to_string(), Some("rust".to_string()), None);
+    }
+
+    #[test]
+    fn insert_seeds_a_watermark_entry_at_zero() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        assert_eq!(
+            watermark_of(&store, &uri),
+            None,
+            "no entry before registration"
+        );
+
+        seed_document(&store, &uri);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(0),
+            "registering the document seeds a watermark at 0"
+        );
+    }
+
+    #[test]
+    fn update_document_seeds_a_watermark_entry_when_it_inserts() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        // `update_document` (a reader on-demand fallback) inserts on its vacant
+        // branch; the watermark invariant must hold for the resulting document.
+        store.update_document(uri.clone(), "x".to_string(), None);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(0),
+            "a document created via update_document must still get a watermark entry"
+        );
+    }
+
+    #[test]
+    fn advance_watermark_publishes_the_ticket() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+
+        store.advance_watermark(&uri, 7);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(7),
+            "publish records the ticket"
+        );
+    }
+
+    #[test]
+    fn advance_watermark_is_monotonic() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        store.advance_watermark(&uri, 5);
+        // An out-of-order resolution for an earlier ticket must not regress it.
+        store.advance_watermark(&uri, 3);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(5),
+            "a later-but-lower publish must not regress the watermark"
+        );
+
+        store.advance_watermark(&uri, 8);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(8),
+            "a higher ticket advances it"
+        );
+    }
+
+    #[test]
+    fn advance_watermark_does_not_resurrect_a_closed_document() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        store.advance_watermark(&uri, 2);
+
+        // didClose drops the entry; a straggler parse for a now-stale ticket then
+        // resolves and tries to publish. Being non-inserting, it must NOT recreate
+        // a ghost watermark for the closed URI.
+        store.remove(&uri);
+        store.advance_watermark(&uri, 3);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            None,
+            "a publish after close must not resurrect a watermark entry"
+        );
+    }
+
+    #[test]
+    fn remove_drops_the_watermark_entry() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        store.advance_watermark(&uri, 4);
+        assert_eq!(watermark_of(&store, &uri), Some(4));
+
+        store.remove(&uri);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            None,
+            "closing the document drops its watermark so a reopen starts fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_returns_immediately_when_already_reached() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        store.advance_watermark(&uri, 5);
+
+        // target below the watermark resolves without blocking.
+        timeout(
+            Duration::from_millis(100),
+            store.wait_for_epoch(&uri, 3, Duration::from_secs(10)),
+        )
+        .await
+        .expect("a watermark already past the target must not block");
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_returns_immediately_when_no_entry() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///absent.rs").unwrap();
+        // No publish has happened: nothing is pending, so the reader proceeds.
+        timeout(
+            Duration::from_millis(100),
+            store.wait_for_epoch(&uri, 1, Duration::from_secs(10)),
+        )
+        .await
+        .expect("a missing watermark entry means nothing to wait for");
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_blocks_until_watermark_reaches_target() {
+        let store = Arc::new(DocumentStore::new());
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        // Entry seeded at 0, advanced to ticket 1, below the reader's target of 3.
+        seed_document(&store, &uri);
+        store.advance_watermark(&uri, 1);
+
+        let waiter = {
+            let store = Arc::clone(&store);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                store.wait_for_epoch(&uri, 3, Duration::from_secs(10)).await;
+            })
+        };
+
+        // The intermediate ticket 2 must not release a reader waiting for 3.
+        store.advance_watermark(&uri, 2);
+        // Let the spawned waiter run to its park point (deterministic on the
+        // current-thread test runtime — no wall-clock dependency).
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "reader must keep waiting until the watermark covers its target ticket"
+        );
+
+        store.advance_watermark(&uri, 3);
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("reaching the target must wake the reader")
+            .expect("waiter task panicked");
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_proceeds_when_entry_removed_mid_wait() {
+        let store = Arc::new(DocumentStore::new());
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        store.advance_watermark(&uri, 1);
+
+        let waiter = {
+            let store = Arc::clone(&store);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                store.wait_for_epoch(&uri, 9, Duration::from_secs(10)).await;
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "reader is waiting for an unreached target"
+        );
+
+        // A didClose drops the watermark entry: the blocked reader must proceed
+        // (into the empty fallback) rather than stall to the timeout.
+        store.remove(&uri);
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("dropping the watermark sender must wake the reader")
+            .expect("waiter task panicked");
+    }
+
+    #[tokio::test]
+    async fn wait_for_epoch_times_out_when_target_unreached() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        store.advance_watermark(&uri, 1);
+
+        // The watermark never reaches 9; the bounded wait returns after the
+        // timeout rather than hanging.
+        timeout(
+            Duration::from_secs(5),
+            store.wait_for_epoch(&uri, 9, Duration::from_millis(80)),
+        )
+        .await
+        .expect("wait_for_epoch must return after its own timeout even if unreached");
     }
 
     #[test]

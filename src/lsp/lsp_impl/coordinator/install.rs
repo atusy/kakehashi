@@ -198,7 +198,11 @@ impl InstallCoordinator {
             let lang_for_parse = host_language.as_deref();
             let parse_coordinator = self.parse_coordinator();
             parse_coordinator
-                .parse_document(uri.clone(), text, lang_for_parse, vec![])
+                // No ingress ticket: this post-install reparse runs off the
+                // ingress sequence (the original didOpen's ticket already
+                // advanced the watermark on its skip-parse path), so it does not
+                // re-stamp the watermark.
+                .parse_document(uri.clone(), text, lang_for_parse, vec![], None)
                 .await;
         }
     }
