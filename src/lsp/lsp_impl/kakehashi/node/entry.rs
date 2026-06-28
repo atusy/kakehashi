@@ -228,6 +228,11 @@ impl Kakehashi {
         self.ensure_injection_languages_loaded(&uri, &host_language, text, tree, byte)
             .await;
 
+        // Re-ensure freshness before the re-snapshot: a `didChange` processed
+        // during the (awaited) grammar load clears the tree off-ingress, so
+        // without this the re-snapshot below would spuriously return `Null`.
+        self.ensure_document_parsed(&uri).await;
+
         // Re-snapshot after the await and recompute the position mapping. From
         // here on we operate strictly on the post-await document state.
         let snapshot = match self.documents.get(&uri).and_then(|doc| doc.snapshot()) {

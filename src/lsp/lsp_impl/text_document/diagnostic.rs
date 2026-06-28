@@ -103,25 +103,11 @@ impl Kakehashi {
 
         log::trace!("textDocument/diagnostic called for {}", uri);
 
-        // Ensure a fresh tree before snapshotting for the VIRT layer: `didChange`
-        // clears the tree and reparses off-ingress, so without this the virt
-        // injection regions would be empty for the reparse window after each edit.
-        // The HOST layer needs no tree (it forwards the real URI + text), so it
-        // must survive even when the tree never lands — hence the snapshot below is
-        // optional, not an early bail.
-        self.ensure_document_parsed(&uri).await;
-
-        // A missing document means a `didClose` removed it — nothing to report. A
-        // present document whose tree isn't ready (parse pending/failed even after
-        // the wait) yields `None` here; the host layer still runs, only virt skips.
-        let snapshot = match self.documents.get(&uri) {
-            None => {
-                log::debug!("textDocument/diagnostic: No document found for {}", uri);
-                return Ok(empty_diagnostic_report());
-            }
-            Some(doc) => doc.snapshot(),
-            // doc automatically dropped here, lock released
-        };
+        // A missing document means a `didClose` removed it — nothing to report.
+        if self.documents.get(&uri).is_none() {
+            log::debug!("textDocument/diagnostic: No document found for {}", uri);
+            return Ok(empty_diagnostic_report());
+        }
 
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
@@ -148,6 +134,19 @@ impl Kakehashi {
             );
             return Ok(empty_diagnostic_report());
         }
+
+        // Snapshot for the VIRT layer ONLY, and ONLY ensure a fresh tree when virt
+        // actually participates: `didChange` clears the tree and reparses
+        // off-ingress, so the virt injection regions would otherwise be empty for
+        // the reparse window after each edit. The HOST layer needs no tree, so a
+        // host-only document must not pay the freshness wait. A still-missing tree
+        // (parse pending/failed) yields `None` — host still pulls, virt skips.
+        let snapshot = if virt_enabled {
+            self.ensure_document_parsed(&uri).await;
+            self.documents.get(&uri).and_then(|doc| doc.snapshot())
+        } else {
+            None
+        };
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = crate::lsp::current_upstream_id();
