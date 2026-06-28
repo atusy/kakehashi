@@ -442,6 +442,14 @@ impl ParseCoordinator {
             .await;
 
         if let Some((tree, text)) = parsed {
+            // Text-CAS, not the full `(incarnation, ticket)` epoch CAS. The
+            // incarnation half is deferred (see #508): a close→reopen with
+            // *identical* text while this parse is in flight can let the CAS attach
+            // this tree to the reopened lifetime. That is benign — the text is
+            // identical, so the tree is a correct parse of it — only the watermark
+            // ticket is from the old lifetime; reads stay correct because the tree
+            // matches the text. The strict epoch CAS (incarnation stored on the
+            // Document so the check is atomic with the write) is the follow-up.
             let stored = self
                 .documents
                 .update_tree_if_text_unchanged(uri, &text, tree.clone());

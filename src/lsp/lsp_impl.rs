@@ -379,6 +379,7 @@ impl Kakehashi {
         let publisher = DiagnosticPublisher::new(self);
         let diagnostics = std::sync::Arc::clone(&self.diagnostics);
         let scheduler = std::sync::Arc::clone(&self.parse_scheduler);
+        let shutdown = self.shutdown_token.clone();
 
         tokio::spawn(async move {
             // If the loop panics in its glue (the blocking parse is already
@@ -394,6 +395,12 @@ impl Kakehashi {
             // ticket between this spawn and the first parse).
             let mut ticket = scheduler.latest_ticket(&uri);
             loop {
+                // Stop promptly on server shutdown rather than running another
+                // parse + injection/bridge round into a tearing-down bridge.
+                if shutdown.is_cancelled() {
+                    guard.disarm();
+                    break;
+                }
                 parse.reparse_latest(&uri, ticket).await;
 
                 // Tree-dependent downstream, in the order did_change ran it inline:

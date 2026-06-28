@@ -99,8 +99,11 @@ impl Kakehashi {
 
         // lazy-node-identity-tracking: Close invalidated virtual documents.
         // Send didClose notifications to downstream LSs for orphaned docs. Stays in
-        // the handler (text-derived) and runs BEFORE the scheduler's forward, so the
-        // close-then-forward wire order is preserved.
+        // the handler (text-derived). It closes the **invalidated** (old) region
+        // ulids, whereas the scheduler loop's forward targets the **current** region
+        // ulids — disjoint virtual documents — so even though the off-ingress loop
+        // can forward a later edit's content before an earlier edit's close
+        // completes, the two never act on the same downstream document.
         self.injection_coordinator()
             .close_invalidated_virtual_docs(&uri, &invalidated_ulids)
             .await;
