@@ -4,6 +4,7 @@ mod coordinator;
 pub(crate) use coordinator::DiagnosticPublisher;
 mod kakehashi;
 mod lifecycle;
+mod parse_scheduler;
 mod show_document_translation;
 pub(crate) mod text_document;
 mod whole_document;
@@ -180,6 +181,12 @@ pub struct Kakehashi {
     /// discards it), so `did_open_impl` skips the synthetic diagnostic task — that
     /// avoids both the wasted downstream pull and the abort-vs-`didClose` race (#489).
     cli_mode: std::sync::atomic::AtomicBool,
+    /// Per-document coalescing scheduler for the off-ingress parse
+    /// (per-document-parse-actor ADR): `did_change` applies the edit and clears the
+    /// tree synchronously, then schedules the (re)parse here so the parse runs off
+    /// the ingress writer ticket, coalescing bursts to one reparse over the latest
+    /// text. Shared (`Arc`) with the spawned parse loops.
+    parse_scheduler: std::sync::Arc<parse_scheduler::ParseScheduler>,
 }
 
 impl std::fmt::Debug for Kakehashi {
@@ -250,6 +257,7 @@ impl Kakehashi {
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
             cli_mode: std::sync::atomic::AtomicBool::new(false),
+            parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
         }
     }
 
@@ -345,6 +353,55 @@ impl Kakehashi {
 
     pub(super) fn diagnostic_scheduler(&self) -> coordinator::DiagnosticScheduler {
         coordinator::DiagnosticScheduler::new(self)
+    }
+
+    /// Schedule the **off-ingress** (re)parse of `uri` after a `did_change` applied
+    /// the edit and cleared the tree (per-document-parse-actor ADR). The parse runs
+    /// in a spawned loop off the writer ticket, so `did_change` returns without
+    /// waiting on it; the [`ParseScheduler`](parse_scheduler::ParseScheduler)
+    /// coalesces a burst of edits into a single follow-up reparse over the latest
+    /// text. The loop reparses, then runs the tree-dependent downstream work
+    /// (injected-language processing + bridge `didChange` forwarding, then the
+    /// diagnostic geometry re-merge), then loops if another edit arrived.
+    ///
+    /// Resurrection-safe with no teardown: the parse's non-inserting CAS no-ops
+    /// once a `didClose` removed the document, so a `Close` needs no actor
+    /// coordination.
+    pub(crate) fn schedule_reparse(&self, uri: Url, ticket: Option<u64>) {
+        if !self.parse_scheduler.schedule(&uri, ticket) {
+            // A parse loop is already running for this document; it has been
+            // marked dirty and will reparse the latest text when it finishes.
+            return;
+        }
+
+        let parse = self.parse_coordinator();
+        let injection = self.injection_coordinator();
+        let publisher = DiagnosticPublisher::new(self);
+        let diagnostics = std::sync::Arc::clone(&self.diagnostics);
+        let scheduler = std::sync::Arc::clone(&self.parse_scheduler);
+
+        tokio::spawn(async move {
+            // Cover the latest edit on the first pass too (an edit can raise the
+            // ticket between this spawn and the first parse).
+            let mut ticket = scheduler.latest_ticket(&uri);
+            loop {
+                parse.reparse_latest(&uri, ticket).await;
+
+                // Tree-dependent downstream, in the order did_change ran it inline:
+                // injected-language processing + forwarding, then geometry re-merge
+                // (which re-anchors region push slots against the now-current
+                // injection geometry).
+                injection.process_injections(&uri, true).await;
+                if diagnostics.has_region_slots(&uri) {
+                    publisher.republish(&uri).await;
+                }
+
+                match scheduler.next(&uri) {
+                    Some(next_ticket) => ticket = next_ticket,
+                    None => break,
+                }
+            }
+        });
     }
 }
 

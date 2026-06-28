@@ -378,6 +378,91 @@ impl ParseCoordinator {
         self.notifier().log_language_events(&events).await;
     }
 
+    /// Re-parse `uri`'s **latest** store text off the ingress path, for the
+    /// per-document parse scheduler (`Kakehashi::schedule_reparse`).
+    ///
+    /// `did_change` clears the tree synchronously and schedules this; it runs in a
+    /// spawned loop, *not* on the writer ticket. A **full** parse (no incremental
+    /// seed — the tree was cleared, which also keeps #348 closed). The tree write
+    /// is the non-inserting text CAS [`update_tree_if_text_unchanged`]: a closed
+    /// (Vacant) document is left gone (resurrection-safe), and a text that moved on
+    /// (a `didChange` landed while parsing) is dropped — the scheduler's `dirty`
+    /// loop then reparses the newer text. On **every** resolution path the parse
+    /// advances the store watermark to `ticket`, so a virt/native reader gated
+    /// behind the originating edit is released once its parse resolved.
+    ///
+    /// Incremental parse and semantic-token delta are intentionally not preserved
+    /// here (the cleared tree forces a full parse); coalescing recovers the burst
+    /// case, and incrementality is a perf optimization, never correctness. Re-adding
+    /// it is a follow-up.
+    pub(crate) async fn reparse_latest(&self, uri: &Url, ticket: Option<u64>) {
+        let advance_watermark = || {
+            if let Some(ticket) = ticket {
+                self.documents.advance_watermark(uri, ticket);
+            }
+        };
+
+        // Re-read the latest text + detect the language under one read guard. A
+        // missing document means a `didClose` ran — resolve the watermark and stop
+        // (no resurrection).
+        let (language_name, text) = {
+            let Some(doc) = self.documents.get(uri) else {
+                advance_watermark();
+                return;
+            };
+            let text = doc.text().to_string();
+            let language_name =
+                self.language
+                    .detect_language(uri.path(), &text, None, doc.language_id());
+            (language_name, text)
+        };
+
+        let Some(language_name) = language_name else {
+            advance_watermark();
+            return;
+        };
+        if self.auto_install.is_parser_failed(&language_name) {
+            advance_watermark();
+            return;
+        }
+        let load_result = self.language.ensure_language_loaded(&language_name);
+
+        let text_len = text.len();
+        let auto_install = self.auto_install.clone();
+        let language_name_clone = language_name.clone();
+        // Move the owned `text` into the blocking closure and hand it back with the
+        // tree, so the document text is never cloned.
+        let parsed = self
+            .parse_with_pool(&language_name, uri, text_len, move |mut parser| {
+                let _ = auto_install.begin_parsing(&language_name_clone);
+                let result = parser.parse(&text, None);
+                let _ = auto_install.end_parsing(&language_name_clone);
+                (parser, result.map(|tree| (tree, text)))
+            })
+            .await;
+
+        if let Some((tree, text)) = parsed {
+            let stored = self
+                .documents
+                .update_tree_if_text_unchanged(uri, &text, tree.clone());
+            if stored {
+                self.cache.populate_injections(
+                    uri,
+                    &text,
+                    &tree,
+                    &language_name,
+                    &self.language,
+                    self.bridge.node_tracker(),
+                );
+            }
+        }
+
+        advance_watermark();
+        self.notifier()
+            .log_language_events(&load_result.events)
+            .await;
+    }
+
     fn notifier(&self) -> ClientNotifier<'_> {
         build_notifier(&self.client, &self.settings_manager)
     }

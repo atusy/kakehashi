@@ -764,6 +764,69 @@ print("hello")
         );
     }
 
+    /// Off-ingress edit reparse (per-document-parse-actor flip): `reparse_latest`
+    /// parses the latest store text and advances the watermark, but must NOT
+    /// resurrect a document a `didClose` removed mid-parse.
+    #[tokio::test]
+    async fn reparse_latest_does_not_resurrect_closed_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/closed_during_reparse.rs").unwrap();
+        // Document already closed (removed) — models a didClose racing the
+        // scheduled reparse. The watermark ticket still resolves.
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(7))
+            .await;
+
+        assert!(
+            server.documents.get(&uri).is_none(),
+            "the off-ingress reparse must not resurrect a closed document"
+        );
+    }
+
+    /// `reparse_latest` attaches a fresh tree to the open document (whose tree was
+    /// cleared by the edit) and advances the watermark to the edit's ticket.
+    #[tokio::test]
+    async fn reparse_latest_parses_and_advances_watermark() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/edited.rs").unwrap();
+        // The edit applied new text and cleared the tree (tree = None), exactly as
+        // did_change does before scheduling the reparse.
+        server.documents.insert(
+            uri.clone(),
+            "fn edited() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(3))
+            .await;
+
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_some(),
+            "the off-ingress reparse attaches a tree to the edited document"
+        );
+        // The watermark reached the edit's ticket, so a reader gated behind it is
+        // released (wait_for_epoch returns immediately for target <= 3).
+        timeout(
+            Duration::from_millis(100),
+            server
+                .documents
+                .wait_for_epoch(&uri, 3, Duration::from_secs(5)),
+        )
+        .await
+        .expect("watermark must have advanced to the reparse ticket");
+    }
+
     /// If a concurrent `didChange` already parsed the document (a tree is
     /// present), the install reparse must short-circuit and not redundantly
     /// reparse / clobber it.
