@@ -735,6 +735,12 @@ impl Kakehashi {
             })));
         };
 
+        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
+        // reparses off-ingress, so without this the visible-range tokens go blank
+        // for the reparse window after every edit. (The full/delta paths get this
+        // via `get_tree_with_wait`; the range path reads the store directly.)
+        self.ensure_document_parsed(&uri).await;
+
         let Some(doc) = self.documents.get(&uri) else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
