@@ -137,7 +137,7 @@ impl DocCompletion {
 
 /// Issues per-document writer tickets and reader barriers in wire order.
 ///
-/// `issue_writer_ticket` / `reader_barrier` are synchronous so they can run
+/// `issue_writer_ticket` / `reader_barrier_and_tail` are synchronous so they run
 /// inside `Service::call`, which tower-lsp-server invokes in wire order; the
 /// returned values are awaited later, inside the buffered handler future.
 #[derive(Default)]
@@ -178,30 +178,31 @@ impl DocumentSequencer {
         }
     }
 
-    /// Snapshot the barrier a reader of `uri` must wait behind: the writer
-    /// ticket tail at call time. Returns `None` when no writer is pending
-    /// (no entry, or every issued ticket already completed).
-    pub(crate) fn reader_barrier(&self, uri: &str) -> Option<ReaderBarrier> {
-        let entry = self.docs.get(uri)?;
-        if *entry.completion.done.borrow() >= entry.tail {
-            return None;
-        }
-        let target = entry.tail;
-        let rx = entry.completion.done.subscribe();
-        drop(entry);
-        Some(ReaderBarrier { target, rx })
-    }
-
-    /// The tail writer ticket a reader of `uri` must observe: the highest ticket
-    /// issued at call time, regardless of completion. `None` when no writer was
-    /// ever ticketed for the document (so there is nothing for the reader to wait
-    /// on). Unlike [`reader_barrier`](Self::reader_barrier) this reports the tail
-    /// even when every writer has already completed, because the reader waits on
-    /// the parse **watermark** (which a completed ticket has already advanced),
-    /// not on ticket completion.
-    pub(crate) fn reader_tail(&self, uri: &str) -> Option<u64> {
-        let entry = self.docs.get(uri)?;
-        (entry.tail > 0).then_some(entry.tail)
+    /// Snapshot, in a **single** `docs` lookup (the reader hot path), both of the
+    /// things a reader of `uri` needs at call time:
+    ///
+    /// - the **barrier** it must wait behind — the writer tail ticket — or `None`
+    ///   when no writer is pending (no entry, or every issued ticket completed);
+    /// - the **tail** writer ticket it must observe via the parse watermark, or
+    ///   `None` when no writer was ever ticketed. Unlike the barrier, this is
+    ///   reported even when every writer has already completed, because the reader
+    ///   waits on the watermark (which a completed ticket has already advanced),
+    ///   not on ticket completion.
+    pub(crate) fn reader_barrier_and_tail(&self, uri: &str) -> (Option<ReaderBarrier>, Option<u64>) {
+        let Some(entry) = self.docs.get(uri) else {
+            return (None, None);
+        };
+        let barrier = if *entry.completion.done.borrow() < entry.tail {
+            let rx = entry.completion.done.subscribe();
+            Some(ReaderBarrier {
+                target: entry.tail,
+                rx,
+            })
+        } else {
+            None
+        };
+        let tail = (entry.tail > 0).then_some(entry.tail);
+        (barrier, tail)
     }
 
     /// Drop `uri`'s sequencing state after a close completed, unless later
@@ -398,13 +399,13 @@ where
                 })
             }
             Some(Role::Reader { uri }) => {
-                let barrier = self.sequencer.reader_barrier(&uri);
-                // Snapshot the tail ticket at `call` time (wire order), exposing
-                // it to the handler so a virt/native reader can wait for the parse
-                // watermark to reach it. `reader_barrier` only reports a pending
-                // writer; the tail is needed even when all writers completed,
-                // because the watermark — not ticket completion — gates the read.
-                let tail = self.sequencer.reader_tail(&uri);
+                // Snapshot the barrier and the tail ticket at `call` time (wire
+                // order) in one lookup, exposing the tail to the handler so a
+                // virt/native reader can wait for the parse watermark to reach it.
+                // The barrier only reports a pending writer; the tail is needed
+                // even when all writers completed, because the watermark — not
+                // ticket completion — gates the read.
+                let (barrier, tail) = self.sequencer.reader_barrier_and_tail(&uri);
                 Box::pin(async move {
                     if let Some(barrier) = barrier {
                         barrier.wait().await;
@@ -458,7 +459,10 @@ mod tests {
         let seq = DocumentSequencer::default();
         let first = seq.issue_writer_ticket(URI);
 
-        let barrier = seq.reader_barrier(URI).expect("writer pending");
+        let barrier = seq
+            .reader_barrier_and_tail(URI)
+            .0
+            .expect("writer pending");
 
         // A writer arriving AFTER the reader must not extend its wait.
         let second = seq.issue_writer_ticket(URI);
@@ -476,14 +480,14 @@ mod tests {
     async fn reader_with_no_pending_writers_does_not_wait() {
         let seq = DocumentSequencer::default();
         assert!(
-            seq.reader_barrier(URI).is_none(),
+            seq.reader_barrier_and_tail(URI).0.is_none(),
             "no entry means no waiting"
         );
 
         let first = seq.issue_writer_ticket(URI);
         drop(first);
         assert!(
-            seq.reader_barrier(URI).is_none(),
+            seq.reader_barrier_and_tail(URI).0.is_none(),
             "all tickets done means no waiting"
         );
     }
@@ -491,23 +495,29 @@ mod tests {
     #[tokio::test]
     async fn reader_tail_reports_highest_ticket_even_after_completion() {
         let seq = DocumentSequencer::default();
-        assert_eq!(seq.reader_tail(URI), None, "no writer issued → nothing to wait on");
+        assert_eq!(
+            seq.reader_barrier_and_tail(URI).1,
+            None,
+            "no writer issued → nothing to wait on"
+        );
 
         let first = seq.issue_writer_ticket(URI);
         let second = seq.issue_writer_ticket(URI);
-        assert_eq!(seq.reader_tail(URI), Some(2), "tail is the highest issued ticket");
+        assert_eq!(
+            seq.reader_barrier_and_tail(URI).1,
+            Some(2),
+            "tail is the highest issued ticket"
+        );
 
-        // Unlike `reader_barrier`, the tail is still reported once every writer
-        // has completed — the reader waits on the parse watermark, which a
-        // completed ticket has already advanced.
+        // Unlike the barrier, the tail is still reported once every writer has
+        // completed — the reader waits on the parse watermark, which a completed
+        // ticket has already advanced.
         drop(first);
         drop(second);
-        assert!(
-            seq.reader_barrier(URI).is_none(),
-            "all writers done → no barrier"
-        );
+        let (barrier, tail) = seq.reader_barrier_and_tail(URI);
+        assert!(barrier.is_none(), "all writers done → no barrier");
         assert_eq!(
-            seq.reader_tail(URI),
+            tail,
             Some(2),
             "but the tail is still observable for the watermark wait"
         );
@@ -567,7 +577,10 @@ mod tests {
     async fn finish_close_removes_state_and_wakes_stragglers() {
         let seq = DocumentSequencer::default();
         let close = seq.issue_writer_ticket(URI);
-        let barrier = seq.reader_barrier(URI).expect("close pending");
+        let barrier = seq
+            .reader_barrier_and_tail(URI)
+            .0
+            .expect("close pending");
 
         let ticket = close.ticket();
         drop(close);
