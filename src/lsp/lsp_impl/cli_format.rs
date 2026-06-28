@@ -42,6 +42,9 @@ impl Kakehashi {
     /// configuration from `root` (typically the current directory) exactly
     /// like an editor session rooted there would.
     pub(crate) async fn cli_initialize(&self, root: &Path) {
+        // One-shot CLI: no editor consumes proactive publishDiagnostics, so
+        // did_open_impl skips the synthetic diagnostic task (#489).
+        self.mark_cli_mode();
         let workspace_folders = Url::from_file_path(root)
             .ok()
             .and_then(|url| url_to_uri(&url).ok())
