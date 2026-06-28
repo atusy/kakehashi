@@ -381,6 +381,15 @@ impl Kakehashi {
         let scheduler = std::sync::Arc::clone(&self.parse_scheduler);
 
         tokio::spawn(async move {
+            // If the loop panics in its glue (the blocking parse is already
+            // panic-isolated by spawn_blocking), this guard clears the stuck
+            // `parsing` entry on unwind so the next edit re-spawns rather than the
+            // document wedging tree-less forever.
+            let mut guard = parse_scheduler::ParseLoopGuard::new(
+                std::sync::Arc::clone(&scheduler),
+                uri.clone(),
+            );
+
             // Cover the latest edit on the first pass too (an edit can raise the
             // ticket between this spawn and the first parse).
             let mut ticket = scheduler.latest_ticket(&uri);
@@ -398,7 +407,11 @@ impl Kakehashi {
 
                 match scheduler.next(&uri) {
                     Some(next_ticket) => ticket = next_ticket,
-                    None => break,
+                    None => {
+                        // Normal exit: next() already removed the entry.
+                        guard.disarm();
+                        break;
+                    }
                 }
             }
         });
