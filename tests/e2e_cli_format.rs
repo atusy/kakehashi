@@ -554,6 +554,16 @@ languages = ["lua"]
         "all preferred formatters failing (no winner) must exit 2; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("operation(s) failed"),
+        "stderr should report the failed requests; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        MARKDOWN,
+        "no winner means no edit — the file must be left untouched"
+    );
 }
 
 #[test]
@@ -590,6 +600,54 @@ languages = ["markdown"]
         read(ws.path(), "doc.md"),
         MARKDOWN,
         "the file must be left untouched"
+    );
+}
+
+#[test]
+fn e2e_host_layer_preferred_non_winning_failure_is_not_counted() {
+    // The HOST-layer analogue of `e2e_format_preferred_non_winning_failure_
+    // is_not_counted`: two `bridge._self` host formatters race under
+    // `preferred`; the higher-priority one errors, the fallback uppercases the
+    // document and WINS. The winning host formatter is authoritative, so the
+    // loser's failure must NOT exit 2 (#503) — pinning the non-counting change
+    // in `host_format_edits`, which the single-server host failure test (no
+    // winner → exit 2) cannot exercise.
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.bridge._self.aggregation."textDocument/formatting"]
+priorities = ["mock-fail-host", "mock-upper-host"]
+
+[languageServers.mock-fail-host]
+cmd = ['{bin}', 'fail-request']
+languages = ["markdown"]
+
+[languageServers.mock-upper-host]
+cmd = ['{bin}', 'upper']
+languages = ["markdown"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write host fail+fallback config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a winning host formatter is authoritative; the loser's failure must not \
+         exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        read(ws.path(), "doc.md").contains("LOCAL X = 1"),
+        "the winning host formatter's uppercased output is still written"
     );
 }
 
