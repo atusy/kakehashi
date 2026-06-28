@@ -615,7 +615,11 @@ mod tests {
     fn insert_seeds_a_watermark_entry_at_zero() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///wm.rs").unwrap();
-        assert_eq!(watermark_of(&store, &uri), None, "no entry before registration");
+        assert_eq!(
+            watermark_of(&store, &uri),
+            None,
+            "no entry before registration"
+        );
 
         seed_document(&store, &uri);
         assert_eq!(
@@ -632,7 +636,11 @@ mod tests {
         seed_document(&store, &uri);
 
         store.advance_watermark(&uri, 7);
-        assert_eq!(watermark_of(&store, &uri), Some(7), "publish records the ticket");
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(7),
+            "publish records the ticket"
+        );
     }
 
     #[test]
@@ -650,7 +658,11 @@ mod tests {
         );
 
         store.advance_watermark(&uri, 8);
-        assert_eq!(watermark_of(&store, &uri), Some(8), "a higher ticket advances it");
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(8),
+            "a higher ticket advances it"
+        );
     }
 
     #[test]

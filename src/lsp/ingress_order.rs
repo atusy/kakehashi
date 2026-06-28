@@ -188,7 +188,10 @@ impl DocumentSequencer {
     ///   reported even when every writer has already completed, because the reader
     ///   waits on the watermark (which a completed ticket has already advanced),
     ///   not on ticket completion.
-    pub(crate) fn reader_barrier_and_tail(&self, uri: &str) -> (Option<ReaderBarrier>, Option<u64>) {
+    pub(crate) fn reader_barrier_and_tail(
+        &self,
+        uri: &str,
+    ) -> (Option<ReaderBarrier>, Option<u64>) {
         let Some(entry) = self.docs.get(uri) else {
             return (None, None);
         };
@@ -463,10 +466,7 @@ mod tests {
         let seq = DocumentSequencer::default();
         let first = seq.issue_writer_ticket(URI);
 
-        let barrier = seq
-            .reader_barrier_and_tail(URI)
-            .0
-            .expect("writer pending");
+        let barrier = seq.reader_barrier_and_tail(URI).0.expect("writer pending");
 
         // A writer arriving AFTER the reader must not extend its wait.
         let second = seq.issue_writer_ticket(URI);
@@ -581,10 +581,7 @@ mod tests {
     async fn finish_close_removes_state_and_wakes_stragglers() {
         let seq = DocumentSequencer::default();
         let close = seq.issue_writer_ticket(URI);
-        let barrier = seq
-            .reader_barrier_and_tail(URI)
-            .0
-            .expect("close pending");
+        let barrier = seq.reader_barrier_and_tail(URI).0.expect("close pending");
 
         let ticket = close.ticket();
         drop(close);
@@ -911,8 +908,7 @@ mod tests {
         });
 
         // The first writer for the document is ticket 1; the handler must see it.
-        gate
-            .call(notification("textDocument/didChange", URI))
+        gate.call(notification("textDocument/didChange", URI))
             .await
             .unwrap();
 
@@ -939,12 +935,10 @@ mod tests {
 
         // A writer issues ticket 1, then a reader follows on the wire: the reader
         // handler must observe tail ticket 1 (so it can wait the watermark to it).
-        gate
-            .call(notification("textDocument/didChange", URI))
+        gate.call(notification("textDocument/didChange", URI))
             .await
             .unwrap();
-        gate
-            .call(notification("textDocument/semanticTokens/full", URI))
+        gate.call(notification("textDocument/semanticTokens/full", URI))
             .await
             .unwrap();
 

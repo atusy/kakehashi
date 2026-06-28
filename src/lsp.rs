@@ -18,8 +18,8 @@ mod semantic_request_tracker;
 mod settings;
 
 pub use bridge::LanguageServerPool;
-pub(crate) use ingress_order::{current_reader_tail, current_writer_ticket};
 pub use ingress_order::IngressOrderGate;
+pub(crate) use ingress_order::{current_reader_tail, current_writer_ticket};
 pub use lsp_impl::Kakehashi;
 pub(crate) use request_id::current_upstream_id;
 pub use request_id::{CancelForwarder, RequestIdCapture};
