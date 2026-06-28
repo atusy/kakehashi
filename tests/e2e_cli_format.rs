@@ -433,11 +433,14 @@ languages = ["lua"]
 }
 
 #[test]
-fn e2e_failed_formatter_rescued_by_fallback_still_exits_with_error() {
-    // Preferred fan-out: the priority server errors, the fallback formats.
-    // The file gets the fallback's output, but the broken configured
-    // formatter must still surface as exit 2 — otherwise CI never learns
-    // the primary formatter is broken.
+fn e2e_format_preferred_non_winning_failure_is_not_counted() {
+    // Preferred fan-out (the bridge-level default for formatting): the
+    // higher-priority server errors, the fallback formats and WINS. Under
+    // `preferred` the winning formatter is authoritative, so a non-winning
+    // server's request failure must NOT surface as exit 2 (#503, mirroring the
+    // diagnose fix #487). Counting losers in-task is also racy — the preferred
+    // fan-in aborts losers without joining them. The run must exit 0
+    // deterministically; the fallback's output is still written.
     let ws = workspace_with(&[("doc.md", MARKDOWN)]);
     std::fs::write(
         ws.path().join("kakehashi.toml"),
@@ -463,8 +466,9 @@ languages = ["lua"]
     let output = run_format(ws.path(), &["doc.md"]);
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "a failed formatter must exit 2 even when a fallback rescued the file; stderr: {}",
+        Some(0),
+        "preferred winner is authoritative; a non-winning formatter's failure must \
+         not exit 2; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
@@ -474,10 +478,12 @@ languages = ["lua"]
 }
 
 #[test]
-fn e2e_malformed_formatter_response_exits_with_error() {
+fn e2e_format_preferred_malformed_non_winner_is_not_counted() {
     // A protocol-invalid success (result is not TextEdit[]) is a request
-    // failure too: the fallback still formats the file, but the run must
-    // exit 2 so the broken formatter surfaces.
+    // failure, but as a non-winning candidate under `preferred` it is treated
+    // the same as any other loser failure: the fallback wins and is
+    // authoritative, so the run exits 0, not 2 (#503). The fallback still
+    // formats the file.
     let ws = workspace_with(&[("doc.md", MARKDOWN)]);
     std::fs::write(
         ws.path().join("kakehashi.toml"),
@@ -503,13 +509,60 @@ languages = ["lua"]
     let output = run_format(ws.path(), &["doc.md"]);
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "a malformed formatter response must exit 2; stderr: {}",
+        Some(0),
+        "a malformed non-winning formatter must not exit 2 when a fallback wins; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         read(ws.path(), "doc.md").contains("LOCAL X = 1"),
         "the fallback formatter's output is still written"
+    );
+}
+
+#[test]
+fn e2e_format_preferred_all_servers_fail_exits_two() {
+    // No formatter wins under `preferred` (both error) → the fan-in drains to
+    // `NoResult` and the failure count is decisive, so the run exits 2. Guards
+    // that #503's "don't count non-winning failures" does not suppress the
+    // genuine all-failed case.
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+priorities = ["mock-fail-a", "mock-fail-b"]
+
+[languageServers.mock-fail-a]
+cmd = ['{bin}', 'fail-request']
+languages = ["lua"]
+
+[languageServers.mock-fail-b]
+cmd = ['{bin}', 'fail-request']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write all-fail config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "all preferred formatters failing (no winner) must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("operation(s) failed"),
+        "stderr should report the failed requests; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        MARKDOWN,
+        "no winner means no edit — the file must be left untouched"
     );
 }
 
@@ -547,6 +600,54 @@ languages = ["markdown"]
         read(ws.path(), "doc.md"),
         MARKDOWN,
         "the file must be left untouched"
+    );
+}
+
+#[test]
+fn e2e_host_layer_preferred_non_winning_failure_is_not_counted() {
+    // The HOST-layer analogue of `e2e_format_preferred_non_winning_failure_
+    // is_not_counted`: two `bridge._self` host formatters race under
+    // `preferred`; the higher-priority one errors, the fallback uppercases the
+    // document and WINS. The winning host formatter is authoritative, so the
+    // loser's failure must NOT exit 2 (#503) — pinning the non-counting change
+    // in `host_format_edits`, which the single-server host failure test (no
+    // winner → exit 2) cannot exercise.
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.bridge._self.aggregation."textDocument/formatting"]
+priorities = ["mock-fail-host", "mock-upper-host"]
+
+[languageServers.mock-fail-host]
+cmd = ['{bin}', 'fail-request']
+languages = ["markdown"]
+
+[languageServers.mock-upper-host]
+cmd = ['{bin}', 'upper']
+languages = ["markdown"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write host fail+fallback config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a winning host formatter is authoritative; the loser's failure must not \
+         exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        read(ws.path(), "doc.md").contains("LOCAL X = 1"),
+        "the winning host formatter's uppercased output is still written"
     );
 }
 
