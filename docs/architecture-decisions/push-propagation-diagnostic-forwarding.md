@@ -7,6 +7,7 @@
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — Server pool, document tracking, notification forwarding
 - [ls-bridge-message-ordering](ls-bridge-message-ordering.md) — Per-URI ordering the cache relies on
 - [host-document-bridge](host-document-bridge.md) — Host-layer (`_self`) participation
+- [downstream-diagnostic-refresh-handling](downstream-diagnostic-refresh-handling.md) — How a downstream `workspace/diagnostic/refresh` triggers the Path A pull and forwards to the editor
 
 ## Context
 
