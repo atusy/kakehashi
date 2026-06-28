@@ -280,6 +280,37 @@ impl DocumentStore {
         stored
     }
 
+    /// Like [`update_tree_if_text_unchanged`], but additionally stores the tree
+    /// only if the document currently has **no** tree. For the off-ingress install
+    /// reparse (`reparse_installed_document`), whose "don't clobber a concurrent
+    /// parse" guard is a `tree.is_some()` pre-check: a parse attaching a tree for
+    /// the same text *between* that pre-check and this write would otherwise be
+    /// overwritten — discarding its incremental-edit linkage (`previous_tree` /
+    /// `previous_text`) and corrupting the next `changed_ranges()`. Folding the
+    /// `tree.is_none()` check into the same `get_mut` shard lock as the text
+    /// comparison makes the guard atomic.
+    pub(crate) fn attach_tree_if_absent(
+        &self,
+        uri: &Url,
+        expected_text: &str,
+        new_tree: Tree,
+    ) -> bool {
+        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
+            if doc.tree().is_none() && doc.text() == expected_text {
+                doc.set_tree(new_tree);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if stored {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        stored
+    }
+
     /// Update document with an edited previous tree for proper changed_ranges() support.
     ///
     /// Call when parsing used an edited old tree (via `tree.edit()`): the
@@ -578,6 +609,42 @@ mod tests {
         assert!(
             store.get(&uri).unwrap().tree().is_none(),
             "the stale tree must not overwrite the current text's (still-absent) tree"
+        );
+    }
+
+    #[test]
+    fn attach_tree_if_absent_stores_only_when_no_tree_present() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///absent.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        // No tree yet → stores.
+        assert!(store.attach_tree_if_absent(&uri, "fn main() {}", parse_rust("fn main() {}")));
+        let first = store.get(&uri).unwrap().tree().unwrap().root_node().id();
+
+        // A tree is now present → a second attach must NOT clobber it (the guard
+        // is atomic with the write, unlike a separate tree.is_some() pre-check).
+        assert!(!store.attach_tree_if_absent(&uri, "fn main() {}", parse_rust("fn main() {}")));
+        assert_eq!(
+            store.get(&uri).unwrap().tree().unwrap().root_node().id(),
+            first,
+            "an existing tree must be preserved, not overwritten"
+        );
+    }
+
+    #[test]
+    fn attach_tree_if_absent_does_not_resurrect_closed_document() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///closed.rs").unwrap();
+        assert!(!store.attach_tree_if_absent(&uri, "fn main() {}", parse_rust("fn main() {}")));
+        assert!(
+            store.get(&uri).is_none(),
+            "must not resurrect a closed document"
         );
     }
 

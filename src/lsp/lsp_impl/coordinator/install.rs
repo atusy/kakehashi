@@ -153,7 +153,6 @@ impl InstallCoordinator {
         &self,
         language: &str,
         uri: Url,
-        text: String,
         is_injection: bool,
     ) -> bool {
         let result = self.auto_install.try_install(language).await;
@@ -161,7 +160,7 @@ impl InstallCoordinator {
         self.dispatch_install_events(language, &result.events).await;
 
         if let Some(data_dir) = result.outcome.data_dir() {
-            self.reload_language_after_install(language, data_dir, uri, text, is_injection)
+            self.reload_language_after_install(language, data_dir, uri, is_injection)
                 .await;
             return true;
         }
@@ -170,12 +169,15 @@ impl InstallCoordinator {
     }
 
     /// Reload a language after installation and optionally re-parse the document.
+    ///
+    /// The re-parse re-reads the latest store text itself
+    /// ([`reparse_installed_document`](ParseCoordinator::reparse_installed_document)),
+    /// so no open-time text is threaded here.
     pub(crate) async fn reload_language_after_install(
         &self,
         language: &str,
         data_dir: &std::path::Path,
         uri: Url,
-        text: String,
         is_injection: bool,
     ) {
         let settings_snapshot = self.settings_manager.load_settings_pair();
@@ -195,14 +197,13 @@ impl InstallCoordinator {
 
         if !is_injection {
             let host_language = self.get_language_for_document(&uri);
-            let lang_for_parse = host_language.as_deref();
-            let parse_coordinator = self.parse_coordinator();
-            parse_coordinator
-                // No ingress ticket: this post-install reparse runs off the
-                // ingress sequence (the original didOpen's ticket already
-                // advanced the watermark on its skip-parse path), so it does not
-                // re-stamp the watermark.
-                .parse_document(uri.clone(), text, lang_for_parse, vec![], None)
+            // Resurrection-safe, off-ingress reparse: re-reads the latest store
+            // text and persists through a non-inserting CAS, so a didClose during
+            // the install can't be resurrected. (The original didOpen's ticket
+            // already advanced the watermark on its skip-parse path, so this
+            // carries no ticket.)
+            self.parse_coordinator()
+                .reparse_installed_document(uri.clone(), host_language)
                 .await;
         }
     }

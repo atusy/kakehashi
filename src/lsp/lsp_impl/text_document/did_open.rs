@@ -73,13 +73,45 @@ impl Kakehashi {
 
             if !load_result.success {
                 if self.settings_manager.is_auto_install_enabled() {
-                    // Language failed to load and auto-install is enabled
-                    // is_injection=false: This is the document's main language
-                    // If install is triggered, skip parse_document here - reload_language_after_install will handle it
-                    skip_parse = self
-                        .install_coordinator()
-                        .maybe_auto_install_language(lang, uri.clone(), text.clone(), false)
-                        .await;
+                    // Language failed to load and auto-install is enabled.
+                    //
+                    // Move auto-install OFF the ingress writer ticket (#480
+                    // liveness): a slow or hung parser *compile* must not hold the
+                    // didOpen ticket and wedge later same-URI readers/writers. The
+                    // spawned task installs, reloads, and resurrection-safely
+                    // reparses the latest store text; this handler returns
+                    // immediately. We skip the inline parse unconditionally — the
+                    // parser is not loaded yet, so an inline parse would yield no
+                    // tree anyway — and the skip-parse branch below advances the
+                    // watermark so a gated reader is not stranded.
+                    let install = self.install_coordinator();
+                    let injection = self.injection_coordinator();
+                    let documents = std::sync::Arc::clone(&self.documents);
+                    let lang = lang.clone();
+                    let install_uri = uri.clone();
+                    tokio::spawn(async move {
+                        install
+                            .maybe_auto_install_language(&lang, install_uri.clone(), false)
+                            .await;
+                        // The skipped inline parse meant the handler's
+                        // process_injections (below) ran with no tree. Now that the
+                        // off-ingress reparse may have produced one, run the normal
+                        // post-parse injection workflow — injected-language install
+                        // and eager bridge spawn — which also keeps that injected
+                        // install off the ingress ticket. forward=false: open path.
+                        //
+                        // Gate on the document actually having a tree: install can
+                        // fail or be deduped (AlreadyInstalling) with no reparse, and
+                        // process_injections would otherwise cancel the eager-open
+                        // for a still-tree-less document.
+                        let has_tree = documents
+                            .get(&install_uri)
+                            .is_some_and(|doc| doc.tree().is_some());
+                        if has_tree {
+                            injection.process_injections(&install_uri, false).await;
+                        }
+                    });
+                    skip_parse = true;
                 } else {
                     // Notify user that parser is missing and needs manual installation
                     let reason = self.install_coordinator().auto_install_disabled_reason();
@@ -96,9 +128,9 @@ impl Kakehashi {
         // has resolved.
         let ticket = crate::lsp::current_writer_ticket();
 
-        // Only parse if auto-install was NOT triggered
-        // If auto-install was triggered, reload_language_after_install will call parse_document
-        // after the parser file is completely written, preventing race condition
+        // Only parse if auto-install was NOT triggered. If it was, the spawned
+        // install task reparses off-ingress once the parser is written
+        // (reparse_installed_document), so we must not parse inline here.
         if !skip_parse {
             self.parse_coordinator()
                 .parse_document(
@@ -110,9 +142,10 @@ impl Kakehashi {
                 )
                 .await;
         } else if let Some(ticket) = ticket {
-            // Parsing is deferred to reload_language_after_install. Advance the
-            // watermark now so a reader gated behind this open does not stall to
-            // its timeout waiting for a parse that won't run on the ingress path;
+            // Parsing is deferred to the spawned off-ingress install reparse.
+            // Advance the watermark now so a reader gated behind this open does not
+            // stall to its timeout waiting for a parse that won't run on the
+            // ingress path;
             // it proceeds and observes the (still tree-less) install-pending
             // document via its existing has-tree wait, exactly as before this
             // signal existed.
@@ -126,9 +159,15 @@ impl Kakehashi {
 
         // Process injected languages: auto-install missing parsers and spawn bridge servers.
         // This must be called AFTER parse_document so we have access to the AST.
-        self.injection_coordinator()
-            .process_injections(&uri, false)
-            .await;
+        // In the skip-parse (auto-install) path there is no tree yet and the
+        // spawned install task runs this itself once its reparse produces one, so
+        // skip it here to avoid a redundant no-op that would cancel the eager-open
+        // the spawn is about to start.
+        if !skip_parse {
+            self.injection_coordinator()
+                .process_injections(&uri, false)
+                .await;
+        }
 
         // pull-first-diagnostic-forwarding Phase 2: Trigger synthetic diagnostic push on didOpen
         // This provides proactive diagnostics for clients that don't support pull diagnostics.
@@ -670,6 +709,94 @@ print("hello")
         assert!(
             host.configs.iter().any(|c| c.server_name == "rust_ls"),
             "the push-only rust_ls must be in the host context so the debounce re-sync reaches it"
+        );
+    }
+
+    /// Resurrection safety (#480 off-ingress install): a `didClose` landing while
+    /// the spawned auto-install runs removes the document; the late
+    /// `reparse_installed_document` must NOT recreate it.
+    #[tokio::test]
+    async fn reparse_installed_document_does_not_resurrect_closed_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/closed_during_install.rs").unwrap();
+        // The document was closed during the install: nothing is in the store.
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), Some("rust".to_string()))
+            .await;
+
+        assert!(
+            server.documents.get(&uri).is_none(),
+            "a reparse after the document was closed must not resurrect it"
+        );
+    }
+
+    /// The off-ingress install reparse re-reads the latest store text and attaches
+    /// a tree to the still-open document.
+    #[tokio::test]
+    async fn reparse_installed_document_parses_the_open_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/installed.rs").unwrap();
+        // Registered (as on didOpen) but not yet parsed — the parser had just
+        // finished installing.
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), Some("rust".to_string()))
+            .await;
+
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_some(),
+            "the reparse must attach a tree to the open document"
+        );
+    }
+
+    /// If a concurrent `didChange` already parsed the document (a tree is
+    /// present), the install reparse must short-circuit and not redundantly
+    /// reparse / clobber it.
+    #[tokio::test]
+    async fn reparse_installed_document_skips_when_a_tree_is_already_present() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/already_parsed.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn already() {}", None).unwrap();
+        let tree_id = tree.root_node().id();
+        server.documents.insert(
+            uri.clone(),
+            "fn already() {}".to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), Some("rust".to_string()))
+            .await;
+
+        let doc = server.documents.get(&uri).unwrap();
+        assert_eq!(
+            doc.tree().unwrap().root_node().id(),
+            tree_id,
+            "the existing tree must be left untouched (no redundant reparse)"
         );
     }
 
