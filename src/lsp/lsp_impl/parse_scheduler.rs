@@ -105,23 +105,20 @@ impl ParseScheduler {
     /// pass (`dirty`) — keep the entry and loop (the next [`start_pass`] clears it);
     /// `false` when nothing is pending — the entry is removed and the loop exits.
     ///
-    /// **Atomic via `entry`** (the whole check-and-remove under one shard write
-    /// lock): a `get_mut`-then-`remove` split would let a concurrent `schedule` set
-    /// `dirty` between the check and the removal and then be deleted — a lost
-    /// wakeup that wedges the document until the next edit. So this is deliberately
-    /// not micro-optimized to avoid the `Url` clone.
+    /// Uses `remove_if`, which holds the shard write lock across the predicate
+    /// **and** the removal, so it is atomic against a concurrent `schedule`: that
+    /// `schedule` either sets `dirty` before the predicate runs (entry kept → we
+    /// continue) or after the removal (entry re-created → it spawns a fresh loop).
+    /// A `get_mut`-then-`remove` split would instead let `schedule` set `dirty`
+    /// between the two and then be deleted — a lost wakeup. `remove_if` also borrows
+    /// the key (no `Url` clone). The loop's entry is always present when this runs
+    /// (nothing else removes scheduler entries), so a non-removal means it was kept
+    /// for `dirty` → continue.
     pub(crate) fn finish(&self, uri: &Url) -> bool {
-        match self.states.entry(uri.clone()) {
-            Entry::Occupied(entry) => {
-                if entry.get().dirty {
-                    true
-                } else {
-                    entry.remove();
-                    false
-                }
-            }
-            Entry::Vacant(_) => false,
-        }
+        // `Some` = removed because it was clean → stop; `None` = kept (dirty) → loop.
+        self.states
+            .remove_if(uri, |_, state| !state.dirty)
+            .is_none()
     }
 
     /// Clear `uri`'s scheduling entry unconditionally. Used by [`ParseLoopGuard`]
