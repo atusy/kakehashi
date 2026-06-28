@@ -52,7 +52,9 @@ use crate::lsp::bridge::{
     UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
 };
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
-use crate::lsp::lsp_impl::text_document::{RequestErrorSink, count_request_errors};
+use crate::lsp::lsp_impl::text_document::{
+    RequestErrorSink, count_no_winner_errors, count_request_errors,
+};
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
 
 use super::super::{Kakehashi, uri_to_url};
@@ -461,19 +463,18 @@ impl Kakehashi {
 
         let cancel_rx = cancel_state.derive_receiver();
         let pool = self.bridge.pool_arc();
-        // Source-level error counting, mirroring the virt preferred dispatch:
-        // `Done` discards the fan-in's error count, so counting here is what
-        // keeps a failed-but-rescued host formatter visible to CLI mode.
-        let request_error_sink = cancel_state.request_error_sink.clone();
         let result = crate::lsp::aggregation::server::dispatch_host_preferred(
             &ctx,
             pool.clone(),
+            // Non-counting send, mirroring the virt preferred dispatch: under
+            // `preferred` a non-winning host server's failure is not a CLI
+            // exit-2 (the winner is authoritative), and in-task counting is racy
+            // (the fan-in aborts losers without joining). Failures are counted
+            // only when no server won, via `count_no_winner_errors` below (#503).
             move |t| {
                 let params = params.clone();
-                let request_error_sink = request_error_sink.clone();
                 async move {
-                    let result = t
-                        .pool
+                    t.pool
                         .send_host_formatting_request(
                             &t.server_name,
                             &t.server_config,
@@ -486,11 +487,7 @@ impl Kakehashi {
                             params,
                             t.upstream_id,
                         )
-                        .await;
-                    if result.is_err() {
-                        count_request_errors(&request_error_sink, 1);
-                    }
-                    result
+                        .await
                 }
             },
             // `Some(vec![])` (and a capable server's `null`, normalized to it)
@@ -502,14 +499,17 @@ impl Kakehashi {
         )
         .await;
         pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        // Count failures only when no host server won (#503): `NoResult` drains
+        // every task, so its `errors` is the exhaustive, deterministic count.
+        count_no_winner_errors(&result, &cancel_state.request_error_sink);
         // Quiet on an all-empty host layer (the virt arm already emits the
         // client-visible LOG); only real host failures get surfaced —
         // mirroring `host_layer_value_with_ctx`.
         match result {
             FanInResult::Done(value) => Ok(value),
             FanInResult::NoResult { errors } => {
-                // Request errors were already counted at the source (the
-                // dispatch closure above); this arm only chooses log severity.
+                // `errors` was just recorded into the sink above; this arm only
+                // chooses log severity.
                 if errors > 0 {
                     self.client
                         .log_message(
@@ -745,15 +745,15 @@ async fn dispatch_preferred_formatting(
 ) -> Option<Vec<TextEdit>> {
     let send = move |t: crate::lsp::aggregation::server::FanOutTask| {
         let options = options.clone();
-        // Count request failures at the SOURCE, not from the fan-in
-        // verdict: `FanInResult::Done` discards the error count, so a
-        // failed higher-priority formatter rescued by a fallback server
-        // would otherwise go unreported and a CLI run would exit 0
-        // despite a broken configured formatter.
-        let request_error_sink = request_error_sink.clone();
+        // Non-counting send: under `preferred` a non-winning server's request
+        // failure is NOT a CLI exit-2 (the winner is authoritative), and
+        // counting losers in-task is racy — the preferred fan-in `abort_all`s
+        // losers without joining them, so a loser's `fetch_add` could land
+        // after the CLI read the counter. Failures are recorded only when no
+        // server won, via `count_no_winner_errors` on the fan-in result below
+        // (#503, mirroring the diagnose fix #487).
         async move {
-            let result = t
-                .pool
+            t.pool
                 .send_formatting_request(
                     &t.server_name,
                     &t.server_config,
@@ -771,11 +771,7 @@ async fn dispatch_preferred_formatting(
                     t.client_progress_token,
                     None,
                 )
-                .await;
-            if result.is_err() {
-                count_request_errors(&request_error_sink, 1);
-            }
-            result
+                .await
         }
     };
     // `Some(vec![])` is an authoritative "no edits needed" from the
@@ -800,6 +796,11 @@ async fn dispatch_preferred_formatting(
         }
         None => dispatch_preferred(region_ctx, pool, send, is_nonempty, region_cancel_rx).await,
     };
+    // Count failures only when no server won. `NoResult` drains every task, so
+    // its `errors` is the exhaustive, deterministic count (zero if the
+    // non-winners merely returned empty); `Done`/`Cancelled` count nothing
+    // (#503).
+    count_no_winner_errors(&result, &request_error_sink);
     match result {
         FanInResult::Done(edits) => edits,
         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
