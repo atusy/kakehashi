@@ -23,12 +23,24 @@ use crate::text::PositionMapper;
 ///
 /// An empty returned edits vec is the caller's signal to do a full re-parse
 /// (`apply_text_change`); a non-empty vec means incremental (`apply_edits`).
+///
+/// **If any rangeless (full-replacement) change occurs anywhere in the batch the
+/// returned edits are empty**, even if ranged changes follow it. The returned
+/// `InputEdit`s describe a transform of `old_text`, but a full replacement severs
+/// that relationship: edits emitted *after* it are relative to the replacement
+/// text, not `old_text`, so they can neither diff against `old_text` nor seed a
+/// tree parsed from `old_text` (the #348 incremental-contract hazard). The whole
+/// batch is therefore a full sync.
 pub(crate) fn apply_content_changes_with_edits(
     old_text: &str,
     content_changes: Vec<TextDocumentContentChangeEvent>,
 ) -> (String, Vec<InputEdit>) {
     let mut text = old_text.to_string();
     let mut edits = Vec::new();
+    // Once a full replacement lands, no `InputEdit` in this batch can describe
+    // `old_text → final` incrementally, so the batch is a full sync regardless of
+    // any ranged changes that follow.
+    let mut saw_full_replacement = false;
 
     for change in content_changes {
         if let Some(range) = change.range {
@@ -46,39 +58,53 @@ pub(crate) fn apply_content_changes_with_edits(
             let mapper = PositionMapper::new(&text);
             let start_offset = mapper.position_to_byte_clamped(range.start);
             let end_offset = mapper.position_to_byte_clamped(range.end).max(start_offset);
-            let new_end_offset = start_offset + change.text.len();
 
-            // Calculate the new end position for tree-sitter (using byte columns)
-            let lines: Vec<&str> = change.text.split('\n').collect();
-            let line_count = lines.len();
-            // last_line_len is in BYTES (not UTF-16) because .len() on &str returns byte count
-            let last_line_len = lines.last().map(|l| l.len()).unwrap_or(0);
+            // Once a full replacement has landed in this batch the edits will be
+            // discarded at the end (the batch is a full sync), so skip building the
+            // `InputEdit` — its `split('\n')` allocation and `byte_to_point` searches
+            // would be pure waste. Still apply the splice so `text` ends correct.
+            if !saw_full_replacement {
+                let new_end_offset = start_offset + change.text.len();
 
-            // Points are derived from the (clamped) byte offsets via the same
-            // `LineIndex` (O(log n)), not the raw LSP positions, so they stay
-            // consistent with start_byte/old_end_byte for incremental parsing.
-            let start_point = mapper.byte_to_point(start_offset);
-            let old_end_point = mapper.byte_to_point(end_offset);
+                // Calculate the new end position for tree-sitter (using byte columns).
+                // Iterate the split directly rather than `.collect()`-ing a `Vec` — this
+                // runs on every keystroke's ranged edit, so the allocation is pure
+                // overhead. `split('\n')` always yields at least one segment, so
+                // `line_count >= 1` and `last_line_len` ends as the last segment's BYTE
+                // length (bytes, not UTF-16, since `str::len` is byte count).
+                let mut line_count = 0usize;
+                let mut last_line_len = 0usize;
+                for line in change.text.split('\n') {
+                    line_count += 1;
+                    last_line_len = line.len();
+                }
 
-            // Calculate new end Point (tree-sitter uses byte columns)
-            let new_end_point = if line_count > 1 {
-                // New content spans multiple lines
-                Point::new(start_point.row + line_count - 1, last_line_len)
-            } else {
-                // New content is on same line as start
-                Point::new(start_point.row, start_point.column + last_line_len)
-            };
+                // Points are derived from the (clamped) byte offsets via the same
+                // `LineIndex` (O(log n)), not the raw LSP positions, so they stay
+                // consistent with start_byte/old_end_byte for incremental parsing.
+                let start_point = mapper.byte_to_point(start_offset);
+                let old_end_point = mapper.byte_to_point(end_offset);
 
-            // Create InputEdit for incremental parsing
-            let edit = InputEdit {
-                start_byte: start_offset,
-                old_end_byte: end_offset,
-                new_end_byte: new_end_offset,
-                start_position: start_point,
-                old_end_position: old_end_point,
-                new_end_position: new_end_point,
-            };
-            edits.push(edit);
+                // Calculate new end Point (tree-sitter uses byte columns)
+                let new_end_point = if line_count > 1 {
+                    // New content spans multiple lines
+                    Point::new(start_point.row + line_count - 1, last_line_len)
+                } else {
+                    // New content is on same line as start
+                    Point::new(start_point.row, start_point.column + last_line_len)
+                };
+
+                // Create InputEdit for incremental parsing
+                let edit = InputEdit {
+                    start_byte: start_offset,
+                    old_end_byte: end_offset,
+                    new_end_byte: new_end_offset,
+                    start_position: start_point,
+                    old_end_position: old_end_point,
+                    new_end_position: new_end_point,
+                };
+                edits.push(edit);
+            }
 
             // Replace the range with new text
             text.replace_range(start_offset..end_offset, &change.text);
@@ -86,7 +112,19 @@ pub(crate) fn apply_content_changes_with_edits(
             // Full document change - no incremental parsing
             text = change.text;
             edits.clear(); // Clear any previous edits since it's a full replacement
+            saw_full_replacement = true;
         }
+    }
+
+    // Authoritative guarantee: any batch containing a full replacement returns
+    // empty edits (the full-reparse path). The skip above already prevents pushing
+    // post-replacement edits, so this is normally a no-op — but keeping it as the
+    // correctness mechanism means that optimization is *only* an optimization: a
+    // future change to the loop can't silently leak a `replacement`-relative edit
+    // (which would be unusable for both the `old_text` diff and the incremental
+    // seed) into the returned vec.
+    if saw_full_replacement {
+        edits.clear();
     }
 
     (text, edits)
@@ -287,6 +325,51 @@ mod tests {
         assert!(
             edits.is_empty(),
             "Full document sync should clear previous incremental edits"
+        );
+    }
+
+    #[test]
+    fn test_apply_content_changes_full_then_incremental_yields_empty_edits() {
+        // Regression: a full replacement FOLLOWED by a ranged change must still
+        // signal a full sync (empty edits). The ranged edit is relative to the
+        // replacement text, not `old_text`; returning it as a non-empty edit would
+        // make the incremental seed apply it to the (old_text) tree — the #348
+        // contract violation. Order matters: unlike the [incremental, full] case,
+        // the full replacement is NOT the last change here.
+        let old_text = "hello world";
+        let changes = vec![
+            // First: full document replacement (clears relationship to old_text)
+            TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "brand new body".to_string(),
+            },
+            // Second: incremental edit on the replacement text ("brand" -> "BRAND")
+            TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
+                }),
+                range_length: Some(5),
+                text: "BRAND".to_string(),
+            },
+        ];
+
+        let (new_text, edits) = apply_content_changes_with_edits(old_text, changes);
+
+        // Text reflects both changes applied in order.
+        assert_eq!(new_text, "BRAND new body");
+        // But edits MUST be empty so the caller does a full reparse — the edits
+        // cannot incrementally describe old_text -> new_text.
+        assert!(
+            edits.is_empty(),
+            "a full replacement anywhere in the batch must force the full-sync path"
         );
     }
 

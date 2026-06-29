@@ -381,9 +381,11 @@ impl ParseCoordinator {
     /// Re-parse `uri`'s **latest** store text off the ingress path, for the
     /// per-document parse scheduler (`Kakehashi::schedule_reparse`).
     ///
-    /// `did_change` clears the tree synchronously and schedules this; it runs in a
-    /// spawned loop, *not* on the writer ticket. A **full** parse (no incremental
-    /// seed — the tree was cleared, which also keeps #348 closed). The tree write
+    /// `did_change` clears the reader-visible tree synchronously and schedules this;
+    /// it runs in a spawned loop, *not* on the writer ticket. When the edit stashed a
+    /// `pending_seed` (the pre-edit tree with this edit's `InputEdit`s applied) the
+    /// parse is **incremental**, seeded from it; a full-text sync stashes no seed and
+    /// parses from scratch (which keeps #348 closed). The tree write
     /// is the non-inserting text **and language** CAS
     /// [`update_tree_if_text_and_language_unchanged`]: a closed (Vacant) document is
     /// left gone (resurrection-safe), a text that moved on (a `didChange` landed
@@ -393,10 +395,9 @@ impl ParseCoordinator {
     /// advances the store watermark to `ticket`, so a virt/native reader gated
     /// behind the originating edit is released once its parse resolved.
     ///
-    /// Incremental parse and semantic-token delta are intentionally not preserved
-    /// here (the cleared tree forces a full parse); coalescing recovers the burst
-    /// case, and incrementality is a perf optimization, never correctness. Re-adding
-    /// it is a follow-up.
+    /// The semantic-token `full/delta` path is unaffected by the off-ingress move:
+    /// it diffs cached token arrays by `result_id` (never `changed_ranges`), so as
+    /// long as the seed keeps this reparse cheap the delta stays cheap too.
     pub(crate) async fn reparse_latest(&self, uri: &Url, ticket: Option<u64>) {
         let advance_watermark = || {
             if let Some(ticket) = ticket {
@@ -407,8 +408,11 @@ impl ParseCoordinator {
         // Re-read the latest text + detect the language under one read guard. A
         // missing document means a `didClose` ran — resolve the watermark and stop
         // (no resurrection). `language_id` is captured so the tree write can reject
-        // a reopen that changed the language while this parse was in flight.
-        let (language_name, language_id, text) = {
+        // a reopen that changed the language while this parse was in flight. The
+        // `pending_seed` (a cheap `Tree` refcount-clone) is the edit's incremental
+        // parse seed stashed by `didChange`; `None` for a full-text sync / freshly
+        // installed parse, in which case we parse from scratch.
+        let (language_name, language_id, text, seed) = {
             let Some(doc) = self.documents.get(uri) else {
                 advance_watermark();
                 return;
@@ -417,10 +421,11 @@ impl ParseCoordinator {
             // (#498) — cheap on this reparse hot path.
             let text = doc.text_arc();
             let language_id = doc.language_id().map(|s| s.to_string());
+            let seed = doc.pending_seed().cloned();
             let language_name =
                 self.language
                     .detect_language(uri.path(), &text, None, language_id.as_deref());
-            (language_name, language_id, text)
+            (language_name, language_id, text, seed)
         };
 
         let Some(language_name) = language_name else {
@@ -437,12 +442,17 @@ impl ParseCoordinator {
         let auto_install = self.auto_install.clone();
         let language_name_clone = language_name.clone();
         // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure; the
-        // original stays here for the CAS + injection populate below.
+        // original stays here for the CAS + injection populate below. The seed (also
+        // a cheap `Tree` refcount-clone) makes this an **incremental** parse when an
+        // edit stashed one: tree-sitter reuses the unchanged subtrees and reparses
+        // only the edited region. `None` (full-text sync / install) parses from
+        // scratch. The seed already has this edit's `InputEdit`s applied
+        // (`didChange` → `apply_edit_and_seed`), satisfying tree-sitter's contract.
         let text_for_parse = text.clone();
         let parsed = self
             .parse_with_pool(&language_name, uri, text_len, move |mut parser| {
                 let _ = auto_install.begin_parsing(&language_name_clone);
-                let result = parser.parse(&*text_for_parse, None);
+                let result = parser.parse(&*text_for_parse, seed.as_ref());
                 let _ = auto_install.end_parsing(&language_name_clone);
                 (parser, result)
             })

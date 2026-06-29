@@ -81,16 +81,23 @@ impl Kakehashi {
         // repopulates the injection map from the freshly parsed tree.
         self.cache.invalidate_for_edits(&uri, &edits);
 
-        // Apply the edit to the store and CLEAR the tree synchronously, here under
-        // the edit lock (per-document-parse-actor ADR). Clearing the tree (rather
-        // than leaving the pre-edit one) is what keeps readers safe once the parse
-        // is off-ingress: a virt/native reader now sees *no* tree until the reparse
-        // lands (empty / on-demand fallback) instead of a stale tree that predates
-        // this edit — turning the #342/#374 stale-tree race into benign emptiness.
-        // The document exists (checked above) and the edit lock serializes didClose,
-        // so this update is in-place, not a resurrection.
+        // Apply the edit to the store and CLEAR the reader-visible tree
+        // synchronously, here under the edit lock (per-document-parse-actor ADR).
+        // Clearing the visible tree (rather than leaving the pre-edit one) is what
+        // keeps readers safe once the parse is off-ingress: a virt/native reader now
+        // sees *no* tree until the reparse lands (empty / on-demand fallback) instead
+        // of a stale tree that predates this edit — turning the #342/#374 stale-tree
+        // race into benign emptiness. The document exists (checked above) and the
+        // edit lock serializes didClose, so this update is in-place, not a
+        // resurrection.
+        //
+        // The pre-edit tree is NOT discarded: with `edits` applied it is stashed as
+        // the off-ingress reparse's incremental seed (`pending_seed`, read only by
+        // `reparse_latest`, never by readers), so a single edit reparses
+        // incrementally rather than from scratch. A full-text sync (`edits` empty)
+        // keeps no seed and parses from scratch (#348).
         let ticket = crate::lsp::current_writer_ticket();
-        self.documents.update_document(uri.clone(), text, None);
+        self.documents.apply_edit_clearing_tree(&uri, text, &edits);
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.
         // The cached tokens (with their result_id) are needed for delta calculations.

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tree_sitter::Tree;
+use tree_sitter::{InputEdit, Tree};
 
 /// Immutable snapshot of document state for lock-free processing
 pub(crate) struct DocumentSnapshot {
@@ -40,6 +40,24 @@ pub struct Document {
     previous_tree: Option<Tree>,
     /// Previous text for line delta calculation during incremental tokenization
     previous_text: Option<Arc<str>>,
+    /// Edited-but-not-yet-reparsed seed for the **off-ingress** incremental parse
+    /// (per-document-parse-actor).
+    ///
+    /// `didChange` clears the reader-visible `tree` (so a reader never sees a tree
+    /// that predates the edit — the flip's reader-safety invariant) but stashes the
+    /// pre-edit tree here with the edit's `InputEdit`s already applied
+    /// (`tree.edit()`). The off-ingress `reparse_latest` consumes it as
+    /// `parser.parse(text, Some(seed))` to parse incrementally instead of from
+    /// scratch. Coalesced edits accumulate their `InputEdit`s onto this same seed,
+    /// so a burst still produces one correctly-edited seed for the final reparse.
+    ///
+    /// **Read by `reparse_latest` only** — never by `tree()` / `snapshot()`, which
+    /// must stay `None` until the reparse lands. Cleared the moment a fresh tree is
+    /// attached (`set_tree`) — a present tree means the seed is consumed — and on a
+    /// full-text sync (`apply_edit_and_seed` with no `InputEdit`s), where seeding an
+    /// unedited tree against wholly-replaced text would violate tree-sitter's
+    /// incremental contract and corrupt external scanners (#348).
+    pending_seed: Option<Tree>,
 }
 
 impl Document {
@@ -51,6 +69,7 @@ impl Document {
             tree: None,
             previous_tree: None,
             previous_text: None,
+            pending_seed: None,
         }
     }
 
@@ -62,6 +81,7 @@ impl Document {
             tree: None,
             previous_tree: None,
             previous_text: None,
+            pending_seed: None,
         }
     }
 
@@ -73,6 +93,7 @@ impl Document {
             tree: Some(tree),
             previous_tree: None,
             previous_text: None,
+            pending_seed: None,
         }
     }
 
@@ -126,6 +147,11 @@ impl Document {
         self.previous_tree = self.tree.take();
         self.previous_text = Some(std::mem::replace(&mut self.text, Arc::from(new_text)));
         self.tree = Some(new_tree);
+        // Any pending incremental seed is for an edit superseded by this fresh
+        // tree+text; keep the invariant "visible tree present ⟹ no stale seed" so a
+        // later `reparse_latest` can't seed from a tree that predates this text
+        // (the #348 contract hazard).
+        self.pending_seed = None;
     }
 
     /// Update tree and text with an explicit edited previous tree.
@@ -142,6 +168,8 @@ impl Document {
         self.previous_tree = Some(edited_previous_tree);
         self.previous_text = Some(std::mem::replace(&mut self.text, Arc::from(new_text)));
         self.tree = Some(new_tree);
+        // See `update_tree_and_text`: a fresh visible tree consumes any pending seed.
+        self.pending_seed = None;
     }
 
     /// Attach a parsed tree **without** touching the text.
@@ -150,8 +178,50 @@ impl Document {
     /// text: there is no content-version transition to record, so `previous_tree`
     /// / `previous_text` are left as-is and the text is neither re-cloned nor
     /// replaced.
+    ///
+    /// Clears `pending_seed`: a present reader-visible tree means the off-ingress
+    /// reparse's seed has been consumed (the tree it would have produced is now
+    /// here), so the next `didChange` seeds from this fresh tree, not a stale seed.
     pub(crate) fn set_tree(&mut self, tree: Tree) {
         self.tree = Some(tree);
+        self.pending_seed = None;
+    }
+
+    /// Apply an edit's new text and stash an **incremental parse seed** for the
+    /// off-ingress reparse, clearing the reader-visible tree.
+    ///
+    /// The reader-visible `tree` is cleared (a reader must never see a tree that
+    /// predates this edit). The pre-edit tree — or the seed already accumulated by
+    /// an earlier coalesced edit — has `edits` applied via `tree.edit()` and is
+    /// stashed in `pending_seed` for `reparse_latest` to parse incrementally.
+    ///
+    /// With **no** `edits` (a full-text sync) the seed is dropped to `None`: seeding
+    /// an unedited tree against wholly-replaced text violates tree-sitter's
+    /// incremental contract and corrupted external scanners in #348, so a full-text
+    /// sync must parse from scratch.
+    pub(crate) fn apply_edit_and_seed(&mut self, new_text: String, edits: &[InputEdit]) {
+        // Base the seed on the reader-visible tree if present, else the seed an
+        // earlier coalesced edit already accumulated (the visible tree is cleared
+        // on the first edit of a burst, so subsequent edits chain onto the seed).
+        let base = self.tree.take().or_else(|| self.pending_seed.take());
+        self.pending_seed = match base {
+            Some(mut tree) if !edits.is_empty() => {
+                for edit in edits {
+                    tree.edit(edit);
+                }
+                Some(tree)
+            }
+            // Full-text sync (no edits) or no base tree: parse from scratch (#348).
+            _ => None,
+        };
+        self.text = Arc::from(new_text);
+    }
+
+    /// The off-ingress incremental parse seed, if any. **Read only by
+    /// `reparse_latest`** — `tree()` / `snapshot()` deliberately ignore it so a
+    /// reader never observes a pre-reparse tree. See [`pending_seed`](Self::pending_seed).
+    pub(crate) fn pending_seed(&self) -> Option<&Tree> {
+        self.pending_seed.as_ref()
     }
 
     /// Update text and clear layers/state
@@ -161,6 +231,7 @@ impl Document {
         self.tree = None;
         self.previous_tree = None;
         self.previous_text = None;
+        self.pending_seed = None;
     }
 }
 
@@ -248,6 +319,175 @@ mod tests {
         assert_eq!(doc.text(), "fn main() { let x = 1; }");
         // Previous tree should also exist
         assert!(doc.previous_tree.is_some());
+    }
+
+    /// A non-empty edit stashes an incremental parse seed and clears the
+    /// reader-visible tree (readers must not see a pre-reparse tree).
+    #[test]
+    fn apply_edit_and_seed_stashes_seed_and_clears_tree() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+
+        // Insert a space at byte 11 (before the closing brace): "fn main() { }".
+        let edit = InputEdit {
+            start_byte: 11,
+            old_end_byte: 11,
+            new_end_byte: 12,
+            start_position: tree_sitter::Point::new(0, 11),
+            old_end_position: tree_sitter::Point::new(0, 11),
+            new_end_position: tree_sitter::Point::new(0, 12),
+        };
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit]);
+
+        assert!(doc.tree().is_none(), "reader-visible tree must be cleared");
+        assert!(
+            doc.pending_seed().is_some(),
+            "incremental seed must be stashed"
+        );
+        assert_eq!(doc.text(), "fn main() { }");
+    }
+
+    /// A full-text sync (no `InputEdit`s) must drop the seed: seeding an unedited
+    /// tree against wholly-replaced text is the tree-sitter contract violation that
+    /// caused the #348 heap corruption.
+    #[test]
+    fn apply_edit_and_seed_drops_seed_on_full_text_sync() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+
+        // Full-text sync carries no InputEdits.
+        doc.apply_edit_and_seed("totally different content".to_string(), &[]);
+
+        assert!(doc.tree().is_none());
+        assert!(
+            doc.pending_seed().is_none(),
+            "full-text sync must not leave a stale seed (#348)"
+        );
+    }
+
+    /// Coalesced edits accumulate onto the same seed: after a first edit clears the
+    /// visible tree, a second edit chains its `InputEdit` onto the stashed seed.
+    #[test]
+    fn apply_edit_and_seed_coalesces_across_edits() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+
+        let edit1 = InputEdit {
+            start_byte: 11,
+            old_end_byte: 11,
+            new_end_byte: 12,
+            start_position: tree_sitter::Point::new(0, 11),
+            old_end_position: tree_sitter::Point::new(0, 11),
+            new_end_position: tree_sitter::Point::new(0, 12),
+        };
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit1]);
+        assert!(doc.tree().is_none());
+
+        // Second edit lands while the visible tree is still cleared: it must chain
+        // onto the accumulated seed, not silently drop incrementality.
+        let edit2 = InputEdit {
+            start_byte: 12,
+            old_end_byte: 12,
+            new_end_byte: 13,
+            start_position: tree_sitter::Point::new(0, 12),
+            old_end_position: tree_sitter::Point::new(0, 12),
+            new_end_position: tree_sitter::Point::new(0, 13),
+        };
+        doc.apply_edit_and_seed("fn main() {  }".to_string(), &[edit2]);
+
+        assert!(doc.tree().is_none());
+        assert!(
+            doc.pending_seed().is_some(),
+            "coalesced edit must keep the accumulated seed"
+        );
+        assert_eq!(doc.text(), "fn main() {  }");
+    }
+
+    /// Attaching a fresh tree consumes (clears) the pending seed.
+    #[test]
+    fn set_tree_clears_pending_seed() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+
+        let edit = InputEdit {
+            start_byte: 11,
+            old_end_byte: 11,
+            new_end_byte: 12,
+            start_position: tree_sitter::Point::new(0, 11),
+            old_end_position: tree_sitter::Point::new(0, 11),
+            new_end_position: tree_sitter::Point::new(0, 12),
+        };
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit]);
+        assert!(doc.pending_seed().is_some());
+
+        let reparsed = parser.parse("fn main() { }", None).unwrap();
+        doc.set_tree(reparsed);
+
+        assert!(doc.tree().is_some());
+        assert!(
+            doc.pending_seed().is_none(),
+            "attaching a fresh tree must consume the seed"
+        );
+    }
+
+    /// Every method that installs a fresh visible tree must clear `pending_seed`,
+    /// upholding "visible tree present ⟹ no stale seed" — else a later
+    /// `reparse_latest` could seed from a tree predating the new text (#348).
+    #[test]
+    fn fresh_tree_updates_clear_pending_seed() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let edit = InputEdit {
+            start_byte: 11,
+            old_end_byte: 11,
+            new_end_byte: 12,
+            start_position: tree_sitter::Point::new(0, 11),
+            old_end_position: tree_sitter::Point::new(0, 11),
+            new_end_position: tree_sitter::Point::new(0, 12),
+        };
+
+        // update_tree_and_text clears the seed.
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit.clone()]);
+        assert!(doc.pending_seed().is_some());
+        let t2 = parser.parse("fn main() { }", None).unwrap();
+        doc.update_tree_and_text(t2, "fn main() { }".to_string());
+        assert!(
+            doc.pending_seed().is_none(),
+            "update_tree_and_text must clear the pending seed"
+        );
+
+        // update_with_edited_tree clears the seed.
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit]);
+        assert!(doc.pending_seed().is_some());
+        let edited = parser.parse("fn main() {}", None).unwrap();
+        let t3 = parser.parse("fn main() { }", None).unwrap();
+        doc.update_with_edited_tree(t3, "fn main() { }".to_string(), edited);
+        assert!(
+            doc.pending_seed().is_none(),
+            "update_with_edited_tree must clear the pending seed"
+        );
     }
 
     #[test]
