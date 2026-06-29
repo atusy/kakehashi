@@ -50,12 +50,12 @@ pub struct DocumentStore {
     /// parse *off* the ingress ticket, at which point ticket-completion no longer
     /// implies a fresh tree and this watermark — not the completion channel — is
     /// what tells a virt/native reader the store reflects its tail edit. Keyed on
-    /// the ticket (the intra-lifetime wire order); the incarnation half of the
-    /// `(incarnation, ticket)` epoch gates the off-ingress *advance*
-    /// ([`advance_watermark_for_incarnation`](Self::advance_watermark_for_incarnation)),
-    /// so a prior lifetime's parse cannot advance a reopened document's
-    /// re-seeded watermark.
-    watermarks: DashMap<Url, watch::Sender<u64>>,
+    /// the ticket (the intra-lifetime wire order). The channel value carries the
+    /// lifetime's [`incarnation`](Watermark) too, so the off-ingress advance
+    /// ([`advance_watermark_for_incarnation`](Self::advance_watermark_for_incarnation))
+    /// gates on it atomically with the ticket write — a prior lifetime's parse
+    /// cannot advance a reopened document's re-seeded watermark.
+    watermarks: DashMap<Url, watch::Sender<Watermark>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -63,6 +63,20 @@ struct ParseState {
     generation: u64,
     in_progress: bool,
     has_tree: bool,
+}
+
+/// The value carried by a document's parse-watermark channel: the open
+/// `incarnation` the channel belongs to, and the highest `ticket` whose parse
+/// has resolved for that lifetime. Storing the incarnation **in the channel**
+/// lets the off-ingress advance compare it against the parse's captured
+/// incarnation *atomically* with the ticket write (inside `send_if_modified`,
+/// under the watch's own lock), so a straggler parse from a prior lifetime can
+/// never advance a reopened document's freshly re-seeded watermark — without a
+/// second-map lookup or any documents↔watermarks lock ordering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Watermark {
+    incarnation: u64,
+    ticket: u64,
 }
 
 pub struct DocumentHandle<'a> {
@@ -195,9 +209,10 @@ impl DocumentStore {
 
         self.documents.insert(uri.clone(), document);
         self.update_tree_availability(&uri, has_tree);
-        // Seed the watermark so its lifetime tracks the document's; `advance_watermark`
-        // is non-inserting and relies on this entry being present.
-        self.ensure_watermark_entry(&uri);
+        // Seed the watermark for this lifetime's incarnation so its lifetime tracks
+        // the document's; the advance paths are non-inserting and rely on this
+        // entry being present. A reopen replaces any leftover prior-lifetime channel.
+        self.ensure_watermark_entry(&uri, incarnation);
     }
 
     // Lock safety: Returns DocumentHandle wrapping Ref - caller holds read lock until drop
@@ -211,11 +226,12 @@ impl DocumentStore {
     pub fn update_document(&self, uri: Url, text: String, new_tree: Option<Tree>) {
         // Use entry API for atomic operations to prevent race conditions
         // between checking if document exists and inserting/updating.
-        let has_tree = match self.documents.entry(uri.clone()) {
+        let (has_tree, incarnation) = match self.documents.entry(uri.clone()) {
             Entry::Occupied(mut entry) => {
-                // Document exists - update in place
+                // Document exists - update in place, preserving its incarnation
+                // (an edit is the same lifetime).
                 let doc = entry.get_mut();
-                if let Some(tree) = new_tree {
+                let has_tree = if let Some(tree) = new_tree {
                     doc.update_tree_and_text(tree, text);
                     true
                 } else {
@@ -223,7 +239,8 @@ impl DocumentStore {
                     // This path is used when text changes without re-parsing (rare edge case).
                     doc.update_text(text);
                     false
-                }
+                };
+                (has_tree, doc.incarnation())
             }
             Entry::Vacant(entry) => {
                 // Document doesn't exist - create new one (a fresh lifetime →
@@ -231,7 +248,7 @@ impl DocumentStore {
                 // counter, not `documents`, so drawing it while holding this
                 // entry's shard write lock cannot deadlock.
                 let incarnation = self.next_incarnation();
-                if let Some(tree) = new_tree {
+                let has_tree = if let Some(tree) = new_tree {
                     entry.insert(Document::with_tree(
                         text,
                         "unknown".to_string(),
@@ -242,15 +259,16 @@ impl DocumentStore {
                 } else {
                     entry.insert(Document::new(text, incarnation));
                     false
-                }
+                };
+                (has_tree, incarnation)
             }
         };
         self.update_tree_availability(&uri, has_tree);
         // Keep the "live document ⟺ watermark entry" invariant: `update_document`
         // can insert on its `Vacant` branch, and a present document with no
         // watermark entry would make `wait_for_epoch` treat it as unregistered.
-        // Idempotent on the (common) update-in-place path.
-        self.ensure_watermark_entry(&uri);
+        // Idempotent on the (common) update-in-place path (same incarnation).
+        self.ensure_watermark_entry(&uri, incarnation);
     }
 
     /// Apply a `didChange`'s new text and stash an **incremental parse seed**,
@@ -276,21 +294,28 @@ impl DocumentStore {
         // of the prior `update_document`. The `RefMut` / entry is dropped before the
         // parse-state and watermark updates below (separate maps), keeping the
         // `documents` shard lock held no longer than `update_document` did.
-        if let Some(mut doc) = self.documents.get_mut(uri) {
+        let incarnation = if let Some(mut doc) = self.documents.get_mut(uri) {
             doc.apply_edit_and_seed(text, edits);
+            doc.incarnation()
         } else {
             match self.documents.entry(uri.clone()) {
-                Entry::Occupied(mut entry) => entry.get_mut().apply_edit_and_seed(text, edits),
+                Entry::Occupied(mut entry) => {
+                    let doc = entry.get_mut();
+                    doc.apply_edit_and_seed(text, edits);
+                    doc.incarnation()
+                }
                 Entry::Vacant(entry) => {
                     // Reordered edit registering an unopened URI: a fresh
                     // lifetime → fresh incarnation (mirrors `update_document`).
-                    entry.insert(Document::new(text, self.next_incarnation()));
+                    let incarnation = self.next_incarnation();
+                    entry.insert(Document::new(text, incarnation));
+                    incarnation
                 }
             }
-        }
+        };
         self.update_tree_availability(uri, false);
         // Keep the "live document ⟺ watermark entry" invariant (see `update_document`).
-        self.ensure_watermark_entry(uri);
+        self.ensure_watermark_entry(uri, incarnation);
     }
 
     /// Record the didOpen parse's result (detected `language` + optional `tree`) on
@@ -466,20 +491,38 @@ impl DocumentStore {
         self.edit_locks.remove(uri);
     }
 
-    /// Ensure a watermark entry exists for `uri`, created at ticket 0. Idempotent:
-    /// an already-advanced watermark is left untouched. Called when a document is
-    /// registered ([`insert`](Self::insert)) so the watermark's lifetime tracks the
-    /// document's — it exists exactly while the document is open and is dropped by
-    /// [`remove`](Self::remove) on close.
-    fn ensure_watermark_entry(&self, uri: &Url) {
-        // `insert()` runs on every didChange; the entry almost always already
-        // exists. Probe with a borrowed `get` first so the common hit path takes
-        // no `Url` clone, paying the clone only on the (rare) first registration.
-        if self.watermarks.get(uri).is_none() {
-            self.watermarks
-                .entry(uri.clone())
-                .or_insert_with(|| watch::channel(0).0);
+    /// Ensure a watermark channel exists for `uri` carrying the current lifetime's
+    /// `incarnation`, created at ticket 0. Called when a document is registered or
+    /// edited so the watermark's lifetime tracks the document's — it exists exactly
+    /// while the document is open and is dropped by [`remove`](Self::remove) on close.
+    ///
+    /// Idempotent **within a lifetime**: an existing channel whose incarnation
+    /// already matches is left untouched, so an edit never resets the ticket. But a
+    /// channel left over from a *prior* lifetime (a different incarnation) is
+    /// **replaced** with a fresh one — this is what guarantees the channel's
+    /// incarnation always equals the document's, so a reopen starts at ticket 0 for
+    /// its own incarnation even if the prior channel somehow outlived its `remove`.
+    /// Replacing drops the old sender, waking any reader still parked on the prior
+    /// lifetime's channel (it falls back, exactly as on a close).
+    fn ensure_watermark_entry(&self, uri: &Url, incarnation: u64) {
+        // Probe with a borrowed `get` first (the common edit hit path takes no
+        // `Url` clone). Drop the `Ref` before any `insert` on the same map — a
+        // held read `Ref` across a write on the same key deadlocks.
+        let matches_current = self
+            .watermarks
+            .get(uri)
+            .is_some_and(|sender| sender.borrow().incarnation == incarnation);
+        if matches_current {
+            return;
         }
+        self.watermarks.insert(
+            uri.clone(),
+            watch::channel(Watermark {
+                incarnation,
+                ticket: 0,
+            })
+            .0,
+        );
     }
 
     /// Publish that the parse covering ingress writer `ticket` for `uri` has
@@ -500,9 +543,12 @@ impl DocumentStore {
         let Some(sender) = self.watermarks.get(uri).map(|sender| sender.clone()) else {
             return;
         };
+        // Bumps only the ticket; the channel's incarnation is fixed for the
+        // lifetime. For the on-ingress open parse, whose writer ticket gates any
+        // reopen, so it always runs against its own lifetime's channel.
         sender.send_if_modified(|watermark| {
-            if ticket > *watermark {
-                *watermark = ticket;
+            if ticket > watermark.ticket {
+                watermark.ticket = ticket;
                 true
             } else {
                 false
@@ -510,9 +556,8 @@ impl DocumentStore {
         });
     }
 
-    /// Advance the watermark to `ticket`, but only if the document's current open
-    /// incarnation still equals `expected_incarnation` — the lifetime that issued
-    /// the ticket.
+    /// Advance the watermark to `ticket`, but only if the channel still belongs to
+    /// `expected_incarnation` — the lifetime that issued the ticket.
     ///
     /// For the off-ingress parse: its ticket is the *intra-lifetime* wire order,
     /// and the watermark is removed on close and re-seeded at 0 on reopen
@@ -520,24 +565,35 @@ impl DocumentStore {
     /// completing after a close + reopen must **not** advance the reopened
     /// document's fresh watermark — its (smaller) ticket could exceed a
     /// new-lifetime reader's target and release that reader before the reopen's
-    /// own parse has run (a stale/empty read). Gating on the incarnation confines
-    /// each lifetime's watermark to its own parses. A closed (absent) document is
-    /// a no-op: its watermark is already gone and its readers were woken by the
-    /// close. The `documents` `Ref` is dropped before the `watermarks` lock is
-    /// taken (the documents → watermarks order).
+    /// own parse has run (a stale/empty read).
+    ///
+    /// The incarnation lives **in the channel value**, so the compare and the
+    /// ticket write happen together inside `send_if_modified`, under the watch's
+    /// own lock, against one consistent value — there is no check-then-write seam
+    /// for a concurrent reopen to slip through (the off-ingress advance holds no
+    /// `edit_lock`, so a `didClose`+`didOpen` *does* run concurrently with it).
+    /// Whichever channel this resolves against, the compare is against *that*
+    /// channel's incarnation: the reopen's fresh channel (incarnation mismatch →
+    /// skip) or the prior lifetime's now-detached channel (a harmless bump of a
+    /// channel whose readers the close already woke). A closed (absent) document
+    /// is a no-op.
     pub(crate) fn advance_watermark_for_incarnation(
         &self,
         uri: &Url,
         ticket: u64,
         expected_incarnation: u64,
     ) {
-        let current_incarnation = match self.documents.get(uri) {
-            Some(doc) => doc.incarnation(),
-            None => return,
+        let Some(sender) = self.watermarks.get(uri).map(|sender| sender.clone()) else {
+            return;
         };
-        if current_incarnation == expected_incarnation {
-            self.advance_watermark(uri, ticket);
-        }
+        sender.send_if_modified(|watermark| {
+            if watermark.incarnation == expected_incarnation && ticket > watermark.ticket {
+                watermark.ticket = ticket;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Wait until the parse watermark for `uri` reaches `target` — the tail
@@ -567,8 +623,13 @@ impl DocumentStore {
 
         let wait_future = async {
             // Err => the sender was dropped (entry removed after a close): every
-            // parse that will ever run for this lifetime has, so proceed.
-            let _ = receiver.wait_for(|watermark| *watermark >= target).await;
+            // parse that will ever run for this lifetime has, so proceed. A reader
+            // waits on its own lifetime's channel ticket; a reopen replaces the
+            // channel (dropping this sender → Err → fallback), so the target (an
+            // intra-lifetime ticket) is only ever compared within one lifetime.
+            let _ = receiver
+                .wait_for(|watermark| watermark.ticket >= target)
+                .await;
         };
 
         let _ = tokio::time::timeout(timeout, wait_future).await;
@@ -863,9 +924,9 @@ mod tests {
         );
     }
 
-    /// Read the published watermark for a URI (test-only; the field is private).
+    /// Read the published watermark ticket for a URI (test-only; the field is private).
     fn watermark_of(store: &DocumentStore, uri: &Url) -> Option<u64> {
-        store.watermarks.get(uri).map(|s| *s.borrow())
+        store.watermarks.get(uri).map(|s| s.borrow().ticket)
     }
 
     /// Register a document so its watermark entry is seeded (mirrors a didOpen).
