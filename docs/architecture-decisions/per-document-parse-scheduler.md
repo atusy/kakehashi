@@ -98,7 +98,7 @@ otherwise-new reader watermark into those two axes, and taking over the
 `edit_lock`'s resurrection-guard duty at the tree write.
 
 The owner is deliberately a scheduler rather than a mailbox actor that owns the
-document's text (the actor is Option 4, considered and deferred below). Because
+document's text (the actor is Option 4, not chosen; see below). Because
 **reads bypass the owner either way** — readers snapshot the store, gated on the
 epoch watermark — owning the text inside the owner would buy readers nothing; the
 scheduler settles the same forces with less moving structure.
@@ -338,7 +338,7 @@ it settles the same forces as Option 4 — the epoch (the largest simplification
 off-ingress parse and install, and resurrection-safety — with materially less
 moving structure.
 
-### 4. Per-document parse actor that owns the text (considered; deferred)
+### 4. Per-document parse actor that owns the text
 
 A mailbox actor per open document that **owns the text**. `didOpen` / `didChange`
 / `didClose` become non-blocking sends to an **unbounded mailbox**; the actor's
@@ -360,7 +360,7 @@ path — at the cost of an ADR-sized refactor, a new task-lifecycle and cancella
 surface, and an unbounded mailbox that cannot be capped without pushing
 backpressure back onto the ingress thread (re-creating what the design removes).
 
-Deferred in favor of Option 3. The actor's one distinguishing trait over the
+Not chosen, in favor of Option 3. The actor's one distinguishing trait over the
 scheduler is that it owns the document text, and that buys nothing for the decided
 concerns: reads bypass the owner in both designs, so latency and throughput are
 unchanged; the epoch, coalescing, and resurrection-safety are equally expressible
@@ -370,9 +370,11 @@ fallbacks, which bypass the actor, so the actor would relocate that work rather
 than remove it. Owning the text was expected to make incremental parsing cleaner;
 in practice incremental parsing was achieved without it. The `edit_lock`-shedding
 and `skip_parse` state-machine simplifications are real, but they are the *only*
-gains unique to the actor and do not justify the extra structure. Retained as the
-documented ideal — a no-behavior-change refactor worth revisiting only if a future
-need turns out genuinely cleaner under single text ownership.
+gains unique to the actor — internal-structure simplifications, not user-visible —
+and do not justify the extra structure. Recorded here as the considered
+alternative, not as planned work; the one motivation that might have outweighed
+its cost (a cleaner incremental parse under single text ownership) did not
+materialize.
 
 ### 5. Actor answers read requests directly (mailbox-query reads)
 

@@ -211,8 +211,8 @@ itself off the ingress path.
 - The edit-path text-freshness change (persist text before parse) is a small
   structural reordering within `did_change_impl`; the per-document parse scheduler
   later builds on it by moving the parse off-ingress with coalescing (the text
-  stays in the shared store; single-owner text application is the deferred actor
-  alternative, not the chosen scheduler).
+  stays in the shared store; single-owner text application is the actor
+  alternative considered and not chosen, not the scheduler that shipped).
 
 ## Decision–Implementation Gap
 
