@@ -940,7 +940,7 @@ print("hello")
         );
     }
 
-    /// Off-ingress edit reparse (per-document-parse-actor flip): `reparse_latest`
+    /// Off-ingress edit reparse (per-document-parse-scheduler flip): `reparse_latest`
     /// parses the latest store text and advances the watermark, but must NOT
     /// resurrect a document a `didClose` removed mid-parse.
     #[tokio::test]

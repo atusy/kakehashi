@@ -182,7 +182,7 @@ pub struct Kakehashi {
     /// avoids both the wasted downstream pull and the abort-vs-`didClose` race (#489).
     cli_mode: std::sync::atomic::AtomicBool,
     /// Per-document coalescing scheduler for the off-ingress parse
-    /// (per-document-parse-actor ADR): `did_change` applies the edit and clears the
+    /// (per-document-parse-scheduler ADR): `did_change` applies the edit and clears the
     /// tree synchronously, then schedules the (re)parse here so the parse runs off
     /// the ingress writer ticket, coalescing bursts to one reparse over the latest
     /// text. Shared (`Arc`) with the spawned parse loops.
@@ -356,7 +356,7 @@ impl Kakehashi {
     }
 
     /// Schedule the **off-ingress** (re)parse of `uri` after a `did_change` applied
-    /// the edit and cleared the tree (per-document-parse-actor ADR). The parse runs
+    /// the edit and cleared the tree (per-document-parse-scheduler ADR). The parse runs
     /// in a spawned loop off the writer ticket, so `did_change` returns without
     /// waiting on it; the [`ParseScheduler`](parse_scheduler::ParseScheduler)
     /// coalesces a burst of edits into a single follow-up reparse over the latest

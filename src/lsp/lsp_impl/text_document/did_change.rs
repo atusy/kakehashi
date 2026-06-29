@@ -82,7 +82,7 @@ impl Kakehashi {
         self.cache.invalidate_for_edits(&uri, &edits);
 
         // Apply the edit to the store and CLEAR the reader-visible tree
-        // synchronously, here under the edit lock (per-document-parse-actor ADR).
+        // synchronously, here under the edit lock (per-document-parse-scheduler ADR).
         // Clearing the visible tree (rather than leaving the pre-edit one) is what
         // keeps readers safe once the parse is off-ingress: a virt/native reader now
         // sees *no* tree until the reparse lands (empty / on-demand fallback) instead

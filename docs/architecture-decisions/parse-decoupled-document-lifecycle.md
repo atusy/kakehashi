@@ -1,6 +1,6 @@
 # Parse-Decoupled Document Lifecycle
 
-**Related Decisions**: [per-document-parse-actor](per-document-parse-actor.md),
+**Related Decisions**: [per-document-parse-scheduler](per-document-parse-scheduler.md),
 [host-document-bridge](host-document-bridge.md),
 [push-propagation-diagnostic-forwarding](push-propagation-diagnostic-forwarding.md),
 [ls-bridge-message-ordering](ls-bridge-message-ordering.md)
@@ -42,7 +42,7 @@ tiers by their dependence on kakehashi's own tree-sitter parse:
 
 1. `maybe_auto_install_language` (when the main parser is missing and
    auto-install is on) — network/git plus an **unbounded** C-compiler step (see
-   per-document-parse-actor for the liveness analysis);
+   per-document-parse-scheduler for the liveness analysis);
 2. `parse_document` plus the injection processing it feeds — measured together
    at **~120–310 ms** for a 50–2000-block injection-heavy Markdown
    (10 KB–435 KB), and bounded only by a 10 s parse timeout;
@@ -69,7 +69,7 @@ forward that reads store text sees the new text only after the parse completes.
 |   2000 |   435 KB |                ~308 ms |                      ~183 ms |
 
 These are the latencies the host tier pays today for nothing (parse + injection
-isolated from token computation; see per-document-parse-actor for method).
+isolated from token computation; see per-document-parse-scheduler for method).
 
 ## Decision
 
@@ -159,24 +159,23 @@ tree work it does not need, up to and including an unbounded compiler hold. The
 measured 120–310 ms parse and the unbounded install are paid by every host-tier
 feature for nothing.
 
-### 2. Fold this into the parse-actor refactor only (rejected as the *first* step)
+### 2. Fold this into the parse-scheduler refactor only (rejected as the *first* step)
 
-Wait for the full per-document parse actor (per-document-parse-actor) to land,
-and let the actor's "non-parse side effects run first" structure deliver the
-decoupling.
+Wait for the full per-document parse scheduler (per-document-parse-scheduler) to land,
+and let its off-ingress restructuring deliver the decoupling as a side effect.
 
 Rejected as the *sequencing*, not as the end state. The tier decoupling is a
 small, self-contained reordering with the single largest UX payoff, and it does
-not require the actor, the epoch unification, or the off-ingress parse. Tying it
-to an ADR-sized refactor needlessly delays the win. It is recorded as its own
-decision so it can ship first.
+not require the parse scheduler, the epoch unification, or the off-ingress parse.
+Tying it to an ADR-sized refactor needlessly delays the win. It is recorded as its
+own decision so it can ship first.
 
 ### 3. Tier decoupling, host hoisted to the front (chosen)
 
 Reorder the handlers so host-tier work precedes everything it does not depend on,
 with the open-before-change invariant made explicit. Independently shippable;
-complementary to the parse actor, which later moves the virt/native parse itself
-off the ingress path.
+complementary to the parse scheduler, which later moves the virt/native parse
+itself off the ingress path.
 
 ## Consequences
 
@@ -186,8 +185,9 @@ off the ingress path.
   available as soon as the document is registered, regardless of parse latency or
   an installing/hung parser. This is the direct user-visible win.
 - **The unbounded install is de-risked for the common case** even before the
-  parse actor lands: a missing/installing main parser no longer blocks host-tier
-  features (it still blocks virt/native, which the actor addresses separately).
+  parse scheduler lands: a missing/installing main parser no longer blocks
+  host-tier features (it still blocks virt/native, which the scheduler addresses
+  separately).
 - **A clear, documented contract** for which tier needs the tree, so future
   handlers are placed correctly by construction.
 
@@ -209,9 +209,10 @@ off the ingress path.
   because they intrinsically depend on it. The decoupling does not make tree
   features faster; it stops non-tree features from waiting on them.
 - The edit-path text-freshness change (persist text before parse) is a small
-  structural reordering within `did_change_impl`; the per-document parse actor
-  later generalizes it into full single-owner text application with parse
-  coalescing.
+  structural reordering within `did_change_impl`; the per-document parse scheduler
+  later builds on it by moving the parse off-ingress with coalescing (the text
+  stays in the shared store; single-owner text application is the actor
+  alternative considered and not chosen, not the scheduler that shipped).
 
 ## Decision–Implementation Gap
 
@@ -220,4 +221,4 @@ only after awaiting auto-install, `parse_document`, and `process_injections`, an
 `did_change_impl` persists the post-delta text via `parse_document` (so host
 forwards see new text only after the parse). The tier taxonomy is described here;
 the handler reordering and the explicit open-before-change assertion are unbuilt.
-This decision can land independently of, and before, the per-document parse actor.
+This decision can land independently of, and before, the per-document parse scheduler.

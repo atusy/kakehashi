@@ -397,7 +397,7 @@ impl Kakehashi {
     /// if needed. The shared post-edit freshness helper for every request handler
     /// that snapshots the document tree.
     ///
-    /// Since the per-document parse actor flip, `didChange` clears the tree and
+    /// Since the per-document parse scheduler flip, `didChange` clears the tree and
     /// reparses **off-ingress**, so a request arriving in the reparse window finds
     /// `Document::snapshot()` returning `None`. Any tree-reading handler must call
     /// this first: it waits the bounded `wait_for_parse_completion` for the

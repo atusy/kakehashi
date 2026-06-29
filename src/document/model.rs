@@ -37,7 +37,7 @@ pub struct Document {
     language_id: Option<String>,
     tree: Option<Tree>,
     /// Edited-but-not-yet-reparsed seed for the **off-ingress** incremental parse
-    /// (per-document-parse-actor).
+    /// (per-document-parse-scheduler).
     ///
     /// `didChange` clears the reader-visible `tree` (so a reader never sees a tree
     /// that predates the edit — the flip's reader-safety invariant) but stashes the
