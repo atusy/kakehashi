@@ -160,7 +160,6 @@ impl ParseCoordinator {
         language_id: Option<&str>,
         ticket: Option<u64>,
     ) {
-        let parse_generation = self.documents.mark_parse_started(&uri);
         let mut events = Vec::new();
 
         // Publish the watermark on whichever path resolves the parse below.
@@ -171,14 +170,15 @@ impl ParseCoordinator {
         };
 
         // Read the text the registering didOpen already stored (a refcount bump, not
-        // a copy). Gone => a didClose removed the document; resolve the watermark and
-        // stop without resurrecting it.
+        // a copy) — BEFORE marking the parse started, so a document a `didClose`
+        // already removed leaves neither a resurrected document nor an orphan
+        // parse-state entry for the now-closed URI. Resolve the watermark and stop.
         let Some(text) = self.documents.get(&uri).map(|doc| doc.text_arc()) else {
-            self.documents
-                .mark_parse_finished(&uri, parse_generation, false);
             advance_watermark();
             return;
         };
+
+        let parse_generation = self.documents.mark_parse_started(&uri);
 
         let language_name = self
             .language
