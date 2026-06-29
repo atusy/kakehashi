@@ -335,36 +335,6 @@ impl DocumentStore {
         self.ensure_watermark_entry(uri, incarnation);
     }
 
-    /// Record the didOpen parse's result (detected `language` + optional `tree`) on
-    /// the **existing** document, preserving its already-stored text. Returns whether
-    /// it was stored.
-    ///
-    /// The registering `didOpen` inserts the document (with its text) before the
-    /// parse, so the parse never needs to carry the text again — it updates language
-    /// and tree in place, avoiding a full-document copy per open. **Non-inserting**
-    /// (`get_mut`): a document a concurrent `didClose` removed is left gone, not
-    /// resurrected — so once the open parse moves off the ingress ticket (the didOpen
-    /// flip) a close racing it stays closed. Availability is marked only when a tree
-    /// landed (the no-tree paths rely on the following `mark_parse_finished(false)`).
-    pub(crate) fn set_parse_result_if_present(
-        &self,
-        uri: &Url,
-        language: Option<String>,
-        tree: Option<Tree>,
-    ) -> bool {
-        let has_tree = tree.is_some();
-        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
-            doc.set_parse_result(language, tree);
-            true
-        } else {
-            false
-        };
-        if stored && has_tree {
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
-    }
-
     /// Store `new_tree` for an **existing** document, but only if its current text
     /// still equals `expected_text`. Returns `true` iff the tree was stored.
     ///
@@ -492,6 +462,53 @@ impl DocumentStore {
             false
         };
         if stored {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        stored
+    }
+
+    /// Record the didOpen parse's detected `language` + optional `tree` on the
+    /// **existing** document, preserving its already-stored text, but only if the
+    /// text and incarnation observed when the parse read them are unchanged.
+    /// Returns `true` iff it was stored.
+    ///
+    /// For the **off-ingress** didOpen parse ([`parse_document`]). Unlike
+    /// [`update_tree_if_text_and_language_unchanged`] it **sets** the language rather
+    /// than checking it: the open parse refines `language_for_path`'s initial guess
+    /// with content detection (`detect_language`), so it is the writer of the
+    /// authoritative language — there is no language to match against. The two axes
+    /// it does check, atomically under the same `get_mut` shard lock as the write:
+    /// - **text** rejects a within-lifetime stale parse — a `didChange` landed while
+    ///   parsing, so this tree (and its language, possibly shebang-derived) is of
+    ///   now-superseded text; the scheduler's reparse covers the newer text;
+    /// - **incarnation** rejects a close + reopen — the result belongs to the prior
+    ///   lifetime and must neither attach its tree nor clobber the reopened
+    ///   document's freshly-inserted language.
+    ///
+    /// **Non-inserting** (`get_mut`): a document a concurrent `didClose` removed is
+    /// left gone, not resurrected — the resurrection-safety the open parse needs once
+    /// it runs off the ingress ticket. Availability is marked only when a tree
+    /// landed (the no-tree paths rely on the caller's `mark_parse_finished(false)`).
+    pub(crate) fn set_parse_result_if_text_and_incarnation_unchanged(
+        &self,
+        uri: &Url,
+        expected_text: &str,
+        expected_incarnation: u64,
+        language: Option<String>,
+        tree: Option<Tree>,
+    ) -> bool {
+        let has_tree = tree.is_some();
+        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
+            if doc.incarnation() == expected_incarnation && doc.text() == expected_text {
+                doc.set_parse_result(language, tree);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if stored && has_tree {
             self.mark_tree_available_if_tracked(uri);
         }
         stored
@@ -1005,6 +1022,120 @@ mod tests {
         assert!(
             store.get(&uri).is_none(),
             "must not resurrect a closed document"
+        );
+    }
+
+    #[test]
+    fn set_parse_result_if_text_and_incarnation_unchanged_sets_language_and_tree() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///open_refine.rs").unwrap();
+        // didOpen inserted the document with the path/id language guess ("text");
+        // the open parse refines it to the content-detected "rust" and attaches a tree.
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("text".to_string()),
+            None,
+        );
+        let incarnation = store.get(&uri).unwrap().incarnation();
+
+        assert!(store.set_parse_result_if_text_and_incarnation_unchanged(
+            &uri,
+            "fn main() {}",
+            incarnation,
+            Some("rust".to_string()),
+            Some(parse_rust("fn main() {}")),
+        ));
+        let doc = store.get(&uri).unwrap();
+        assert_eq!(
+            doc.language_id(),
+            Some("rust"),
+            "the open parse must SET (refine) the language, not just check it"
+        );
+        assert!(doc.tree().is_some(), "the tree must be attached");
+    }
+
+    #[test]
+    fn set_parse_result_if_text_and_incarnation_unchanged_rejects_stale_text() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///open_stale_text.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let incarnation = store.get(&uri).unwrap().incarnation();
+        // A didChange landed mid-parse, moving the text on (same lifetime).
+        store.apply_edit_clearing_tree(&uri, "fn newer() {}".to_string(), &[]);
+
+        let stored = store.set_parse_result_if_text_and_incarnation_unchanged(
+            &uri,
+            "fn main() {}",
+            incarnation,
+            Some("rust".to_string()),
+            Some(parse_rust("fn main() {}")),
+        );
+        assert!(!stored, "a tree parsed from now-stale text must be dropped");
+        assert!(
+            store.get(&uri).unwrap().tree().is_none(),
+            "the stale tree must not overwrite the newer text's (still-absent) tree"
+        );
+    }
+
+    #[test]
+    fn set_parse_result_if_text_and_incarnation_unchanged_rejects_a_reopen() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///open_reopen.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        // The open parse read this lifetime's incarnation, then a didClose + reopen
+        // (identical text + language) raced it while parsing.
+        let stale_incarnation = store.get(&uri).unwrap().incarnation();
+        store.remove(&uri);
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let stored = store.set_parse_result_if_text_and_incarnation_unchanged(
+            &uri,
+            "fn main() {}",
+            stale_incarnation,
+            Some("rust".to_string()),
+            Some(parse_rust("fn main() {}")),
+        );
+        assert!(
+            !stored,
+            "a tree from the prior lifetime must not attach to the reopened document"
+        );
+        assert!(
+            store.get(&uri).unwrap().tree().is_none(),
+            "the reopened document keeps no tree from the closed lifetime"
+        );
+    }
+
+    #[test]
+    fn set_parse_result_if_text_and_incarnation_unchanged_does_not_resurrect_closed_document() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///open_closed.rs").unwrap();
+        // No document exists (a didClose removed it before the off-ingress parse ran).
+        assert!(!store.set_parse_result_if_text_and_incarnation_unchanged(
+            &uri,
+            "fn main() {}",
+            1,
+            Some("rust".to_string()),
+            Some(parse_rust("fn main() {}")),
+        ));
+        assert!(
+            store.get(&uri).is_none(),
+            "the off-ingress open parse must not resurrect a closed document"
         );
     }
 
