@@ -320,6 +320,13 @@ impl DiagnosticPublisher {
     }
 
     /// Drop the host's cache entry and publish the now-empty set (host `didClose`).
+    ///
+    /// Deliberately does **not** emit `workspace/diagnostic/refresh` (#499): the
+    /// editor itself originated the `didClose`, so it is not displaying (and won't
+    /// re-pull) a closed document — a refresh would be redundant. This is the
+    /// editor-originated sibling of [`Self::clear_pull_layer`], opposite the
+    /// crash-driven [`Self::evict_connection_diagnostics`] (which the editor has no
+    /// event to learn about, so it does refresh).
     pub(crate) async fn clear_host(&self, host: &Url) {
         self.aggregator.evict_host(host);
         self.republish(host).await;
