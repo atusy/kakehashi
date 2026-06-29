@@ -93,15 +93,27 @@ scheduling have **no single owner**.
 
 ## Decision
 
-Introduce a **per-document parse actor**: one actor task per open document that
-exclusively owns that document's text, parser-readiness state, and parse
-scheduling, and a **single per-document epoch** — the pair
+Give a document's parse lifecycle a **single per-document owner that drives the
+parse off the ingress ticket**, and a **single per-document epoch** — the pair
 `(incarnation, ticket)` — that is the one source of truth for ordering,
-resurrection-safety, and parse-staleness. It pairs the retained process-wide open
-generation (the incarnation, monotonic across reopen) with the ingress writer
-ticket (intra-lifetime wire order), folds `ParseState.generation` and the
-otherwise-new reader watermark into those two axes, and its per-write check
-additionally takes over the `edit_lock`'s resurrection-guard duty.
+resurrection-safety, and parse-staleness. The epoch pairs the retained
+process-wide open generation (the incarnation, monotonic across reopen) with the
+ingress writer ticket (intra-lifetime wire order), folds `ParseState.generation`
+and the otherwise-new reader watermark into those two axes, and its per-write
+check additionally takes over the `edit_lock`'s resurrection-guard duty.
+
+The owner is a **per-document coalescing parse scheduler**: the text stays in the
+shared document store, and the owner holds only the parse-scheduling decision —
+collapsing a burst of edits into a single off-ingress reparse. It is deliberately
+**not** a mailbox actor that owns the document's text (that is Option 4,
+considered and deferred below). The two are architecturally equivalent for the
+concerns this decision settles — off-ingress parsing, burst coalescing, the
+epoch, and resurrection-safety — because **reads bypass the owner in either
+design** (readers snapshot the store, gated on the epoch watermark), so owning the
+text inside the owner buys readers nothing. The mechanism subsections below are
+written in actor terms because that was the original formulation; each property
+they describe holds for the chosen scheduler, the only difference being where the
+text lives.
 
 ### Writes are messages; the loop never blocks on the slow op
 
@@ -391,29 +403,44 @@ in non-cancellable `spawn_blocking` with no exposed child, so a real deadline
 needs a killable subprocess, not a `timeout` wrapper. Retained as a
 *complementary* mitigation, not an alternative.
 
-### 3. Decompose without an actor (generation-checked store + killable installer)
+### 3. A per-document coalescing scheduler, text left in the store (chosen)
 
-Keep the concurrent handlers, but (a) make every tree write epoch-checked CAS so
-resurrection is closed without an owner, (b) move install off-ingress as a
-subscribe/notify, and (c) add the killable installer. This delivers liveness and
-resurrection-safety with no mailbox and no watermark.
+Keep the text in the store and the concurrent handlers, but add a per-document
+parse-scheduling owner: (a) every tree write is an epoch-checked, non-inserting
+store update so resurrection is closed without owning the text, (b) install moves
+off-ingress as a subscribe/notify, (c) the killable installer bounds compilation,
+and (d) a per-document coalescing scheduler collapses a burst into a single
+off-ingress reparse and keeps one parse in flight per document.
 
-Rejected, narrowly, on the **cost** and **change-path** forces. It distributes
-the epoch-check and edit-application discipline across more call sites (each
-`didChange`, the install-completion parse, every reader fallback), and — crucially
-— it has no natural place to **coalesce a burst into one parse**, which the cost
-table shows is worth tens-to-hundreds of milliseconds per superseded edit on
-injection-heavy documents. The single-consumer actor gets coalescing for free;
-the decomposed design would have to bolt on a per-URI debounce that re-creates an
-ad-hoc owner. The epoch unification (the largest simplification) is adopted from
-this option regardless of the actor.
+Originally rejected on the **cost** and **change-path** forces — the worry that a
+decomposed design "has no natural place to coalesce a burst" and would "bolt on a
+per-URI debounce that re-creates an ad-hoc owner." That objection did not hold:
+the per-document scheduler **is** that owner, and it is a small, self-contained
+coalescing point rather than an ad-hoc one. It gives the same burst-coalescing the
+actor would and keeps per-document parse concurrency, without a mailbox or a
+text-owning task. Chosen because it settles the same forces as Option 4 — the
+epoch (the largest simplification), off-ingress parse and install, and
+resurrection-safety — with materially less moving structure.
 
-### 4. Per-document parse actor with a unified epoch (chosen)
+### 4. Per-document parse actor that owns the text (considered; deferred)
 
-Serializes by construction, folds `skip_parse` into state, unifies the four
+A mailbox actor per open document that **owns the text**, serializes by
+construction, folds `skip_parse` into an explicit state, unifies the four
 sequences into one epoch, closes the resurrection path with CAS writes, coalesces
 bursts, and keeps install/parse off the ingress path — at the cost of an
-ADR-sized refactor.
+ADR-sized refactor and a new task-lifecycle and cancellation surface.
+
+Deferred in favor of Option 3. The actor's one distinguishing trait over the
+scheduler is that it owns the document text, and that buys nothing for the decided
+concerns: reads bypass the owner in both designs, so latency and throughput are
+unchanged; the epoch, coalescing, and resurrection-safety are equally expressible
+without text ownership; and the remaining epoch work an actor would absorb —
+enforcing the incarnation axis on store writes — still has to guard the reader
+fallbacks, which bypass the actor, so the actor would relocate that work rather
+than remove it. Owning the text was expected to make incremental parsing cleaner;
+in practice incremental parsing was achieved without it. Retained as the
+documented ideal — a no-behavior-change refactor worth revisiting only if a future
+need turns out genuinely cleaner under single text ownership.
 
 ### 5. Actor answers read requests directly (mailbox-query reads)
 
@@ -424,6 +451,11 @@ the same mailbox, reintroducing the blocking the design removes. The
 write-only-mailbox / shared-store-read split is load-bearing.
 
 ## Consequences
+
+These are stated for the actor formulation. All hold for the chosen scheduler
+except the two that specifically concern owning the text — a single owner of the
+document *text*, and folding `skip_parse` into the actor's state machine — which
+pertain to the deferred Option 4.
 
 ### Positive
 
@@ -486,17 +518,15 @@ write-only-mailbox / shared-store-read split is load-bearing.
 
 ## Decision–Implementation Gap
 
-Not yet implemented. This ADR records the target design; it runs ahead of the
-code. As of writing, `did_open_impl` still awaits auto-install inline and carries
-`skip_parse`, `did_change_impl` still serializes via `edit_lock`,
-`reload_language_after_install` still re-enters the parse path, and readers still
-wait on `has_tree` (no epoch watermark, no install-pending signal). The store
-still keeps `open_generations` and `ParseState.generation` as separate counters,
-and `update_document` still inserts on vacancy. The `IngressOrderGate` ticket is
-still middleware-private. Injected-language auto-install is still awaited inline,
-reader fallbacks still write the store, and compilation still runs in
-non-cancellable `spawn_blocking`. The actor, the unified epoch, the CAS writes,
-the child-task model, the ingress plumbing, the injected-install re-homing, and
-the killable-subprocess install deadline are all unbuilt. A staged rollout may
-land Option 1 (minimal spawn) and parse-decoupled-document-lifecycle first as
-interim steps before the full actor.
+Realized as Option 3, the per-document coalescing scheduler. The parse runs off
+the ingress ticket, a burst collapses to one reparse, install is off-ingress,
+readers wait on the epoch watermark rather than on tree presence, store writes are
+resurrection-safe (non-inserting), and injection orchestration is re-homed off the
+ingress path.
+
+Two architectural elements of the decision remain deferred. The epoch's
+**incarnation** axis is not yet enforced on tree writes — only the intra-lifetime
+ticket is — so a close-then-reopen race during an in-flight parse is not yet fully
+closed. And the `didOpen` parse still runs on the ingress ticket rather than off
+it (a one-time open cost; change-path immediacy is already covered). The
+text-owning actor of Option 4 is not pursued; see Considered Options.
