@@ -505,24 +505,44 @@ impl DocumentStore {
     /// Replacing drops the old sender, waking any reader still parked on the prior
     /// lifetime's channel (it falls back, exactly as on a close).
     fn ensure_watermark_entry(&self, uri: &Url, incarnation: u64) {
-        // Probe with a borrowed `get` first (the common edit hit path takes no
-        // `Url` clone). Drop the `Ref` before any `insert` on the same map — a
-        // held read `Ref` across a write on the same key deadlocks.
-        let matches_current = self
+        // Fast path: a borrowed `get` (no `Url` clone) covers the common case — an
+        // edit whose channel is already at this incarnation needs nothing. The
+        // `Ref` is dropped at the end of this `if` before any write on the map.
+        if self
             .watermarks
             .get(uri)
-            .is_some_and(|sender| sender.borrow().incarnation == incarnation);
-        if matches_current {
+            .is_some_and(|sender| sender.borrow().incarnation == incarnation)
+        {
             return;
         }
-        self.watermarks.insert(
-            uri.clone(),
-            watch::channel(Watermark {
-                incarnation,
-                ticket: 0,
-            })
-            .0,
-        );
+        // Slow path: take the entry (shard write lock) and re-check under it, so two
+        // concurrent registrations for the same live incarnation can't both insert
+        // and reset a live ticket to 0 (the probe-then-insert race). A matching
+        // channel another racer just seeded is left untouched; only a missing or
+        // prior-lifetime channel is (re)seeded at ticket 0.
+        match self.watermarks.entry(uri.clone()) {
+            Entry::Occupied(mut entry) => {
+                let same_incarnation = entry.get().borrow().incarnation == incarnation;
+                if !same_incarnation {
+                    entry.insert(
+                        watch::channel(Watermark {
+                            incarnation,
+                            ticket: 0,
+                        })
+                        .0,
+                    );
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(
+                    watch::channel(Watermark {
+                        incarnation,
+                        ticket: 0,
+                    })
+                    .0,
+                );
+            }
+        }
     }
 
     /// Publish that the parse covering ingress writer `ticket` for `uri` has
