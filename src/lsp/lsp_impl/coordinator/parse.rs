@@ -236,7 +236,7 @@ impl ParseCoordinator {
                         &uri,
                         &text,
                         incarnation,
-                        Some(language_name),
+                        Some(&language_name),
                         None,
                     )
                 {
@@ -287,7 +287,7 @@ impl ParseCoordinator {
                         &uri,
                         &text,
                         incarnation,
-                        Some(language_name.clone()),
+                        Some(&language_name),
                         Some(tree.clone()),
                     );
                 if stored {
@@ -322,7 +322,7 @@ impl ParseCoordinator {
                     &uri,
                     &text,
                     incarnation,
-                    Some(language_name),
+                    Some(&language_name),
                     None,
                 )
             {

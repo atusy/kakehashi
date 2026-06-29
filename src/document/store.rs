@@ -509,15 +509,18 @@ impl DocumentStore {
         uri: &Url,
         expected_text: &Arc<str>,
         expected_incarnation: u64,
-        language: Option<String>,
+        language: Option<&str>,
         tree: Option<Tree>,
     ) -> bool {
         let has_tree = tree.is_some();
+        // `language` is borrowed: the `String` allocation is deferred to inside the
+        // successful CAS branch (`language.map(String::from)`), so a CAS that rejects
+        // (a `didChange`/reopen raced this off-ingress parse) allocates nothing.
         let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
             if doc.incarnation() == expected_incarnation
                 && Arc::ptr_eq(&doc.text_arc(), expected_text)
             {
-                doc.set_parse_result(language, tree);
+                doc.set_parse_result(language.map(String::from), tree);
                 true
             } else {
                 false
@@ -1063,7 +1066,7 @@ mod tests {
             &uri,
             &text,
             incarnation,
-            Some("rust".to_string()),
+            Some("rust"),
             Some(parse_rust("fn main() {}")),
         ));
         let doc = store.get(&uri).unwrap();
@@ -1098,7 +1101,7 @@ mod tests {
             &uri,
             &text,
             incarnation,
-            Some("rust".to_string()),
+            Some("rust"),
             None,
         ));
         let doc = store.get(&uri).unwrap();
@@ -1135,7 +1138,7 @@ mod tests {
             &uri,
             &text,
             incarnation,
-            Some("rust".to_string()),
+            Some("rust"),
             Some(parse_rust("fn main() {}")),
         );
         assert!(!stored, "a tree parsed from now-stale text must be dropped");
@@ -1173,7 +1176,7 @@ mod tests {
             &uri,
             &stale_text,
             stale_incarnation,
-            Some("rust".to_string()),
+            Some("rust"),
             Some(parse_rust("fn main() {}")),
         );
         assert!(
@@ -1195,7 +1198,7 @@ mod tests {
             &uri,
             &Arc::<str>::from("fn main() {}"),
             1,
-            Some("rust".to_string()),
+            Some("rust"),
             Some(parse_rust("fn main() {}")),
         ));
         assert!(
