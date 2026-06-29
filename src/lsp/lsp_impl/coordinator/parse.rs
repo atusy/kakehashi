@@ -191,10 +191,19 @@ impl ParseCoordinator {
                     "Skipping parsing for '{}' - parser previously crashed",
                     language_name
                 );
-                self.documents
-                    .set_parse_result_if_present(&uri, Some(language_name), None);
-                self.documents
-                    .mark_parse_finished(&uri, parse_generation, false);
+                // Mark the parse finished only if the result actually landed: a
+                // `didClose` that removed the document mid-parse makes the store write
+                // a no-op, and `mark_parse_finished` would otherwise recreate a parse
+                // -state entry (via `parse_sender`'s vacant insert) for the closed URI.
+                // (Unreachable while the open parse is inline on the writer ticket; the
+                // guard is for the off-ingress open flip, #6.)
+                if self
+                    .documents
+                    .set_parse_result_if_present(&uri, Some(language_name), None)
+                {
+                    self.documents
+                        .mark_parse_finished(&uri, parse_generation, false);
+                }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 return;
@@ -233,23 +242,26 @@ impl ParseCoordinator {
                     self.bridge.node_tracker(),
                 );
 
-                self.documents.set_parse_result_if_present(
-                    &uri,
-                    Some(language_name.clone()),
-                    Some(tree),
-                );
-
-                self.documents
-                    .mark_parse_finished(&uri, parse_generation, true);
+                // `language_name` is unused past here — move it in (no clone). Gate
+                // `mark_parse_finished` on the store write landing (see the
+                // parser-failed path above).
+                if self
+                    .documents
+                    .set_parse_result_if_present(&uri, Some(language_name), Some(tree))
+                {
+                    self.documents
+                        .mark_parse_finished(&uri, parse_generation, true);
+                }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 return;
             }
         }
 
-        self.documents.set_parse_result_if_present(&uri, None, None);
-        self.documents
-            .mark_parse_finished(&uri, parse_generation, false);
+        if self.documents.set_parse_result_if_present(&uri, None, None) {
+            self.documents
+                .mark_parse_finished(&uri, parse_generation, false);
+        }
         advance_watermark();
         self.notifier().log_language_events(&events).await;
     }
