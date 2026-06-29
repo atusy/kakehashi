@@ -159,24 +159,23 @@ tree work it does not need, up to and including an unbounded compiler hold. The
 measured 120–310 ms parse and the unbounded install are paid by every host-tier
 feature for nothing.
 
-### 2. Fold this into the parse-actor refactor only (rejected as the *first* step)
+### 2. Fold this into the parse-scheduler refactor only (rejected as the *first* step)
 
 Wait for the full per-document parse scheduler (per-document-parse-scheduler) to land,
-and let the actor's "non-parse side effects run first" structure deliver the
-decoupling.
+and let its off-ingress restructuring deliver the decoupling as a side effect.
 
 Rejected as the *sequencing*, not as the end state. The tier decoupling is a
 small, self-contained reordering with the single largest UX payoff, and it does
-not require the actor, the epoch unification, or the off-ingress parse. Tying it
-to an ADR-sized refactor needlessly delays the win. It is recorded as its own
-decision so it can ship first.
+not require the parse scheduler, the epoch unification, or the off-ingress parse.
+Tying it to an ADR-sized refactor needlessly delays the win. It is recorded as its
+own decision so it can ship first.
 
 ### 3. Tier decoupling, host hoisted to the front (chosen)
 
 Reorder the handlers so host-tier work precedes everything it does not depend on,
 with the open-before-change invariant made explicit. Independently shippable;
-complementary to the parse actor, which later moves the virt/native parse itself
-off the ingress path.
+complementary to the parse scheduler, which later moves the virt/native parse
+itself off the ingress path.
 
 ## Consequences
 
@@ -186,8 +185,9 @@ off the ingress path.
   available as soon as the document is registered, regardless of parse latency or
   an installing/hung parser. This is the direct user-visible win.
 - **The unbounded install is de-risked for the common case** even before the
-  parse actor lands: a missing/installing main parser no longer blocks host-tier
-  features (it still blocks virt/native, which the actor addresses separately).
+  parse scheduler lands: a missing/installing main parser no longer blocks
+  host-tier features (it still blocks virt/native, which the scheduler addresses
+  separately).
 - **A clear, documented contract** for which tier needs the tree, so future
   handlers are placed correctly by construction.
 
@@ -210,8 +210,9 @@ off the ingress path.
   features faster; it stops non-tree features from waiting on them.
 - The edit-path text-freshness change (persist text before parse) is a small
   structural reordering within `did_change_impl`; the per-document parse scheduler
-  later generalizes it into full single-owner text application with parse
-  coalescing.
+  later builds on it by moving the parse off-ingress with coalescing (the text
+  stays in the shared store; single-owner text application is the deferred actor
+  alternative, not the chosen scheduler).
 
 ## Decision–Implementation Gap
 

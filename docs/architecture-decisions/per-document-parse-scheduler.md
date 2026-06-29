@@ -202,8 +202,11 @@ per language: the second document of the same uninstalled language gets an
 - **Global install** — shared, deduplicated, deadline-bounded (see below), owned
   by a process-wide installer. The owner *subscribes* to its completion; it does
   not own or abort it. When the install completes, the owner parses the **latest**
-  text (not the open-time text), subsuming the `reload_language_after_install`
-  re-entry.
+  text (not the open-time text) — the completion-triggered reparse that
+  `reload_language_after_install` performs today, now coordinated by the owner
+  rather than re-entered from a second call site. (Collapsing the
+  readiness/`skip_parse` structure into a single explicit state machine is unique
+  to the Option-4 actor; the scheduler retains that structure.)
 - **Per-document parse** — owned by the parse owner, the **authoritative**
   epoch-checked writer of the document's tree into the store, and the only work
   cancelled on close.
