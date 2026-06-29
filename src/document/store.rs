@@ -51,7 +51,10 @@ pub struct DocumentStore {
     /// implies a fresh tree and this watermark — not the completion channel — is
     /// what tells a virt/native reader the store reflects its tail edit. Keyed on
     /// the ticket (the intra-lifetime wire order); the incarnation half of the
-    /// eventual `(incarnation, ticket)` epoch is not folded in yet.
+    /// `(incarnation, ticket)` epoch gates the off-ingress *advance*
+    /// ([`advance_watermark_for_incarnation`](Self::advance_watermark_for_incarnation)),
+    /// so a prior lifetime's parse cannot advance a reopened document's
+    /// re-seeded watermark.
     watermarks: DashMap<Url, watch::Sender<u64>>,
 }
 
