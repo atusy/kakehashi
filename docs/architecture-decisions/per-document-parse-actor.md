@@ -111,9 +111,12 @@ concerns this decision settles — off-ingress parsing, burst coalescing, the
 epoch, and resurrection-safety — because **reads bypass the owner in either
 design** (readers snapshot the store, gated on the epoch watermark), so owning the
 text inside the owner buys readers nothing. The mechanism subsections below are
-written in actor terms because that was the original formulation; each property
-they describe holds for the chosen scheduler, the only difference being where the
-text lives.
+written in actor terms because that was the original formulation. Off-ingress
+parsing, burst coalescing, the epoch, and resurrection-safety all carry over to
+the chosen scheduler. Two properties do **not**, because they follow from owning
+the text rather than from the off-ingress architecture: folding `skip_parse` into
+an explicit state machine, and shedding the `edit_lock` by funneling edits through
+a single consumer. Both belong to the deferred Option 4.
 
 ### Writes are messages; the loop never blocks on the slow op
 
@@ -388,8 +391,8 @@ the eager-open supersede machinery.
 Rejected as the end state. It fixes the immediate liveness exposure with a small
 diff, but leaves `skip_parse`, the `edit_lock`, the install re-entry, and the
 four ad-hoc sequences in place, and adds a *second* spawn/cancel lifecycle bolted
-onto the parse path. It remains a reasonable interim step if the full actor is
-staged.
+onto the parse path. It remains a reasonable interim step toward the chosen
+off-ingress owner.
 
 ### 2. Install-wide deadline only
 
@@ -418,9 +421,12 @@ per-URI debounce that re-creates an ad-hoc owner." That objection did not hold:
 the per-document scheduler **is** that owner, and it is a small, self-contained
 coalescing point rather than an ad-hoc one. It gives the same burst-coalescing the
 actor would and keeps per-document parse concurrency, without a mailbox or a
-text-owning task. Chosen because it settles the same forces as Option 4 — the
-epoch (the largest simplification), off-ingress parse and install, and
-resurrection-safety — with materially less moving structure.
+text-owning task. The rejection's other prong — that decomposition spreads the
+epoch-check and edit discipline across more call sites than a single consumer
+would — does hold, and is accepted as a worthwhile tradeoff (see Negative and the
+Gap). Chosen because it settles the same forces as Option 4 — the epoch (the
+largest simplification), off-ingress parse and install, and resurrection-safety —
+with materially less moving structure.
 
 ### 4. Per-document parse actor that owns the text (considered; deferred)
 
