@@ -365,25 +365,38 @@ impl DocumentStore {
     }
 
     /// Like [`update_tree_if_text_unchanged`], but additionally requires the
-    /// document's `language_id` to still equal `expected_language_id`.
+    /// document's `language_id` to still equal `expected_language_id` **and** its
+    /// open incarnation to still equal `expected_incarnation`.
     ///
     /// For the off-ingress edit reparse (`reparse_latest`), whose tree was parsed
-    /// with a grammar chosen from the language detected at read time. A
-    /// `didClose` + reopen of the same URI with **identical text but a different
-    /// `language_id`** while the parse is in flight would, under the text-only CAS,
-    /// attach a tree parsed by the *old* grammar to the reopened document — wrong
-    /// tokens. Folding the language check into the same `get_mut` shard lock as the
-    /// text check rejects that atomically. (Same-language identical-text reopen
-    /// stays benign: the tree is a correct parse of the identical text.)
+    /// from the text, grammar, and lifetime observed at read time. Three axes,
+    /// checked atomically under the same `get_mut` shard lock as the tree write:
+    /// - **text** rejects a within-lifetime stale parse — a `didChange` landed
+    ///   while parsing, so the tree is of now-superseded text (the scheduler's
+    ///   `dirty` loop reparses the newer text);
+    /// - **language** rejects a close + reopen with identical text but a different
+    ///   `language_id` — a tree parsed by the *old* grammar must not attach to the
+    ///   relabelled document;
+    /// - **incarnation** rejects a close + reopen even with identical text *and*
+    ///   language — the tree belongs to the prior lifetime, and attaching it to
+    ///   the reopened document (then advancing its watermark on the old ticket)
+    ///   would let a new-lifetime reader observe a parse it never requested. This
+    ///   is the [`(incarnation, ticket)`](Document::incarnation) epoch's
+    ///   incarnation half; the text and language checks remain because they guard
+    ///   the orthogonal within-lifetime races above.
     pub(crate) fn update_tree_if_text_and_language_unchanged(
         &self,
         uri: &Url,
         expected_text: &str,
         expected_language_id: Option<&str>,
+        expected_incarnation: u64,
         new_tree: Tree,
     ) -> bool {
         let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
-            if doc.text() == expected_text && doc.language_id() == expected_language_id {
+            if doc.incarnation() == expected_incarnation
+                && doc.text() == expected_text
+                && doc.language_id() == expected_language_id
+            {
                 doc.set_tree(new_tree);
                 true
             } else {
@@ -712,11 +725,13 @@ mod tests {
             Some("ruby".to_string()),
             None,
         );
+        let incarnation = store.get(&uri).unwrap().incarnation();
 
         let stored = store.update_tree_if_text_and_language_unchanged(
             &uri,
             "fn main() {}",
             Some("rust"),
+            incarnation,
             parse_rust("fn main() {}"),
         );
         assert!(
@@ -728,14 +743,55 @@ mod tests {
             "the relabelled document keeps no wrong-grammar tree"
         );
 
-        // Same language → stores.
+        // Same language and incarnation → stores.
         assert!(store.update_tree_if_text_and_language_unchanged(
             &uri,
             "fn main() {}",
             Some("ruby"),
+            incarnation,
             parse_rust("fn main() {}"),
         ));
         assert!(store.get(&uri).unwrap().tree().is_some());
+    }
+
+    #[test]
+    fn update_tree_if_text_and_language_unchanged_rejects_a_reopen_with_a_fresh_incarnation() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///reopened.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        // An off-ingress parse read this lifetime's incarnation, then the document
+        // was closed and reopened with identical text and language while the parse
+        // was in flight.
+        let stale_incarnation = store.get(&uri).unwrap().incarnation();
+        store.remove(&uri);
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let stored = store.update_tree_if_text_and_language_unchanged(
+            &uri,
+            "fn main() {}",
+            Some("rust"),
+            stale_incarnation,
+            parse_rust("fn main() {}"),
+        );
+        assert!(
+            !stored,
+            "a tree from the prior lifetime must not attach to the reopened \
+             document even when text and language are identical"
+        );
+        assert!(
+            store.get(&uri).unwrap().tree().is_none(),
+            "the reopened document keeps no tree from the closed lifetime"
+        );
     }
 
     #[test]
