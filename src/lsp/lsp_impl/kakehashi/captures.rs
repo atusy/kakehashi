@@ -490,7 +490,7 @@ impl Kakehashi {
         };
 
         // Same didOpen→async-parse race the node handlers guard against.
-        self.ensure_parsed_for_node_lookup(&uri).await;
+        self.ensure_document_parsed(&uri).await;
 
         let Some(language_id) = self.document_language(&uri) else {
             log::debug!(target: "kakehashi::captures", "no host language detected for {uri}");
@@ -515,7 +515,7 @@ impl Kakehashi {
             // a reparse; wait for it like the initial prelude does, so the
             // snapshot below is the settled (text, tree) pair and never a
             // mid-parse combination.
-            self.ensure_parsed_for_node_lookup(&uri).await;
+            self.ensure_document_parsed(&uri).await;
         }
 
         // Fetch the open generation BEFORE snapshotting: if a close+reopen

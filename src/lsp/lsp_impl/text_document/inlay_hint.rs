@@ -46,7 +46,10 @@ impl Kakehashi {
         range: Range,
         client_progress_token: Option<NumberOrString>,
     ) -> Result<Option<Vec<InlayHint>>> {
-        let Some(mut ctx) = self.resolve_bridge_contexts_for_range(lsp_uri, range, METHOD) else {
+        let Some(mut ctx) = self
+            .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
+            .await
+        else {
             return Ok(None);
         };
         ctx.document.client_progress_token = client_progress_token;

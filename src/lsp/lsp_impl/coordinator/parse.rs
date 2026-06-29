@@ -273,7 +273,7 @@ impl ParseCoordinator {
     ///
     /// - re-reads the **latest** store text rather than the open-time text (a
     ///   `didChange` may have landed while the install ran), and
-    /// - persists through the **non-inserting** `update_tree_if_text_unchanged`
+    /// - persists through the **non-inserting**, tree-absent `attach_tree_if_absent`
     ///   CAS, so a `didClose` during the install leaves the document gone instead
     ///   of resurrecting it (the install/parse resurrection vector the actor ADR
     ///   calls out), and a `didChange` between the read and the write drops the
@@ -376,6 +376,110 @@ impl ParseCoordinator {
         }
 
         self.notifier().log_language_events(&events).await;
+    }
+
+    /// Re-parse `uri`'s **latest** store text off the ingress path, for the
+    /// per-document parse scheduler (`Kakehashi::schedule_reparse`).
+    ///
+    /// `did_change` clears the tree synchronously and schedules this; it runs in a
+    /// spawned loop, *not* on the writer ticket. A **full** parse (no incremental
+    /// seed — the tree was cleared, which also keeps #348 closed). The tree write
+    /// is the non-inserting text **and language** CAS
+    /// [`update_tree_if_text_and_language_unchanged`]: a closed (Vacant) document is
+    /// left gone (resurrection-safe), a text that moved on (a `didChange` landed
+    /// while parsing) is dropped — the scheduler's `dirty` loop then reparses the
+    /// newer text — and a reopen that changed the language is rejected (no
+    /// wrong-grammar tree). On **every** resolution path the parse
+    /// advances the store watermark to `ticket`, so a virt/native reader gated
+    /// behind the originating edit is released once its parse resolved.
+    ///
+    /// Incremental parse and semantic-token delta are intentionally not preserved
+    /// here (the cleared tree forces a full parse); coalescing recovers the burst
+    /// case, and incrementality is a perf optimization, never correctness. Re-adding
+    /// it is a follow-up.
+    pub(crate) async fn reparse_latest(&self, uri: &Url, ticket: Option<u64>) {
+        let advance_watermark = || {
+            if let Some(ticket) = ticket {
+                self.documents.advance_watermark(uri, ticket);
+            }
+        };
+
+        // Re-read the latest text + detect the language under one read guard. A
+        // missing document means a `didClose` ran — resolve the watermark and stop
+        // (no resurrection). `language_id` is captured so the tree write can reject
+        // a reopen that changed the language while this parse was in flight.
+        let (language_name, language_id, text) = {
+            let Some(doc) = self.documents.get(uri) else {
+                advance_watermark();
+                return;
+            };
+            // `text_arc()` is a refcount bump, not a full copy of the document text
+            // (#498) — cheap on this reparse hot path.
+            let text = doc.text_arc();
+            let language_id = doc.language_id().map(|s| s.to_string());
+            let language_name =
+                self.language
+                    .detect_language(uri.path(), &text, None, language_id.as_deref());
+            (language_name, language_id, text)
+        };
+
+        let Some(language_name) = language_name else {
+            advance_watermark();
+            return;
+        };
+        if self.auto_install.is_parser_failed(&language_name) {
+            advance_watermark();
+            return;
+        }
+        let load_result = self.language.ensure_language_loaded(&language_name);
+
+        let text_len = text.len();
+        let auto_install = self.auto_install.clone();
+        let language_name_clone = language_name.clone();
+        // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure; the
+        // original stays here for the CAS + injection populate below.
+        let text_for_parse = text.clone();
+        let parsed = self
+            .parse_with_pool(&language_name, uri, text_len, move |mut parser| {
+                let _ = auto_install.begin_parsing(&language_name_clone);
+                let result = parser.parse(&*text_for_parse, None);
+                let _ = auto_install.end_parsing(&language_name_clone);
+                (parser, result)
+            })
+            .await;
+
+        if let Some(tree) = parsed {
+            // Text + language CAS (non-inserting). Rejecting on a changed
+            // `language_id` closes the close→reopen-with-different-language race
+            // (a tree parsed by the old grammar must not attach to a relabelled
+            // document). The remaining residual — a same-language reopen with
+            // *identical* text — is benign (the tree is a correct parse of that
+            // text); only the watermark ticket is from the old lifetime, and reads
+            // stay correct. The strict `(incarnation, ticket)` epoch CAS
+            // (incarnation stored on the Document, atomic with the write) is the
+            // follow-up that closes even that.
+            let stored = self.documents.update_tree_if_text_and_language_unchanged(
+                uri,
+                &text,
+                language_id.as_deref(),
+                tree.clone(),
+            );
+            if stored {
+                self.cache.populate_injections(
+                    uri,
+                    &text,
+                    &tree,
+                    &language_name,
+                    &self.language,
+                    self.bridge.node_tracker(),
+                );
+            }
+        }
+
+        advance_watermark();
+        self.notifier()
+            .log_language_events(&load_result.events)
+            .await;
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {

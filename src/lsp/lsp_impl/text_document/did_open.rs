@@ -86,6 +86,7 @@ impl Kakehashi {
                     // watermark so a gated reader is not stranded.
                     let install = self.install_coordinator();
                     let injection = self.injection_coordinator();
+                    let diagnostic_scheduler = self.diagnostic_scheduler();
                     let documents = std::sync::Arc::clone(&self.documents);
                     let lang = lang.clone();
                     let install_uri = uri.clone();
@@ -109,6 +110,12 @@ impl Kakehashi {
                             .is_some_and(|doc| doc.tree().is_some());
                         if has_tree {
                             injection.process_injections(&install_uri, false).await;
+                            // Re-fire the proactive synthetic diagnostic now that a
+                            // tree exists: the handler's spawn (below) ran in the
+                            // skip-parse path with no tree, so its snapshot was None
+                            // and the pull-layer diagnostics were skipped on this
+                            // first open of a just-installed parser.
+                            diagnostic_scheduler.spawn_synthetic_diagnostic_task(install_uri);
                         }
                     });
                     skip_parse = true;
@@ -712,6 +719,173 @@ print("hello")
         );
     }
 
+    /// Regression (parse-actor flip): the host bridge context needs only the
+    /// document text, never the parse tree (parse-decoupled ADR), so it must keep
+    /// resolving after `did_change` clears the tree — otherwise every host-bridged
+    /// request (hover / definition / formatting / diagnostics) would bail for the
+    /// whole reparse window after each edit.
+    #[tokio::test]
+    async fn resolve_host_bridge_context_survives_a_cleared_tree() {
+        use std::str::FromStr;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/host_cleared.rs").unwrap();
+        let lsp_uri = tower_lsp_server::ls_types::Uri::from_str(uri.as_str()).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust"),
+                vec![],
+                None,
+            )
+            .await;
+        assert!(
+            server
+                .resolve_host_bridge_context(&lsp_uri, "textDocument/diagnostic")
+                .is_some(),
+            "sanity: host context resolves with a tree present"
+        );
+
+        // did_change clears the tree synchronously.
+        server
+            .documents
+            .update_document(uri.clone(), "fn changed() {}".to_string(), None);
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_none(),
+            "precondition: the tree is cleared"
+        );
+        assert!(
+            server
+                .resolve_host_bridge_context(&lsp_uri, "textDocument/diagnostic")
+                .is_some(),
+            "host context must survive a cleared tree (it needs only text, not the tree)"
+        );
+    }
+
+    /// Regression (parse-actor flip): `ensure_document_parsed` — the shared
+    /// post-edit freshness helper that every snapshot-reading handler (pull
+    /// diagnostics, the position/range bridge preamble, formatting, node/captures)
+    /// now calls — must restore a tree that `did_change` cleared, so those handlers
+    /// don't return empty/null after every edit while the off-ingress reparse is
+    /// still pending. (Without it, a request racing the reparse sees
+    /// `snapshot() == None`.)
+    #[tokio::test]
+    async fn ensure_document_parsed_restores_a_cleared_tree() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/ensure_fresh.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust"),
+                vec![],
+                None,
+            )
+            .await;
+
+        // did_change applies the edit and CLEARS the tree synchronously.
+        server
+            .documents
+            .update_document(uri.clone(), "fn changed() {}".to_string(), None);
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+
+        // A reader's freshness call restores the tree (here via on-demand parse,
+        // since no off-ingress reparse is running in this unit test).
+        server.ensure_document_parsed(&uri).await;
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_some(),
+            "the freshness helper must restore the tree so post-edit readers aren't empty"
+        );
+    }
+
+    /// Regression (parse-actor flip): the debounced diagnostic — which drives the
+    /// on-edit host re-sync (#431) that keeps a push host's diagnostics following
+    /// edits — must be scheduled AFTER the off-ingress reparse, not in the
+    /// `did_change` handler. The handler clears the tree, and
+    /// `prepare_diagnostic_snapshot` returns `None` without a tree, so scheduling
+    /// the debounce there would capture a `None` snapshot and silently skip the
+    /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
+    /// the snapshot is `None` with the tree cleared and valid again once the
+    /// reparse restores it.
+    #[tokio::test]
+    async fn diagnostic_snapshot_needs_the_reparsed_tree_not_the_cleared_one() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/diag_follow.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust"),
+                vec![],
+                None,
+            )
+            .await;
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_some(),
+            "a parsed self-host doc yields a diagnostic snapshot"
+        );
+
+        // What did_change does synchronously: apply the edit and CLEAR the tree.
+        server
+            .documents
+            .update_document(uri.clone(), "fn changed() {}".to_string(), None);
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_none(),
+            "with the tree cleared, the snapshot is None — scheduling the debounce \
+             here (as the handler used to) would skip the on-edit host re-sync"
+        );
+
+        // The off-ingress reparse restores the tree → the snapshot is valid again,
+        // which is exactly why the debounce is scheduled from the reparse loop.
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+        assert!(
+            server
+                .diagnostic_scheduler()
+                .prepare_diagnostic_snapshot(&uri)
+                .is_some(),
+            "after the reparse the snapshot is valid again (the debounce is scheduled here)"
+        );
+    }
+
     /// Resurrection safety (#480 off-ingress install): a `didClose` landing while
     /// the spawned auto-install runs removes the document; the late
     /// `reparse_installed_document` must NOT recreate it.
@@ -762,6 +936,69 @@ print("hello")
             server.documents.get(&uri).unwrap().tree().is_some(),
             "the reparse must attach a tree to the open document"
         );
+    }
+
+    /// Off-ingress edit reparse (per-document-parse-actor flip): `reparse_latest`
+    /// parses the latest store text and advances the watermark, but must NOT
+    /// resurrect a document a `didClose` removed mid-parse.
+    #[tokio::test]
+    async fn reparse_latest_does_not_resurrect_closed_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/closed_during_reparse.rs").unwrap();
+        // Document already closed (removed) — models a didClose racing the
+        // scheduled reparse. The watermark ticket still resolves.
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(7))
+            .await;
+
+        assert!(
+            server.documents.get(&uri).is_none(),
+            "the off-ingress reparse must not resurrect a closed document"
+        );
+    }
+
+    /// `reparse_latest` attaches a fresh tree to the open document (whose tree was
+    /// cleared by the edit) and advances the watermark to the edit's ticket.
+    #[tokio::test]
+    async fn reparse_latest_parses_and_advances_watermark() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/edited.rs").unwrap();
+        // The edit applied new text and cleared the tree (tree = None), exactly as
+        // did_change does before scheduling the reparse.
+        server.documents.insert(
+            uri.clone(),
+            "fn edited() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(3))
+            .await;
+
+        assert!(
+            server.documents.get(&uri).unwrap().tree().is_some(),
+            "the off-ingress reparse attaches a tree to the edited document"
+        );
+        // The watermark reached the edit's ticket, so a reader gated behind it is
+        // released (wait_for_epoch returns immediately for target <= 3).
+        timeout(
+            Duration::from_millis(100),
+            server
+                .documents
+                .wait_for_epoch(&uri, 3, Duration::from_secs(5)),
+        )
+        .await
+        .expect("watermark must have advanced to the reparse ticket");
     }
 
     /// If a concurrent `didChange` already parsed the document (a tree is

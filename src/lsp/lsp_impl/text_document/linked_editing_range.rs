@@ -43,7 +43,10 @@ impl Kakehashi {
         lsp_uri: &Uri,
         position: Position,
     ) -> Result<Option<LinkedEditingRanges>> {
-        let Some(ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
+        let Some(ctx) = self
+            .resolve_bridge_contexts(lsp_uri, position, METHOD)
+            .await
+        else {
             return Ok(None);
         };
 

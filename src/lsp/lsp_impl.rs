@@ -4,6 +4,7 @@ mod coordinator;
 pub(crate) use coordinator::DiagnosticPublisher;
 mod kakehashi;
 mod lifecycle;
+mod parse_scheduler;
 mod show_document_translation;
 pub(crate) mod text_document;
 mod whole_document;
@@ -180,6 +181,12 @@ pub struct Kakehashi {
     /// discards it), so `did_open_impl` skips the synthetic diagnostic task — that
     /// avoids both the wasted downstream pull and the abort-vs-`didClose` race (#489).
     cli_mode: std::sync::atomic::AtomicBool,
+    /// Per-document coalescing scheduler for the off-ingress parse
+    /// (per-document-parse-actor ADR): `did_change` applies the edit and clears the
+    /// tree synchronously, then schedules the (re)parse here so the parse runs off
+    /// the ingress writer ticket, coalescing bursts to one reparse over the latest
+    /// text. Shared (`Arc`) with the spawned parse loops.
+    parse_scheduler: std::sync::Arc<parse_scheduler::ParseScheduler>,
 }
 
 impl std::fmt::Debug for Kakehashi {
@@ -250,6 +257,7 @@ impl Kakehashi {
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
             cli_mode: std::sync::atomic::AtomicBool::new(false),
+            parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
         }
     }
 
@@ -345,6 +353,115 @@ impl Kakehashi {
 
     pub(super) fn diagnostic_scheduler(&self) -> coordinator::DiagnosticScheduler {
         coordinator::DiagnosticScheduler::new(self)
+    }
+
+    /// Schedule the **off-ingress** (re)parse of `uri` after a `did_change` applied
+    /// the edit and cleared the tree (per-document-parse-actor ADR). The parse runs
+    /// in a spawned loop off the writer ticket, so `did_change` returns without
+    /// waiting on it; the [`ParseScheduler`](parse_scheduler::ParseScheduler)
+    /// coalesces a burst of edits into a single follow-up reparse over the latest
+    /// text. The loop reparses, then runs the tree-dependent downstream work
+    /// (injected-language processing + bridge `didChange` forwarding, then the
+    /// diagnostic geometry re-merge), then loops if another edit arrived.
+    ///
+    /// Resurrection-safe with no teardown: the parse's non-inserting CAS no-ops
+    /// once a `didClose` removed the document, so a `Close` needs no actor
+    /// coordination.
+    pub(crate) fn schedule_reparse(&self, uri: Url, ticket: Option<u64>) {
+        if !self.parse_scheduler.schedule(&uri, ticket) {
+            // A parse loop is already running for this document; it has been
+            // marked dirty and will reparse the latest text when it finishes.
+            return;
+        }
+
+        let parse = self.parse_coordinator();
+        let injection = self.injection_coordinator();
+        let publisher = DiagnosticPublisher::new(self);
+        let diagnostic_scheduler = self.diagnostic_scheduler();
+        let diagnostics = std::sync::Arc::clone(&self.diagnostics);
+        let documents = std::sync::Arc::clone(&self.documents);
+        let scheduler = std::sync::Arc::clone(&self.parse_scheduler);
+        let shutdown = self.shutdown_token.clone();
+
+        tokio::spawn(async move {
+            // If the loop panics in its glue (the blocking parse is already
+            // panic-isolated by spawn_blocking), this guard clears the stuck
+            // `parsing` entry on unwind so the next edit re-spawns rather than the
+            // document wedging tree-less forever.
+            let mut guard = parse_scheduler::ParseLoopGuard::new(
+                std::sync::Arc::clone(&scheduler),
+                uri.clone(),
+            );
+
+            // Stop the loop and clear the scheduler entry so a later edit re-spawns
+            // (leaving the entry at `parsing: true` would wedge the URI — the same
+            // failure the panic guard prevents). Used by the shutdown and
+            // closed-document early exits, which bypass the normal `finish()`.
+            let stop = |scheduler: &parse_scheduler::ParseScheduler,
+                        guard: &mut parse_scheduler::ParseLoopGuard| {
+                scheduler.clear(&uri);
+                guard.disarm();
+            };
+
+            loop {
+                // Stop promptly on server shutdown rather than running another
+                // parse + injection/bridge round into a tearing-down bridge.
+                if shutdown.is_cancelled() {
+                    stop(&scheduler, &mut guard);
+                    break;
+                }
+
+                // Start the pass: clear `dirty` and take the latest ticket, so an
+                // edit folded into this text doesn't trigger a redundant reparse and
+                // a later edit still loops. (`flatten`: outer = entry present, inner
+                // = the ticket.)
+                let ticket = scheduler.start_pass(&uri).flatten();
+                parse.reparse_latest(&uri, ticket).await;
+
+                // If the document was closed during the parse, skip ALL downstream
+                // work: process_injections / republish on a gone URI could re-publish
+                // diagnostics that `didClose` just cleared (resurrecting them in the
+                // editor) and act on removed state.
+                if documents.get(&uri).is_none() {
+                    stop(&scheduler, &mut guard);
+                    break;
+                }
+
+                // Re-check shutdown after the (awaited) parse and BEFORE the
+                // downstream work: shutdown could have been requested while parsing,
+                // and process_injections can spawn fresh eager bridge connections
+                // that would escape `shutdown_all`'s snapshot.
+                if shutdown.is_cancelled() {
+                    stop(&scheduler, &mut guard);
+                    break;
+                }
+
+                // Tree-dependent downstream, in the order did_change ran it inline:
+                // injected-language processing + forwarding, then geometry re-merge
+                // (which re-anchors region push slots against the now-current
+                // injection geometry).
+                injection.process_injections(&uri, true).await;
+                if diagnostics.has_region_slots(&uri) {
+                    publisher.republish(&uri).await;
+                }
+
+                // Schedule the debounced diagnostic HERE, after the reparse restored
+                // the tree — NOT in the did_change handler, where the tree has just
+                // been cleared. `prepare_diagnostic_snapshot` returns `None` without
+                // a tree (`Document::snapshot()` requires one), and a `None` snapshot
+                // makes the debounce a no-op — skipping the on-edit host re-sync
+                // (#431) that keeps a push-only `_self` host server's diagnostics
+                // following edits. Running it post-parse captures a snapshot with the
+                // fresh tree; the debounce coalesces across loop iterations.
+                diagnostic_scheduler.schedule_debounced_diagnostic(uri.clone());
+
+                if !scheduler.finish(&uri) {
+                    // Normal exit: finish() removed the entry.
+                    guard.disarm();
+                    break;
+                }
+            }
+        });
     }
 }
 

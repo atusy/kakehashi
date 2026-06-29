@@ -35,11 +35,15 @@ impl Kakehashi {
             .log_trace(format!("[DID_CHANGE] START uri={}", uri))
             .await;
 
-        // Retrieve the stored document info
-        let (language_id, old_text) = {
+        // Retrieve the stored document's current text (the base for the diff). The
+        // language is re-detected by the off-ingress reparse from the stored
+        // `language_id`, so it is not needed here.
+        let old_text = {
             let doc = self.documents.get(&uri);
             match doc {
-                Some(d) => (d.language_id().map(|s| s.to_string()), d.text().to_string()),
+                // `text_arc()` is a refcount bump, not a full copy of the pre-edit
+                // text — cheap on every keystroke (#498).
+                Some(d) => d.text_arc(),
                 None => {
                     self.notifier()
                         .log_warning("Document not found for change event")
@@ -60,8 +64,9 @@ impl Kakehashi {
         // Use InputEdits directly for precise invalidation when available,
         // fall back to diff-based approach for full document sync.
         //
-        // This must be called AFTER content changes are applied (so we have new text)
-        // but BEFORE parse_document (so position sync happens before new tree is built).
+        // This must be called AFTER content changes are applied (so we have new
+        // text) but BEFORE the tree is cleared and the off-ingress reparse is
+        // scheduled (so node-position sync happens against the pre-edit state).
         let invalidated_ulids = if edits.is_empty() {
             // Full document sync: no InputEdits available, reconstruct from diff
             self.bridge.apply_text_diff(&uri, &old_text, &text)
@@ -71,21 +76,21 @@ impl Kakehashi {
             self.bridge.apply_input_edits(&uri, &edit_infos)
         };
 
-        // Invalidate injection caches for regions overlapping with edits.
-        // Must be called BEFORE parse_document which updates the injection_map.
+        // Invalidate injection caches for regions overlapping with edits. Must run
+        // here (pre-edit invalidation) before the off-ingress reparse loop
+        // repopulates the injection map from the freshly parsed tree.
         self.cache.invalidate_for_edits(&uri, &edits);
 
-        // Parse the updated document with edit information. The parse stamps the
-        // store watermark with this didChange's ingress ticket on resolution.
-        self.parse_coordinator()
-            .parse_document(
-                uri.clone(),
-                text,
-                language_id.as_deref(),
-                edits,
-                crate::lsp::current_writer_ticket(),
-            )
-            .await;
+        // Apply the edit to the store and CLEAR the tree synchronously, here under
+        // the edit lock (per-document-parse-actor ADR). Clearing the tree (rather
+        // than leaving the pre-edit one) is what keeps readers safe once the parse
+        // is off-ingress: a virt/native reader now sees *no* tree until the reparse
+        // lands (empty / on-demand fallback) instead of a stale tree that predates
+        // this edit — turning the #342/#374 stale-tree race into benign emptiness.
+        // The document exists (checked above) and the edit lock serializes didClose,
+        // so this update is in-place, not a resurrection.
+        let ticket = crate::lsp::current_writer_ticket();
+        self.documents.update_document(uri.clone(), text, None);
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.
         // The cached tokens (with their result_id) are needed for delta calculations.
@@ -97,39 +102,29 @@ impl Kakehashi {
         // tokens won't be returned for mismatched result_ids.
 
         // lazy-node-identity-tracking: Close invalidated virtual documents.
-        // Send didClose notifications to downstream LSs for orphaned docs.
+        // Send didClose notifications to downstream LSs for orphaned docs. Stays in
+        // the handler (text-derived). It closes the **invalidated** (old) region
+        // ulids, whereas the scheduler loop's forward targets the **current** region
+        // ulids — disjoint virtual documents — so even though the off-ingress loop
+        // can forward a later edit's content before an earlier edit's close
+        // completes, the two never act on the same downstream document.
         self.injection_coordinator()
             .close_invalidated_virtual_docs(&uri, &invalidated_ulids)
             .await;
 
-        // Forward didChange to opened virtual documents + process injected languages.
-        // Injection data is resolved once and reused for:
-        // 1. didChange forwarding to already-opened virtual documents
-        // 2. Auto-install missing parsers
-        // 3. Eager server spawn + didOpen for virtual documents
-        // Must be called AFTER parse_document so we have access to the updated AST.
-        self.injection_coordinator()
-            .process_injections(&uri, true)
-            .await;
-
-        // Geometry re-merge (#422): a host edit can shift a region's position without
-        // changing its extracted content — the fingerprint guard then skips re-syncing
-        // it, so no downstream re-push will re-anchor its cached diagnostics. Republish
-        // (off the debounce) so the cached region push slots re-anchor to their new
-        // host coordinates via lazy re-anchor. Gated on actually having region push
-        // slots so a quiet/diagnostic-free file pays nothing; the no-op-publish
-        // suppression then emits only when the re-anchored coordinates really changed.
-        if self.diagnostics.has_region_slots(&uri) {
-            crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(self)
-                .republish(&uri)
-                .await;
-        }
-
-        // pull-first-diagnostic-forwarding Phase 3: Schedule debounced diagnostic push on didChange.
-        // After 500ms of no changes, diagnostics will be collected and published.
-        // This provides near-real-time feedback while avoiding excessive requests during typing.
-        self.diagnostic_scheduler()
-            .schedule_debounced_diagnostic(uri);
+        // Schedule the OFF-INGRESS reparse: this replaces the inline parse_document,
+        // the post-parse process_injections (didChange forwarding + injected-language
+        // processing + eager bridge spawn), the geometry re-merge republish, AND the
+        // debounced diagnostic — all of which need the fresh tree and so run in the
+        // spawned, coalescing parse loop instead of holding the writer ticket.
+        //
+        // The debounced diagnostic in particular MUST run post-parse, not here: this
+        // handler just cleared the tree, and `prepare_diagnostic_snapshot` returns
+        // `None` without one (`Document::snapshot()` requires a tree). A `None`
+        // snapshot makes the debounce a no-op, skipping the on-edit host re-sync
+        // (#431) that keeps a push-only `_self` host server's diagnostics following
+        // edits. The handler returns without waiting on the parse.
+        self.schedule_reparse(uri, ticket);
 
         // NOTE: We intentionally do NOT call semantic_tokens_refresh() here.
         // LSP clients already request new tokens after didChange (via semanticTokens/full/delta).

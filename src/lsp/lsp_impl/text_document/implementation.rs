@@ -49,7 +49,10 @@ impl Kakehashi {
         position: Position,
         client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
     ) -> Result<Option<Vec<LocationLink>>> {
-        let Some(mut ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
+        let Some(mut ctx) = self
+            .resolve_bridge_contexts(lsp_uri, position, METHOD)
+            .await
+        else {
             return Ok(None);
         };
         // Aggregate the fanned-out servers' progress onto the editor's token

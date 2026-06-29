@@ -280,6 +280,40 @@ impl DocumentStore {
         stored
     }
 
+    /// Like [`update_tree_if_text_unchanged`], but additionally requires the
+    /// document's `language_id` to still equal `expected_language_id`.
+    ///
+    /// For the off-ingress edit reparse (`reparse_latest`), whose tree was parsed
+    /// with a grammar chosen from the language detected at read time. A
+    /// `didClose` + reopen of the same URI with **identical text but a different
+    /// `language_id`** while the parse is in flight would, under the text-only CAS,
+    /// attach a tree parsed by the *old* grammar to the reopened document — wrong
+    /// tokens. Folding the language check into the same `get_mut` shard lock as the
+    /// text check rejects that atomically. (Same-language identical-text reopen
+    /// stays benign: the tree is a correct parse of the identical text.)
+    pub(crate) fn update_tree_if_text_and_language_unchanged(
+        &self,
+        uri: &Url,
+        expected_text: &str,
+        expected_language_id: Option<&str>,
+        new_tree: Tree,
+    ) -> bool {
+        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
+            if doc.text() == expected_text && doc.language_id() == expected_language_id {
+                doc.set_tree(new_tree);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if stored {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        stored
+    }
+
     /// Like [`update_tree_if_text_unchanged`], but additionally stores the tree
     /// only if the document currently has **no** tree. For the off-ingress install
     /// reparse (`reparse_installed_document`), whose "don't clobber a concurrent
@@ -635,6 +669,44 @@ mod tests {
             first,
             "an existing tree must be preserved, not overwritten"
         );
+    }
+
+    #[test]
+    fn update_tree_if_text_and_language_unchanged_rejects_a_changed_language() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///relabelled.rs").unwrap();
+        // Document was reopened with the same text but a different language_id
+        // while an old-grammar parse was in flight.
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("ruby".to_string()),
+            None,
+        );
+
+        let stored = store.update_tree_if_text_and_language_unchanged(
+            &uri,
+            "fn main() {}",
+            Some("rust"),
+            parse_rust("fn main() {}"),
+        );
+        assert!(
+            !stored,
+            "a tree parsed for a different language must be rejected"
+        );
+        assert!(
+            store.get(&uri).unwrap().tree().is_none(),
+            "the relabelled document keeps no wrong-grammar tree"
+        );
+
+        // Same language → stores.
+        assert!(store.update_tree_if_text_and_language_unchanged(
+            &uri,
+            "fn main() {}",
+            Some("ruby"),
+            parse_rust("fn main() {}"),
+        ));
+        assert!(store.get(&uri).unwrap().tree().is_some());
     }
 
     #[test]

@@ -21,7 +21,6 @@
 //! range-only servers still format.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
@@ -59,15 +58,12 @@ impl Kakehashi {
 
             log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
 
-            // Tower-LSP runs requests concurrently, so a rangeFormatting call can
-            // arrive before didOpen/didChange has finished parsing. Wait briefly
-            // for any in-flight parse to land a tree before snapshotting, matching
-            // the read-handler pattern (semantic tokens, node lookups); otherwise
-            // an otherwise-valid request would degrade to `Ok(None)` purely due to
-            // a parse race.
-            self.documents
-                .wait_for_parse_completion(&uri, Duration::from_millis(200))
-                .await;
+            // Tower-LSP runs requests concurrently, and `didChange` now reparses
+            // off-ingress, so a rangeFormatting call can arrive before a tree
+            // exists. Wait for the reparse (and parse on demand if needed) before
+            // snapshotting — the shared post-edit freshness helper — so an
+            // otherwise-valid request doesn't degrade to `Ok(None)` on a parse race.
+            self.ensure_document_parsed(&uri).await;
 
             let snapshot = match self.documents.get(&uri) {
                 None => {

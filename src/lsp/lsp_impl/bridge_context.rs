@@ -667,7 +667,14 @@ impl Kakehashi {
         method_name: &str,
     ) -> Option<HostRequestContext> {
         let uri = uri_to_url(lsp_uri).ok()?;
-        let snapshot = self.documents.get(&uri)?.snapshot()?;
+        // Host tier needs only the text, never the parse tree
+        // (parse-decoupled-document-lifecycle ADR): read `text_arc()` directly
+        // rather than `snapshot()?`, which requires a tree. Otherwise — now that
+        // `didChange` clears the tree and reparses off-ingress — every host-bridged
+        // request (hover / definition / formatting / will-save / diagnostics) would
+        // bail to `None` for the whole reparse window after each edit, even though
+        // it forwards the real URI + text verbatim and depends on no tree.
+        let text = self.documents.get(&uri)?.text_arc();
         let language_name = self.document_language(&uri)?;
 
         let settings = self.settings_manager.load_settings();
@@ -697,7 +704,7 @@ impl Kakehashi {
 
         Some(HostRequestContext {
             uri,
-            text: snapshot.text_arc(),
+            text,
             language_id: language_name,
             configs,
             priorities: agg.priorities,
@@ -849,28 +856,42 @@ impl Kakehashi {
     ///
     /// Delegates to the shared preamble, then looks up ALL bridge server configs
     /// for the injection language. Returns `None` if no configs found.
-    pub(crate) fn resolve_bridge_contexts(
+    pub(crate) async fn resolve_bridge_contexts(
         &self,
         lsp_uri: &Uri,
         position: Position,
         method_name: &str,
     ) -> Option<PositionRequestContext> {
+        // Ensure a fresh tree before the (sync) preamble snapshots it: `didChange`
+        // now clears the tree and reparses off-ingress, so without this an injection
+        // request (hover / definition / completion / …) issued in the reparse window
+        // would find `snapshot()` empty and return null after every edit.
+        self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let preamble = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
         let document = self.preamble_to_document_context(preamble, method_name)?;
 
         Some(PositionRequestContext { document, position })
     }
 
+    /// Wait for / on-demand the document's tree before a sync bridge-preamble
+    /// snapshot (shared by the position and range resolvers).
+    async fn ensure_fresh_tree_for_bridge(&self, lsp_uri: &Uri) {
+        if let Ok(uri) = uri_to_url(lsp_uri) {
+            self.ensure_document_parsed(&uri).await;
+        }
+    }
+
     /// Resolve injection context for a range-based bridge endpoint request.
     ///
     /// Uses `range.start` to find the injection region, then returns a
     /// [`RangeRequestContext`] with the full range for the handler to use.
-    pub(crate) fn resolve_bridge_contexts_for_range(
+    pub(crate) async fn resolve_bridge_contexts_for_range(
         &self,
         lsp_uri: &Uri,
         range: Range,
         method_name: &str,
     ) -> Option<RangeRequestContext> {
+        self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let preamble = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
         let document = self.preamble_to_document_context(preamble, method_name)?;
 

@@ -28,6 +28,11 @@ impl Kakehashi {
 
         log::debug!("documentColor called for {}", uri);
 
+        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
+        // reparses off-ingress, so without this documentColor (virt-only) returns
+        // empty for the whole reparse window after every edit.
+        self.ensure_document_parsed(&uri).await;
+
         // Get document snapshot (minimizes lock duration)
         let snapshot = match self.documents.get(&uri) {
             None => {

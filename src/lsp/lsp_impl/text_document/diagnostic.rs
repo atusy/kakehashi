@@ -103,24 +103,11 @@ impl Kakehashi {
 
         log::trace!("textDocument/diagnostic called for {}", uri);
 
-        // Get document snapshot (minimizes lock duration)
-        let snapshot = match self.documents.get(&uri) {
-            None => {
-                log::debug!("textDocument/diagnostic: No document found for {}", uri);
-                return Ok(empty_diagnostic_report());
-            }
-            Some(doc) => match doc.snapshot() {
-                None => {
-                    log::debug!(
-                        "textDocument/diagnostic: Document not fully initialized for {}",
-                        uri
-                    );
-                    return Ok(empty_diagnostic_report());
-                }
-                Some(snapshot) => snapshot,
-            },
-            // doc automatically dropped here, lock released
-        };
+        // A missing document means a `didClose` removed it — nothing to report.
+        if self.documents.get(&uri).is_none() {
+            log::debug!("textDocument/diagnostic: No document found for {}", uri);
+            return Ok(empty_diagnostic_report());
+        }
 
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
@@ -148,6 +135,19 @@ impl Kakehashi {
             return Ok(empty_diagnostic_report());
         }
 
+        // Snapshot for the VIRT layer ONLY, and ONLY ensure a fresh tree when virt
+        // actually participates: `didChange` clears the tree and reparses
+        // off-ingress, so the virt injection regions would otherwise be empty for
+        // the reparse window after each edit. The HOST layer needs no tree, so a
+        // host-only document must not pay the freshness wait. A still-missing tree
+        // (parse pending/failed) yields `None` — host still pulls, virt skips.
+        let snapshot = if virt_enabled {
+            self.ensure_document_parsed(&uri).await;
+            self.documents.get(&uri).and_then(|doc| doc.snapshot())
+        } else {
+            None
+        };
+
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = crate::lsp::current_upstream_id();
 
@@ -159,8 +159,9 @@ impl Kakehashi {
 
         // Resolve injection regions once: the live virt pull below and the
         // pushFallback fold (#425) after the join share them.
-        let virt_regions = if virt_enabled {
-            self.language
+        let virt_regions = match (virt_enabled, snapshot.as_ref()) {
+            (true, Some(snapshot)) => self
+                .language
                 .injection_query(&language_name)
                 .map(|injection_query| {
                     InjectionResolver::resolve_all(
@@ -172,9 +173,11 @@ impl Kakehashi {
                         injection_query.as_ref(),
                     )
                 })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+                .unwrap_or_default(),
+            // Virt gated off, or no tree yet (the host layer still pulls). The
+            // wait+on-demand above already tried, so a missing tree here is the
+            // rare parse-failure case, self-healing on the next pull.
+            _ => Vec::new(),
         };
         // Lightweight per-region metadata `(region_id, injection_language,
         // current offset)` for the pushFallback fold; the live pull below moves
