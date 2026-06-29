@@ -1,6 +1,6 @@
 //! Integration coverage for the hidden `__compile-parser` subcommand — the
 //! re-exec target of the killable parser-compile deadline (see the
-//! per-document-parse-actor ADR). A *successful* in-process compile is unit-tested
+//! per-document-parse-scheduler ADR). A *successful* in-process compile is unit-tested
 //! in `install::parser` (`test_compile_parser_with_loader`); here we lock the
 //! subcommand's contract through the real binary: it exists, is hidden from
 //! `--help`, and maps a failed compile to a non-zero exit without producing an

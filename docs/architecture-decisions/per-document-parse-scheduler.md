@@ -1,4 +1,4 @@
-# Per-Document Parse Actor
+# Per-Document Parse Scheduler
 
 **Related Decisions**:
 [parse-decoupled-document-lifecycle](parse-decoupled-document-lifecycle.md),

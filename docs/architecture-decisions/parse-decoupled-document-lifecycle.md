@@ -1,6 +1,6 @@
 # Parse-Decoupled Document Lifecycle
 
-**Related Decisions**: [per-document-parse-actor](per-document-parse-actor.md),
+**Related Decisions**: [per-document-parse-scheduler](per-document-parse-scheduler.md),
 [host-document-bridge](host-document-bridge.md),
 [push-propagation-diagnostic-forwarding](push-propagation-diagnostic-forwarding.md),
 [ls-bridge-message-ordering](ls-bridge-message-ordering.md)
@@ -42,7 +42,7 @@ tiers by their dependence on kakehashi's own tree-sitter parse:
 
 1. `maybe_auto_install_language` (when the main parser is missing and
    auto-install is on) — network/git plus an **unbounded** C-compiler step (see
-   per-document-parse-actor for the liveness analysis);
+   per-document-parse-scheduler for the liveness analysis);
 2. `parse_document` plus the injection processing it feeds — measured together
    at **~120–310 ms** for a 50–2000-block injection-heavy Markdown
    (10 KB–435 KB), and bounded only by a 10 s parse timeout;
@@ -69,7 +69,7 @@ forward that reads store text sees the new text only after the parse completes.
 |   2000 |   435 KB |                ~308 ms |                      ~183 ms |
 
 These are the latencies the host tier pays today for nothing (parse + injection
-isolated from token computation; see per-document-parse-actor for method).
+isolated from token computation; see per-document-parse-scheduler for method).
 
 ## Decision
 
@@ -161,7 +161,7 @@ feature for nothing.
 
 ### 2. Fold this into the parse-actor refactor only (rejected as the *first* step)
 
-Wait for the full per-document parse actor (per-document-parse-actor) to land,
+Wait for the full per-document parse scheduler (per-document-parse-scheduler) to land,
 and let the actor's "non-parse side effects run first" structure deliver the
 decoupling.
 
@@ -209,7 +209,7 @@ off the ingress path.
   because they intrinsically depend on it. The decoupling does not make tree
   features faster; it stops non-tree features from waiting on them.
 - The edit-path text-freshness change (persist text before parse) is a small
-  structural reordering within `did_change_impl`; the per-document parse actor
+  structural reordering within `did_change_impl`; the per-document parse scheduler
   later generalizes it into full single-owner text application with parse
   coalescing.
 
@@ -220,4 +220,4 @@ only after awaiting auto-install, `parse_document`, and `process_injections`, an
 `did_change_impl` persists the post-delta text via `parse_document` (so host
 forwards see new text only after the parse). The tier taxonomy is described here;
 the handler reordering and the explicit open-before-change assertion are unbuilt.
-This decision can land independently of, and before, the per-document parse actor.
+This decision can land independently of, and before, the per-document parse scheduler.

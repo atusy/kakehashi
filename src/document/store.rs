@@ -43,7 +43,7 @@ pub struct DocumentStore {
     /// completion channel. Today the parse resolves *inline*, before its writer
     /// ticket completes, so the watermark and ticket-completion move in lockstep;
     /// a reader gated behind the ticket already observes a fresh tree. The
-    /// per-document parse actor (see `per-document-parse-actor` ADR) will run the
+    /// per-document parse scheduler (see `per-document-parse-scheduler` ADR) will run the
     /// parse *off* the ingress ticket, at which point ticket-completion no longer
     /// implies a fresh tree and this watermark — not the completion channel — is
     /// what tells a virt/native reader the store reflects its tail edit. Keyed on
@@ -237,7 +237,7 @@ impl DocumentStore {
     }
 
     /// Apply a `didChange`'s new text and stash an **incremental parse seed**,
-    /// clearing the reader-visible tree — the per-document-parse-actor flip's edit
+    /// clearing the reader-visible tree — the per-document-parse-scheduler flip's edit
     /// path.
     ///
     /// Replaces the prior `update_document(uri, text, None)`: it still clears the

@@ -235,7 +235,7 @@ fn self_exe_for_reexec() -> Result<PathBuf, ParserInstallError> {
 /// child, so a `tokio::time::timeout` cannot kill a hung compiler (the blocking
 /// thread and its `cc` would keep running). Instead we **re-exec** this binary's
 /// hidden `__compile-parser` subcommand inside a killable process group (see the
-/// per-document-parse-actor ADR, "a real install deadline via a killable
+/// per-document-parse-scheduler ADR, "a real install deadline via a killable
 /// subprocess") and bound it with [`PARSER_COMPILE_TIMEOUT`]. Re-exec rather than
 /// `fork`: forking a multithreaded process is unsafe past the child's first
 /// non-async-signal-safe call.

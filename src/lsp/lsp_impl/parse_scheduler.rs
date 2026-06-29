@@ -1,5 +1,5 @@
 //! Per-document coalescing scheduler for the **off-ingress parse**
-//! (per-document-parse-actor ADR).
+//! (per-document-parse-scheduler ADR).
 //!
 //! `did_change` applies the edit to the store and clears the tree synchronously
 //! (under the edit lock), then asks this scheduler to (re)parse off the ingress
