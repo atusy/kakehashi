@@ -1076,6 +1076,44 @@ mod tests {
     }
 
     #[test]
+    fn set_parse_result_if_text_and_incarnation_unchanged_records_language_without_a_tree() {
+        // The parse-failed-but-language-detected path (parse timeout / parser
+        // unavailable / join error): the open parse records the detected language
+        // with NO tree, so a host-bridged document keeps its language after a parse
+        // failure rather than being nulled out.
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///open_lang_no_tree.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("text".to_string()),
+            None,
+        );
+        let (incarnation, text) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.incarnation(), doc.text_arc())
+        };
+
+        assert!(store.set_parse_result_if_text_and_incarnation_unchanged(
+            &uri,
+            &text,
+            incarnation,
+            Some("rust".to_string()),
+            None,
+        ));
+        let doc = store.get(&uri).unwrap();
+        assert_eq!(
+            doc.language_id(),
+            Some("rust"),
+            "the detected language is recorded even though the parse produced no tree"
+        );
+        assert!(
+            doc.tree().is_none(),
+            "no tree lands on the parse-failure path"
+        );
+    }
+
+    #[test]
     fn set_parse_result_if_text_and_incarnation_unchanged_rejects_stale_text() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///open_stale_text.rs").unwrap();
