@@ -482,7 +482,8 @@ the `edit_lock`). This matches the carve-out in the Decision intro.
   reopen even though tickets restart.
 - **`skip_parse` disappears**, folded into the `Uninstalled/Installing/Ready`
   state machine; the install path stops re-entering parsing from a second call
-  site.
+  site. *(Option-4 part — the shipped scheduler retains `skip_parse` and the
+  install re-entry.)*
 - **The install/parse resurrection path is structurally closed** — `Close` aborts
   the actor's store-writing parse and advances the epoch, so a later
   shared-install completion has no actor and a stale epoch — without adding
