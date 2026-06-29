@@ -274,6 +274,36 @@ impl DocumentStore {
         self.ensure_watermark_entry(uri);
     }
 
+    /// Record the didOpen parse's result (detected `language` + optional `tree`) on
+    /// the **existing** document, preserving its already-stored text. Returns whether
+    /// it was stored.
+    ///
+    /// The registering `didOpen` inserts the document (with its text) before the
+    /// parse, so the parse never needs to carry the text again — it updates language
+    /// and tree in place, avoiding a full-document copy per open. **Non-inserting**
+    /// (`get_mut`): a document a concurrent `didClose` removed is left gone, not
+    /// resurrected — so once the open parse moves off the ingress ticket (the didOpen
+    /// flip) a close racing it stays closed. Availability is marked only when a tree
+    /// landed (the no-tree paths rely on the following `mark_parse_finished(false)`).
+    pub(crate) fn set_parse_result_if_present(
+        &self,
+        uri: &Url,
+        language: Option<String>,
+        tree: Option<Tree>,
+    ) -> bool {
+        let has_tree = tree.is_some();
+        let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
+            doc.set_parse_result(language, tree);
+            true
+        } else {
+            false
+        };
+        if stored && has_tree {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        stored
+    }
+
     /// Store `new_tree` for an **existing** document, but only if its current text
     /// still equals `expected_text`. Returns `true` iff the tree was stored.
     ///
