@@ -303,15 +303,30 @@ impl ParseCoordinator {
         // resurrect it) or already parsed (a concurrent parse won — nothing to do,
         // and skip the `ensure_language_loaded` work). Detection borrows the stored
         // text (synchronous, no `.await` and no document write under the `Ref`).
-        let language_name = {
+        // Capture the grammar **and** the (language_id, incarnation) it is resolved
+        // for, together under one read guard. `language_name` is fixed for the whole
+        // loop, so the CAS must check against the language_id/incarnation captured
+        // *here* — not re-read per attempt. Otherwise a relabelling reopen mid-loop
+        // would have its new language_id captured per attempt, satisfy the CAS's
+        // language check, and let a tree parsed by the *old* grammar attach to the
+        // relabelled document. The incarnation is likewise lifetime-stable; only the
+        // text legitimately changes within a lifetime (a `didChange`), so only the
+        // text is re-read per attempt.
+        let (language_name, expected_language_id, expected_incarnation) = {
             let Some(doc) = self.documents.get(&uri) else {
                 return;
             };
             if doc.tree().is_some() {
                 return;
             }
-            self.language
-                .detect_language(uri.path(), doc.text(), None, language_id.as_deref())
+            let language_name =
+                self.language
+                    .detect_language(uri.path(), doc.text(), None, language_id.as_deref());
+            (
+                language_name,
+                doc.language_id().map(|s| s.to_string()),
+                doc.incarnation(),
+            )
         };
         let Some(language_name) = language_name else {
             return;
@@ -324,25 +339,25 @@ impl ParseCoordinator {
 
         for _ in 0..MAX_REPARSE_ATTEMPTS {
             // Re-read the latest text each attempt. Gone => closed (no resurrect);
-            // already has a tree => a concurrent parse won, nothing to do. Capture
-            // the lifetime's incarnation and the document's language alongside the
-            // text so the CAS below can reject a close+reopen (possibly a relabel)
-            // that raced this off-ingress install reparse.
-            let (text, cas_language_id, incarnation) = {
+            // already has a tree => a concurrent parse won; a changed incarnation =>
+            // a close+reopen, whose new lifetime drives its own parse — stop rather
+            // than parse its text with this lifetime's (possibly relabelled-away)
+            // grammar (the CAS would reject it anyway; this just avoids the wasted
+            // parses).
+            let text = {
                 let Some(doc) = self.documents.get(&uri) else {
                     break;
                 };
                 if doc.tree().is_some() {
                     break;
                 }
-                (
-                    // `text_arc()` is a refcount bump, not a full copy (#498) — the
-                    // original stays here for the CAS while a cheap clone goes to
-                    // the blocking parse closure.
-                    doc.text_arc(),
-                    doc.language_id().map(|s| s.to_string()),
-                    doc.incarnation(),
-                )
+                if doc.incarnation() != expected_incarnation {
+                    break;
+                }
+                // `text_arc()` is a refcount bump, not a full copy (#498) — the
+                // original stays here for the CAS while a cheap clone goes to the
+                // blocking parse closure.
+                doc.text_arc()
             };
 
             let text_len = text.len();
@@ -374,8 +389,8 @@ impl ParseCoordinator {
             let stored = self.documents.attach_tree_if_absent(
                 &uri,
                 &text,
-                cas_language_id.as_deref(),
-                incarnation,
+                expected_language_id.as_deref(),
+                expected_incarnation,
                 tree.clone(),
             );
             if stored {
