@@ -5,7 +5,6 @@ use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
 use tower_lsp_server::Client;
-use tree_sitter::InputEdit;
 use url::Url;
 
 use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
@@ -156,7 +155,6 @@ impl ParseCoordinator {
         uri: Url,
         text: String,
         language_id: Option<&str>,
-        edits: Vec<InputEdit>,
         ticket: Option<u64>,
     ) {
         let parse_generation = self.documents.mark_parse_started(&uri);
@@ -192,24 +190,13 @@ impl ParseCoordinator {
             let load_result = self.language.ensure_language_loaded(&language_name);
             events.extend(load_result.events);
 
-            let (base_tree, pre_edit_tree) = if !edits.is_empty() {
-                let edited = self.documents.get_edited_tree(&uri, &edits);
-                let for_store = edited.clone();
-                (edited, for_store)
-            } else {
-                // Full-text sync (and any other no-edits reparse): do NOT seed
-                // the parse with the stored tree. tree-sitter's incremental
-                // contract requires every text change to be applied to the old
-                // tree via ts_tree_edit first; reusing an unedited tree against
-                // different text makes external scanners deserialize state at
-                // wrong positions and (for the markdown grammar) overflow in
-                // scanner serialize — heap corruption that killed the whole
-                // server (#348). A full parse is the correct cost of full-text
-                // sync: without InputEdits there is nothing to be incremental
-                // about.
-                (None, None)
-            };
-
+            // This is the document-open parse: there is no prior tree to seed an
+            // incremental parse from, so it is always a full parse. (The off-ingress
+            // edit reparse — `reparse_latest` — is the incremental path, seeded from
+            // `Document::pending_seed`.) A full parse is also the only safe option
+            // without an edited old tree: reusing an unedited tree against different
+            // text violates tree-sitter's incremental contract and corrupts external
+            // scanners (#348).
             let text_clone = text.clone();
             let auto_install = self.auto_install.clone();
             let language_name_clone = language_name.clone();
@@ -217,13 +204,13 @@ impl ParseCoordinator {
             let parsed_tree = self
                 .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
-                    let parse_result = parser.parse(&text_clone, base_tree.as_ref());
+                    let parse_result = parser.parse(&text_clone, None);
                     let _ = auto_install.end_parsing(&language_name_clone);
-                    (parser, parse_result.map(|tree| (tree, pre_edit_tree)))
+                    (parser, parse_result)
                 })
                 .await;
 
-            if let Some((tree, pre_edit_tree)) = parsed_tree {
+            if let Some(tree) = parsed_tree {
                 self.cache.populate_injections(
                     &uri,
                     &text,
@@ -233,21 +220,8 @@ impl ParseCoordinator {
                     self.bridge.node_tracker(),
                 );
 
-                if let Some(edited_tree) = pre_edit_tree {
-                    self.documents.update_document_with_edited_tree(
-                        uri.clone(),
-                        text,
-                        tree,
-                        edited_tree,
-                    );
-                } else {
-                    self.documents.insert(
-                        uri.clone(),
-                        text,
-                        Some(language_name.clone()),
-                        Some(tree),
-                    );
-                }
+                self.documents
+                    .insert(uri.clone(), text, Some(language_name.clone()), Some(tree));
 
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, true);

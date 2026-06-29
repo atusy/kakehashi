@@ -205,7 +205,7 @@ impl DocumentStore {
         // between checking if document exists and inserting/updating.
         let has_tree = match self.documents.entry(uri.clone()) {
             Entry::Occupied(mut entry) => {
-                // Document exists - update in place to preserve previous_tree and previous_text
+                // Document exists - update in place
                 let doc = entry.get_mut();
                 if let Some(tree) = new_tree {
                     doc.update_tree_and_text(tree, text);
@@ -299,7 +299,7 @@ impl DocumentStore {
         // the `Url`. The `RefMut` holds the shard write lock for the whole arm, so
         // the text check and the tree write are atomic against didChange/didClose.
         // Text already equals `expected_text`, so only the tree is attached — no
-        // text re-clone, no `previous_text` churn.
+        // text re-clone.
         let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
             if doc.text() == expected_text {
                 doc.set_tree(new_tree);
@@ -357,10 +357,8 @@ impl DocumentStore {
     /// reparse (`reparse_installed_document`), whose "don't clobber a concurrent
     /// parse" guard is a `tree.is_some()` pre-check: a parse attaching a tree for
     /// the same text *between* that pre-check and this write would otherwise be
-    /// overwritten — discarding its incremental-edit linkage (`previous_tree` /
-    /// `previous_text`) and corrupting the next `changed_ranges()`. Folding the
-    /// `tree.is_none()` check into the same `get_mut` shard lock as the text
-    /// comparison makes the guard atomic.
+    /// overwritten. Folding the `tree.is_none()` check into the same `get_mut` shard
+    /// lock as the text comparison makes the guard atomic.
     pub(crate) fn attach_tree_if_absent(
         &self,
         uri: &Url,
@@ -381,49 +379,6 @@ impl DocumentStore {
             self.mark_tree_available_if_tracked(uri);
         }
         stored
-    }
-
-    /// Update document with an edited previous tree for proper changed_ranges() support.
-    ///
-    /// Call when parsing used an edited old tree (via `tree.edit()`): the
-    /// `edited_previous_tree` lets tree-sitter's `changed_ranges()` accurately
-    /// compute the byte ranges that changed between versions.
-    pub fn update_document_with_edited_tree(
-        &self,
-        uri: Url,
-        text: String,
-        new_tree: Tree,
-        edited_previous_tree: Tree,
-    ) {
-        match self.documents.entry(uri.clone()) {
-            Entry::Occupied(mut entry) => {
-                // Document exists - update with edited tree to preserve change history
-                entry
-                    .get_mut()
-                    .update_with_edited_tree(new_tree, text, edited_previous_tree);
-            }
-            Entry::Vacant(entry) => {
-                // Document doesn't exist - create new one (edited_previous_tree is lost,
-                // but this is expected for newly created documents)
-                entry.insert(Document::with_tree(text, "unknown".to_string(), new_tree));
-            }
-        }
-        self.update_tree_availability(&uri, true);
-    }
-
-    /// Get the existing tree and apply edits for incremental parsing
-    /// Returns the edited tree without updating the document store
-    // Lock safety: and_then() consumes Ref, returning owned Tree clone - no read lock held after return
-    pub fn get_edited_tree(&self, uri: &Url, edits: &[InputEdit]) -> Option<Tree> {
-        self.documents.get(uri).and_then(|doc| {
-            doc.tree().map(|tree| {
-                let mut tree = tree.clone();
-                for edit in edits {
-                    tree.edit(edit);
-                }
-                tree
-            })
-        })
     }
 
     /// Return the per-document `didChange` serialization lock, creating it on

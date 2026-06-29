@@ -69,9 +69,10 @@ impl CacheCoordinator {
 
     /// Invalidate injection caches for regions that overlap with edits.
     ///
-    /// Called BEFORE parse_document to use pre-edit byte offsets against pre-edit
-    /// injection regions: edits outside injections preserve caches, edits inside
-    /// invalidate only affected regions.
+    /// Called by `did_change` BEFORE the tree is cleared and the off-ingress reparse
+    /// is scheduled, so it uses pre-edit byte offsets against pre-edit injection
+    /// regions: edits outside injections preserve caches, edits inside invalidate
+    /// only affected regions.
     ///
     /// Uses an O(log n) interval tree query.
     pub(crate) fn invalidate_for_edits(&self, uri: &Url, edits: &[InputEdit]) {
