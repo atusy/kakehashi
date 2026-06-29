@@ -66,11 +66,18 @@ pub(crate) fn apply_content_changes_with_edits(
             if !saw_full_replacement {
                 let new_end_offset = start_offset + change.text.len();
 
-                // Calculate the new end position for tree-sitter (using byte columns)
-                let lines: Vec<&str> = change.text.split('\n').collect();
-                let line_count = lines.len();
-                // last_line_len is in BYTES (not UTF-16) because .len() on &str returns byte count
-                let last_line_len = lines.last().map(|l| l.len()).unwrap_or(0);
+                // Calculate the new end position for tree-sitter (using byte columns).
+                // Iterate the split directly rather than `.collect()`-ing a `Vec` — this
+                // runs on every keystroke's ranged edit, so the allocation is pure
+                // overhead. `split('\n')` always yields at least one segment, so
+                // `line_count >= 1` and `last_line_len` ends as the last segment's BYTE
+                // length (bytes, not UTF-16, since `str::len` is byte count).
+                let mut line_count = 0usize;
+                let mut last_line_len = 0usize;
+                for line in change.text.split('\n') {
+                    line_count += 1;
+                    last_line_len = line.len();
+                }
 
                 // Points are derived from the (clamped) byte offsets via the same
                 // `LineIndex` (O(log n)), not the raw LSP positions, so they stay
