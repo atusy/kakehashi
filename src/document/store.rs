@@ -162,7 +162,16 @@ impl DocumentStore {
     }
 
     pub fn mark_parse_finished(&self, uri: &Url, generation: u64, has_tree: bool) {
-        let sender = self.parse_sender(uri);
+        // Non-inserting (`get`, not `parse_sender`'s get-or-insert), mirroring
+        // [`mark_tree_available_if_tracked`]: once the open parse runs off the ingress
+        // ticket (#6) a `didClose` can land between `mark_parse_started` and here, and
+        // `remove` drops `parse_states` first — a get-or-insert would recreate an
+        // orphan default entry for the closed URI. The generation guard already
+        // prevents state corruption; this also stops the resurrection. Holding the
+        // `Ref` serializes against that `remove`.
+        let Some(sender) = self.parse_states.get(uri) else {
+            return;
+        };
         let mut state = *sender.borrow();
         if state.generation != generation {
             return;

@@ -310,8 +310,31 @@ impl ParseCoordinator {
                 // over the edit's tree.
                 return stored;
             }
+
+            // Parse produced no tree (timeout / parser unavailable / join error) but
+            // the language WAS detected — record it with no tree, rather than falling
+            // through to the no-language path below which would null it out. Host
+            // bridging needs only text + language (never a tree), so preserving the
+            // language keeps a host-bridged document working after a parse failure.
+            if self
+                .documents
+                .set_parse_result_if_text_and_incarnation_unchanged(
+                    &uri,
+                    &text,
+                    incarnation,
+                    Some(language_name),
+                    None,
+                )
+            {
+                self.documents
+                    .mark_parse_finished(&uri, parse_generation, false);
+            }
+            advance_watermark();
+            self.notifier().log_language_events(&events).await;
+            return false;
         }
 
+        // No language detected at all → store no language, no tree.
         if self
             .documents
             .set_parse_result_if_text_and_incarnation_unchanged(
@@ -327,7 +350,6 @@ impl ParseCoordinator {
         }
         advance_watermark();
         self.notifier().log_language_events(&events).await;
-        // Parsed to nothing / no detectable language → no tree landed.
         false
     }
 

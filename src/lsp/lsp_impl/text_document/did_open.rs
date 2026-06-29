@@ -90,6 +90,11 @@ impl Kakehashi {
                     let documents = std::sync::Arc::clone(&self.documents);
                     let lang = lang.clone();
                     let install_uri = uri.clone();
+                    // Mirror the handler's `!is_cli_mode()` gate on the synthetic
+                    // diagnostic (#489): in one-shot CLI mode no editor consumes the
+                    // proactive publishDiagnostics, so re-firing it from the install
+                    // spawn is pure wasted work and races the bridge-state sweep.
+                    let is_cli_mode = self.is_cli_mode();
                     tokio::spawn(async move {
                         install
                             .maybe_auto_install_language(&lang, install_uri.clone(), false)
@@ -114,8 +119,11 @@ impl Kakehashi {
                             // tree exists: the handler's spawn (below) ran in the
                             // skip-parse path with no tree, so its snapshot was None
                             // and the pull-layer diagnostics were skipped on this
-                            // first open of a just-installed parser.
-                            diagnostic_scheduler.spawn_synthetic_diagnostic_task(install_uri);
+                            // first open of a just-installed parser. Skipped in CLI
+                            // mode (#489), matching the handler's own gate.
+                            if !is_cli_mode {
+                                diagnostic_scheduler.spawn_synthetic_diagnostic_task(install_uri);
+                            }
                         }
                     });
                     skip_parse = true;
