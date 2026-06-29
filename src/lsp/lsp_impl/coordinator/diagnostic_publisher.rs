@@ -275,6 +275,13 @@ impl DiagnosticPublisher {
     /// spontaneous push under `pullFallback = false` (#425). A pull that ran and
     /// returned clean keeps its empty `PullLayer` (via [`Self::publish_pull_layer`]),
     /// so that path still suppresses a stale push — the two empties differ.
+    ///
+    /// Deliberately does **not** emit `workspace/diagnostic/refresh` (#499). This is
+    /// the empty-contributors branch of the same host-event pull task as
+    /// [`Self::publish_pull_layer`], which #496 left no-refresh: both are always
+    /// downstream of a host event (didOpen/didChange/didSave) the editor originated
+    /// and re-pulls for on its own. There is no spontaneous `clear_pull_layer`, so a
+    /// refresh here would be redundant (the editor's own re-pull already covers it).
     pub(crate) async fn clear_pull_layer(&self, host: &Url) {
         self.aggregator
             .evict_source(host, &DiagnosticSource::PullLayer);
@@ -285,10 +292,30 @@ impl DiagnosticPublisher {
     /// republish the affected hosts (#469). Called when a connection's reader exits
     /// (crash/respawn); a restart's slots carry a fresh connection id and survive,
     /// so this clears only the dead server's contribution.
+    ///
+    /// A downstream reader exit emits **no LSP event the editor sees**, so a
+    /// pull-mode client (which displays the diagnostics it *pulled*, not our
+    /// `publishDiagnostics`) has no trigger to re-pull — the crashed server's now
+    /// removed diagnostics would rot until the next edit-triggered pull. So when an
+    /// eviction actually changed a host's merged set, nudge pull-mode clients to
+    /// re-pull, exactly like the spontaneous-push paths (#499, push/pull-divergence
+    /// #422). `workspace/diagnostic/refresh` is workspace-wide, so emit it once for
+    /// the whole eviction, not per host. Loop-safe: a refresh-induced pull is
+    /// answered inline by `diagnostic_impl` without republishing.
+    ///
+    /// Scope: `evict_connection` clears only **push** slots (the `PullLayer` blob is
+    /// recorded with no connection id, so it survives eviction), so a *purely
+    /// pull-driven* server's crash evicts nothing here and isn't refreshed by this
+    /// path — that case is out of scope and self-heals on the next host-event pull,
+    /// matching the intentional push-only asymmetry of `evict_connection` (#469).
     pub(crate) async fn evict_connection_diagnostics(&self, connection_id: ProgressConnectionId) {
         let affected = self.aggregator.evict_connection(connection_id);
+        let mut any_changed = false;
         for host in affected {
-            self.republish(&host).await;
+            any_changed |= self.republish(&host).await;
+        }
+        if any_changed {
+            self.request_pull_diagnostic_refresh();
         }
     }
 
@@ -391,7 +418,8 @@ impl DiagnosticPublisher {
     }
 
     /// Ask pull-mode clients to re-pull diagnostics (`workspace/diagnostic/refresh`)
-    /// after a **spontaneous downstream push** changed the merged set.
+    /// after a change the editor has no event to learn about — a **spontaneous
+    /// downstream push**, or a **crash-driven eviction** — moved the merged set.
     ///
     /// kakehashi advertises `diagnosticProvider`, so a pull-mode editor (e.g.
     /// Neovim) displays the diagnostics it *pulled* and ignores our
@@ -403,13 +431,17 @@ impl DiagnosticPublisher {
     /// symptom). This refresh closes that gap: it tells the client to re-pull,
     /// which returns the now-current merged set.
     ///
-    /// Emitted **off** the per-host republish lock and **only** from the
-    /// push-origin paths ([`Self::publish_host_push`], [`Self::publish_region_push`]),
-    /// never from the pull-origin republish ([`Self::publish_pull_layer`]) nor the
-    /// edit-origin re-merge (`did_change`): those carry no *new* result the editor
-    /// is unaware of — a pull-origin set is already the answer to a pull the editor
-    /// made, and an edit-origin re-merge is covered by the editor's own `didChange`
-    /// re-pull — so a refresh there would be redundant. (No tight loop forms: a
+    /// Emitted **off** the per-host republish lock and **only** from the origins
+    /// the editor can't learn about on its own — the push-origin paths
+    /// ([`Self::publish_host_push`], [`Self::publish_region_push`]) and the
+    /// crash-driven eviction ([`Self::evict_connection_diagnostics`]) — never from
+    /// the pull-origin republish ([`Self::publish_pull_layer`]), the
+    /// editor-originated eviction paths ([`Self::clear_pull_layer`],
+    /// [`Self::clear_host`]), nor the edit-origin re-merge (`did_change`): those
+    /// carry no *new* result the editor is unaware of — a pull-origin set is already
+    /// the answer to a pull the editor made, and an edit-origin re-merge is covered
+    /// by the editor's own `didChange` re-pull — so a refresh there would be
+    /// redundant. (No tight loop forms: a
     /// refresh-induced pull is answered inline by `diagnostic_impl`, which never
     /// republishes, so a refresh cannot directly beget another; the indirect
     /// push→refresh→re-pull→downstream-re-push→here path is bounded by
@@ -439,7 +471,7 @@ impl DiagnosticPublisher {
             if let Err(e) = client.workspace_diagnostic_refresh().await {
                 log::debug!(
                     target: LOG_TARGET,
-                    "workspace/diagnostic/refresh after push failed: {e}"
+                    "workspace/diagnostic/refresh failed: {e}"
                 );
             }
         });
@@ -827,6 +859,47 @@ mod tests {
         assert!(
             host.contains_key("live_ls"),
             "the live connection's slot survives the eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_connection_diagnostics_republishes_the_changed_set() {
+        // The eviction path drives `workspace/diagnostic/refresh` off the same
+        // changed-set gate the spontaneous-push paths use (#499): a crashed server's
+        // slot is evicted and the now-empty merged set is republished as a *change*
+        // the editor (pull-mode) has no event to learn about. We assert that gate
+        // (republish's bool) rather than the capability-gated, fire-and-forget
+        // refresh emission, matching `republish_reports_whether_the_published_set_changed`.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/host.rs").unwrap();
+        let dead = ProgressConnectionId::for_test(1);
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "dead_ls".to_string(),
+            Some(dead),
+            vec![diag("from dead")],
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        // Establish the editor's baseline: the non-empty set is published.
+        assert!(
+            publisher.republish(&uri).await,
+            "the initial non-empty set is a change"
+        );
+
+        publisher.evict_connection_diagnostics(dead).await;
+
+        // The eviction already republished the now-empty (changed) set, so a
+        // follow-up republish is a no-op — confirming the eviction itself carried
+        // the change that gates the refresh. The capability-gated, fire-and-forget
+        // refresh spawn isn't asserted directly: that needs driving full server
+        // `initialize` (server→client messages are suppressed until then), the
+        // mock-client harness this file's tests deliberately avoid — true
+        // end-to-end refresh coverage belongs in the e2e suite.
+        assert!(
+            !publisher.republish(&uri).await,
+            "eviction published the empty changed set; re-publishing is unchanged"
         );
     }
 
