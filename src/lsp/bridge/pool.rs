@@ -194,9 +194,12 @@ pub struct LanguageServerPool {
     /// `shutdown_all_with_timeout`, and checked inside the `connections` lock in
     /// `get_or_create_connection_resolved`: holding that same lock makes the
     /// set-then-snapshot and the check-then-insert mutually exclusive, so a spawn
-    /// either lands before the snapshot (and is torn down) or is rejected. Additive
-    /// to `abort_all_eager_open` + the per-task `CancellationToken`s, which already
-    /// stop most eager spawns before they reach this point.
+    /// either lands before the snapshot (and is torn down) or is rejected. The
+    /// "lands before the snapshot ⟹ torn down" half relies on a freshly inserted
+    /// handle being `Initializing`, which `shutdown_all_with_timeout`'s snapshot
+    /// filter includes (alongside `Ready`); narrowing that filter would reopen the
+    /// window. Additive to `abort_all_eager_open` + the per-task `CancellationToken`s,
+    /// which already stop most eager spawns before they reach this point.
     shutting_down: AtomicBool,
     /// Document tracking for virtual documents (versions, host mappings, opened state)
     document_tracker: DocumentTracker,
