@@ -131,11 +131,9 @@ impl Kakehashi {
             .wait_for_parse_completion(uri, remaining)
             .await;
 
-        // First, try to use the tree from the document store.
-        // This is preferred because:
-        // 1. The tree was parsed with the old tree reference (via tree.edit())
-        // 2. Tree-sitter can accurately compute changed_ranges() for incremental tokenization
-        // 3. Avoids redundant parsing
+        // First, try to use the tree already in the document store, to avoid a
+        // redundant parse here: the store's tree is kept current by didOpen's parse
+        // and the off-ingress edit reparse.
         if let Some(doc) = self.documents.get(uri) {
             let text = doc.text().to_string();
             if let Some(tree) = doc.tree().cloned() {
