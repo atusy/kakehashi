@@ -144,7 +144,6 @@ impl Kakehashi {
                     uri.clone(),
                     params.text_document.text,
                     Some(&language_id),
-                    vec![], // No edits for initial document open
                     ticket,
                 )
                 .await;
@@ -703,7 +702,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), text, Some("rust"), vec![], None)
+            .parse_document(uri.clone(), text, Some("rust"), None)
             .await;
 
         let snapshot = server
@@ -741,13 +740,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(
-                uri.clone(),
-                "fn main() {}".to_string(),
-                Some("rust"),
-                vec![],
-                None,
-            )
+            .parse_document(uri.clone(), "fn main() {}".to_string(), Some("rust"), None)
             .await;
         assert!(
             server
@@ -794,13 +787,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(
-                uri.clone(),
-                "fn main() {}".to_string(),
-                Some("rust"),
-                vec![],
-                None,
-            )
+            .parse_document(uri.clone(), "fn main() {}".to_string(), Some("rust"), None)
             .await;
 
         // did_change applies the edit and CLEARS the tree synchronously.
@@ -842,13 +829,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(
-                uri.clone(),
-                "fn main() {}".to_string(),
-                Some("rust"),
-                vec![],
-                None,
-            )
+            .parse_document(uri.clone(), "fn main() {}".to_string(), Some("rust"), None)
             .await;
         assert!(
             server
@@ -1154,7 +1135,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), text, Some("rust"), vec![], None)
+            .parse_document(uri.clone(), text, Some("rust"), None)
             .await;
 
         let snapshot = server

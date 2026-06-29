@@ -36,10 +36,6 @@ pub struct Document {
     text: Arc<str>,
     language_id: Option<String>,
     tree: Option<Tree>,
-    /// Previous tree for changed_ranges comparison during incremental parsing
-    previous_tree: Option<Tree>,
-    /// Previous text for line delta calculation during incremental tokenization
-    previous_text: Option<Arc<str>>,
     /// Edited-but-not-yet-reparsed seed for the **off-ingress** incremental parse
     /// (per-document-parse-actor).
     ///
@@ -67,8 +63,6 @@ impl Document {
             text: Arc::from(text),
             language_id: None,
             tree: None,
-            previous_tree: None,
-            previous_text: None,
             pending_seed: None,
         }
     }
@@ -79,8 +73,6 @@ impl Document {
             text: Arc::from(text),
             language_id: Some(language_id),
             tree: None,
-            previous_tree: None,
-            previous_text: None,
             pending_seed: None,
         }
     }
@@ -91,8 +83,6 @@ impl Document {
             text: Arc::from(text),
             language_id: Some(language_id),
             tree: Some(tree),
-            previous_tree: None,
-            previous_text: None,
             pending_seed: None,
         }
     }
@@ -135,17 +125,9 @@ impl Document {
         })
     }
 
-    /// Update tree and text together for incremental tokenization support
-    ///
-    /// This preserves both previous tree and previous text for:
-    /// - changed_ranges comparison (tree)
-    /// - line delta calculation (text)
-    ///
-    /// Note: For proper `changed_ranges()` support, prefer `update_with_edited_tree`
-    /// which accepts the edited previous tree (after `tree.edit()` was called).
+    /// Install a freshly parsed tree together with its text.
     pub(crate) fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
-        self.previous_tree = self.tree.take();
-        self.previous_text = Some(std::mem::replace(&mut self.text, Arc::from(new_text)));
+        self.text = Arc::from(new_text);
         self.tree = Some(new_tree);
         // Any pending incremental seed is for an edit superseded by this fresh
         // tree+text; keep the invariant "visible tree present ⟹ no stale seed" so a
@@ -154,30 +136,11 @@ impl Document {
         self.pending_seed = None;
     }
 
-    /// Update tree and text with an explicit edited previous tree.
-    ///
-    /// Preferred when the previous tree was edited via `tree.edit()` before
-    /// parsing: the edited tree lets `changed_ranges()` accurately compute the
-    /// byte ranges changed between the old and new parse trees.
-    pub(crate) fn update_with_edited_tree(
-        &mut self,
-        new_tree: Tree,
-        new_text: String,
-        edited_previous_tree: Tree,
-    ) {
-        self.previous_tree = Some(edited_previous_tree);
-        self.previous_text = Some(std::mem::replace(&mut self.text, Arc::from(new_text)));
-        self.tree = Some(new_tree);
-        // See `update_tree_and_text`: a fresh visible tree consumes any pending seed.
-        self.pending_seed = None;
-    }
-
     /// Attach a parsed tree **without** touching the text.
     ///
     /// For an on-demand reader parse whose parsed text already equals the stored
-    /// text: there is no content-version transition to record, so `previous_tree`
-    /// / `previous_text` are left as-is and the text is neither re-cloned nor
-    /// replaced.
+    /// text: there is no content-version transition to record, so the text is
+    /// neither re-cloned nor replaced.
     ///
     /// Clears `pending_seed`: a present reader-visible tree means the off-ingress
     /// reparse's seed has been consumed (the tree it would have produced is now
@@ -229,8 +192,6 @@ impl Document {
         self.text = Arc::from(text);
         // Note: Tree needs to be rebuilt after text change
         self.tree = None;
-        self.previous_tree = None;
-        self.previous_text = None;
         self.pending_seed = None;
     }
 }
@@ -268,57 +229,6 @@ mod tests {
         doc.update_text("updated".to_string());
         assert_eq!(doc.text(), "updated");
         assert!(doc.tree().is_none());
-    }
-
-    #[test]
-    fn test_document_preserves_previous_tree() {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let tree1 = parser.parse("fn main() {}", None).unwrap();
-
-        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree1);
-
-        // Initially no previous tree
-        assert!(doc.previous_tree.is_none());
-
-        // Update tree and text - old should become previous
-        let tree2 = parser.parse("fn main() { let x = 1; }", None).unwrap();
-        doc.update_tree_and_text(tree2, "fn main() { let x = 1; }".to_string());
-
-        // Now previous tree should exist
-        assert!(doc.previous_tree.is_some());
-        // Current tree should be the new one
-        assert!(doc.tree().is_some());
-    }
-
-    #[test]
-    fn test_document_preserves_previous_text() {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-
-        let old_text = "fn main() {}".to_string();
-        let new_text = "fn main() { let x = 1; }".to_string();
-
-        let tree1 = parser.parse(&old_text, None).unwrap();
-        let mut doc = Document::with_tree(old_text.clone(), "rust".to_string(), tree1);
-
-        // Initially no previous text
-        assert!(doc.previous_text.is_none());
-
-        // Update tree and text together
-        let tree2 = parser.parse(&new_text, None).unwrap();
-        doc.update_tree_and_text(tree2, new_text.clone());
-
-        // Now previous text should exist and match old text
-        assert_eq!(doc.previous_text.as_deref(), Some("fn main() {}"));
-        // Current text should be new text
-        assert_eq!(doc.text(), "fn main() { let x = 1; }");
-        // Previous tree should also exist
-        assert!(doc.previous_tree.is_some());
     }
 
     /// A non-empty edit stashes an incremental parse seed and clears the
@@ -467,26 +377,13 @@ mod tests {
         // update_tree_and_text clears the seed.
         let tree = parser.parse("fn main() {}", None).unwrap();
         let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
-        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit.clone()]);
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit]);
         assert!(doc.pending_seed().is_some());
         let t2 = parser.parse("fn main() { }", None).unwrap();
         doc.update_tree_and_text(t2, "fn main() { }".to_string());
         assert!(
             doc.pending_seed().is_none(),
             "update_tree_and_text must clear the pending seed"
-        );
-
-        // update_with_edited_tree clears the seed.
-        let tree = parser.parse("fn main() {}", None).unwrap();
-        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
-        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit]);
-        assert!(doc.pending_seed().is_some());
-        let edited = parser.parse("fn main() {}", None).unwrap();
-        let t3 = parser.parse("fn main() { }", None).unwrap();
-        doc.update_with_edited_tree(t3, "fn main() { }".to_string(), edited);
-        assert!(
-            doc.pending_seed().is_none(),
-            "update_with_edited_tree must clear the pending seed"
         );
     }
 
