@@ -147,6 +147,11 @@ impl Document {
         self.previous_tree = self.tree.take();
         self.previous_text = Some(std::mem::replace(&mut self.text, Arc::from(new_text)));
         self.tree = Some(new_tree);
+        // Any pending incremental seed is for an edit superseded by this fresh
+        // tree+text; keep the invariant "visible tree present ⟹ no stale seed" so a
+        // later `reparse_latest` can't seed from a tree that predates this text
+        // (the #348 contract hazard).
+        self.pending_seed = None;
     }
 
     /// Update tree and text with an explicit edited previous tree.
@@ -163,6 +168,8 @@ impl Document {
         self.previous_tree = Some(edited_previous_tree);
         self.previous_text = Some(std::mem::replace(&mut self.text, Arc::from(new_text)));
         self.tree = Some(new_tree);
+        // See `update_tree_and_text`: a fresh visible tree consumes any pending seed.
+        self.pending_seed = None;
     }
 
     /// Attach a parsed tree **without** touching the text.
@@ -436,6 +443,50 @@ mod tests {
         assert!(
             doc.pending_seed().is_none(),
             "attaching a fresh tree must consume the seed"
+        );
+    }
+
+    /// Every method that installs a fresh visible tree must clear `pending_seed`,
+    /// upholding "visible tree present ⟹ no stale seed" — else a later
+    /// `reparse_latest` could seed from a tree predating the new text (#348).
+    #[test]
+    fn fresh_tree_updates_clear_pending_seed() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let edit = InputEdit {
+            start_byte: 11,
+            old_end_byte: 11,
+            new_end_byte: 12,
+            start_position: tree_sitter::Point::new(0, 11),
+            old_end_position: tree_sitter::Point::new(0, 11),
+            new_end_position: tree_sitter::Point::new(0, 12),
+        };
+
+        // update_tree_and_text clears the seed.
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit.clone()]);
+        assert!(doc.pending_seed().is_some());
+        let t2 = parser.parse("fn main() { }", None).unwrap();
+        doc.update_tree_and_text(t2, "fn main() { }".to_string());
+        assert!(
+            doc.pending_seed().is_none(),
+            "update_tree_and_text must clear the pending seed"
+        );
+
+        // update_with_edited_tree clears the seed.
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit]);
+        assert!(doc.pending_seed().is_some());
+        let edited = parser.parse("fn main() {}", None).unwrap();
+        let t3 = parser.parse("fn main() { }", None).unwrap();
+        doc.update_with_edited_tree(t3, "fn main() { }".to_string(), edited);
+        assert!(
+            doc.pending_seed().is_none(),
+            "update_with_edited_tree must clear the pending seed"
         );
     }
 
