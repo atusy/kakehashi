@@ -370,6 +370,24 @@ pub(crate) struct DiagnosticAggregator {
     /// (#422). Updated under the host's republish lock (same-host republishes are
     /// serialized), and forgotten on `didClose` ([`Self::forget_published`]).
     last_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
+    /// Single-flight guard for the **workspace-wide** `workspace/diagnostic/refresh`
+    /// nudge (#497). `workspace/diagnostic/refresh` is param-less and workspace-wide,
+    /// so concurrent refreshes are redundant; without this, a burst of set-changing
+    /// pushes spawns one detached refresh request *each*, every one a tower-lsp
+    /// pending-request entry until the editor acks. This collapses a burst: at most
+    /// one refresh is in flight (awaiting the editor's ack); further requests during
+    /// that window set `pending`, which fires exactly one more refresh on
+    /// completion. Drives [`Self::try_begin_refresh`]/[`Self::finish_refresh`].
+    refresh_flight: Mutex<RefreshFlight>,
+}
+
+/// Workspace-wide single-flight state for `workspace/diagnostic/refresh` (#497).
+#[derive(Default)]
+struct RefreshFlight {
+    /// A refresh request has been sent and its ack is not yet received.
+    in_flight: bool,
+    /// A refresh was requested while one was in flight; fire one more on completion.
+    pending: bool,
 }
 
 impl DiagnosticAggregator {
@@ -541,6 +559,49 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::last_published")
             .remove(host);
+    }
+
+    /// Begin a workspace-wide refresh under the single-flight guard (#497).
+    ///
+    /// Returns `true` if the caller should actually send the refresh (no other was
+    /// in flight); `false` if one is already in flight — the request is recorded as
+    /// `pending` so [`Self::finish_refresh`] fires exactly one more on completion.
+    /// The caller pairs a `true` with sending the refresh and a later
+    /// [`Self::finish_refresh`]; a `false` requires no further action.
+    pub(crate) fn try_begin_refresh(&self) -> bool {
+        let mut flight = self
+            .refresh_flight
+            .lock()
+            .recover_poison("DiagnosticAggregator::refresh_flight");
+        if flight.in_flight {
+            flight.pending = true;
+            false
+        } else {
+            flight.in_flight = true;
+            true
+        }
+    }
+
+    /// Complete an in-flight refresh (its ack arrived) under the single-flight
+    /// guard (#497). Returns `true` if a refresh was requested while this one was in
+    /// flight (`pending`) and the caller should send exactly one more — `in_flight`
+    /// stays set so the next requester still coalesces; `false` clears the guard.
+    ///
+    /// Setting `pending` and this check both take the guard lock, so a request that
+    /// races completion is never lost: it either sets `pending` before this reads it
+    /// (→ re-fire) or finds `in_flight` already cleared and sends fresh.
+    pub(crate) fn finish_refresh(&self) -> bool {
+        let mut flight = self
+            .refresh_flight
+            .lock()
+            .recover_poison("DiagnosticAggregator::refresh_flight");
+        if flight.pending {
+            flight.pending = false;
+            true
+        } else {
+            flight.in_flight = false;
+            false
+        }
     }
 
     /// Drop one `source`'s slots (every server) under `host` — e.g. a region
@@ -1574,5 +1635,50 @@ mod tests {
             vec![diag("r")],
         );
         assert!(agg.has_region_slots(&host()));
+    }
+
+    #[test]
+    fn refresh_single_flight_collapses_a_burst_into_at_most_one_trailing() {
+        // #497: while a workspace refresh is in flight (awaiting the editor's ack),
+        // a burst of further requests must coalesce — at most ONE trailing refresh
+        // fires on completion, regardless of how many requests arrived.
+        let agg = DiagnosticAggregator::new();
+
+        // The first request of an idle guard is sent.
+        assert!(agg.try_begin_refresh(), "first request sends");
+        // Everything during the in-flight window coalesces (no new send).
+        assert!(!agg.try_begin_refresh(), "in-flight: coalesced");
+        assert!(!agg.try_begin_refresh(), "in-flight: still coalesced");
+
+        // On completion, the recorded `pending` fires exactly one trailing refresh
+        // (guard stays in-flight so a request racing it still coalesces).
+        assert!(agg.finish_refresh(), "pending → one trailing refresh");
+        // The trailing refresh saw no further requests → it clears the guard.
+        assert!(!agg.finish_refresh(), "no further pending → guard clears");
+
+        // Guard clear → the next request sends again (no stuck in-flight).
+        assert!(
+            agg.try_begin_refresh(),
+            "cleared guard → next request sends"
+        );
+        assert!(!agg.finish_refresh(), "no pending → clears");
+    }
+
+    #[test]
+    fn refresh_single_flight_re_pends_each_window_independently() {
+        // A request arriving during the *trailing* refresh's own in-flight window
+        // must itself coalesce and drive one more trailing refresh — the guard
+        // re-arms per window, so no change is ever stranded.
+        let agg = DiagnosticAggregator::new();
+        assert!(agg.try_begin_refresh(), "first sends");
+        assert!(!agg.try_begin_refresh(), "coalesced → pending");
+        assert!(
+            agg.finish_refresh(),
+            "pending → trailing refresh, stays in-flight"
+        );
+        // A new request during the trailing refresh's window coalesces again.
+        assert!(!agg.try_begin_refresh(), "coalesced during trailing window");
+        assert!(agg.finish_refresh(), "second pending → one more trailing");
+        assert!(!agg.finish_refresh(), "now drained → clears");
     }
 }

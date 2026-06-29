@@ -470,14 +470,13 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
         .expect("editor should receive the pushed diagnostic before the crash");
 
     // That spontaneous push itself changed the merged set, so it also drives a
-    // refresh (push/pull-divergence, #422). Consume it so the next refresh we wait
-    // for is unambiguously the crash-eviction one (#499).
-    assert!(
-        client
-            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
-            .is_some(),
-        "the spontaneous push must drive a workspace/diagnostic/refresh (#422)"
-    );
+    // refresh (push/pull-divergence, #422). Consume it, and **ack** it: the bridge
+    // single-flights the workspace refresh (#497), so the crash-eviction refresh
+    // below won't be sent until this one is answered.
+    let (push_refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("the spontaneous push must drive a workspace/diagnostic/refresh (#422)");
+    client.send_response(push_refresh_id, json!(null));
 
     // The content-changing edit reaches the mock, driving it to exit (crash). The
     // bridge's reader sees EOF, evicts the dead connection's slots, and republishes

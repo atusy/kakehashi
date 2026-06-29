@@ -463,6 +463,16 @@ impl DiagnosticPublisher {
     /// that doesn't answer). Detaching it keeps the push path non-blocking and
     /// avoids the upstream-notification loop's inline-await head-of-line block.
     ///
+    /// **Single-flight (#497):** `workspace/diagnostic/refresh` is param-less and
+    /// workspace-wide, so concurrent refreshes are redundant. A burst of
+    /// set-changing pushes would otherwise spawn one detached refresh request each —
+    /// every one an un-acked tower-lsp pending-request entry. The aggregator's
+    /// guard ([`DiagnosticAggregator::try_begin_refresh`]) collapses the burst: at
+    /// most one refresh is in flight (awaiting the editor's ack); requests during
+    /// that window set `pending`, and the spawned task loops to fire exactly one
+    /// more on completion ([`DiagnosticAggregator::finish_refresh`]). The trailing
+    /// refresh still guarantees the editor re-pulls after the last change.
+    ///
     /// Gated on the client advertising `workspace.diagnostics.refreshSupport`: a
     /// client that supports pull but not refresh would silently ignore the request,
     /// leaking a tower-lsp pending-request entry plus a parked task — the same gate
@@ -476,13 +486,52 @@ impl DiagnosticPublisher {
         if !supported {
             return;
         }
+        // Coalesce against any in-flight refresh: if one is already outstanding,
+        // this request is recorded as `pending` and the outstanding task's loop
+        // fires the trailing refresh — nothing more to do here.
+        if !self.aggregator.try_begin_refresh() {
+            return;
+        }
         let client = self.client.clone();
+        let aggregator = Arc::clone(&self.aggregator);
         tokio::spawn(async move {
-            if let Err(e) = client.workspace_diagnostic_refresh().await {
-                log::debug!(
-                    target: LOG_TARGET,
-                    "workspace/diagnostic/refresh failed: {e}"
-                );
+            loop {
+                // `workspace_diagnostic_refresh()` resolves when the editor answers
+                // the request. A conformant client always answers (the transport is
+                // reliable), so this resolves and `finish_refresh` runs. The lone
+                // wedge is a live client that advertises `refreshSupport`, receives
+                // the request, and never answers (a protocol violation, or a client
+                // bug): the await never resolves, `in_flight` stays set, and further
+                // refreshes coalesce into a `pending` that never fires. That is
+                // accepted degradation — such a client ignores refreshes anyway, so
+                // suppressing further (useless) ones is harmless. We deliberately do
+                // **not** wrap this in `tokio::time::timeout`: dropping the request
+                // future strands tower-lsp's pending-request entry (it is reaped only
+                // on a matching response or socket close, never on receiver-drop), so
+                // re-firing on timeout would accumulate one stranded entry per change
+                // — the very leak this single-flight exists to bound.
+                //
+                // Panic-safety: the one panic this task can hit is tower-lsp's
+                // shutdown-time `expect("sender already dropped")` in the response
+                // await — reachable only when the whole pending-request map drops
+                // with the `ClientSocket` at teardown (a real response always *sends*
+                // on the waiter, never drops it). At shutdown the stuck `in_flight`
+                // is moot (the aggregator is being dropped) and tokio isolates the
+                // panicking task, so no `catch_unwind` is warranted. TRIPWIRE: if a
+                // future change adds a *pre-shutdown* panic source to this task,
+                // revisit — it would wedge the guard (and a drop-guard "fix" would
+                // reopen the `finish_refresh` lost-wakeup, so clear it atomically).
+                if let Err(e) = client.workspace_diagnostic_refresh().await {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "workspace/diagnostic/refresh failed: {e}"
+                    );
+                }
+                // Fire exactly one more iff a refresh was requested while this one
+                // was in flight; otherwise the guard is now clear and we stop.
+                if !aggregator.finish_refresh() {
+                    break;
+                }
             }
         });
     }
