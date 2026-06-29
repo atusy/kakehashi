@@ -480,7 +480,13 @@ impl DocumentStore {
     /// it does check, atomically under the same `get_mut` shard lock as the write:
     /// - **text** rejects a within-lifetime stale parse — a `didChange` landed while
     ///   parsing, so this tree (and its language, possibly shebang-derived) is of
-    ///   now-superseded text; the scheduler's reparse covers the newer text;
+    ///   now-superseded text; the scheduler's reparse covers the newer text. The
+    ///   check is `Arc::ptr_eq` on the `Arc<str>` the parse captured, **O(1)** — any
+    ///   text mutation (`didChange`) or reopen swaps in a *fresh* allocation, so
+    ///   pointer identity is exactly "same text this parse read" without an O(n)
+    ///   byte compare under the shard write lock (this is the large-document open
+    ///   path). A spurious mismatch could only drop a still-valid tree to a harmless
+    ///   reparse, never attach a stale one;
     /// - **incarnation** rejects a close + reopen — the result belongs to the prior
     ///   lifetime and must neither attach its tree nor clobber the reopened
     ///   document's freshly-inserted language.
@@ -492,14 +498,16 @@ impl DocumentStore {
     pub(crate) fn set_parse_result_if_text_and_incarnation_unchanged(
         &self,
         uri: &Url,
-        expected_text: &str,
+        expected_text: &Arc<str>,
         expected_incarnation: u64,
         language: Option<String>,
         tree: Option<Tree>,
     ) -> bool {
         let has_tree = tree.is_some();
         let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
-            if doc.incarnation() == expected_incarnation && doc.text() == expected_text {
+            if doc.incarnation() == expected_incarnation
+                && Arc::ptr_eq(&doc.text_arc(), expected_text)
+            {
                 doc.set_parse_result(language, tree);
                 true
             } else {
@@ -1037,11 +1045,14 @@ mod tests {
             Some("text".to_string()),
             None,
         );
-        let incarnation = store.get(&uri).unwrap().incarnation();
+        let (incarnation, text) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.incarnation(), doc.text_arc())
+        };
 
         assert!(store.set_parse_result_if_text_and_incarnation_unchanged(
             &uri,
-            "fn main() {}",
+            &text,
             incarnation,
             Some("rust".to_string()),
             Some(parse_rust("fn main() {}")),
@@ -1065,13 +1076,17 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
-        let incarnation = store.get(&uri).unwrap().incarnation();
+        // Capture the text the parse "read" (its Arc identity) before the edit.
+        let (incarnation, text) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.incarnation(), doc.text_arc())
+        };
         // A didChange landed mid-parse, moving the text on (same lifetime).
         store.apply_edit_clearing_tree(&uri, "fn newer() {}".to_string(), &[]);
 
         let stored = store.set_parse_result_if_text_and_incarnation_unchanged(
             &uri,
-            "fn main() {}",
+            &text,
             incarnation,
             Some("rust".to_string()),
             Some(parse_rust("fn main() {}")),
@@ -1093,9 +1108,12 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
-        // The open parse read this lifetime's incarnation, then a didClose + reopen
-        // (identical text + language) raced it while parsing.
-        let stale_incarnation = store.get(&uri).unwrap().incarnation();
+        // The open parse read this lifetime's incarnation + text, then a didClose +
+        // reopen (identical text + language) raced it while parsing.
+        let (stale_incarnation, stale_text) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.incarnation(), doc.text_arc())
+        };
         store.remove(&uri);
         store.insert(
             uri.clone(),
@@ -1106,7 +1124,7 @@ mod tests {
 
         let stored = store.set_parse_result_if_text_and_incarnation_unchanged(
             &uri,
-            "fn main() {}",
+            &stale_text,
             stale_incarnation,
             Some("rust".to_string()),
             Some(parse_rust("fn main() {}")),
@@ -1128,7 +1146,7 @@ mod tests {
         // No document exists (a didClose removed it before the off-ingress parse ran).
         assert!(!store.set_parse_result_if_text_and_incarnation_unchanged(
             &uri,
-            "fn main() {}",
+            &Arc::<str>::from("fn main() {}"),
             1,
             Some("rust".to_string()),
             Some(parse_rust("fn main() {}")),

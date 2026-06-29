@@ -391,6 +391,12 @@ enum Kind {
     /// so each measured request pays incremental reparse + cache invalidation +
     /// delta diff on top of the (full) token recompute.
     EditDelta,
+    /// Cold-open latency: each iteration opens a FRESH document and times
+    /// `didOpen` → first `semanticTokens/full` response — the editor-visible
+    /// "open the file, see highlights" latency. The one scenario that captures
+    /// the open parse itself (no settle sleep), so it is what validates the
+    /// off-ingress open flip (#6) against the reader's watermark settle budget.
+    OpenFirstToken,
 }
 
 /// Mutable per-run state for [`Kind::EditDelta`]: the next `didChange` version,
@@ -426,6 +432,9 @@ fn measure(
     iters: usize,
     warmup: usize,
 ) -> Vec<Duration> {
+    if let Kind::OpenFirstToken = scn.kind {
+        return measure_open(bin, scn, data_dir, iters, warmup);
+    }
     let mut server = Server::start(&bin.path, data_dir);
     server.did_open(scn.uri, scn.language_id, &scn.content);
     // Let the initial parse settle (didOpen parse may be async).
@@ -457,9 +466,43 @@ fn measure(
     samples
 }
 
+/// Cold-open latency loop for [`Kind::OpenFirstToken`]. Each iteration opens a
+/// FRESH document (unique URI, so it is a genuine cold open rather than a reopen)
+/// and times `didOpen` → first `semanticTokens/full` response. No settle sleep —
+/// capturing the open parse is the whole point: this is the path the off-ingress
+/// flip (#6) changes from "gated by the ingress barrier (always the full parse)"
+/// to "gated by the reader's watermark settle budget, then an on-demand fallback
+/// parse if it times out". The language is driven by `language_id` (detected
+/// before the path's now-mangled extension), so the per-iteration URI suffix is
+/// harmless.
+fn measure_open(
+    bin: &Binary,
+    scn: &Scenario,
+    data_dir: &str,
+    iters: usize,
+    warmup: usize,
+) -> Vec<Duration> {
+    let mut server = Server::start(&bin.path, data_dir);
+    let mut samples = Vec::with_capacity(iters);
+    for i in 0..(warmup + iters) {
+        let uri = format!("{}_{i}", scn.uri);
+        let start = Instant::now();
+        server.did_open(&uri, scn.language_id, &scn.content);
+        // Blocks until the server answers — i.e. until the (off-ingress) open parse
+        // has produced a tree the reader can tokenize, or the reader fell back to an
+        // on-demand parse.
+        let _ = server.semantic_full(&uri);
+        let elapsed = start.elapsed();
+        if i >= warmup {
+            samples.push(elapsed);
+        }
+    }
+    samples
+}
+
 fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
     match scn.kind {
-        Kind::Full => String::new(),
+        Kind::Full | Kind::OpenFirstToken => String::new(),
         // Both delta-based scenarios need an initial result_id to diff against.
         Kind::DeltaNoop | Kind::EditDelta => {
             result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
@@ -474,6 +517,8 @@ fn run_once(
     edit: &mut EditState,
 ) {
     match scn.kind {
+        // Handled by `measure_open`, which never calls `run_once`.
+        Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
         Kind::Full => {
             let _ = server.semantic_full(scn.uri);
         }
@@ -596,6 +641,42 @@ fn main() {
             content: gen_markdown_injections(60),
             kind: Kind::EditDelta,
             targets: "edit→reparse→injection re-detect→cache invalidation→delta (typing)",
+        },
+        // Cold-open latency scenarios for the #6 off-ingress flip. The reader gates
+        // on the **host parse** via the watermark (≤200ms budget), then falls back to
+        // an on-demand parse; the expensive injection work runs off the reader's
+        // critical path. So the regime that risks a regression is a doc whose *host
+        // parse* alone exceeds 200ms — that is dense host-language source, NOT an
+        // injection-heavy doc (whose host parse is small; its cost is injections,
+        // off-path). Empirically: markdown stays well under budget at any realistic
+        // size; rust crosses ~200ms host-parse only around ~4000 dense functions
+        // (~150KB), where the on-demand fallback fires every open — and even there
+        // HEAD ≈ main, because token computation dominates and the redundant parse
+        // overlaps the off-ingress one.
+        Scenario {
+            name: "markdown_injections/open_first_token",
+            language_id: "markdown",
+            uri: "file:///bench/open_md.md",
+            content: gen_markdown_injections(150),
+            kind: Kind::OpenFirstToken,
+            targets: "cold open; injection work moved off the reader path (HEAD faster)",
+        },
+        Scenario {
+            name: "rust_large/open_first_token (host parse under budget)",
+            language_id: "rust",
+            uri: "file:///bench/open_rust_under.rs",
+            content: gen_rust(1500),
+            kind: Kind::OpenFirstToken,
+            targets: "cold open; host parse stays under the 200ms budget — no fallback",
+        },
+        Scenario {
+            name: "rust_xlarge/open_first_token (host parse OVER budget — fallback fires)",
+            language_id: "rust",
+            uri: "file:///bench/open_rust_over.rs",
+            content: gen_rust(4000),
+            kind: Kind::OpenFirstToken,
+            targets: "cold open whose host parse exceeds 200ms — the on-demand fallback \
+                      regime; validates no latency regression there (slow; use low iters)",
         },
     ];
 
