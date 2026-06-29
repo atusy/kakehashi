@@ -507,6 +507,36 @@ impl DocumentStore {
         });
     }
 
+    /// Advance the watermark to `ticket`, but only if the document's current open
+    /// incarnation still equals `expected_incarnation` — the lifetime that issued
+    /// the ticket.
+    ///
+    /// For the off-ingress parse: its ticket is the *intra-lifetime* wire order,
+    /// and the watermark is removed on close and re-seeded at 0 on reopen
+    /// (per-lifetime, not globally monotonic). So a parse from a prior lifetime
+    /// completing after a close + reopen must **not** advance the reopened
+    /// document's fresh watermark — its (smaller) ticket could exceed a
+    /// new-lifetime reader's target and release that reader before the reopen's
+    /// own parse has run (a stale/empty read). Gating on the incarnation confines
+    /// each lifetime's watermark to its own parses. A closed (absent) document is
+    /// a no-op: its watermark is already gone and its readers were woken by the
+    /// close. The `documents` `Ref` is dropped before the `watermarks` lock is
+    /// taken (the documents → watermarks order).
+    pub(crate) fn advance_watermark_for_incarnation(
+        &self,
+        uri: &Url,
+        ticket: u64,
+        expected_incarnation: u64,
+    ) {
+        let current_incarnation = match self.documents.get(uri) {
+            Some(doc) => doc.incarnation(),
+            None => return,
+        };
+        if current_incarnation == expected_incarnation {
+            self.advance_watermark(uri, ticket);
+        }
+    }
+
     /// Wait until the parse watermark for `uri` reaches `target` — the tail
     /// ingress ticket a virt/native reader must observe — bounded by `timeout`.
     ///
@@ -924,6 +954,52 @@ mod tests {
             watermark_of(&store, &uri),
             None,
             "a publish after close must not resurrect a watermark entry"
+        );
+    }
+
+    #[test]
+    fn advance_watermark_for_incarnation_advances_within_the_same_lifetime() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        let incarnation = store.get(&uri).unwrap().incarnation();
+
+        store.advance_watermark_for_incarnation(&uri, 5, incarnation);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(5),
+            "a parse from the current lifetime advances the watermark"
+        );
+    }
+
+    #[test]
+    fn advance_watermark_for_incarnation_skips_a_prior_lifetime() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        let stale_incarnation = store.get(&uri).unwrap().incarnation();
+
+        // Close + reopen: the watermark is dropped and re-seeded at 0 for the new
+        // lifetime. A straggler parse from the prior lifetime then resolves with
+        // its old ticket; it must NOT advance the reopened document's watermark
+        // (which would prematurely release a new-lifetime reader).
+        store.remove(&uri);
+        seed_document(&store, &uri);
+
+        store.advance_watermark_for_incarnation(&uri, 9, stale_incarnation);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(0),
+            "a prior lifetime's parse must not advance the reopened watermark"
+        );
+
+        // The reopen's own parse (current incarnation) does advance it.
+        let fresh_incarnation = store.get(&uri).unwrap().incarnation();
+        store.advance_watermark_for_incarnation(&uri, 1, fresh_incarnation);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(1),
+            "the reopened lifetime's own parse advances its watermark"
         );
     }
 

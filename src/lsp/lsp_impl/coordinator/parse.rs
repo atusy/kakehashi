@@ -416,6 +416,9 @@ impl ParseCoordinator {
         // installed parse, in which case we parse from scratch.
         let (language_name, language_id, text, seed, incarnation) = {
             let Some(doc) = self.documents.get(uri) else {
+                // Document already closed: its watermark is gone (advance no-ops)
+                // and its readers were woken by the close. The incarnation isn't
+                // known on this path, but it is not needed.
                 advance_watermark();
                 return;
             };
@@ -432,6 +435,18 @@ impl ParseCoordinator {
                 self.language
                     .detect_language(uri.path(), &text, None, language_id.as_deref());
             (language_name, language_id, text, seed, incarnation)
+        };
+
+        // Post-read resolutions advance the watermark **only if this lifetime is
+        // still current** — a close+reopen re-seeds the watermark at 0, and this
+        // (prior-lifetime) ticket must not inflate it and prematurely release a
+        // new-lifetime reader. Same lifetime → advances (releasing readers even on
+        // the no-language / no-tree paths, to the empty fallback).
+        let advance_watermark = || {
+            if let Some(ticket) = ticket {
+                self.documents
+                    .advance_watermark_for_incarnation(uri, ticket, incarnation);
+            }
         };
 
         let Some(language_name) = language_name else {
