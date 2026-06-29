@@ -150,6 +150,20 @@ impl Document {
         self.pending_seed = None;
     }
 
+    /// Store the open-time parse result — the detected `language` and the parsed
+    /// `tree` (`None` for a parsed-to-nothing / no-language / crashed-parser open) —
+    /// **preserving the existing text**.
+    ///
+    /// For the didOpen parse, whose text was already stored when the document was
+    /// registered: it reparses that same text and records the result *in place*,
+    /// rather than re-inserting a fresh copy of the (potentially large) text. Clears
+    /// any `pending_seed` (the open path never has one — it is set only by an edit).
+    pub(crate) fn set_parse_result(&mut self, language: Option<String>, tree: Option<Tree>) {
+        self.language_id = language;
+        self.tree = tree;
+        self.pending_seed = None;
+    }
+
     /// Apply an edit's new text and stash an **incremental parse seed** for the
     /// off-ingress reparse, clearing the reader-visible tree.
     ///

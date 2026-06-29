@@ -140,12 +140,7 @@ impl Kakehashi {
         // (reparse_installed_document), so we must not parse inline here.
         if !skip_parse {
             self.parse_coordinator()
-                .parse_document(
-                    uri.clone(),
-                    params.text_document.text,
-                    Some(&language_id),
-                    ticket,
-                )
+                .parse_document(uri.clone(), Some(&language_id), ticket)
                 .await;
         } else if let Some(ticket) = ticket {
             // Parsing is deferred to the spawned off-ingress install reparse.
@@ -702,7 +697,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), text, Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None)
             .await;
 
         let snapshot = server
@@ -740,7 +735,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), "fn main() {}".to_string(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None)
             .await;
         assert!(
             server
@@ -787,7 +782,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), "fn main() {}".to_string(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None)
             .await;
 
         // did_change applies the edit and CLEARS the tree synchronously.
@@ -802,6 +797,32 @@ print("hello")
         assert!(
             server.documents.get(&uri).unwrap().tree().is_some(),
             "the freshness helper must restore the tree so post-edit readers aren't empty"
+        );
+    }
+
+    /// `parse_document` now records its result onto the already-registered document
+    /// in place (non-inserting). If the document was closed before the parse ran
+    /// (no entry in the store), the parse must NOT resurrect it — it reads no text,
+    /// stores nothing, and returns. This is the resurrection-safety the open parse
+    /// gains for free once it moves off the ingress ticket.
+    #[tokio::test]
+    async fn parse_document_does_not_resurrect_a_closed_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/closed_before_parse.rs").unwrap();
+        // The document is absent (a didClose removed it before this parse ran).
+        assert!(server.documents.get(&uri).is_none());
+
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        assert!(
+            server.documents.get(&uri).is_none(),
+            "parse_document must not resurrect a document closed before it ran"
         );
     }
 
@@ -829,7 +850,7 @@ print("hello")
         );
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), "fn main() {}".to_string(), Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None)
             .await;
         assert!(
             server
@@ -1135,7 +1156,7 @@ print("hello")
             .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
         server
             .parse_coordinator()
-            .parse_document(uri.clone(), text, Some("rust"), None)
+            .parse_document(uri.clone(), Some("rust"), None)
             .await;
 
         let snapshot = server

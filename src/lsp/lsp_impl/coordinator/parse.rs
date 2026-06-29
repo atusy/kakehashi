@@ -138,26 +138,28 @@ impl ParseCoordinator {
         }
     }
 
-    /// Parse `uri`'s text and publish the result into the store.
+    /// Parse the (already-registered) document at `uri` and publish the result.
+    ///
+    /// The registering `didOpen` inserts the document — **with its text** — before
+    /// calling this, so the parse re-reads that stored text (a cheap `Arc<str>`
+    /// refcount bump, [`text_arc`](crate::document::Document::text_arc)) rather than
+    /// carrying a second owned `String`, and records the detected language + tree
+    /// **in place** via [`set_parse_result_if_present`] instead of re-inserting a
+    /// fresh copy of the text. Net: zero full-document text copies in the open parse.
+    /// That store write is **non-inserting**, so it is resurrection-safe once the open
+    /// parse later moves off the ingress ticket (a `didClose` racing it stays closed).
     ///
     /// `ticket` is the ingress writer ticket of the mutation that scheduled this
-    /// parse (plumbed from `IngressOrderGate` via the handler), or `None` for a
-    /// caller outside the ingress sequence (a post-install reparse, or a test
-    /// driving the coordinator directly). On every resolution path — a tree, a
-    /// parsed-to-nothing, a previously-crashed parser, or no detectable language —
-    /// the parse advances the store's per-document **watermark** to `ticket`, so a
-    /// virt/native reader waiting on the watermark is released once the parse
-    /// covering its tail edit has resolved. Threading the ticket as an explicit
-    /// value (rather than reading a task-local here) keeps this signature stable
-    /// when the per-document parse actor later runs this off the ingress task.
+    /// parse, or `None` for a caller outside the ingress sequence. On every resolution
+    /// path — a tree, a parsed-to-nothing, a previously-crashed parser, no detectable
+    /// language, or a document closed mid-parse — the parse advances the store's
+    /// per-document **watermark** to `ticket`, releasing a reader waiting on it.
     pub(crate) async fn parse_document(
         &self,
         uri: Url,
-        text: String,
         language_id: Option<&str>,
         ticket: Option<u64>,
     ) {
-        let parse_generation = self.documents.mark_parse_started(&uri);
         let mut events = Vec::new();
 
         // Publish the watermark on whichever path resolves the parse below.
@@ -166,6 +168,17 @@ impl ParseCoordinator {
                 self.documents.advance_watermark(&uri, ticket);
             }
         };
+
+        // Read the text the registering didOpen already stored (a refcount bump, not
+        // a copy) — BEFORE marking the parse started, so a document a `didClose`
+        // already removed leaves neither a resurrected document nor an orphan
+        // parse-state entry for the now-closed URI. Resolve the watermark and stop.
+        let Some(text) = self.documents.get(&uri).map(|doc| doc.text_arc()) else {
+            advance_watermark();
+            return;
+        };
+
+        let parse_generation = self.documents.mark_parse_started(&uri);
 
         let language_name = self
             .language
@@ -178,10 +191,19 @@ impl ParseCoordinator {
                     "Skipping parsing for '{}' - parser previously crashed",
                     language_name
                 );
-                self.documents
-                    .insert(uri.clone(), text, Some(language_name), None);
-                self.documents
-                    .mark_parse_finished(&uri, parse_generation, false);
+                // Mark the parse finished only if the result actually landed: a
+                // `didClose` that removed the document mid-parse makes the store write
+                // a no-op, and `mark_parse_finished` would otherwise recreate a parse
+                // -state entry (via `parse_sender`'s vacant insert) for the closed URI.
+                // (Unreachable while the open parse is inline on the writer ticket; the
+                // guard is for the off-ingress open flip, #6.)
+                if self
+                    .documents
+                    .set_parse_result_if_present(&uri, Some(language_name), None)
+                {
+                    self.documents
+                        .mark_parse_finished(&uri, parse_generation, false);
+                }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 return;
@@ -197,14 +219,14 @@ impl ParseCoordinator {
             // without an edited old tree: reusing an unedited tree against different
             // text violates tree-sitter's incremental contract and corrupts external
             // scanners (#348).
-            let text_clone = text.clone();
+            let text_for_parse = text.clone();
             let auto_install = self.auto_install.clone();
             let language_name_clone = language_name.clone();
 
             let parsed_tree = self
                 .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
-                    let parse_result = parser.parse(&text_clone, None);
+                    let parse_result = parser.parse(&*text_for_parse, None);
                     let _ = auto_install.end_parsing(&language_name_clone);
                     (parser, parse_result)
                 })
@@ -220,20 +242,26 @@ impl ParseCoordinator {
                     self.bridge.node_tracker(),
                 );
 
-                self.documents
-                    .insert(uri.clone(), text, Some(language_name.clone()), Some(tree));
-
-                self.documents
-                    .mark_parse_finished(&uri, parse_generation, true);
+                // `language_name` is unused past here — move it in (no clone). Gate
+                // `mark_parse_finished` on the store write landing (see the
+                // parser-failed path above).
+                if self
+                    .documents
+                    .set_parse_result_if_present(&uri, Some(language_name), Some(tree))
+                {
+                    self.documents
+                        .mark_parse_finished(&uri, parse_generation, true);
+                }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 return;
             }
         }
 
-        self.documents.insert(uri.clone(), text, None, None);
-        self.documents
-            .mark_parse_finished(&uri, parse_generation, false);
+        if self.documents.set_parse_result_if_present(&uri, None, None) {
+            self.documents
+                .mark_parse_finished(&uri, parse_generation, false);
+        }
         advance_watermark();
         self.notifier().log_language_events(&events).await;
     }
