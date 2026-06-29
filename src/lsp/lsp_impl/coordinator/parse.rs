@@ -336,7 +336,10 @@ impl ParseCoordinator {
                     break;
                 }
                 (
-                    doc.text().to_string(),
+                    // `text_arc()` is a refcount bump, not a full copy (#498) — the
+                    // original stays here for the CAS while a cheap clone goes to
+                    // the blocking parse closure.
+                    doc.text_arc(),
                     doc.language_id().map(|s| s.to_string()),
                     doc.incarnation(),
                 )
@@ -345,18 +348,20 @@ impl ParseCoordinator {
             let text_len = text.len();
             let auto_install = self.auto_install.clone();
             let language_name_clone = language_name.clone();
-            // Move the owned `text` into the blocking closure and hand it back with
-            // the tree, so the (potentially large) document text is never cloned.
+            // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure;
+            // the original stays here for the CAS below, so the (potentially large)
+            // document text is never copied.
+            let text_for_parse = text.clone();
             let parsed = self
                 .parse_with_pool(&language_name, &uri, text_len, move |mut parser| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
-                    let result = parser.parse(&text, None);
+                    let result = parser.parse(&*text_for_parse, None);
                     let _ = auto_install.end_parsing(&language_name_clone);
-                    (parser, result.map(|tree| (tree, text)))
+                    (parser, result)
                 })
                 .await;
 
-            let Some((tree, text)) = parsed else { break };
+            let Some(tree) = parsed else { break };
 
             // Persist FIRST through the non-inserting, tree-absent CAS: a closed
             // (Vacant) document, one whose text moved (a concurrent `didChange`),
