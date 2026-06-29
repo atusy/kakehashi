@@ -458,10 +458,13 @@ write-only-mailbox / shared-store-read split is load-bearing.
 
 ## Consequences
 
-These are stated for the actor formulation. All hold for the chosen scheduler
-except the two that specifically concern owning the text — a single owner of the
-document *text*, and folding `skip_parse` into the actor's state machine — which
-pertain to the deferred Option 4.
+These are stated for the actor formulation. Off-ingress parsing, burst
+coalescing, the epoch, and resurrection-safety all carry over to the chosen
+scheduler. What does **not** carry over are the consequences of the actor *owning
+the text* — and these pertain to the deferred Option 4: single ownership of the
+document *text*, folding `skip_parse` into the state machine, and shedding the
+`edit_lock` by funneling edits through a single consumer (the scheduler retains
+the `edit_lock`). This matches the carve-out in the Decision intro.
 
 ### Positive
 
@@ -486,8 +489,9 @@ pertain to the deferred Option 4.
   supersede machinery. This holds *provided* the reader on-demand fallback also
   writes through the epoch-checked CAS path (the one residual vector; see
   Negative), not as an unconditional property of `Close` alone.
-- **One owner** for a document's text, parse-readiness, and parse scheduling
-  (global install stays shared).
+- **One owner** for a document's parse-readiness and parse scheduling (global
+  install stays shared); single ownership of the document *text* is the Option-4
+  part — the scheduler leaves the text in the store.
 
 ### Negative
 
@@ -498,10 +502,12 @@ pertain to the deferred Option 4.
   completion plumbed back as messages, and the unbounded mailbox are new surface
   area.
 - **Carefully tuned races must be preserved**: the captures-lineage close
-  ordering (it rides the `edit_lock` the parse path sheds, so it needs the
-  dedicated-lock-or-epoch-check replacement); the geometry re-merge / no-op
-  suppression on `didChange` (push-propagation-diagnostic-forwarding); and the
-  diagnostic teardown ordering in `didClose`.
+  ordering (under Option 4 it would ride the `edit_lock` the single-consumer path
+  sheds and so would need a dedicated-lock-or-epoch-check replacement; the chosen
+  scheduler retains the `edit_lock`, so the ordering still rides it); the geometry
+  re-merge / no-op suppression on `didChange`
+  (push-propagation-diagnostic-forwarding); and the diagnostic teardown ordering
+  in `didClose`.
 - **A new read-path coupling**: virt/native readers wait on the epoch instead of
   `has_tree`. Getting it wrong silently reintroduces the #342/#374 stale-tree
   race.
