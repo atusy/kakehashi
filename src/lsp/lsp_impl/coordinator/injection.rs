@@ -19,6 +19,10 @@ use crate::lsp::lsp_impl::detect_document_language;
 use super::InstallCoordinator;
 use super::install::InstallCoordinatorDeps;
 
+/// `Clone` is a cheap refcount bump of the shared coordinators (every field is a
+/// `Client` / `Arc<_>` / `AutoInstallManager`, all `Clone`); it lets
+/// `process_injections` hand an owned handle to a spawned off-ingress install task.
+#[derive(Clone)]
 pub(crate) struct InjectionCoordinator {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
@@ -161,8 +165,34 @@ impl InjectionCoordinator {
         let languages: HashSet<String> =
             injections.iter().map(|inj| inj.language.clone()).collect();
 
-        self.check_injected_languages_auto_install(uri, &languages)
-            .await;
+        // Re-home the injected-language parser install OFF this task (#480 liveness;
+        // the parse-actor ADR's "PR-3"). When a region's injected language has no
+        // parser yet, `check_injected_languages_auto_install` awaits a compile that
+        // can take seconds; on the parse-loop path that would stall the per-URI
+        // coalescing loop's next pass, and on the didOpen install-retry path it would
+        // re-hold work the ingress already returned from. Spawn it instead:
+        //
+        // - The didChange forwarding above already completed (ordered-after-parse,
+        //    before this spawn), so forwarding order is unaffected.
+        // - The injected-language **parser** install only enables kakehashi to PARSE
+        //   deeper-nested regions later; it is independent of the bridge-server
+        //   warmup below, which spawns the **external** language servers for these
+        //   regions (no tree-sitter parser needed), so that warmup still runs
+        //   promptly without waiting on the compile.
+        // - `maybe_auto_install_language`'s `InstallingLanguages` tracker dedupes
+        //   concurrent attempts, and the injected install (`is_injection=true`) never
+        //   reparses or resurrects the host document, so a `didClose` racing this
+        //   spawn is benign (it just finishes installing a global parser).
+        let install_task = {
+            let coordinator = self.clone();
+            let uri = uri.clone();
+            async move {
+                coordinator
+                    .check_injected_languages_auto_install(&uri, &languages)
+                    .await;
+            }
+        };
+        tokio::spawn(install_task);
 
         self.eager_spawn_bridge_servers(uri, &host_language, injections);
     }
