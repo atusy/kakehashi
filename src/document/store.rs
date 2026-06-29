@@ -207,12 +207,15 @@ impl DocumentStore {
             _ => Document::new(text, incarnation),
         };
 
-        self.documents.insert(uri.clone(), document);
+        // The parse-state and watermark maps are independent of `documents`, so seed
+        // them with the borrowed `&uri` first and let `documents.insert` consume the
+        // owned `uri` last — avoiding a `Url` clone on every didOpen.
         self.update_tree_availability(&uri, has_tree);
         // Seed the watermark for this lifetime's incarnation so its lifetime tracks
         // the document's; the advance paths are non-inserting and rely on this
         // entry being present. A reopen replaces any leftover prior-lifetime channel.
         self.ensure_watermark_entry(&uri, incarnation);
+        self.documents.insert(uri, document);
     }
 
     // Lock safety: Returns DocumentHandle wrapping Ref - caller holds read lock until drop
@@ -226,41 +229,55 @@ impl DocumentStore {
     pub fn update_document(&self, uri: Url, text: String, new_tree: Option<Tree>) {
         // Use entry API for atomic operations to prevent race conditions
         // between checking if document exists and inserting/updating.
-        let (has_tree, incarnation) = match self.documents.entry(uri.clone()) {
-            Entry::Occupied(mut entry) => {
-                // Document exists - update in place, preserving its incarnation
-                // (an edit is the same lifetime).
-                let doc = entry.get_mut();
-                let has_tree = if let Some(tree) = new_tree {
-                    doc.update_tree_and_text(tree, text);
-                    true
-                } else {
-                    // No new tree provided - clear existing tree and update text only.
-                    // This path is used when text changes without re-parsing (rare edge case).
-                    doc.update_text(text);
-                    false
-                };
-                (has_tree, doc.incarnation())
-            }
-            Entry::Vacant(entry) => {
-                // Document doesn't exist - create new one (a fresh lifetime →
-                // fresh incarnation). `next_incarnation` touches only the atomic
-                // counter, not `documents`, so drawing it while holding this
-                // entry's shard write lock cannot deadlock.
-                let incarnation = self.next_incarnation();
-                let has_tree = if let Some(tree) = new_tree {
-                    entry.insert(Document::with_tree(
-                        text,
-                        "unknown".to_string(),
-                        tree,
-                        incarnation,
-                    ));
-                    true
-                } else {
-                    entry.insert(Document::new(text, incarnation));
-                    false
-                };
-                (has_tree, incarnation)
+        // Hot path (the document already exists): `get_mut` borrows the key, so no
+        // `Url` clone. Only a miss falls back to `entry` (owned key), which re-checks
+        // for a document a concurrent insert added between the `get_mut` and here —
+        // matching `apply_edit_clearing_tree`.
+        let (has_tree, incarnation) = if let Some(mut doc) = self.documents.get_mut(&uri) {
+            // Update in place, preserving the incarnation (an edit is the same lifetime).
+            let has_tree = if let Some(tree) = new_tree {
+                doc.update_tree_and_text(tree, text);
+                true
+            } else {
+                // No new tree provided - clear existing tree and update text only.
+                // This path is used when text changes without re-parsing (rare edge case).
+                doc.update_text(text);
+                false
+            };
+            (has_tree, doc.incarnation())
+        } else {
+            match self.documents.entry(uri.clone()) {
+                Entry::Occupied(mut entry) => {
+                    let doc = entry.get_mut();
+                    let has_tree = if let Some(tree) = new_tree {
+                        doc.update_tree_and_text(tree, text);
+                        true
+                    } else {
+                        doc.update_text(text);
+                        false
+                    };
+                    (has_tree, doc.incarnation())
+                }
+                Entry::Vacant(entry) => {
+                    // Document doesn't exist - create new one (a fresh lifetime →
+                    // fresh incarnation). `next_incarnation` touches only the atomic
+                    // counter, not `documents`, so drawing it while holding this
+                    // entry's shard write lock cannot deadlock.
+                    let incarnation = self.next_incarnation();
+                    let has_tree = if let Some(tree) = new_tree {
+                        entry.insert(Document::with_tree(
+                            text,
+                            "unknown".to_string(),
+                            tree,
+                            incarnation,
+                        ));
+                        true
+                    } else {
+                        entry.insert(Document::new(text, incarnation));
+                        false
+                    };
+                    (has_tree, incarnation)
+                }
             }
         };
         self.update_tree_availability(&uri, has_tree);
