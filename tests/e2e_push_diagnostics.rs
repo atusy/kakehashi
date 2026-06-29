@@ -511,3 +511,61 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+/// Send a `didOpen` for the markdown host (with its lua region) so the bridge
+/// spawns the downstream mock for that region and forwards the region's events.
+fn open_host(client: &mut LspClient) {
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": MD_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": MD_TEXT
+            }
+        }),
+    );
+}
+
+#[test]
+fn e2e_downstream_refresh_forwarded_to_refresh_capable_client() {
+    // #521: a downstream server's own `workspace/diagnostic/refresh` request is
+    // forwarded upstream to the editor. With a refresh-capable client the bridge
+    // relays it (the `diagnostics-refresh` mock fires one on didOpen).
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh", refresh_capable_caps());
+    open_host(&mut client);
+
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+            .is_some(),
+        "a downstream's workspace/diagnostic/refresh must reach a refresh-capable editor (#521)"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_gated_off_for_refresh_incapable_client() {
+    // #521: the same downstream refresh must NOT be forwarded when the client did
+    // not advertise `workspace.diagnostics.refreshSupport` — forwarding it would
+    // leak a tower-lsp pending-request entry on a client that silently ignores it.
+    // Empty capabilities (`init_client_with_mode`) → refresh unsupported. Paired
+    // with the positive test above (same mock mode), so a "no refresh" result here
+    // is the gate working, not the mock failing to emit.
+    let (mut client, _config_dir) = init_client_with_mode("diagnostics-refresh");
+    open_host(&mut client);
+
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(6))
+            .is_none(),
+        "the refresh forward must be gated off for a client without refreshSupport (#521)"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}

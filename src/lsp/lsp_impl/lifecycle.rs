@@ -979,12 +979,17 @@ async fn deliver_upstream_notification(
     use tower_lsp_server::ls_types::{ProgressParamsValue, WorkDoneProgress};
     match notification {
         UpstreamNotification::DiagnosticRefresh => {
-            if let Err(e) = client.workspace_diagnostic_refresh().await {
-                log::debug!(
-                    target: "kakehashi::bridge",
-                    "workspace/diagnostic/refresh forwarding failed: {}",
-                    e
-                );
+            // A downstream server asked the editor to re-pull diagnostics. Route it
+            // through the publisher's `request_pull_diagnostic_refresh` so it reuses
+            // the `workspace.diagnostics.refreshSupport` capability gate (a client
+            // that doesn't support refresh would otherwise leak a tower-lsp
+            // pending-request entry + parked task) and the detached `tokio::spawn`
+            // (an inline `.await` here would block this delivery loop on the client
+            // round-trip — head-of-line). A `None` publisher (test loop) has no
+            // settings to gate on, so the forward is dropped; production always has
+            // one (#521).
+            if let Some(publisher) = diagnostic_publisher {
+                publisher.request_pull_diagnostic_refresh();
             }
         }
         UpstreamNotification::PublishDiagnostics {
@@ -1491,8 +1496,10 @@ mod tests {
 
     /// Cancellation is re-checked *between* deliveries of a coalesced batch, so a
     /// shutdown mid-batch is not delayed by the rest of the batch (#426). Two
-    /// `DiagnosticRefresh` are drained into one batch; cancelling during the first's
-    /// editor round-trip must make the loop skip the second and exit.
+    /// `CreateWorkDoneProgress` (distinct tokens — each an inline-awaited request, so
+    /// both survive coalescing as a 2-item barrier batch) are drained into one batch;
+    /// cancelling during the first's editor round-trip must make the loop skip the
+    /// second and exit.
     #[tokio::test]
     async fn forwarding_loop_rechecks_cancellation_between_batched_deliveries() {
         use crate::lsp::bridge::UpstreamNotification;
@@ -1500,7 +1507,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tower::{Service, ServiceExt};
         use tower_lsp_server::jsonrpc::{Request, Response};
-        use tower_lsp_server::ls_types::{InitializeParams, InitializeResult};
+        use tower_lsp_server::ls_types::{InitializeParams, InitializeResult, NumberOrString};
         use tower_lsp_server::{LanguageServer, LspService};
 
         struct Dummy;
@@ -1538,9 +1545,17 @@ mod tests {
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
         let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Two refreshes queued before the loop runs → drained into one batch.
-        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
-        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+        // Two creates (distinct tokens) queued before the loop runs → drained into
+        // one batch. Each is an inline-awaited server→client request, so they map to
+        // the "deliver first / cancel mid-round-trip / skip second" scenario.
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: NumberOrString::String("batch-canary-a".to_string()),
+        })
+        .unwrap();
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: NumberOrString::String("batch-canary-b".to_string()),
+        })
+        .unwrap();
 
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
             rx,
@@ -1553,25 +1568,22 @@ mod tests {
             cancel.clone(),
         ));
 
-        // The loop delivers the first refresh (a request that awaits the editor).
-        let first = requests
-            .next()
-            .await
-            .expect("first refresh request emitted");
-        assert_eq!(first.method(), "workspace/diagnostic/refresh");
+        // The loop delivers the first create (a request that awaits the editor).
+        let first = requests.next().await.expect("first create request emitted");
+        assert_eq!(first.method(), "window/workDoneProgress/create");
         // Cancel during the first delivery's round-trip; when it completes the loop
-        // must re-check cancellation and skip the second batched refresh.
+        // must re-check cancellation and skip the second batched create.
         cancel.cancel();
         responses
             .send(Response::from_ok(
-                first.id().expect("refresh request id").clone(),
+                first.id().expect("create request id").clone(),
                 serde_json::Value::Null,
             ))
             .await
             .unwrap();
 
-        // The loop must skip the second refresh and exit. Were cancellation NOT
-        // re-checked mid-batch, it would deliver the second refresh and block on its
+        // The loop must skip the second create and exit. Were cancellation NOT
+        // re-checked mid-batch, it would deliver the second create and block on its
         // (never-sent) response — so this would hang. The timeout turns that
         // regression into a failure instead of an infinite hang.
         tokio::time::timeout(std::time::Duration::from_secs(5), loop_handle)
@@ -1666,8 +1678,14 @@ mod tests {
             },
         })
         .unwrap();
-        // A later, unrelated request that IS expected to reach the editor.
-        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+        // A later, unrelated message that IS expected to reach the editor — a
+        // telemetry notification, used as the delivery canary because it is
+        // forwarded unconditionally (the refresh forward is now publisher-gated, so
+        // it no longer works as a publisher-independent canary, #521).
+        tx.send(UpstreamNotification::TelemetryEvent {
+            data: serde_json::json!({ "canary": "after-rejected-create" }),
+        })
+        .unwrap();
 
         // First message: the create request — reject it.
         let first = requests.next().await.expect("create request emitted");
@@ -1678,20 +1696,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Next message MUST be the diagnostic refresh, NOT $/progress — the
-        // rejected token's progress was dropped.
-        let next = requests.next().await.expect("a follow-up request emitted");
+        // Next message MUST be the telemetry event, NOT $/progress — the rejected
+        // token's progress was dropped. (telemetry/event is a notification, so there
+        // is no response to send.)
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), requests.next())
+            .await
+            .expect("the telemetry canary must arrive, not hang (fail fast on a dropped forward)")
+            .expect("a follow-up message emitted");
         assert_eq!(
             next.method(),
-            "workspace/diagnostic/refresh",
-            "progress for a rejected token must be dropped; only the later request survives"
+            "telemetry/event",
+            "progress for a rejected token must be dropped; only the later message survives"
         );
-        // Respond so the loop's inline (un-timed) refresh await completes.
-        let id = next.id().expect("refresh request has an id").clone();
-        responses
-            .send(Response::from_ok(id, serde_json::Value::Null))
-            .await
-            .unwrap();
 
         cancel.cancel();
         let _ = loop_handle.await;
@@ -1794,22 +1810,24 @@ mod tests {
             },
         })
         .unwrap();
-        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+        // Telemetry notification as the delivery canary (unconditionally forwarded,
+        // unlike the now publisher-gated refresh, #521).
+        tx.send(UpstreamNotification::TelemetryEvent {
+            data: serde_json::json!({ "canary": "after-forget" }),
+        })
+        .unwrap();
 
         // The forgotten token's progress must be dropped; the next editor-bound
-        // message is the diagnostic refresh.
-        let next = requests.next().await.expect("a follow-up request emitted");
+        // message is the telemetry event.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), requests.next())
+            .await
+            .expect("the telemetry canary must arrive, not hang (fail fast on a dropped forward)")
+            .expect("a follow-up message emitted");
         assert_eq!(
             next.method(),
-            "workspace/diagnostic/refresh",
+            "telemetry/event",
             "progress for a forgotten token must be dropped"
         );
-        // Respond so the loop's inline (un-timed) refresh await completes.
-        let id = next.id().expect("refresh request has an id").clone();
-        responses
-            .send(Response::from_ok(id, serde_json::Value::Null))
-            .await
-            .unwrap();
 
         cancel.cancel();
         let _ = loop_handle.await;
@@ -2037,18 +2055,21 @@ mod tests {
             token.clone(),
         ]))
         .unwrap();
-        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
-        let next = requests.next().await.expect("a follow-up request emitted");
+        // Telemetry notification as the delivery canary (unconditionally forwarded,
+        // unlike the now publisher-gated refresh, #521).
+        tx.send(UpstreamNotification::TelemetryEvent {
+            data: serde_json::json!({ "canary": "after-purge-ended" }),
+        })
+        .unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), requests.next())
+            .await
+            .expect("the telemetry canary must arrive, not hang (fail fast on a dropped forward)")
+            .expect("a follow-up message emitted");
         assert_eq!(
             next.method(),
-            "workspace/diagnostic/refresh",
+            "telemetry/event",
             "an already-ended token must not be ended a second time on purge"
         );
-        let id = next.id().expect("refresh request has an id").clone();
-        responses
-            .send(Response::from_ok(id, serde_json::Value::Null))
-            .await
-            .unwrap();
 
         cancel.cancel();
         let _ = loop_handle.await;
@@ -2203,20 +2224,21 @@ mod tests {
             fresh.clone(),
         ]))
         .unwrap();
-        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
-        let next = requests.next().await.expect("a follow-up request emitted");
+        // Telemetry notification as the delivery canary (unconditionally forwarded,
+        // unlike the now publisher-gated refresh, #521).
+        tx.send(UpstreamNotification::TelemetryEvent {
+            data: serde_json::json!({ "canary": "after-purge-fresh" }),
+        })
+        .unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), requests.next())
+            .await
+            .expect("the telemetry canary must arrive, not hang (fail fast on a dropped forward)")
+            .expect("a follow-up message emitted");
         assert_eq!(
             next.method(),
-            "workspace/diagnostic/refresh",
+            "telemetry/event",
             "fresh token was ended normally; its purge must synthesize no second End"
         );
-        responses
-            .send(Response::from_ok(
-                next.id().unwrap().clone(),
-                serde_json::Value::Null,
-            ))
-            .await
-            .unwrap();
 
         cancel.cancel();
         let _ = loop_handle.await;
