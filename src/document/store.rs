@@ -27,13 +27,16 @@ pub struct DocumentStore {
     /// <https://github.com/atusy/kakehashi/issues/342>). Different documents keep
     /// their own locks and run concurrently.
     edit_locks: DashMap<Url, Arc<Mutex<()>>>,
-    /// Monotonic "open generation" per URI, lazily assigned on first ask and
-    /// cleared by [`remove`](Self::remove). A consumer that captures the
-    /// generation alongside a snapshot can later detect that the document was
-    /// closed and reopened in between — the reopened document draws a fresh
-    /// generation even though the URI looks alive again. See
+    /// Source of the process-wide-unique **open incarnation** stamped onto every
+    /// [`Document`] this store constructs (see [`Document::incarnation`] and
+    /// [`next_incarnation`](Self::next_incarnation)). Starts at 1, so a document
+    /// built outside the store (incarnation `0`) is always distinguishable from
+    /// one this store owns. The incarnation lives *on the document* rather than
+    /// in a side map, so a tree-write CAS or a watermark advance can check it
+    /// atomically with the document state under the same shard lock; a consumer
+    /// that captured a snapshot detects a close-then-reopen by comparing the
+    /// snapshot's incarnation against the URI's current one. See
     /// `Kakehashi::store_lineage` (captures-protocol §"Delta semantics").
-    open_generations: DashMap<Url, u64>,
     open_counter: std::sync::atomic::AtomicU64,
     /// Per-document **parse watermark**: the highest ingress writer ticket whose
     /// parse has reached a terminal outcome (a tree, or parsed-to-nothing). It is
@@ -83,8 +86,7 @@ impl Default for DocumentStore {
             documents: DashMap::new(),
             parse_states: DashMap::new(),
             edit_locks: DashMap::new(),
-            open_generations: DashMap::new(),
-            open_counter: std::sync::atomic::AtomicU64::new(0),
+            open_counter: std::sync::atomic::AtomicU64::new(1),
             watermarks: DashMap::new(),
         }
     }
@@ -179,10 +181,13 @@ impl DocumentStore {
     // Lock safety: Single insert() call - no read lock held before or during write
     pub fn insert(&self, uri: Url, text: String, language_id: Option<String>, tree: Option<Tree>) {
         let has_tree = tree.is_some();
+        // didOpen registers a fresh lifetime → a fresh incarnation, so an
+        // in-flight parse from a prior open of this URI can't publish against it.
+        let incarnation = self.next_incarnation();
         let document = match (language_id, tree) {
-            (Some(lang), Some(t)) => Document::with_tree(text, lang, t),
-            (Some(lang), None) => Document::with_language(text, lang),
-            _ => Document::new(text),
+            (Some(lang), Some(t)) => Document::with_tree(text, lang, t, incarnation),
+            (Some(lang), None) => Document::with_language(text, lang, incarnation),
+            _ => Document::new(text, incarnation),
         };
 
         self.documents.insert(uri.clone(), document);
@@ -218,12 +223,21 @@ impl DocumentStore {
                 }
             }
             Entry::Vacant(entry) => {
-                // Document doesn't exist - create new one
+                // Document doesn't exist - create new one (a fresh lifetime →
+                // fresh incarnation). `next_incarnation` touches only the atomic
+                // counter, not `documents`, so drawing it while holding this
+                // entry's shard write lock cannot deadlock.
+                let incarnation = self.next_incarnation();
                 if let Some(tree) = new_tree {
-                    entry.insert(Document::with_tree(text, "unknown".to_string(), tree));
+                    entry.insert(Document::with_tree(
+                        text,
+                        "unknown".to_string(),
+                        tree,
+                        incarnation,
+                    ));
                     true
                 } else {
-                    entry.insert(Document::new(text));
+                    entry.insert(Document::new(text, incarnation));
                     false
                 }
             }
@@ -265,7 +279,9 @@ impl DocumentStore {
             match self.documents.entry(uri.clone()) {
                 Entry::Occupied(mut entry) => entry.get_mut().apply_edit_and_seed(text, edits),
                 Entry::Vacant(entry) => {
-                    entry.insert(Document::new(text));
+                    // Reordered edit registering an unopened URI: a fresh
+                    // lifetime → fresh incarnation (mirrors `update_document`).
+                    entry.insert(Document::new(text, self.next_incarnation()));
                 }
             }
         }
@@ -516,7 +532,6 @@ impl DocumentStore {
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
         self.edit_locks.remove(uri);
-        self.open_generations.remove(uri);
         // Dropping the watermark sender wakes any reader still blocked on
         // `wait_for_epoch` for this document, so a reader racing the close
         // proceeds into the empty fallback instead of stalling to the timeout.
@@ -524,39 +539,15 @@ impl DocumentStore {
         self.documents.remove(uri).map(|(_, doc)| doc)
     }
 
-    /// The current open generation for `uri`, lazily assigned. Two reads
-    /// straddling a [`remove`](Self::remove) (didClose) return different
-    /// values, because the removal clears the entry and the next ask draws a
-    /// fresh number — letting callers detect a close-then-reopen even when the
-    /// URI looks alive on both sides. Fetch it **before** snapshotting: if a
-    /// reopen races in between, the stale generation makes the later
-    /// comparison fail (conservative), whereas the reverse order could pair an
-    /// old snapshot with the new document's generation.
-    pub(crate) fn open_generation(&self, uri: &Url) -> u64 {
-        *self.open_generations.entry(uri.clone()).or_insert_with(|| {
-            self.open_counter
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        })
-    }
-
-    /// Drop the lazily-created generation entry for a URI that turned out to
-    /// have no document — the cleanup for an [`open_generation`](Self::open_generation)
-    /// ask that raced a `didClose`. Safety does not depend on this (the
-    /// counter is monotonic, so a pre-close generation can never equal any
-    /// later one); it only prevents entries accumulating for closed URIs.
-    /// Check-then-remove rather than `remove_if`: the predicate would read
-    /// `documents` while holding the `open_generations` shard write lock,
-    /// inverting the documents → open_generations order taken by callers
-    /// that hold a document `Ref` while asking for the generation — a latent
-    /// ABBA deadlock under a writer-preferring shard lock. The TOCTOU this
-    /// opens (a reopen racing between check and removal loses its entry)
-    /// merely hands the reopened document a fresh number on its next ask,
-    /// which is the conservative direction.
-    pub(crate) fn forget_open_generation_if_closed(&self, uri: &Url) {
-        if self.documents.get(uri).is_some() {
-            return;
-        }
-        self.open_generations.remove(uri);
+    /// Draw the next process-wide-unique **open incarnation** (see
+    /// [`Document::incarnation`]). Monotonic and never reused, so two documents
+    /// — including a close-then-reopen of the same URI — always get distinct
+    /// values, which is what lets a consumer detect a reopen by comparing a
+    /// captured incarnation against the document's current one. Starts at 1, so
+    /// `0` is reserved for a document built outside any store.
+    pub(crate) fn next_incarnation(&self) -> u64 {
+        self.open_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -569,35 +560,50 @@ mod tests {
     use tokio::time::timeout;
 
     #[test]
-    fn forget_open_generation_keeps_live_document_entry() {
+    fn insert_stamps_a_fresh_nonzero_incarnation() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///gen.rs").unwrap();
         store.insert(uri.clone(), "x".to_string(), Some("rust".to_string()), None);
-        let generation = store.open_generation(&uri);
-
-        store.forget_open_generation_if_closed(&uri);
-
-        assert_eq!(
-            store.open_generation(&uri),
-            generation,
-            "cleanup must not disturb the generation of an open document"
+        let incarnation = store.get(&uri).unwrap().incarnation();
+        assert_ne!(
+            incarnation, 0,
+            "a store-owned document must carry a nonzero incarnation (0 is the \
+             outside-the-store sentinel)"
         );
     }
 
     #[test]
-    fn forget_open_generation_drops_entry_for_closed_document() {
+    fn reopen_draws_a_fresh_incarnation() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///gen.rs").unwrap();
-        // A generation asked while no document exists (request racing didClose)
-        let stale = store.open_generation(&uri);
-
-        store.forget_open_generation_if_closed(&uri);
-
         store.insert(uri.clone(), "x".to_string(), Some("rust".to_string()), None);
+        let first = store.get(&uri).unwrap().incarnation();
+
+        store.remove(&uri);
+        store.insert(uri.clone(), "x".to_string(), Some("rust".to_string()), None);
+        let second = store.get(&uri).unwrap().incarnation();
+
         assert_ne!(
-            store.open_generation(&uri),
-            stale,
-            "a closed URI's entry must be dropped so a reopen draws a fresh generation"
+            first, second,
+            "a close-then-reopen must draw a fresh incarnation so a consumer can \
+             detect the reopen"
+        );
+    }
+
+    #[test]
+    fn edit_preserves_the_incarnation() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///gen.rs").unwrap();
+        store.insert(uri.clone(), "x".to_string(), Some("rust".to_string()), None);
+        let before = store.get(&uri).unwrap().incarnation();
+
+        // An edit is the same lifetime — the incarnation must not move.
+        store.apply_edit_clearing_tree(&uri, "xy".to_string(), &[]);
+        let after = store.get(&uri).unwrap().incarnation();
+
+        assert_eq!(
+            before, after,
+            "an edit stays within one lifetime and must preserve the incarnation"
         );
     }
 
