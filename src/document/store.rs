@@ -439,21 +439,33 @@ impl DocumentStore {
         stored
     }
 
-    /// Like [`update_tree_if_text_unchanged`], but additionally stores the tree
-    /// only if the document currently has **no** tree. For the off-ingress install
-    /// reparse (`reparse_installed_document`), whose "don't clobber a concurrent
-    /// parse" guard is a `tree.is_some()` pre-check: a parse attaching a tree for
-    /// the same text *between* that pre-check and this write would otherwise be
-    /// overwritten. Folding the `tree.is_none()` check into the same `get_mut` shard
-    /// lock as the text comparison makes the guard atomic.
+    /// Like [`update_tree_if_text_and_language_unchanged`], but additionally stores
+    /// the tree only if the document currently has **no** tree. For the off-ingress
+    /// install reparse (`reparse_installed_document`), whose "don't clobber a
+    /// concurrent parse" guard is a `tree.is_some()` pre-check: a parse attaching a
+    /// tree for the same text *between* that pre-check and this write would otherwise
+    /// be overwritten. Folding the `tree.is_none()` check into the same `get_mut`
+    /// shard lock as the text comparison makes the guard atomic.
+    ///
+    /// Carries the same `language` and `incarnation` axes as
+    /// [`update_tree_if_text_and_language_unchanged`], for the same reason: the
+    /// install reparse is off-ingress, so a `didClose` + reopen (possibly relabelling
+    /// the language) can race it. Without these checks the freshly-installed grammar's
+    /// tree could attach to a reopened — even relabelled — document.
     pub(crate) fn attach_tree_if_absent(
         &self,
         uri: &Url,
         expected_text: &str,
+        expected_language_id: Option<&str>,
+        expected_incarnation: u64,
         new_tree: Tree,
     ) -> bool {
         let stored = if let Some(mut doc) = self.documents.get_mut(uri) {
-            if doc.tree().is_none() && doc.text() == expected_text {
+            if doc.tree().is_none()
+                && doc.incarnation() == expected_incarnation
+                && doc.text() == expected_text
+                && doc.language_id() == expected_language_id
+            {
                 doc.set_tree(new_tree);
                 true
             } else {
@@ -812,18 +824,70 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
+        let incarnation = store.get(&uri).unwrap().incarnation();
 
         // No tree yet → stores.
-        assert!(store.attach_tree_if_absent(&uri, "fn main() {}", parse_rust("fn main() {}")));
+        assert!(store.attach_tree_if_absent(
+            &uri,
+            "fn main() {}",
+            Some("rust"),
+            incarnation,
+            parse_rust("fn main() {}")
+        ));
         let first = store.get(&uri).unwrap().tree().unwrap().root_node().id();
 
         // A tree is now present → a second attach must NOT clobber it (the guard
         // is atomic with the write, unlike a separate tree.is_some() pre-check).
-        assert!(!store.attach_tree_if_absent(&uri, "fn main() {}", parse_rust("fn main() {}")));
+        assert!(!store.attach_tree_if_absent(
+            &uri,
+            "fn main() {}",
+            Some("rust"),
+            incarnation,
+            parse_rust("fn main() {}")
+        ));
         assert_eq!(
             store.get(&uri).unwrap().tree().unwrap().root_node().id(),
             first,
             "an existing tree must be preserved, not overwritten"
+        );
+    }
+
+    #[test]
+    fn attach_tree_if_absent_rejects_a_reopen_with_a_fresh_incarnation() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///reinstalled.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        // An install reparse read this lifetime's incarnation, then the document was
+        // closed and reopened (same text + language, no tree yet) while the install
+        // finished.
+        let stale_incarnation = store.get(&uri).unwrap().incarnation();
+        store.remove(&uri);
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        assert!(
+            !store.attach_tree_if_absent(
+                &uri,
+                "fn main() {}",
+                Some("rust"),
+                stale_incarnation,
+                parse_rust("fn main() {}")
+            ),
+            "a freshly-installed grammar's tree from the prior lifetime must not \
+             attach to the reopened document"
+        );
+        assert!(
+            store.get(&uri).unwrap().tree().is_none(),
+            "the reopened document keeps no tree from the closed lifetime"
         );
     }
 
@@ -912,7 +976,15 @@ mod tests {
     fn attach_tree_if_absent_does_not_resurrect_closed_document() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///closed.rs").unwrap();
-        assert!(!store.attach_tree_if_absent(&uri, "fn main() {}", parse_rust("fn main() {}")));
+        // No document exists, so the CAS rejects regardless of the expected
+        // language/incarnation (they are never compared on the Vacant path).
+        assert!(!store.attach_tree_if_absent(
+            &uri,
+            "fn main() {}",
+            Some("rust"),
+            1,
+            parse_rust("fn main() {}")
+        ));
         assert!(
             store.get(&uri).is_none(),
             "must not resurrect a closed document"
@@ -1084,6 +1156,26 @@ mod tests {
             watermark_of(&store, &uri),
             Some(1),
             "the reopened lifetime's own parse advances its watermark"
+        );
+    }
+
+    #[test]
+    fn apply_edit_clearing_tree_preserves_the_watermark_ticket() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        let incarnation = store.get(&uri).unwrap().incarnation();
+        store.advance_watermark_for_incarnation(&uri, 7, incarnation);
+        assert_eq!(watermark_of(&store, &uri), Some(7));
+
+        // An edit is the same lifetime: `ensure_watermark_entry` must hit its
+        // matching-incarnation fast path and leave the live ticket untouched (a
+        // reset to 0 would prematurely release readers gated behind ticket 7).
+        store.apply_edit_clearing_tree(&uri, "xy".to_string(), &[]);
+        assert_eq!(
+            watermark_of(&store, &uri),
+            Some(7),
+            "an edit (same incarnation) must not reset the live watermark ticket"
         );
     }
 

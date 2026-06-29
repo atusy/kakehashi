@@ -324,15 +324,22 @@ impl ParseCoordinator {
 
         for _ in 0..MAX_REPARSE_ATTEMPTS {
             // Re-read the latest text each attempt. Gone => closed (no resurrect);
-            // already has a tree => a concurrent parse won, nothing to do.
-            let text = {
+            // already has a tree => a concurrent parse won, nothing to do. Capture
+            // the lifetime's incarnation and the document's language alongside the
+            // text so the CAS below can reject a close+reopen (possibly a relabel)
+            // that raced this off-ingress install reparse.
+            let (text, cas_language_id, incarnation) = {
                 let Some(doc) = self.documents.get(&uri) else {
                     break;
                 };
                 if doc.tree().is_some() {
                     break;
                 }
-                doc.text().to_string()
+                (
+                    doc.text().to_string(),
+                    doc.language_id().map(|s| s.to_string()),
+                    doc.incarnation(),
+                )
             };
 
             let text_len = text.len();
@@ -359,9 +366,13 @@ impl ParseCoordinator {
             // the tree actually landed, so a `didClose` racing this reparse can't
             // leave stale injection entries for a gone document. (`Tree` clone is a
             // cheap refcount bump.)
-            let stored = self
-                .documents
-                .attach_tree_if_absent(&uri, &text, tree.clone());
+            let stored = self.documents.attach_tree_if_absent(
+                &uri,
+                &text,
+                cas_language_id.as_deref(),
+                incarnation,
+                tree.clone(),
+            );
             if stored {
                 self.cache.populate_injections(
                     &uri,
@@ -401,25 +412,22 @@ impl ParseCoordinator {
     /// it diffs cached token arrays by `result_id` (never `changed_ranges`), so as
     /// long as the seed keeps this reparse cheap the delta stays cheap too.
     pub(crate) async fn reparse_latest(&self, uri: &Url, ticket: Option<u64>) {
-        let advance_watermark = || {
-            if let Some(ticket) = ticket {
-                self.documents.advance_watermark(uri, ticket);
-            }
-        };
-
         // Re-read the latest text + detect the language under one read guard. A
-        // missing document means a `didClose` ran — resolve the watermark and stop
-        // (no resurrection). `language_id` is captured so the tree write can reject
-        // a reopen that changed the language while this parse was in flight. The
+        // missing document means a `didClose` ran — stop without touching the
+        // watermark (no resurrection). Advancing it here would be unsafe: the
+        // watermark is per-lifetime, so if a reopen has *already* re-seeded a fresh
+        // channel, a plain advance with this prior-lifetime ticket would inflate it
+        // and prematurely release a new-lifetime reader — and it is also
+        // unnecessary, since a genuine close drops the channel and wakes its readers
+        // (they fall back). The incarnation isn't known on this path, but it isn't
+        // needed: only the post-read paths below (which captured it) advance, and
+        // they gate on it. `language_id` is captured so the tree write can reject a
+        // reopen that changed the language while this parse was in flight. The
         // `pending_seed` (a cheap `Tree` refcount-clone) is the edit's incremental
         // parse seed stashed by `didChange`; `None` for a full-text sync / freshly
         // installed parse, in which case we parse from scratch.
         let (language_name, language_id, text, seed, incarnation) = {
             let Some(doc) = self.documents.get(uri) else {
-                // Document already closed: its watermark is gone (advance no-ops)
-                // and its readers were woken by the close. The incarnation isn't
-                // known on this path, but it is not needed.
-                advance_watermark();
                 return;
             };
             // `text_arc()` is a refcount bump, not a full copy of the document text
