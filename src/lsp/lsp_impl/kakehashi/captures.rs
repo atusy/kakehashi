@@ -243,12 +243,12 @@ fn load_kind_query(
 }
 
 /// Outcome of the shared resolution + execution pipeline: the resolved `Url`
-/// (cache key half), the document's open generation at snapshot time (so the
+/// (cache key half), the document's open incarnation at snapshot time (so the
 /// lineage store can detect a close-then-reopen racing the request), and the
 /// wire-shaped `matches` / `skipped` arrays.
 struct ComputedCaptures {
     uri: Url,
-    open_generation: u64,
+    incarnation: u64,
     matches: Vec<Value>,
     skipped: Vec<Value>,
 }
@@ -289,9 +289,9 @@ impl Kakehashi {
     /// - liveness: a close that won the lock first leaves the document gone,
     ///   so the check skips the insert; an insert that won first is cleared by
     ///   the close's cache cleanup, which runs after the removal;
-    /// - generation: a close **followed by a fast reopen** makes the URI look
-    ///   alive again, but the reopened document draws a fresh open generation,
-    ///   so a stale request's snapshot-time generation no longer matches and
+    /// - incarnation: a close **followed by a fast reopen** makes the URI look
+    ///   alive again, but the reopened document carries a fresh open incarnation,
+    ///   so a stale request's snapshot-time incarnation no longer matches and
     ///   the insert is skipped — a reopened document starts its lineage fresh
     ///   (captures-protocol §"Delta semantics").
     async fn store_lineage(
@@ -304,13 +304,17 @@ impl Kakehashi {
         let uri = computed.uri;
         let edit_lock = self.documents.edit_lock(&uri);
         let _guard = edit_lock.lock().await;
-        // Separate statement so the documents Ref (a shard read lock) drops
-        // before open_generation's entry() takes an open_generations shard
-        // write — holding a Ref across another map's write acquisition is
-        // the lock-order half of a latent ABBA inversion (see
-        // forget_open_generation_if_closed).
-        let document_is_open = self.documents.get(&uri).is_some();
-        if document_is_open && self.documents.open_generation(&uri) == computed.open_generation {
+        // A single `documents` lookup reads both liveness and the current
+        // incarnation atomically: a closed URI is `None` (skip), and a reopened
+        // one carries a fresh incarnation that no longer equals the snapshot's
+        // (skip). The incarnation lives on the document, so this no longer
+        // straddles two maps — the former ABBA-avoidance dance (drop the Ref
+        // before a separate `open_generations` write) is gone.
+        let still_current = self
+            .documents
+            .get(&uri)
+            .is_some_and(|doc| doc.incarnation() == computed.incarnation);
+        if still_current {
             let mut entry = self.captures_cache.entry((uri, kind)).or_default();
             entry[usize::from(injection)] = Some((result_id, computed.matches));
         }
@@ -518,21 +522,16 @@ impl Kakehashi {
             self.ensure_document_parsed(&uri).await;
         }
 
-        // Fetch the open generation BEFORE snapshotting: if a close+reopen
-        // races in between, the stale generation makes store_lineage's
-        // comparison fail (conservative skip). The reverse order could pair
-        // an old snapshot with the reopened document's generation and seed
-        // the new document with stale lineage.
-        let open_generation = self.documents.open_generation(&uri);
+        // The snapshot carries the document's open incarnation, captured under
+        // the same shard read lock as its text and tree — so there is no longer
+        // a separate "fetch the generation before snapshotting" ordering to get
+        // right. If a close+reopen races after this, store_lineage sees a fresh
+        // incarnation on the URI and skips the stale insert (conservative).
         let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
-            // The generation ask above may have lazily created an entry for a
-            // URI that a racing didClose just removed; drop it again so
-            // closed URIs don't accumulate entries (safety never depended on
-            // it — the counter is monotonic).
-            self.documents.forget_open_generation_if_closed(&uri);
             log::debug!(target: "kakehashi::captures", "no parsed document for {uri}");
             return Ok(None);
         };
+        let incarnation = snapshot.incarnation();
         let text = snapshot.text();
         let tree = snapshot.tree();
 
@@ -675,7 +674,7 @@ impl Kakehashi {
 
         Ok(Some(ComputedCaptures {
             uri,
-            open_generation,
+            incarnation,
             matches,
             skipped,
         }))

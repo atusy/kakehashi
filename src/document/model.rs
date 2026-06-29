@@ -6,12 +6,22 @@ use tree_sitter::{InputEdit, Tree};
 pub(crate) struct DocumentSnapshot {
     text: Arc<str>,
     tree: Tree,
+    incarnation: u64,
 }
 
 impl DocumentSnapshot {
     /// Get the text content
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The open incarnation of the document this snapshot was taken from
+    /// (see [`Document::incarnation`]). Captured atomically with the text and
+    /// tree under the same shard read lock, so a consumer can later detect a
+    /// close-then-reopen that raced its request by comparing against the URI's
+    /// current incarnation.
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     /// Cheaply clone the text as a shared `Arc<str>` (a refcount bump, no copy)
@@ -54,36 +64,60 @@ pub struct Document {
     /// unedited tree against wholly-replaced text would violate tree-sitter's
     /// incremental contract and corrupt external scanners (#348).
     pending_seed: Option<Tree>,
+    /// The document's **open incarnation** — a process-wide-unique number drawn
+    /// from [`DocumentStore`](crate::document::store::DocumentStore)'s monotonic
+    /// counter at every construction (so a `didClose` + reopen of the same URI
+    /// yields a fresh value). Stored *on the document* so a tree-write CAS or a
+    /// watermark advance can check it **atomically with the document state**
+    /// under the same shard lock — closing the residual where an in-flight
+    /// off-ingress parse from a prior lifetime publishes against the reopened
+    /// document (`per-document-parse-scheduler`, the `(incarnation, ticket)`
+    /// epoch).
+    ///
+    /// Edits preserve it (an edit is the same lifetime); only a fresh
+    /// construction (didOpen / a reordered mutation registering an unopened URI)
+    /// draws a new one. A `Document` built outside the store keeps `0`;
+    /// incarnation is only meaningful relative to that store's counter, and the
+    /// store assigns every document it owns a nonzero value.
+    incarnation: u64,
 }
 
 impl Document {
     /// Create a new document with just text
-    pub(crate) fn new(text: String) -> Self {
+    pub(crate) fn new(text: String, incarnation: u64) -> Self {
         Self {
             text: Arc::from(text),
             language_id: None,
             tree: None,
             pending_seed: None,
+            incarnation,
         }
     }
 
     /// Create with language but no tree yet (for early document registration)
-    pub(crate) fn with_language(text: String, language_id: String) -> Self {
+    pub(crate) fn with_language(text: String, language_id: String, incarnation: u64) -> Self {
         Self {
             text: Arc::from(text),
             language_id: Some(language_id),
             tree: None,
             pending_seed: None,
+            incarnation,
         }
     }
 
     /// Create with language and tree
-    pub(crate) fn with_tree(text: String, language_id: String, tree: Tree) -> Self {
+    pub(crate) fn with_tree(
+        text: String,
+        language_id: String,
+        tree: Tree,
+        incarnation: u64,
+    ) -> Self {
         Self {
             text: Arc::from(text),
             language_id: Some(language_id),
             tree: Some(tree),
             pending_seed: None,
+            incarnation,
         }
     }
 
@@ -109,6 +143,12 @@ impl Document {
         self.tree.as_ref()
     }
 
+    /// The document's open incarnation (see the [`incarnation`](Self::incarnation)
+    /// field).
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
     /// Get a position mapper for this document
     pub(crate) fn position_mapper(&self) -> crate::text::PositionMapper {
         crate::text::PositionMapper::new(self.text())
@@ -122,6 +162,7 @@ impl Document {
         Some(DocumentSnapshot {
             text: self.text.clone(),
             tree: self.tree.as_ref()?.clone(),
+            incarnation: self.incarnation,
         })
     }
 
@@ -216,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_document_creation() {
-        let doc = Document::new("hello world".to_string());
+        let doc = Document::new("hello world".to_string(), 0);
         assert_eq!(doc.text(), "hello world");
         assert_eq!(doc.text().len(), 11);
         assert!(!doc.text().is_empty());
@@ -230,7 +271,7 @@ mod tests {
             .unwrap();
         let tree = parser.parse("fn main() {}", None).unwrap();
 
-        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         assert_eq!(doc.text(), "fn main() {}");
         assert!(doc.tree().is_some());
@@ -239,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_update_text() {
-        let mut doc = Document::new("initial".to_string());
+        let mut doc = Document::new("initial".to_string(), 0);
         doc.update_text("updated".to_string());
         assert_eq!(doc.text(), "updated");
         assert!(doc.tree().is_none());
@@ -254,7 +295,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse("fn main() {}", None).unwrap();
-        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         // Insert a space at byte 11 (before the closing brace): "fn main() { }".
         let edit = InputEdit {
@@ -285,7 +326,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse("fn main() {}", None).unwrap();
-        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         // Full-text sync carries no InputEdits.
         doc.apply_edit_and_seed("totally different content".to_string(), &[]);
@@ -306,7 +347,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse("fn main() {}", None).unwrap();
-        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         let edit1 = InputEdit {
             start_byte: 11,
@@ -347,7 +388,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse("fn main() {}", None).unwrap();
-        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         let edit = InputEdit {
             start_byte: 11,
@@ -390,7 +431,7 @@ mod tests {
 
         // update_tree_and_text clears the seed.
         let tree = parser.parse("fn main() {}", None).unwrap();
-        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
         doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit]);
         assert!(doc.pending_seed().is_some());
         let t2 = parser.parse("fn main() { }", None).unwrap();
@@ -409,7 +450,7 @@ mod tests {
             .unwrap();
         let tree = parser.parse("fn main() {}", None).unwrap();
 
-        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         // Snapshot should succeed for fully initialized document
         let snapshot = doc.snapshot();
@@ -422,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_document_snapshot_none_when_no_tree() {
-        let doc = Document::new("test".to_string());
+        let doc = Document::new("test".to_string(), 0);
         // No tree, so snapshot should be None
         assert!(doc.snapshot().is_none());
     }
@@ -435,7 +476,7 @@ mod tests {
             .unwrap();
         let tree = parser.parse("fn main() {}", None).unwrap();
 
-        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         // Create snapshot
         let snapshot = doc.snapshot().unwrap();
@@ -454,7 +495,7 @@ mod tests {
 
     #[test]
     fn text_arc_is_a_cheap_shared_clone() {
-        let doc = Document::new("shared text".to_string());
+        let doc = Document::new("shared text".to_string(), 0);
         let a = doc.text_arc();
         let b = doc.text_arc();
         // Both handles point to the SAME allocation — a refcount bump, not a
@@ -470,7 +511,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse("fn main() {}", None).unwrap();
-        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree);
+        let doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         let snapshot = doc.snapshot().unwrap();
 
@@ -483,7 +524,7 @@ mod tests {
     fn update_text_installs_a_fresh_allocation() {
         // An edit replaces the `Arc` (so prior snapshots keep their bytes); the
         // new text is correct.
-        let mut doc = Document::new("v1".to_string());
+        let mut doc = Document::new("v1".to_string(), 0);
         let before = doc.text_arc();
         doc.update_text("v2".to_string());
         let after = doc.text_arc();

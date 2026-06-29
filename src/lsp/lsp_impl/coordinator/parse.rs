@@ -303,15 +303,30 @@ impl ParseCoordinator {
         // resurrect it) or already parsed (a concurrent parse won — nothing to do,
         // and skip the `ensure_language_loaded` work). Detection borrows the stored
         // text (synchronous, no `.await` and no document write under the `Ref`).
-        let language_name = {
+        // Capture the grammar **and** the (language_id, incarnation) it is resolved
+        // for, together under one read guard. `language_name` is fixed for the whole
+        // loop, so the CAS must check against the language_id/incarnation captured
+        // *here* — not re-read per attempt. Otherwise a relabelling reopen mid-loop
+        // would have its new language_id captured per attempt, satisfy the CAS's
+        // language check, and let a tree parsed by the *old* grammar attach to the
+        // relabelled document. The incarnation is likewise lifetime-stable; only the
+        // text legitimately changes within a lifetime (a `didChange`), so only the
+        // text is re-read per attempt.
+        let (language_name, expected_language_id, expected_incarnation) = {
             let Some(doc) = self.documents.get(&uri) else {
                 return;
             };
             if doc.tree().is_some() {
                 return;
             }
-            self.language
-                .detect_language(uri.path(), doc.text(), None, language_id.as_deref())
+            let language_name =
+                self.language
+                    .detect_language(uri.path(), doc.text(), None, language_id.as_deref());
+            (
+                language_name,
+                doc.language_id().map(|s| s.to_string()),
+                doc.incarnation(),
+            )
         };
         let Some(language_name) = language_name else {
             return;
@@ -324,7 +339,11 @@ impl ParseCoordinator {
 
         for _ in 0..MAX_REPARSE_ATTEMPTS {
             // Re-read the latest text each attempt. Gone => closed (no resurrect);
-            // already has a tree => a concurrent parse won, nothing to do.
+            // already has a tree => a concurrent parse won; a changed incarnation =>
+            // a close+reopen, whose new lifetime drives its own parse — stop rather
+            // than parse its text with this lifetime's (possibly relabelled-away)
+            // grammar (the CAS would reject it anyway; this just avoids the wasted
+            // parses).
             let text = {
                 let Some(doc) = self.documents.get(&uri) else {
                     break;
@@ -332,24 +351,32 @@ impl ParseCoordinator {
                 if doc.tree().is_some() {
                     break;
                 }
-                doc.text().to_string()
+                if doc.incarnation() != expected_incarnation {
+                    break;
+                }
+                // `text_arc()` is a refcount bump, not a full copy (#498) — the
+                // original stays here for the CAS while a cheap clone goes to the
+                // blocking parse closure.
+                doc.text_arc()
             };
 
             let text_len = text.len();
             let auto_install = self.auto_install.clone();
             let language_name_clone = language_name.clone();
-            // Move the owned `text` into the blocking closure and hand it back with
-            // the tree, so the (potentially large) document text is never cloned.
+            // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure;
+            // the original stays here for the CAS below, so the (potentially large)
+            // document text is never copied.
+            let text_for_parse = text.clone();
             let parsed = self
                 .parse_with_pool(&language_name, &uri, text_len, move |mut parser| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
-                    let result = parser.parse(&text, None);
+                    let result = parser.parse(&*text_for_parse, None);
                     let _ = auto_install.end_parsing(&language_name_clone);
-                    (parser, result.map(|tree| (tree, text)))
+                    (parser, result)
                 })
                 .await;
 
-            let Some((tree, text)) = parsed else { break };
+            let Some(tree) = parsed else { break };
 
             // Persist FIRST through the non-inserting, tree-absent CAS: a closed
             // (Vacant) document, one whose text moved (a concurrent `didChange`),
@@ -359,9 +386,13 @@ impl ParseCoordinator {
             // the tree actually landed, so a `didClose` racing this reparse can't
             // leave stale injection entries for a gone document. (`Tree` clone is a
             // cheap refcount bump.)
-            let stored = self
-                .documents
-                .attach_tree_if_absent(&uri, &text, tree.clone());
+            let stored = self.documents.attach_tree_if_absent(
+                &uri,
+                &text,
+                expected_language_id.as_deref(),
+                expected_incarnation,
+                tree.clone(),
+            );
             if stored {
                 self.cache.populate_injections(
                     &uri,
@@ -401,22 +432,22 @@ impl ParseCoordinator {
     /// it diffs cached token arrays by `result_id` (never `changed_ranges`), so as
     /// long as the seed keeps this reparse cheap the delta stays cheap too.
     pub(crate) async fn reparse_latest(&self, uri: &Url, ticket: Option<u64>) {
-        let advance_watermark = || {
-            if let Some(ticket) = ticket {
-                self.documents.advance_watermark(uri, ticket);
-            }
-        };
-
         // Re-read the latest text + detect the language under one read guard. A
-        // missing document means a `didClose` ran — resolve the watermark and stop
-        // (no resurrection). `language_id` is captured so the tree write can reject
-        // a reopen that changed the language while this parse was in flight. The
+        // missing document means a `didClose` ran — stop without touching the
+        // watermark (no resurrection). Advancing it here would be unsafe: the
+        // watermark is per-lifetime, so if a reopen has *already* re-seeded a fresh
+        // channel, a plain advance with this prior-lifetime ticket would inflate it
+        // and prematurely release a new-lifetime reader — and it is also
+        // unnecessary, since a genuine close drops the channel and wakes its readers
+        // (they fall back). The incarnation isn't known on this path, but it isn't
+        // needed: only the post-read paths below (which captured it) advance, and
+        // they gate on it. `language_id` is captured so the tree write can reject a
+        // reopen that changed the language while this parse was in flight. The
         // `pending_seed` (a cheap `Tree` refcount-clone) is the edit's incremental
         // parse seed stashed by `didChange`; `None` for a full-text sync / freshly
         // installed parse, in which case we parse from scratch.
-        let (language_name, language_id, text, seed) = {
+        let (language_name, language_id, text, seed, incarnation) = {
             let Some(doc) = self.documents.get(uri) else {
-                advance_watermark();
                 return;
             };
             // `text_arc()` is a refcount bump, not a full copy of the document text
@@ -424,10 +455,26 @@ impl ParseCoordinator {
             let text = doc.text_arc();
             let language_id = doc.language_id().map(|s| s.to_string());
             let seed = doc.pending_seed().cloned();
+            // The lifetime this parse is for: a close+reopen before the tree write
+            // changes it, and the CAS below rejects on the mismatch (so a tree from
+            // this lifetime never attaches to a reopened document).
+            let incarnation = doc.incarnation();
             let language_name =
                 self.language
                     .detect_language(uri.path(), &text, None, language_id.as_deref());
-            (language_name, language_id, text, seed)
+            (language_name, language_id, text, seed, incarnation)
+        };
+
+        // Post-read resolutions advance the watermark **only if this lifetime is
+        // still current** — a close+reopen re-seeds the watermark at 0, and this
+        // (prior-lifetime) ticket must not inflate it and prematurely release a
+        // new-lifetime reader. Same lifetime → advances (releasing readers even on
+        // the no-language / no-tree paths, to the empty fallback).
+        let advance_watermark = || {
+            if let Some(ticket) = ticket {
+                self.documents
+                    .advance_watermark_for_incarnation(uri, ticket, incarnation);
+            }
         };
 
         let Some(language_name) = language_name else {
@@ -461,19 +508,18 @@ impl ParseCoordinator {
             .await;
 
         if let Some(tree) = parsed {
-            // Text + language CAS (non-inserting). Rejecting on a changed
-            // `language_id` closes the close→reopen-with-different-language race
-            // (a tree parsed by the old grammar must not attach to a relabelled
-            // document). The remaining residual — a same-language reopen with
-            // *identical* text — is benign (the tree is a correct parse of that
-            // text); only the watermark ticket is from the old lifetime, and reads
-            // stay correct. The strict `(incarnation, ticket)` epoch CAS
-            // (incarnation stored on the Document, atomic with the write) is the
-            // follow-up that closes even that.
+            // Text + language + incarnation CAS (non-inserting), all three checked
+            // atomically under the tree-write shard lock. Text rejects a
+            // within-lifetime stale parse (a `didChange` landed mid-parse);
+            // language rejects a reopen that relabelled the URI; incarnation
+            // rejects a same-language, identical-text reopen — the tree belongs to
+            // the prior lifetime and must not attach to the reopened document (nor
+            // let the watermark advance below run on the old lifetime's ticket).
             let stored = self.documents.update_tree_if_text_and_language_unchanged(
                 uri,
                 &text,
                 language_id.as_deref(),
+                incarnation,
                 tree.clone(),
             );
             if stored {
