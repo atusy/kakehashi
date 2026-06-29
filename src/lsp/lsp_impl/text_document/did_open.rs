@@ -196,7 +196,6 @@ impl Kakehashi {
             let parse = self.parse_coordinator();
             let injection = self.injection_coordinator();
             let diagnostic_scheduler = self.diagnostic_scheduler();
-            let documents = std::sync::Arc::clone(&self.documents);
             let client = self.client.clone();
             let settings_manager = std::sync::Arc::clone(&self.settings_manager);
             let parse_uri = uri.clone();
@@ -207,17 +206,20 @@ impl Kakehashi {
             // after the tree lands lets the re-request find the tree immediately.
             let deferred = std::mem::take(&mut deferred_events);
             tokio::spawn(async move {
-                parse
+                let landed = parse
                     .parse_document(parse_uri.clone(), Some(parse_language_id.as_str()), ticket)
                     .await;
-                // Tree-dependent downstream, only once a tree landed: a parse that
-                // produced none (failed / no language / closed mid-parse) has nothing
-                // to inject or refresh against, and `process_injections` on a
-                // tree-less doc would cancel the eager-open. Mirrors the install spawn.
-                let has_tree = documents
-                    .get(&parse_uri)
-                    .is_some_and(|doc| doc.tree().is_some());
-                if has_tree {
+                // Run the open downstream only when THIS parse's CAS landed the tree —
+                // not merely when "a tree exists". A `didChange` racing this open parse
+                // can move the text on and let the edit reparse attach the newer tree
+                // (and run `process_injections(forward=true)`) first; this parse then
+                // loses its CAS (`landed == false`). Re-running the open downstream
+                // (`process_injections(forward=false)`) over the edit's tree would
+                // supersede the edit's eager-open batch. When `landed` is false the
+                // edit reparse owns the current tree and already ran the correct
+                // downstream, so there is nothing for the open path to do. (A parse
+                // that produced no tree at all also returns false.)
+                if landed {
                     injection.process_injections(&parse_uri, false).await;
                     if !deferred.is_empty() {
                         build_notifier(&client, &settings_manager)

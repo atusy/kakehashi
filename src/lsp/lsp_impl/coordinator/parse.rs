@@ -160,12 +160,23 @@ impl ParseCoordinator {
     /// incarnation), releasing a reader waiting on it. The one path that does **not**
     /// advance is a document already gone (a `didClose` removed it): its watermark
     /// channel is gone too, so its readers have already fallen back.
+    ///
+    /// Returns `true` iff **this** call's CAS landed a tree (i.e. it is the parse
+    /// whose tree is now current). The off-ingress open caller gates its
+    /// tree-dependent downstream (`process_injections(forward=false)`, the deferred
+    /// refresh, the synthetic diagnostic) on this — **not** on "the document has a
+    /// tree": a `didChange` racing this parse can move the text on and let the edit
+    /// reparse attach the newer tree (and run `process_injections(forward=true)`)
+    /// first; this parse's CAS then rejects, and re-checking `tree().is_some()` would
+    /// wrongly see the edit's tree and re-run the *open* downstream over it,
+    /// superseding the edit's eager-open batch. Gating on the own-CAS result is the
+    /// same discipline `reparse_latest` follows for its `populate_injections`.
     pub(crate) async fn parse_document(
         &self,
         uri: Url,
         language_id: Option<&str>,
         ticket: Option<u64>,
-    ) {
+    ) -> bool {
         let mut events = Vec::new();
 
         // Read the text the registering didOpen already stored (a refcount bump, not
@@ -184,7 +195,7 @@ impl ParseCoordinator {
             .get(&uri)
             .map(|doc| (doc.text_arc(), doc.incarnation()))
         else {
-            return;
+            return false;
         };
 
         // Publish the watermark on whichever path resolves the parse below, but
@@ -234,7 +245,9 @@ impl ParseCoordinator {
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                return;
+                // No tree landed (the parser previously crashed): the open caller
+                // must not run its tree-dependent downstream.
+                return false;
             }
 
             let load_result = self.language.ensure_language_loaded(&language_name);
@@ -291,7 +304,11 @@ impl ParseCoordinator {
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                return;
+                // `stored` is exactly "this call's CAS landed the tree": false when a
+                // racing `didChange`/reopen moved the text or incarnation on and the
+                // edit reparse won, in which case the open downstream must NOT re-run
+                // over the edit's tree.
+                return stored;
             }
         }
 
@@ -310,6 +327,8 @@ impl ParseCoordinator {
         }
         advance_watermark();
         self.notifier().log_language_events(&events).await;
+        // Parsed to nothing / no detectable language → no tree landed.
+        false
     }
 
     /// Re-parse a document after its parser finished installing, **off the
