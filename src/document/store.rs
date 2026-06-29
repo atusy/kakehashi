@@ -236,6 +236,35 @@ impl DocumentStore {
         self.ensure_watermark_entry(&uri);
     }
 
+    /// Apply a `didChange`'s new text and stash an **incremental parse seed**,
+    /// clearing the reader-visible tree — the per-document-parse-actor flip's edit
+    /// path.
+    ///
+    /// Replaces the prior `update_document(uri, text, None)`: it still clears the
+    /// reader-visible tree (so a reader never sees a tree predating this edit) and
+    /// keeps the same side effects (tree-availability → false, watermark entry
+    /// ensured), but additionally stashes the pre-edit tree — with `edits` applied —
+    /// as the seed for the off-ingress `reparse_latest`'s incremental parse. With no
+    /// `edits` (full-text sync) no seed is kept (#348). Coalesced edits accumulate
+    /// onto the seed (see [`Document::apply_edit_and_seed`]).
+    ///
+    /// Called under the per-URI edit lock with the document known to exist; the
+    /// `Vacant` branch (a reordered notification for an unopened URI) inserts a
+    /// tree-less document to mirror the prior `update_document` behavior.
+    pub(crate) fn apply_edit_clearing_tree(&self, uri: Url, text: String, edits: &[InputEdit]) {
+        match self.documents.entry(uri.clone()) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().apply_edit_and_seed(text, edits);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Document::new(text));
+            }
+        }
+        self.update_tree_availability(&uri, false);
+        // Keep the "live document ⟺ watermark entry" invariant (see `update_document`).
+        self.ensure_watermark_entry(&uri);
+    }
+
     /// Store `new_tree` for an **existing** document, but only if its current text
     /// still equals `expected_text`. Returns `true` iff the tree was stored.
     ///
