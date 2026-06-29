@@ -2,7 +2,7 @@
 
 use tower_lsp_server::ls_types::DidOpenTextDocumentParams;
 
-use super::super::{Kakehashi, uri_to_url};
+use super::super::{Kakehashi, build_notifier, uri_to_url};
 use crate::language::LanguageEvent;
 
 impl Kakehashi {
@@ -135,52 +135,98 @@ impl Kakehashi {
         // has resolved.
         let ticket = crate::lsp::current_writer_ticket();
 
-        // Only parse if auto-install was NOT triggered. If it was, the spawned
-        // install task reparses off-ingress once the parser is written
-        // (reparse_installed_document), so we must not parse inline here.
-        if !skip_parse {
+        // Parse the document and run its tree-dependent downstream. Three shapes:
+        //
+        // - **auto-install (`skip_parse`)**: the install task spawned above reparses
+        //   off-ingress and runs its own downstream once the parser lands; here we
+        //   only resolve this open's watermark (so a gated reader isn't stranded) and
+        //   run the non-tree-dependent handler tail.
+        // - **CLI one-shot**: parse INLINE and await the downstream. There is one
+        //   document and no concurrent same-URI op to wedge, and the caller reads the
+        //   result — plus the eager-open handles `process_injections` registers
+        //   (`wait_eager_open_finished`) — the moment `did_open_impl` returns, so the
+        //   open parse must be complete before returning.
+        // - **interactive LSP (#6)**: flip the present-parser parse OFF the ingress
+        //   ticket, mirroring the auto-install spawn — a slow/large open parse no
+        //   longer holds the writer ticket and wedges later same-URI readers/writers.
+        //   The handler returns immediately; the spawned parse advances the watermark
+        //   to `ticket` (releasing a reader gated behind this open) and runs the
+        //   tree-dependent downstream once the tree lands.
+        if skip_parse {
+            if let Some(ticket) = ticket {
+                // Parsing is deferred to the spawned off-ingress install reparse.
+                // Advance the watermark now so a reader gated behind this open does
+                // not stall to its timeout waiting for a parse that won't run on the
+                // ingress path; it proceeds and observes the (still tree-less)
+                // install-pending document via its existing has-tree wait.
+                self.documents.advance_watermark(&uri, ticket);
+            }
+            // Deferred SemanticTokensRefresh (empty unless the load succeeded, which
+            // in the skip path it did not — kept for symmetry).
+            if !deferred_events.is_empty() {
+                self.notifier().log_language_events(&deferred_events).await;
+            }
+            // pull-first-diagnostic-forwarding Phase 2: proactive synthetic diagnostic
+            // for clients without pull support. Skipped in one-shot CLI mode (#489):
+            // no editor consumes the proactive `publishDiagnostics` (the stub client
+            // pump discards it), the task is wasted downstream work, and its
+            // abort-without-join on `didClose` races the bridge-state sweep. The
+            // install spawn re-fires it once its reparse produces a tree.
+            if !self.is_cli_mode() {
+                self.diagnostic_scheduler()
+                    .spawn_synthetic_diagnostic_task(uri);
+            }
+        } else if self.is_cli_mode() {
             self.parse_coordinator()
                 .parse_document(uri.clone(), Some(&language_id), ticket)
                 .await;
-        } else if let Some(ticket) = ticket {
-            // Parsing is deferred to the spawned off-ingress install reparse.
-            // Advance the watermark now so a reader gated behind this open does not
-            // stall to its timeout waiting for a parse that won't run on the
-            // ingress path;
-            // it proceeds and observes the (still tree-less) install-pending
-            // document via its existing has-tree wait, exactly as before this
-            // signal existed.
-            self.documents.advance_watermark(&uri, ticket);
-        }
-
-        // Now handle deferred SemanticTokensRefresh events after document is parsed
-        if !deferred_events.is_empty() {
-            self.notifier().log_language_events(&deferred_events).await;
-        }
-
-        // Process injected languages: auto-install missing parsers and spawn bridge servers.
-        // This must be called AFTER parse_document so we have access to the AST.
-        // In the skip-parse (auto-install) path there is no tree yet and the
-        // spawned install task runs this itself once its reparse produces one, so
-        // skip it here to avoid a redundant no-op that would cancel the eager-open
-        // the spawn is about to start.
-        if !skip_parse {
+            if !deferred_events.is_empty() {
+                self.notifier().log_language_events(&deferred_events).await;
+            }
+            // AFTER the parse so the AST exists; registers the eager-open handles the
+            // CLI's `wait_eager_open_finished` polls. No synthetic diagnostic in CLI
+            // mode (#489).
             self.injection_coordinator()
                 .process_injections(&uri, false)
                 .await;
-        }
-
-        // pull-first-diagnostic-forwarding Phase 2: Trigger synthetic diagnostic push on didOpen
-        // This provides proactive diagnostics for clients that don't support pull diagnostics.
-        //
-        // Skipped in one-shot CLI mode (#489): no editor consumes the proactive
-        // `publishDiagnostics` (the stub client pump discards it), so the task is
-        // pure wasted downstream work, and its abort-without-join on `didClose`
-        // races the bridge-state sweep. The CLI's reported diagnostics come from the
-        // explicit `diagnostic_impl` pull, which is unaffected.
-        if !self.is_cli_mode() {
-            self.diagnostic_scheduler()
-                .spawn_synthetic_diagnostic_task(uri);
+        } else {
+            // #6 off-ingress open flip (interactive LSP). The owned coordinators /
+            // Arcs are captured into the spawned task; the handler returns without
+            // awaiting the parse.
+            let parse = self.parse_coordinator();
+            let injection = self.injection_coordinator();
+            let diagnostic_scheduler = self.diagnostic_scheduler();
+            let documents = std::sync::Arc::clone(&self.documents);
+            let client = self.client.clone();
+            let settings_manager = std::sync::Arc::clone(&self.settings_manager);
+            let parse_uri = uri.clone();
+            let parse_language_id = language_id.clone();
+            // Move the deferred SemanticTokensRefresh into the task: firing it now (at
+            // handler return) would make the client re-request semantic tokens against
+            // a still-tree-less document and burn its watermark settle wait; firing it
+            // after the tree lands lets the re-request find the tree immediately.
+            let deferred = std::mem::take(&mut deferred_events);
+            tokio::spawn(async move {
+                parse
+                    .parse_document(parse_uri.clone(), Some(parse_language_id.as_str()), ticket)
+                    .await;
+                // Tree-dependent downstream, only once a tree landed: a parse that
+                // produced none (failed / no language / closed mid-parse) has nothing
+                // to inject or refresh against, and `process_injections` on a
+                // tree-less doc would cancel the eager-open. Mirrors the install spawn.
+                let has_tree = documents
+                    .get(&parse_uri)
+                    .is_some_and(|doc| doc.tree().is_some());
+                if has_tree {
+                    injection.process_injections(&parse_uri, false).await;
+                    if !deferred.is_empty() {
+                        build_notifier(&client, &settings_manager)
+                            .log_language_events(&deferred)
+                            .await;
+                    }
+                    diagnostic_scheduler.spawn_synthetic_diagnostic_task(parse_uri);
+                }
+            });
         }
 
         // NOTE: No semantic_tokens_refresh() on didOpen.
@@ -300,15 +346,23 @@ print("hello")
             })
             .await;
 
-        let document = server
-            .documents
-            .get(&uri)
-            .expect("document should be stored");
+        // The present-parser open parse now runs off the ingress ticket (#6), so the
+        // tree + injection cache appear asynchronously after `did_open_impl` returns.
+        wait_until(|| {
+            server
+                .cache
+                .get_injections(&uri)
+                .is_some_and(|injections| injections.len() == 1)
+        })
+        .await;
+
         assert!(
-            document.tree().is_some(),
+            server
+                .documents
+                .get(&uri)
+                .is_some_and(|doc| doc.tree().is_some()),
             "did_open should parse the document"
         );
-        drop(document);
 
         let injections = server
             .cache
@@ -1046,11 +1100,12 @@ print("hello")
     /// install) must not gate it.
     ///
     /// We block the parse deterministically by holding the parser-pool lock, so
-    /// `parse_document` -> `parse_with_pool` parks on `pool.lock().await` and
-    /// never finishes within the test. We drive `did_open_impl` concurrently and
-    /// assert the host doc still opens. Before the host-tier hoist the attach sat
-    /// *after* this (now-blocked) parse, so the host doc would never open and this
-    /// test would fail at its timeout.
+    /// the (now off-ingress, #6) spawned `parse_document` -> `parse_with_pool` parks
+    /// on `pool.lock().await` and never finishes within the test. The host-tier
+    /// hoist runs synchronously in the handler BEFORE the parse is spawned, so the
+    /// host doc still attaches while the parse is blocked — proving it does not wait
+    /// for the parse. (Before the hoist the attach sat *after* the parse, so with the
+    /// pool lock held the host doc would never open and this test would time out.)
     #[tokio::test]
     async fn host_document_attaches_before_parse_completes() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1062,7 +1117,7 @@ print("hello")
         let uri = Url::parse("file:///test/host_attach_no_wait.rs").unwrap();
         let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
 
-        // Hold the parser-pool lock so the parse parks indefinitely (see above).
+        // Hold the parser-pool lock so the spawned parse parks indefinitely (above).
         let pool_guard = server.parser_pool.lock().await;
 
         let params = DidOpenTextDocumentParams {
@@ -1074,44 +1129,32 @@ print("hello")
             },
         };
 
-        let did_open = server.did_open_impl(params);
-        tokio::pin!(did_open);
+        // `did_open_impl` returns immediately — the open parse is off the ingress
+        // ticket (#6) and parked on the held pool lock. The host doc must already be
+        // attaching by the time it returns, since the hoist precedes the spawn.
+        server.did_open_impl(params).await;
 
-        tokio::select! {
-            // The whole point of this test is that the host opens *while the parse
-            // is blocked*. If the handler returns instead, the parse wasn't
-            // actually gating (e.g. parsing got skipped) and the old post-parse
-            // attach position would pass too — i.e. the test would no longer
-            // discriminate the hoist. Fail loudly rather than checking vacuously.
-            _ = &mut did_open => {
-                panic!(
-                    "did_open_impl returned while the parse was blocked; the parse \
-                     was not gating, so this test cannot discriminate the host-tier hoist"
-                );
-            }
-            result = timeout(Duration::from_secs(2), async {
-                loop {
-                    if server
-                        .bridge
-                        .pool()
-                        .is_host_document_opened(&uri, "rust_ls")
-                        .await
-                    {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .is_host_document_opened(&uri, "rust_ls")
+                    .await
+                {
+                    break;
                 }
-            }) => {
-                result.expect(
-                    "host document must attach to the _self server without waiting for the parse",
-                );
+                tokio::task::yield_now().await;
             }
-        }
+        })
+        .await
+        .expect(
+            "host document must attach to the _self server while the parse is blocked \
+             (the hoist precedes the off-ingress parse spawn)",
+        );
 
-        // Cleanup: release the lock so the parked parse can finish, then drive
-        // the handler to completion.
+        // Cleanup: release the lock so the parked spawned parse can finish.
         drop(pool_guard);
-        did_open.await;
     }
 
     /// #425 regression guard: host `pullFallback = false` gates the host **pull**
@@ -1241,6 +1284,10 @@ print("hello")
             })
             .await;
 
+        // The present-parser open parse now runs off the ingress ticket (#6), so the
+        // synthetic diagnostic is scheduled by the spawned task once the tree lands —
+        // asynchronously after `did_open_impl` returns.
+        wait_until(|| server.synthetic_diagnostics.has_active_task(&uri)).await;
         assert!(
             server.synthetic_diagnostics.has_active_task(&uri),
             "LSP-mode didOpen schedules the synthetic diagnostic task"
