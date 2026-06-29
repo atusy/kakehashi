@@ -426,7 +426,8 @@ impl DiagnosticPublisher {
 
     /// Ask pull-mode clients to re-pull diagnostics (`workspace/diagnostic/refresh`)
     /// after a change the editor has no event to learn about — a **spontaneous
-    /// downstream push**, or a **crash-driven eviction** — moved the merged set.
+    /// downstream push**, a **crash-driven eviction**, or a **downstream server's
+    /// own refresh request** forwarded upstream — moved (or invalidated) the set.
     ///
     /// kakehashi advertises `diagnosticProvider`, so a pull-mode editor (e.g.
     /// Neovim) displays the diagnostics it *pulled* and ignores our
@@ -440,8 +441,10 @@ impl DiagnosticPublisher {
     ///
     /// Emitted **off** the per-host republish lock and **only** from the origins
     /// the editor can't learn about on its own — the push-origin paths
-    /// ([`Self::publish_host_push`], [`Self::publish_region_push`]) and the
-    /// crash-driven eviction ([`Self::evict_connection_diagnostics`]) — never from
+    /// ([`Self::publish_host_push`], [`Self::publish_region_push`]), the
+    /// crash-driven eviction ([`Self::evict_connection_diagnostics`]), and the
+    /// upstream forwarding loop relaying a downstream server's own
+    /// `workspace/diagnostic/refresh` (`deliver_upstream_notification`) — never from
     /// the pull-origin republish ([`Self::publish_pull_layer`]), the
     /// editor-originated eviction paths ([`Self::clear_pull_layer`],
     /// [`Self::clear_host`]), nor the edit-origin re-merge (`did_change`): those
@@ -464,7 +467,7 @@ impl DiagnosticPublisher {
     /// client that supports pull but not refresh would silently ignore the request,
     /// leaking a tower-lsp pending-request entry plus a parked task — the same gate
     /// the `semantic_tokens_refresh` path uses.
-    fn request_pull_diagnostic_refresh(&self) {
+    pub(crate) fn request_pull_diagnostic_refresh(&self) {
         let supported = self
             .settings_manager
             .client_capabilities_lock()

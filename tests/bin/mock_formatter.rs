@@ -62,6 +62,9 @@
 //!   the process on the next `didChange` to simulate a downstream crash while the
 //!   host stays open. Used to prove the bridge evicts the dead connection's slots
 //!   and republishes the host cleared (#469).
+//! - `diagnostics-refresh` — sends a `workspace/diagnostic/refresh` server→client
+//!   request on `didOpen`. The bridge forwards it upstream to the editor; used to
+//!   prove that forward is capability-gated (#521).
 //! - `on-type` — advertises `documentOnTypeFormattingProvider` with `}` and
 //!   `;` as triggers; answers `textDocument/onTypeFormatting` with the
 //!   uppercasing whole-document edit for ANY typed character (bridge-side
@@ -265,6 +268,14 @@ fn main() {
                             "textDocument/publishDiagnostics",
                             push_diagnostics(uri, true),
                         );
+                    }
+                    // `diagnostics-refresh`: ask the client (via the bridge) to
+                    // re-pull diagnostics. The bridge forwards this upstream to the
+                    // editor (#521). Fire-and-forget: the bridge's `null` ack comes
+                    // back as a response with no `method`, which the read loop
+                    // ignores. A fixed id is fine since nothing awaits the ack.
+                    if mode == "diagnostics-refresh" {
+                        request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
                     }
                 }
             }
@@ -651,6 +662,14 @@ fn push_diagnostics(uri: &str, present: bool) -> Value {
         json!([])
     };
     json!({ "uri": uri, "diagnostics": diagnostics })
+}
+
+/// Send a server→client **request** (a message carrying both `id` and `method`,
+/// no params) to the bridge — e.g. an unsolicited `workspace/diagnostic/refresh`.
+fn request<W: Write>(writer: &mut W, id: Value, method: &str) {
+    let body = json!({ "jsonrpc": "2.0", "id": id, "method": method }).to_string();
+    let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
+    let _ = writer.flush();
 }
 
 /// Send a JSON-RPC success response for `id` (no-op for notifications).
