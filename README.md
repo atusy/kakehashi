@@ -73,17 +73,21 @@ To let kakehashi auto-install the parsers it needs, make sure a **C compiler** i
 
 ```lua
 vim.lsp.config.kakehashi = {
-  cmd = { "kakehashi" },
-  init_options = { autoInstall = true },
+    cmd = { "kakehashi" },
+    init_options = { autoInstall = true },
+    on_attach = function(_, bufnr)
+        -- Let kakehashi own highlighting (avoids double-highlighting)
+        vim.api.nvim_create_autocmd("LspTokenUpdate", {
+            buffer = bufnr,
+            once = true,
+            callback = function()
+                vim.opt_local.syntax = "OFF"
+                vim.treesitter.stop(bufnr)
+            end,
+        })
+    end,
 }
 vim.lsp.enable("kakehashi")
-
--- Let kakehashi own highlighting (avoids double-highlighting)
-vim.api.nvim_create_autocmd("FileType", {
-  callback = function()
-    vim.treesitter.stop()
-  end,
-})
 ```
 
 Open a file and you'll have highlighting and smart selection immediately.
