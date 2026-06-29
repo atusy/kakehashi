@@ -40,6 +40,13 @@ impl LanguageServerPool {
     /// ones jump straight to Closed. When `timeout` elapses, survivors are
     /// force-killed (SIGTERM→SIGKILL on Unix) and all enter Closed.
     pub(crate) async fn shutdown_all_with_timeout(&self, timeout: GlobalShutdownTimeout) {
+        // Close the new-spawn window FIRST, before snapshotting connections below:
+        // a late eager spawn that acquires the `connections` lock after this point
+        // is rejected by `get_or_create_connection_resolved`, so it cannot insert a
+        // connection that escapes this teardown. See `LanguageServerPool::shutting_down`.
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
         // Track connections that were skipped for logging (minimize lock duration)
         let mut failed_connections: Vec<super::ConnectionKey> = Vec::new();
         let mut already_closing: Vec<super::ConnectionKey> = Vec::new();

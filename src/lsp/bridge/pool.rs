@@ -39,7 +39,7 @@ pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -184,6 +184,20 @@ pub struct LanguageServerPool {
     /// workspace root (issue #382); documents sharing a root (or the
     /// client-root fallback) still share one process.
     connections: Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    /// Gate that rejects **new** connection spawns once shutdown has begun.
+    ///
+    /// `shutdown_all` snapshots the live connections and tears them down, but a
+    /// late eager spawn (an in-flight `process_injections` / eager-open task whose
+    /// body started before `abort_all_eager_open` could cancel it) could otherwise
+    /// create and insert a connection *after* that snapshot — escaping teardown and
+    /// leaking a child process past shutdown. Set true at the very start of
+    /// `shutdown_all_with_timeout`, and checked inside the `connections` lock in
+    /// `get_or_create_connection_resolved`: holding that same lock makes the
+    /// set-then-snapshot and the check-then-insert mutually exclusive, so a spawn
+    /// either lands before the snapshot (and is torn down) or is rejected. Additive
+    /// to `abort_all_eager_open` + the per-task `CancellationToken`s, which already
+    /// stop most eager spawns before they reach this point.
+    shutting_down: AtomicBool,
     /// Document tracking for virtual documents (versions, host mappings, opened state)
     document_tracker: DocumentTracker,
     /// Host-document sync state per `(uri, connection key)`
@@ -289,6 +303,7 @@ impl LanguageServerPool {
         let (upstream_request_tx, upstream_request_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             connections: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
             document_tracker: DocumentTracker::new(),
             host_documents: Mutex::new(HashMap::new()),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
@@ -1242,6 +1257,20 @@ impl LanguageServerPool {
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
+
+        // Reject new spawns once shutdown has begun. Checked here, INSIDE the
+        // `connections` lock that `shutdown_all` also takes to snapshot: if shutdown
+        // set the flag first, this rejects (no escaping connection); if this inserts
+        // first, shutdown's later snapshot sees the connection and tears it down.
+        // Relaxed is sufficient — the lock provides the happens-before. Callers
+        // (eager open / lazy request) already degrade gracefully on a connection
+        // error, so an `Interrupted` here is a no-op at shutdown time.
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "bridge pool is shutting down; rejecting new connection spawn",
+            ));
+        }
 
         // Get consecutive panic count for this connection
         let panic_count = {
@@ -3322,6 +3351,33 @@ mod tests {
     // ========================================
     // Forced Shutdown Tests
     // ========================================
+
+    /// A spawn that reaches the pool after shutdown has begun must be rejected,
+    /// not create a connection that escapes `shutdown_all`'s snapshot+teardown and
+    /// leaks a child process. Guards the narrow terminal-time eager-spawn window
+    /// (`LanguageServerPool::shutting_down`).
+    #[tokio::test]
+    async fn rejects_new_connection_spawn_after_shutdown() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+
+        // Shutdown with no live connections still arms the new-spawn gate.
+        pool.shutdown_all().await;
+
+        let err = pool
+            .get_or_create_connection_with_timeout("test", &config, None, Duration::from_secs(5))
+            .await
+            .map(|_| ()) // ConnectionHandle isn't Debug; discard it for expect_err
+            .expect_err("a spawn after shutdown must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+
+        // Nothing was inserted — no connection escaped teardown.
+        let connections = pool.connections.lock().await;
+        assert!(
+            connections.is_empty(),
+            "a rejected spawn must not insert a connection"
+        );
+    }
 
     /// Test that pool.shutdown_all_with_timeout force-kills unresponsive processes.
     ///
