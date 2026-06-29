@@ -251,18 +251,27 @@ impl DocumentStore {
     /// Called under the per-URI edit lock with the document known to exist; the
     /// `Vacant` branch (a reordered notification for an unopened URI) inserts a
     /// tree-less document to mirror the prior `update_document` behavior.
-    pub(crate) fn apply_edit_clearing_tree(&self, uri: Url, text: String, edits: &[InputEdit]) {
-        match self.documents.entry(uri.clone()) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().apply_edit_and_seed(text, edits);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(Document::new(text));
+    pub(crate) fn apply_edit_clearing_tree(&self, uri: &Url, text: String, edits: &[InputEdit]) {
+        // Hot path (a live document being edited): `get_mut` borrows the key, so no
+        // `Url` clone per keystroke. Only a miss falls back to `entry` (owned key),
+        // which also re-checks for a document a concurrent open inserted between the
+        // `get_mut` and here — mirroring `ParseScheduler::schedule` and the atomicity
+        // of the prior `update_document`. The `RefMut` / entry is dropped before the
+        // parse-state and watermark updates below (separate maps), keeping the
+        // `documents` shard lock held no longer than `update_document` did.
+        if let Some(mut doc) = self.documents.get_mut(uri) {
+            doc.apply_edit_and_seed(text, edits);
+        } else {
+            match self.documents.entry(uri.clone()) {
+                Entry::Occupied(mut entry) => entry.get_mut().apply_edit_and_seed(text, edits),
+                Entry::Vacant(entry) => {
+                    entry.insert(Document::new(text));
+                }
             }
         }
-        self.update_tree_availability(&uri, false);
+        self.update_tree_availability(uri, false);
         // Keep the "live document ⟺ watermark entry" invariant (see `update_document`).
-        self.ensure_watermark_entry(&uri);
+        self.ensure_watermark_entry(uri);
     }
 
     /// Store `new_tree` for an **existing** document, but only if its current text
