@@ -673,12 +673,19 @@ impl LspClient {
                 return None;
             }
 
-            let message = self.try_receive_message(remaining)?;
+            let mut message = self.try_receive_message(remaining)?;
 
             if message.get("id").is_some()
                 && message.get("method").and_then(|m| m.as_str()) == Some(expected_method)
             {
-                return Some(message.get("params").cloned().unwrap_or(Value::Null));
+                // `message` is discarded right after, so move `params` out instead
+                // of cloning it.
+                return Some(
+                    message
+                        .get_mut("params")
+                        .map(Value::take)
+                        .unwrap_or(Value::Null),
+                );
             }
             // A response or notification, or a different request — skip and keep
             // waiting within the deadline.
