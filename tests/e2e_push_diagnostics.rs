@@ -49,6 +49,10 @@ fn init_client() -> (LspClient, tempfile::TempDir) {
 }
 
 fn init_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
+    init_client_with_mode_caps(mode, json!({}))
+}
+
+fn init_client_with_mode_caps(mode: &str, capabilities: Value) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("push_diagnostics.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -63,7 +67,7 @@ fn init_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": {},
+            "capabilities": capabilities,
             "workspaceFolders": null,
             "initializationOptions": {
                 "languageServers": {
@@ -420,6 +424,88 @@ fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
     assert!(
         cleared.is_some(),
         "a crashed downstream's pushed diagnostics must be evicted and the host republished cleared"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+/// Client capabilities advertising pull-diagnostic refresh support, so the bridge
+/// will send `workspace/diagnostic/refresh` (it's gated on this; an editor that
+/// doesn't advertise it is never sent the request).
+fn refresh_capable_caps() -> Value {
+    json!({ "workspace": { "diagnostics": { "refreshSupport": true } } })
+}
+
+#[test]
+fn e2e_downstream_crash_refreshes_pull_clients() {
+    // #499: when a downstream server crash evicts its diagnostics and clears the
+    // host, a pull-mode editor (which displays what it *pulled*, not our push) has
+    // no event to learn the diagnostics vanished — so the bridge must nudge it with
+    // `workspace/diagnostic/refresh`. With a refresh-capable client this asserts
+    // the wire path the unit test can't reach (server→client requests are
+    // suppressed until `initialize`, which only the spawned-server e2e harness drives).
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-push-crash", refresh_capable_caps());
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": MD_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": MD_TEXT
+            }
+        }),
+    );
+
+    // The crash mock pushes one diagnostic on didOpen; the editor receives it.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("editor should receive the pushed diagnostic before the crash");
+
+    // That spontaneous push itself changed the merged set, so it also drives a
+    // refresh (push/pull-divergence, #422). Consume it so the next refresh we wait
+    // for is unambiguously the crash-eviction one (#499).
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+            .is_some(),
+        "the spontaneous push must drive a workspace/diagnostic/refresh (#422)"
+    );
+
+    // The content-changing edit reaches the mock, driving it to exit (crash). The
+    // bridge's reader sees EOF, evicts the dead connection's slots, and republishes
+    // the host cleared.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
+        }),
+    );
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            cleared_host_diag,
+        )
+        .expect("the crash must evict the dead server's diagnostic and republish cleared");
+
+    // The eviction changed the merged set with no event the editor could see, so
+    // the bridge must emit a second `workspace/diagnostic/refresh` (#499) after the
+    // cleared publish, telling the pull-mode editor to re-pull the now-current set.
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+            .is_some(),
+        "a crash eviction that clears the host must drive a workspace/diagnostic/refresh (#499)"
     );
 
     client.send_request("shutdown", json!(null));
