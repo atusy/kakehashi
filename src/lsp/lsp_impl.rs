@@ -95,6 +95,7 @@ pub(super) async fn apply_shared_settings(
     client: &Client,
     language: &std::sync::Arc<LanguageCoordinator>,
     settings_manager: &SettingsManager,
+    cache: &CacheCoordinator,
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
 ) {
@@ -103,6 +104,14 @@ pub(super) async fn apply_shared_settings(
         Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
         None => settings_manager.apply_settings(settings),
     }
+    // A settings/query reload can change tokenization for unchanged text, so drop
+    // the content-hash-keyed semantic-token cache — otherwise a repeat request on
+    // an unedited document would serve tokens from the old queries. Cleared at this
+    // single choke point so every reload path (initialize, didChangeConfiguration,
+    // and the auto-install reload) is covered, and *before* the refresh below so the
+    // editor's re-request recomputes. `didChange` deliberately does NOT clear (delta
+    // needs the previous tokens); only a query/config reload does.
+    cache.clear_all_semantic_tokens();
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
@@ -291,14 +300,11 @@ impl Kakehashi {
             &self.client,
             &self.language,
             &self.settings_manager,
+            &self.cache,
             Some(raw_settings),
             settings,
         )
         .await;
-        // A settings/query reload can change tokenization for unchanged text, so
-        // drop the content-hash-keyed semantic-token cache — otherwise a repeat
-        // request on an unedited document would serve tokens from the old queries.
-        self.cache.clear_all_semantic_tokens();
         self.warn_on_misconfigured_settings().await;
     }
 
