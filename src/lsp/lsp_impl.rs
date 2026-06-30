@@ -93,7 +93,7 @@ pub(super) fn bridge_configs_for_injection_language(
 
 pub(super) async fn apply_shared_settings(
     client: &Client,
-    language: &std::sync::Arc<LanguageCoordinator>,
+    language: &LanguageCoordinator,
     settings_manager: &SettingsManager,
     cache: &CacheCoordinator,
     raw_settings: Option<RawWorkspaceSettings>,
