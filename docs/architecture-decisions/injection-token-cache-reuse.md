@@ -192,14 +192,49 @@ conversion, pre-resolved token indices). Real wins, but all O(work) constant-
 factor reductions — none removes the *recompute-everything* structure. Kept as
 complementary, not a substitute.
 
+## Correctness hazards
+
+The cache is **push-based / evict-on-mutation**: `get` does no read-time
+validity check, so every mutation path that can change a region's tokens must
+evict its entry before it is re-served. The existing eviction (edit-overlap,
+content/language change, region removed, close) covers most paths. An audit
+surfaced four the original design did not address:
+
+1. **`injection.combined` sibling cross-contamination (showstopper).** Combined
+   injections are discovered as separate `region_id`s but tokenized *jointly*
+   (multiple blocks parsed as one document). Editing one block does not change a
+   sibling's content hash, so the sibling would serve a hit computed in the
+   *old* joint context. **Mitigation: exclude combined groups from the cache** —
+   the v1 predicate already does, and the vendored Markdown query reserves
+   `combined` for HTML anyway.
+2. **Config / query reload (showstopper).** `bump_semantic_token_generation`
+   (PR #530) clears the whole-doc cache but never touches `InjectionTokenCache`,
+   which has no `clear()` and no generation in its key. A query/settings reload
+   with unchanged text would serve tokens computed under the *old* highlight
+   query. **Mitigation: clear the injection cache in
+   `bump_semantic_token_generation`, or fold the generation into its validity.**
+3. **Parser-load race (guard).** `process_injection_sync` returns empty tokens
+   when a region's parser is not yet loaded — indistinguishable from a genuinely
+   empty region. **Mitigation: never store on the parser-missing branch.**
+4. **Row-0 `start_column` re-anchoring (guard, sidestepped by v1 scope).** A
+   same-line-before edit shifts row-0 columns without changing the content hash.
+   Out of scope for v1 by the `content_start_col == 0` predicate; required only
+   if a later version caches non-column-0 regions.
+
+Stale-position bugs here are the same family as the rejected content-epoch
+version gate and the delta-encoding position trap — a stale hit is
+*wrong-colored text*, worse than a slow recompute. The v1 scope plus the
+two showstopper mitigations are the price of correctness, not optional polish.
+
 ## Consequences
 
 ### Positive
 
-- Editing one region recomputes one region; the rest are O(token-count) copies
-  with an offset. Turns per-edit cost from "reparse whole document" into
-  "reparse the edited region", which is the dominant cost for large injected
-  documents.
+- On the typing path (where the whole-doc cache is structurally useless),
+  editing one region recomputes one region; the rest are O(token-count) copies
+  with a line offset. Measured ceiling at 150–300 injection blocks: ~−1/3 of
+  per-keystroke compute for tokenize-only, up to ~−60% with the discovery
+  companion.
 - Reuses infrastructure already built, maintained, and tested (`InjectionMap`,
   `content_hash`, eviction in `src/lsp/cache.rs`).
 
@@ -207,12 +242,14 @@ complementary, not a substitute.
 
 - `RawToken` becomes a cross-request persisted type, so its memory layout and
   any future field changes now affect cache validity, not just one request.
-- Re-anchoring logic is a new correctness surface: an off-by-one in the line/
-  column offset would mis-place every token in a reused region. Needs targeted
-  tests (edit-above-shifts-region, same-line-edit-before-region, region added/
-  removed) plus the existing e2e snapshot coverage as a backstop.
-- Column re-anchoring is only trivial for the region's *first* line; multi-line
-  regions whose `start_column` changes need care (only line-0 columns shift).
+- Re-anchoring logic is a new correctness surface; the v1 scope bounds it to a
+  trivial `line += Δ`, but still needs targeted tests (edit-above-shifts-region,
+  region added/removed) plus the existing e2e snapshot coverage as a backstop.
+- **The win is bounded.** Host-collect + discovery + finalize stay on every
+  keystroke (~2/3 of the recompute for tokenize-only v1). On fast hardware the
+  absolute saving is sub-frame until documents are very large — this lever is
+  for very large injected documents and/or slower hardware, not a universal
+  speedup.
 
 ### Neutral
 
@@ -224,6 +261,12 @@ complementary, not a substitute.
 Only the invalidation half is implemented today: `InjectionMap` population +
 `find_overlapping` + `InjectionTokenCache::{remove, clear_document}` are wired in
 `src/lsp/cache.rs`; `InjectionTokenCache::{store, get}` are `#[cfg(test)]`-only
-and never called from production. This ADR records the intended design for the
-reuse half; until it lands, the cache is maintained-but-unread and the hot path
-recomputes in full.
+and never called from production. The whole-document layer (Option C) shipped
+separately as PR #530.
+
+This ADR records the intended design for the per-region reuse half — scoped to
+the language-agnostic translation predicate, gated on the two showstopper
+mitigations (exclude `injection.combined`; clear the injection cache on
+generation bump) — plus the injection-discovery companion as a follow-up. Until
+it lands, the cache is maintained-but-unread and the typing path recomputes in
+full.
