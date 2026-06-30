@@ -79,7 +79,7 @@ struct EagerOpenBatch {
 /// genuinely benefits from a semantic name (e.g., document lifecycle, shutdown).
 pub(crate) struct BridgeCoordinator {
     pool: Arc<LanguageServerPool>,
-    node_tracker: NodeTracker,
+    node_tracker: Arc<NodeTracker>,
     /// Cancel forwarder for upstream cancel notification and downstream forwarding.
     ///
     /// This is shared with the `RequestIdCapture` middleware via `cancel_forwarder()`.
@@ -127,7 +127,7 @@ impl BridgeCoordinator {
         let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
         Self {
             pool,
-            node_tracker: NodeTracker::new(),
+            node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             eager_open_tasks: DashMap::new(),
@@ -149,7 +149,7 @@ impl BridgeCoordinator {
     ) -> Self {
         Self {
             pool,
-            node_tracker: NodeTracker::new(),
+            node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             eager_open_tasks: DashMap::new(),

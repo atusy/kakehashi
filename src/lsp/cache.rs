@@ -34,7 +34,7 @@ pub(crate) type RequestId = u64;
 pub(crate) struct CacheCoordinator {
     semantic_cache: SemanticTokenCache,
     injection_map: InjectionMap,
-    injection_token_cache: InjectionTokenCache,
+    injection_token_cache: std::sync::Arc<InjectionTokenCache>,
     request_tracker: SemanticRequestTracker,
     /// Settings generation folded into every semantic-token `cache_key`. Bumped
     /// on a query/config reload so cached tokens computed under the old queries
@@ -50,7 +50,7 @@ impl CacheCoordinator {
         Self {
             semantic_cache: SemanticTokenCache::new(),
             injection_map: InjectionMap::new(),
-            injection_token_cache: InjectionTokenCache::new(),
+            injection_token_cache: std::sync::Arc::new(InjectionTokenCache::new()),
             request_tracker: SemanticRequestTracker::new(),
             semantic_token_generation: std::sync::atomic::AtomicU64::new(0),
         }
