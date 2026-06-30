@@ -1,8 +1,8 @@
 # Injection Token Cache Reuse
 
 <!--
-Status: Proposed (aspirational). The invalidation half described here is
-implemented; the reuse half is not. See "Decision–Implementation Gap".
+Status: Per-region token reuse IMPLEMENTED (PR #540). The injection-discovery
+companion lever is designed but NOT implemented. See "Decision–Implementation Gap".
 -->
 
 **Related Decisions**: [semantic-token-overlap-resolution](semantic-token-overlap-resolution.md), [lazy-node-identity-tracking](lazy-node-identity-tracking.md), [per-document-parse-scheduler](per-document-parse-scheduler.md)
@@ -208,11 +208,7 @@ fenced block. Reusing a tracked set across an edit means either re-deriving it
 from the new tree (no saving) or trusting an incrementally-maintained set without
 re-querying (a categorically deeper correctness commitment than the token half,
 which never had to answer "what regions exist" — it took the freshly discovered
-set as given and only reused per-region *tokens*). Reinforcing the point: the
-regions expensive to rebuild — blockquote-style prefixes whose `included_ranges`
-need a real `compute_included_ranges` node-walk — are exactly the ones the v1
-predicate already excludes from caching, so for *eligible* regions the per-region
-context-building is already cheap and only the query-match loop is worth eliding.
+set as given and only reused per-region *tokens*).
 
 What is sound is a narrower mechanism: **don't run discovery twice on the same
 tree.** An edit already pays the injection query *twice* — once off-ingress in
@@ -224,13 +220,18 @@ discovery proven to be on the **same text** it is about to tokenize — which
 sidesteps the structural-change problem entirely (the query did run for this
 edit; just once).
 
-**Currency (verified).** In the reparse loop the order is set-tree →
+**Currency — hit-rate, not correctness.** Correctness rests *entirely* on the
+content-hash + generation gate below; ordering only governs how often the gate
+hits. In the reparse loop, when a tree lands the order is set-tree →
 `populate_injections` → `advance_watermark` / `mark_parse_finished`
 (`coordinator/parse.rs`), and the semantic handler's settle waits on the parse
 watermark + parse-completion before snapshotting the tree
-(`text_document/semantic_tokens.rs`) — both raised *after* `populate_injections`.
-So in the common debounced case the populated discovery corresponds to the tree
-the request snapshots.
+(`text_document/semantic_tokens.rs`), so in the common debounced case the
+populated discovery already covers the snapshotted tree and the gate hits. On the
+branches where `populate_injections` is skipped (the CAS-fail `if stored` guard,
+the no-tree / error paths — `advance_watermark` still runs there), or when the
+200 ms settle budget expires, or on the on-demand-parse fallback, the gate simply
+misses and the request re-discovers inline. No ordering guarantee is load-bearing.
 
 **Mechanism.**
 
@@ -251,6 +252,16 @@ the request snapshots.
   the on-demand-parse fallback path that deliberately never runs
   `populate_injections`) → discover inline as today; never call
   `populate_injections` off the reader path.
+
+The reuse is **whole-document, not eligibility-gated**: `collect_all_injections`
+is a single all-or-nothing query over the host tree, so to skip it on a hit
+`populate_injections` must store rebuildable contexts for *every* region,
+including non-eligible prefixed (blockquote) ones. The `eligible` predicate gates
+only the per-region *token* re-anchoring (the shipped half); it does **not**
+narrow the discovery reuse. Consequently the `C` that relocates to
+`populate_injections` is the full per-region context-build for all regions —
+trivial for eligible column-0 fences (no children to exclude), but a real
+`compute_included_ranges` node-walk for prefixed regions.
 
 **Why this is the same safety philosophy as the rest of this ADR.** The content-
 hash gate (keyed on the hash of the *snapshotted* text + settings generation, the
@@ -278,11 +289,18 @@ So the per-edit total-CPU saving ≈ `Q` ≈ 1.2 ms at 150 blocks — comparable
 shipped per-region-tokenize saving (1.66 ms), and combined with it reaches ≈ −58%
 of the per-keystroke budget, confirming this section's original ~−60% projection
 in *magnitude* (the projection mis-attributed the cost to the whole bucket, but
-`Q` carries it). The relocated `C` (~0.3 ms) makes the off-ingress path only
-marginally heavier. Per-*request* latency improves by `Q` (if the request blocks
-on populate's watermark) up to `Q`+`C` (if populate finished during the debounce
-gap); which regime dominates is timing-dependent and shifts as parsing moves
-off-ingress, so the stable, defensible figure is the ~`Q` total-CPU saving.
+`Q` carries it). The benchmark is the *eligible-heavy* case (column-0 fences,
+trivial `C`), so the ~0.3 ms relocated `C` at 300 blocks is a best case; a
+document dominated by prefixed/blockquote regions relocates a larger `C` to the
+off-ingress path (the node-walks), though the per-edit total-CPU saving is still
+≈ `Q` regardless of eligibility, since `C` is relocated, not added. Per-*request*
+latency improves by `Q` (if the request blocks on populate's watermark) up to
+`Q`+`C` (if populate finished during the debounce gap); which regime dominates is
+timing-dependent and shifts as parsing moves off-ingress, so the stable,
+defensible figure is the ~`Q` total-CPU saving. **The no-regression gate must
+therefore measure a prefixed-region-heavy document too**, not only eligible
+fences, since that is where the relocated `C` could lengthen the off-ingress
+reparse the semantic settle waits on.
 
 **Open correctness surface (for the design review):** (1) the owned
 `included_ranges` are byte/point data computed on the populate tree — valid for
@@ -295,6 +313,23 @@ cache too); (3) combined groups are stored whole; (4) gated by the same region
 count as the token half and measured for no regression, since `populate_injections`
 now does strictly more work per reparse even for edits with no following
 `semanticTokens` request.
+
+(5) **Transient parser/query-load state must not be cached** — the discovery
+analogue of Hazard 3. `collect_injection_contexts_sync` already *drops* a region
+and taints `discovery_complete = false` when its parser/highlight query is not yet
+loaded; this is text- and generation-independent, so the content-hash gate does
+*not* catch it. If `populate_injections` builds the discovery cache during a load
+gap, a later same-text request passes the gate and is served an **incomplete
+region set → missing tokens until the next edit**. The store must therefore be
+gated on `discovery_complete` (don't persist an incomplete discovery), exactly as
+the token half gates `store` on `fully_loaded`. (6) **Lifecycle wiring**: the new
+per-`uri` `DiscoveredInjectionCache` must be cleared everywhere the existing
+`injection_map` / `injection_token_cache` are — `remove_document` on close and the
+no-query / empty-regions branches of `populate_injections` (`src/lsp/cache.rs`).
+Memory grows by a second per-region owned structure (the `included_ranges` /
+prefix / exclusion vectors) beyond the token half's per-region token vector,
+bounded by the same `clear_document` / close path; the Consequences section needs
+that addendum.
 
 ## Considered Options
 
@@ -443,15 +478,18 @@ two showstopper mitigations are the price of correctness, not optional polish.
 
 ## Decision–Implementation Gap
 
-Only the invalidation half is implemented today: `InjectionMap` population +
-`find_overlapping` + `InjectionTokenCache::{remove, clear_document}` are wired in
-`src/lsp/cache.rs`; `InjectionTokenCache::{store, get}` are `#[cfg(test)]`-only
-and never called from production. The whole-document layer (Option C) shipped
-separately as PR #530.
+The per-region token reuse half (Option A) is **implemented and merged (PR #540)**:
+`InjectionTokenCache::{store, get}` are production code keyed by `(uri, region_id)`
+with the validity (`validity_hash` = content ⊕ language, plus settings
+`generation`) in the value; `collect_injection_tokens_parallel` resolves hits
+before the Rayon fan-out and re-anchors them, scoped to the language-agnostic
+translation predicate (re-evaluated at read time), region-count-gated, with the
+two showstopper mitigations in place (combined groups excluded; settings
+generation folded into validity). The whole-document layer (Option C) shipped as
+PR #530.
 
-This ADR records the intended design for the per-region reuse half — scoped to
-the language-agnostic translation predicate (re-evaluated at read time), gated on
-the two showstopper mitigations (exclude `injection.combined`; fold the settings
-generation into injection-cache validity) — plus the injection-discovery
-companion as a follow-up. Until it lands, the cache is maintained-but-unread and
-the typing path recomputes in full.
+What remains a gap is the **injection-discovery companion lever** (the
+don't-discover-twice design above): not implemented. Its `DiscoveredInjectionCache`,
+the content-hash/generation currency gate, the `discovery_complete`-gated store,
+and the lifecycle wiring are the open work; until it lands, an edit still runs the
+injection query twice (off-ingress `populate_injections` + the semantic request).
