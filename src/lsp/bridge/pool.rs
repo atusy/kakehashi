@@ -490,18 +490,28 @@ impl LanguageServerPool {
             }
             // Always advance the cell so a later pull / the post-`initialized`
             // push (path a) reflects the change, even for a connection we don't
-            // notify yet.
-            handle.store_settings(resolved.clone().map(Arc::new));
+            // notify yet. Wrap once in `Arc` and store a cheap `Arc` clone; the
+            // inner `Value` is cloned only for an actual push below.
+            let resolved = resolved.map(Arc::new);
+            handle.store_settings(resolved.clone());
             // Only notify a Ready connection: sending
             // `workspace/didChangeConfiguration` to a still-initializing server
             // would precede its `initialized` and violate LSP ordering. An
             // Initializing connection instead gets its (now-updated) cell pushed
             // by path (a) once the handshake completes. Count only a successful
             // enqueue, so the returned count never reports a dropped push.
+            //
+            // No `Arc::ptr_eq`-against-the-map liveness recheck is needed here:
+            // this loop holds the `connections` lock and iterates the map's live
+            // values directly (never retrieve-then-release), so a respawn — which
+            // takes the same lock — cannot replace a handle mid-iteration.
             if handle.state() == ConnectionState::Ready {
-                let result = handle.send_notification(build_did_change_configuration_notification(
-                    resolved.unwrap_or(serde_json::Value::Null),
-                ));
+                let payload = resolved
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let result =
+                    handle.send_notification(build_did_change_configuration_notification(payload));
                 if result == NotificationSendResult::Queued {
                     pushed += 1;
                 }

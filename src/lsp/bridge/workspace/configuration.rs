@@ -43,26 +43,25 @@ pub(in crate::lsp::bridge) fn handle(
     // Log the incoming items (section + scopeUri) so the resolution convention
     // can be validated against a real downstream server, which is the only way
     // to confirm what `section` it actually sends (downstream-settings-propagation).
+    // `{:?}` borrows `items` — no clone or intermediate string on this path.
     debug!(
         target: "kakehashi::bridge::reader",
-        "{}Answering workspace/configuration for items: {}",
+        "{}Answering workspace/configuration for items: {:?}",
         server_prefix,
         items
-            .map(|i| serde_json::Value::Array(i.clone()).to_string())
-            .unwrap_or_else(|| "<missing>".to_string())
     );
 
     let guard = deps.settings.load();
     let root = guard.as_ref().map(|arc| arc.as_ref());
 
-    Ok(Value::Array(build_response(root, items)))
+    Ok(Value::Array(build_response(root, items.map(Vec::as_slice))))
 }
 
 /// Build the `LSPAny[]` response: one element per requested item, in request
 /// order, each resolved against `root`. A missing `items` (malformed request,
 /// `items` is spec-required) yields an empty array rather than an error,
 /// mirroring the bridge's lenient request handling.
-fn build_response(root: Option<&Value>, items: Option<&Vec<Value>>) -> Vec<Value> {
+fn build_response(root: Option<&Value>, items: Option<&[Value]>) -> Vec<Value> {
     let Some(items) = items else {
         return Vec::new();
     };
