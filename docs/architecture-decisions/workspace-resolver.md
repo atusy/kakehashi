@@ -1,0 +1,313 @@
+# Workspace Resolver
+
+## Context
+
+A bridged language server needs a workspace root to base its `rootUri`/
+`workspaceFolders` on at initialization. Today this is decided statically by
+`languageServers.<name>.rootMarkers` (see `src/config/settings.rs`, default
+`[".git"]` in `src/config/defaults.rs`), resolved upward from the document path
+by `src/lsp/bridge/root_markers.rs`.
+
+Two forces push beyond static markers:
+
+1. **Naming drift from the LSP spec.** The spec deprecates `rootPath` in favor
+   of `rootUri`, and `rootUri` in favor of `workspaceFolders`. `rootMarkers`
+   (a name inherited from Neovim's `vim.fs.root`) reads as the deprecated
+   vocabulary.
+
+2. **Static markers cannot make content-dependent decisions.** For
+   ecosystems like Deno vs. Node (`deno`/`tsserver`/`tsgo`), *which* server to
+   attach — and *whether* to attach at all — can depend on more than the
+   presence of a marker file: it may require inspecting the document text or
+   running custom logic (e.g. "`package.json` present but no `deno.json`").
+   Markers alone, even with priority groups, cannot express this.
+
+kakehashi is **file-first**: bridged servers are spawned on demand when a
+document that needs them is opened. There is no document-less activation path —
+every workspace decision happens with a concrete triggering document in hand.
+
+## Decision
+
+### 1. Rename `rootMarkers` → `workspaceMarkers`
+
+Adopt `workspaceMarkers` as the configuration key, aligning vocabulary with the
+LSP spec's `workspaceFolders`. `rootMarkers` remains a **deprecated serde
+alias** (`#[serde(alias = "rootMarkers")]`) for backward compatibility. The
+default is unchanged: `[".git"]`. Resolution semantics (upward search, nested
+arrays = equal-priority groups) are unchanged.
+
+Concretely, the Rust field `root_markers: Option<Vec<RootMarker>>`
+(`src/config/settings.rs`) is renamed `workspace_markers`; the
+`#[serde(rename_all = "camelCase")]` on `BridgeServerConfig` emits the
+`workspaceMarkers` TOML/JSON key automatically, and `#[serde(alias =
+"rootMarkers")]` keeps the old key parsing.
+
+### 2. Introduce `workspaceResolver` — a Lua function
+
+A new optional key holds a Lua function that dynamically decides both **whether
+to attach** and **what workspace** to use:
+
+```toml
+[languageServers.<serverName>]
+workspaceMarkers = [ ".git" ]            # used only when workspaceResolver is unset
+workspaceResolver = """
+---@param server_info { name: string, config: table }
+---@param document_info { uri: string, path: string, language_id: string, text: string } -- fields resolved lazily via metatable
+---@return boolean, nil | string
+--- first return  — attach? if false, do not attach this document to this server.
+--- second return — workspace folder, a filesystem path (ignored when first is false):
+---   nil:    attach using the client-supplied workspace fallback — the upstream
+---           rootUri/workspaceFolders (the ClientFallback root), not "no folder".
+---   string: attach rooted at the given folder (becomes the connection's root).
+--- To resolve a folder from markers, call kakehashi.fs.find_ancestor and return
+--- its result, e.g. `return true, kakehashi.fs.find_ancestor(document_info.path, {"deno.json"})`.
+return function(server_info, document_info)
+    ...
+end
+"""
+```
+
+kakehashi **compiles the source once, in Rust** (via the sandbox-restricted
+`mlua::Lua::load`) and keeps the resulting `Function`. Because the sandbox
+strips `load`/`loadstring` (see lua-host-api), the resolver source is never
+recompiled from inside Lua per call.
+
+Key properties:
+
+- **Idempotent function `(server_info, document_info) -> (attach, workspace)`.**
+  Not pure — it reads the filesystem and cwd through `kakehashi.fs`/`env` (see
+  lua-host-api). The point is statelessness w.r.t. spawn-vs-attach: there is no
+  `event` parameter, the resolver does not know — and must not care — whether
+  this document is spawning the server or attaching to a running one, and it is
+  expected to return the **same result for a given `document_info`** (modulo
+  on-disk changes). kakehashi decides how to apply the result from the server's
+  current state (below).
+- **`document_info` is always present** (file-first model), so it is
+  non-optional. Its fields — including `text` — are materialized **lazily via a
+  metatable** to avoid copying large documents into Lua when the resolver never
+  reads them. `document_info.path` is a plain `string` (never nil) **because**
+  of the skip rule below: a document without a representable filesystem path
+  never reaches a running resolver.
+- **`workspaceMarkers` is the fallback**, used only when `workspaceResolver` is
+  unset — with **one exception**: a configured resolver is **skipped** for a
+  document that has no representable filesystem path (a non-`file://` URI, or a
+  `file://` path that fails the encoding contract in lua-host-api). Such a
+  document is resolved exactly as if no `workspaceResolver` were set — the
+  normal `workspaceMarkers` → `ClientFallback` path. Note the two skip sub-cases
+  differ underneath: a non-representable `file://` path still has a URL, so the
+  Rust-side marker walk runs normally; a **non-`file://` URI** has no file path
+  at all, so `resolve_marker_root` returns `None` *immediately*
+  (`document_uri?.to_file_path()` fails) and the marker walk never runs — the
+  document lands directly on `ClientFallback`. Either way the result is the
+  no-resolver behavior. This skip is distinct from §6 fail-closed: the resolver
+  was not run, so the document still attaches; fail-closed applies only when a
+  resolver that *did* run errors or times out.
+- **The second return is always a filesystem path (or nil)** — never raw
+  markers. A resolver that wants marker-based resolution calls
+  `kakehashi.fs.find_ancestor` itself (see lua-host-api), so there is one
+  folder-from-markers entry point (`root_markers.rs`), reached either by the
+  `workspaceMarkers` fallback or by an explicit `find_ancestor` call — not by a
+  second, return-value-shaped path.
+
+### 3. Execution model: synchronous return-style on a worker thread
+
+The resolver runs **synchronously** (return-style, not continuation-passing) off
+the tokio runtime, so a blocking resolver cannot stall the LSP event loop — the
+async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
+
+- **Thread ownership.** `mlua::Lua` is `!Send` by default, so the VM cannot be
+  moved across threads or held across an `await`. A reusable compiled VM
+  therefore lives on a **dedicated thread** that owns it and receives requests
+  over a channel (not an ad-hoc `spawn_blocking` per call, which would force
+  re-creating the VM and a `Send` bound on every `kakehashi.*` callback).
+- **Timeout is in-VM, not wall-clock-only.** Wrapping the call in
+  `tokio::time::timeout` (or dropping the join handle) only stops *awaiting* the
+  result; the Lua code keeps running and keeps occupying the worker thread. Real
+  interruption requires an **in-VM hook**: an instruction-counting hook that
+  raises a timeout error from inside the VM (in `mlua` 0.9, `Lua::set_hook` with
+  `HookTriggers::every_nth_instruction`, or Luau `set_interrupt` — names are
+  illustrative and to be reconciled with whatever `mlua` version is adopted,
+  since none is in `Cargo.toml` yet). This bounds Lua-level loops.
+  - **Caveat:** an instruction hook cannot interrupt time spent inside a host
+    C-call (`kakehashi.fs.find_ancestor`'s filesystem walk, `read_to_string`)
+    or the lazy `document_info` metatable `__index`. Host operations carry their
+    own bounds (a capped `read_to_string`, see lua-host-api) — but those bound
+    *memory*, not *syscall latency*: a synchronous fs call stalled on a hung
+    NFS/FUSE mount is bounded by neither the hook nor a size cap. §6 states the
+    liveness guarantee honestly and points at stuck-worker replacement.
+- The `text` snapshot is **owned in Rust** (`Arc<str>` or equivalent) before
+  entering Lua; the metatable only defers *materialization into Lua*, never
+  performs async I/O. A metatable `__index` must not await (and, per the caveat,
+  must itself be cheap/bounded).
+
+### 4. Veto and wiring
+
+- **Veto (`attach = false`)** is applied as a filter **after** the
+  language-based server selection in `src/lsp/bridge/coordinator.rs` (the
+  `c.languages.iter().any(...)` filters). Language match first, resolver
+  refinement second.
+- **The resolved workspace replaces the marker in the existing acquire flow**,
+  not signaled separately by the resolver. It is exactly what
+  `resolve_marker_and_key` / `resolve_acquire` (`pool.rs`) would otherwise
+  compute from `workspaceMarkers` via `workspace_from_marker` (defined in
+  `root_markers.rs`); everything downstream is unchanged. The workspace is thus
+  part of the connection's identity, not a late add-on:
+  - **Per-root (default).** `ConnectionKey` is `(server, root)`
+    (`connection_key.rs`), so a distinct resolved workspace is a distinct
+    `ConnectionKey::new(server, Some(root))` (i.e. `ConnectionRoot::Marker`) →
+    its own connection: reused if one already runs for that root, else spawned
+    with the workspace seeding `InitializeParams` via `build_initialize_request`
+    (`protocol/lifecycle.rs`). A `nil` workspace maps to the `ClientFallback`
+    key — which `workspace_from_marker`'s fallback roots at the **upstream
+    client's** `rootUri`/`workspaceFolders`, not at "no folder".
+  - **Shared instance (`preferSharedInstance`, #391).** Marker-rooted documents
+    join one `Shared` connection via `workspace/didChangeWorkspaceFolders` (the
+    `WorkspaceFolderSet`, defined in `workspace/folder_set.rs`, driven from
+    `pool.rs`). A shared connection that came up **without**
+    `workspace.workspaceFolders.changeNotifications`
+    (`supports_workspace_folder_changes`, static `InitializeResult` capabilities
+    only — no dynamic `client/registerCapability` tracking) cannot take on a new
+    root, so the document is **diverted to its own per-root process** (not
+    dropped). This divert happens at **two** sites, because the shared
+    connection's capability is only known once it is `Ready`:
+    - **Early** in `resolve_acquire` — when the shared handle is *already*
+      `Ready` and incapable.
+    - **Late** in `get_or_create_connection_wait_ready` — when the shared
+      handle was still `Initializing` at acquire time (the catch-all routes it
+      to the shared key optimistically), then comes up incapable; after
+      `wait_for_ready` it re-checks and re-keys to the per-root process,
+      reusing the already-resolved marker to avoid a second filesystem walk.
+
+### 5. Cache contract
+
+The resolver is evaluated **once, at didOpen attach time**, and the resolved
+workspace is fixed to the connection-pool key. It is **not re-evaluated on
+didChange** — server routing does not change mid-edit. This bounds resolver
+cost to O(documents attached), not O(edits), despite the resolver depending on
+document text.
+
+### 6. Error policy
+
+A Lua error **or** a timeout overrun is treated as **fail-closed**: do not
+attach the document to that server, and log. A broken or slow resolver must not
+silently misroute.
+
+**Scope of the liveness guarantee, honestly stated.** The in-VM hook bounds
+runaway *Lua compute*; the host-side size cap bounds *memory / read volume*.
+Neither time-bounds a synchronous host **syscall** stalled on a pathological
+filesystem (a hung NFS/FUSE mount can block `find_ancestor`/`read_to_string`
+indefinitely). So "never tie up a worker thread" is **not** an absolute
+in-process guarantee. Defending against arbitrary I/O latency requires
+abandoning and replacing a stuck worker — the dedicated-thread model of §3
+permits this (spawn a replacement, leak the wedged thread), but the policy is
+left to implementation (see Open Questions).
+
+### 7. Open questions
+
+Deferred to implementation, recorded so they are not lost:
+
+- **Timeout default value.** Not fixed here; must be generous enough for a
+  filesystem walk yet bound a misbehaving resolver.
+- **`read_to_string` size cap.** Per §3 the in-VM hook cannot interrupt a host
+  read, so `kakehashi.fs.read_to_string` needs its own large-file bound (see
+  lua-host-api); the exact cap is open.
+- **Non-`file://` documents.** Per §2 these skip the resolver and resolve via
+  `workspaceMarkers` → `ClientFallback`. Open: whether any non-`file://` scheme
+  (e.g. a remote/virtual fs) should instead derive a usable path and run the
+  resolver after all.
+- **Stuck-worker recovery** (§3, §6): the policy for abandoning and replacing a
+  worker wedged in a hung filesystem syscall — timeout, replacement, and what to
+  leak — is left open.
+- **Windows path encoding** (see lua-host-api § Path encoding contract): paths
+  are strict UTF-8 and unpaired-surrogate paths fail closed; whether that
+  exotic edge ever needs lossless (WTF-8) support is open.
+
+## Considered Options
+
+- **Pure declarative extensions (negative markers / `requireWorkspace`).**
+  Rejected as the sole mechanism: it can express "`package.json` but not
+  `deno.json`" but cannot inspect document *content*, which is a stated
+  requirement. `workspaceMarkers` is retained as the declarative common case;
+  the resolver is the escape hatch for what declarations cannot express.
+
+- **Continuation-passing `on_dir(root_dir)` callback (Neovim's `root_dir`
+  form).** Neovim uses CPS because its Lua runs on the editor's single-threaded
+  main loop, where blocking freezes the UI; calling `on_dir` later lets the
+  resolver do async work, and *not* calling it doubles as the skip signal.
+  kakehashi has neither constraint: Lua runs on a worker thread, so a
+  synchronous resolver does not block the event loop, and an explicit
+  `attach = false` is a safer veto than Neovim's "forgot to call `on_dir` →
+  silent no-attach" footgun. The single lesson imported from Neovim is the
+  **timeout**, not the callback shape.
+
+- **Single overloaded return (`false | nil | string | table`).** An earlier
+  shape folded attach-or-not and the workspace value into one return.
+  Rejected for the explicit 2-tuple `(attach, workspace)`: four return shapes
+  on one value are error-prone to author in Lua.
+
+- **Marker-array second return (`(string | string[])[]`).** The 2-tuple's
+  workspace slot once also accepted raw markers, which kakehashi would resolve
+  via `root_markers.rs`. Dropped once `kakehashi.fs.find_ancestor` exposed that
+  same resolution to Lua: the return form was a redundant second entry point to
+  one implementation. Folding it away makes the second return uniformly a path
+  (or nil), simplifies the boundary, and lets the resolver author control the
+  no-marker-found fallback explicitly instead of relying on an implicit
+  kakehashi rule.
+
+- **`event: "initialize" | "didOpen"` parameter.** Considered so the resolver
+  could branch on spawn vs. attach. Rejected: in the file-first model both
+  carry a document, and folding the spawn/attach distinction into kakehashi's
+  state (rather than the resolver's logic) keeps the resolver an idempotent,
+  stateless function and removes a state-management responsibility from
+  resolver authors.
+
+- **`workspaceFallback` (e.g. `"$PWD"`) when neither markers nor resolver
+  resolve.** Deferred — not part of this decision. A resolver can already
+  return a literal string for the same effect; revisit only if a purely
+  declarative fallback proves needed.
+
+## Consequences
+
+### Positive
+
+- Vocabulary aligns with the LSP spec (`workspaceFolders`), with a no-break
+  deprecation alias.
+- Content-dependent server selection (Deno vs. Node/tsgo) becomes expressible.
+- The resolver is an idempotent, stateless function; spawn-vs-attach routing
+  stays in kakehashi, not in user Lua.
+- One folder-from-markers implementation, shared by markers and resolver.
+
+### Negative
+
+- **Introduces a Lua VM as a new dependency** (e.g. `mlua`). Today only
+  `lua-pattern` (Lua-pattern→regex) is present; there is no general Lua
+  runtime. This changes the nature of config from purely declarative data to
+  embedded executable code, with the attendant sandboxing, sync/async-boundary,
+  and timeout machinery.
+- Resolver correctness depends on author discipline (idempotence) that the type
+  signature cannot enforce.
+
+### Neutral
+
+- Resolver evaluation is off the request hot path (attach time only) and capped
+  by timeout, so it does not affect semantic-token or diagnostic latency.
+- `workspaceResolver` and `workspaceMarkers` are either/or per server, not
+  layered — the one exception being the §2 skip rule (a document with no
+  representable path resolves via `workspaceMarkers`/`ClientFallback`).
+
+## Decision–Implementation Gap
+
+Not yet implemented. As of this record:
+
+- The config key is still `rootMarkers`; the rename and `#[serde(alias)]` are
+  pending.
+- No Lua VM dependency is present; `workspaceResolver` evaluation, the lazy
+  `document_info` metatable, the worker-thread/timeout harness, the
+  coordinator-level veto, and the cache contract are all unbuilt.
+
+## Related Decisions
+
+- [lua-host-api](lua-host-api.md): the `kakehashi.*` Lua functions the resolver calls (`path`, `fs` incl. `find_ancestor`, `env.current_dir`) and the path-vs-URI boundary.
+- [language-server-bridge](language-server-bridge.md): the bridge this resolver feeds.
+- [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md): pool keys and spawn-time workspace seeding the resolver result must integrate with.
+- [wildcard-config-inheritance](wildcard-config-inheritance.md): how `languageServers._` defaults *will* inherit `workspaceMarkers`/`workspaceResolver` — via the existing per-field merge in `merge_bridge_server_configs` (`src/config/merge.rs`); that ADR documents the wildcard model generally and does not yet name these fields.
