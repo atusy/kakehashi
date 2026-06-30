@@ -50,8 +50,9 @@ workspaceResolver = """
 ---@return boolean, nil | string
 --- first return  — attach? if false, do not attach this document to this server.
 --- second return — workspace folder, a filesystem path (ignored when first is false):
----   nil:    attach without adding a workspace folder.
----   string: attach with the given folder; add it if missing.
+---   nil:    attach using the client-supplied workspace fallback — the upstream
+---           rootUri/workspaceFolders (the ClientFallback root), not "no folder".
+---   string: attach rooted at the given folder (becomes the connection's root).
 --- To resolve a folder from markers, call kakehashi.fs.find_ancestor and return
 --- its result, e.g. `return true, kakehashi.fs.find_ancestor(document_info.path, {"deno.json"})`.
 return function(server_info, document_info)
@@ -129,7 +130,9 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
     `Marker(root)` key → its own connection: reused if one already runs for that
     root, else spawned with the workspace seeding `InitializeParams` via
     `build_initialize_request` (`protocol/lifecycle.rs`). A `nil` workspace maps
-    to the `ClientFallback` key (attach, no folder).
+    to the `ClientFallback` key — which `workspace_from_marker`'s fallback roots
+    at the **upstream client's** `rootUri`/`workspaceFolders`, not at "no
+    folder".
   - **Shared instance (`preferSharedInstance`, #391).** Marker-rooted documents
     join one `Shared` connection via `workspace/didChangeWorkspaceFolders` (the
     `WorkspaceFolderSet`, defined in `workspace/folder_set.rs`, driven from
@@ -180,8 +183,9 @@ Deferred to implementation, recorded so they are not lost:
 - **Stuck-worker recovery** (§3, §6): the policy for abandoning and replacing a
   worker wedged in a hung filesystem syscall — timeout, replacement, and what to
   leak — is left open.
-- **Windows path encoding** (see lua-host-api § Path encoding contract): the
-  exact fail-closed policy for paths not representable as UTF-8/WTF-8 is open.
+- **Windows path encoding** (see lua-host-api § Path encoding contract): paths
+  are strict UTF-8 and unpaired-surrogate paths fail closed; whether that
+  exotic edge ever needs lossless (WTF-8) support is open.
 
 ## Considered Options
 

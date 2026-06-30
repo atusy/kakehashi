@@ -194,20 +194,23 @@ resolver.
 #### Path encoding contract
 
 Lua strings are arbitrary **byte** strings, but Rust `Path`/`OsStr` are not
-universally byte-representable, so the boundary needs a defined encoding:
+universally byte-representable, so the boundary needs **one** defined encoding:
 
 - **Unix:** an `OsStr` path *is* bytes, so paths cross the boundary losslessly
   as raw byte strings — including non-UTF-8 paths (which Lua holds fine, though
   `string.*` pattern functions may behave oddly on them).
-- **Windows:** paths are UTF-16 and are passed as UTF-8 (WTF-8). A path that is
-  not representable (an unpaired surrogate) **fails closed** — the host function
-  returns `nil`/error rather than handing back a lossy, non-round-trippable
-  string. Callers that pass a path string back to `kakehashi.fs`/`path` get
-  byte-for-byte the value they received, so round-tripping holds for every path
-  that crossed the boundary in the first place.
+- **Windows:** paths are **strict UTF-8** (not WTF-8). A Windows path containing
+  unpaired UTF-16 surrogates is therefore **not representable and fails
+  closed** — we deliberately do *not* adopt WTF-8's lossless surrogate encoding,
+  trading exotic-path support for a single, simple, round-trippable string type
+  that Lua `string.*` can operate on.
 
-This is a recorded contract, not yet implemented; the exact Windows policy is
-an open question (see workspace-resolver Open Questions).
+Failure shape is uniform: a path that cannot be represented yields the same
+result as an unreadable/missing path — host **functions** (`fs.*`, `path.*`)
+return `nil`; the **`document_info.path` field** yields `nil`, and a resolver
+that needs the path should treat `nil` as "skip / fall back to
+`workspaceMarkers`" (the same bucket as non-`file://` documents). Not yet
+implemented; the Windows surrogate edge is recorded as an open question.
 
 ## Considered Options
 
