@@ -797,53 +797,83 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Threshold for parallel processing - below this, Rayon scheduling overhead exceeds benefit
     const PARALLEL_THRESHOLD: usize = 4;
 
-    // Process injections: parallel for larger collections, sequential for small
-    // ones. Each context yields an `InjectionTokens` (tokens + fully_loaded),
-    // index-aligned with `contexts` so the store decision below can pair each
-    // result with its region's cache identity off the Rayon workers.
-    let results: Vec<InjectionTokens> = if contexts.len() >= PARALLEL_THRESHOLD {
-        contexts
+    // Resolve cache hits before the fan-out (#529, read half): an eligible region
+    // whose content hash and settings generation still match a stored entry is
+    // re-anchored to its current host line and never re-tokenized; only misses go
+    // to the Rayon workers. Eligibility is evaluated against THIS request's fresh
+    // context, so a region that stopped qualifying recomputes rather than serving
+    // a stale hit. Below the region-count gate `region_cache` is `None`, so every
+    // context misses and the path matches the uncached behavior exactly.
+    let mut hit_tokens: Vec<RawToken> = Vec::new();
+    let mut miss_indices: Vec<usize> = Vec::with_capacity(contexts.len());
+    if let Some(cc) = cache_ctx {
+        for (i, ctx) in contexts.iter().enumerate() {
+            if let Some(rc) = &ctx.region_cache
+                && rc.eligible
+                && let Some(local) =
+                    cc.cache
+                        .get(cc.uri, &rc.region_id, rc.content_hash, cc.generation)
+            {
+                hit_tokens.extend(reanchor_to_host(local, rc.line_start));
+            } else {
+                miss_indices.push(i);
+            }
+        }
+    } else {
+        miss_indices.extend(0..contexts.len());
+    }
+
+    // Tokenize only the misses: parallel above the threshold, sequential below.
+    // Each result carries its context index so the store decision can pair it
+    // with the region's cache identity off the Rayon workers.
+    let processed: Vec<(usize, InjectionTokens)> = if miss_indices.len() >= PARALLEL_THRESHOLD {
+        miss_indices
             .par_iter()
-            .map(|ctx| {
-                process_injection_sync(
-                    ctx,
-                    &factory,
-                    coordinator,
-                    capture_mappings,
-                    host_text,
-                    host_lines,
-                    host_line_starts,
-                    1, // depth 1 (first level of injection, host is 0)
-                    supports_multiline,
+            .map(|&i| {
+                (
+                    i,
+                    process_injection_sync(
+                        &contexts[i],
+                        &factory,
+                        coordinator,
+                        capture_mappings,
+                        host_text,
+                        host_lines,
+                        host_line_starts,
+                        1, // depth 1 (first level of injection, host is 0)
+                        supports_multiline,
+                    ),
                 )
             })
             .collect()
     } else {
-        contexts
+        miss_indices
             .iter()
-            .map(|ctx| {
-                process_injection_sync(
-                    ctx,
-                    &factory,
-                    coordinator,
-                    capture_mappings,
-                    host_text,
-                    host_lines,
-                    host_line_starts,
-                    1,
-                    supports_multiline,
+            .map(|&i| {
+                (
+                    i,
+                    process_injection_sync(
+                        &contexts[i],
+                        &factory,
+                        coordinator,
+                        capture_mappings,
+                        host_text,
+                        host_lines,
+                        host_line_starts,
+                        1,
+                        supports_multiline,
+                    ),
                 )
             })
             .collect()
     };
 
-    // Store region-local tokens for eligible, fully-loaded regions (#529),
-    // single-threaded after fan-in so cache writes never run inside a Rayon
-    // worker. `region_cache` is `Some` only when caching is active and the region
-    // is a top-level single; `eligible` is this request's translation predicate.
+    // Store region-local tokens for newly computed eligible, fully-loaded regions
+    // (#529, write half), single-threaded after fan-in so cache writes never run
+    // inside a Rayon worker.
     if let Some(cc) = cache_ctx {
-        for (ctx, res) in contexts.iter().zip(results.iter()) {
-            if let Some(rc) = &ctx.region_cache
+        for (i, res) in &processed {
+            if let Some(rc) = &contexts[*i].region_cache
                 && rc.eligible
                 && res.fully_loaded
             {
@@ -854,8 +884,11 @@ pub(crate) fn collect_injection_tokens_parallel(
         }
     }
 
-    // Flatten per-context tokens into one vector, then sort by position.
-    let mut all_tokens: Vec<RawToken> = results.into_iter().flat_map(|r| r.tokens).collect();
+    // Merge cache-hit and freshly computed tokens, then sort by position.
+    let mut all_tokens: Vec<RawToken> = hit_tokens;
+    for (_, res) in processed {
+        all_tokens.extend(res.tokens);
+    }
     all_tokens.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.column.cmp(&b.column)));
 
     // Convert byte ranges to line/column ActiveInjectionBounds values, but only for
@@ -882,6 +915,23 @@ fn to_region_local(tokens: &[RawToken], line_start: u32) -> Vec<RawToken> {
     tokens
         .iter()
         .map(|t| t.with_span(t.line.saturating_sub(line_start), t.column, t.length))
+        .collect()
+}
+
+/// Re-anchor cached region-local tokens to the region's current host position:
+/// the inverse of [`to_region_local`]. Because the region is eligible
+/// (`start_column == 0`, no per-row prefixes), the column is already correct and
+/// only the line shifts by the region's current first host line — so an edit
+/// *above* an unchanged region (which leaves its content hash, hence the cache
+/// entry, intact but moves it) is re-anchored exactly.
+fn reanchor_to_host(tokens: Vec<RawToken>, line_start: u32) -> Vec<RawToken> {
+    let line_start = line_start as usize;
+    tokens
+        .into_iter()
+        .map(|t| {
+            let line = t.line;
+            t.with_span(line + line_start, t.column, t.length)
+        })
         .collect()
 }
 
@@ -2030,6 +2080,267 @@ local b = 2
             leaked.is_empty(),
             "combined-layer tokens must not leak into gap lines 2..=6, got {:?}",
             leaked
+        );
+    }
+
+    /// Markdown with eight lua fences — enough to clear
+    /// `INJECTION_CACHE_MIN_REGIONS`. Each block starts at column 0 with no
+    /// per-row prefix, so every region is cache-eligible.
+    fn eight_lua_block_doc() -> String {
+        let mut text = String::new();
+        for i in 0..8 {
+            text.push_str(&format!("```lua\nlocal x{i} = {i}\n```\n\n"));
+        }
+        text
+    }
+
+    /// Coordinator with markdown + lua loaded, or `None` to skip when the
+    /// parsers aren't available in the environment.
+    fn markdown_lua_coordinator() -> Option<LanguageCoordinator> {
+        use crate::config::WorkspaceSettings;
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        let md = coordinator.ensure_language_loaded("markdown");
+        let lua = coordinator.ensure_language_loaded("lua");
+        if !md.success || !lua.success {
+            eprintln!("Skipping: markdown or lua parser not available");
+            return None;
+        }
+        Some(coordinator)
+    }
+
+    fn parse_markdown(coordinator: &LanguageCoordinator, text: &str) -> Tree {
+        let mut pool = coordinator.create_document_parser_pool();
+        let mut parser = pool.acquire("markdown").expect("markdown parser");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+        tree
+    }
+
+    /// The cached path must produce byte-identical tokens to the uncached path,
+    /// on both the first (all-miss, store) and second (all-hit) request.
+    #[test]
+    fn injection_cache_reuse_matches_uncached_output() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
+
+        let uncached = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            None,
+        )
+        .0;
+
+        let uri = Url::parse("file:///cache_reuse.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+        };
+
+        let first = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+        assert_eq!(first, uncached, "first (store) pass must match uncached");
+
+        // All eight eligible regions should have been stored.
+        assert_eq!(
+            cache.test_keys(&uri).len(),
+            8,
+            "every eligible region should be cached after the first pass"
+        );
+
+        let second = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+        assert_eq!(second, uncached, "second (hit) pass must match uncached");
+    }
+
+    /// Proof the reuse path actually *reads* the cache rather than recomputing:
+    /// overwrite one region's stored entry with a sentinel token (length 999,
+    /// which no real lua token has), then re-run. The sentinel can only appear in
+    /// the output if the region was served from the cache.
+    #[test]
+    fn injection_cache_reuse_serves_stored_tokens() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
+
+        let uri = Url::parse("file:///cache_sentinel.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+        };
+
+        // Populate.
+        let _ = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        );
+
+        // Overwrite one region with a region-local sentinel token.
+        let (rid, ch, generation) = cache
+            .test_keys(&uri)
+            .into_iter()
+            .next()
+            .expect("a region should be cached");
+        let sentinel = RawToken {
+            line: 0,
+            column: 0,
+            length: 999,
+            kind: crate::analysis::semantic::token_collector::TokenKind::Mapped(1, 0),
+            depth: 1,
+            pattern_index: 0,
+            priority: 100,
+            node_byte_len: 999,
+        };
+        cache.store(&uri, &rid, ch, generation, vec![sentinel]);
+
+        let tokens = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+
+        assert!(
+            tokens.iter().any(|t| t.length == 999),
+            "the sentinel token must surface, proving the reuse path read the cache"
+        );
+    }
+
+    /// An edit *above* an unchanged region must re-anchor its cached tokens to the
+    /// new host line. With the tracker positions adjusted (as production does in
+    /// did_change), the cached entry stays valid and is shifted by the inserted
+    /// line — matching a fresh uncached compute of the edited document.
+    #[test]
+    fn injection_cache_reanchors_after_edit_above() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let old_text = eight_lua_block_doc();
+        let old_tree = parse_markdown(&coordinator, &old_text);
+        let old_lines: Vec<&str> = old_text.lines().collect();
+        let old_line_starts = build_line_start_bytes(&old_text);
+
+        let uri = Url::parse("file:///cache_reanchor.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+        };
+
+        // Populate against the original document.
+        let _ = collect_injection_tokens_parallel(
+            &old_text,
+            &old_lines,
+            &old_line_starts,
+            &old_tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        );
+
+        // Insert a blank line at the very top: every region shifts down one line,
+        // none of their content changes. Adjust the tracker positions the way
+        // did_change does, so the stored entries stay addressable (stable ULIDs).
+        let new_text = format!("\n{old_text}");
+        tracker.apply_text_diff(&uri, &old_text, &new_text);
+        let new_tree = parse_markdown(&coordinator, &new_text);
+        let new_lines: Vec<&str> = new_text.lines().collect();
+        let new_line_starts = build_line_start_bytes(&new_text);
+
+        let cached = collect_injection_tokens_parallel(
+            &new_text,
+            &new_lines,
+            &new_line_starts,
+            &new_tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+
+        let uncached = collect_injection_tokens_parallel(
+            &new_text,
+            &new_lines,
+            &new_line_starts,
+            &new_tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            None,
+        )
+        .0;
+
+        assert_eq!(
+            cached, uncached,
+            "re-anchored cached tokens must match a fresh compute of the edited doc"
         );
     }
 }

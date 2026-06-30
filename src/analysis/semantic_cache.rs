@@ -245,7 +245,6 @@ impl InjectionTokenCache {
 
     /// Retrieve region-local tokens iff an entry exists for this exact validity
     /// key — same region, same content, same settings generation.
-    #[cfg(test)]
     pub fn get(
         &self,
         uri: &Url,
@@ -289,6 +288,18 @@ impl InjectionTokenCache {
     /// Remove all cached tokens for a document (all its injection regions).
     pub fn clear_document(&self, uri: &Url) {
         self.cache.retain(|key, _| &key.0 != uri);
+    }
+
+    /// Validity keys `(region_id, content_hash, generation)` currently stored for
+    /// a document — lets a test confirm what the hot path persisted and overwrite
+    /// a specific entry to prove the reuse path reads it.
+    #[cfg(test)]
+    pub fn test_keys(&self, uri: &Url) -> Vec<(String, u64, u64)> {
+        self.cache
+            .iter()
+            .filter(|e| &e.key().0 == uri)
+            .map(|e| (e.key().1.clone(), e.key().2, e.key().3))
+            .collect()
     }
 }
 
