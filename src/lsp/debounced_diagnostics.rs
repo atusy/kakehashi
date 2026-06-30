@@ -104,6 +104,12 @@ impl DebouncedDiagnosticsManager {
         self.debounce_millis.store(millis, Ordering::Relaxed);
     }
 
+    /// The debounce delay (milliseconds) the next schedule will use.
+    #[cfg(test)]
+    pub(crate) fn debounce_millis(&self) -> u64 {
+        self.debounce_millis.load(Ordering::Relaxed)
+    }
+
     /// Schedule a debounced diagnostic for a document.
     ///
     /// Any existing timer for this document is cancelled and replaced; on expiry
@@ -310,6 +316,24 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debounce_millis_defaults_and_reflects_config_updates() {
+        let manager = DebouncedDiagnosticsManager::new();
+        assert_eq!(
+            manager.debounce_millis(),
+            crate::config::settings::DEFAULT_DEBOUNCE_MS,
+            "a fresh manager uses the runtime default"
+        );
+
+        // A config reload pushes a new value via set_debounce_millis; the next
+        // schedule reads it (production wiring in `schedule_debounced_diagnostic`).
+        manager.set_debounce_millis(120);
+        assert_eq!(manager.debounce_millis(), 120);
+
+        manager.set_debounce_millis(0);
+        assert_eq!(manager.debounce_millis(), 0, "explicit zero is honored");
+    }
 
     #[tokio::test]
     async fn test_initial_state_and_cancel_noop() {

@@ -747,6 +747,10 @@ mod tests {
         assert!(props.get("searchPaths").is_some(), "missing searchPaths");
         assert!(props.get("autoInstall").is_some(), "missing autoInstall");
         assert!(
+            props.get("diagnosticsDebounceMs").is_some(),
+            "missing diagnosticsDebounceMs"
+        );
+        assert!(
             props.get("captureMappings").is_some(),
             "missing captureMappings"
         );

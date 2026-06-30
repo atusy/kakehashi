@@ -449,7 +449,7 @@ impl Kakehashi {
         // readable without a profiler. `requested - sent` is what the #497 gate saved.
         let m = self.diagnostics.metrics_snapshot();
         log::info!(
-            target: "kakehashi::diag_metrics",
+            target: "kakehashi::diagnostic_metrics",
             "diagnostic path totals: push_republishes={} refreshes_requested={} refreshes_sent={} (gate saved {}) pulls_answered={} mean_pull_us={}",
             m.push_republishes,
             m.refreshes_requested,

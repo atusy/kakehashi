@@ -427,7 +427,7 @@ struct HostCoverage {
 /// saved. Plain relaxed `AtomicU64`s: incrementing on the hot path is negligible and
 /// the counters carry no cross-counter invariant.
 #[derive(Default)]
-pub(crate) struct DiagnosticMetrics {
+struct DiagnosticMetrics {
     /// Push/eviction-origin republishes that changed the editor-visible set (the
     /// ingress that can drive a refresh). Counted in [`DiagnosticAggregator::bump_current`].
     push_republishes: AtomicU64,
@@ -449,11 +449,11 @@ pub(crate) struct DiagnosticMetrics {
 /// A point-in-time copy of [`DiagnosticMetrics`] for logging and assertions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct DiagnosticMetricsSnapshot {
-    pub push_republishes: u64,
-    pub refreshes_requested: u64,
-    pub refreshes_sent: u64,
-    pub pulls_answered: u64,
-    pub pull_micros_total: u64,
+    pub(crate) push_republishes: u64,
+    pub(crate) refreshes_requested: u64,
+    pub(crate) refreshes_sent: u64,
+    pub(crate) pulls_answered: u64,
+    pub(crate) pull_micros_total: u64,
 }
 
 impl DiagnosticMetrics {
@@ -477,7 +477,7 @@ impl DiagnosticMetrics {
     /// Snapshot all counters. Not atomic across counters (a concurrent update may
     /// land between reads), which is fine for monitoring — the chain ratios are
     /// still representative.
-    pub(crate) fn snapshot(&self) -> DiagnosticMetricsSnapshot {
+    fn snapshot(&self) -> DiagnosticMetricsSnapshot {
         DiagnosticMetricsSnapshot {
             push_republishes: self.push_republishes.load(Ordering::Relaxed),
             refreshes_requested: self.refreshes_requested.load(Ordering::Relaxed),
