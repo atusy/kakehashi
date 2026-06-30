@@ -170,13 +170,16 @@ Two implementation obligations follow, neither inferable from
   continuations leave `prefix_byte_widths` empty, so that remains a *valid* hit.)
 - **Source `region_id` from the freshly parsed tree's `NodeTracker`, not the
   cached `InjectionMap`.** `InjectionContext` carries no `region_id` today, so v1
-  resolves it per request — e.g. `tracker.get_or_create(uri, host_start_byte,
-  end_byte, kind)` at the boundary between `collect_injection_contexts_sync` and
-  the parallel fan-out (no new field on `InjectionContext` needed). This threads
-  two new inputs into `collect_injection_tokens_parallel` and
-  `handle_semantic_tokens_full`, which take neither today: the document `uri` and
-  the `NodeTracker` (it lives on `CacheCoordinator`, not the `LanguageCoordinator`
-  they currently receive). This is safe
+  resolves it *inside* `collect_injection_contexts_sync`, where the tree-sitter
+  node is in hand — `tracker.get_or_create(uri, start_byte, end_byte, kind)` —
+  and carries the ULIDs to the fan-out as a parallel `Vec` aligned with the
+  contexts (or as a new `region_id` field on `InjectionContext`). It cannot be
+  deferred to the fan-out boundary: `InjectionContext` keeps only
+  `host_start_byte`, not the `end_byte` / node `kind` that `get_or_create` needs.
+  Either way this threads two new inputs into `collect_injection_tokens_parallel`
+  and `handle_semantic_tokens_full`, which take neither today: the document `uri`
+  and the `NodeTracker` (it lives on `CacheCoordinator`, not the
+  `LanguageCoordinator` they currently receive). This is safe
   because `apply_input_edits` updates the `NodeTracker` synchronously under the
   edit lock the moment an edit lands — *before* the off-ingress reparse — so the
   ULIDs are consistent even while the cached `InjectionMap` is still pre-edit
