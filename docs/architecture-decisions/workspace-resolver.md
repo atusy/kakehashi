@@ -46,13 +46,13 @@ workspaceMarkers = [ ".git" ]            # used only when workspaceResolver is u
 workspaceResolver = """
 ---@param server_info { name: string, config: table }
 ---@param document_info { uri: string, language_id: string, text: string } -- fields resolved lazily via metatable
----@return boolean, nil | string | (string | string[])[]
+---@return boolean, nil | string
 --- first return  — attach? if false, do not attach this document to this server.
---- second return — workspace (ignored when first is false):
----   nil:                       attach without adding a workspace folder.
----   string:                    attach with the given folder; add it if missing.
----   (string | string[])[]:     treat as workspace markers; resolve a folder via
----                              the same path as workspaceMarkers; add if missing.
+--- second return — workspace folder, a filesystem path (ignored when first is false):
+---   nil:    attach without adding a workspace folder.
+---   string: attach with the given folder; add it if missing.
+--- To resolve a folder from markers, call kakehashi.fs.find_ancestor and return
+--- its result, e.g. `return true, kakehashi.fs.find_ancestor(document_info.path, {"deno.json"})`.
 return function(server_info, document_info)
     ...
 end
@@ -72,8 +72,12 @@ Key properties:
   reads them.
 - **`workspaceMarkers` is the fallback**, used only when `workspaceResolver` is
   unset. They are not layered; a configured resolver fully governs the decision.
-- The marker-array return form **joins the existing `root_markers.rs`
-  resolution path** — there is one folder-from-markers implementation, reused.
+- **The second return is always a filesystem path (or nil)** — never raw
+  markers. A resolver that wants marker-based resolution calls
+  `kakehashi.fs.find_ancestor` itself (see lua-host-api), so there is one
+  folder-from-markers entry point (`root_markers.rs`), reached either by the
+  `workspaceMarkers` fallback or by an explicit `find_ancestor` call — not by a
+  second, return-value-shaped path.
 
 ### 3. Execution model: synchronous return-style on a worker thread
 
@@ -140,6 +144,15 @@ silently misroute, nor tie up a worker thread indefinitely.
   Rejected for the explicit 2-tuple `(attach, workspace)`: four return shapes
   on one value are error-prone to author in Lua.
 
+- **Marker-array second return (`(string | string[])[]`).** The 2-tuple's
+  workspace slot once also accepted raw markers, which kakehashi would resolve
+  via `root_markers.rs`. Dropped once `kakehashi.fs.find_ancestor` exposed that
+  same resolution to Lua: the return form was a redundant second entry point to
+  one implementation. Folding it away makes the second return uniformly a path
+  (or nil), simplifies the boundary, and lets the resolver author control the
+  no-marker-found fallback explicitly instead of relying on an implicit
+  kakehashi rule.
+
 - **`event: "initialize" | "didOpen"` parameter.** Considered so the resolver
   could branch on spawn vs. attach. Rejected: in the file-first model both
   carry a document, and folding the spawn/attach distinction into kakehashi's
@@ -192,6 +205,7 @@ Not yet implemented. As of this record:
 
 ## Related Decisions
 
+- [lua-host-api](lua-host-api.md): the `kakehashi.*` Lua functions the resolver calls (`path`, `fs` incl. `find_ancestor`, `env.current_dir`) and the path-vs-URI boundary.
 - [language-server-bridge](language-server-bridge.md): the bridge this resolver feeds.
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md): pool keys and spawn-time workspace seeding the resolver result must integrate with.
 - [wildcard-config-inheritance](wildcard-config-inheritance.md): how `languageServers._` defaults (including `workspaceMarkers`/`workspaceResolver`) are inherited.
