@@ -653,18 +653,20 @@ impl LspClient {
 
     /// Wait for the first server→client **request** (a message carrying both an
     /// `id` and a `method`) whose method is `expected_method`, returning its
-    /// params (`Value::Null` for a param-less request like
+    /// `(id, params)` (`params` is `Value::Null` for a param-less request like
     /// `workspace/diagnostic/refresh`). Returns None on timeout or disconnect.
     ///
     /// `wait_for_notification*` deliberately skip messages with an `id`, so they
     /// can't observe a server-initiated request; this is the counterpart that does.
-    /// The request's response is left unsent — the server's refresh is spawned and
-    /// not awaited, so an unanswered request doesn't stall it.
+    /// The `id` is returned so the caller can ack via [`Self::send_response`] —
+    /// needed when the server single-flights on the ack (e.g. the workspace
+    /// diagnostic refresh, #497): the next refresh won't fire until this one is
+    /// answered.
     pub(crate) fn wait_for_server_request(
         &mut self,
         expected_method: &str,
         timeout: Duration,
-    ) -> Option<Value> {
+    ) -> Option<(Value, Value)> {
         let start_time = Instant::now();
 
         loop {
@@ -673,23 +675,28 @@ impl LspClient {
                 return None;
             }
 
-            let mut message = self.try_receive_message(remaining)?;
+            let message = self.try_receive_message(remaining)?;
 
-            if message.get("id").is_some()
-                && message.get("method").and_then(|m| m.as_str()) == Some(expected_method)
+            // A server→client request carries both an `id` and a `method`. The
+            // message is discarded right after, so destructure it and `remove` the
+            // fields (one lookup each, moved rather than cloned). A message with no
+            // `id` (a notification) fails the inner `remove` and is skipped.
+            if let Value::Object(mut map) = message
+                && map.get("method").and_then(|m| m.as_str()) == Some(expected_method)
+                && let Some(id) = map.remove("id")
             {
-                // `message` is discarded right after, so move `params` out instead
-                // of cloning it.
-                return Some(
-                    message
-                        .get_mut("params")
-                        .map(Value::take)
-                        .unwrap_or(Value::Null),
-                );
+                let params = map.remove("params").unwrap_or(Value::Null);
+                return Some((id, params));
             }
             // A response or notification, or a different request — skip and keep
             // waiting within the deadline.
         }
+    }
+
+    /// Send a JSON-RPC success response for a server→client request `id` (e.g. to
+    /// ack a `workspace/diagnostic/refresh`).
+    pub(crate) fn send_response(&mut self, id: Value, result: Value) {
+        self.send_message(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
     }
 
     /// Try to receive a message within `timeout`, returning None if none arrives.

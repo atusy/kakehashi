@@ -989,7 +989,9 @@ async fn deliver_upstream_notification(
             // settings to gate on, so the forward is dropped; production always has
             // one (#521).
             if let Some(publisher) = diagnostic_publisher {
-                publisher.request_pull_diagnostic_refresh();
+                // `forced`: a downstream server explicitly asked for a refresh, which
+                // no coverage version represents, so bypass the coverage gate (#497).
+                publisher.request_pull_diagnostic_refresh(true);
             }
         }
         UpstreamNotification::PublishDiagnostics {
