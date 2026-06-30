@@ -295,6 +295,10 @@ impl Kakehashi {
             settings,
         )
         .await;
+        // A settings/query reload can change tokenization for unchanged text, so
+        // drop the content-hash-keyed semantic-token cache — otherwise a repeat
+        // request on an unedited document would serve tokens from the old queries.
+        self.cache.clear_all_semantic_tokens();
         self.warn_on_misconfigured_settings().await;
     }
 

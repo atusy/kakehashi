@@ -308,9 +308,31 @@ impl CacheCoordinator {
         }
     }
 
-    /// Store semantic tokens for a document.
-    pub(crate) fn store_tokens(&self, uri: Url, tokens: SemanticTokens) {
-        self.semantic_cache.store(uri, tokens);
+    /// Store semantic tokens for a document, tagged with the `content_hash` of
+    /// the text they were computed from so an unchanged-document repeat request
+    /// can skip re-tokenizing via [`get_current_tokens`](Self::get_current_tokens).
+    pub(crate) fn store_tokens(&self, uri: Url, tokens: SemanticTokens, content_hash: u64) {
+        self.semantic_cache.store(uri, tokens, content_hash);
+    }
+
+    /// Return the cached tokens iff they were computed from text with this
+    /// `content_hash` (the document is unchanged), letting the caller skip the
+    /// full re-tokenization. None on a content change or no entry.
+    pub(crate) fn get_current_tokens(
+        &self,
+        uri: &Url,
+        content_hash: u64,
+    ) -> Option<SemanticTokens> {
+        self.semantic_cache
+            .get_if_current(uri, content_hash)
+            .map(|cached| cached.tokens)
+    }
+
+    /// Drop all cached semantic tokens (settings/query reload): the same text
+    /// can tokenize differently under new queries, so content-hash hits would
+    /// otherwise serve stale tokens.
+    pub(crate) fn clear_all_semantic_tokens(&self) {
+        self.semantic_cache.clear();
     }
 
     // ========================================================================
@@ -375,7 +397,7 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store_tokens(uri.clone(), tokens);
+        cache.store_tokens(uri.clone(), tokens, 0);
 
         // Start a request
         let _request_id = cache.start_request(&uri);
@@ -398,7 +420,7 @@ mod tests {
             result_id: Some("test-id".to_string()),
             data: vec![],
         };
-        cache.store_tokens(uri.clone(), tokens);
+        cache.store_tokens(uri.clone(), tokens, 0);
 
         // Verify stored
         assert!(cache.get_tokens_if_valid(&uri, "test-id").is_some());

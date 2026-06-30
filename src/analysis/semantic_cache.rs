@@ -18,6 +18,13 @@ use url::Url;
 #[derive(Clone)]
 pub struct CachedSemanticTokens {
     pub tokens: SemanticTokens,
+    /// FNV-1a hash of the document text these tokens were computed from. Lets a
+    /// repeat request on an *unchanged* document serve the cached tokens instead
+    /// of re-tokenizing (the `result_id` can't do this — it is a fresh global
+    /// counter per response, so it never matches the document's current state).
+    /// Text-only: a config/query reload changes tokenization for the same text,
+    /// so the cache is dropped wholesale on settings apply (see `clear`).
+    pub content_hash: u64,
 }
 
 /// Thread-safe semantic token cache.
@@ -33,14 +40,42 @@ impl SemanticTokenCache {
         }
     }
 
-    /// Store semantic tokens for a document.
-    pub fn store(&self, uri: Url, tokens: SemanticTokens) {
-        self.cache.insert(uri, CachedSemanticTokens { tokens });
+    /// Store semantic tokens for a document, tagged with the `content_hash` of
+    /// the text they were computed from (see [`get_if_current`](Self::get_if_current)).
+    pub fn store(&self, uri: Url, tokens: SemanticTokens, content_hash: u64) {
+        self.cache.insert(
+            uri,
+            CachedSemanticTokens {
+                tokens,
+                content_hash,
+            },
+        );
     }
 
     /// Retrieve semantic tokens for a document.
     pub fn get(&self, uri: &Url) -> Option<CachedSemanticTokens> {
         self.cache.get(uri).map(|entry| entry.clone())
+    }
+
+    /// Get cached tokens if they were computed from text with this `content_hash`
+    /// — i.e. the document is unchanged since they were cached, so re-tokenizing
+    /// would reproduce them. Returns None on a content-hash mismatch (the text
+    /// changed) or no entry.
+    pub fn get_if_current(&self, uri: &Url, content_hash: u64) -> Option<CachedSemanticTokens> {
+        self.cache.get(uri).and_then(|entry| {
+            if entry.content_hash == content_hash {
+                Some(entry.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Drop every cached entry. Used on a settings/query reload: the same text
+    /// can tokenize differently under new queries, so content-hash hits would
+    /// otherwise serve stale tokens.
+    pub fn clear(&self) {
+        self.cache.clear();
     }
 
     /// Get cached tokens if the result_id matches.
@@ -257,7 +292,7 @@ mod tests {
         };
 
         // Store tokens
-        cache.store(uri.clone(), tokens.clone());
+        cache.store(uri.clone(), tokens.clone(), 0);
 
         // Retrieve tokens
         let retrieved = cache.get(&uri);
@@ -297,7 +332,7 @@ mod tests {
             }],
         };
 
-        cache.store(uri.clone(), tokens);
+        cache.store(uri.clone(), tokens, 0);
 
         // Matching result_id returns tokens
         let valid = cache.get_if_valid(&uri, "42");
@@ -323,6 +358,52 @@ mod tests {
     }
 
     #[test]
+    fn get_if_current_matches_on_content_hash() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///t.rs").unwrap();
+        let tokens = SemanticTokens {
+            result_id: Some("7".to_string()),
+            data: vec![],
+        };
+        cache.store(uri.clone(), tokens, 0xABCD);
+
+        // Same content hash => the document is unchanged => serve cached tokens.
+        let hit = cache.get_if_current(&uri, 0xABCD);
+        assert!(hit.is_some(), "should hit when the content hash matches");
+        assert_eq!(hit.unwrap().tokens.result_id, Some("7".to_string()));
+
+        // Different content hash => the text changed => recompute (miss).
+        assert!(
+            cache.get_if_current(&uri, 0x1234).is_none(),
+            "should miss when the content hash differs"
+        );
+
+        // Unknown URI => miss.
+        let other = Url::parse("file:///o.rs").unwrap();
+        assert!(cache.get_if_current(&other, 0xABCD).is_none());
+    }
+
+    #[test]
+    fn clear_drops_all_entries() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///t.rs").unwrap();
+        let tokens = SemanticTokens {
+            result_id: Some("1".to_string()),
+            data: vec![],
+        };
+        cache.store(uri.clone(), tokens, 0xAA);
+        assert!(cache.get_if_current(&uri, 0xAA).is_some());
+
+        // A config reload changes tokenization for the same text, so the whole
+        // cache must drop — a later request recomputes against the new queries.
+        cache.clear();
+        assert!(
+            cache.get_if_current(&uri, 0xAA).is_none(),
+            "clear() must drop entries so stale-config tokens are not served"
+        );
+    }
+
+    #[test]
     fn test_semantic_cache_remove_on_close() {
         let cache = SemanticTokenCache::new();
         let uri = Url::parse("file:///test.rs").unwrap();
@@ -338,7 +419,7 @@ mod tests {
         };
 
         // Store tokens
-        cache.store(uri.clone(), tokens);
+        cache.store(uri.clone(), tokens, 0);
         assert!(cache.get(&uri).is_some(), "Should have cached tokens");
 
         // Remove on close
