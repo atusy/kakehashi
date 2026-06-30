@@ -133,6 +133,12 @@ pub(crate) struct ConnectionHandle {
     /// falling back to per-root instances" log for this server (#391), so the
     /// per-acquisition capability check does not spam the log.
     incapable_fallback_logged: AtomicBool,
+    /// This server's current workspace settings, shared with the reader task's
+    /// `ServerRequestDeps` (downstream-settings-propagation). The same `Arc` cell
+    /// the reader reads to answer `workspace/configuration` pulls; the pool
+    /// re-stores it here on a merge change (path c) so a re-pull reflects the
+    /// current config. `None` slot = no settings configured for this server.
+    settings: Arc<arc_swap::ArcSwapOption<serde_json::Value>>,
 }
 
 impl ConnectionHandle {
@@ -158,6 +164,7 @@ impl ConnectionHandle {
             dynamic_capabilities,
             ConnectionKey::for_server("test"),
             WorkspaceFolderSet::new(None),
+            Arc::new(arc_swap::ArcSwapOption::empty()),
         )
     }
 
@@ -175,6 +182,7 @@ impl ConnectionHandle {
         dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
         connection_key: ConnectionKey,
         workspace_folders: WorkspaceFolderSet,
+        settings: Arc<arc_swap::ArcSwapOption<serde_json::Value>>,
     ) -> Self {
         use crate::lsp::bridge::actor::spawn_writer_task;
 
@@ -197,7 +205,22 @@ impl ConnectionHandle {
             connection_key,
             workspace_folders,
             incapable_fallback_logged: AtomicBool::new(false),
+            settings,
         }
+    }
+
+    /// This connection's current workspace settings, if any
+    /// (downstream-settings-propagation). Read by the propagation diff to decide
+    /// whether a merge change needs a `workspace/didChangeConfiguration` push.
+    pub(super) fn current_settings(&self) -> Option<Arc<serde_json::Value>> {
+        self.settings.load_full()
+    }
+
+    /// Re-store this connection's settings after a merge change (path c). The
+    /// reader's `ServerRequestDeps` shares the same cell, so a subsequent
+    /// `workspace/configuration` pull reflects the new value.
+    pub(super) fn store_settings(&self, settings: Option<Arc<serde_json::Value>>) {
+        self.settings.store(settings);
     }
 
     /// This connection's pool identity: `(server_name, resolved_root)`.
@@ -872,6 +895,54 @@ mod tests {
         Arc::new(DynamicCapabilityRegistry::new())
     }
 
+    /// The settings cell stored on the handle is the *same* `Arc` the reader's
+    /// `ServerRequestDeps` clones, so a path-c `store_settings` is observable by a
+    /// path-b pull (downstream-settings-propagation).
+    #[tokio::test]
+    async fn settings_cell_roundtrips_and_is_shared_with_the_reader() {
+        use serde_json::json;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("spawn sink");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+
+        // The shared cell, as the pool builds it — one Arc cloned into both the
+        // reader deps and the handle.
+        let cell = Arc::new(arc_swap::ArcSwapOption::empty());
+        let handle = ConnectionHandle::with_state(
+            writer,
+            router,
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            Arc::clone(&cell),
+        );
+
+        assert!(handle.current_settings().is_none(), "starts empty");
+
+        let value = Arc::new(json!({ "Lua": { "diagnostics": { "globals": ["vim"] } } }));
+        handle.store_settings(Some(Arc::clone(&value)));
+
+        assert_eq!(handle.current_settings().as_deref(), Some(value.as_ref()));
+        // The reader's clone of the same Arc observes the write.
+        assert_eq!(cell.load_full().as_deref(), Some(value.as_ref()));
+
+        handle.store_settings(None);
+        assert!(handle.current_settings().is_none(), "clears to None");
+    }
+
     /// Test that ConnectionHandle provides unique request IDs via atomic counter.
     ///
     /// Each call to next_request_id() should return a unique, incrementing value.
@@ -1003,6 +1074,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Verify initial state is Ready
@@ -1078,6 +1150,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Register a request to start the liveness timer
@@ -1137,6 +1210,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Register a request - this should NOT start the liveness timer
@@ -1203,6 +1277,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Register first request - this starts the liveness timer
@@ -1297,6 +1372,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         );
 
         // Register a request with upstream ID
@@ -1340,6 +1416,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         );
 
         // Register without upstream ID
@@ -1382,6 +1459,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         );
 
         // Should return immediately
@@ -1416,6 +1494,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Spawn a task that will transition to Ready after a delay
@@ -1461,6 +1540,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Spawn a task that will transition to Failed
@@ -1508,6 +1588,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         );
 
         // Wait with short timeout - should timeout
@@ -1544,6 +1625,7 @@ mod tests {
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Spawn a task that will transition to Closing

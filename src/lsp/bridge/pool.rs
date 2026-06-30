@@ -461,6 +461,36 @@ impl LanguageServerPool {
         self.connections.lock().await
     }
 
+    /// Propagate a workspace-settings change to every live connection whose
+    /// settings changed (downstream-settings-propagation, path c).
+    ///
+    /// `resolve` maps a server name to its newly merged settings. For each
+    /// connection the resolved value is diffed against the connection's current
+    /// settings cell; on a change the cell is re-stored — so a later
+    /// `workspace/configuration` re-pull reflects it — and a best-effort
+    /// `workspace/didChangeConfiguration` is pushed (carrying the new value, or
+    /// `null` when settings were cleared). Unchanged servers get nothing, so a
+    /// global reload does not storm every connection. The cell is updated before
+    /// the push so a pull-model server's re-pull never races onto the old value.
+    pub(crate) async fn propagate_settings(
+        &self,
+        resolve: impl Fn(&str) -> Option<serde_json::Value>,
+    ) {
+        let connections = self.connections.lock().await;
+        for handle in connections.values() {
+            let resolved = resolve(handle.key().server());
+            // Diff by value (Arc identity is irrelevant); skip unchanged servers
+            // so an unchanged config reload pushes nothing.
+            if resolved.as_ref() == handle.current_settings().as_deref() {
+                continue;
+            }
+            handle.store_settings(resolved.clone().map(Arc::new));
+            handle.send_notification(build_did_change_configuration_notification(
+                resolved.unwrap_or(serde_json::Value::Null),
+            ));
+        }
+    }
+
     /// Among `candidates`, the server names that have a **live connection
     /// advertising pull diagnostics** — `textDocument/diagnostic`, via static
     /// initialize caps or a dynamic registration — checked WITHOUT creating a
@@ -1393,6 +1423,14 @@ impl LanguageServerPool {
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
         // Server name is passed for structured logging and notification prefixes
+        // Per-connection settings cell, shared between the reader (answers
+        // workspace/configuration pulls, path b) and the handle (re-stored on a
+        // merge change, path c). Seeded from the resolved config
+        // (downstream-settings-propagation).
+        let settings_cell = Arc::new(arc_swap::ArcSwapOption::from(
+            server_config.settings.clone().map(Arc::new),
+        ));
+
         let liveness_timeout = liveness_timeout::LivenessTimeout::default();
         let reader_handle = spawn_reader_task_for_server(
             reader,
@@ -1412,13 +1450,7 @@ impl LanguageServerPool {
                 progress_registry: Arc::clone(&self.progress_registry),
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
                 progress_connection_id: self.progress_registry.new_connection_id(),
-                // Seed this connection's settings cell from the resolved config
-                // so the reader can answer downstream `workspace/configuration`
-                // pulls (downstream-settings-propagation). Updated on later merge
-                // changes by the propagation path (c).
-                settings: Arc::new(arc_swap::ArcSwapOption::from(
-                    server_config.settings.clone().map(Arc::new),
-                )),
+                settings: Arc::clone(&settings_cell),
             },
         );
 
@@ -1435,6 +1467,7 @@ impl LanguageServerPool {
             dynamic_capabilities,
             connection_key.clone(),
             workspace_folders,
+            settings_cell,
         ));
 
         // Insert into pool immediately so concurrent requests see Initializing state
@@ -3445,6 +3478,7 @@ mod tests {
             Arc::new(DynamicCapabilityRegistry::new()),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Add connection to pool
@@ -5080,5 +5114,62 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// Path c: `propagate_settings` re-stores each live connection's cell from the
+    /// resolver, so a later `workspace/configuration` re-pull reflects the change.
+    /// A connection whose resolved value is unchanged keeps its cell as-is.
+    #[tokio::test]
+    async fn propagate_settings_updates_changed_connections() {
+        use serde_json::json;
+
+        let pool = LanguageServerPool::new();
+
+        // Two live connections: "rust-analyzer" gets new settings; "lua" already
+        // holds its value and the resolver returns the same thing (unchanged).
+        let ra = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("rust-analyzer"),
+        )
+        .await;
+        let lua_value = Arc::new(json!({ "Lua": { "telemetry": { "enable": false } } }));
+        let lua =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
+        lua.store_settings(Some(Arc::clone(&lua_value)));
+        {
+            let mut conns = pool.connections().await;
+            conns.insert(ConnectionKey::for_server("rust-analyzer"), Arc::clone(&ra));
+            conns.insert(ConnectionKey::for_server("lua"), Arc::clone(&lua));
+        }
+
+        let ra_value = json!({ "rust-analyzer": { "cargo": { "features": "all" } } });
+        let ra_value_for_resolve = ra_value.clone();
+        let lua_value_for_resolve = (*lua_value).clone();
+        pool.propagate_settings(move |name| match name {
+            "rust-analyzer" => Some(ra_value_for_resolve.clone()),
+            "lua" => Some(lua_value_for_resolve.clone()),
+            _ => None,
+        })
+        .await;
+
+        assert_eq!(
+            ra.current_settings().as_deref(),
+            Some(&ra_value),
+            "changed connection's cell is updated to the resolved value"
+        );
+        assert_eq!(
+            lua.current_settings().as_deref(),
+            Some(lua_value.as_ref()),
+            "unchanged connection keeps its settings"
+        );
+    }
+
+    /// Path c with no live connections (e.g. initialize-time apply) is a clean
+    /// no-op, not a panic.
+    #[tokio::test]
+    async fn propagate_settings_no_connections_is_noop() {
+        let pool = LanguageServerPool::new();
+        pool.propagate_settings(|_| Some(serde_json::json!({ "x": 1 })))
+            .await;
     }
 }

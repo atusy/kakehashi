@@ -96,18 +96,29 @@ The handler needs two things the dispatch does not carry today:
 
 ### (c) Re-propagate on merge change, diffing per server
 
-Whenever the merged settings tree changes — `did_change_configuration_impl` and
-any config-file reload path — kakehashi, for each **live** downstream
-connection, compares that server's current merged `settings` slice against the
-**last value sent to that connection**; on a difference it sends
+Propagation hooks the single settings-apply choke point (`apply_shared_settings`)
+that every reload already funnels through — `didChangeConfiguration`, the
+auto-install reload, and initialize. For each **live** downstream connection
+kakehashi re-resolves that server's `settings` (through the same wildcard merge
+used at spawn) and compares it against the connection's current settings cell;
+on a difference it re-stores the cell and sends
 `workspace/didChangeConfiguration { settings }` (pull-model servers then
-re-request and are answered by (b)). Unchanged servers get nothing, so a global
-reload does not storm every connection.
+re-request and are answered by (b)). The cell is updated **before** the push so
+a pull-model re-pull never races onto the stale value. Unchanged servers get
+nothing, so a global reload does not storm every connection.
 
-This requires per-connection **last-sent settings** state to diff against
-(owned by the connection/pool), plus the reload paths enumerating live
-connections. Not-yet-started servers need no notification — they pick up the
-latest merged value at startup via (a).
+The per-connection settings cell *is* the diff baseline: it holds the latest
+resolved value (what (b) serves), updated unconditionally on change with the
+push sent best-effort afterward — a dropped push self-heals when a pull-model
+server re-requests, or on respawn (re-seed + (a) re-push). Not-yet-started
+servers need no notification — they pick up the latest merged value at startup
+via (a). At initialize time there are no live connections, so the hook is a
+clean no-op.
+
+(There is no runtime config-file *re-read* path today; `./kakehashi.toml` and
+the user file are read once at startup. Runtime changes arrive via
+`didChangeConfiguration`. If a file-watch reload is ever added, routing it
+through `apply_shared_settings` extends (c) for free.)
 
 ## Considered Options
 
@@ -153,7 +164,12 @@ keeps propagation proportional to actual change.
 - **`initializationOptions` changes still need a restart**: a server that reads
   a given key only from `initializationOptions` (and ignores
   `didChangeConfiguration`) will not see a runtime change to it until respawn.
-- Adds per-connection last-sent-settings state to the bridge pool.
+- Adds a per-connection settings cell to the bridge pool, shared between the
+  reader (serves pulls) and the pool (re-stores on change).
+- A failed push (queue full / channel closed) to a push-model server leaves it
+  with stale config until it re-pulls or respawns; the cell still holds the
+  current value, so a pull-model server self-heals. Guaranteed push delivery
+  would need a separate retry baseline and is not implemented.
 
 ### Neutral
 

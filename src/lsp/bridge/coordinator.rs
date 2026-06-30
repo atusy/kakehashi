@@ -198,6 +198,23 @@ impl BridgeCoordinator {
         Arc::clone(&self.pool)
     }
 
+    /// Propagate a merged-settings change to every live downstream connection
+    /// (downstream-settings-propagation, path c). Each server's settings are
+    /// re-resolved through the same wildcard merge used at spawn, so an
+    /// unchanged config yields identical values and pushes nothing.
+    pub(crate) async fn propagate_settings(&self, settings: &WorkspaceSettings) {
+        self.pool
+            .propagate_settings(|server_name| {
+                resolve_with_wildcard(
+                    &settings.language_servers,
+                    server_name,
+                    merge_bridge_server_configs,
+                )
+                .and_then(|config| config.settings)
+            })
+            .await;
+    }
+
     /// Access the cancel forwarder.
     ///
     /// Used by:
