@@ -17,7 +17,9 @@ use tower_lsp_server::ls_types::SemanticTokens;
 use tree_sitter::{InputEdit, Tree};
 use url::Url;
 
-use crate::analysis::{InjectionMap, InjectionTokenCache, SemanticTokenCache};
+use crate::analysis::{
+    InjectionMap, InjectionTokenCache, SemanticTokenCache, SemanticTokenRangeCache,
+};
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{CacheableInjectionRegion, collect_all_injections};
@@ -33,6 +35,10 @@ pub(crate) type RequestId = u64;
 /// for document lifecycle management, edit handling, and token operations.
 pub(crate) struct CacheCoordinator {
     semantic_cache: SemanticTokenCache,
+    /// Most-recent `semanticTokens/range` result per URI (#535), keyed by viewport
+    /// range + the same `cache_key` as `semantic_cache`. Cleared on a generation
+    /// bump and evicted on `didClose` alongside `semantic_cache`.
+    semantic_range_cache: SemanticTokenRangeCache,
     injection_map: InjectionMap,
     injection_token_cache: std::sync::Arc<InjectionTokenCache>,
     request_tracker: SemanticRequestTracker,
@@ -49,6 +55,7 @@ impl CacheCoordinator {
     pub(crate) fn new() -> Self {
         Self {
             semantic_cache: SemanticTokenCache::new(),
+            semantic_range_cache: SemanticTokenRangeCache::new(),
             injection_map: InjectionMap::new(),
             injection_token_cache: std::sync::Arc::new(InjectionTokenCache::new()),
             request_tracker: SemanticRequestTracker::new(),
@@ -69,6 +76,7 @@ impl CacheCoordinator {
     /// - Request tracking state
     pub(crate) fn remove_document(&self, uri: &Url) {
         self.semantic_cache.remove(uri);
+        self.semantic_range_cache.remove(uri);
         self.injection_map.clear(uri);
         self.injection_token_cache.clear_document(uri);
         self.request_tracker.cancel_all_for_uri(uri);
@@ -354,6 +362,35 @@ impl CacheCoordinator {
         self.semantic_cache.store(uri, tokens, cache_key);
     }
 
+    /// Store the most-recent `semanticTokens/range` result for a document (#535),
+    /// tagged with the viewport `range` and the `cache_key` it was computed under.
+    pub(crate) fn store_range_tokens(
+        &self,
+        uri: Url,
+        range: tower_lsp_server::ls_types::Range,
+        language: String,
+        tokens: SemanticTokens,
+        cache_key: u64,
+    ) {
+        self.semantic_range_cache
+            .store(uri, range, language, tokens, cache_key);
+    }
+
+    /// Return the cached range tokens iff they were computed for this exact
+    /// viewport `range` and `language` under this `cache_key` (same text + settings
+    /// generation), letting the caller skip the range re-tokenization. None on a
+    /// scroll, a language switch, a text edit, a settings reload, or no entry.
+    pub(crate) fn get_current_range_tokens(
+        &self,
+        uri: &Url,
+        range: &tower_lsp_server::ls_types::Range,
+        language: &str,
+        cache_key: u64,
+    ) -> Option<SemanticTokens> {
+        self.semantic_range_cache
+            .get_if_current(uri, range, language, cache_key)
+    }
+
     /// Return the cached tokens iff they were computed under this `cache_key`
     /// (same text and settings generation), letting the caller skip the full
     /// re-tokenization. None on a text edit, a settings reload, or no entry.
@@ -376,6 +413,9 @@ impl CacheCoordinator {
         // them too so a reload doesn't leak per-region entries until each
         // document closes.
         self.injection_token_cache.clear();
+        // The range cache folds the same generation into its key, so the bump
+        // already invalidates it; clear to reclaim the dead entries (#535).
+        self.semantic_range_cache.clear();
     }
 
     // ========================================================================
@@ -814,6 +854,112 @@ print("goodbye")
                 .get(&uri, &initial_region_id, initial_content_hash, 0)
                 .is_none(),
             "cached tokens should be invalidated when content changes"
+        );
+    }
+
+    // ========================================================================
+    // semanticTokens/range cache (#535)
+    // ========================================================================
+
+    fn range_tokens(len: u32) -> SemanticTokens {
+        SemanticTokens {
+            result_id: None,
+            data: vec![SemanticToken {
+                delta_line: 0,
+                delta_start: 0,
+                length: len,
+                token_type: 0,
+                token_modifiers_bitset: 0,
+            }],
+        }
+    }
+
+    fn test_range(start_line: u32, end_line: u32) -> tower_lsp_server::ls_types::Range {
+        use tower_lsp_server::ls_types::{Position, Range};
+        Range::new(Position::new(start_line, 0), Position::new(end_line, 0))
+    }
+
+    #[test]
+    fn range_cache_hits_only_on_matching_range_language_and_key() {
+        let cache = CacheCoordinator::new();
+        let uri = create_test_uri("range.rs");
+        let range = test_range(0, 10);
+        let key = cache.cache_key_for("hello", cache.semantic_token_generation());
+        cache.store_range_tokens(uri.clone(), range, "rust".to_string(), range_tokens(5), key);
+
+        // Same range + language + key → hit.
+        assert!(
+            cache
+                .get_current_range_tokens(&uri, &range, "rust", key)
+                .is_some(),
+            "identical viewport + language + unchanged text/settings should hit"
+        );
+        // Different viewport (a scroll) → miss.
+        assert!(
+            cache
+                .get_current_range_tokens(&uri, &test_range(5, 15), "rust", key)
+                .is_none(),
+            "a different range must miss even with the same language and key"
+        );
+        // Different language (same URI+text re-opened as another language) → miss.
+        assert!(
+            cache
+                .get_current_range_tokens(&uri, &range, "python", key)
+                .is_none(),
+            "a language switch must miss even with the same range and key"
+        );
+        // Different key (text edit or settings reload) → miss.
+        assert!(
+            cache
+                .get_current_range_tokens(&uri, &range, "rust", key ^ 1)
+                .is_none(),
+            "a different cache_key must miss even with the same range and language"
+        );
+    }
+
+    #[test]
+    fn range_cache_cleared_on_generation_bump() {
+        let cache = CacheCoordinator::new();
+        let uri = create_test_uri("range.rs");
+        let range = test_range(0, 10);
+        let key = cache.cache_key_for("hello", cache.semantic_token_generation());
+        cache.store_range_tokens(uri.clone(), range, "rust".to_string(), range_tokens(5), key);
+        assert!(
+            cache
+                .get_current_range_tokens(&uri, &range, "rust", key)
+                .is_some()
+        );
+
+        // A settings/query reload must drop range entries (same must-do wiring as
+        // the full-token cache), or they would serve stale after the reload.
+        cache.bump_semantic_token_generation();
+        assert!(
+            cache
+                .get_current_range_tokens(&uri, &range, "rust", key)
+                .is_none(),
+            "generation bump must clear the range cache"
+        );
+    }
+
+    #[test]
+    fn range_cache_evicted_on_remove_document() {
+        let cache = CacheCoordinator::new();
+        let uri = create_test_uri("range.rs");
+        let range = test_range(0, 10);
+        let key = cache.cache_key_for("hello", cache.semantic_token_generation());
+        cache.store_range_tokens(uri.clone(), range, "rust".to_string(), range_tokens(5), key);
+        assert!(
+            cache
+                .get_current_range_tokens(&uri, &range, "rust", key)
+                .is_some()
+        );
+
+        cache.remove_document(&uri);
+        assert!(
+            cache
+                .get_current_range_tokens(&uri, &range, "rust", key)
+                .is_none(),
+            "didClose must evict the range cache entry"
         );
     }
 }
