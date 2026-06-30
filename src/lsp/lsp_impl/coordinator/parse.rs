@@ -144,38 +144,70 @@ impl ParseCoordinator {
     /// calling this, so the parse re-reads that stored text (a cheap `Arc<str>`
     /// refcount bump, [`text_arc`](crate::document::Document::text_arc)) rather than
     /// carrying a second owned `String`, and records the detected language + tree
-    /// **in place** via [`set_parse_result_if_present`] instead of re-inserting a
+    /// **in place** via the non-inserting, text + incarnation CAS
+    /// [`set_parse_result_if_text_and_incarnation_unchanged`] instead of re-inserting a
     /// fresh copy of the text. Net: zero full-document text copies in the open parse.
-    /// That store write is **non-inserting**, so it is resurrection-safe once the open
-    /// parse later moves off the ingress ticket (a `didClose` racing it stays closed).
+    /// That store write is **non-inserting** and lifetime-guarded, so it is
+    /// resurrection-safe and stale-safe once the open parse moves off the ingress
+    /// ticket: a `didClose` racing it stays closed, and a `didChange` / reopen landing
+    /// mid-parse drops the now-stale tree rather than clobbering the newer state.
     ///
     /// `ticket` is the ingress writer ticket of the mutation that scheduled this
     /// parse, or `None` for a caller outside the ingress sequence. On every resolution
-    /// path — a tree, a parsed-to-nothing, a previously-crashed parser, no detectable
-    /// language, or a document closed mid-parse — the parse advances the store's
-    /// per-document **watermark** to `ticket`, releasing a reader waiting on it.
+    /// path that still observes this lifetime — a tree, a parsed-to-nothing, a
+    /// previously-crashed parser, or no detectable language — the parse advances the
+    /// store's per-document **watermark** to `ticket` (guarded by the open
+    /// incarnation), releasing a reader waiting on it. The one path that does **not**
+    /// advance is a document already gone (a `didClose` removed it): its watermark
+    /// channel is gone too, so its readers have already fallen back.
+    ///
+    /// Returns `true` iff **this** call's CAS landed a tree (i.e. it is the parse
+    /// whose tree is now current). The off-ingress open caller gates its
+    /// tree-dependent downstream (`process_injections(forward=false)`, the deferred
+    /// refresh, the synthetic diagnostic) on this — **not** on "the document has a
+    /// tree": a `didChange` racing this parse can move the text on and let the edit
+    /// reparse attach the newer tree (and run `process_injections(forward=true)`)
+    /// first; this parse's CAS then rejects, and re-checking `tree().is_some()` would
+    /// wrongly see the edit's tree and re-run the *open* downstream over it,
+    /// superseding the edit's eager-open batch. Gating on the own-CAS result is the
+    /// same discipline `reparse_latest` follows for its `populate_injections`.
     pub(crate) async fn parse_document(
         &self,
         uri: Url,
         language_id: Option<&str>,
         ticket: Option<u64>,
-    ) {
+    ) -> bool {
         let mut events = Vec::new();
 
-        // Publish the watermark on whichever path resolves the parse below.
-        let advance_watermark = || {
-            if let Some(ticket) = ticket {
-                self.documents.advance_watermark(&uri, ticket);
-            }
+        // Read the text the registering didOpen already stored (a refcount bump, not
+        // a copy), together with the open lifetime's **incarnation** — BEFORE marking
+        // the parse started, so a document a `didClose` already removed leaves neither
+        // a resurrected document nor an orphan parse-state entry for the now-closed
+        // URI. A missing document stops **without** touching the watermark: the
+        // watermark is per-lifetime, so a plain advance with this prior-lifetime
+        // ticket could inflate a reopen's freshly-seeded channel and prematurely
+        // release a new-lifetime reader; a genuine close instead drops the channel and
+        // wakes its readers (they fall back). Unreachable while this parse is inline on
+        // the writer ticket (a `didClose` is gated behind the open); the guard is for
+        // the off-ingress open flip (#6), where a `didClose`/reopen can race it.
+        let Some((text, incarnation)) = self
+            .documents
+            .get(&uri)
+            .map(|doc| (doc.text_arc(), doc.incarnation()))
+        else {
+            return false;
         };
 
-        // Read the text the registering didOpen already stored (a refcount bump, not
-        // a copy) — BEFORE marking the parse started, so a document a `didClose`
-        // already removed leaves neither a resurrected document nor an orphan
-        // parse-state entry for the now-closed URI. Resolve the watermark and stop.
-        let Some(text) = self.documents.get(&uri).map(|doc| doc.text_arc()) else {
-            advance_watermark();
-            return;
+        // Publish the watermark on whichever path resolves the parse below, but
+        // **only if this lifetime is still current**: a close + reopen re-seeds the
+        // watermark at 0, and this (prior-lifetime) ticket must not inflate it. Same
+        // lifetime → advances (releasing a gated reader even on the no-language /
+        // no-tree paths, to the empty fallback). Mirrors `reparse_latest`.
+        let advance_watermark = || {
+            if let Some(ticket) = ticket {
+                self.documents
+                    .advance_watermark_for_incarnation(&uri, ticket, incarnation);
+            }
         };
 
         let parse_generation = self.documents.mark_parse_started(&uri);
@@ -192,21 +224,30 @@ impl ParseCoordinator {
                     language_name
                 );
                 // Mark the parse finished only if the result actually landed: a
-                // `didClose` that removed the document mid-parse makes the store write
-                // a no-op, and `mark_parse_finished` would otherwise recreate a parse
-                // -state entry (via `parse_sender`'s vacant insert) for the closed URI.
-                // (Unreachable while the open parse is inline on the writer ticket; the
-                // guard is for the off-ingress open flip, #6.)
+                // `didClose` that removed the document mid-parse (or a `didChange` /
+                // reopen that moved the text or incarnation on) makes the CAS a no-op,
+                // and `mark_parse_finished` would otherwise recreate a parse-state
+                // entry (via `parse_sender`'s vacant insert) for the gone URI. The
+                // text + incarnation guard is what makes this resurrection-safe once
+                // the open parse runs off the ingress ticket (#6).
                 if self
                     .documents
-                    .set_parse_result_if_present(&uri, Some(language_name), None)
+                    .set_parse_result_if_text_and_incarnation_unchanged(
+                        &uri,
+                        &text,
+                        incarnation,
+                        Some(&language_name),
+                        None,
+                    )
                 {
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, false);
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                return;
+                // No tree landed (the parser previously crashed): the open caller
+                // must not run its tree-dependent downstream.
+                return false;
             }
 
             let load_result = self.language.ensure_language_loaded(&language_name);
@@ -233,37 +274,83 @@ impl ParseCoordinator {
                 .await;
 
             if let Some(tree) = parsed_tree {
-                self.cache.populate_injections(
-                    &uri,
-                    &text,
-                    &tree,
-                    &language_name,
-                    &self.language,
-                    self.bridge.node_tracker(),
-                );
-
-                // `language_name` is unused past here — move it in (no clone). Gate
-                // `mark_parse_finished` on the store write landing (see the
-                // parser-failed path above).
-                if self
+                // Persist FIRST through the text + incarnation CAS (non-inserting), so
+                // a tree parsed from open-time text/lifetime is dropped when a
+                // `didChange` moved the text on or a `didClose`/reopen changed the
+                // incarnation — instead of clobbering the newer state. Only populate
+                // the injection caches when the tree actually landed, so a `didClose`
+                // racing this off-ingress parse can't leave stale injection entries for
+                // a gone document. (`Tree` clone is a cheap refcount bump.)
+                let stored = self
                     .documents
-                    .set_parse_result_if_present(&uri, Some(language_name), Some(tree))
-                {
+                    .set_parse_result_if_text_and_incarnation_unchanged(
+                        &uri,
+                        &text,
+                        incarnation,
+                        Some(&language_name),
+                        Some(tree.clone()),
+                    );
+                if stored {
+                    self.cache.populate_injections(
+                        &uri,
+                        &text,
+                        &tree,
+                        &language_name,
+                        &self.language,
+                        self.bridge.node_tracker(),
+                    );
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, true);
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                return;
+                // `stored` is exactly "this call's CAS landed the tree": false when a
+                // racing `didChange`/reopen moved the text or incarnation on and the
+                // edit reparse won, in which case the open downstream must NOT re-run
+                // over the edit's tree.
+                return stored;
             }
+
+            // Parse produced no tree (timeout / parser unavailable / join error) but
+            // the language WAS detected — record it with no tree, rather than falling
+            // through to the no-language path below which would null it out. Host
+            // bridging needs only text + language (never a tree), so preserving the
+            // language keeps a host-bridged document working after a parse failure.
+            if self
+                .documents
+                .set_parse_result_if_text_and_incarnation_unchanged(
+                    &uri,
+                    &text,
+                    incarnation,
+                    Some(&language_name),
+                    None,
+                )
+            {
+                self.documents
+                    .mark_parse_finished(&uri, parse_generation, false);
+            }
+            advance_watermark();
+            self.notifier().log_language_events(&events).await;
+            return false;
         }
 
-        if self.documents.set_parse_result_if_present(&uri, None, None) {
+        // No language detected at all → store no language, no tree.
+        if self
+            .documents
+            .set_parse_result_if_text_and_incarnation_unchanged(
+                &uri,
+                &text,
+                incarnation,
+                None,
+                None,
+            )
+        {
             self.documents
                 .mark_parse_finished(&uri, parse_generation, false);
         }
         advance_watermark();
         self.notifier().log_language_events(&events).await;
+        false
     }
 
     /// Re-parse a document after its parser finished installing, **off the
