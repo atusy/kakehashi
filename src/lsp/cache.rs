@@ -371,6 +371,11 @@ impl CacheCoordinator {
         self.semantic_token_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.semantic_cache.clear();
+        // The injection token cache folds the same generation into its key, so
+        // old-generation entries are already unreachable after the bump; clear
+        // them too so a reload doesn't leak per-region entries until each
+        // document closes.
+        self.injection_token_cache.clear();
     }
 
     // ========================================================================

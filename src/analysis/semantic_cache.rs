@@ -306,6 +306,15 @@ impl InjectionTokenCache {
         self.cache.retain(|key, _| &key.0 != uri);
     }
 
+    /// Drop every cached entry. Used on a settings/query reload (alongside the
+    /// generation bump) to reclaim memory: the generation fold already makes
+    /// old-generation entries unreachable — this just stops them leaking until
+    /// each document closes. Mirrors `SemanticTokenCache::clear`; the fold, not
+    /// this clear, is what makes a concurrent store race-safe.
+    pub(crate) fn clear(&self) {
+        self.cache.clear();
+    }
+
     /// Validity keys `(region_id, validity_hash, generation)` currently stored for
     /// a document — lets a test confirm what the hot path persisted and overwrite
     /// a specific entry to prove the reuse path reads it.

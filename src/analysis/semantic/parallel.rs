@@ -973,7 +973,18 @@ fn to_region_local(tokens: &[RawToken], line_start: u32) -> Vec<RawToken> {
     let line_start = line_start as usize;
     tokens
         .iter()
-        .map(|t| t.with_span(t.line.saturating_sub(line_start), t.column, t.length))
+        .map(|t| {
+            // Invariant: every token of an eligible region sits on or below the
+            // region's first host line, so the subtraction never truncates. The
+            // saturating_sub is a release-build backstop only.
+            debug_assert!(
+                t.line >= line_start,
+                "injection token at host line {} precedes its region start {}",
+                t.line,
+                line_start
+            );
+            t.with_span(t.line.saturating_sub(line_start), t.column, t.length)
+        })
         .collect()
 }
 
@@ -2178,6 +2189,44 @@ local b = 2
         let tree = parser.parse(text, None).expect("parse markdown");
         pool.release("markdown".to_string(), parser);
         tree
+    }
+
+    /// `to_region_local` and `reanchor_to_host` are exact inverses, and a region
+    /// that moved (re-anchored at a different `line_start`) shifts uniformly by
+    /// the line delta with columns untouched.
+    #[test]
+    fn region_local_roundtrip_and_shift() {
+        let host = vec![
+            raw_token_at(5, 2, 3),
+            raw_token_at(6, 0, 4),
+            raw_token_at(7, 8, 1),
+        ];
+
+        // Store at line_start 5, re-anchor at the same start → identical.
+        let local = to_region_local(&host, 5);
+        assert_eq!(local.iter().map(|t| t.line).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(reanchor_to_host(local.clone(), 5), host);
+
+        // Region moved down 3 lines (edit above): re-anchor shifts every token by
+        // +3, columns unchanged.
+        let moved = reanchor_to_host(local, 8);
+        assert_eq!(
+            moved.iter().map(|t| (t.line, t.column)).collect::<Vec<_>>(),
+            [(8, 2), (9, 0), (10, 8)]
+        );
+    }
+
+    fn raw_token_at(line: usize, column: usize, length: usize) -> RawToken {
+        RawToken {
+            line,
+            column,
+            length,
+            kind: crate::analysis::semantic::token_collector::TokenKind::Mapped(1, 0),
+            depth: 1,
+            pattern_index: 0,
+            priority: 100,
+            node_byte_len: length,
+        }
     }
 
     /// The cached path must produce byte-identical tokens to the uncached path,
