@@ -106,7 +106,13 @@ pub(super) async fn apply_shared_settings(
     // auto-install reload), before `settings` is consumed by the apply below.
     // At initialize time there are no connections yet, so it is a clean no-op
     // (downstream-settings-propagation).
-    bridge.propagate_settings(&settings).await;
+    let pushed = bridge.propagate_settings(&settings).await;
+    if pushed > 0 {
+        log::debug!(
+            target: "kakehashi::bridge",
+            "Propagated settings change to {} downstream connection(s)", pushed
+        );
+    }
     match raw_settings {
         Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
         None => settings_manager.apply_settings(settings),

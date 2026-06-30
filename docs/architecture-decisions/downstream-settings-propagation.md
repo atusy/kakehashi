@@ -53,17 +53,25 @@ tree.** Concretely, three coupled changes:
 
 ### (a) Advertise the client capability and seed initial settings
 
-- `build_bridge_client_capabilities` advertises
-  `workspace.configuration = true` so spec-compliant downstream servers will
-  send `workspace/configuration`.
+- `build_bridge_client_capabilities` advertises `workspace.configuration` so a
+  spec-compliant downstream server sends `workspace/configuration` — but **gated
+  per-server on that server having `settings` to serve** (`settings.is_some()`,
+  evaluated at spawn from the resolved config). Advertising it for a server with
+  no `settings` would flip a server configured only via `initializationOptions`
+  (today's only mechanism, so every existing setup) into pulling, then answer
+  every section `null` — clobbering config it held. The gate makes (a) safe to
+  ship alongside (b) without an empirical per-server validation step.
 - Add `settings: Option<Value>` to `BridgeServerConfig` (opaque passthrough;
   kakehashi never interprets the contents) and to `merge_bridge_server_configs`,
   where it **deep-merges** across config layers exactly like
   `initialization_options` (nested objects merge, overlay scalars win), so a
   project layer can override one sub-key without restating the rest.
-- After `initialized`, if the server's merged `settings` is non-null, kakehashi
+- After `initialized`, if the server's settings cell is non-null, kakehashi
   sends one `workspace/didChangeConfiguration { settings }` so push-model
-  servers are configured even before they pull.
+  servers are configured even before they pull. It reads the **live cell**, not
+  the spawn-time value, so a (c) re-propagation that landed during the handshake
+  is not overwritten by a stale push — the push always agrees with what (b)
+  would answer.
 
 `initialization_options` and `settings` are kept distinct, matching their LSP
 roles: `initialization_options` is consumed only at `initialize` time;
@@ -155,12 +163,15 @@ keeps propagation proportional to actual change.
 
 ### Negative
 
-- **Regression risk in (a)↔(b) coupling**: advertising
-  `workspace.configuration` may cause a server that previously relied solely on
-  `initializationOptions` to start *pulling*. If (b) resolves a section to
-  `null` where the server expected a value, that server can *lose* config it
-  used to have. (a) must not ship without (b) returning correct values for an
-  actually-configured server.
+- **A server that starts with no `settings` never pulls, even if settings are
+  added at runtime**: the capability is negotiated once at `initialize` and the
+  per-server gate evaluates `settings.is_some()` then. If a user later adds
+  `settings` for that server, push-model servers still receive it via (c)'s
+  `didChangeConfiguration`, but a pure pull-model server will not pull until it
+  respawns. This is the deliberate cost of the gate (see (a)) — accepted because
+  the alternative (advertising unconditionally) regresses the *common* case:
+  every server configured via `initializationOptions` only, which is every
+  existing setup, would flip to pulling and be answered `null`.
 - **`initializationOptions` changes still need a restart**: a server that reads
   a given key only from `initializationOptions` (and ignores
   `didChangeConfiguration`) will not see a runtime change to it until respawn.
@@ -194,10 +205,13 @@ The following are **deferred** and intentionally out of scope:
 ## Validation
 
 Section resolution cannot be reasoned out in the abstract — real servers differ
-on whether `section` is `null` or their own name. (a) is therefore a
-**prerequisite** for (b): advertise the capability, log the incoming `items`
-(`section` + `scopeUri`) from an actually-configured server, then make
-resolution match what was observed. A unit test written on the wrong assumption
-passes while the real server gets `null` back. Confirm an actually-configured
-server still receives its settings after (a)+(b) land together (the regression
-guard above).
+on whether `section` is `null` or their own name. The handler logs the incoming
+`items` (`section` + `scopeUri`) at debug, so the resolution convention can be
+confirmed against an actually-configured server. A unit test written on the
+wrong assumption passes while the real server gets `null` back; the
+dotted-path-into-editor-root convention is chosen because it handles both the
+`null` and own-namespace cases, but observing a real server is still the
+acceptance check. The per-server capability gate (a) removes the earlier
+"(a) must not ship without (b) validated" coupling: a server with no `settings`
+is never told to pull, so an incorrect resolution can only affect a server the
+user explicitly gave `settings`.

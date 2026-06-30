@@ -25,6 +25,7 @@ pub(crate) fn build_initialize_request(
     root_uri: Option<String>,
     workspace_folders: Option<Vec<WorkspaceFolder>>,
     upstream_capabilities: Option<&ClientCapabilities>,
+    advertise_configuration: bool,
 ) -> JsonRpcRequest<InitializeParams> {
     let root_path = root_uri.as_deref().and_then(|uri| {
         url::Url::parse(uri)
@@ -40,7 +41,10 @@ pub(crate) fn build_initialize_request(
         root_uri,
         root_path,
         workspace_folders,
-        capabilities: build_bridge_client_capabilities(upstream_capabilities),
+        capabilities: build_bridge_client_capabilities(
+            upstream_capabilities,
+            advertise_configuration,
+        ),
         initialization_options,
         ..Default::default()
     };
@@ -167,7 +171,7 @@ mod tests {
 
     #[test]
     fn initialize_request_has_correct_structure() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None, true);
 
         insta::with_settings!({snapshot_suffix => feature_suffix()}, {
             insta::assert_json_snapshot!(request, {
@@ -185,8 +189,14 @@ mod tests {
                 }
             }
         });
-        let request =
-            build_initialize_request(RequestId::new(42), Some(options.clone()), None, None, None);
+        let request = build_initialize_request(
+            RequestId::new(42),
+            Some(options.clone()),
+            None,
+            None,
+            None,
+            true,
+        );
 
         insta::with_settings!({snapshot_suffix => feature_suffix()}, {
             insta::assert_json_snapshot!(request, {
@@ -204,6 +214,7 @@ mod tests {
             Some(root_uri.to_string()),
             None,
             None,
+            true,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -212,7 +223,7 @@ mod tests {
 
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None, true);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["rootUri"].is_null());
@@ -224,7 +235,8 @@ mod tests {
             uri: Uri::from_str("file:///home/user/project").unwrap(),
             name: "project".to_string(),
         }];
-        let request = build_initialize_request(RequestId::new(1), None, None, Some(folders), None);
+        let request =
+            build_initialize_request(RequestId::new(1), None, None, Some(folders), None, true);
 
         insta::with_settings!({snapshot_suffix => feature_suffix()}, {
             insta::assert_json_snapshot!(request, {
@@ -235,7 +247,7 @@ mod tests {
 
     #[test]
     fn initialize_request_has_null_workspace_folders_when_not_provided() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None, true);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["workspaceFolders"].is_null());
@@ -250,6 +262,7 @@ mod tests {
             Some(root_uri.to_string()),
             None,
             None,
+            true,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -258,7 +271,7 @@ mod tests {
 
     #[test]
     fn initialize_request_has_null_root_path_when_no_root_uri() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None, true);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["rootPath"].is_null());
@@ -292,7 +305,7 @@ mod tests {
         };
 
         let request =
-            build_initialize_request(RequestId::new(1), None, None, None, Some(&upstream));
+            build_initialize_request(RequestId::new(1), None, None, None, Some(&upstream), true);
 
         insta::with_settings!({snapshot_suffix => feature_suffix()}, {
             insta::assert_json_snapshot!(request, {

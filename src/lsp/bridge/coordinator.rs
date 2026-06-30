@@ -201,8 +201,9 @@ impl BridgeCoordinator {
     /// Propagate a merged-settings change to every live downstream connection
     /// (downstream-settings-propagation, path c). Each server's settings are
     /// re-resolved through the same wildcard merge used at spawn, so an
-    /// unchanged config yields identical values and pushes nothing.
-    pub(crate) async fn propagate_settings(&self, settings: &WorkspaceSettings) {
+    /// unchanged config yields identical values and pushes nothing. Returns the
+    /// number of connections pushed.
+    pub(crate) async fn propagate_settings(&self, settings: &WorkspaceSettings) -> usize {
         self.pool
             .propagate_settings(|server_name| {
                 resolve_with_wildcard(
@@ -212,7 +213,7 @@ impl BridgeCoordinator {
                 )
                 .and_then(|config| config.settings)
             })
-            .await;
+            .await
     }
 
     /// Access the cancel forwarder.

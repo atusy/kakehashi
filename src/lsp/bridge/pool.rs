@@ -472,11 +472,15 @@ impl LanguageServerPool {
     /// `null` when settings were cleared). Unchanged servers get nothing, so a
     /// global reload does not storm every connection. The cell is updated before
     /// the push so a pull-model server's re-pull never races onto the old value.
+    ///
+    /// Returns the number of connections that changed (and were pushed), so the
+    /// anti-storm behavior is observable to callers and tests.
     pub(crate) async fn propagate_settings(
         &self,
         resolve: impl Fn(&str) -> Option<serde_json::Value>,
-    ) {
+    ) -> usize {
         let connections = self.connections.lock().await;
+        let mut pushed = 0;
         for handle in connections.values() {
             let resolved = resolve(handle.key().server());
             // Diff by value (Arc identity is irrelevant); skip unchanged servers
@@ -488,7 +492,9 @@ impl LanguageServerPool {
             handle.send_notification(build_did_change_configuration_notification(
                 resolved.unwrap_or(serde_json::Value::Null),
             ));
+            pushed += 1;
         }
+        pushed
     }
 
     /// Among `candidates`, the server names that have a **live connection
@@ -1486,12 +1492,12 @@ impl LanguageServerPool {
         // - If this function's caller is cancelled, only the JoinHandle await is dropped
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
-        // Seed value for the post-`initialized` settings push (path a). Same
-        // value the reader's settings cell was seeded with; push-model servers
-        // read it directly, pull-model servers re-request via
-        // workspace/configuration (downstream-settings-propagation).
-        let seed_settings = server_config.settings.clone();
         let client_capabilities = self.client_capabilities();
+        // Only advertise `workspace.configuration` when this server actually has
+        // settings to serve. Advertising it otherwise would flip an
+        // `initializationOptions`-configured server to pull and get every
+        // section answered `null` (downstream-settings-propagation).
+        let advertise_configuration = server_config.settings.is_some();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let handshake_task = tokio::spawn(async move {
@@ -1505,6 +1511,7 @@ impl LanguageServerPool {
                     root_uri,
                     init_folders,
                     client_capabilities,
+                    advertise_configuration,
                 ),
             )
             .await;
@@ -1520,14 +1527,18 @@ impl LanguageServerPool {
                     );
                     handle_for_handshake.set_server_capabilities(capabilities);
                     handle_for_handshake.set_state(ConnectionState::Ready);
-                    // Path a: push this server's seed settings now that it is
+                    // Path a: push this server's settings now that it is
                     // initialized, so push-model servers are configured even
-                    // before they pull (downstream-settings-propagation).
-                    // Best-effort: a dropped notification self-heals when a
-                    // pull-model server re-requests via workspace/configuration.
-                    if let Some(settings) = seed_settings {
+                    // before they pull (downstream-settings-propagation). Read
+                    // the *live* cell, not the spawn-time value: a path-c
+                    // re-propagation during the handshake may have already
+                    // advanced it, and the cell is exactly what (b) serves — so
+                    // this pushes what a pull would return, never a stale
+                    // snapshot. Best-effort: a dropped notification self-heals on
+                    // the next pull.
+                    if let Some(settings) = handle_for_handshake.current_settings() {
                         handle_for_handshake.send_notification(
-                            build_did_change_configuration_notification(settings),
+                            build_did_change_configuration_notification((*settings).clone()),
                         );
                     }
                     Ok(())
@@ -5145,13 +5156,18 @@ mod tests {
         let ra_value = json!({ "rust-analyzer": { "cargo": { "features": "all" } } });
         let ra_value_for_resolve = ra_value.clone();
         let lua_value_for_resolve = (*lua_value).clone();
-        pool.propagate_settings(move |name| match name {
-            "rust-analyzer" => Some(ra_value_for_resolve.clone()),
-            "lua" => Some(lua_value_for_resolve.clone()),
-            _ => None,
-        })
-        .await;
+        let pushed = pool
+            .propagate_settings(move |name| match name {
+                "rust-analyzer" => Some(ra_value_for_resolve.clone()),
+                "lua" => Some(lua_value_for_resolve.clone()),
+                _ => None,
+            })
+            .await;
 
+        assert_eq!(
+            pushed, 1,
+            "only the changed connection is pushed — the unchanged one does not storm"
+        );
         assert_eq!(
             ra.current_settings().as_deref(),
             Some(&ra_value),
@@ -5162,6 +5178,18 @@ mod tests {
             Some(lua_value.as_ref()),
             "unchanged connection keeps its settings"
         );
+
+        // Re-running with the same resolver now pushes nothing: both cells match.
+        let lua_again = (*lua_value).clone();
+        let ra_again = ra_value.clone();
+        let pushed_again = pool
+            .propagate_settings(move |name| match name {
+                "rust-analyzer" => Some(ra_again.clone()),
+                "lua" => Some(lua_again.clone()),
+                _ => None,
+            })
+            .await;
+        assert_eq!(pushed_again, 0, "an unchanged reload pushes nothing");
     }
 
     /// Path c with no live connections (e.g. initialize-time apply) is a clean
@@ -5169,7 +5197,9 @@ mod tests {
     #[tokio::test]
     async fn propagate_settings_no_connections_is_noop() {
         let pool = LanguageServerPool::new();
-        pool.propagate_settings(|_| Some(serde_json::json!({ "x": 1 })))
+        let pushed = pool
+            .propagate_settings(|_| Some(serde_json::json!({ "x": 1 })))
             .await;
+        assert_eq!(pushed, 0, "no live connections → nothing pushed");
     }
 }
