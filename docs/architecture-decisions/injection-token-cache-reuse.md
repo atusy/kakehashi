@@ -44,9 +44,10 @@ Two structural facts fall out:
 
 1. **The delta diff and incremental parse are nearly free.** The per-keystroke
    CPU is almost entirely the *token recompute* — exactly what a per-region
-   cache avoids. (This is also why the whole-doc cache helps `full` but not
-   `delta`: both endpoints run the same recompute; the diff that distinguishes
-   them costs nothing.)
+   cache avoids. (The whole-doc cache keys on text alone, so it hits for both
+   `full` and `delta` when the document is unchanged and misses for both after
+   an edit; the typing path is always a miss, so the recompute — not the
+   endpoint — is what matters here.)
 2. **Per-region tokenize is ~1/3 of the recompute, not all of it.** Host token
    collection and injection *discovery* are each roughly equal in cost, and
    `finalize` adds ~10%. Even a perfect per-region tokenize cache leaves a hard
@@ -136,9 +137,12 @@ content starts at column 0 on its own line.
 **v1 scope: cache only regions satisfying the predicate; recompute the rest.**
 This eliminates the row-0 / prefix re-anchoring correctness surface entirely
 while covering the common "many fenced code blocks" case the measurements
-target. A later version may store true region-local tokens and run the rebase
-math on read to cover the remaining regions, but that is not required to land
-the win.
+target. For the qualifying set, region-local and host-absolute coordinates
+differ only by an additive line constant, so v1 can store the host-absolute
+tokens exactly as emitted and reuse them with `line += Δ` — which equals the
+region-local design of Decision step 3 for this set. True region-local storage
+(with the column rebase run on read) is the later, broader-coverage version that
+extends the cache to non-qualifying regions; it is not required to land the win.
 
 ### Companion lever: injection discovery
 
@@ -162,9 +166,10 @@ Re-anchoring is a single additive line/column offset. The sweep line still sees
 the full token set, so host-vs-injection exclusion and transparent-token
 breakpoints at region boundaries keep working unchanged. Cost: change
 `InjectionTokenCache`'s value type from `SemanticTokens` to `Vec<RawToken>` (or a
-region-local newtype), and make `RawToken` storable across requests (it already
-holds only owned/`Copy` fields after `perf(semantic): pre-resolve token type to
-legend indices` removed the `String`).
+region-local newtype), and make `RawToken` storable across requests (it is
+`Clone` and holds only owned, borrow-free fields — `TokenKind` carries an owned
+`Box<str>` for the not-in-legend case, so there are no lifetimes to outlive the
+request).
 
 ### B. Cache post-finalize `SemanticTokens`, splice into output (today's type)
 
@@ -178,7 +183,8 @@ right). It also forces a delta-decode + re-encode to re-anchor coordinates.
 ### C. Whole-document memoization keyed by content hash (shipped, complementary)
 
 Cache the entire finalized result per `(uri, content_hash)`. **Shipped as PR
-#530** (`SemanticTokenCache`, keyed by `fnv1a_hash(text) ^ generation`). It
+#530** (`SemanticTokenCache`, keyed by
+`fnv1a_hash(text) ^ generation.wrapping_mul(FNV_PRIME)`). It
 covers the *unchanged-document* case — idle `full` re-requests and no-op deltas.
 It does nothing for the typing path, because every keystroke changes the
 document hash, which is exactly why this ADR exists. The two are complementary
