@@ -444,6 +444,21 @@ impl Kakehashi {
         // - Escalates to SIGTERM/SIGKILL for unresponsive servers (Unix)
         self.bridge.shutdown_all().await;
 
+        // Dump diagnostic-path counters (#533) so a session's refresh amplification
+        // (push republishes in → refreshes requested vs sent → pulls answered) is
+        // readable without a profiler. `requested - sent` is what the #497 gate saved.
+        let m = self.diagnostics.metrics_snapshot();
+        log::info!(
+            target: "kakehashi::diag_metrics",
+            "diagnostic path totals: push_republishes={} refreshes_requested={} refreshes_sent={} (gate saved {}) pulls_answered={} mean_pull_us={}",
+            m.push_republishes,
+            m.refreshes_requested,
+            m.refreshes_sent,
+            m.refreshes_requested.saturating_sub(m.refreshes_sent),
+            m.pulls_answered,
+            m.mean_pull_micros(),
+        );
+
         Ok(())
     }
 }
