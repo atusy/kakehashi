@@ -93,7 +93,8 @@ re-entering the pipeline *before* `finalize_tokens`.
 Per request, in `collect_injection_tokens_parallel`:
 
 1. For each injection region (identified by `region_id` from the freshly parsed
-   tree's `NodeTracker` — not the cached `InjectionMap`; see obligation 2), check
+   tree's `NodeTracker` — not the cached `InjectionMap`; see the `NodeTracker`
+   obligation below), check
    `InjectionTokenCache` for a still-valid entry: its `content_hash` matches the
    region's current content **and** it was stored under the current settings
    generation (see Hazard 2).
@@ -178,8 +179,9 @@ Two implementation obligations follow, neither inferable from
   `host_start_byte`, not the `end_byte` / node `kind` that `get_or_create` needs.
   Either way this threads two new inputs into `collect_injection_tokens_parallel`
   and `handle_semantic_tokens_full`, which take neither today: the document `uri`
-  and the `NodeTracker` (it lives on `CacheCoordinator`, not the
-  `LanguageCoordinator` they currently receive). This is safe
+  and the `NodeTracker` (owned by the bridge coordinator and passed *into* cache
+  methods like `populate_injections`, not held by the `LanguageCoordinator` these
+  functions receive). This is safe
   because `apply_input_edits` updates the `NodeTracker` synchronously under the
   edit lock the moment an edit lands — *before* the off-ingress reparse — so the
   ULIDs are consistent even while the cached `InjectionMap` is still pre-edit
