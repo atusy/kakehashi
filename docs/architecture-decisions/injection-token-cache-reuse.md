@@ -105,6 +105,55 @@ Caching **region-local pre-finalize `RawToken`s** (not post-finalize
 re-anchoring a pure `line += region_line_offset` translation rather than a
 delta-decode-then-re-encode.
 
+### Re-anchoring and the language-agnostic scope (v1)
+
+Injection `RawToken`s today are emitted in **host-absolute** coordinates, with
+the per-region host offset baked in at emission (`token_collector.rs`).
+Re-anchoring a cached region therefore means reproducing the same host-absolute
+tokens after the region has moved. For an arbitrary region this is non-trivial:
+row 0 carries the region's `start_column`, deeper rows can carry per-row
+host-byte prefixes (e.g. a blockquote `> ` strip), and UTF-16 columns depend on
+host line bytes. A same-line edit *before* the region would shift row-0 columns
+without changing the region's content hash — a stale-position hazard.
+
+But the re-anchor is **trivial and exact** for any region whose host↔content map
+is a pure uniform translation:
+
+- `content_start_col == 0` (the content begins at column 0 of its first line),
+  **and**
+- the region has no per-row prefix widths (its included ranges are contiguous
+  whole lines — no host bytes interleaved per row), **and**
+- the region is not part of an `injection.combined` group.
+
+These are **geometry predicates on the region's included ranges, not
+language-specific**. A fenced code block that starts at column 0 qualifies; a
+region that interleaves host bytes per row (blockquote-style, line-continuation
+markers, etc.) does not — the predicate self-selects regardless of language. For
+a qualifying region, re-anchoring after any content-preserving edit is a single
+additive `line += Δ`, and a same-line-before edit is impossible because the
+content starts at column 0 on its own line.
+
+**v1 scope: cache only regions satisfying the predicate; recompute the rest.**
+This eliminates the row-0 / prefix re-anchoring correctness surface entirely
+while covering the common "many fenced code blocks" case the measurements
+target. A later version may store true region-local tokens and run the rebase
+math on read to cover the remaining regions, but that is not required to land
+the win.
+
+### Companion lever: injection discovery
+
+The per-keystroke table shows injection *discovery* (the injection query over
+the whole host tree, run every request to enumerate regions) costs as much as
+tokenize and is also recomputed every keystroke. It is not cached by v1, but the
+same position-stable `region_id` / `InjectionMap` identity that makes token
+reuse possible could let an edit reuse the previous region *set* instead of
+re-querying. Caching discovery + tokenize together roughly doubles the
+per-keystroke saving (measured projection: ~−1/3 for tokenize alone vs ~−60% for
+both at 150–300 blocks — the discovery figure is an optimistic ceiling, since
+the tracked region set still costs something to update per edit). Treated as a
+follow-up, not part of v1: skipping discovery means trusting the tracked set
+rather than re-deriving it from the tree, a larger correctness commitment.
+
 ## Considered Options
 
 ### A. Cache region-local `RawToken`s, re-enter before finalize (chosen)
@@ -126,12 +175,15 @@ breakpoints at their boundaries — splicing them in risks wrong winners exactly
 at region edges (the subtlety `semantic-token-overlap-resolution` exists to get
 right). It also forces a delta-decode + re-encode to re-anchor coordinates.
 
-### C. Whole-document memoization keyed by content hash
+### C. Whole-document memoization keyed by content hash (shipped, complementary)
 
-Cache the entire finalized result per `(uri, content_hash)`. Trivial to wire,
-but only helps when the *whole* document is unchanged — which the existing
-`result_id` no-op short-circuit already covers. Provides nothing for the actual
-hot case (one region edited, the rest reused). Rejected as redundant.
+Cache the entire finalized result per `(uri, content_hash)`. **Shipped as PR
+#530** (`SemanticTokenCache`, keyed by `fnv1a_hash(text) ^ generation`). It
+covers the *unchanged-document* case — idle `full` re-requests and no-op deltas.
+It does nothing for the typing path, because every keystroke changes the
+document hash, which is exactly why this ADR exists. The two are complementary
+layers, not alternatives: the whole-doc cache is the cheap outer gate, the
+per-region cache is the inner reuse on the typing path.
 
 ### D. Leave as-is, optimize allocation/algorithm only
 
