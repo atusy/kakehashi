@@ -1560,9 +1560,19 @@ impl LanguageServerPool {
                     // that landed during the handshake is reflected and the push
                     // agrees with what (b) would answer. Best-effort: a dropped
                     // notification self-heals on the next pull.
-                    if let Some(settings) = handle_for_handshake.current_settings() {
+                    //
+                    // Push when we advertised `configuration` (so a clear to
+                    // `None` during the handshake still reaches the server as
+                    // `null` instead of leaving it on stale settings) OR when the
+                    // cell now holds settings (added during the handshake). When
+                    // neither holds there is nothing to communicate.
+                    let current = handle_for_handshake.current_settings();
+                    if advertise_configuration || current.is_some() {
+                        let payload = current
+                            .map(|s| (*s).clone())
+                            .unwrap_or(serde_json::Value::Null);
                         handle_for_handshake.send_notification(
-                            build_did_change_configuration_notification((*settings).clone()),
+                            build_did_change_configuration_notification(payload),
                         );
                     }
                     handle_for_handshake.set_state(ConnectionState::Ready);

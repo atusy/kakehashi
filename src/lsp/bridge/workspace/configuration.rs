@@ -92,6 +92,13 @@ fn resolve_section(root: Option<&Value>, section: Option<&str>) -> Value {
         Some(path) => {
             let mut current = root;
             for segment in path.split('.') {
+                // An empty segment (leading/trailing/double dot) is a malformed
+                // path, not a lookup of a literal `""` key — reject it explicitly
+                // so the result never depends on whether settings happens to
+                // contain an empty-string key.
+                if segment.is_empty() {
+                    return Value::Null;
+                }
                 match current.get(segment) {
                     Some(next) => current = next,
                     None => return Value::Null,
@@ -179,6 +186,20 @@ mod tests {
                 "section {section:?}"
             );
         }
+    }
+
+    #[test]
+    fn empty_segment_does_not_reach_a_literal_empty_string_key() {
+        // Even when settings contains an empty-string key, an empty path segment
+        // resolves to null rather than indexing it (the path is malformed).
+        let r = json!({ "server": { "": "trap" }, "": "trap2" });
+        assert_eq!(resolve_section(Some(&r), Some("server.")), Value::Null);
+        assert_eq!(resolve_section(Some(&r), Some(".server")), Value::Null);
+        // …but a non-empty key is still reachable.
+        assert_eq!(
+            resolve_section(Some(&r), Some("server")),
+            json!({ "": "trap" })
+        );
     }
 
     #[test]

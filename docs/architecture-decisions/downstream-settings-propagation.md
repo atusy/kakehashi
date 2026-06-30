@@ -66,12 +66,15 @@ tree.** Concretely, three coupled changes:
   where it **deep-merges** across config layers exactly like
   `initialization_options` (nested objects merge, overlay scalars win), so a
   project layer can override one sub-key without restating the rest.
-- After `initialized`, if the server's settings cell is non-null, kakehashi
-  sends one `workspace/didChangeConfiguration { settings }` so push-model
-  servers are configured even before they pull. It reads the **live cell**, not
-  the spawn-time value, so a (c) re-propagation that landed during the handshake
-  is not overwritten by a stale push — the push always agrees with what (b)
-  would answer.
+- After `initialized`, kakehashi sends one `workspace/didChangeConfiguration
+  { settings }` so push-model servers are configured even before they pull. It
+  reads the **live cell**, not the spawn-time value, so a (c) re-propagation
+  that landed during the handshake is reflected — the push always agrees with
+  what (b) would answer. It fires when the server advertised `configuration`
+  (so a clear to `None` during the handshake reaches the server as `null`
+  instead of leaving it on stale settings) **or** when the cell now holds
+  settings (added during the handshake); when neither holds there is nothing to
+  send.
 
 `initialization_options` and `settings` are kept distinct, matching their LSP
 roles: `initialization_options` is consumed only at `initialize` time;
