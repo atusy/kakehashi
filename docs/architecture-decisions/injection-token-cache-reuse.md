@@ -5,16 +5,52 @@ Status: Proposed (aspirational). The invalidation half described here is
 implemented; the reuse half is not. See "Decision–Implementation Gap".
 -->
 
-**Related Decisions**: [semantic-token-overlap-resolution](semantic-token-overlap-resolution.md), [lazy-node-identity-tracking](lazy-node-identity-tracking.md)
+**Related Decisions**: [semantic-token-overlap-resolution](semantic-token-overlap-resolution.md), [lazy-node-identity-tracking](lazy-node-identity-tracking.md), [per-document-parse-scheduler](per-document-parse-scheduler.md)
 
 ## Context
 
 Semantic tokens for a document with code injections (e.g. a Markdown file with
 many fenced code blocks) are recomputed *in full* on every `semanticTokens/full`
 and `semanticTokens/full/delta` request. The delta request additionally diffs
-the freshly computed token vector against the previous one — saving wire size
-but not CPU. Editing a single character inside one Python block re-parses and
+the freshly computed token vector against the previous one.
+
+A whole-document content-hash cache (`SemanticTokenCache`, shipped in PR #530)
+already short-circuits the case where the *entire* document text is unchanged —
+so an idle re-request of `semanticTokens/full` is free. **That cache cannot help
+the steady-state typing path**: every keystroke changes the document text, so
+its content-hash key always misses and the hot path recomputes from scratch. The
+`semanticTokens/full/delta`-after-edit request is therefore the path this
+decision targets — editing one character inside one injected block re-parses and
 re-queries the host plus *every* injection region in the document.
+
+### Where the per-keystroke time actually goes
+
+Measured on the `full/delta`-after-edit path for a single-character,
+single-region edit (production-faithful: incremental `tree.edit` +
+`reparse(Some(seed))`, then the token recompute, then the delta diff), release
+build, warm, on Markdown with N fenced code blocks (rust/lua/yaml):
+
+| phase | 60 blocks | 150 blocks | 300 blocks | cacheable here? |
+|---|---|---|---|---|
+| incremental host parse | 0.06 ms | 0.17 ms | 0.37 ms | no — already incremental & cheap |
+| host token collect | 0.45 | 1.28 | 2.88 | no |
+| **injection discovery** | 0.45 | 1.28 | 2.92 | not in v1 (see Companion lever) |
+| **per-region tokenize** | **0.75** | **1.66** | **3.27** | **yes — the target** |
+| finalize sweep line | 0.18 | 0.50 | 1.10 | no |
+| delta diff | 0.002 | 0.004 | 0.008 | no — negligible |
+| **per-keystroke total** | **1.89** | **4.90** | **10.54** | |
+
+Two structural facts fall out:
+
+1. **The delta diff and incremental parse are nearly free.** The per-keystroke
+   CPU is almost entirely the *token recompute* — exactly what a per-region
+   cache avoids. (This is also why the whole-doc cache helps `full` but not
+   `delta`: both endpoints run the same recompute; the diff that distinguishes
+   them costs nothing.)
+2. **Per-region tokenize is ~1/3 of the recompute, not all of it.** Host token
+   collection and injection *discovery* are each roughly equal in cost, and
+   `finalize` adds ~10%. Even a perfect per-region tokenize cache leaves a hard
+   floor of host-collect + discovery + finalize on every keystroke.
 
 The codebase already contains most of the machinery to avoid this, but only its
 *invalidation* half is wired up:
@@ -37,10 +73,11 @@ guards an always-empty cache. The hot path (`handle_semantic_tokens_full` in
 `src/analysis/semantic.rs`) unconditionally calls `collect_host_tokens` +
 `collect_injection_tokens_parallel` over the whole document.
 
-This is the single highest-impact remaining performance lever for the feature.
-The reason it has not been wired in is a genuine design question, not an
-oversight: what to cache, and how to keep coordinates correct when an edit above
-a region shifts that region's position in the host document.
+This is the largest remaining *typing-path* lever for injection-heavy documents
+(the whole-doc cache having already taken the unchanged-document case). The
+reason it has not been wired in is a genuine design question, not an oversight:
+what to cache, and how to keep coordinates correct when an edit above a region
+shifts that region's position in the host document.
 
 ## Decision
 
