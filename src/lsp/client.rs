@@ -133,6 +133,40 @@ impl<'a> ClientNotifier<'a> {
     /// `SemanticTokensRefresh` only fires when the client declared support, since
     /// sending the request unconditionally would violate the LSP capability gate.
     pub(crate) async fn log_language_events(&self, events: &[LanguageEvent]) {
+        // Send at most one workspace/semanticTokens/refresh for the whole batch,
+        // and spawn it BEFORE the per-event log/show-message awaits below so a
+        // slow/blocked client log channel can't delay when the refresh task starts
+        // (the refresh is detached, so it then runs concurrently with the logs).
+        // The request is parameterless and workspace-wide, so multiple refresh
+        // events (e.g. one per derived language on a config reload) collapse into a
+        // single request: firing N would only force (N-1) redundant workspace
+        // re-tokenizations and leak that many tower-lsp pending entries on a
+        // non-responding client. See #531 (twin of #497).
+        if batch_requests_semantic_tokens_refresh(events) {
+            if self.supports_semantic_tokens_refresh() {
+                // Fire-and-forget because the response is just null
+                //
+                // Keep the receiver alive without dropping by timeout in order to
+                // avoid tower-lsp panics (see commit b902e28d)
+                //
+                // Trade-off: If a client never responds (e.g., vim-lsp), this causes:
+                // - A small memory leak in tower-lsp's pending requests map
+                // - A spawned task waiting indefinitely
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = client.semantic_tokens_refresh().await {
+                        log::debug!("semantic_tokens_refresh failed: {}", err);
+                    }
+                });
+            } else {
+                // Only send refresh if client supports it (LSP @since 3.16.0 compliance).
+                log::debug!(
+                    "Skipping semantic_tokens_refresh - client does not support it (batch of {} event(s))",
+                    events.len()
+                );
+            }
+        }
+
         for event in events {
             match event {
                 LanguageEvent::Log { level, message } => {
@@ -153,44 +187,10 @@ impl<'a> ClientNotifier<'a> {
                         .show_message(message_type, message.clone())
                         .await;
                 }
-                // Refresh requests are handled once, after the loop — see below.
+                // Refresh requests are handled once, before the loop — see above.
                 LanguageEvent::SemanticTokensRefresh { .. } => {}
             }
         }
-
-        // Send at most one workspace/semanticTokens/refresh for the whole batch.
-        // The request is parameterless and workspace-wide, so multiple refresh
-        // events (e.g. one per derived language on a config reload) collapse into
-        // a single request: firing N would only force (N-1) redundant workspace
-        // re-tokenizations and leak that many tower-lsp pending entries on a
-        // non-responding client. See #531 (twin of #497).
-        if !batch_requests_semantic_tokens_refresh(events) {
-            return;
-        }
-
-        // Only send refresh if client supports it (LSP @since 3.16.0 compliance).
-        if !self.supports_semantic_tokens_refresh() {
-            log::debug!(
-                "Skipping semantic_tokens_refresh - client does not support it (batch of {} event(s))",
-                events.len()
-            );
-            return;
-        }
-
-        // Fire-and-forget because the response is just null
-        //
-        // Keep the receiver alive without dropping by timeout in order to
-        // avoid tower-lsp panics (see commit b902e28d)
-        //
-        // Trade-off: If a client never responds (e.g., vim-lsp), this causes:
-        // - A small memory leak in tower-lsp's pending requests map
-        // - A spawned task waiting indefinitely
-        let client = self.client.clone();
-        tokio::spawn(async move {
-            if let Err(err) = client.semantic_tokens_refresh().await {
-                log::debug!("semantic_tokens_refresh failed: {}", err);
-            }
-        });
     }
 
     /// Handle settings events by logging messages at appropriate levels.
