@@ -29,7 +29,9 @@ pub(crate) async fn handle_semantic_tokens_range_parallel_async(
     coordinator: std::sync::Arc<crate::language::LanguageCoordinator>,
     supports_multiline: bool,
 ) -> Option<SemanticTokensResult> {
-    // Get all tokens using the parallel full handler
+    // Get all tokens using the parallel full handler. Range requests don't
+    // populate the injection-token cache (v1 targets the full/delta typing path),
+    // so no cache handle is threaded in.
     let full_result = handle_semantic_tokens_full(
         text,
         tree,
@@ -38,6 +40,7 @@ pub(crate) async fn handle_semantic_tokens_range_parallel_async(
         capture_mappings,
         coordinator,
         supports_multiline,
+        None,
     )
     .await?;
 

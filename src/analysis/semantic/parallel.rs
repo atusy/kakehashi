@@ -13,17 +13,51 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use tree_sitter::{Parser, Tree};
+use url::Url;
 
-use super::injection::InjectionContext;
+use super::injection::{InjectionContext, RegionCacheInfo};
 use super::token_collector::{ActiveInjectionBounds, RawToken, collect_host_tokens};
+use crate::analysis::InjectionTokenCache;
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
+use crate::language::NodeTracker;
 use crate::language::injection::{
-    InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
+    CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
     compute_included_ranges_clipped, effective_offset_for_pattern, has_combined_for_pattern,
     intersect_included_ranges, parse_with_ranges, sub_select_included_ranges,
 };
+use crate::text::fnv1a_hash;
 use crate::text::position::byte_to_utf16_col;
+
+/// Minimum number of top-level single injection regions before injection-token
+/// caching engages. Below this, `collect_injection_tokens_parallel` runs exactly
+/// as it did pre-#529 — no region-id resolution, no content hashing, no store —
+/// so small documents (the overwhelming majority) pay zero overhead and are
+/// byte-identical to the uncached path. The cache only helps once enough regions
+/// exist that reusing the untouched ones outweighs the per-region bookkeeping.
+const INJECTION_CACHE_MIN_REGIONS: usize = 8;
+
+/// Per-context output of [`process_injection_sync`]: the region's tokens plus
+/// whether every parser in its subtree (its own and all nested injections) was
+/// loaded. `fully_loaded == false` means at least one region produced an empty
+/// token set only because its parser was missing — caching that would serve an
+/// incomplete result forever, since the content hash won't change when the
+/// parser later loads. The store decision gates on this.
+pub(crate) struct InjectionTokens {
+    pub tokens: Vec<RawToken>,
+    pub fully_loaded: bool,
+}
+
+/// Borrowed handle bundling everything the top-level injection pass needs to
+/// resolve region identities and read/write the injection-token cache (#529).
+/// Threaded as `Option`: `None` disables caching (nested passes, range requests,
+/// tests) and reproduces the pre-#529 behavior exactly.
+pub(crate) struct InjectionCacheCtx<'a> {
+    pub uri: &'a Url,
+    pub tracker: &'a NodeTracker,
+    pub cache: &'a InjectionTokenCache,
+    pub generation: u64,
+}
 
 /// Maximum number of parsers to cache per Rayon worker thread.
 ///
@@ -191,34 +225,49 @@ pub(crate) fn process_injection_sync(
     host_line_starts: &[usize],
     depth: usize,
     supports_multiline: bool,
-) -> Vec<RawToken> {
-    // Check recursion depth
+) -> InjectionTokens {
+    // Check recursion depth. Hitting the cap is a deliberate truncation, not a
+    // missing parser, so the result is still "fully loaded" for caching purposes.
     if depth >= MAX_INJECTION_DEPTH {
-        return Vec::new();
+        return InjectionTokens {
+            tokens: Vec::new(),
+            fully_loaded: true,
+        };
     }
 
-    // Parse the injection content (with optional included ranges for blockquotes)
+    // Parse the injection content (with optional included ranges for blockquotes).
+    // A missing parser is indistinguishable from an empty region by tokens alone,
+    // so flag it: the orchestration layer must not cache a parser-missing result.
     let Some(tree) = factory.parse(
         &ctx.resolved_lang,
         ctx.content_text,
         ctx.included_ranges.as_deref(),
     ) else {
-        return Vec::new();
+        return InjectionTokens {
+            tokens: Vec::new(),
+            fully_loaded: false,
+        };
     };
 
     // Discover nested injections BEFORE collecting tokens so we can compute
     // exclusion ranges. This suppresses this level's captures within regions
-    // that will be handled by deeper injection languages.
-    let (nested_contexts, nested_exclusion_ranges) = collect_injection_contexts_sync(
-        ctx.content_text,
-        &tree,
-        Some(&ctx.resolved_lang),
-        coordinator,
-        ctx.host_start_byte,
-        ctx.included_ranges.as_deref(),
-    );
+    // that will be handled by deeper injection languages. Nested regions are
+    // never cached in v1, so no cache context is threaded into the recursion.
+    let (nested_contexts, nested_exclusion_ranges, nested_discovery_complete) =
+        collect_injection_contexts_sync(
+            ctx.content_text,
+            &tree,
+            Some(&ctx.resolved_lang),
+            coordinator,
+            ctx.host_start_byte,
+            ctx.included_ranges.as_deref(),
+            None,
+        );
 
     let mut tokens = Vec::new();
+    // A nested injection dropped during discovery (its parser/query not loaded)
+    // leaves this subtree incomplete, so it must not be cached as a hit.
+    let mut fully_loaded = nested_discovery_complete;
 
     // Collect tokens from this injection's highlight query, excluding
     // regions covered by nested injections. Combined contexts force per-line
@@ -245,9 +294,12 @@ pub(crate) fn process_injection_sync(
         clip_tokens_to_included_ranges(&mut tokens, ctx, host_lines, host_line_starts);
     }
 
-    // Recursively process nested injections (same thread, no parallelism)
+    // Recursively process nested injections (same thread, no parallelism). A
+    // nested region with a missing parser taints this whole subtree's
+    // `fully_loaded`, so the top-level region it belongs to is not cached until
+    // every parser it depends on is available.
     for nested_ctx in nested_contexts {
-        let nested_tokens = process_injection_sync(
+        let nested = process_injection_sync(
             &nested_ctx,
             factory,
             coordinator,
@@ -258,10 +310,14 @@ pub(crate) fn process_injection_sync(
             depth + 1,
             supports_multiline,
         );
-        tokens.extend(nested_tokens);
+        tokens.extend(nested.tokens);
+        fully_loaded &= nested.fully_loaded;
     }
 
-    tokens
+    InjectionTokens {
+        tokens,
+        fully_loaded,
+    }
 }
 
 /// Clip a combined context's tokens to its included ranges (#187).
@@ -338,10 +394,14 @@ fn clip_tokens_to_included_ranges(
 /// works without mutable parser access. It discovers all injections in the
 /// given tree and returns their contexts for processing.
 ///
-/// Returns `(contexts, exclusion_ranges)` where exclusion_ranges are the
-/// content-local byte ranges of each resolved injection. These ranges
-/// correspond to the regions where child injections produce their own tokens,
-/// so parent captures overlapping these ranges should be suppressed.
+/// Returns `(contexts, exclusion_ranges, discovery_complete)`. `exclusion_ranges`
+/// are the content-local byte ranges of each resolved injection (regions where
+/// child injections produce their own tokens, so parent captures overlapping
+/// them should be suppressed). `discovery_complete` is `false` when any injection
+/// was dropped because its parser/highlight query was unavailable — a *transient*
+/// gap that re-fills when the parser loads without the content changing. A caller
+/// that caches a region must taint it with this so an incomplete subtree is never
+/// stored (and then served stale once the missing parser arrives, #529 Hazard 3).
 fn collect_injection_contexts_sync<'a>(
     text: &'a str,
     tree: &Tree,
@@ -349,21 +409,27 @@ fn collect_injection_contexts_sync<'a>(
     coordinator: &LanguageCoordinator,
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
-) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>) {
+    cache_ctx: Option<(&Url, &NodeTracker)>,
+) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>, bool) {
     use crate::language::injection::collect_all_injections;
 
     let current_lang = filetype.unwrap_or("unknown");
     let Some(injection_query) = coordinator.injection_query(current_lang) else {
-        return (Vec::new(), Vec::new());
+        // No injection query: there is nothing to discover, so discovery is
+        // trivially complete (no region was dropped).
+        return (Vec::new(), Vec::new(), true);
     };
 
     let Some(injections) = collect_all_injections(&tree.root_node(), text, Some(&injection_query))
     else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), true);
     };
 
     let mut contexts = Vec::with_capacity(injections.len());
     let mut exclusion_ranges = Vec::with_capacity(injections.len());
+    // Tainted to `false` when an injection is skipped because its parser or
+    // highlight query isn't loaded yet (vs. a permanently malformed region).
+    let mut discovery_complete = true;
 
     // Partition out `injection.combined` regions: every capture of one
     // (language, pattern) pair parses as a single document so cross-block
@@ -391,6 +457,16 @@ fn collect_injection_contexts_sync<'a>(
         }
     }
 
+    // Resolve cache identity only when a cache handle is threaded in (top-level
+    // request, not a nested pass) AND the region count clears the gate. The count
+    // is `singles.len()` — the raw single captures, an upper bound on the regions
+    // that will actually be cacheable (some may later fail bounds/language/query
+    // resolution). Below the gate, `region_cache` stays `None` for every context,
+    // so the store/reuse path is skipped entirely. The gate only governs whether
+    // the (cheap) bookkeeping runs; output is byte-identical to the pre-#529 code
+    // either way, so the upper-bound count is a safe, conservative trigger.
+    let cache_for_singles = cache_ctx.filter(|_| singles.len() >= INJECTION_CACHE_MIN_REGIONS);
+
     for injection in singles {
         let start = injection.content_node.start_byte();
         let end = injection.content_node.end_byte();
@@ -403,15 +479,19 @@ fn collect_injection_contexts_sync<'a>(
         // Extract injection content for language detection
         let injection_content = &text[start..end];
 
-        // Resolve injection language
+        // Resolve injection language. A failure here means no parser could be
+        // loaded for it yet — a transient gap, so discovery is incomplete.
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&injection.language, injection_content)
         else {
+            discovery_complete = false;
             continue;
         };
 
-        // Get highlight query for resolved language
+        // Get highlight query for resolved language. Missing query is likewise
+        // transient (loads with the language), so taint discovery.
         let Some(highlight_query) = coordinator.highlight_query(&resolved_lang) else {
+            discovery_complete = false;
             continue;
         };
 
@@ -499,6 +579,39 @@ fn collect_injection_contexts_sync<'a>(
             None => Vec::new(),
         };
 
+        // Resolve this single region's cache identity (#529). region_id is minted
+        // from the RAW content node — byte-identical to populate_injections
+        // (cache.rs) — so invalidate_for_edits evicts the same entry. Eligibility
+        // is this request's translation predicate: column-0 start AND no per-row
+        // prefixes (singles are never injection.combined).
+        let region_cache = cache_for_singles.map(|(uri, tracker)| {
+            let region_id = tracker
+                .get_or_create(
+                    uri,
+                    injection.content_node.start_byte(),
+                    injection.content_node.end_byte(),
+                    injection.content_node.kind(),
+                )
+                .to_string();
+            let cacheable =
+                CacheableInjectionRegion::from_region_info(&injection, &region_id, text);
+            let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
+            // Fold the resolved language into the validity hash so a position-
+            // stable region_id with identical content but a different injected
+            // language gets a different key (barring a 64-bit collision) and won't
+            // serve a stale hit — defends the cross-language hazard from a
+            // superseded request's orphaned ULID; same fold style as the
+            // generation fold in cache_key.
+            let validity_hash =
+                cacheable.content_hash ^ fnv1a_hash(&resolved_lang).wrapping_mul(0x100000001b3);
+            RegionCacheInfo {
+                region_id,
+                validity_hash,
+                line_start: cacheable.line_range.start,
+                eligible,
+            }
+        });
+
         contexts.push(InjectionContext {
             resolved_lang,
             highlight_query,
@@ -507,11 +620,12 @@ fn collect_injection_contexts_sync<'a>(
             included_ranges,
             prefix_byte_widths,
             combined: false,
+            region_cache,
         });
     }
 
     for (_group_key, regions) in combined_groups {
-        if let Some(ctx) = build_combined_context(
+        match build_combined_context(
             &regions,
             text,
             coordinator,
@@ -519,11 +633,16 @@ fn collect_injection_contexts_sync<'a>(
             parent_included_ranges,
             &mut exclusion_ranges,
         ) {
-            contexts.push(ctx);
+            Ok(Some(ctx)) => contexts.push(ctx),
+            // Permanently empty/invalid/clipped-away group — nothing dropped.
+            Ok(None) => {}
+            // Parser/highlight query for the group isn't loaded yet — a transient
+            // drop, same as the single-region case, so taint discovery.
+            Err(CombinedDiscoveryIncomplete) => discovery_complete = false,
         }
     }
 
-    (contexts, exclusion_ranges)
+    (contexts, exclusion_ranges, discovery_complete)
 }
 
 /// Per-line byte prefix widths from included ranges: each range's
@@ -549,6 +668,11 @@ fn derive_prefix_byte_widths(ranges: &[tree_sitter::Range]) -> Vec<usize> {
     widths
 }
 
+/// A combined-injection group was dropped because its parser/highlight query
+/// isn't loaded yet — a transient gap the caller taints into `discovery_complete`
+/// (distinct from a permanent `Ok(None)` empty/invalid group).
+struct CombinedDiscoveryIncomplete;
+
 /// Build one [`InjectionContext`] covering every region of an
 /// `injection.combined` group (#187): the content slice spans from the first
 /// block's start to the last block's end, and `included_ranges` restricts the
@@ -556,9 +680,11 @@ fn derive_prefix_byte_widths(ranges: &[tree_sitter::Range]) -> Vec<usize> {
 /// opened in one `html_block` and closed in another) while the host text
 /// between blocks stays invisible to the injected parser.
 ///
-/// Returns `None` when the group's language/query doesn't resolve or every
-/// range is clipped away by the parent's exclusions — the regions then simply
-/// produce no tokens, like any unresolvable injection.
+/// Returns `Ok(None)` for a permanently empty/invalid/clipped-away group (no
+/// tokens, nothing dropped) and `Err(CombinedDiscoveryIncomplete)` when the
+/// group's language/query isn't loaded yet — a *transient* drop the caller must
+/// taint into `discovery_complete` so a parent injection isn't cached with an
+/// incomplete combined subtree.
 fn build_combined_context<'a>(
     regions: &[InjectionRegionInfo<'_>],
     text: &'a str,
@@ -566,22 +692,32 @@ fn build_combined_context<'a>(
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
     exclusion_ranges: &mut Vec<(usize, usize)>,
-) -> Option<InjectionContext<'a>> {
+) -> Result<Option<InjectionContext<'a>>, CombinedDiscoveryIncomplete> {
     // collect_all_injections sorts by start byte, so `first` anchors the group.
-    let first = regions.first()?;
+    let Some(first) = regions.first() else {
+        return Ok(None);
+    };
     let group_start = first.content_node.start_byte();
     let group_start_pos = first.content_node.start_position();
-    let group_end = regions.iter().map(|r| r.content_node.end_byte()).max()?;
+    let Some(group_end) = regions.iter().map(|r| r.content_node.end_byte()).max() else {
+        return Ok(None);
+    };
     if group_start >= group_end || group_end > text.len() {
-        return None;
+        return Ok(None);
     }
 
     // Resolve the language once from the first block's content — the grouping
-    // key guarantees every region shares the raw injection language.
+    // key guarantees every region shares the raw injection language. A missing
+    // language/query is transient (loads later without the content changing).
     let first_content = &text[first.content_node.start_byte()..first.content_node.end_byte()];
-    let (resolved_lang, _) =
-        coordinator.resolve_injection_language(&first.language, first_content)?;
-    let highlight_query = coordinator.highlight_query(&resolved_lang)?;
+    let Some((resolved_lang, _)) =
+        coordinator.resolve_injection_language(&first.language, first_content)
+    else {
+        return Err(CombinedDiscoveryIncomplete);
+    };
+    let Some(highlight_query) = coordinator.highlight_query(&resolved_lang) else {
+        return Err(CombinedDiscoveryIncomplete);
+    };
 
     // Rebase an absolute point into the combined content's coordinate space.
     let to_relative_point = |abs: tree_sitter::Point| tree_sitter::Point {
@@ -635,7 +771,7 @@ fn build_combined_context<'a>(
         Some(parent_ranges) => {
             let intersected = intersect_included_ranges(&group_ranges, &parent_ranges);
             if intersected.is_empty() {
-                return None;
+                return Ok(None);
             }
             intersected
         }
@@ -649,7 +785,7 @@ fn build_combined_context<'a>(
 
     let prefix_byte_widths = derive_prefix_byte_widths(&included_ranges);
 
-    Some(InjectionContext {
+    Ok(Some(InjectionContext {
         resolved_lang,
         highlight_query,
         content_text: &text[group_start..group_end],
@@ -657,7 +793,10 @@ fn build_combined_context<'a>(
         included_ranges: Some(included_ranges),
         prefix_byte_widths,
         combined: true,
-    })
+        // Combined groups are excluded from the v1 cache (sibling
+        // cross-contamination hazard); see the ADR's correctness hazards.
+        region_cache: None,
+    }))
 }
 
 /// Walk top-level injections of the host doc in parallel via Rayon work-stealing,
@@ -682,12 +821,25 @@ pub(crate) fn collect_injection_tokens_parallel(
     coordinator: &LanguageCoordinator,
     capture_mappings: Option<&CaptureMappings>,
     supports_multiline: bool,
+    cache_ctx: Option<&InjectionCacheCtx>,
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use rayon::prelude::*;
 
-    // Collect top-level injection contexts and their byte ranges
-    let (contexts, exclusion_byte_ranges) =
-        collect_injection_contexts_sync(host_text, host_tree, host_filetype, coordinator, 0, None);
+    // Collect top-level injection contexts and their byte ranges. The cache
+    // handle (if any) lets the discovery phase resolve region identities
+    // single-threaded, before the fan-out.
+    // A top-level region dropped during discovery isn't cached (no region_cache
+    // is built for it), so the top-level completeness flag is irrelevant here —
+    // only nested completeness, threaded through process_injection_sync, matters.
+    let (contexts, exclusion_byte_ranges, _discovery_complete) = collect_injection_contexts_sync(
+        host_text,
+        host_tree,
+        host_filetype,
+        coordinator,
+        0,
+        None,
+        cache_ctx.map(|c| (c.uri, c.tracker)),
+    );
 
     if contexts.is_empty() {
         return (Vec::new(), Vec::new());
@@ -699,46 +851,103 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Threshold for parallel processing - below this, Rayon scheduling overhead exceeds benefit
     const PARALLEL_THRESHOLD: usize = 4;
 
-    // Process injections: parallel for larger collections, sequential for small ones
-    let mut all_tokens: Vec<RawToken> = if contexts.len() >= PARALLEL_THRESHOLD {
-        // Parallel processing for larger collections
-        contexts
+    // Resolve cache hits before the fan-out (#529, read half): an eligible region
+    // whose content hash and settings generation still match a stored entry is
+    // re-anchored to its current host line and never re-tokenized; only misses go
+    // to the Rayon workers. Eligibility is evaluated against THIS request's fresh
+    // context, so a region that stopped qualifying recomputes rather than serving
+    // a stale hit. Below the region-count gate `region_cache` is `None`, so every
+    // context misses and the path matches the uncached behavior exactly.
+    let mut hit_tokens: Vec<RawToken> = Vec::new();
+    let mut miss_indices: Vec<usize> = Vec::with_capacity(contexts.len());
+    if let Some(cc) = cache_ctx {
+        for (i, ctx) in contexts.iter().enumerate() {
+            if let Some(rc) = &ctx.region_cache
+                && rc.eligible
+                && let Some(local) =
+                    cc.cache
+                        .get(cc.uri, &rc.region_id, rc.validity_hash, cc.generation)
+            {
+                hit_tokens.extend(reanchor_to_host(local, rc.line_start));
+            } else {
+                miss_indices.push(i);
+            }
+        }
+    } else {
+        miss_indices.extend(0..contexts.len());
+    }
+
+    // Tokenize only the misses: parallel above the threshold, sequential below.
+    // Each result carries its context index so the store decision can pair it
+    // with the region's cache identity off the Rayon workers.
+    let processed: Vec<(usize, InjectionTokens)> = if miss_indices.len() >= PARALLEL_THRESHOLD {
+        miss_indices
             .par_iter()
-            .flat_map(|ctx| {
-                process_injection_sync(
-                    ctx,
-                    &factory,
-                    coordinator,
-                    capture_mappings,
-                    host_text,
-                    host_lines,
-                    host_line_starts,
-                    1, // depth 1 (first level of injection, host is 0)
-                    supports_multiline,
+            .map(|&i| {
+                (
+                    i,
+                    process_injection_sync(
+                        &contexts[i],
+                        &factory,
+                        coordinator,
+                        capture_mappings,
+                        host_text,
+                        host_lines,
+                        host_line_starts,
+                        1, // depth 1 (first level of injection, host is 0)
+                        supports_multiline,
+                    ),
                 )
             })
             .collect()
     } else {
-        // Sequential processing for small collections to avoid Rayon overhead
-        contexts
+        miss_indices
             .iter()
-            .flat_map(|ctx| {
-                process_injection_sync(
-                    ctx,
-                    &factory,
-                    coordinator,
-                    capture_mappings,
-                    host_text,
-                    host_lines,
-                    host_line_starts,
-                    1,
-                    supports_multiline,
+            .map(|&i| {
+                (
+                    i,
+                    process_injection_sync(
+                        &contexts[i],
+                        &factory,
+                        coordinator,
+                        capture_mappings,
+                        host_text,
+                        host_lines,
+                        host_line_starts,
+                        1,
+                        supports_multiline,
+                    ),
                 )
             })
             .collect()
     };
 
-    // Sort tokens by position (line, then column)
+    // Store region-local tokens for newly computed eligible, fully-loaded regions
+    // (#529, write half), single-threaded after fan-in so cache writes never run
+    // inside a Rayon worker.
+    if let Some(cc) = cache_ctx {
+        for (i, res) in &processed {
+            if let Some(rc) = &contexts[*i].region_cache
+                && rc.eligible
+                && res.fully_loaded
+            {
+                let local = to_region_local(&res.tokens, rc.line_start);
+                cc.cache.store(
+                    cc.uri,
+                    &rc.region_id,
+                    rc.validity_hash,
+                    cc.generation,
+                    local,
+                );
+            }
+        }
+    }
+
+    // Merge cache-hit and freshly computed tokens, then sort by position.
+    let mut all_tokens: Vec<RawToken> = hit_tokens;
+    for (_, res) in processed {
+        all_tokens.extend(res.tokens);
+    }
     all_tokens.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.column.cmp(&b.column)));
 
     // Convert byte ranges to line/column ActiveInjectionBounds values, but only for
@@ -752,6 +961,48 @@ pub(crate) fn collect_injection_tokens_parallel(
     );
 
     (all_tokens, active_regions)
+}
+
+/// Translate an eligible region's host-absolute tokens into region-local
+/// coordinates for caching: subtract the region's first host line so a stored
+/// entry re-anchors with a single `line += line_start` on reuse. The column is
+/// already region-invariant for an eligible region (`start_column == 0`, no
+/// per-row prefixes), so only the line shifts. `saturating_sub` guards the
+/// (unexpected) case of a token above the region start rather than underflowing.
+fn to_region_local(tokens: &[RawToken], line_start: u32) -> Vec<RawToken> {
+    let line_start = line_start as usize;
+    tokens
+        .iter()
+        .map(|t| {
+            // Invariant: every token of an eligible region sits on or below the
+            // region's first host line, so the subtraction never truncates. The
+            // saturating_sub is a release-build backstop only.
+            debug_assert!(
+                t.line >= line_start,
+                "injection token at host line {} precedes its region start {}",
+                t.line,
+                line_start
+            );
+            t.with_span(t.line.saturating_sub(line_start), t.column, t.length)
+        })
+        .collect()
+}
+
+/// Re-anchor cached region-local tokens to the region's current host position:
+/// the inverse of [`to_region_local`]. Because the region is eligible
+/// (`start_column == 0`, no per-row prefixes), the column is already correct and
+/// only the line shifts by the region's current first host line — so an edit
+/// *above* an unchanged region (which leaves its content hash, hence the cache
+/// entry, intact but moves it) is re-anchored exactly.
+fn reanchor_to_host(tokens: Vec<RawToken>, line_start: u32) -> Vec<RawToken> {
+    let line_start = line_start as usize;
+    tokens
+        .into_iter()
+        .map(|t| {
+            let line = t.line;
+            t.with_span(line + line_start, t.column, t.length)
+        })
+        .collect()
 }
 
 /// Convert byte-based exclusion ranges to line/column `ActiveInjectionBounds`s,
@@ -971,6 +1222,7 @@ mod tests {
             included_ranges: None,
             prefix_byte_widths: Vec::new(),
             combined: false,
+            region_cache: None,
         };
 
         assert_eq!(ctx.resolved_lang, "rust");
@@ -1075,6 +1327,7 @@ mod tests {
             included_ranges: None,
             prefix_byte_widths: Vec::new(),
             combined: false,
+            region_cache: None,
         };
 
         let tokens = process_injection_sync(
@@ -1087,7 +1340,8 @@ mod tests {
             &build_line_start_bytes(host_text),
             1, // depth 1 (not host document)
             false,
-        );
+        )
+        .tokens;
 
         // Should produce some tokens (at minimum "fn" keyword and "main" identifier)
         assert!(
@@ -1133,6 +1387,7 @@ mod tests {
             included_ranges: None,
             prefix_byte_widths: Vec::new(),
             combined: false,
+            region_cache: None,
         };
 
         // Process at MAX_INJECTION_DEPTH should return empty
@@ -1146,7 +1401,8 @@ mod tests {
             &build_line_start_bytes(host_text),
             MAX_INJECTION_DEPTH,
             false,
-        );
+        )
+        .tokens;
 
         assert!(
             tokens.is_empty(),
@@ -1203,6 +1459,7 @@ mod tests {
             &coordinator,
             None,
             false,
+            None,
         );
 
         assert!(tokens.is_empty(), "Empty document should have no tokens");
@@ -1258,6 +1515,7 @@ local x = 42
             &coordinator,
             None,
             false,
+            None,
         );
 
         // Should have tokens from the Lua injection
@@ -1354,6 +1612,7 @@ local x = 42
             &coordinator,
             None,
             false,
+            None,
         );
 
         // The surviving `local` keyword maps to host line 2, col 2 (after the
@@ -1446,6 +1705,7 @@ local b = 2
             &coordinator,
             None,
             false,
+            None,
         );
 
         // Verify tokens are sorted by position
@@ -1654,12 +1914,13 @@ local b = 2
             .expect("markdown must parse");
         parser_pool.release("markdown".to_string(), parser);
 
-        let (contexts, exclusions) = collect_injection_contexts_sync(
+        let (contexts, exclusions, _complete) = collect_injection_contexts_sync(
             COMBINED_LUA_DOC,
             &tree,
             Some("markdown"),
             &coordinator,
             0,
+            None,
             None,
         );
 
@@ -1730,8 +1991,15 @@ local b = 2
         let tree = parser.parse(doc, None).expect("markdown must parse");
         parser_pool.release("markdown".to_string(), parser);
 
-        let (contexts, _exclusions) =
-            collect_injection_contexts_sync(doc, &tree, Some("markdown"), &coordinator, 0, None);
+        let (contexts, _exclusions, _complete) = collect_injection_contexts_sync(
+            doc,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+            None,
+        );
 
         // The vendored query injects more than html (markdown_inline for the
         // prose); only the html contexts matter here.
@@ -1792,6 +2060,7 @@ local b = 2
             &coordinator,
             None,
             false,
+            None,
         );
 
         let (keyword_type, keyword_mods) =
@@ -1855,6 +2124,7 @@ local b = 2
             // Multiline client support must not let the spanning string token
             // bleed across the gap either.
             true,
+            None,
         );
 
         // The combined parse produces lua tokens inside both blocks…
@@ -1880,6 +2150,305 @@ local b = 2
             leaked.is_empty(),
             "combined-layer tokens must not leak into gap lines 2..=6, got {:?}",
             leaked
+        );
+    }
+
+    /// Markdown with eight lua fences — enough to clear
+    /// `INJECTION_CACHE_MIN_REGIONS`. Each block starts at column 0 with no
+    /// per-row prefix, so every region is cache-eligible.
+    fn eight_lua_block_doc() -> String {
+        let mut text = String::new();
+        for i in 0..8 {
+            text.push_str(&format!("```lua\nlocal x{i} = {i}\n```\n\n"));
+        }
+        text
+    }
+
+    /// Coordinator with markdown + lua loaded, or `None` to skip when the
+    /// parsers aren't available in the environment.
+    fn markdown_lua_coordinator() -> Option<LanguageCoordinator> {
+        use crate::config::WorkspaceSettings;
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        let md = coordinator.ensure_language_loaded("markdown");
+        let lua = coordinator.ensure_language_loaded("lua");
+        if !md.success || !lua.success {
+            eprintln!("Skipping: markdown or lua parser not available");
+            return None;
+        }
+        Some(coordinator)
+    }
+
+    fn parse_markdown(coordinator: &LanguageCoordinator, text: &str) -> Tree {
+        let mut pool = coordinator.create_document_parser_pool();
+        let mut parser = pool.acquire("markdown").expect("markdown parser");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+        tree
+    }
+
+    /// `to_region_local` and `reanchor_to_host` are exact inverses, and a region
+    /// that moved (re-anchored at a different `line_start`) shifts uniformly by
+    /// the line delta with columns untouched.
+    #[test]
+    fn region_local_roundtrip_and_shift() {
+        let host = vec![
+            raw_token_at(5, 2, 3),
+            raw_token_at(6, 0, 4),
+            raw_token_at(7, 8, 1),
+        ];
+
+        // Store at line_start 5, re-anchor at the same start → identical.
+        let local = to_region_local(&host, 5);
+        assert_eq!(local.iter().map(|t| t.line).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(reanchor_to_host(local.clone(), 5), host);
+
+        // Region moved down 3 lines (edit above): re-anchor shifts every token by
+        // +3, columns unchanged.
+        let moved = reanchor_to_host(local, 8);
+        assert_eq!(
+            moved.iter().map(|t| (t.line, t.column)).collect::<Vec<_>>(),
+            [(8, 2), (9, 0), (10, 8)]
+        );
+    }
+
+    fn raw_token_at(line: usize, column: usize, length: usize) -> RawToken {
+        RawToken {
+            line,
+            column,
+            length,
+            kind: crate::analysis::semantic::token_collector::TokenKind::Mapped(1, 0),
+            depth: 1,
+            pattern_index: 0,
+            priority: 100,
+            node_byte_len: length,
+        }
+    }
+
+    /// The cached path must produce byte-identical tokens to the uncached path,
+    /// on both the first (all-miss, store) and second (all-hit) request.
+    #[test]
+    fn injection_cache_reuse_matches_uncached_output() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
+
+        let uncached = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            None,
+        )
+        .0;
+
+        let uri = Url::parse("file:///cache_reuse.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+        };
+
+        let first = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+        assert_eq!(first, uncached, "first (store) pass must match uncached");
+
+        // All eight eligible regions should have been stored.
+        assert_eq!(
+            cache.test_keys(&uri).len(),
+            8,
+            "every eligible region should be cached after the first pass"
+        );
+
+        let second = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+        assert_eq!(second, uncached, "second (hit) pass must match uncached");
+    }
+
+    /// Proof the reuse path actually *reads* the cache rather than recomputing:
+    /// overwrite one region's stored entry with a sentinel token (length 999,
+    /// which no real lua token has), then re-run. The sentinel can only appear in
+    /// the output if the region was served from the cache.
+    #[test]
+    fn injection_cache_reuse_serves_stored_tokens() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
+
+        let uri = Url::parse("file:///cache_sentinel.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+        };
+
+        // Populate.
+        let _ = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        );
+
+        // Overwrite one region with a region-local sentinel token.
+        let (rid, ch, generation) = cache
+            .test_keys(&uri)
+            .into_iter()
+            .next()
+            .expect("a region should be cached");
+        let sentinel = RawToken {
+            line: 0,
+            column: 0,
+            length: 999,
+            kind: crate::analysis::semantic::token_collector::TokenKind::Mapped(1, 0),
+            depth: 1,
+            pattern_index: 0,
+            priority: 100,
+            node_byte_len: 999,
+        };
+        cache.store(&uri, &rid, ch, generation, vec![sentinel]);
+
+        let tokens = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+
+        assert!(
+            tokens.iter().any(|t| t.length == 999),
+            "the sentinel token must surface, proving the reuse path read the cache"
+        );
+    }
+
+    /// An edit *above* an unchanged region must re-anchor its cached tokens to the
+    /// new host line. With the tracker positions adjusted (as production does in
+    /// did_change), the cached entry stays valid and is shifted by the inserted
+    /// line — matching a fresh uncached compute of the edited document.
+    #[test]
+    fn injection_cache_reanchors_after_edit_above() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let old_text = eight_lua_block_doc();
+        let old_tree = parse_markdown(&coordinator, &old_text);
+        let old_lines: Vec<&str> = old_text.lines().collect();
+        let old_line_starts = build_line_start_bytes(&old_text);
+
+        let uri = Url::parse("file:///cache_reanchor.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+        };
+
+        // Populate against the original document.
+        let _ = collect_injection_tokens_parallel(
+            &old_text,
+            &old_lines,
+            &old_line_starts,
+            &old_tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        );
+
+        // Insert a blank line at the very top: every region shifts down one line,
+        // none of their content changes. Adjust the tracker positions the way
+        // did_change does, so the stored entries stay addressable (stable ULIDs).
+        let new_text = format!("\n{old_text}");
+        tracker.apply_text_diff(&uri, &old_text, &new_text);
+        let new_tree = parse_markdown(&coordinator, &new_text);
+        let new_lines: Vec<&str> = new_text.lines().collect();
+        let new_line_starts = build_line_start_bytes(&new_text);
+
+        let cached = collect_injection_tokens_parallel(
+            &new_text,
+            &new_lines,
+            &new_line_starts,
+            &new_tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+
+        let uncached = collect_injection_tokens_parallel(
+            &new_text,
+            &new_lines,
+            &new_line_starts,
+            &new_tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            None,
+        )
+        .0;
+
+        assert_eq!(
+            cached, uncached,
+            "re-anchored cached tokens must match a fresh compute of the edited doc"
         );
     }
 }

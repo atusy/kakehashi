@@ -8,6 +8,7 @@
 //! - `InjectionTokenCache`: per-(URI, region_id) tokens, reusable when an edit
 //!   lies outside that region.
 
+use crate::analysis::semantic::RawToken;
 use crate::language::injection::CacheableInjectionRegion;
 use dashmap::DashMap;
 use rust_lapper::{Interval, Lapper};
@@ -200,36 +201,88 @@ impl Default for InjectionMap {
     }
 }
 
-/// Thread-safe cache for per-injection semantic tokens.
+/// Thread-safe cache for per-injection-region semantic tokens (#529).
 ///
-/// Unlike `SemanticTokenCache` which stores tokens per document, this cache
-/// stores tokens keyed by (uri, region_id), enabling injection-level caching.
-pub struct InjectionTokenCache {
-    cache: DashMap<(Url, String), SemanticTokens>,
+/// Unlike `SemanticTokenCache` (per-document, finalized tokens), this stores the
+/// **region-local pre-finalize `RawToken`s** of a single injection region so the
+/// hot path can reuse them across edits that don't touch the region, re-anchoring
+/// them to the region's current host line at read time.
+///
+/// The key is just `(uri, region_id)`; the validity lives in the *value* — the
+/// same shape `SemanticTokenCache` uses for its `cache_key`. `validity_hash`
+/// folds the region's content hash with its resolved injection language (a
+/// content edit OR a language change at the same position misses on read), and
+/// `generation` is the settings/query generation (a config reload changes it, so
+/// old-query tokens stop matching) — the race-safe fold, not a bare `clear()`.
+/// Keeping these out of the *key* means each region holds exactly one entry
+/// (`store` overwrites), so `remove` is an O(1) point delete instead of a full
+/// scan and stale validity-siblings can't accumulate.
+///
+/// `supports_multiline` is deliberately *not* in the validity: it changes
+/// multiline-token emission, but it comes from the client capabilities snapshot
+/// (a `OnceLock` set once at `initialize()`), so it is session-constant and
+/// cannot flip mid-session — no entry can outlive a change to it.
+pub(crate) struct InjectionTokenCache {
+    cache: DashMap<(Url, String), CachedRegionTokens>,
+}
+
+/// A region's cached tokens with the validity they were computed under.
+#[derive(Clone)]
+struct CachedRegionTokens {
+    /// Content hash folded with the resolved injection language.
+    validity_hash: u64,
+    /// Settings/query generation in effect when these were computed.
+    generation: u64,
+    /// Region-local pre-finalize tokens.
+    tokens: Vec<RawToken>,
 }
 
 impl InjectionTokenCache {
     /// Create a new empty cache.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cache: DashMap::new(),
         }
     }
 
-    /// Store semantic tokens for a specific injection region (test-only).
-    #[cfg(test)]
-    pub fn store(&self, uri: &Url, region_id: &str, tokens: SemanticTokens) {
-        self.cache
-            .insert((uri.clone(), region_id.to_string()), tokens);
+    /// Store region-local tokens for an injection region, tagged with the
+    /// validity (`validity_hash` = content ⊕ resolved language, plus settings
+    /// `generation`) they were computed under. Overwrites any prior entry for the
+    /// region, so a region never holds more than one (possibly stale) entry.
+    pub(crate) fn store(
+        &self,
+        uri: &Url,
+        region_id: &str,
+        validity_hash: u64,
+        generation: u64,
+        tokens: Vec<RawToken>,
+    ) {
+        self.cache.insert(
+            (uri.clone(), region_id.to_string()),
+            CachedRegionTokens {
+                validity_hash,
+                generation,
+                tokens,
+            },
+        );
     }
 
-    /// Retrieve semantic tokens for a specific injection region (test-only).
-    #[cfg(test)]
-    pub fn get(&self, uri: &Url, region_id: &str) -> Option<SemanticTokens> {
+    /// Retrieve region-local tokens iff the stored entry was computed under this
+    /// exact validity — same content + resolved language, same settings
+    /// generation. A mismatch (content/language edit or config reload) reads as a
+    /// miss so the region is recomputed.
+    pub(crate) fn get(
+        &self,
+        uri: &Url,
+        region_id: &str,
+        validity_hash: u64,
+        generation: u64,
+    ) -> Option<Vec<RawToken>> {
         let result = self
             .cache
             .get(&(uri.clone(), region_id.to_string()))
-            .map(|entry| entry.clone());
+            .filter(|entry| entry.validity_hash == validity_hash && entry.generation == generation)
+            .map(|entry| entry.tokens.clone());
 
         if result.is_some() {
             log::debug!(
@@ -250,14 +303,43 @@ impl InjectionTokenCache {
         result
     }
 
-    /// Remove cached tokens for a specific injection region.
-    pub fn remove(&self, uri: &Url, region_id: &str) {
+    /// Remove an injection region's cached entry — an O(1) point delete, since a
+    /// region holds at most one entry. Called on eviction (edit-overlap,
+    /// content/language change, region removed).
+    pub(crate) fn remove(&self, uri: &Url, region_id: &str) {
         self.cache.remove(&(uri.clone(), region_id.to_string()));
     }
 
     /// Remove all cached tokens for a document (all its injection regions).
-    pub fn clear_document(&self, uri: &Url) {
+    pub(crate) fn clear_document(&self, uri: &Url) {
         self.cache.retain(|key, _| &key.0 != uri);
+    }
+
+    /// Drop every cached entry. Used on a settings/query reload (alongside the
+    /// generation bump) to reclaim memory: the generation fold already makes
+    /// old-generation entries unreachable — this just stops them leaking until
+    /// each document closes. Mirrors `SemanticTokenCache::clear`; the fold, not
+    /// this clear, is what makes a concurrent store race-safe.
+    pub(crate) fn clear(&self) {
+        self.cache.clear();
+    }
+
+    /// `(region_id, validity_hash, generation)` currently stored for a document —
+    /// lets a test confirm what the hot path persisted and overwrite a specific
+    /// entry to prove the reuse path reads it.
+    #[cfg(test)]
+    pub(crate) fn test_keys(&self, uri: &Url) -> Vec<(String, u64, u64)> {
+        self.cache
+            .iter()
+            .filter(|e| &e.key().0 == uri)
+            .map(|e| {
+                (
+                    e.key().1.clone(),
+                    e.value().validity_hash,
+                    e.value().generation,
+                )
+            })
+            .collect()
     }
 }
 
@@ -501,52 +583,94 @@ mod tests {
         map.clear(&other_uri); // Should not panic
     }
 
+    /// Minimal region-local `RawToken` for cache tests: an emitted token at the
+    /// given region-local line/column with the given UTF-16 length.
+    fn raw_token(line: usize, column: usize, length: usize) -> RawToken {
+        use crate::analysis::semantic::TokenKind;
+        RawToken {
+            line,
+            column,
+            length,
+            kind: TokenKind::Mapped(1, 0),
+            depth: 1,
+            pattern_index: 0,
+            priority: 100,
+            node_byte_len: length,
+        }
+    }
+
     #[test]
     fn test_injection_token_cache_store_retrieve() {
         let cache = InjectionTokenCache::new();
         let uri = Url::parse("file:///test.md").unwrap();
 
-        let tokens1 = SemanticTokens {
-            result_id: Some("lua-region-1".to_string()),
-            data: vec![SemanticToken {
-                delta_line: 0,
-                delta_start: 0,
-                length: 5,
-                token_type: 0,
-                token_modifiers_bitset: 0,
-            }],
-        };
+        let tokens1 = vec![raw_token(0, 0, 5)];
+        let tokens2 = vec![raw_token(1, 2, 10)];
 
-        let tokens2 = SemanticTokens {
-            result_id: Some("python-region-2".to_string()),
-            data: vec![SemanticToken {
-                delta_line: 1,
-                delta_start: 2,
-                length: 10,
-                token_type: 1,
-                token_modifiers_bitset: 0,
-            }],
-        };
+        // Store region-local tokens under a content hash + generation.
+        cache.store(&uri, "region-1", 0xAA, 0, tokens1.clone());
+        cache.store(&uri, "region-2", 0xBB, 0, tokens2.clone());
 
-        // Store tokens for different regions in same document
-        cache.store(&uri, "region-1", tokens1.clone());
-        cache.store(&uri, "region-2", tokens2.clone());
-
-        // Retrieve by (uri, region_id)
-        let retrieved1 = cache.get(&uri, "region-1");
+        // Retrieve by the full validity key.
+        let retrieved1 = cache.get(&uri, "region-1", 0xAA, 0);
         assert!(retrieved1.is_some(), "Should retrieve tokens for region-1");
-        assert_eq!(retrieved1.unwrap().data[0].length, 5);
+        assert_eq!(retrieved1.unwrap()[0].length, 5);
 
-        let retrieved2 = cache.get(&uri, "region-2");
+        let retrieved2 = cache.get(&uri, "region-2", 0xBB, 0);
         assert!(retrieved2.is_some(), "Should retrieve tokens for region-2");
-        assert_eq!(retrieved2.unwrap().data[0].length, 10);
+        assert_eq!(retrieved2.unwrap()[0].length, 10);
 
         // Non-existent region returns None
-        assert!(cache.get(&uri, "region-3").is_none());
+        assert!(cache.get(&uri, "region-3", 0xAA, 0).is_none());
 
         // Non-existent URI returns None
         let other_uri = Url::parse("file:///other.md").unwrap();
-        assert!(cache.get(&other_uri, "region-1").is_none());
+        assert!(cache.get(&other_uri, "region-1", 0xAA, 0).is_none());
+    }
+
+    #[test]
+    fn injection_token_cache_validity_key_gates_reads() {
+        let cache = InjectionTokenCache::new();
+        let uri = Url::parse("file:///t.md").unwrap();
+        cache.store(&uri, "r", 0x1111, 7, vec![raw_token(0, 0, 4)]);
+
+        // Exact key hits.
+        assert!(cache.get(&uri, "r", 0x1111, 7).is_some());
+
+        // A different content hash (region content changed) misses.
+        assert!(
+            cache.get(&uri, "r", 0x2222, 7).is_none(),
+            "content-hash mismatch must miss so edited content is recomputed"
+        );
+
+        // A different generation (settings/query reload) misses, even for the
+        // same content — the race-safe fold, not a bare clear.
+        assert!(
+            cache.get(&uri, "r", 0x1111, 8).is_none(),
+            "generation mismatch must miss so post-reload requests recompute"
+        );
+    }
+
+    #[test]
+    fn injection_token_cache_store_overwrites_and_remove_is_point_delete() {
+        let cache = InjectionTokenCache::new();
+        let uri = Url::parse("file:///t.md").unwrap();
+
+        // Validity lives in the value, so a second store for the same region
+        // OVERWRITES the first — a region never accumulates stale siblings, which
+        // is what lets `remove` be an O(1) point delete.
+        cache.store(&uri, "r", 0x1111, 0, vec![raw_token(0, 0, 4)]);
+        cache.store(&uri, "r", 0x2222, 0, vec![raw_token(0, 0, 5)]);
+        assert!(
+            cache.get(&uri, "r", 0x1111, 0).is_none(),
+            "the overwritten (old-validity) entry must be gone"
+        );
+        let current = cache.get(&uri, "r", 0x2222, 0).expect("latest entry hits");
+        assert_eq!(current[0].length, 5);
+
+        // remove drops that single entry.
+        cache.remove(&uri, "r");
+        assert!(cache.get(&uri, "r", 0x2222, 0).is_none());
     }
 
     #[test]
@@ -578,18 +702,8 @@ mod tests {
         ];
         injection_map.insert(uri.clone(), regions);
 
-        // Set up cached tokens for each region
-        let lua_tokens = SemanticTokens {
-            result_id: Some("lua-tokens".to_string()),
-            data: vec![SemanticToken {
-                delta_line: 0,
-                delta_start: 0,
-                length: 3,
-                token_type: 0,
-                token_modifiers_bitset: 0,
-            }],
-        };
-        token_cache.store(&uri, "lua-region-1", lua_tokens);
+        // Set up cached tokens for the lua region, keyed by its content hash.
+        token_cache.store(&uri, "lua-region-1", 11111, 0, vec![raw_token(0, 0, 3)]);
 
         // Find region containing byte offset and get its cached tokens
         let regions = injection_map.get(&uri).unwrap();
@@ -599,10 +713,10 @@ mod tests {
         let region = region_at_byte_30.unwrap();
         assert_eq!(region.language, "lua");
 
-        // Use region_id to get cached tokens
-        let cached = token_cache.get(&uri, &region.region_id);
+        // Use region_id + content_hash to get cached tokens
+        let cached = token_cache.get(&uri, &region.region_id, region.content_hash, 0);
         assert!(cached.is_some(), "Should have cached tokens for lua region");
-        assert_eq!(cached.unwrap().data[0].length, 3);
+        assert_eq!(cached.unwrap()[0].length, 3);
     }
 
     #[test]
