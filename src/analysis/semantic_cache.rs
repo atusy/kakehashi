@@ -234,7 +234,7 @@ impl InjectionTokenCache {
     }
 
     /// Store region-local tokens for an injection region under its validity key
-    /// (`content_hash` + settings `generation`).
+    /// (`validity_hash` = content ⊕ resolved language, plus settings `generation`).
     pub(crate) fn store(
         &self,
         uri: &Url,
@@ -255,7 +255,7 @@ impl InjectionTokenCache {
     }
 
     /// Retrieve region-local tokens iff an entry exists for this exact validity
-    /// key — same region, same content, same settings generation.
+    /// key — same region, same content + resolved language, same settings generation.
     pub(crate) fn get(
         &self,
         uri: &Url,
@@ -292,8 +292,8 @@ impl InjectionTokenCache {
         result
     }
 
-    /// Remove every cached entry for an injection region, across all content
-    /// hashes / generations. `content_hash` and `generation` are part of the key,
+    /// Remove every cached entry for an injection region, across all validity
+    /// hashes / generations. `validity_hash` and `generation` are part of the key,
     /// so a single `(uri, region_id)` can have stale siblings; eviction
     /// (edit-overlap, content/language change, region removed) must drop them all.
     pub(crate) fn remove(&self, uri: &Url, region_id: &str) {
@@ -306,7 +306,7 @@ impl InjectionTokenCache {
         self.cache.retain(|key, _| &key.0 != uri);
     }
 
-    /// Validity keys `(region_id, content_hash, generation)` currently stored for
+    /// Validity keys `(region_id, validity_hash, generation)` currently stored for
     /// a document — lets a test confirm what the hot path persisted and overwrite
     /// a specific entry to prove the reuse path reads it.
     #[cfg(test)]
