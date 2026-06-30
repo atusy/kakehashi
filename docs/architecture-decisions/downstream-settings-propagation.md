@@ -194,11 +194,13 @@ keeps propagation proportional to actual change.
 - **Accepted narrow race during the handshake window**: path (a) reads the cell
   then sends; a path-(c) store that lands between that read and send (a few-
   hundred-ms window, multithreaded runtime) can leave a push-model server one
-  revision stale while the cell — and any pull — already holds the new value.
-  This is the same deferred-epoch-class race accepted elsewhere (e.g. the pull
-  refresh coverage gate); pull-model servers self-heal, and the worst case is
-  bounded staleness, not corruption. Fully closing it would require serializing
-  (a) and (c) on a per-connection lock.
+  revision behind while the cell — and any pull — already holds the new value.
+  The staleness is bounded by *revision*, not time: it persists until the next
+  config change re-pushes or the server respawns. This is the same deferred-
+  epoch-class race accepted elsewhere (e.g. the pull refresh coverage gate);
+  pull-model servers self-heal, and the worst case is bounded staleness, not
+  corruption. Fully closing it would require serializing (a) and (c) on a
+  per-connection lock.
 
 ### Neutral
 
