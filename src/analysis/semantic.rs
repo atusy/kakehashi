@@ -20,7 +20,16 @@ use parallel::collect_injection_tokens_parallel;
 
 // Internal re-exports for production code
 use finalize::finalize_tokens;
-use token_collector::{RawToken, build_line_start_bytes, collect_host_tokens};
+use token_collector::{build_line_start_bytes, collect_host_tokens};
+
+// Region-local token type persisted by the injection-token cache (#529). Lives
+// in `token_collector`; re-exported here so `semantic_cache` can name it.
+pub(crate) use token_collector::RawToken;
+// `TokenKind` is only needed to construct `RawToken`s in `semantic_cache` tests
+// (the production re-anchor path touches only line/column), so its re-export is
+// test-gated to avoid an unused import in release builds.
+#[cfg(test)]
+pub(crate) use token_collector::TokenKind;
 
 // Test-only imports
 #[cfg(test)]

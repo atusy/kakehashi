@@ -407,10 +407,25 @@ impl Default for CacheCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::semantic::{RawToken, TokenKind};
     use tower_lsp_server::ls_types::SemanticToken;
 
     fn create_test_uri(path: &str) -> Url {
         Url::parse(&format!("file:///{}", path)).unwrap()
+    }
+
+    /// One region-local `RawToken`, for seeding the injection token cache.
+    fn injection_raw_tokens() -> Vec<RawToken> {
+        vec![RawToken {
+            line: 0,
+            column: 0,
+            length: 5,
+            kind: TokenKind::Mapped(1, 0),
+            depth: 1,
+            pattern_index: 0,
+            priority: 100,
+            node_byte_len: 5,
+        }]
     }
 
     #[test]
@@ -592,28 +607,23 @@ print("hello")
         let regions = cache.get_injections(&uri).expect("should have injections");
         assert_eq!(regions.len(), 1);
         let initial_region_id = regions[0].region_id.clone();
+        let initial_content_hash = regions[0].content_hash;
         assert_eq!(regions[0].language, "lua");
 
-        // Store tokens for this injection region
-        let lua_tokens = SemanticTokens {
-            result_id: Some("lua-tokens".to_string()),
-            data: vec![SemanticToken {
-                delta_line: 0,
-                delta_start: 0,
-                length: 5,
-                token_type: 1,
-                token_modifiers_bitset: 0,
-            }],
-        };
-        cache
-            .injection_token_cache
-            .store(&uri, &initial_region_id, lua_tokens);
+        // Store region-local tokens under the region's current content hash.
+        cache.injection_token_cache.store(
+            &uri,
+            &initial_region_id,
+            initial_content_hash,
+            0,
+            injection_raw_tokens(),
+        );
 
         // Verify tokens are stored
         assert!(
             cache
                 .injection_token_cache
-                .get(&uri, &initial_region_id)
+                .get(&uri, &initial_region_id, initial_content_hash, 0)
                 .is_some(),
             "tokens should be cached before language change"
         );
@@ -672,7 +682,7 @@ print("hello")
         assert!(
             cache
                 .injection_token_cache
-                .get(&uri, &initial_region_id)
+                .get(&uri, &initial_region_id, initial_content_hash, 0)
                 .is_none(),
             "cached tokens should be invalidated when language changes"
         );
@@ -731,25 +741,19 @@ print("hello")
         let initial_region_id = regions[0].region_id.clone();
         let initial_content_hash = regions[0].content_hash;
 
-        // Store tokens
-        let lua_tokens = SemanticTokens {
-            result_id: Some("lua-tokens".to_string()),
-            data: vec![SemanticToken {
-                delta_line: 0,
-                delta_start: 0,
-                length: 5,
-                token_type: 1,
-                token_modifiers_bitset: 0,
-            }],
-        };
-        cache
-            .injection_token_cache
-            .store(&uri, &initial_region_id, lua_tokens);
+        // Store region-local tokens under the region's current content hash.
+        cache.injection_token_cache.store(
+            &uri,
+            &initial_region_id,
+            initial_content_hash,
+            0,
+            injection_raw_tokens(),
+        );
 
         assert!(
             cache
                 .injection_token_cache
-                .get(&uri, &initial_region_id)
+                .get(&uri, &initial_region_id, initial_content_hash, 0)
                 .is_some(),
             "tokens should be cached before content change"
         );
@@ -796,7 +800,7 @@ print("goodbye")
         assert!(
             cache
                 .injection_token_cache
-                .get(&uri, &initial_region_id)
+                .get(&uri, &initial_region_id, initial_content_hash, 0)
                 .is_none(),
             "cached tokens should be invalidated when content changes"
         );
