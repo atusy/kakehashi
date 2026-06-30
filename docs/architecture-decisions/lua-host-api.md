@@ -12,8 +12,11 @@ Two boundaries shape what kakehashi must provide:
 1. **The resolver runs in a restricted sandbox.** For determinism, safety, and
    the worker-thread/timeout execution model (see workspace-resolver), the Lua
    environment is stripped: `string`, `table`, `math` stay; `io`, `os`,
-   `package`, `require`, `load`/`loadstring`, `dofile`, and FFI are removed.
-   So *any* host access — filesystem, working directory — must be an explicit
+   `package`, `require`, `load`/`loadstring`, `dofile`, `debug`, and FFI are
+   removed (also `string.dump`; `collectgarbage` left read-only or removed).
+   `debug` is on the list deliberately — `debug.getupvalue`/`setupvalue`/
+   `sethook`/`getregistry` are introspection and sandbox-escape vectors. So
+   *any* host access — filesystem, working directory — must be an explicit
    kakehashi-provided function, not Lua's stdlib.
 
 2. **Lua's `string` library is already powerful.** Splitting, matching, and
@@ -49,7 +52,10 @@ each submodule mirrors a Rust `std` module, keeping one naming language:
   including the `find_ancestor` walk.
 - `kakehashi.env` ← `std::env` — **impure**: ambient process environment
   (`current_dir`; env-var reads if later promoted from deferred).
-- `kakehashi.log` — diagnostics output.
+- `kakehashi.log` — diagnostics output. The one deliberate exception to the
+  std-mirror rule: there is no `std::log` (logging is the `log` crate's
+  facade), but a sanctioned output channel is needed since `print`/`io` are
+  stripped.
 
 The `path`/`fs` divide is the **purity line**, which keeps "any `path.X` is
 side-effect-free" a guarantee a reader can rely on.
@@ -79,7 +85,11 @@ needs); deliberately pure and side-effect-free.
 | `path.join(base, ...)` | `string` | `Path::join` (variadic for convenience) |
 
 `nil`-returning cases mirror Rust exactly: `parent("/")` → `nil`,
-`extension("README")` → `nil`, etc.
+`extension("README")` → `nil`, etc. All wrapped methods are stable since Rust
+1.0 (`ancestors` since 1.28) **except `Path::file_prefix`, stabilized in 1.91**
+— including it sets an implicit MSRV floor of 1.91. The project currently pins
+no MSRV and builds on ≥1.95, so this is a recorded caveat, not a blocker; drop
+`file_prefix` (it overlaps `file_stem`) if an older toolchain must be supported.
 
 #### `kakehashi.fs` — read-only host filesystem (criteria 2 and 3)
 
@@ -94,29 +104,41 @@ in the pure `path` module.
 | `fs.exists(p)` | `boolean` |
 | `fs.is_file(p)` | `boolean` |
 | `fs.is_dir(p)` | `boolean` |
-| `fs.read_to_string(p)` | `string \| nil` (nil on missing / unreadable / non-UTF-8) |
-| `fs.find_ancestor(start, markers)` | `string \| nil` (the matching ancestor directory) |
+| `fs.read_to_string(p)` | `string \| nil` (nil on missing / unreadable / non-UTF-8 / over size cap) |
+| `fs.find_ancestor(start, markers)` | `string \| nil` (the matching directory) |
+
+`fs.read_to_string` is **size-capped**: the workspace-resolver in-VM timeout
+hook cannot interrupt a host read, so an unbounded read of a huge file could
+block the worker thread or OOM. Over the cap it returns `nil` (treated like
+unreadable). The cap value is an open question (see workspace-resolver).
 
 `fs.find_ancestor` is a **general upward-search primitive**, not a
 workspace-specific function — finding a project root is just one use. It reuses
 `src/lsp/bridge/root_markers.rs` (criterion 3) rather than having every caller
 reimplement the walk:
 
-- `start`: a path (file or directory). Search begins at the file's directory
-  (Neovim `vim.fs.root` semantics) and walks upward.
+- `start`: a path. The search's **base directory** is `start` itself when it is
+  a directory, or `start`'s parent when it is a file (Neovim `vim.fs.root`
+  semantics). The walk checks the base directory **and** each ancestor.
 - `markers`: `(string | string[])[]` — a nested array is an equal-priority
   group. This is the **same shape** as `workspaceMarkers`, but the function
   does not assume the result is a workspace. (The resolver's return no longer
   accepts raw markers; it calls this function instead — see workspace-resolver.)
-- Returns the first **ancestor directory** containing a marker, or `nil`.
+- Returns the first directory (base, then ancestors) containing a marker, or
+  `nil`.
 
-It pairs with the pure `path.ancestors`: `fs.find_ancestor(start, markers)` is
-"the first directory in `path.ancestors(start)` that contains a marker." Named
-for what it returns (an ancestor directory) and the mechanism, **not** for the
-workspace use case — `find_workspace`/`find_root` would over-narrow a reusable
-primitive to one consumer. A resolver can combine it with content checks
-imperatively — e.g. find the `package.json` directory, then branch on whether
-`deno.json` sits beside it.
+> **Implementation note:** the reused `root_markers.rs::find_marker_root` takes
+> a *document file* and starts at `parent().ancestors()`, so it never inspects
+> the passed path itself. Generalizing it to `fs.find_ancestor` must check the
+> base directory when `start` is a directory — otherwise a marker sitting *in*
+> a directory `start` (e.g. `find_ancestor(kakehashi.env.current_dir(), …)`)
+> is missed.
+
+Named for what it returns (a directory among the base + ancestors) and the
+mechanism, **not** for the workspace use case — `find_workspace`/`find_root`
+would over-narrow a reusable primitive to one consumer. A resolver can combine
+it with content checks imperatively — e.g. find the `package.json` directory,
+then branch on whether `deno.json` sits beside it.
 
 No writes, no spawning. Reads and walks are **point-in-time**, consistent with
 the evaluate-once-at-didOpen cache contract in workspace-resolver: a later
@@ -232,8 +254,8 @@ resolver.
   `path.*` stays a side-effect-free, independently testable layer.
 - `kakehashi.env.current_dir()` retires the deferred `workspaceFallback` cleanly.
 - `kakehashi.*` is submodule-only and each submodule mirrors a Rust `std`
-  module (`path`/`fs`/`env`), so there is one naming language and no bare
-  top-level functions to accrete.
+  module (`path`/`fs`/`env`; `log` is the one documented exception), so there
+  is one naming language and no bare top-level functions to accrete.
 
 ### Negative
 

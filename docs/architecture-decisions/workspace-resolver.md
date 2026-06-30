@@ -10,9 +10,10 @@ by `src/lsp/bridge/root_markers.rs`.
 
 Two forces push beyond static markers:
 
-1. **Naming drift from the LSP spec.** The spec deprecated `rootUri`/`rootPath`
-   in favor of `workspaceFolders`. `rootMarkers` (a name inherited from
-   Neovim's `vim.fs.root`) reads as the deprecated vocabulary.
+1. **Naming drift from the LSP spec.** The spec deprecates `rootPath` in favor
+   of `rootUri`, and `rootUri` in favor of `workspaceFolders`. `rootMarkers`
+   (a name inherited from Neovim's `vim.fs.root`) reads as the deprecated
+   vocabulary.
 
 2. **Static markers cannot make content-dependent decisions.** For
    ecosystems like Deno vs. Node (`deno`/`tsserver`/`tsgo`), *which* server to
@@ -35,7 +36,7 @@ alias** (`#[serde(alias = "rootMarkers")]`) for backward compatibility. The
 default is unchanged: `[".git"]`. Resolution semantics (upward search, nested
 arrays = equal-priority groups) are unchanged.
 
-### 2. Introduce `workspaceResolver` — a Lua pure function
+### 2. Introduce `workspaceResolver` — a Lua function
 
 A new optional key holds a Lua function that dynamically decides both **whether
 to attach** and **what workspace** to use:
@@ -45,7 +46,7 @@ to attach** and **what workspace** to use:
 workspaceMarkers = [ ".git" ]            # used only when workspaceResolver is unset
 workspaceResolver = """
 ---@param server_info { name: string, config: table }
----@param document_info { uri: string, language_id: string, text: string } -- fields resolved lazily via metatable
+---@param document_info { uri: string, path: string, language_id: string, text: string } -- fields resolved lazily via metatable
 ---@return boolean, nil | string
 --- first return  — attach? if false, do not attach this document to this server.
 --- second return — workspace folder, a filesystem path (ignored when first is false):
@@ -61,11 +62,14 @@ end
 
 Key properties:
 
-- **Pure function `(server_info, document_info) -> (attach, workspace)`.** No
-  `event` parameter. The resolver does not know — and must not care — whether
-  this document is spawning the server or attaching to a running one; it is
-  expected to be **idempotent** for a given `document_info`. kakehashi decides
-  how to apply the result from the server's current state (below).
+- **Idempotent function `(server_info, document_info) -> (attach, workspace)`.**
+  Not pure — it reads the filesystem and cwd through `kakehashi.fs`/`env` (see
+  lua-host-api). The point is statelessness w.r.t. spawn-vs-attach: there is no
+  `event` parameter, the resolver does not know — and must not care — whether
+  this document is spawning the server or attaching to a running one, and it is
+  expected to return the **same result for a given `document_info`** (modulo
+  on-disk changes). kakehashi decides how to apply the result from the server's
+  current state (below).
 - **`document_info` is always present** (file-first model), so it is
   non-optional. Its fields — including `text` — are materialized **lazily via a
   metatable** to avoid copying large documents into Lua when the resolver never
@@ -81,15 +85,31 @@ Key properties:
 
 ### 3. Execution model: synchronous return-style on a worker thread
 
-The resolver runs **synchronously** (return-style, not continuation-passing) on
-a blocking worker thread (`spawn_blocking` or a dedicated thread), off the tokio
-runtime, guarded by a **timeout**.
+The resolver runs **synchronously** (return-style, not continuation-passing) off
+the tokio runtime, so a blocking resolver cannot stall the LSP event loop — the
+async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
 
-- A blocking resolver therefore cannot stall the LSP event loop — the
-  async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
+- **Thread ownership.** `mlua::Lua` is `!Send` by default, so the VM cannot be
+  moved across threads or held across an `await`. A reusable compiled VM
+  therefore lives on a **dedicated thread** that owns it and receives requests
+  over a channel (not an ad-hoc `spawn_blocking` per call, which would force
+  re-creating the VM and a `Send` bound on every `kakehashi.*` callback).
+- **Timeout is in-VM, not wall-clock-only.** Wrapping the call in
+  `tokio::time::timeout` (or dropping the join handle) only stops *awaiting* the
+  result; the Lua code keeps running and keeps occupying the worker thread. Real
+  interruption requires an **in-VM hook** — `Lua::set_hook` with
+  `HookTriggers::every_nth_instruction` (or Luau `set_interrupt`) that checks
+  elapsed time and raises. This bounds Lua-level loops.
+  - **Caveat:** an instruction hook cannot interrupt time spent inside a host
+    C-call (`kakehashi.fs.find_ancestor`'s filesystem walk, `read_to_string`)
+    or the lazy `document_info` metatable `__index`. Those host operations must
+    carry **their own bounds** (e.g. a capped `read_to_string`, see
+    lua-host-api) — the §6 "must not tie up a worker thread" guarantee depends
+    on both the hook and these host-side limits.
 - The `text` snapshot is **owned in Rust** (`Arc<str>` or equivalent) before
   entering Lua; the metatable only defers *materialization into Lua*, never
-  performs async I/O. A metatable `__index` must not await.
+  performs async I/O. A metatable `__index` must not await (and, per the caveat,
+  must itself be cheap/bounded).
 
 ### 4. Veto and wiring
 
@@ -100,12 +120,17 @@ runtime, guarded by a **timeout**.
 - **Result application is inferred from server state**, not signaled by the
   resolver:
   - Server not yet running, this document triggers the spawn → resolved
-    workspace **seeds `InitializeParams`** (`src/lsp/bridge/protocol/lifecycle.rs`
-    `build_initialize_request`), overriding the marker input at
-    `src/lsp/bridge/pool.rs` (`workspace_from_marker`).
+    workspace **seeds `InitializeParams`** via `build_initialize_request`
+    (`protocol/lifecycle.rs`), replacing the `marker` argument that
+    `workspace_from_marker` (defined in `root_markers.rs`, called from `pool.rs`)
+    would otherwise supply.
   - Server already running, a new document arrives → a returned folder is added
     via `workspace/didChangeWorkspaceFolders` (the `WorkspaceFolderSet` in
-    `pool.rs`).
+    `pool.rs`). **Precondition:** this only reaches a server that advertised
+    `workspace.workspaceFolders.changeNotifications` (or dynamically registered
+    it); the implementation already gates on `supports_workspace_folder_changes`,
+    so for a non-supporting running server a resolver's returned folder is
+    **silently dropped**. See Open Questions.
 
 ### 5. Cache contract
 
@@ -119,7 +144,26 @@ document text.
 
 A Lua error **or** a timeout overrun is treated as **fail-closed**: do not
 attach the document to that server, and log. A broken or slow resolver must not
-silently misroute, nor tie up a worker thread indefinitely.
+silently misroute. "Tie up a worker thread indefinitely" is prevented by the
+in-VM hook **plus** the host-side bounds of §3 — a hook alone cannot stop a
+runaway host call, so both are load-bearing for this guarantee.
+
+### 7. Open questions
+
+Deferred to implementation, recorded so they are not lost:
+
+- **Timeout default value.** Not fixed here; must be generous enough for a
+  filesystem walk yet bound a misbehaving resolver.
+- **`read_to_string` size cap.** Per §3 the in-VM hook cannot interrupt a host
+  read, so `kakehashi.fs.read_to_string` needs its own large-file bound (see
+  lua-host-api); the exact cap is open.
+- **Non-`file://` documents.** The "file-first" framing assumes a filesystem
+  path. What `document_info.path` (and the path-based host API) yield for
+  `untitled:` and other non-`file://` URIs is undefined; likely the resolver
+  should be skipped (fall back to `workspaceMarkers`/no folder) for those.
+- **Folder dropped on a non-supporting running server** (§4): whether to fall
+  back (e.g. respawn with the folder, or surface a warning) instead of silently
+  dropping is open.
 
 ## Considered Options
 
@@ -156,8 +200,8 @@ silently misroute, nor tie up a worker thread indefinitely.
 - **`event: "initialize" | "didOpen"` parameter.** Considered so the resolver
   could branch on spawn vs. attach. Rejected: in the file-first model both
   carry a document, and folding the spawn/attach distinction into kakehashi's
-  state (rather than the resolver's logic) keeps the resolver a pure,
-  idempotent function and removes a state-management responsibility from
+  state (rather than the resolver's logic) keeps the resolver an idempotent,
+  stateless function and removes a state-management responsibility from
   resolver authors.
 
 - **`workspaceFallback` (e.g. `"$PWD"`) when neither markers nor resolver
@@ -172,8 +216,8 @@ silently misroute, nor tie up a worker thread indefinitely.
 - Vocabulary aligns with the LSP spec (`workspaceFolders`), with a no-break
   deprecation alias.
 - Content-dependent server selection (Deno vs. Node/tsgo) becomes expressible.
-- The resolver is a pure, idempotent function; spawn-vs-attach routing stays in
-  kakehashi, not in user Lua.
+- The resolver is an idempotent, stateless function; spawn-vs-attach routing
+  stays in kakehashi, not in user Lua.
 - One folder-from-markers implementation, shared by markers and resolver.
 
 ### Negative
