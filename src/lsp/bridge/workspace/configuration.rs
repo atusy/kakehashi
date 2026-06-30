@@ -9,6 +9,13 @@
 //! The editor cannot answer for a downstream server's config section (it
 //! configures kakehashi, not `rust-analyzer`), so the bridge owns and serves
 //! the configuration itself.
+//!
+//! Limitations (downstream-settings-propagation, deferred scope):
+//! `ConfigurationItem.scopeUri` is ignored — the one per-server settings value
+//! answers every scope. `section` is treated as a dotted path into the settings
+//! root (the editor convention), not a JSON Pointer; a segment is a literal
+//! object key, so a section that indexes into an array or a scalar, or that has
+//! an empty segment (`"a."`, `".a"`, `"a..b"`), resolves to `null`.
 
 use log::debug;
 use serde_json::Value;
@@ -153,6 +160,53 @@ mod tests {
     fn absent_root_resolves_every_section_to_null() {
         assert_eq!(resolve_section(None, None), Value::Null);
         assert_eq!(resolve_section(None, Some("rust-analyzer")), Value::Null);
+    }
+
+    #[test]
+    fn empty_segments_resolve_to_null() {
+        // A literal-key dotted path: an empty segment indexes a `""` key, which
+        // never exists, so trailing/leading/double dots resolve to null
+        // (panic-free).
+        let r = root();
+        for section in [
+            "rust-analyzer.",
+            ".rust-analyzer",
+            "rust-analyzer..cargo",
+            ".",
+        ] {
+            assert_eq!(
+                resolve_section(Some(&r), Some(section)),
+                Value::Null,
+                "section {section:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_null_leaf_is_returned_as_null() {
+        // A section whose value is genuinely JSON `null` returns that null — the
+        // same wire value as a miss, which is correct for `LSPAny`.
+        let r = json!({ "server": { "feature": Value::Null } });
+        assert_eq!(
+            resolve_section(Some(&r), Some("server.feature")),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn indexing_into_an_array_resolves_to_null() {
+        // A string segment can only index an object; descending into an array
+        // value yields null rather than panicking or coercing.
+        let r = json!({ "server": { "list": [1, 2, 3] } });
+        assert_eq!(
+            resolve_section(Some(&r), Some("server.list.0")),
+            Value::Null
+        );
+        // …but addressing the array itself returns it verbatim.
+        assert_eq!(
+            resolve_section(Some(&r), Some("server.list")),
+            json!([1, 2, 3])
+        );
     }
 
     #[test]
