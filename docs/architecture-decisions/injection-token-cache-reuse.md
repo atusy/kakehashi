@@ -171,12 +171,17 @@ Two implementation obligations follow, neither inferable from
   continuations leave `prefix_byte_widths` empty, so that remains a *valid* hit.)
 - **Source `region_id` from the freshly parsed tree's `NodeTracker`, not the
   cached `InjectionMap`.** `InjectionContext` carries no `region_id` today, so v1
-  resolves it *inside* `collect_injection_contexts_sync`, where the tree-sitter
-  node is in hand — `tracker.get_or_create(uri, start_byte, end_byte, kind)` —
-  and carries the ULIDs to the fan-out as a parallel `Vec` aligned with the
-  contexts (or as a new `region_id` field on `InjectionContext`). It cannot be
-  deferred to the fan-out boundary: `InjectionContext` keeps only
-  `host_start_byte`, not the `end_byte` / node `kind` that `get_or_create` needs.
+  resolves it *inside* `collect_injection_contexts_sync` — the single-threaded
+  discovery phase that runs *before* the Rayon fan-out — where the tree-sitter
+  node is in hand: `tracker.get_or_create(uri, start_byte, end_byte, kind)`, with
+  the ULIDs carried to the fan-out as an index-aligned `Vec` (or as a new
+  `region_id` field on `InjectionContext`). Resolving here, not inside the
+  parallel workers, is deliberate: `NodeTracker.entries` is a
+  `DashMap<Url, UriEntries>`, so calling `get_or_create` for the same `uri` from
+  many workers at once would contend on that document's single write lock — the
+  sequential phase sidesteps the contention. It also cannot be deferred to the
+  fan-out boundary anyway: `InjectionContext` keeps only `host_start_byte`, not
+  the `end_byte` / node `kind` that `get_or_create` needs.
   Either way this threads two new inputs into `collect_injection_tokens_parallel`
   and `handle_semantic_tokens_full`, which take neither today: the document `uri`
   and the `NodeTracker` (owned by the bridge coordinator and passed *into* cache
