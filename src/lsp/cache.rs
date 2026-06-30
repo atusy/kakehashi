@@ -3,9 +3,13 @@
 //! `SemanticRequestTracker` (in-flight cancellation).
 //!
 //! The semantic-token cache is intentionally **not** invalidated on `didChange`
-//! — `semanticTokens/full/delta` needs the previous version, and `result_id`
-//! validation at lookup time rejects stale hits. Dropping it on every edit
-//! would disable delta calculations entirely.
+//! — `semanticTokens/full/delta` needs the previous version for delta
+//! calculation, and dropping it on every edit would disable that. Two keys gate
+//! lookups instead: `result_id` (for the delta baseline) and a `cache_key` (the
+//! text content hash folded with a settings generation) that lets an unchanged
+//! document skip re-tokenizing. A query/config reload bumps the generation (see
+//! `bump_semantic_token_generation`) so post-reload requests recompute; `didChange`
+//! never invalidates.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,6 +36,12 @@ pub(crate) struct CacheCoordinator {
     injection_map: InjectionMap,
     injection_token_cache: InjectionTokenCache,
     request_tracker: SemanticRequestTracker,
+    /// Settings generation folded into every semantic-token `cache_key`. Bumped
+    /// on a query/config reload so cached tokens computed under the old queries
+    /// stop matching — even one stored *after* the reload's `clear` by a request
+    /// that was already computing (it captured the pre-bump generation), which a
+    /// bare clear could not prevent.
+    semantic_token_generation: std::sync::atomic::AtomicU64,
 }
 
 impl CacheCoordinator {
@@ -42,6 +52,7 @@ impl CacheCoordinator {
             injection_map: InjectionMap::new(),
             injection_token_cache: InjectionTokenCache::new(),
             request_tracker: SemanticRequestTracker::new(),
+            semantic_token_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -308,30 +319,51 @@ impl CacheCoordinator {
         }
     }
 
-    /// Store semantic tokens for a document, tagged with the `content_hash` of
-    /// the text they were computed from so an unchanged-document repeat request
-    /// can skip re-tokenizing via [`get_current_tokens`](Self::get_current_tokens).
-    pub(crate) fn store_tokens(&self, uri: Url, tokens: SemanticTokens, content_hash: u64) {
-        self.semantic_cache.store(uri, tokens, content_hash);
+    /// Snapshot the current settings generation. Take this at the TOP of a token
+    /// handler — before reading ANY settings-dependent tokenization input
+    /// (language resolution, `ensure_language_loaded`, highlight query, capture
+    /// mappings) — and pass it to [`cache_key_for`](Self::cache_key_for) once the
+    /// text is available. A reload that bumps the generation after this snapshot
+    /// leaves the request's stored key on the old generation, invisible to
+    /// post-reload requests (which compute the new-generation key) — so a request
+    /// racing a `didChangeConfiguration` can never poison the cache, regardless of
+    /// whether it observed the old or new queries.
+    pub(crate) fn semantic_token_generation(&self) -> u64 {
+        self.semantic_token_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Return the cached tokens iff they were computed from text with this
-    /// `content_hash` (the document is unchanged), letting the caller skip the
-    /// full re-tokenization. None on a content change or no entry.
-    pub(crate) fn get_current_tokens(
-        &self,
-        uri: &Url,
-        content_hash: u64,
-    ) -> Option<SemanticTokens> {
+    /// Build the cache validity key for `text` under a previously snapshotted
+    /// `generation` (see [`semantic_token_generation`](Self::semantic_token_generation)):
+    /// the FNV-1a content hash folded with the generation, so distinct
+    /// generations yield distinct keys for identical text.
+    pub(crate) fn cache_key_for(&self, text: &str, generation: u64) -> u64 {
+        crate::text::fnv1a_hash(text) ^ generation.wrapping_mul(0x100000001b3)
+    }
+
+    /// Store semantic tokens for a document, tagged with the `cache_key` they
+    /// were computed under so an unchanged-document repeat request (same text and
+    /// settings) can skip re-tokenizing via [`get_current_tokens`](Self::get_current_tokens).
+    pub(crate) fn store_tokens(&self, uri: Url, tokens: SemanticTokens, cache_key: u64) {
+        self.semantic_cache.store(uri, tokens, cache_key);
+    }
+
+    /// Return the cached tokens iff they were computed under this `cache_key`
+    /// (same text and settings generation), letting the caller skip the full
+    /// re-tokenization. None on a text edit, a settings reload, or no entry.
+    pub(crate) fn get_current_tokens(&self, uri: &Url, cache_key: u64) -> Option<SemanticTokens> {
         self.semantic_cache
-            .get_if_current(uri, content_hash)
+            .get_if_current(uri, cache_key)
             .map(|cached| cached.tokens)
     }
 
-    /// Drop all cached semantic tokens (settings/query reload): the same text
-    /// can tokenize differently under new queries, so content-hash hits would
-    /// otherwise serve stale tokens.
-    pub(crate) fn clear_all_semantic_tokens(&self) {
+    /// Bump the settings generation on a settings/query reload so every cached
+    /// token (computed under the old queries) stops matching, and clear the map
+    /// to reclaim the now-dead entries. The bump — not the clear — is what makes
+    /// this race-safe against a request that stores tokens after the clear.
+    pub(crate) fn bump_semantic_token_generation(&self) {
+        self.semantic_token_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.semantic_cache.clear();
     }
 
@@ -408,6 +440,44 @@ mod tests {
         // Verify all caches are cleared
         assert!(cache.get_tokens_if_valid(&uri, "test-id").is_none());
         assert!(cache.get_injections(&uri).is_none());
+    }
+
+    #[test]
+    fn bump_generation_invalidates_pre_reload_tokens() {
+        let cache = CacheCoordinator::new();
+        let uri = create_test_uri("reload_race.rs");
+        let text = "fn main() {}";
+        let tokens = SemanticTokens {
+            result_id: Some("1".to_string()),
+            data: vec![],
+        };
+
+        // A request snapshots the generation, then builds its key (generation 0).
+        let gen_before = cache.semantic_token_generation();
+        let key_before = cache.cache_key_for(text, gen_before);
+        cache.store_tokens(uri.clone(), tokens.clone(), key_before);
+        assert!(cache.get_current_tokens(&uri, key_before).is_some());
+
+        // A settings/query reload bumps the generation (and clears the map).
+        cache.bump_semantic_token_generation();
+
+        // Race: a request that began tokenizing under the OLD queries (it captured
+        // `key_before`) stores its now-stale tokens AFTER the reload's clear.
+        cache.store_tokens(uri.clone(), tokens, key_before);
+
+        // A fresh post-reload request snapshots the new generation and builds its
+        // key for the same text. The stale, old-generation tokens must NOT be
+        // served — this is what the generation (not a bare clear) buys us.
+        let gen_after = cache.semantic_token_generation();
+        let key_after = cache.cache_key_for(text, gen_after);
+        assert_ne!(
+            key_before, key_after,
+            "the generation bump must change the key for identical text"
+        );
+        assert!(
+            cache.get_current_tokens(&uri, key_after).is_none(),
+            "tokens stored under the pre-reload generation must not survive a reload"
+        );
     }
 
     #[test]

@@ -18,13 +18,14 @@ use url::Url;
 #[derive(Clone)]
 pub struct CachedSemanticTokens {
     pub tokens: SemanticTokens,
-    /// FNV-1a hash of the document text these tokens were computed from. Lets a
-    /// repeat request on an *unchanged* document serve the cached tokens instead
-    /// of re-tokenizing (the `result_id` can't do this — it is a fresh global
-    /// counter per response, so it never matches the document's current state).
-    /// Text-only: a config/query reload changes tokenization for the same text,
-    /// so the cache is dropped wholesale on settings apply (see `clear`).
-    pub content_hash: u64,
+    /// Opaque validity key these tokens were computed under (built by
+    /// `CacheCoordinator::token_cache_key`: the FNV-1a hash of the document text
+    /// folded with the settings generation). Lets a repeat request on an
+    /// *unchanged* document under *unchanged* settings serve the cached tokens
+    /// instead of re-tokenizing — the `result_id` can't (it is a fresh global
+    /// counter per response). A text edit OR a config/query reload changes the
+    /// key, so stale tokens stop matching.
+    pub cache_key: u64,
 }
 
 /// Thread-safe semantic token cache.
@@ -40,16 +41,11 @@ impl SemanticTokenCache {
         }
     }
 
-    /// Store semantic tokens for a document, tagged with the `content_hash` of
-    /// the text they were computed from (see [`get_if_current`](Self::get_if_current)).
-    pub fn store(&self, uri: Url, tokens: SemanticTokens, content_hash: u64) {
-        self.cache.insert(
-            uri,
-            CachedSemanticTokens {
-                tokens,
-                content_hash,
-            },
-        );
+    /// Store semantic tokens for a document, tagged with the `cache_key` they
+    /// were computed under (see [`get_if_current`](Self::get_if_current)).
+    pub fn store(&self, uri: Url, tokens: SemanticTokens, cache_key: u64) {
+        self.cache
+            .insert(uri, CachedSemanticTokens { tokens, cache_key });
     }
 
     /// Retrieve semantic tokens for a document.
@@ -57,13 +53,13 @@ impl SemanticTokenCache {
         self.cache.get(uri).map(|entry| entry.clone())
     }
 
-    /// Get cached tokens if they were computed from text with this `content_hash`
-    /// — i.e. the document is unchanged since they were cached, so re-tokenizing
-    /// would reproduce them. Returns None on a content-hash mismatch (the text
-    /// changed) or no entry.
-    pub fn get_if_current(&self, uri: &Url, content_hash: u64) -> Option<CachedSemanticTokens> {
+    /// Get cached tokens if they were computed under this `cache_key` — i.e. the
+    /// document text AND the settings generation are unchanged since they were
+    /// cached, so re-tokenizing would reproduce them. Returns None on a mismatch
+    /// (text edit or config reload) or no entry.
+    pub fn get_if_current(&self, uri: &Url, cache_key: u64) -> Option<CachedSemanticTokens> {
         self.cache.get(uri).and_then(|entry| {
-            if entry.content_hash == content_hash {
+            if entry.cache_key == cache_key {
                 Some(entry.clone())
             } else {
                 None
@@ -71,9 +67,9 @@ impl SemanticTokenCache {
         })
     }
 
-    /// Drop every cached entry. Used on a settings/query reload: the same text
-    /// can tokenize differently under new queries, so content-hash hits would
-    /// otherwise serve stale tokens.
+    /// Drop every cached entry. Used (alongside a generation bump) on a
+    /// settings/query reload to reclaim memory; the generation bump is what makes
+    /// the invalidation race-safe, this just stops the dead entries from leaking.
     pub fn clear(&self) {
         self.cache.clear();
     }

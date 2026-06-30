@@ -241,6 +241,14 @@ impl Kakehashi {
         // Start tracking this request - supersedes any previous request for this URI
         let request_id = self.cache.start_request(&uri);
 
+        // Snapshot the settings generation NOW, before reading any
+        // settings-dependent tokenization input (language resolution, queries,
+        // capture mappings) below. Folded into the cache key once the text is
+        // available; pinning it here means a settings reload racing this request
+        // leaves our stored tokens on the old generation — invisible to
+        // post-reload requests — so we can't poison the cache (see `cache_key_for`).
+        let token_generation = self.cache.semantic_token_generation();
+
         log::debug!(
             target: "kakehashi::semantic",
             "[SEMANTIC_TOKENS] START uri={} req={}",
@@ -314,9 +322,12 @@ impl Kakehashi {
             })));
         };
 
-        // Hash the snapshotted text once: it keys both the unchanged-document
-        // cache short-circuit below and the store of the freshly computed tokens.
-        let content_hash = crate::text::fnv1a_hash(&text);
+        // Validity key for the snapshotted text under the generation captured at
+        // the top (before any query/capture-mapping read): keys both the
+        // unchanged-document cache short-circuit below and the store of the freshly
+        // computed tokens. Pinning to the early generation is what keeps a
+        // concurrent settings reload from making this request poison the cache.
+        let cache_key = self.cache.cache_key_for(&text, token_generation);
 
         // Get document data and compute tokens
         let (result, text_used) = {
@@ -346,7 +357,13 @@ impl Kakehashi {
             // per response — but the content hash can. Returns the cached tokens
             // with their original `result_id`, keeping a client's delta baseline
             // stable across idle re-requests. Dropped wholesale on settings reload.
-            if let Some(cached) = self.cache.get_current_tokens(&uri, content_hash) {
+            //
+            // No `.await` runs between the staleness check above and this serve, so
+            // no `didChange` can interleave — the cached tokens stay consistent with
+            // that check. (The compute path below DOES await, which is why it
+            // re-checks staleness after the block; this early return needs no such
+            // re-check.)
+            if let Some(cached) = self.cache.get_current_tokens(&uri, cache_key) {
                 self.cache.finish_request(&uri, request_id);
                 return Ok(Some(SemanticTokensResult::Tokens(cached)));
             }
@@ -439,10 +456,10 @@ impl Kakehashi {
         tokens_with_id.result_id = Some(next_result_id());
         let stored_tokens = tokens_with_id.clone();
         let lsp_tokens = tokens_with_id;
-        // Store keyed by result_id (delta baseline) AND content_hash (so an
+        // Store keyed by result_id (delta baseline) AND cache_key (so an
         // unchanged-document repeat request short-circuits the re-tokenization above).
         self.cache
-            .store_tokens(uri.clone(), stored_tokens, content_hash);
+            .store_tokens(uri.clone(), stored_tokens, cache_key);
 
         // Finish tracking this request
         self.cache.finish_request(&uri, request_id);
@@ -476,6 +493,11 @@ impl Kakehashi {
 
         // Start tracking this request - supersedes any previous request for this URI
         let request_id = self.cache.start_request(&uri);
+
+        // Snapshot the settings generation NOW, before any settings-dependent
+        // tokenization input is read below (same reload-race safety as
+        // semanticTokens/full; folded into the cache key once the text is known).
+        let token_generation = self.cache.semantic_token_generation();
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -558,9 +580,11 @@ impl Kakehashi {
             )));
         };
 
-        // Hash the snapshotted text once: keys the unchanged-document reuse below
-        // and the store of freshly computed tokens (same as semanticTokens/full).
-        let content_hash = crate::text::fnv1a_hash(&text);
+        // Validity key for the snapshotted text under the generation captured at
+        // the top (before the tokenization inputs are read, as in
+        // semanticTokens/full): keys the unchanged-document reuse below and the
+        // store of freshly computed tokens.
+        let cache_key = self.cache.cache_key_for(&text, token_generation);
 
         // Get document data and compute tokens (same as semanticTokens/full)
         let (result, text_used) = {
@@ -588,7 +612,7 @@ impl Kakehashi {
             // re-tokenizing. The delta diff below still runs against them — so a
             // matching baseline yields the same no-op delta — but we skip the
             // expensive tokenization. Cleared wholesale on a settings reload.
-            if let Some(cached) = self.cache.get_current_tokens(&uri, content_hash) {
+            if let Some(cached) = self.cache.get_current_tokens(&uri, cache_key) {
                 (Some(SemanticTokensResult::Tokens(cached)), text)
             } else {
                 // Get capture mappings for token type resolution
@@ -686,7 +710,7 @@ impl Kakehashi {
             SemanticTokensFullDeltaResult::Tokens(mut tokens) => {
                 tokens.result_id = Some(next_result_id());
                 self.cache
-                    .store_tokens(uri.clone(), tokens.clone(), content_hash);
+                    .store_tokens(uri.clone(), tokens.clone(), cache_key);
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
             SemanticTokensFullDeltaResult::TokensDelta(mut delta) if delta.edits.is_empty() => {
@@ -704,7 +728,7 @@ impl Kakehashi {
                 stored_tokens.result_id = Some(next_result_id());
                 delta.result_id = stored_tokens.result_id.clone();
                 self.cache
-                    .store_tokens(uri.clone(), stored_tokens, content_hash);
+                    .store_tokens(uri.clone(), stored_tokens, cache_key);
                 SemanticTokensFullDeltaResult::TokensDelta(delta)
             }
             SemanticTokensFullDeltaResult::PartialTokensDelta { .. } => {
@@ -719,7 +743,7 @@ impl Kakehashi {
                 let mut tokens = current_tokens;
                 tokens.result_id = Some(next_result_id());
                 self.cache
-                    .store_tokens(uri.clone(), tokens.clone(), content_hash);
+                    .store_tokens(uri.clone(), tokens.clone(), cache_key);
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
         };

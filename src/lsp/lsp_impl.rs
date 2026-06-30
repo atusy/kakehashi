@@ -104,14 +104,17 @@ pub(super) async fn apply_shared_settings(
         Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
         None => settings_manager.apply_settings(settings),
     }
-    // A settings/query reload can change tokenization for unchanged text, so drop
-    // the content-hash-keyed semantic-token cache — otherwise a repeat request on
-    // an unedited document would serve tokens from the old queries. Cleared at this
-    // single choke point so every reload path (initialize, didChangeConfiguration,
-    // and the auto-install reload) is covered, and *before* the refresh below so the
-    // editor's re-request recomputes. `didChange` deliberately does NOT clear (delta
-    // needs the previous tokens); only a query/config reload does.
-    cache.clear_all_semantic_tokens();
+    // A settings/query reload can change tokenization for unchanged text, so bump
+    // the semantic-token cache generation — otherwise a repeat request on an
+    // unedited document would serve tokens from the old queries. Done at this single
+    // choke point so every reload path (initialize, didChangeConfiguration, and the
+    // auto-install reload) is covered, and *before* the refresh below so the editor's
+    // re-request recomputes. The generation bump (not a bare clear) also defeats a
+    // request that was mid-tokenization across the reload and stores afterwards: it
+    // captured the old generation, so its entry can't be served post-reload.
+    // `didChange` deliberately does NOT invalidate (delta needs the previous tokens);
+    // only a query/config reload does.
+    cache.bump_semantic_token_generation();
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
