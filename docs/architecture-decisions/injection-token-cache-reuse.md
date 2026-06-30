@@ -72,17 +72,20 @@ The codebase already contains most of the machinery to avoid this, but only its
   for each touched region, and `clear_document` on close/reparse — so stale
   entries are evicted correctly.
 
-The gap: `InjectionTokenCache::store` and `::get` are `#[cfg(test)]`-only. In
-production nothing ever writes to or reads from the cache, so the eviction logic
-guards an always-empty cache. The hot path (`handle_semantic_tokens_full` in
-`src/analysis/semantic.rs`) unconditionally calls `collect_host_tokens` +
-`collect_injection_tokens_parallel` over the whole document.
+The gap this ADR was written to close (historical — **resolved by PR #540**):
+`InjectionTokenCache::store` and `::get` were `#[cfg(test)]`-only, so production
+never wrote to or read from the cache and the eviction logic guarded an
+always-empty cache; the hot path (`handle_semantic_tokens_full` in
+`src/analysis/semantic.rs`) recomputed `collect_host_tokens` +
+`collect_injection_tokens_parallel` over the whole document on every request.
 
-This is the largest remaining *typing-path* lever for injection-heavy documents
-(the whole-doc cache having already taken the unchanged-document case). The
-reason it has not been wired in is a genuine design question, not an oversight:
-what to cache, and how to keep coordinates correct when an edit above a region
-shifts that region's position in the host document.
+This was the largest *typing-path* lever for injection-heavy documents (the
+whole-doc cache having already taken the unchanged-document case). It was not
+wired in because of a genuine design question, not an oversight: what to cache,
+and how to keep coordinates correct when an edit above a region shifts that
+region's position in the host document. The rest of this ADR records how that was
+resolved (now implemented); the injection-discovery companion lever below is the
+remaining, still-unimplemented follow-up.
 
 ## Decision
 
