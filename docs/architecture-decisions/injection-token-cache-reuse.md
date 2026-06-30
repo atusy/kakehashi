@@ -196,19 +196,105 @@ Two implementation obligations follow, neither inferable from
   — and means a fallback parse that skips `populate_injections` stays safe and
   must not be "fixed" by calling it there.
 
-### Companion lever: injection discovery
+### Companion lever: injection discovery (don't-discover-twice)
 
 The per-keystroke table shows injection *discovery* (the injection query over
 the whole host tree, run every request to enumerate regions) costs as much as
-tokenize and is also recomputed every keystroke. It is not cached by v1, but the
-same position-stable `region_id` / `InjectionMap` identity that makes token
-reuse possible could let an edit reuse the previous region *set* instead of
-re-querying. Caching discovery + tokenize together roughly doubles the
-per-keystroke saving (measured projection: ~−1/3 for tokenize alone vs ~−60% for
-both at 150–300 blocks — the discovery figure is an optimistic ceiling, since
-the tracked region set still costs something to update per edit). Treated as a
-follow-up, not part of v1: skipping discovery means trusting the tracked set
-rather than re-deriving it from the tree, a larger correctness commitment.
+tokenize and is also recomputed every keystroke. The headline ~−60% projection
+above assumed the region *set* could be cached and reused across edits. **That
+framing is rejected.** `collect_all_injections` is the structural-change
+detector — it is what notices that *this* keystroke added, removed, or split a
+fenced block. Reusing a tracked set across an edit means either re-deriving it
+from the new tree (no saving) or trusting an incrementally-maintained set without
+re-querying (a categorically deeper correctness commitment than the token half,
+which never had to answer "what regions exist" — it took the freshly discovered
+set as given and only reused per-region *tokens*). Reinforcing the point: the
+regions expensive to rebuild — blockquote-style prefixes whose `included_ranges`
+need a real `compute_included_ranges` node-walk — are exactly the ones the v1
+predicate already excludes from caching, so for *eligible* regions the per-region
+context-building is already cheap and only the query-match loop is worth eliding.
+
+What is sound is a narrower mechanism: **don't run discovery twice on the same
+tree.** An edit already pays the injection query *twice* — once off-ingress in
+`populate_injections` (`src/lsp/cache.rs`) during the reparse, and again,
+independently, in the `semanticTokens` request
+(`collect_injection_contexts_sync`). The semantic request can instead *reuse
+what `populate_injections` already discovered*, gated so it only ever reuses
+discovery proven to be on the **same text** it is about to tokenize — which
+sidesteps the structural-change problem entirely (the query did run for this
+edit; just once).
+
+**Currency (verified).** In the reparse loop the order is set-tree →
+`populate_injections` → `advance_watermark` / `mark_parse_finished`
+(`coordinator/parse.rs`), and the semantic handler's settle waits on the parse
+watermark + parse-completion before snapshotting the tree
+(`text_document/semantic_tokens.rs`) — both raised *after* `populate_injections`.
+So in the common debounced case the populated discovery corresponds to the tree
+the request snapshots.
+
+**Mechanism.**
+
+- `populate_injections` builds the owned per-region discovery outputs it already
+  has the tree for — for each region: `resolved_lang`, `included_ranges` (owned
+  `Vec<Range>`), `prefix_byte_widths`, the `combined` flag and grouping, the
+  content byte-range (to re-slice `content_text` later), `host_start_byte`, the
+  `region_cache` identity (`region_id` + `validity_hash` + `line_start` +
+  `eligible`, minted exactly as the token half does), and the host
+  exclusion-ranges — and stores them in a new per-`uri` `DiscoveredInjectionCache`
+  **tagged with the content hash** of the text it discovered over.
+- The `semanticTokens` path, before calling `collect_injection_contexts_sync`,
+  looks up the cache for `uri` and compares the stored content hash against
+  `fnv1a(snapshotted_text)`. **Match** → rebuild the `InjectionContext`s from the
+  owned data (re-slice `content_text` from the current text, look up
+  `highlight_query` by `resolved_lang`) and skip both the query-match loop *and*
+  the per-region `get_or_create`. **Miss** (populate hasn't caught up, or this is
+  the on-demand-parse fallback path that deliberately never runs
+  `populate_injections`) → discover inline as today; never call
+  `populate_injections` off the reader path.
+
+**Why this is the same safety philosophy as the rest of this ADR.** The content-
+hash gate (keyed on the hash of the *snapshotted* text + settings generation, the
+same discipline as #530's `cache_key`) is the `cache_key` idea applied to
+discovery: reuse is only ever served for discovery computed on byte-identical text
+under unchanged settings, so a structural change (added / removed / moved fence)
+changes the hash, misses, and re-discovers. There is no "trust a stale tracked
+set" — the deeper commitment the naïve framing required is never taken on.
+
+**Magnitude (measured).** The saving is *not* a full discovery+context-build —
+the per-region context-build (`C`: `compute_included_ranges` node-walks, prefix
+widths, combined grouping) is built only in the semantic path today, so the lever
+*relocates* `C` into `populate_injections` rather than deduplicating it. What is
+genuinely deduplicated is the injection query-match loop (`Q` =
+`collect_all_injections`), which runs twice per edit today. A release
+microbenchmark (markdown, eligible column-0 lua fences) shows `Q` *dominates* the
+discovery bucket, because eligible fences have a trivial `C`:
+
+| blocks | `Q` (query match) | `Q`+`C` (full discovery) | `Q`/(`Q`+`C`) |
+|---|---|---|---|
+| 150 | 1.18 ms | 1.55 ms | 76% |
+| 300 | 2.41 ms | 2.73 ms | 88% |
+
+So the per-edit total-CPU saving ≈ `Q` ≈ 1.2 ms at 150 blocks — comparable to the
+shipped per-region-tokenize saving (1.66 ms), and combined with it reaches ≈ −58%
+of the per-keystroke budget, confirming this section's original ~−60% projection
+in *magnitude* (the projection mis-attributed the cost to the whole bucket, but
+`Q` carries it). The relocated `C` (~0.3 ms) makes the off-ingress path only
+marginally heavier. Per-*request* latency improves by `Q` (if the request blocks
+on populate's watermark) up to `Q`+`C` (if populate finished during the debounce
+gap); which regime dominates is timing-dependent and shifts as parsing moves
+off-ingress, so the stable, defensible figure is the ~`Q` total-CPU saving.
+
+**Open correctness surface (for the design review):** (1) the owned
+`included_ranges` are byte/point data computed on the populate tree — valid for
+the semantic path *only* under the content-hash match, which is the whole point
+of the gate; (2) `highlight_query`/registry must be looked up fresh at reuse
+(don't persist the `Arc<Query>` across a possible reload — the settings
+generation already keys the token cache, but the discovery cache must not serve
+contexts built under an old query, so the generation has to gate the discovery
+cache too); (3) combined groups are stored whole; (4) gated by the same region
+count as the token half and measured for no regression, since `populate_injections`
+now does strictly more work per reparse even for edits with no following
+`semanticTokens` request.
 
 ## Considered Options
 
