@@ -130,28 +130,38 @@ These three conditions are **language-agnostic** — they turn on the region's
 coordinate geometry and injection mode, not on which language is injected. A
 fenced code block that starts at column 0 qualifies; a region that interleaves
 host bytes per row (blockquote-style, line-continuation markers, etc.) does not
-— the predicate self-selects regardless of language. For a qualifying region,
-re-anchoring after any content-preserving edit is a single additive `line += Δ`,
-and a same-line-before edit is impossible because the content starts at column 0
-on its own line.
-
-Implementation note: these facts (start column, per-row prefix widths,
-combined-ness) live today on the transient `InjectionContext` that tokenization
-builds, not on the persisted `CacheableInjectionRegion`, and `injection.combined`
-is a query property rather than range geometry. v1 must therefore evaluate
-eligibility from the injection context tokenization actually uses and carry it
-alongside the cached entry — not infer it from `CacheableInjectionRegion`
-metadata alone.
+— the predicate self-selects regardless of language.
 
 **v1 scope: cache only regions satisfying the predicate; recompute the rest.**
-This eliminates the row-0 / prefix re-anchoring correctness surface entirely
-while covering the common "many fenced code blocks" case the measurements
-target. For the qualifying set, region-local and host-absolute coordinates
-differ only by an additive line constant, so v1 can store the host-absolute
-tokens exactly as emitted and reuse them with `line += Δ` — which equals the
-region-local design of Decision step 3 for this set. True region-local storage
-(with the column rebase run on read) is the later, broader-coverage version that
-extends the cache to non-qualifying regions; it is not required to land the win.
+v1 stores **region-local `RawToken`s** (per Decision step 3) keyed by
+`(uri, region_id)` + `content_hash`. On a hit it re-anchors to the region's
+*current* host position: `host_line = region.line_range.start + token.row`, and
+`host_col = token.col` — the row-0 `start_column` term is 0 for every qualifying
+region, so no column rebase is needed. This reads only the current region's
+already-persisted `line_range.start` / `start_column` from
+`CacheableInjectionRegion`: no stored baseline, no delta-decode. The row-0 /
+prefix re-anchoring correctness surface is eliminated by construction, and a
+same-line-before edit is impossible because the content starts at column 0 on
+its own line. Carrying the column rebase to non-qualifying regions is the later,
+broader-coverage version; it is not required to land the win.
+
+Two implementation obligations follow, neither inferable from
+`CacheableInjectionRegion` alone:
+
+- **Evaluate eligibility on the *current* injection context, at read as well as
+  write.** `start_column` is on `CacheableInjectionRegion`, but
+  `prefix_byte_widths` and combined-ness live on the transient `InjectionContext`
+  that tokenization builds (and `injection.combined` is a query property, not
+  range geometry). Re-checking at read is what makes `content_hash` sufficient:
+  a host-tree restructure that changes a region's prefix geometry without
+  changing its content bytes (e.g. a fenced block gaining a `block_continuation`)
+  flips it to ineligible, forcing a recompute rather than a stale hit.
+- **Source `region_id` from the freshly parsed tree, not the cached
+  `InjectionMap`.** `InjectionContext` carries no `region_id` today, so v1 must
+  either add one or resolve it per request from the fresh tree (via `NodeTracker`
+  / `InjectionMap` by byte range). Using the fresh tree also closes the
+  stale-`InjectionMap` window between `invalidate_for_edits` and the off-ingress
+  `populate_injections`.
 
 ### Companion lever: injection discovery
 
@@ -227,10 +237,13 @@ paths; an audit surfaced four the original design did not address:
    `combined` for HTML anyway.
 2. **Config / query reload (showstopper).** `bump_semantic_token_generation`
    (PR #530) clears the whole-doc cache but never touches `InjectionTokenCache`,
-   which has no `clear()` and no generation in its key. A query/settings reload
-   with unchanged text would serve tokens computed under the *old* highlight
-   query. **Mitigation: clear the injection cache in
-   `bump_semantic_token_generation`, or fold the generation into its validity.**
+   which has no generation in its key. A query/settings reload with unchanged
+   text would serve tokens computed under the *old* highlight query.
+   **Mitigation: fold the settings generation into the entry's validity (the
+   same fix PR #530 applied to the whole-doc cache) — implementable with no new
+   API. Clearing the injection cache on generation bump is the alternative, but
+   needs a new global clear: today `InjectionTokenCache` exposes only per-region
+   `remove` and per-document `clear_document`.**
 3. **Parser-load race (guard).** `process_injection_sync` returns empty tokens
    when a region's parser is not yet loaded — indistinguishable from a genuinely
    empty region. **Mitigation: never store on the parser-missing branch.**
@@ -283,8 +296,8 @@ and never called from production. The whole-document layer (Option C) shipped
 separately as PR #530.
 
 This ADR records the intended design for the per-region reuse half — scoped to
-the language-agnostic translation predicate, gated on the two showstopper
-mitigations (exclude `injection.combined`; clear the injection cache on
-generation bump) — plus the injection-discovery companion as a follow-up. Until
-it lands, the cache is maintained-but-unread and the typing path recomputes in
-full.
+the language-agnostic translation predicate (re-evaluated at read time), gated on
+the two showstopper mitigations (exclude `injection.combined`; fold the settings
+generation into injection-cache validity) — plus the injection-discovery
+companion as a follow-up. Until it lands, the cache is maintained-but-unread and
+the typing path recomputes in full.
