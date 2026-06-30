@@ -609,10 +609,24 @@ impl Kakehashi {
             }
 
             // Unchanged document: reuse the cached full tokens instead of
-            // re-tokenizing. The delta diff below still runs against them — so a
-            // matching baseline yields the same no-op delta — but we skip the
-            // expensive tokenization. Cleared wholesale on a settings reload.
+            // re-tokenizing. No `.await` runs between the staleness check above and
+            // here, so the cached tokens stay consistent with it. Cleared wholesale
+            // on a settings reload.
             if let Some(cached) = self.cache.get_current_tokens(&uri, cache_key) {
+                // Fast path: the client's baseline already IS these cached tokens,
+                // so the delta is necessarily empty — return it directly and skip
+                // the `previous_tokens` clone + O(N) `calculate_delta` below.
+                if cached.result_id.as_deref() == Some(previous_result_id.as_str()) {
+                    self.cache.finish_request(&uri, request_id);
+                    return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                        tower_lsp_server::ls_types::SemanticTokensDelta {
+                            result_id: Some(previous_result_id),
+                            edits: vec![],
+                        },
+                    )));
+                }
+                // Baseline differs: fall through to diff the cached tokens against
+                // the client's `previous_result_id` (still skips re-tokenization).
                 (Some(SemanticTokensResult::Tokens(cached)), text)
             } else {
                 // Get capture mappings for token type resolution
@@ -1319,6 +1333,75 @@ mod tests {
             "an unchanged document should reuse cached tokens (stable result_id), \
              not recompute with a fresh id"
         );
+    }
+
+    /// A delta request on an unchanged document whose baseline matches the cached
+    /// tokens returns an empty delta with the same `result_id` — the fast path that
+    /// skips the `previous_tokens` clone and the O(N) diff entirely.
+    #[tokio::test]
+    async fn semantic_tokens_delta_returns_empty_delta_for_unchanged_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///delta_noop.lua").expect("should construct test uri");
+
+        server.documents.insert(
+            uri.clone(),
+            "local x = 1".to_string(),
+            Some("lua".to_string()),
+            None,
+        );
+
+        let load_result = server.language.ensure_language_loaded("lua");
+        if !load_result.success || server.language.highlight_query("lua").is_none() {
+            eprintln!("Skipping: lua language parser or highlight query not available");
+            return;
+        }
+
+        // Full request establishes the baseline result_id.
+        let full = server
+            .semantic_tokens_full_impl(SemanticTokensParams {
+                text_document: TextDocumentIdentifier {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("full request should succeed")
+            .expect("should return tokens");
+        let baseline_id = match full {
+            SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
+            _ => panic!("expected Tokens variant"),
+        };
+
+        // Delta on the UNCHANGED document with the matching baseline: empty delta,
+        // same result_id (the fast path).
+        let delta = server
+            .semantic_tokens_full_delta_impl(SemanticTokensDeltaParams {
+                text_document: TextDocumentIdentifier {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+                },
+                previous_result_id: baseline_id.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("delta request should succeed")
+            .expect("should return a delta");
+        match delta {
+            SemanticTokensFullDeltaResult::TokensDelta(d) => {
+                assert_eq!(
+                    d.result_id,
+                    Some(baseline_id),
+                    "no-op delta should reuse the baseline result_id"
+                );
+                assert!(
+                    d.edits.is_empty(),
+                    "an unchanged document should yield an empty delta"
+                );
+            }
+            other => panic!("expected an empty TokensDelta, got {:?}", other),
+        }
     }
 
     /// Test that semantic tokens full request returns RequestCancelled (-32800) when cancelled.
