@@ -186,7 +186,10 @@ To keep resolvers in path-space and avoid a URI module:
 - The resolver's **string workspace return is interpreted as a filesystem
   path**; kakehashi converts it to a `file://` `WorkspaceFolder` URI at the
   boundary — the same conversion marker resolution already performs. This
-  pins down the otherwise-ambiguous "folder" string in workspace-resolver.
+  pins down the otherwise-ambiguous "folder" string in workspace-resolver. As a
+  Lua→host path input it obeys the **same decoding rule** below as `path.*`/`fs.*`
+  arguments: on Windows an invalid-UTF-8 return raises a boundary error and
+  triggers §6 fail-closed.
 
 Percent-decoding and `file://` handling thus happen once, in Rust, not in every
 resolver.
@@ -214,9 +217,10 @@ Failure shape depends on **direction**, because the declared return types differ
   surfaces this failure, because workspace-resolver §2 **skips the resolver
   entirely** for a document whose path is not representable. So inside a running
   resolver `document_info.path` is always valid.
-- **Lua → host (a Lua byte-string path argument).** *Every* path consumer —
-  all `path.*` and all `fs.*` — must decode the argument into an OS `Path` to
-  apply `std::path` semantics, so they share one validation rule: on Unix any
+- **Lua → host (a Lua byte-string path argument).** *Every* path that crosses
+  back to the host — all `path.*` and `fs.*` arguments **and the resolver's
+  string workspace return** — must decode into an OS `Path` to apply `std::path`
+  semantics, so they share one validation rule: on Unix any
   byte string is a valid path (infallible); on **Windows** the argument must be
   valid UTF-8, and a fabricated non-UTF-8 string raises a **Lua error**. The
   error is out-of-band, so declared return types are unchanged — `path.*` stay
