@@ -234,17 +234,25 @@ preference order:
   part of the document's parse result so the semantic path reads `(tree, discovery)`
   from one atomic snapshot — physically one unit, **no gate to get wrong**: a
   snapshot carries discovery (reuse) or does not (the on-demand-parse fallback tree
-  → discover inline). The realizability constraint is the current ordering:
-  `populate_injections` runs *after* the tree CAS
-  (`set_parse_result_if_text_and_incarnation_unchanged`, `coordinator/parse.rs`),
-  and the full build calls `tracker.get_or_create`, which must **not** run for a
-  parse that loses the CAS (it would mint ids from stale-tree coordinates against
-  the shared `NodeTracker` — the side effect today's "build only after the CAS
-  lands" ordering avoids). So the publication scheme is: **publish the tree first;
-  build discovery; then attach it via a second CAS that no-ops unless the tree /
-  parse epoch is still the one just published.** Discovery is therefore briefly
-  *absent* between the two CASes (a request in that window re-discovers inline),
-  but never mismatched. `tracker.get_or_create` runs only on the winning parse.
+  → discover inline). Two realizability constraints, given `populate_injections`
+  runs *after* the tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`,
+  `coordinator/parse.rs`):
+  - **The off-ingress build must be `NodeTracker`-side-effect-free.** It must *not*
+    call `tracker.get_or_create` while building, because a *subsequent* edit can
+    replace the tree and adjust the tracker mid-build — a second CAS that rejects
+    *attachment* does not undo `get_or_create`'s mutation of the now-current
+    tracker. So the stored discovery holds **no `region_id`**; it holds each
+    region's `(start_byte, end_byte, kind)` and the rest of the owned context.
+    `region_id` is minted by the *reader* at reuse, via the same
+    `tracker.get_or_create` the miss-path already calls, under the semantic
+    handler's settle where the tree is stable. `get_or_create` was never the
+    expensive part (`Q` is), so re-minting on reuse costs essentially nothing and
+    removes the off-ingress mutation entirely.
+  - **Publication scheme:** publish the tree first; build discovery
+    (side-effect-free); then attach it via a *second* CAS that no-ops unless the
+    tree / parse epoch is still the one just published. Discovery is therefore
+    briefly *absent* between the two CASes (a request in that window re-discovers
+    inline), but never mismatched.
 - **Alternative — a parse epoch.** If coupling into the parse result is too
   invasive, key a separate `DiscoveredInjectionCache` on a **fresh monotonic
   per-parse epoch** — *not* `incarnation` (preserved across edits, so it cannot
@@ -279,10 +287,11 @@ is load-bearing.
   `collect_injection_contexts_sync`: `collect_all_injections` (the `Q` query) runs
   once and feeds a `build_contexts_from_regions` step that produces, per region,
   `resolved_lang`, `included_ranges` (owned `Vec<Range>`), `prefix_byte_widths`,
-  the `combined` flag/grouping, the content byte-range, `host_start_byte`, the
-  `region_cache` identity (`region_id` + `validity_hash` + `line_start` +
-  `eligible`, minted exactly as the token half does), the host exclusion-ranges,
-  **and a `discovery_complete` flag**. This is the load-bearing refactor: it lets
+  the `combined` flag/grouping, the content byte-range, `host_start_byte`,
+  `(start_byte, end_byte, kind)` for id minting, `validity_hash` / `line_start` /
+  `eligible`, the host exclusion-ranges, **and a `discovery_complete` flag** —
+  everything *except* `region_id`, which is `NodeTracker`-side-effecting and so is
+  left to the reader (see Preferred). This is the load-bearing refactor: it lets
   `populate_injections` produce *both* the existing `CacheableInjectionRegion`
   (`R`) *and* the owned discovery — from one `Q` — rather than calling
   `collect_injection_contexts_sync` (which would run `Q` a second time and defeat
@@ -293,8 +302,9 @@ is load-bearing.
 - The `semanticTokens` path, before discovering, takes the discovery carried by
   its tree snapshot (or epoch-matched entry). **Present** → rebuild the
   `InjectionContext`s from the owned data (re-slice `content_text` from the
-  current text, look up `highlight_query` fresh by `resolved_lang`) and skip both
-  the `Q` query-match loop *and* the per-region `get_or_create`. **Absent** →
+  current text, look up `highlight_query` fresh by `resolved_lang`, and mint each
+  `region_id` via `tracker.get_or_create` from the stored `(start, end, kind)`),
+  skipping the `Q` query-match loop — the part that carries the cost. **Absent** →
   discover inline via the shared stage as today; never call `populate_injections`
   off the reader path.
 
@@ -387,10 +397,14 @@ must be one atomic config epoch.** Registry/query mutation currently *precedes* 
 snapshot-before-build / recheck-after is **not** sufficient on its own: a build can
 observe new (or mixed) registry state while both the before- and after-reads still
 return the *old* generation, tagging stale-query discovery as current. Closing this
-requires making the registry swap and the generation bump a single atomic
-configuration epoch — bump-*before*-mutation, an odd/even seqlock around the swap,
-or a config lock — so that any build observing new registry state necessarily reads
-a new generation. (This ordering also tightens the shipped token half, whose
+requires making registry state and generation one *indivisible* configuration
+epoch — an **atomic immutable registry swap** carrying its generation (a single
+pointer/`Arc` swap, so no build ever observes a half-mutated registry), or a
+seqlock / config lock that **rejects any snapshot taken mid-mutation**. A bare
+"bump before mutation" is *not* sufficient on its own: a build can still snapshot
+the already-bumped generation partway through a multi-step registry mutation,
+observe mixed state, recheck the same generation, and store it. (This ordering also
+tightens the shipped token half, whose
 `generation` validity rests on the same assumption; the discovery lever makes it
 load-bearing because populate resolves queries and builds contexts off-ingress.)
 
