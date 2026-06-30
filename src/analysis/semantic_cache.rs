@@ -208,21 +208,33 @@ impl Default for InjectionMap {
 /// hot path can reuse them across edits that don't touch the region, re-anchoring
 /// them to the region's current host line at read time.
 ///
-/// The key carries the region's validity inline: `(uri, region_id, validity_hash,
-/// generation)`. `validity_hash` folds the region's content hash with its
-/// resolved injection language (a content edit OR a language change at the same
-/// position misses), and `generation` is the settings/query generation (a config
-/// reload changes it, so old-query tokens stop matching) — the same race-safe
-/// fold `SemanticTokenCache` applies to its own key, rather than a bare
-/// `clear()`. A lookup is therefore an exact key match; no separate read-time
-/// validity check is needed.
+/// The key is just `(uri, region_id)`; the validity lives in the *value* — the
+/// same shape `SemanticTokenCache` uses for its `cache_key`. `validity_hash`
+/// folds the region's content hash with its resolved injection language (a
+/// content edit OR a language change at the same position misses on read), and
+/// `generation` is the settings/query generation (a config reload changes it, so
+/// old-query tokens stop matching) — the race-safe fold, not a bare `clear()`.
+/// Keeping these out of the *key* means each region holds exactly one entry
+/// (`store` overwrites), so `remove` is an O(1) point delete instead of a full
+/// scan and stale validity-siblings can't accumulate.
 ///
-/// `supports_multiline` is deliberately *not* part of the key: it changes
+/// `supports_multiline` is deliberately *not* in the validity: it changes
 /// multiline-token emission, but it comes from the client capabilities snapshot
 /// (a `OnceLock` set once at `initialize()`), so it is session-constant and
 /// cannot flip mid-session — no entry can outlive a change to it.
 pub(crate) struct InjectionTokenCache {
-    cache: DashMap<(Url, String, u64, u64), Vec<RawToken>>,
+    cache: DashMap<(Url, String), CachedRegionTokens>,
+}
+
+/// A region's cached tokens with the validity they were computed under.
+#[derive(Clone)]
+struct CachedRegionTokens {
+    /// Content hash folded with the resolved injection language.
+    validity_hash: u64,
+    /// Settings/query generation in effect when these were computed.
+    generation: u64,
+    /// Region-local pre-finalize tokens.
+    tokens: Vec<RawToken>,
 }
 
 impl InjectionTokenCache {
@@ -233,8 +245,10 @@ impl InjectionTokenCache {
         }
     }
 
-    /// Store region-local tokens for an injection region under its validity key
-    /// (`validity_hash` = content ⊕ resolved language, plus settings `generation`).
+    /// Store region-local tokens for an injection region, tagged with the
+    /// validity (`validity_hash` = content ⊕ resolved language, plus settings
+    /// `generation`) they were computed under. Overwrites any prior entry for the
+    /// region, so a region never holds more than one (possibly stale) entry.
     pub(crate) fn store(
         &self,
         uri: &Url,
@@ -244,18 +258,19 @@ impl InjectionTokenCache {
         tokens: Vec<RawToken>,
     ) {
         self.cache.insert(
-            (
-                uri.clone(),
-                region_id.to_string(),
+            (uri.clone(), region_id.to_string()),
+            CachedRegionTokens {
                 validity_hash,
                 generation,
-            ),
-            tokens,
+                tokens,
+            },
         );
     }
 
-    /// Retrieve region-local tokens iff an entry exists for this exact validity
-    /// key — same region, same content + resolved language, same settings generation.
+    /// Retrieve region-local tokens iff the stored entry was computed under this
+    /// exact validity — same content + resolved language, same settings
+    /// generation. A mismatch (content/language edit or config reload) reads as a
+    /// miss so the region is recomputed.
     pub(crate) fn get(
         &self,
         uri: &Url,
@@ -265,13 +280,9 @@ impl InjectionTokenCache {
     ) -> Option<Vec<RawToken>> {
         let result = self
             .cache
-            .get(&(
-                uri.clone(),
-                region_id.to_string(),
-                validity_hash,
-                generation,
-            ))
-            .map(|entry| entry.clone());
+            .get(&(uri.clone(), region_id.to_string()))
+            .filter(|entry| entry.validity_hash == validity_hash && entry.generation == generation)
+            .map(|entry| entry.tokens.clone());
 
         if result.is_some() {
             log::debug!(
@@ -292,13 +303,11 @@ impl InjectionTokenCache {
         result
     }
 
-    /// Remove every cached entry for an injection region, across all validity
-    /// hashes / generations. `validity_hash` and `generation` are part of the key,
-    /// so a single `(uri, region_id)` can have stale siblings; eviction
-    /// (edit-overlap, content/language change, region removed) must drop them all.
+    /// Remove an injection region's cached entry — an O(1) point delete, since a
+    /// region holds at most one entry. Called on eviction (edit-overlap,
+    /// content/language change, region removed).
     pub(crate) fn remove(&self, uri: &Url, region_id: &str) {
-        self.cache
-            .retain(|key, _| !(&key.0 == uri && key.1 == region_id));
+        self.cache.remove(&(uri.clone(), region_id.to_string()));
     }
 
     /// Remove all cached tokens for a document (all its injection regions).
@@ -315,15 +324,21 @@ impl InjectionTokenCache {
         self.cache.clear();
     }
 
-    /// Validity keys `(region_id, validity_hash, generation)` currently stored for
-    /// a document — lets a test confirm what the hot path persisted and overwrite
-    /// a specific entry to prove the reuse path reads it.
+    /// `(region_id, validity_hash, generation)` currently stored for a document —
+    /// lets a test confirm what the hot path persisted and overwrite a specific
+    /// entry to prove the reuse path reads it.
     #[cfg(test)]
     pub(crate) fn test_keys(&self, uri: &Url) -> Vec<(String, u64, u64)> {
         self.cache
             .iter()
             .filter(|e| &e.key().0 == uri)
-            .map(|e| (e.key().1.clone(), e.key().2, e.key().3))
+            .map(|e| {
+                (
+                    e.key().1.clone(),
+                    e.value().validity_hash,
+                    e.value().generation,
+                )
+            })
             .collect()
     }
 }
@@ -637,21 +652,24 @@ mod tests {
     }
 
     #[test]
-    fn injection_token_cache_remove_drops_all_validity_siblings() {
+    fn injection_token_cache_store_overwrites_and_remove_is_point_delete() {
         let cache = InjectionTokenCache::new();
         let uri = Url::parse("file:///t.md").unwrap();
 
-        // Two entries for the same region under different content hashes (e.g. a
-        // stale pre-edit entry that overlap-eviction never reached, plus a fresh
-        // one). `remove` must drop both.
+        // Validity lives in the value, so a second store for the same region
+        // OVERWRITES the first — a region never accumulates stale siblings, which
+        // is what lets `remove` be an O(1) point delete.
         cache.store(&uri, "r", 0x1111, 0, vec![raw_token(0, 0, 4)]);
         cache.store(&uri, "r", 0x2222, 0, vec![raw_token(0, 0, 5)]);
-        assert!(cache.get(&uri, "r", 0x1111, 0).is_some());
-        assert!(cache.get(&uri, "r", 0x2222, 0).is_some());
+        assert!(
+            cache.get(&uri, "r", 0x1111, 0).is_none(),
+            "the overwritten (old-validity) entry must be gone"
+        );
+        let current = cache.get(&uri, "r", 0x2222, 0).expect("latest entry hits");
+        assert_eq!(current[0].length, 5);
 
+        // remove drops that single entry.
         cache.remove(&uri, "r");
-
-        assert!(cache.get(&uri, "r", 0x1111, 0).is_none());
         assert!(cache.get(&uri, "r", 0x2222, 0).is_none());
     }
 
