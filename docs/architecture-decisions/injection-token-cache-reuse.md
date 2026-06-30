@@ -371,11 +371,10 @@ approaches `Q`+`C` when populate finished during the debounce gap (the request
 reuses without waiting) and shrinks toward zero when the request blocks on an
 as-yet-unfinished populate (it waits out the work it would otherwise have done
 itself). Which regime dominates shifts as parsing moves off-ingress, so the
-stable, defensible figure is the ~`Q` total-CPU saving. **The no-regression gate
-must
-therefore measure a prefixed-region-heavy document too**, not only eligible
-fences, since that is where the relocated `C` could lengthen the off-ingress
-reparse the semantic settle waits on.
+stable, defensible figure is the ~`Q` total-CPU saving. **No-regression gate:**
+it must measure a prefixed-region-heavy document too, not only eligible fences,
+since that is where the relocated `C` could lengthen the off-ingress reparse the
+semantic settle waits on.
 
 **Open correctness surface (for the design review):** (1) the owned
 `included_ranges` are byte/point data computed on the populate tree — valid for
