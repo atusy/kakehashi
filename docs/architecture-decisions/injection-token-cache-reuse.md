@@ -141,9 +141,9 @@ self-selects regardless of which language is injected.
 v1 stores **region-local `RawToken`s** (per Decision step 3) keyed by
 `(uri, region_id)`, validated by `content_hash` + settings generation. On a hit
 it re-anchors to the region's *current* host position:
-`host_line = region.line_range.start + token.line`, and `host_col = token.col` —
-the row-0 `start_column` term is 0 for every qualifying region, so no column
-rebase is needed. This reads only the current region's
+`host_line = region.line_range.start + token.line`, and
+`host_col = token.column` — the row-0 `start_column` term is 0 for every
+qualifying region, so no column rebase is needed. This reads only the current region's
 already-persisted `line_range.start` / `start_column` from
 `CacheableInjectionRegion`: no stored baseline, no delta-decode. The row-0 /
 prefix re-anchoring correctness surface is eliminated by construction, and a
@@ -168,7 +168,11 @@ Two implementation obligations follow, neither inferable from
   cached `InjectionMap`.** `InjectionContext` carries no `region_id` today, so v1
   resolves it per request — e.g. `tracker.get_or_create(uri, host_start_byte,
   end_byte, kind)` at the boundary between `collect_injection_contexts_sync` and
-  the parallel fan-out (no new field on `InjectionContext` needed). This is safe
+  the parallel fan-out (no new field on `InjectionContext` needed). This threads
+  two new inputs into `collect_injection_tokens_parallel` and
+  `handle_semantic_tokens_full`, which take neither today: the document `uri` and
+  the `NodeTracker` (it lives on `CacheCoordinator`, not the `LanguageCoordinator`
+  they currently receive). This is safe
   because `apply_input_edits` updates the `NodeTracker` synchronously under the
   edit lock the moment an edit lands — *before* the off-ingress reparse — so the
   ULIDs are consistent even while the cached `InjectionMap` is still pre-edit
