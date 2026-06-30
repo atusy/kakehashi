@@ -488,11 +488,24 @@ impl LanguageServerPool {
             if resolved.as_ref() == handle.current_settings().as_deref() {
                 continue;
             }
+            // Always advance the cell so a later pull / the post-`initialized`
+            // push (path a) reflects the change, even for a connection we don't
+            // notify yet.
             handle.store_settings(resolved.clone().map(Arc::new));
-            handle.send_notification(build_did_change_configuration_notification(
-                resolved.unwrap_or(serde_json::Value::Null),
-            ));
-            pushed += 1;
+            // Only notify a Ready connection: sending
+            // `workspace/didChangeConfiguration` to a still-initializing server
+            // would precede its `initialized` and violate LSP ordering. An
+            // Initializing connection instead gets its (now-updated) cell pushed
+            // by path (a) once the handshake completes. Count only a successful
+            // enqueue, so the returned count never reports a dropped push.
+            if handle.state() == ConnectionState::Ready {
+                let result = handle.send_notification(build_did_change_configuration_notification(
+                    resolved.unwrap_or(serde_json::Value::Null),
+                ));
+                if result == NotificationSendResult::Queued {
+                    pushed += 1;
+                }
+            }
         }
         pushed
     }
@@ -1526,21 +1539,23 @@ impl LanguageServerPool {
                         server_name_for_log
                     );
                     handle_for_handshake.set_server_capabilities(capabilities);
-                    handle_for_handshake.set_state(ConnectionState::Ready);
-                    // Path a: push this server's settings now that it is
-                    // initialized, so push-model servers are configured even
-                    // before they pull (downstream-settings-propagation). Read
-                    // the *live* cell, not the spawn-time value: a path-c
-                    // re-propagation during the handshake may have already
-                    // advanced it, and the cell is exactly what (b) serves — so
-                    // this pushes what a pull would return, never a stale
-                    // snapshot. Best-effort: a dropped notification self-heals on
-                    // the next pull.
+                    // Path a: push this server's settings now that `initialized`
+                    // has been sent, so push-model servers are configured even
+                    // before they pull (downstream-settings-propagation). Queue it
+                    // *before* flipping to Ready: a waiter unblocked by the Ready
+                    // transition may enqueue `didOpen`, and the single-writer FIFO
+                    // must carry the settings ahead of it so the server never
+                    // processes a document under default config. Read the *live*
+                    // cell, not the spawn-time value, so a path-c re-propagation
+                    // that landed during the handshake is reflected and the push
+                    // agrees with what (b) would answer. Best-effort: a dropped
+                    // notification self-heals on the next pull.
                     if let Some(settings) = handle_for_handshake.current_settings() {
                         handle_for_handshake.send_notification(
                             build_did_change_configuration_notification((*settings).clone()),
                         );
                     }
+                    handle_for_handshake.set_state(ConnectionState::Ready);
                     Ok(())
                 }
                 Ok(Err(e)) => {
@@ -5190,6 +5205,38 @@ mod tests {
             })
             .await;
         assert_eq!(pushed_again, 0, "an unchanged reload pushes nothing");
+    }
+
+    /// Path c does NOT notify a still-initializing connection (that would
+    /// precede its `initialized` and break LSP ordering), but it DOES advance the
+    /// cell so the post-`initialized` push (path a) carries the latest value.
+    #[tokio::test]
+    async fn propagate_settings_updates_but_does_not_notify_initializing_connection() {
+        use serde_json::json;
+
+        let pool = LanguageServerPool::new();
+        let initializing = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("rust-analyzer"),
+        )
+        .await;
+        pool.connections().await.insert(
+            ConnectionKey::for_server("rust-analyzer"),
+            Arc::clone(&initializing),
+        );
+
+        let value = json!({ "rust-analyzer": { "cargo": { "features": "all" } } });
+        let value_for_resolve = value.clone();
+        let pushed = pool
+            .propagate_settings(move |_| Some(value_for_resolve.clone()))
+            .await;
+
+        assert_eq!(pushed, 0, "an initializing connection is not notified");
+        assert_eq!(
+            initializing.current_settings().as_deref(),
+            Some(&value),
+            "but its cell is advanced so path (a) pushes the latest value",
+        );
     }
 
     /// Path c with no live connections (e.g. initialize-time apply) is a clean

@@ -109,11 +109,19 @@ that every reload already funnels through — `didChangeConfiguration`, the
 auto-install reload, and initialize. For each **live** downstream connection
 kakehashi re-resolves that server's `settings` (through the same wildcard merge
 used at spawn) and compares it against the connection's current settings cell;
-on a difference it re-stores the cell and sends
-`workspace/didChangeConfiguration { settings }` (pull-model servers then
+on a difference it re-stores the cell and, **for a `Ready` connection only**,
+sends `workspace/didChangeConfiguration { settings }` (pull-model servers then
 re-request and are answered by (b)). The cell is updated **before** the push so
 a pull-model re-pull never races onto the stale value. Unchanged servers get
 nothing, so a global reload does not storm every connection.
+
+A still-initializing connection is **not** notified — a
+`workspace/didChangeConfiguration` before its `initialized` would violate LSP
+ordering. Its cell is still advanced, and the post-`initialized` push (a), which
+reads the live cell, delivers the latest value once the handshake completes.
+That push is queued *before* the connection flips to `Ready`, so the
+single-writer FIFO carries it ahead of any `didOpen` a waiter enqueues on
+observing `Ready` — the server never processes a document under default config.
 
 The per-connection settings cell *is* the diff baseline: it holds the latest
 resolved value (what (b) serves), updated unconditionally on change with the
@@ -180,7 +188,17 @@ keeps propagation proportional to actual change.
 - A failed push (queue full / channel closed) to a push-model server leaves it
   with stale config until it re-pulls or respawns; the cell still holds the
   current value, so a pull-model server self-heals. Guaranteed push delivery
-  would need a separate retry baseline and is not implemented.
+  would need a separate retry baseline and is not implemented. (The push count
+  (c) returns counts only successfully-enqueued notifications, so a drop is
+  never reported as delivered.)
+- **Accepted narrow race during the handshake window**: path (a) reads the cell
+  then sends; a path-(c) store that lands between that read and send (a few-
+  hundred-ms window, multithreaded runtime) can leave a push-model server one
+  revision stale while the cell — and any pull — already holds the new value.
+  This is the same deferred-epoch-class race accepted elsewhere (e.g. the pull
+  refresh coverage gate); pull-model servers self-heal, and the worst case is
+  bounded staleness, not corruption. Fully closing it would require serializing
+  (a) and (c) on a per-connection lock.
 
 ### Neutral
 
