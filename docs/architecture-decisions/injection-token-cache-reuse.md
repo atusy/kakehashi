@@ -234,25 +234,26 @@ preference order:
   part of the document's parse result so the semantic path reads `(tree, discovery)`
   from one atomic snapshot — physically one unit, **no gate to get wrong**: a
   snapshot carries discovery (reuse) or does not (the on-demand-parse fallback tree
-  → discover inline). Two realizability constraints, given `populate_injections`
-  runs *after* the tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`,
+  → discover inline). Realizability, given `populate_injections` runs *after* the
+  tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`,
   `coordinator/parse.rs`):
-  - **The off-ingress build must be `NodeTracker`-side-effect-free.** It must *not*
-    call `tracker.get_or_create` while building, because a *subsequent* edit can
-    replace the tree and adjust the tracker mid-build — a second CAS that rejects
-    *attachment* does not undo `get_or_create`'s mutation of the now-current
-    tracker. So the stored discovery holds **no `region_id`**; it holds each
-    region's `(start_byte, end_byte, kind)` and the rest of the owned context.
-    `region_id` is minted by the *reader* at reuse, via the same
-    `tracker.get_or_create` the miss-path already calls, under the semantic
-    handler's settle where the tree is stable. `get_or_create` was never the
-    expensive part (`Q` is), so re-minting on reuse costs essentially nothing and
-    removes the off-ingress mutation entirely.
-  - **Publication scheme:** publish the tree first; build discovery
-    (side-effect-free); then attach it via a *second* CAS that no-ops unless the
-    tree / parse epoch is still the one just published. Discovery is therefore
-    briefly *absent* between the two CASes (a request in that window re-discovers
-    inline), but never mismatched.
+  - **No *new* `NodeTracker` mutation.** `populate_injections` *already* calls
+    `tracker.get_or_create` today, to mint the `region_id` on each
+    `CacheableInjectionRegion` it inserts into the `InjectionMap` (which
+    `invalidate_for_edits` needs for token-cache eviction). The discovery build
+    must **reuse that same id** — it is produced by the same shared stage, from the
+    same `Q`, so the lever adds *no* off-ingress `get_or_create` beyond today's.
+    (The pre-existing off-ingress minting, and its interaction with a concurrent
+    subsequent edit, is governed by [lazy-node-identity-tracking] and is neither
+    worsened nor in scope to fix here.) Because reuse is bound to the tree
+    identity, a stored `region_id` is only ever served for the exact tree it was
+    minted on — consistent with the `InjectionMap` / tracker state for that tree;
+    a changed tree misses and the miss-path mints fresh, as today.
+  - **Publication scheme:** publish the tree first; build discovery; then attach it
+    to the parse result via a *second* CAS that no-ops unless the tree / parse
+    epoch is still the one just published. Discovery is therefore briefly *absent*
+    between the two CASes (a request in that window re-discovers inline), but never
+    attached to the wrong tree.
 - **Alternative — a parse epoch.** If coupling into the parse result is too
   invasive, key a separate `DiscoveredInjectionCache` on a **fresh monotonic
   per-parse epoch** — *not* `incarnation` (preserved across edits, so it cannot
@@ -287,13 +288,13 @@ is load-bearing.
   `collect_injection_contexts_sync`: `collect_all_injections` (the `Q` query) runs
   once and feeds a `build_contexts_from_regions` step that produces, per region,
   `resolved_lang`, `included_ranges` (owned `Vec<Range>`), `prefix_byte_widths`,
-  the `combined` flag/grouping, the content byte-range, `host_start_byte`,
-  `(start_byte, end_byte, kind)` for id minting, `validity_hash` / `line_start` /
-  `eligible`, the host exclusion-ranges, **and a `discovery_complete` flag** —
-  everything *except* `region_id`, which is `NodeTracker`-side-effecting and so is
-  left to the reader (see Preferred). This is the load-bearing refactor: it lets
-  `populate_injections` produce *both* the existing `CacheableInjectionRegion`
-  (`R`) *and* the owned discovery — from one `Q` — rather than calling
+  the `combined` flag/grouping, the content byte-range, `host_start_byte`, the
+  `region_cache` identity (`region_id` + `validity_hash` + `line_start` +
+  `eligible`), the host exclusion-ranges, **and a `discovery_complete` flag**. This
+  is the load-bearing refactor: it lets `populate_injections` produce *both* the
+  existing `CacheableInjectionRegion` (`R`) *and* the owned discovery — from one
+  `Q` and one `get_or_create` per region (the `region_id` is shared between `R` and
+  the discovery, so the lever mints no new ids) — rather than calling
   `collect_injection_contexts_sync` (which would run `Q` a second time and defeat
   the whole lever). The semantic miss-path uses the same stage.
 - `populate_injections` runs that stage and stores the owned discovery (coupled to
@@ -302,11 +303,11 @@ is load-bearing.
 - The `semanticTokens` path, before discovering, takes the discovery carried by
   its tree snapshot (or epoch-matched entry). **Present** → rebuild the
   `InjectionContext`s from the owned data (re-slice `content_text` from the
-  current text, look up `highlight_query` fresh by `resolved_lang`, and mint each
-  `region_id` via `tracker.get_or_create` from the stored `(start, end, kind)`),
-  skipping the `Q` query-match loop — the part that carries the cost. **Absent** →
-  discover inline via the shared stage as today; never call `populate_injections`
-  off the reader path.
+  current text, look up `highlight_query` fresh by `resolved_lang`, and use the
+  stored `region_id`), skipping the `Q` query-match loop *and* the reader's own
+  `get_or_create` — the stored id is the one populate already minted for this same
+  tree. **Absent** → discover inline via the shared stage as today; never call
+  `populate_injections` off the reader path.
 
 The reuse is **whole-document, not eligibility-gated**: `collect_all_injections`
 is a single all-or-nothing query over the host tree, so to skip it on a hit
