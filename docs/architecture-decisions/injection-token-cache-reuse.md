@@ -260,9 +260,24 @@ paths; an audit surfaced four the original design did not address:
    injections are discovered as separate `region_id`s but tokenized *jointly*
    (multiple blocks parsed as one document). Editing one block does not change a
    sibling's content hash, so the sibling would serve a hit computed in the
-   *old* joint context. **Mitigation: exclude combined groups from the cache** —
-   the v1 predicate already does, and the vendored Markdown query reserves
-   `combined` for HTML anyway.
+   *old* joint context. **Mitigation (v1): exclude combined groups from the
+   cache** — the v1 predicate already does, and the vendored Markdown query
+   reserves `combined` for HTML anyway.
+
+   *Caching them later (follow-up)* means treating the whole group as one cache
+   unit, which takes three pieces: (a) **one identity** — a composite
+   `injection_id` formed from the members' `region_id`s (e.g. joined with `-`),
+   so a membership change (a block added/removed) changes the id and misses
+   naturally; (b) **a group-wide `content_hash`** over *all* members, so editing
+   any one member invalidates the group — this is the part that actually closes
+   the cross-contamination, since a composite id alone still hits when the member
+   set is unchanged but one member's bytes changed; and (c) **per-member
+   re-anchoring**, because the group spans disjoint host ranges and an edit in
+   the host gap *between* members shifts later members by a different offset than
+   earlier ones — so the trivial single `line += Δ` does not apply. (`region_id`s
+   are minted in the cache layer from byte ranges, not on the semantic combined
+   context, so each member's id is resolved the same way as a single region —
+   see the `NodeTracker` obligation above.)
 2. **Config / query reload (showstopper).** `bump_semantic_token_generation`
    (PR #530) clears the whole-doc cache but never touches `InjectionTokenCache`,
    which has no generation in its key. A query/settings reload with unchanged
