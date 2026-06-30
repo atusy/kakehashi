@@ -217,6 +217,7 @@ impl InstallCoordinator {
             &self.client,
             &self.language,
             &self.settings_manager,
+            &self.cache,
             Some(raw_settings),
             settings,
         )

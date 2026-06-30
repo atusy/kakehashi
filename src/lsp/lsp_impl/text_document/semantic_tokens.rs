@@ -241,6 +241,14 @@ impl Kakehashi {
         // Start tracking this request - supersedes any previous request for this URI
         let request_id = self.cache.start_request(&uri);
 
+        // Snapshot the settings generation NOW, before reading any
+        // settings-dependent tokenization input (language resolution, queries,
+        // capture mappings) below. Folded into the cache key once the text is
+        // available; pinning it here means a settings reload racing this request
+        // leaves our stored tokens on the old generation — invisible to
+        // post-reload requests — so we can't poison the cache (see `cache_key_for`).
+        let token_generation = self.cache.semantic_token_generation();
+
         log::debug!(
             target: "kakehashi::semantic",
             "[SEMANTIC_TOKENS] START uri={} req={}",
@@ -295,6 +303,14 @@ impl Kakehashi {
             })));
         };
 
+        // Read the remaining settings-dependent tokenization inputs HERE — together
+        // with the query above and BEFORE the get_tree_with_wait().await below — so
+        // a settings reload during that await can't split them into an inconsistent
+        // mix (e.g. old query + new capture mappings). All are consistent with the
+        // `token_generation` snapshotted at the top.
+        let capture_mappings = self.language.capture_mappings();
+        let supports_multiline = self.settings_manager.supports_multiline_tokens();
+
         // Early exit check before expensive computation
         if !self.cache.is_request_active(&uri, request_id) {
             log::debug!(
@@ -313,6 +329,13 @@ impl Kakehashi {
                 data: vec![],
             })));
         };
+
+        // Validity key for the snapshotted text under the generation captured at
+        // the top (before any query/capture-mapping read): keys both the
+        // unchanged-document cache short-circuit below and the store of the freshly
+        // computed tokens. Pinning to the early generation is what keeps a
+        // concurrent settings reload from making this request poison the cache.
+        let cache_key = self.cache.cache_key_for(&text, token_generation);
 
         // Get document data and compute tokens
         let (result, text_used) = {
@@ -336,13 +359,27 @@ impl Kakehashi {
                 return Ok(None);
             }
 
-            // Get capture mappings for token type resolution
-            let capture_mappings = self.language.capture_mappings();
+            // Unchanged document: tokens already cached for this exact text are
+            // still correct, so skip re-tokenizing (the expensive work). The
+            // `result_id` can't signal "unchanged" — it's a fresh global counter
+            // per response — but the content hash can. Returns the cached tokens
+            // with their original `result_id`, keeping a client's delta baseline
+            // stable across idle re-requests. Dropped wholesale on settings reload.
+            //
+            // No `.await` runs between the staleness check above and this serve, so
+            // no `didChange` can interleave — the cached tokens stay consistent with
+            // that check. (The compute path below DOES await, which is why it
+            // re-checks staleness after the block; this early return needs no such
+            // re-check.)
+            if let Some(cached) = self.cache.get_current_tokens(&uri, cache_key) {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(Some(SemanticTokensResult::Tokens(cached)));
+            }
 
-            // Use Rayon-based parallel injection processing.
-            // This uses thread-local parser caching instead of the shared parser pool,
-            // avoiding lock contention during parallel processing.
-            let supports_multiline = self.settings_manager.supports_multiline_tokens();
+            // capture_mappings and supports_multiline were read before the await
+            // above (consistent with the query and token_generation). Rayon-based
+            // parallel injection processing uses thread-local parser caching
+            // instead of the shared parser pool, avoiding lock contention.
             let coordinator = std::sync::Arc::clone(&self.language);
 
             // Compute tokens, racing against cancel notification if provided
@@ -424,8 +461,10 @@ impl Kakehashi {
         tokens_with_id.result_id = Some(next_result_id());
         let stored_tokens = tokens_with_id.clone();
         let lsp_tokens = tokens_with_id;
-        // Store in dedicated cache for delta requests with result_id validation
-        self.cache.store_tokens(uri.clone(), stored_tokens);
+        // Store keyed by result_id (delta baseline) AND cache_key (so an
+        // unchanged-document repeat request short-circuits the re-tokenization above).
+        self.cache
+            .store_tokens(uri.clone(), stored_tokens, cache_key);
 
         // Finish tracking this request
         self.cache.finish_request(&uri, request_id);
@@ -459,6 +498,11 @@ impl Kakehashi {
 
         // Start tracking this request - supersedes any previous request for this URI
         let request_id = self.cache.start_request(&uri);
+
+        // Snapshot the settings generation NOW, before any settings-dependent
+        // tokenization input is read below (same reload-race safety as
+        // semanticTokens/full; folded into the cache key once the text is known).
+        let token_generation = self.cache.semantic_token_generation();
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -520,6 +564,13 @@ impl Kakehashi {
             )));
         };
 
+        // Read the remaining settings-dependent tokenization inputs HERE — with the
+        // query above and BEFORE the get_tree_with_wait().await below — so a settings
+        // reload during that await can't split them into an inconsistent mix
+        // (same as semanticTokens/full; all consistent with `token_generation`).
+        let capture_mappings = self.language.capture_mappings();
+        let supports_multiline = self.settings_manager.supports_multiline_tokens();
+
         // Early exit check before expensive computation
         if !self.cache.is_request_active(&uri, request_id) {
             log::debug!(
@@ -540,6 +591,12 @@ impl Kakehashi {
                 },
             )));
         };
+
+        // Validity key for the snapshotted text under the generation captured at
+        // the top (before the tokenization inputs are read, as in
+        // semanticTokens/full): keys the unchanged-document reuse below and the
+        // store of freshly computed tokens.
+        let cache_key = self.cache.cache_key_for(&text, token_generation);
 
         // Get document data and compute tokens (same as semanticTokens/full)
         let (result, text_used) = {
@@ -563,50 +620,70 @@ impl Kakehashi {
                 return Ok(None);
             }
 
-            // Get capture mappings for token type resolution
-            let capture_mappings = self.language.capture_mappings();
-
-            // Use Rayon-based parallel injection processing (SAME as semanticTokens/full)
-            let supports_multiline = self.settings_manager.supports_multiline_tokens();
-            let coordinator = std::sync::Arc::clone(&self.language);
-
-            // Compute tokens, racing against cancel notification if provided
-            let compute_future = handle_semantic_tokens_full(
-                text.clone(),
-                tree.clone(),
-                query,
-                Some(language_name.clone()),
-                Some(capture_mappings),
-                coordinator,
-                supports_multiline,
-            );
-
-            let result = if let Some(cancel_rx) = cancel_rx {
-                // Race between computation and cancel notification
-                tokio::pin!(cancel_rx);
-                tokio::select! {
-                    biased;
-
-                    // Cancel notification received - abort immediately
-                    _ = &mut cancel_rx => {
-                        self.cache.finish_request(&uri, request_id);
-                        log::debug!(
-                            target: "kakehashi::semantic",
-                            "[SEMANTIC_TOKENS_DELTA] CANCELLED via $/cancelRequest uri={} req={}",
-                            uri, request_id
-                        );
-                        return Err(Error::request_cancelled());
-                    }
-
-                    // Computation completed
-                    result = compute_future => result,
+            // Unchanged document: reuse the cached full tokens instead of
+            // re-tokenizing. No `.await` runs between the staleness check above and
+            // here, so the cached tokens stay consistent with it. Cleared wholesale
+            // on a settings reload.
+            if let Some(cached) = self.cache.get_current_tokens(&uri, cache_key) {
+                // Fast path: the client's baseline already IS these cached tokens,
+                // so the delta is necessarily empty — return it directly and skip
+                // the `previous_tokens` clone + O(N) `calculate_delta` below.
+                if cached.result_id.as_deref() == Some(previous_result_id.as_str()) {
+                    self.cache.finish_request(&uri, request_id);
+                    return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                        tower_lsp_server::ls_types::SemanticTokensDelta {
+                            result_id: Some(previous_result_id),
+                            edits: vec![],
+                        },
+                    )));
                 }
+                // Baseline differs: fall through to diff the cached tokens against
+                // the client's `previous_result_id` (still skips re-tokenization).
+                (Some(SemanticTokensResult::Tokens(cached)), text)
             } else {
-                // No cancel support - just await the computation
-                compute_future.await
-            };
+                // capture_mappings and supports_multiline were read before the await
+                // above (consistent with the query and token_generation). Rayon-based
+                // parallel injection processing (SAME as semanticTokens/full).
+                let coordinator = std::sync::Arc::clone(&self.language);
 
-            (result, text)
+                // Compute tokens, racing against cancel notification if provided
+                let compute_future = handle_semantic_tokens_full(
+                    text.clone(),
+                    tree.clone(),
+                    query,
+                    Some(language_name.clone()),
+                    Some(capture_mappings),
+                    coordinator,
+                    supports_multiline,
+                );
+
+                let result = if let Some(cancel_rx) = cancel_rx {
+                    // Race between computation and cancel notification
+                    tokio::pin!(cancel_rx);
+                    tokio::select! {
+                        biased;
+
+                        // Cancel notification received - abort immediately
+                        _ = &mut cancel_rx => {
+                            self.cache.finish_request(&uri, request_id);
+                            log::debug!(
+                                target: "kakehashi::semantic",
+                                "[SEMANTIC_TOKENS_DELTA] CANCELLED via $/cancelRequest uri={} req={}",
+                                uri, request_id
+                            );
+                            return Err(Error::request_cancelled());
+                        }
+
+                        // Computation completed
+                        result = compute_future => result,
+                    }
+                } else {
+                    // No cancel support - just await the computation
+                    compute_future.await
+                };
+
+                (result, text)
+            }
         };
 
         if let Some(reason) = self.check_text_staleness(&uri, &text_used) {
@@ -656,7 +733,8 @@ impl Kakehashi {
         let final_result = match delta_result {
             SemanticTokensFullDeltaResult::Tokens(mut tokens) => {
                 tokens.result_id = Some(next_result_id());
-                self.cache.store_tokens(uri.clone(), tokens.clone());
+                self.cache
+                    .store_tokens(uri.clone(), tokens.clone(), cache_key);
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
             SemanticTokensFullDeltaResult::TokensDelta(mut delta) if delta.edits.is_empty() => {
@@ -673,7 +751,8 @@ impl Kakehashi {
                 let mut stored_tokens = current_tokens;
                 stored_tokens.result_id = Some(next_result_id());
                 delta.result_id = stored_tokens.result_id.clone();
-                self.cache.store_tokens(uri.clone(), stored_tokens);
+                self.cache
+                    .store_tokens(uri.clone(), stored_tokens, cache_key);
                 SemanticTokensFullDeltaResult::TokensDelta(delta)
             }
             SemanticTokensFullDeltaResult::PartialTokensDelta { .. } => {
@@ -687,7 +766,8 @@ impl Kakehashi {
                 );
                 let mut tokens = current_tokens;
                 tokens.result_id = Some(next_result_id());
-                self.cache.store_tokens(uri.clone(), tokens.clone());
+                self.cache
+                    .store_tokens(uri.clone(), tokens.clone(), cache_key);
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
         };
@@ -1203,6 +1283,135 @@ mod tests {
             still_cached.is_some(),
             "cache should STILL contain tokens after document update - needed for delta calculations"
         );
+    }
+
+    /// An unchanged document must reuse cached tokens instead of re-tokenizing:
+    /// the second `semanticTokens/full` returns the SAME `result_id` as the first.
+    /// Before content-hash keying, every full response drew a fresh `result_id`,
+    /// so this asserts the cache short-circuit (skipped recomputation) is live.
+    #[tokio::test]
+    async fn semantic_tokens_full_reuses_cached_tokens_for_unchanged_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///unchanged.lua").expect("should construct test uri");
+
+        server.documents.insert(
+            uri.clone(),
+            "local x = 1".to_string(),
+            Some("lua".to_string()),
+            None,
+        );
+
+        let load_result = server.language.ensure_language_loaded("lua");
+        if !load_result.success || server.language.highlight_query("lua").is_none() {
+            eprintln!("Skipping: lua language parser or highlight query not available");
+            return;
+        }
+
+        let make_params = || SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let first = server
+            .semantic_tokens_full_impl(make_params())
+            .await
+            .expect("first full request should succeed")
+            .expect("should return tokens");
+        let first_id = match first {
+            SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
+            _ => panic!("expected Tokens variant"),
+        };
+
+        // Second request, document UNCHANGED: must serve the cached tokens (same
+        // result_id), proving the re-tokenization was skipped.
+        let second = server
+            .semantic_tokens_full_impl(make_params())
+            .await
+            .expect("second full request should succeed")
+            .expect("should return tokens");
+        let second_id = match second {
+            SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
+            _ => panic!("expected Tokens variant"),
+        };
+
+        assert_eq!(
+            first_id, second_id,
+            "an unchanged document should reuse cached tokens (stable result_id), \
+             not recompute with a fresh id"
+        );
+    }
+
+    /// A delta request on an unchanged document whose baseline matches the cached
+    /// tokens returns an empty delta with the same `result_id` — the fast path that
+    /// skips the `previous_tokens` clone and the O(N) diff entirely.
+    #[tokio::test]
+    async fn semantic_tokens_delta_returns_empty_delta_for_unchanged_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///delta_noop.lua").expect("should construct test uri");
+
+        server.documents.insert(
+            uri.clone(),
+            "local x = 1".to_string(),
+            Some("lua".to_string()),
+            None,
+        );
+
+        let load_result = server.language.ensure_language_loaded("lua");
+        if !load_result.success || server.language.highlight_query("lua").is_none() {
+            eprintln!("Skipping: lua language parser or highlight query not available");
+            return;
+        }
+
+        // Full request establishes the baseline result_id.
+        let full = server
+            .semantic_tokens_full_impl(SemanticTokensParams {
+                text_document: TextDocumentIdentifier {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("full request should succeed")
+            .expect("should return tokens");
+        let baseline_id = match full {
+            SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
+            _ => panic!("expected Tokens variant"),
+        };
+
+        // Delta on the UNCHANGED document with the matching baseline: empty delta,
+        // same result_id (the fast path).
+        let delta = server
+            .semantic_tokens_full_delta_impl(SemanticTokensDeltaParams {
+                text_document: TextDocumentIdentifier {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+                },
+                previous_result_id: baseline_id.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("delta request should succeed")
+            .expect("should return a delta");
+        match delta {
+            SemanticTokensFullDeltaResult::TokensDelta(d) => {
+                assert_eq!(
+                    d.result_id,
+                    Some(baseline_id),
+                    "no-op delta should reuse the baseline result_id"
+                );
+                assert!(
+                    d.edits.is_empty(),
+                    "an unchanged document should yield an empty delta"
+                );
+            }
+            other => panic!("expected an empty TokensDelta, got {:?}", other),
+        }
     }
 
     /// Test that semantic tokens full request returns RequestCancelled (-32800) when cancelled.
