@@ -109,9 +109,27 @@ impl Kakehashi {
             return Ok(empty_diagnostic_report());
         }
 
+        // Capture the coverage version BEFORE doing any work (the fold below reads
+        // the push cache), so the `served` we record once we hand the editor a report
+        // is a lower bound — never ahead of the set it actually receives (#497). A
+        // concurrent push bumping `current` after this read just makes the *next*
+        // refresh redundant, never skips a needed one. Recorded only on the paths
+        // that return a report for this open doc (not the cancel path).
+        //
+        // Known limitation (deferred epoch class, like `did_close.rs`): if this doc
+        // is closed and re-opened while this pull is in flight, `forget_coverage`
+        // resets the entry to 0 and this captured version becomes stale-HIGH for the
+        // re-opened incarnation. `mark_served` then sets `served` above the re-opened
+        // `current`, leaving the gate briefly stuck-clean → a needed refresh can be
+        // skipped (narrow staleness) until `current` catches back up. Closing this
+        // fully needs a per-incarnation epoch; the editor's own re-open pull
+        // self-heals it.
+        let served_version = self.diagnostics.current_version(&uri);
+
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
             log::debug!(target: "kakehashi::diagnostic", "No language detected");
+            self.diagnostics.mark_served(&uri, served_version);
             return Ok(empty_diagnostic_report());
         };
 
@@ -132,6 +150,7 @@ impl Kakehashi {
                 "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
                 language_name
             );
+            self.diagnostics.mark_served(&uri, served_version);
             return Ok(empty_diagnostic_report());
         }
 
@@ -296,6 +315,12 @@ impl Kakehashi {
             &mut host_items,
         )
         .await;
+
+        // The editor is about to receive the current merged set: advance `served` to
+        // the version captured at entry, so the refresh gate stops treating those
+        // changes as dirty (#497). Pure bookkeeping — never republishes — so this
+        // can't beget a refresh.
+        self.diagnostics.mark_served(&uri, served_version);
 
         Ok(make_diagnostic_report(combine_layer_diagnostics(
             &layer_cfg, virt_items, host_items,

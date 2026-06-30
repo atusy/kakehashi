@@ -113,9 +113,27 @@ impl DiagnosticPublisher {
         );
         // A host `_self` push is spontaneous and asynchronous; a pull-mode client
         // won't know to re-pull, so nudge it when the merged set actually changed
-        // (push/pull-divergence, #422).
+        // (push/pull-divergence, #422). Bump the coverage version first so the gated
+        // refresh sees this push-origin change as dirty (#497) — only push/eviction
+        // origins bump; editor-originated republishes don't (the editor re-pulls).
         if self.republish(&host).await {
-            self.request_pull_diagnostic_refresh();
+            self.bump_current_if_open(&host);
+            self.request_pull_diagnostic_refresh(false);
+        }
+    }
+
+    /// Bump a host's coverage version, but only if it is still an open document
+    /// (#497). The open-check at the top of a push path and this bump straddle the
+    /// push's `record` + `republish().await`, so a `didClose` in that macro-window
+    /// could otherwise strand a coverage entry on a now-closed host that no pull will
+    /// ever clear — defeating the workspace-wide suppression for the rest of the
+    /// session. Re-reading `documents` here collapses that to the same narrow
+    /// resolve-vs-`didClose` micro-window the codebase already accepts (see
+    /// `text_document/did_close.rs`); fully closing it needs the deferred per-host
+    /// tombstone/epoch gate.
+    fn bump_current_if_open(&self, host: &Url) {
+        if self.documents.get(host).is_some() {
+            self.aggregator.bump_current(host);
         }
     }
 
@@ -242,8 +260,10 @@ impl DiagnosticPublisher {
         // A region push is spontaneous and asynchronous (a push-only injected-
         // language server); like the host push, nudge a pull-mode client to
         // re-pull when the merged set actually changed (push/pull-divergence, #422).
+        // Bump the coverage version (a push-origin change) before the gated refresh (#497).
         if self.republish(&host).await {
-            self.request_pull_diagnostic_refresh();
+            self.bump_current_if_open(&host);
+            self.request_pull_diagnostic_refresh(false);
         }
     }
 
@@ -312,10 +332,15 @@ impl DiagnosticPublisher {
         let affected = self.aggregator.evict_connection(connection_id);
         let mut any_changed = false;
         for host in affected {
-            any_changed |= self.republish(&host).await;
+            if self.republish(&host).await {
+                // A crash eviction is a push-origin change the editor doesn't know
+                // about → bump coverage so the gated refresh below fires (#497).
+                self.bump_current_if_open(&host);
+                any_changed = true;
+            }
         }
         if any_changed {
-            self.request_pull_diagnostic_refresh();
+            self.request_pull_diagnostic_refresh(false);
         }
     }
 
@@ -334,6 +359,11 @@ impl DiagnosticPublisher {
         // linger and a later re-open publishes afresh (#422). Done after the
         // clear-republish above so that publish still sees the prior set.
         self.aggregator.forget_published(host);
+        // Likewise forget its coverage versions (#497) — a closed doc can't be
+        // pulled, so it must not keep the workspace dirty; a re-open starts fresh at
+        // 0. (`clear_host` is editor-originated, so its republish doesn't bump
+        // `current`; this just drops any prior push-origin coverage state.)
+        self.aggregator.forget_coverage(host);
         // didClose is off the hot path: reclaim republish-lock entries whose lock
         // now has no live holder — this host's, once the clear-republish above
         // released it, plus any earlier-closed hosts that have since drained (#466).
@@ -477,7 +507,7 @@ impl DiagnosticPublisher {
     /// client that supports pull but not refresh would silently ignore the request,
     /// leaking a tower-lsp pending-request entry plus a parked task — the same gate
     /// the `semantic_tokens_refresh` path uses.
-    pub(crate) fn request_pull_diagnostic_refresh(&self) {
+    pub(crate) fn request_pull_diagnostic_refresh(&self, forced: bool) {
         let supported = self
             .settings_manager
             .client_capabilities_lock()
@@ -486,10 +516,12 @@ impl DiagnosticPublisher {
         if !supported {
             return;
         }
-        // Coalesce against any in-flight refresh: if one is already outstanding,
-        // this request is recorded as `pending` and the outstanding task's loop
-        // fires the trailing refresh — nothing more to do here.
-        if !self.aggregator.try_begin_refresh() {
+        // Coalesce against any in-flight refresh and apply the coverage gate (#497):
+        // `false` here means either one is already outstanding (recorded as `pending`,
+        // so the outstanding task's loop fires the trailing) or — for a non-`forced`
+        // request — nothing is dirty (the editor already has the current set). A
+        // `forced` downstream-forwarded refresh (#521) bypasses the coverage gate.
+        if !self.aggregator.try_begin_refresh(forced) {
             return;
         }
         let client = self.client.clone();
@@ -701,6 +733,60 @@ mod tests {
             .expect("a Host slot should be recorded for an open _self-bridged doc");
         assert_eq!(host_slots["rust_ls"].diagnostics.len(), 1);
         assert_eq!(host_slots["rust_ls"].diagnostics[0].message, "boom");
+    }
+
+    #[tokio::test]
+    async fn coverage_bumps_on_push_origin_not_on_pull_layer() {
+        // #497: only push/eviction-origin republishes bump the coverage version. An
+        // editor-originated `publish_pull_layer` changes the set but must NOT bump —
+        // bumping there would strand the host dirty between the editor's own pulls and
+        // defeat the gate during active editing (the debounce-vs-pull race).
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        assert!(!server.diagnostics.is_dirty(), "fresh host is clean");
+
+        // A push-origin change bumps coverage → dirty.
+        publisher
+            .publish_host_push(
+                uri.as_str(),
+                "rust_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("boom")],
+            )
+            .await;
+        assert!(
+            server.diagnostics.is_dirty(),
+            "a push-origin change makes the host dirty"
+        );
+
+        // The editor pulls and is answered against the current version → clean.
+        let v = server.diagnostics.current_version(&uri);
+        server.diagnostics.mark_served(&uri, v);
+        assert!(
+            !server.diagnostics.is_dirty(),
+            "a covering pull clears dirty"
+        );
+
+        // An editor-originated pull-layer republish changes the merged set (it is
+        // published) but must NOT re-dirty the host.
+        publisher
+            .publish_pull_layer(&uri, vec![diag("from-pull-layer")])
+            .await;
+        assert!(
+            !server.diagnostics.is_dirty(),
+            "pull-layer (editor-origin) republish must not bump the coverage version"
+        );
     }
 
     #[tokio::test]

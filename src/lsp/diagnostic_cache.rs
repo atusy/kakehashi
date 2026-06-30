@@ -379,6 +379,14 @@ pub(crate) struct DiagnosticAggregator {
     /// that window set `pending`, which fires exactly one more refresh on
     /// completion. Drives [`Self::try_begin_refresh`]/[`Self::finish_refresh`].
     refresh_flight: Mutex<RefreshFlight>,
+    /// Per-host coverage versions for the refresh **coverage gate** (#497, commit 2).
+    /// `current` bumps on every set-changing republish (the editor's pulled view is
+    /// now stale); `served` records the `current` a pull was answered against. A
+    /// gated refresh fires only when some host has `current > served` ("dirty") — so
+    /// a change the editor already re-pulled (its own `didChange` pull advances
+    /// `served`) sends no redundant nudge. Drives [`Self::bump_current`],
+    /// [`Self::mark_served`], [`Self::is_dirty`]; forgotten on `didClose`.
+    coverage: Mutex<HashMap<Url, HostCoverage>>,
 }
 
 /// Workspace-wide single-flight state for `workspace/diagnostic/refresh` (#497).
@@ -386,8 +394,23 @@ pub(crate) struct DiagnosticAggregator {
 struct RefreshFlight {
     /// A refresh request has been sent and its ack is not yet received.
     in_flight: bool,
-    /// A refresh was requested while one was in flight; fire one more on completion.
+    /// A refresh was requested while one was in flight; bounds the trailing refresh
+    /// to one per window-with-activity (so a never-pulling editor can't spin).
     pending: bool,
+    /// At least one request during this window was **forced** (a downstream-forwarded
+    /// refresh, #521), so the trailing must fire regardless of the coverage gate —
+    /// there is no version representing what the downstream asked to refresh.
+    pending_forced: bool,
+}
+
+/// Per-host coverage versions for the refresh gate (#497, commit 2).
+#[derive(Default, Clone, Copy)]
+struct HostCoverage {
+    /// Bumped on each set-changing republish for this host.
+    current: u64,
+    /// The `current` value a pull was last answered against (a lower bound — read
+    /// before the pull's fold, so never ahead of what the editor actually received).
+    served: u64,
 }
 
 impl DiagnosticAggregator {
@@ -561,47 +584,155 @@ impl DiagnosticAggregator {
             .remove(host);
     }
 
-    /// Begin a workspace-wide refresh under the single-flight guard (#497).
+    /// Begin a workspace-wide refresh under the single-flight + coverage guard
+    /// (#497). `forced` is `true` for a downstream-forwarded refresh (#521), which
+    /// **bypasses the coverage gate** (no version represents what the downstream
+    /// asked to refresh); `false` for a push/eviction-origin refresh, which sends
+    /// only when some host is dirty ([`Self::is_dirty`]).
     ///
-    /// Returns `true` if the caller should actually send the refresh (no other was
-    /// in flight); `false` if one is already in flight — the request is recorded as
-    /// `pending` so [`Self::finish_refresh`] fires exactly one more on completion.
-    /// The caller pairs a `true` with sending the refresh and a later
-    /// [`Self::finish_refresh`]; a `false` requires no further action.
-    pub(crate) fn try_begin_refresh(&self) -> bool {
+    /// Returns `true` if the caller should send the refresh now; `false` otherwise.
+    /// A `false` means either one is already in flight (recorded as `pending` so
+    /// [`Self::finish_refresh`] fires one more on completion) or a gated request found
+    /// nothing dirty (the editor already has the current set — no nudge needed).
+    ///
+    /// `is_dirty` is evaluated **while holding** the guard lock, so the "set pending"
+    /// of a racing request is serialized against the "read pending + dirty" of a
+    /// concurrent [`Self::finish_refresh`] — without that, a push that bumps `current`
+    /// and sets `pending` between a stale dirty read and the lock could have its
+    /// trailing refresh dropped. Lock order is `refresh_flight → coverage` (the
+    /// coverage lock is a leaf; `bump_current`/`mark_served`/`is_dirty` never take
+    /// `refresh_flight`), so no cycle.
+    pub(crate) fn try_begin_refresh(&self, forced: bool) -> bool {
         let mut flight = self
             .refresh_flight
             .lock()
             .recover_poison("DiagnosticAggregator::refresh_flight");
         if flight.in_flight {
             flight.pending = true;
-            false
-        } else {
-            flight.in_flight = true;
-            true
+            flight.pending_forced |= forced;
+            return false;
         }
+        if !(forced || self.is_dirty()) {
+            return false; // gated + clean: the editor already has the current set
+        }
+        flight.in_flight = true;
+        true
     }
 
-    /// Complete an in-flight refresh (its ack arrived) under the single-flight
-    /// guard (#497). Returns `true` if a refresh was requested while this one was in
-    /// flight (`pending`) and the caller should send exactly one more — `in_flight`
-    /// stays set so the next requester still coalesces; `false` clears the guard.
+    /// Complete an in-flight refresh (its ack arrived) under the single-flight +
+    /// coverage guard (#497). Returns `true` if the caller should send exactly one
+    /// more — `in_flight` stays set so the next requester still coalesces — and
+    /// `false` clears the guard.
     ///
-    /// Setting `pending` and this check both take the guard lock, so a request that
-    /// races completion is never lost: it either sets `pending` before this reads it
-    /// (→ re-fire) or finds `in_flight` already cleared and sends fresh.
+    /// The trailing fires only when a request arrived during this window (`pending`,
+    /// which bounds it to one per window-with-activity so a never-pulling editor
+    /// can't spin) AND that work still needs a nudge — either it was `forced`, or a
+    /// host is still dirty (a covering pull would have advanced `served` and cleared
+    /// it). `pending`/`pending_forced` AND `is_dirty` are all read under this one
+    /// lock, so a request racing completion is never lost: it sets the flags (and its
+    /// bump is visible to the in-lock dirty read) before this reads them, or finds
+    /// `in_flight` already cleared and sends fresh.
     pub(crate) fn finish_refresh(&self) -> bool {
         let mut flight = self
             .refresh_flight
             .lock()
             .recover_poison("DiagnosticAggregator::refresh_flight");
-        if flight.pending {
-            flight.pending = false;
+        let fire = flight.pending && (flight.pending_forced || self.is_dirty());
+        flight.pending = false;
+        flight.pending_forced = false;
+        if fire {
             true
         } else {
             flight.in_flight = false;
             false
         }
+    }
+
+    /// Bump a host's `current` coverage version (#497) — a **push-origin** change the
+    /// editor doesn't know about just landed, so its last-pulled view is now stale.
+    /// Called only from the push/eviction paths (`publish_host_push`,
+    /// `publish_region_push`, `evict_connection_diagnostics`) when their `republish`
+    /// published a changed set — paired with the gated `request_pull_diagnostic_refresh`.
+    ///
+    /// Deliberately **not** bumped on editor-originated republishes (`publish_pull_layer`
+    /// /`clear_pull_layer`/edit-remerge/`clear_host`): those are answered by the
+    /// editor's own re-pull, so bumping there would strand `current > served` between
+    /// the editor's pull and its next one — defeating the gate during active editing.
+    ///
+    /// INVARIANT: every `current` bump must be **coverable by a later pull** so
+    /// `served` catches up — push/region/eviction fold into the pull
+    /// (`fold_push_fallback_diagnostics`). A future bump whose change a pull would NOT
+    /// reflect would strand `current > served` and turn every later push into a
+    /// refresh storm — keep this property (and the push-origin-only rule) when adding
+    /// bump sites.
+    pub(crate) fn bump_current(&self, host: &Url) {
+        let mut coverage = self
+            .coverage
+            .lock()
+            .recover_poison("DiagnosticAggregator::coverage");
+        // Look up by `&Url` first, cloning the host key only on first insert (the
+        // common path is a repeat push for an already-tracked host), matching
+        // `record`'s convention — no `Url` clone on the hot path.
+        if let Some(cov) = coverage.get_mut(host) {
+            cov.current += 1;
+        } else {
+            coverage.insert(
+                host.clone(),
+                HostCoverage {
+                    current: 1,
+                    served: 0,
+                },
+            );
+        }
+    }
+
+    /// Read a host's current coverage version (`0` if it has never changed). A pull
+    /// captures this *before* its fold and later passes it to [`Self::mark_served`],
+    /// so `served` is a lower bound (never ahead of the set the editor received).
+    pub(crate) fn current_version(&self, host: &Url) -> u64 {
+        self.coverage
+            .lock()
+            .recover_poison("DiagnosticAggregator::coverage")
+            .get(host)
+            .map_or(0, |c| c.current)
+    }
+
+    /// Record that a pull was answered for `host` against coverage version
+    /// `version` (#497): the editor now has the set as of `version`, so it is no
+    /// longer dirty up to there. Pure bookkeeping — it must **never** bump `current`
+    /// or republish, so a refresh→pull→`mark_served` cannot beget another refresh
+    /// (keeps #496/#499 loop-safety). Monotonic via `max`, so a slower concurrent
+    /// pull can't regress `served`. No-op for a host with no coverage entry (nothing
+    /// was ever pushed → nothing to be dirty about).
+    pub(crate) fn mark_served(&self, host: &Url, version: u64) {
+        if let Some(cov) = self
+            .coverage
+            .lock()
+            .recover_poison("DiagnosticAggregator::coverage")
+            .get_mut(host)
+        {
+            cov.served = cov.served.max(version);
+        }
+    }
+
+    /// Whether any open host has an uncovered set-change (`current > served`) — the
+    /// coverage gate for [`Self::try_begin_refresh`]/[`Self::finish_refresh`] (#497).
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.coverage
+            .lock()
+            .recover_poison("DiagnosticAggregator::coverage")
+            .values()
+            .any(|c| c.current > c.served)
+    }
+
+    /// Forget a host's coverage versions (#497) — `didClose`, so the doc can no
+    /// longer be pulled and must not keep the workspace dirty. Paired with
+    /// [`Self::forget_published`].
+    pub(crate) fn forget_coverage(&self, host: &Url) {
+        self.coverage
+            .lock()
+            .recover_poison("DiagnosticAggregator::coverage")
+            .remove(host);
     }
 
     /// Drop one `source`'s slots (every server) under `host` — e.g. a region
@@ -1641,14 +1772,15 @@ mod tests {
     fn refresh_single_flight_collapses_a_burst_into_at_most_one_trailing() {
         // #497: while a workspace refresh is in flight (awaiting the editor's ack),
         // a burst of further requests must coalesce — at most ONE trailing refresh
-        // fires on completion, regardless of how many requests arrived.
+        // fires on completion. Uses `forced` requests so the test exercises the pure
+        // single-flight machinery without the coverage gate (covered separately).
         let agg = DiagnosticAggregator::new();
 
         // The first request of an idle guard is sent.
-        assert!(agg.try_begin_refresh(), "first request sends");
+        assert!(agg.try_begin_refresh(true), "first request sends");
         // Everything during the in-flight window coalesces (no new send).
-        assert!(!agg.try_begin_refresh(), "in-flight: coalesced");
-        assert!(!agg.try_begin_refresh(), "in-flight: still coalesced");
+        assert!(!agg.try_begin_refresh(true), "in-flight: coalesced");
+        assert!(!agg.try_begin_refresh(true), "in-flight: still coalesced");
 
         // On completion, the recorded `pending` fires exactly one trailing refresh
         // (guard stays in-flight so a request racing it still coalesces).
@@ -1658,7 +1790,7 @@ mod tests {
 
         // Guard clear → the next request sends again (no stuck in-flight).
         assert!(
-            agg.try_begin_refresh(),
+            agg.try_begin_refresh(true),
             "cleared guard → next request sends"
         );
         assert!(!agg.finish_refresh(), "no pending → clears");
@@ -1670,15 +1802,127 @@ mod tests {
         // must itself coalesce and drive one more trailing refresh — the guard
         // re-arms per window, so no change is ever stranded.
         let agg = DiagnosticAggregator::new();
-        assert!(agg.try_begin_refresh(), "first sends");
-        assert!(!agg.try_begin_refresh(), "coalesced → pending");
+        assert!(agg.try_begin_refresh(true), "first sends");
+        assert!(!agg.try_begin_refresh(true), "coalesced → pending");
         assert!(
             agg.finish_refresh(),
             "pending → trailing refresh, stays in-flight"
         );
         // A new request during the trailing refresh's window coalesces again.
-        assert!(!agg.try_begin_refresh(), "coalesced during trailing window");
+        assert!(
+            !agg.try_begin_refresh(true),
+            "coalesced during trailing window"
+        );
         assert!(agg.finish_refresh(), "second pending → one more trailing");
         assert!(!agg.finish_refresh(), "now drained → clears");
+    }
+
+    #[test]
+    fn coverage_gate_blocks_a_clean_request_and_passes_a_dirty_one() {
+        // #497 commit 2: a non-forced (push/eviction-origin) request sends only when
+        // some host is dirty (`current > served`); a `forced` one always sends.
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+
+        // Nothing has changed → not dirty → a gated request sends nothing…
+        assert!(!agg.is_dirty(), "fresh aggregator is clean");
+        assert!(!agg.try_begin_refresh(false), "gated + clean → no refresh");
+        // …but a forced (downstream-forwarded) refresh bypasses the gate.
+        assert!(agg.try_begin_refresh(true), "forced bypasses the gate");
+        assert!(!agg.finish_refresh(), "no pending → clears");
+
+        // A set-change makes the host dirty → the gated request now sends.
+        agg.bump_current(&h);
+        assert!(agg.is_dirty(), "a bumped, un-served host is dirty");
+        assert!(agg.try_begin_refresh(false), "gated + dirty → sends");
+        assert!(!agg.finish_refresh(), "no pending → clears");
+    }
+
+    #[test]
+    fn coverage_gate_suppresses_the_trailing_when_a_pull_covered_the_change() {
+        // The win: a change pushed during the in-flight window is covered by the
+        // editor's own pull (which advances `served`), so the trailing is suppressed.
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+
+        agg.bump_current(&h); // current=1, served=0 → dirty
+        assert!(agg.try_begin_refresh(false), "dirty → first refresh sends");
+        // Another change lands during the in-flight window (coalesced as pending).
+        agg.bump_current(&h); // current=2
+        assert!(!agg.try_begin_refresh(false), "in-flight → pending");
+        // The editor pulls and is answered against the latest version → not dirty.
+        agg.mark_served(&h, 2);
+        assert!(!agg.is_dirty(), "the pull covered both changes");
+        // Completion: pending was set, but nothing is dirty and it wasn't forced →
+        // the trailing is suppressed.
+        assert!(
+            !agg.finish_refresh(),
+            "covered by a pull → no redundant trailing refresh"
+        );
+    }
+
+    #[test]
+    fn coverage_gate_fires_the_trailing_when_still_dirty() {
+        // The complement: a change lands during the window and the editor has NOT
+        // pulled it → still dirty → the trailing fires.
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+
+        agg.bump_current(&h); // dirty
+        assert!(agg.try_begin_refresh(false), "dirty → sends");
+        agg.bump_current(&h); // another change during the window → pending
+        assert!(!agg.try_begin_refresh(false), "in-flight → pending");
+        // No pull → still dirty → trailing fires once, then drains.
+        assert!(
+            agg.finish_refresh(),
+            "pending + still dirty → trailing fires"
+        );
+        assert!(!agg.finish_refresh(), "no further pending → clears");
+    }
+
+    #[test]
+    fn coverage_gate_does_not_spin_without_new_requests() {
+        // acks-but-never-pulls bound: with a host left dirty (editor acks the refresh
+        // but never pulls), `finish_refresh` must NOT keep firing — the trailing
+        // requires a `pending` (a request *during* the window), so absent new
+        // requests it fires zero trailing and clears. This is what prevents an
+        // ack-rate refresh spin.
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h); // dirty, and stays dirty (no pull ever)
+        assert!(agg.try_begin_refresh(false), "dirty → first refresh sends");
+        // No request arrived during the window → no pending → no trailing despite dirty.
+        assert!(
+            !agg.finish_refresh(),
+            "dirty but no pending → no trailing (no spin)"
+        );
+        // And it really cleared — a subsequent completion is a no-op.
+        assert!(!agg.finish_refresh(), "guard already clear");
+    }
+
+    #[test]
+    fn coverage_forget_and_served_bookkeeping() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        assert_eq!(agg.current_version(&h), 0, "unseen host starts at 0");
+        agg.bump_current(&h);
+        agg.bump_current(&h);
+        assert_eq!(agg.current_version(&h), 2);
+        // `served` is monotonic: a stale (lower) mark can't regress it.
+        agg.mark_served(&h, 2);
+        agg.mark_served(&h, 1);
+        assert!(
+            !agg.is_dirty(),
+            "served caught up and a stale mark didn't regress it"
+        );
+        // didClose forgets coverage entirely → a re-open starts clean.
+        agg.bump_current(&h); // dirty again
+        assert!(agg.is_dirty());
+        agg.forget_coverage(&h);
+        assert!(
+            !agg.is_dirty(),
+            "a closed host no longer keeps the workspace dirty"
+        );
+        assert_eq!(agg.current_version(&h), 0, "re-open starts fresh");
     }
 }
