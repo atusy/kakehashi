@@ -215,13 +215,18 @@ impl Default for InjectionMap {
 /// the same race-safe fold `SemanticTokenCache` applies to its own key, rather
 /// than a bare `clear()`. A lookup is therefore an exact key match; no separate
 /// read-time validity check is needed.
-pub struct InjectionTokenCache {
+///
+/// `supports_multiline` is deliberately *not* part of the key: it changes
+/// multiline-token emission, but it comes from the client capabilities snapshot
+/// (a `OnceLock` set once at `initialize()`), so it is session-constant and
+/// cannot flip mid-session — no entry can outlive a change to it.
+pub(crate) struct InjectionTokenCache {
     cache: DashMap<(Url, String, u64, u64), Vec<RawToken>>,
 }
 
 impl InjectionTokenCache {
     /// Create a new empty cache.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cache: DashMap::new(),
         }
@@ -229,7 +234,7 @@ impl InjectionTokenCache {
 
     /// Store region-local tokens for an injection region under its validity key
     /// (`content_hash` + settings `generation`).
-    pub fn store(
+    pub(crate) fn store(
         &self,
         uri: &Url,
         region_id: &str,
@@ -245,7 +250,7 @@ impl InjectionTokenCache {
 
     /// Retrieve region-local tokens iff an entry exists for this exact validity
     /// key — same region, same content, same settings generation.
-    pub fn get(
+    pub(crate) fn get(
         &self,
         uri: &Url,
         region_id: &str,
@@ -280,13 +285,13 @@ impl InjectionTokenCache {
     /// hashes / generations. `content_hash` and `generation` are part of the key,
     /// so a single `(uri, region_id)` can have stale siblings; eviction
     /// (edit-overlap, content/language change, region removed) must drop them all.
-    pub fn remove(&self, uri: &Url, region_id: &str) {
+    pub(crate) fn remove(&self, uri: &Url, region_id: &str) {
         self.cache
             .retain(|key, _| !(&key.0 == uri && key.1 == region_id));
     }
 
     /// Remove all cached tokens for a document (all its injection regions).
-    pub fn clear_document(&self, uri: &Url) {
+    pub(crate) fn clear_document(&self, uri: &Url) {
         self.cache.retain(|key, _| &key.0 != uri);
     }
 
@@ -294,7 +299,7 @@ impl InjectionTokenCache {
     /// a document — lets a test confirm what the hot path persisted and overwrite
     /// a specific entry to prove the reuse path reads it.
     #[cfg(test)]
-    pub fn test_keys(&self, uri: &Url) -> Vec<(String, u64, u64)> {
+    pub(crate) fn test_keys(&self, uri: &Url) -> Vec<(String, u64, u64)> {
         self.cache
             .iter()
             .filter(|e| &e.key().0 == uri)
