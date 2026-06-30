@@ -1411,6 +1411,13 @@ impl LanguageServerPool {
                 progress_registry: Arc::clone(&self.progress_registry),
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
                 progress_connection_id: self.progress_registry.new_connection_id(),
+                // Seed this connection's settings cell from the resolved config
+                // so the reader can answer downstream `workspace/configuration`
+                // pulls (downstream-settings-propagation). Updated on later merge
+                // changes by the propagation path (c).
+                settings: Arc::new(arc_swap::ArcSwapOption::from(
+                    server_config.settings.clone().map(Arc::new),
+                )),
             },
         );
 

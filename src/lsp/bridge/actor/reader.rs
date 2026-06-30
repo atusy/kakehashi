@@ -248,6 +248,13 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) progress_registry: Arc<crate::lsp::bridge::ProgressRegistry>,
     /// This connection's id, used to scope forward token translation.
     pub(crate) progress_connection_id: crate::lsp::bridge::ProgressConnectionId,
+    /// This server's current workspace settings, shared with the pool, used to
+    /// answer downstream `workspace/configuration` pulls (downstream-settings-propagation).
+    /// `None` slot = no settings configured for this server. The pool seeds it at
+    /// spawn from the resolved `BridgeServerConfig.settings` and (later) re-stores
+    /// it on a merge change, so a re-pull after a `didChangeConfiguration` reads
+    /// the current value.
+    pub(crate) settings: Arc<arc_swap::ArcSwapOption<serde_json::Value>>,
     /// Routes bridge-minted client-progress tokens (`kakehashi/bridge/cprog/*`)
     /// to their aggregator (ls-bridge-client-progress).
     pub(crate) client_progress_registry: Arc<crate::lsp::bridge::ClientProgressRegistry>,
@@ -502,6 +509,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
         router,
         liveness_timeout,
         ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -592,6 +600,7 @@ async fn reader_loop(
     let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
     let progress_connection_id = progress_registry.new_connection_id();
     let server_request_deps = ServerRequestDeps {
+        settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         server_name: None,
         response_tx,
         dynamic_capabilities,
@@ -918,6 +927,9 @@ async fn handle_server_request(
             workspace::diagnostic_refresh::handle(server_prefix, deps)
         }
         "workspace/workspaceFolders" => workspace::workspace_folders::handle(server_prefix, deps),
+        "workspace/configuration" => {
+            workspace::configuration::handle(&message, server_prefix, deps)
+        }
         _ => {
             debug!(
                 target: "kakehashi::bridge::reader",
@@ -1048,6 +1060,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx: tx,
             dynamic_capabilities: caps,
@@ -1161,6 +1174,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: server_name.map(String::from),
             response_tx: tx,
             dynamic_capabilities: caps,
@@ -1258,6 +1272,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
             response_tx: tx,
             dynamic_capabilities: caps,
@@ -1334,6 +1349,7 @@ mod tests {
             Arc::clone(&router),
             None,
             ServerRequestDeps {
+                settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: None,
                 response_tx,
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
@@ -1787,6 +1803,7 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
@@ -1848,6 +1865,7 @@ mod tests {
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
@@ -1908,6 +1926,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -1968,6 +1987,7 @@ mod tests {
         let progress_connection_id = progress_registry.new_connection_id();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2027,6 +2047,7 @@ mod tests {
         let progress_connection_id = progress_registry.new_connection_id();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2083,6 +2104,7 @@ mod tests {
         );
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2140,6 +2162,7 @@ mod tests {
         let progress_connection_id = progress_registry.new_connection_id();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2179,6 +2202,7 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2235,6 +2259,7 @@ mod tests {
             name: "repo".to_string(),
         }];
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2279,6 +2304,7 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(1);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2323,6 +2349,7 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2373,6 +2400,7 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("luals".to_string()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
@@ -2431,6 +2459,7 @@ mod tests {
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("lua_ls".to_string()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
@@ -2482,6 +2511,7 @@ mod tests {
             let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
             let (window_tx, _window_rx) = mpsc::channel(16);
             let deps = ServerRequestDeps {
+                settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: Some("luals".to_string()),
                 response_tx,
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
@@ -2563,6 +2593,7 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -2603,6 +2634,7 @@ mod tests {
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
@@ -2658,6 +2690,7 @@ mod tests {
         }]);
 
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
@@ -2724,6 +2757,7 @@ mod tests {
 
         // Spawn handle_server_request in a separate task (it needs to await)
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx: response_tx.clone(),
             dynamic_capabilities,
@@ -2785,6 +2819,7 @@ mod tests {
         drop(response_rx);
 
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             response_tx,
             dynamic_capabilities,
@@ -3088,6 +3123,7 @@ mod tests {
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
