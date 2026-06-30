@@ -36,6 +36,12 @@ alias** (`#[serde(alias = "rootMarkers")]`) for backward compatibility. The
 default is unchanged: `[".git"]`. Resolution semantics (upward search, nested
 arrays = equal-priority groups) are unchanged.
 
+Concretely, the Rust field `root_markers: Option<Vec<RootMarker>>`
+(`src/config/settings.rs`) is renamed `workspace_markers`; the
+`#[serde(rename_all = "camelCase")]` on `BridgeServerConfig` emits the
+`workspaceMarkers` TOML/JSON key automatically, and `#[serde(alias =
+"rootMarkers")]` keeps the old key parsing.
+
 ### 2. Introduce `workspaceResolver` — a Lua function
 
 A new optional key holds a Lua function that dynamically decides both **whether
@@ -61,6 +67,11 @@ end
 """
 ```
 
+kakehashi **compiles the source once, in Rust** (via the sandbox-restricted
+`mlua::Lua::load`) and keeps the resulting `Function`. Because the sandbox
+strips `load`/`loadstring` (see lua-host-api), the resolver source is never
+recompiled from inside Lua per call.
+
 Key properties:
 
 - **Idempotent function `(server_info, document_info) -> (attach, workspace)`.**
@@ -81,11 +92,15 @@ Key properties:
   unset — with **one exception**: a configured resolver is **skipped** for a
   document that has no representable filesystem path (a non-`file://` URI, or a
   `file://` path that fails the encoding contract in lua-host-api). Such a
-  document is resolved exactly as if no `workspaceResolver` were set — via
-  `workspaceMarkers`, which itself falls through to `ClientFallback` when no
-  marker resolves (a non-file URI resolves no marker, so it lands on
-  `ClientFallback`). This skip is distinct from §6 fail-closed: the resolver was
-  not run, so the document still attaches; fail-closed applies only when a
+  document is resolved exactly as if no `workspaceResolver` were set — the
+  normal `workspaceMarkers` → `ClientFallback` path. Note the two skip sub-cases
+  differ underneath: a non-representable `file://` path still has a URL, so the
+  Rust-side marker walk runs normally; a **non-`file://` URI** has no file path
+  at all, so `resolve_marker_root` returns `None` *immediately*
+  (`document_uri?.to_file_path()` fails) and the marker walk never runs — the
+  document lands directly on `ClientFallback`. Either way the result is the
+  no-resolver behavior. This skip is distinct from §6 fail-closed: the resolver
+  was not run, so the document still attaches; fail-closed applies only when a
   resolver that *did* run errors or times out.
 - **The second return is always a filesystem path (or nil)** — never raw
   markers. A resolver that wants marker-based resolution calls
@@ -108,9 +123,11 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
 - **Timeout is in-VM, not wall-clock-only.** Wrapping the call in
   `tokio::time::timeout` (or dropping the join handle) only stops *awaiting* the
   result; the Lua code keeps running and keeps occupying the worker thread. Real
-  interruption requires an **in-VM hook** — `Lua::set_hook` with
-  `HookTriggers::every_nth_instruction` (or Luau `set_interrupt`) that checks
-  elapsed time and raises. This bounds Lua-level loops.
+  interruption requires an **in-VM hook**: an instruction-counting hook that
+  raises a timeout error from inside the VM (in `mlua` 0.9, `Lua::set_hook` with
+  `HookTriggers::every_nth_instruction`, or Luau `set_interrupt` — names are
+  illustrative and to be reconciled with whatever `mlua` version is adopted,
+  since none is in `Cargo.toml` yet). This bounds Lua-level loops.
   - **Caveat:** an instruction hook cannot interrupt time spent inside a host
     C-call (`kakehashi.fs.find_ancestor`'s filesystem walk, `read_to_string`)
     or the lazy `document_info` metatable `__index`. Host operations carry their
@@ -137,21 +154,29 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
   part of the connection's identity, not a late add-on:
   - **Per-root (default).** `ConnectionKey` is `(server, root)`
     (`connection_key.rs`), so a distinct resolved workspace is a distinct
-    `Marker(root)` key → its own connection: reused if one already runs for that
-    root, else spawned with the workspace seeding `InitializeParams` via
-    `build_initialize_request` (`protocol/lifecycle.rs`). A `nil` workspace maps
-    to the `ClientFallback` key — which `workspace_from_marker`'s fallback roots
-    at the **upstream client's** `rootUri`/`workspaceFolders`, not at "no
-    folder".
+    `ConnectionKey::new(server, Some(root))` (i.e. `ConnectionRoot::Marker`) →
+    its own connection: reused if one already runs for that root, else spawned
+    with the workspace seeding `InitializeParams` via `build_initialize_request`
+    (`protocol/lifecycle.rs`). A `nil` workspace maps to the `ClientFallback`
+    key — which `workspace_from_marker`'s fallback roots at the **upstream
+    client's** `rootUri`/`workspaceFolders`, not at "no folder".
   - **Shared instance (`preferSharedInstance`, #391).** Marker-rooted documents
     join one `Shared` connection via `workspace/didChangeWorkspaceFolders` (the
     `WorkspaceFolderSet`, defined in `workspace/folder_set.rs`, driven from
-    `pool.rs`). If that shared connection came up **without**
+    `pool.rs`). A shared connection that came up **without**
     `workspace.workspaceFolders.changeNotifications`
-    (`supports_workspace_folder_changes` reads static `InitializeResult`
-    capabilities only — there is no dynamic `client/registerCapability`
-    tracking), `resolve_acquire` **diverts the document to its own per-root
-    process** rather than dropping it.
+    (`supports_workspace_folder_changes`, static `InitializeResult` capabilities
+    only — no dynamic `client/registerCapability` tracking) cannot take on a new
+    root, so the document is **diverted to its own per-root process** (not
+    dropped). This divert happens at **two** sites, because the shared
+    connection's capability is only known once it is `Ready`:
+    - **Early** in `resolve_acquire` — when the shared handle is *already*
+      `Ready` and incapable.
+    - **Late** in `get_or_create_connection_wait_ready` — when the shared
+      handle was still `Initializing` at acquire time (the catch-all routes it
+      to the shared key optimistically), then comes up incapable; after
+      `wait_for_ready` it re-checks and re-keys to the per-root process,
+      reusing the already-resolved marker to avoid a second filesystem walk.
 
 ### 5. Cache contract
 
@@ -285,4 +310,4 @@ Not yet implemented. As of this record:
 - [lua-host-api](lua-host-api.md): the `kakehashi.*` Lua functions the resolver calls (`path`, `fs` incl. `find_ancestor`, `env.current_dir`) and the path-vs-URI boundary.
 - [language-server-bridge](language-server-bridge.md): the bridge this resolver feeds.
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md): pool keys and spawn-time workspace seeding the resolver result must integrate with.
-- [wildcard-config-inheritance](wildcard-config-inheritance.md): how `languageServers._` defaults (including `workspaceMarkers`/`workspaceResolver`) are inherited.
+- [wildcard-config-inheritance](wildcard-config-inheritance.md): how `languageServers._` defaults *will* inherit `workspaceMarkers`/`workspaceResolver` — via the existing per-field merge in `merge_bridge_server_configs` (`src/config/merge.rs`); that ADR documents the wildcard model generally and does not yet name these fields.

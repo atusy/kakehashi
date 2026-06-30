@@ -32,8 +32,11 @@ and the **inclusion criteria** that gate future additions.
 
 A `kakehashi.*` function is provided only if it meets at least one of:
 
-1. **Correctness Lua stdlib cannot guarantee** — e.g. cross-platform path
-   semantics matching Rust's `std::path`, URI percent-decoding.
+1. **Correctness Lua stdlib cannot guarantee** — e.g. cross-platform `std::path`
+   semantics (separators, roots, `ancestors`), which `string.match` cannot get
+   right portably. (URI handling is *not* an example here — it is centralized at
+   the boundary in Rust and deliberately not exposed as a Lua function; see
+   Considered Options.)
 2. **Sandboxed host access** the stripped environment otherwise denies —
    filesystem reads, working directory.
 3. **Reuse of non-trivial kakehashi Rust logic** the resolver should not
@@ -62,8 +65,9 @@ side-effect-free" a guarantee a reader can rely on.
 
 ### Surface (initial)
 
-All functions are snake_case (matching Rust and the resolver examples). A
-return of `nil` corresponds to Rust's `None`.
+All functions are snake_case (matching the resolver examples and the project's
+Lua-side naming — Rust's own methods are camelCase, e.g. `Path::is_absolute`).
+A return of `nil` corresponds to Rust's `None`.
 
 #### `kakehashi.path` — pure path manipulation (no I/O)
 
@@ -87,9 +91,12 @@ needs); deliberately pure and side-effect-free.
 `nil`-returning cases mirror Rust exactly: `parent("/")` → `nil`,
 `extension("README")` → `nil`, etc. All wrapped methods are stable since Rust
 1.0 (`ancestors` since 1.28) **except `Path::file_prefix`, stabilized in 1.91**
-— including it sets an implicit MSRV floor of 1.91. The project currently pins
-no MSRV and builds on ≥1.95, so this is a recorded caveat, not a blocker; drop
-`file_prefix` (it overlaps `file_stem`) if an older toolchain must be supported.
+— including it raises the implicit MSRV floor to 1.91. The project pins no MSRV
+(`Cargo.toml` has no `rust-version`; `flake.nix` tracks `stable.latest` and CI
+uses the default toolchain), so the effective floor just follows that channel —
+a recorded caveat, not a blocker. Drop `file_prefix` (it overlaps `file_stem`),
+or add `rust-version = "1.91"` to `Cargo.toml`, if an older toolchain must be
+supported.
 
 #### `kakehashi.fs` — read-only host filesystem (criteria 2 and 3)
 
@@ -118,14 +125,17 @@ workspace-specific function — finding a project root is just one use. It reuse
 reimplement the walk:
 
 - `start`: a path. The search's **base directory** is `start` itself when it is
-  an existing directory, or `start`'s parent otherwise — including when `start`
-  does **not** exist (e.g. an unsaved/new document path), which is treated as a
-  file path, matching `find_marker_root`. The walk checks the base directory
-  **and** each ancestor.
+  an existing directory (`metadata().is_dir()`), or `start`'s parent otherwise —
+  including when `start` does **not** exist (e.g. an unsaved/new document path),
+  which is treated as a file path. The file case mirrors `find_marker_root`
+  (parent + ancestors); the existing-directory case is the new generalization
+  (see the note). The walk checks the base directory **and** each ancestor.
 - `markers`: `(string | string[])[]` — a nested array is an equal-priority
   group. This is the **same shape** as `workspaceMarkers`, but the function
   does not assume the result is a workspace. (The resolver's return no longer
   accepts raw markers; it calls this function instead — see workspace-resolver.)
+  An **empty list `{}` is the explicit kill switch**: it returns `nil` without
+  searching, matching `find_marker_root`.
 - Returns the first directory (base, then ancestors) containing a marker, or
   `nil`.
 
@@ -201,7 +211,12 @@ universally byte-representable, so the boundary needs **one** defined encoding:
 
 - **Unix:** an `OsStr` path *is* bytes, so paths cross the boundary losslessly
   as raw byte strings — including non-UTF-8 paths (which Lua holds fine, though
-  `string.*` pattern functions may behave oddly on them).
+  `string.*` pattern functions may behave oddly on them). The implementation
+  must use the **byte-level channel** for this to hold: `OsStr::as_bytes` /
+  `OsStrExt::from_bytes` (`std::os::unix::ffi`) paired with `mlua`'s `[u8]`-
+  accepting `create_string` / `String::as_bytes`. A naive `String`/`&str`
+  wrapper would lossily corrupt non-UTF-8 Unix paths — the byte channel is
+  load-bearing, not incidental.
 - **Windows:** paths are **strict UTF-8** (not WTF-8). A Windows path containing
   unpaired UTF-16 surrogates is therefore **not representable and fails
   closed** — we deliberately do *not* adopt WTF-8's lossless surrogate encoding,
@@ -210,13 +225,18 @@ universally byte-representable, so the boundary needs **one** defined encoding:
 
 Failure shape depends on **direction**, because the declared return types differ:
 
-- **Host → Lua (kakehashi produces an OS path).** These are the only places a
-  non-representable path can surface, and their return types are nullable
-  accordingly: `fs.find_ancestor` and `env.current_dir` return `string | nil`.
-  `document_info.path` is the exception — it is typed plain `string` and never
-  surfaces this failure, because workspace-resolver §2 **skips the resolver
-  entirely** for a document whose path is not representable. So inside a running
-  resolver `document_info.path` is always valid.
+- **Host → Lua (kakehashi produces an OS path).** Non-representability can
+  surface only on the **Windows** side (a producible OS path that is not strict
+  UTF-8); on Unix the byte channel above always succeeds. Producers whose return
+  can fail are typed nullable: `fs.find_ancestor` and `env.current_dir` return
+  `string | nil`. `document_info.path` is the exception — typed plain `string`,
+  it never surfaces this failure because workspace-resolver §2 **skips the
+  resolver entirely** for a document whose path is not representable, so inside a
+  running resolver it is always valid. `path.*` returns (`parent`, `ancestors`,
+  `file_name`, …) take a Lua string and produce one: on Windows their input is
+  already strict UTF-8 (per the `Lua → host` rule), so their output is too — no
+  extra failure case, declared return types unchanged; on Unix they round-trip
+  bytes.
 - **Lua → host (a Lua byte-string path argument).** *Every* path that crosses
   back to the host — all `path.*` and `fs.*` arguments **and the resolver's
   string workspace return** — must decode into an OS `Path` to apply `std::path`
@@ -228,7 +248,16 @@ Failure shape depends on **direction**, because the declared return types differ
   of leaking a misleading `false`. The error fails the resolver closed (§6),
   which is the safe outcome.
 
-Not yet implemented; the Windows surrogate edge is recorded as an open question.
+### Open questions
+
+Deferred to implementation (cross-referenced from workspace-resolver § "Open
+questions"):
+
+- **`fs.read_to_string` size cap value** — the read is capped (the §3 in-VM hook
+  cannot interrupt a host read), but the exact byte limit is open.
+- **Windows surrogate edge** — paths with unpaired UTF-16 surrogates fail closed
+  under the strict-UTF-8 contract; whether any caller ever needs lossless
+  (WTF-8) handling is open.
 
 ## Considered Options
 
@@ -271,7 +300,9 @@ Not yet implemented; the Windows surrogate edge is recorded as an open question.
   returns an ancestor *directory*; finding a workspace root is one use, not its
   definition. `find_workspace`/`find_root` over-narrow it to a single consumer,
   and `find_marker` misreads as returning the marker. `find_ancestor` names the
-  return type and pairs with `path.ancestors`.
+  return type, and reads as a filtered `path.ancestors` walk (the first ancestor
+  matching a marker) — though `path.ancestors` returns the full list while
+  `find_ancestor` returns just that first match.
 
 - **Writable `fs` / `os.execute` / env-var reads.** Rejected for now. Read-only
   fs covers the known use cases; writes and subprocess spawning enlarge the
