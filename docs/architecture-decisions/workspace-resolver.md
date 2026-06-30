@@ -74,9 +74,19 @@ Key properties:
 - **`document_info` is always present** (file-first model), so it is
   non-optional. Its fields — including `text` — are materialized **lazily via a
   metatable** to avoid copying large documents into Lua when the resolver never
-  reads them.
+  reads them. `document_info.path` is a plain `string` (never nil) **because**
+  of the skip rule below: a document without a representable filesystem path
+  never reaches a running resolver.
 - **`workspaceMarkers` is the fallback**, used only when `workspaceResolver` is
-  unset. They are not layered; a configured resolver fully governs the decision.
+  unset — with **one exception**: a configured resolver is **skipped** for a
+  document that has no representable filesystem path (a non-`file://` URI, or a
+  `file://` path that fails the encoding contract in lua-host-api). Such a
+  document is resolved exactly as if no `workspaceResolver` were set — via
+  `workspaceMarkers`, which itself falls through to `ClientFallback` when no
+  marker resolves (a non-file URI resolves no marker, so it lands on
+  `ClientFallback`). This skip is distinct from §6 fail-closed: the resolver was
+  not run, so the document still attaches; fail-closed applies only when a
+  resolver that *did* run errors or times out.
 - **The second return is always a filesystem path (or nil)** — never raw
   markers. A resolver that wants marker-based resolution calls
   `kakehashi.fs.find_ancestor` itself (see lua-host-api), so there is one
@@ -176,10 +186,10 @@ Deferred to implementation, recorded so they are not lost:
 - **`read_to_string` size cap.** Per §3 the in-VM hook cannot interrupt a host
   read, so `kakehashi.fs.read_to_string` needs its own large-file bound (see
   lua-host-api); the exact cap is open.
-- **Non-`file://` documents.** The "file-first" framing assumes a filesystem
-  path. What `document_info.path` (and the path-based host API) yield for
-  `untitled:` and other non-`file://` URIs is undefined; likely the resolver
-  should be skipped (fall back to `workspaceMarkers`/no folder) for those.
+- **Non-`file://` documents.** Per §2 these skip the resolver and resolve via
+  `workspaceMarkers` → `ClientFallback`. Open: whether any non-`file://` scheme
+  (e.g. a remote/virtual fs) should instead derive a usable path and run the
+  resolver after all.
 - **Stuck-worker recovery** (§3, §6): the policy for abandoning and replacing a
   worker wedged in a hung filesystem syscall — timeout, replacement, and what to
   leak — is left open.
@@ -257,7 +267,8 @@ Deferred to implementation, recorded so they are not lost:
 - Resolver evaluation is off the request hot path (attach time only) and capped
   by timeout, so it does not affect semantic-token or diagnostic latency.
 - `workspaceResolver` and `workspaceMarkers` are either/or per server, not
-  layered.
+  layered — the one exception being the §2 skip rule (a document with no
+  representable path resolves via `workspaceMarkers`/`ClientFallback`).
 
 ## Decision–Implementation Gap
 

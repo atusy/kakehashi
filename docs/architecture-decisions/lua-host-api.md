@@ -154,7 +154,7 @@ Mirrors `std::env`. Initially one function:
 
 | Function | Returns |
 |---|---|
-| `env.current_dir()` | `string` — the process working directory, wrapping `std::env::current_dir()` (`getcwd(2)`) |
+| `env.current_dir()` | `string \| nil` — the process working directory, wrapping `std::env::current_dir()` (`getcwd(2)`); `nil` if it is not representable per the encoding contract |
 
 `env.current_dir()` subsumes the `workspaceFallback`/`"$PWD"` idea deferred in
 workspace-resolver: a resolver can simply `return true, kakehashi.env.current_dir()` as
@@ -205,12 +205,25 @@ universally byte-representable, so the boundary needs **one** defined encoding:
   trading exotic-path support for a single, simple, round-trippable string type
   that Lua `string.*` can operate on.
 
-Failure shape is uniform: a path that cannot be represented yields the same
-result as an unreadable/missing path — host **functions** (`fs.*`, `path.*`)
-return `nil`; the **`document_info.path` field** yields `nil`, and a resolver
-that needs the path should treat `nil` as "skip / fall back to
-`workspaceMarkers`" (the same bucket as non-`file://` documents). Not yet
-implemented; the Windows surrogate edge is recorded as an open question.
+Failure shape depends on **direction**, because the declared return types differ:
+
+- **Host → Lua (kakehashi produces an OS path).** These are the only places a
+  non-representable path can surface, and their return types are nullable
+  accordingly: `fs.find_ancestor` and `env.current_dir` return `string | nil`.
+  `document_info.path` is the exception — it is typed plain `string` and never
+  surfaces this failure, because workspace-resolver §2 **skips the resolver
+  entirely** for a document whose path is not representable. So inside a running
+  resolver `document_info.path` is always valid.
+- **Lua → host (a Lua byte-string path argument).** `path.*` are pure
+  byte-string functions — they operate on the bytes and keep their declared
+  return types (`boolean`, or `string | nil` mirroring Rust `None`), with no
+  encoding-failure case. The `fs.*` predicates (`exists`/`is_file`/`is_dir`)
+  must materialize an OS path from the argument; a byte string that is not a
+  valid path on the platform (only reachable on Windows via a deliberately
+  fabricated non-UTF-8 string) raises a **Lua error** rather than a misleading
+  `false`. The error fails the resolver closed (§6), which is the safe outcome.
+
+Not yet implemented; the Windows surrogate edge is recorded as an open question.
 
 ## Considered Options
 
