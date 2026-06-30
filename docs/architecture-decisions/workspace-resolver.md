@@ -125,8 +125,8 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
     `workspace_from_marker` (defined in `root_markers.rs`, called from `pool.rs`)
     would otherwise supply.
   - Server already running, a new document arrives → a returned folder is added
-    via `workspace/didChangeWorkspaceFolders` (the `WorkspaceFolderSet` in
-    `pool.rs`). **Precondition:** this only reaches a server that advertised
+    via `workspace/didChangeWorkspaceFolders` (the `WorkspaceFolderSet`, defined
+    in `workspace/folder_set.rs` and driven from `pool.rs`). **Precondition:** this only reaches a server that advertised
     `workspace.workspaceFolders.changeNotifications` (or dynamically registered
     it); the implementation already gates on `supports_workspace_folder_changes`,
     so for a non-supporting running server a resolver's returned folder is
