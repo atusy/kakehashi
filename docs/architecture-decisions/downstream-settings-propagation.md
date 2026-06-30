@@ -57,9 +57,10 @@ tree.** Concretely, three coupled changes:
   `workspace.configuration = true` so spec-compliant downstream servers will
   send `workspace/configuration`.
 - Add `settings: Option<Value>` to `BridgeServerConfig` (opaque passthrough;
-  kakehashi never interprets the contents) and to the deep-merge in
-  `merge_bridge_server_configs` (overlay-wins-when-present, like
-  `initialization_options`), so it composes across config layers.
+  kakehashi never interprets the contents) and to `merge_bridge_server_configs`,
+  where it **deep-merges** across config layers exactly like
+  `initialization_options` (nested objects merge, overlay scalars win), so a
+  project layer can override one sub-key without restating the rest.
 - After `initialized`, if the server's merged `settings` is non-null, kakehashi
   sends one `workspace/didChangeConfiguration { settings }` so push-model
   servers are configured even before they pull.

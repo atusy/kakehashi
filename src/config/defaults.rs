@@ -42,6 +42,7 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             // generated template documents the opt-in and the knob is
             // discoverable (#391). Concrete servers inherit it via the wildcard.
             prefer_shared_instance: Some(false),
+            settings: None,
         },
     )])
 }

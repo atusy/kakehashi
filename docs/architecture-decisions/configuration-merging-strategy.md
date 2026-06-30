@@ -140,7 +140,7 @@ final_config = [defaults, user_config, project_config, InitializationOptions]
 
 **Bridge servers HashMap** (`languageServers`):
 - **Deep merge at server level**: Keys (server names) from later sources override same keys from earlier sources
-- **Deep merge within each server**: Individual fields (`cmd`, `languages`, `initializationOptions`, `onTypeFormattingTriggers`) are merged (list options like `onTypeFormattingTriggers` are overlay-wins-when-present, not unioned)
+- **Deep merge within each server**: Individual fields (`cmd`, `languages`, `initializationOptions`, `settings`, `onTypeFormattingTriggers`) are merged (JSON-object fields `initializationOptions` and `settings` deep-merge; list options like `onTypeFormattingTriggers` are overlay-wins-when-present, not unioned). `settings` carries downstream workspace configuration propagated post-initialize — see downstream-settings-propagation.
 - Example:
   ```toml
   # user config

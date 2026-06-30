@@ -1077,6 +1077,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
 
@@ -1113,6 +1114,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
 
@@ -1153,6 +1155,7 @@ mod tests {
                 )]),
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
         servers.insert(
@@ -1164,6 +1167,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
 
@@ -1229,6 +1233,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
         servers.insert(
@@ -1240,6 +1245,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
 
@@ -1293,6 +1299,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
 
@@ -1329,6 +1336,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
 
@@ -1446,6 +1454,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
 
@@ -1670,6 +1679,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
 

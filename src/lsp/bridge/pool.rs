@@ -2072,6 +2072,7 @@ mod tests {
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
+            settings: None,
             ..devnull_config()
         }
     }
@@ -2677,6 +2678,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            settings: None,
         };
 
         let result = pool

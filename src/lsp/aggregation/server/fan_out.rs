@@ -143,6 +143,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             }),
         }
     }

@@ -341,7 +341,7 @@ impl RootMarker {
 ///
 /// This is used to configure external language servers (like rust-analyzer, pyright)
 /// that kakehashi can redirect requests to for injection regions.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
@@ -357,6 +357,20 @@ pub struct BridgeServerConfig {
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize
     pub initialization_options: Option<Value>,
+    /// Optional workspace settings for the server, propagated *after*
+    /// initialize: answered to the server's `workspace/configuration` pulls and
+    /// pushed via `workspace/didChangeConfiguration` (downstream-settings-propagation).
+    ///
+    /// Distinct from `initialization_options`, which is consumed only at
+    /// `initialize` time: a runtime change to `settings` reaches a running
+    /// server, whereas an `initialization_options` change needs a restart.
+    ///
+    /// Treated as the editor-style settings root: a downstream
+    /// `workspace/configuration` item's `section` (e.g. `"rust-analyzer.cargo"`)
+    /// is resolved as a dotted path into this object. The contents are opaque to
+    /// kakehashi (passthrough), exactly like `initialization_options`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Value>,
     /// Marker files/directories that locate the workspace root for this
     /// server, mirroring Neovim's `vim.fs.root` `(string|string[])[]` shape:
     /// entries are tried in list order (earlier = higher priority) and each
@@ -1418,6 +1432,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            settings: None,
         };
         let servers = HashMap::from([
             ("a".to_string(), server(Some(vec!["}", ";"]))),
@@ -1456,6 +1471,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
+                settings: None,
             },
         )]);
         assert_eq!(
@@ -1550,6 +1566,7 @@ mod tests {
             ]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            settings: None,
         };
 
         let json = serde_json::to_value(&config).unwrap();

@@ -323,6 +323,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
         server.settings_manager.apply_settings(WorkspaceSettings {
@@ -415,6 +416,7 @@ print("hello")
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         );
         let mut languages = HashMap::new();
