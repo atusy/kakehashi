@@ -1,6 +1,6 @@
-//! `CacheCoordinator` unifies the four semantic-token caches under one API:
-//! `SemanticTokenCache`, `InjectionMap`, `InjectionTokenCache`, and
-//! `SemanticRequestTracker` (in-flight cancellation).
+//! `CacheCoordinator` unifies the semantic-token caches under one API:
+//! `SemanticTokenCache`, `SemanticTokenRangeCache`, `InjectionMap`,
+//! `InjectionTokenCache`, and `SemanticRequestTracker` (in-flight cancellation).
 //!
 //! The semantic-token cache is intentionally **not** invalidated on `didChange`
 //! — `semanticTokens/full/delta` needs the previous version for delta
@@ -31,8 +31,9 @@ pub(crate) type RequestId = u64;
 
 /// Coordinates all cache structures for semantic token operations.
 ///
-/// This struct wraps four underlying caches and provides a unified API
-/// for document lifecycle management, edit handling, and token operations.
+/// This struct wraps five underlying caches (full tokens, range tokens, the
+/// injection map, injection-region tokens, and request tracking) and provides a
+/// unified API for document lifecycle management, edit handling, and token operations.
 pub(crate) struct CacheCoordinator {
     semantic_cache: SemanticTokenCache,
     /// Most-recent `semanticTokens/range` result per URI (#535), keyed by viewport

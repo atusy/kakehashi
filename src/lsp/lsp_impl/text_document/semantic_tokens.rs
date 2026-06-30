@@ -895,17 +895,18 @@ impl Kakehashi {
         )
         .await;
 
-        // Convert to RangeResult, treating partial responses as empty for now.
-        // Cache ONLY a clean `Tokens` result (#535): a `Partial` is a degraded
-        // response and a `None` is a transient miss/cancel — caching either could
-        // serve a degraded set on a later identical-viewport re-request.
+        // Convert to RangeResult. Cache ONLY a clean `Tokens` result (#535); a
+        // `Partial` is passed through to the client as-is but NOT cached (it is a
+        // degraded response), and a `None` becomes an empty `Tokens` and is not
+        // cached either (transient miss/cancel) — caching either could serve a
+        // degraded set on a later identical-viewport re-request.
         let domain_range_result = match result {
             Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens)) => {
-                // `language_name` is unused after this arm, so move it (no clone);
-                // `tokens` is cloned because the store and the response below each
-                // need an owned copy.
+                // `uri` and `language_name` are unused after this arm, so move them
+                // (no clone); `tokens` is cloned because the store and the response
+                // below each need an owned copy.
                 self.cache.store_range_tokens(
-                    uri.clone(),
+                    uri,
                     domain_range,
                     language_name,
                     tokens.clone(),
