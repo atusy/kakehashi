@@ -284,23 +284,32 @@ paths; an audit surfaced four the original design did not address:
    text would serve tokens computed under the *old* highlight query.
    **Mitigation: fold the settings generation into the entry's validity, the
    same fix PR #530 applied to the whole-doc cache (where the inner cache takes a
-   derived `cache_key`). This is the right design — it matches the existing
-   pattern and avoids a global flush — but it is not free: wiring the reuse half
-   already promotes `store`/`get` from `#[cfg(test)]` to production, extends their
+   derived `cache_key`). This is preferred for a concrete correctness reason, not
+   just neatness: a bare global `clear()` on reload has a store-after-clear race —
+   a request already computing when the reload fires captured the pre-bump
+   generation and writes its now-stale entry *after* the clear, which the clear
+   cannot prevent (exactly why #530 folds a generation into the key instead of
+   only clearing; see the `semantic_token_generation` note on `CacheCoordinator`
+   in `src/lsp/cache.rs`). The fold is not free — wiring the reuse half already
+   promotes `store`/`get` from `#[cfg(test)]` to production, extends their
    signatures to thread the validity key, and changes the value type to
-   `Vec<RawToken>` (Option A); folding the generation rides along on those same
-   signatures. The alternative — a new global `clear()` on `InjectionTokenCache`
-   called from `bump_semantic_token_generation` — is a single new method, but
-   flushes every region on any reload.**
+   `Vec<RawToken>` (Option A), and the generation rides along on those same
+   signatures. A one-method global `clear()` from `bump_semantic_token_generation`
+   is simpler and the flush is cheap on a rare reload, but it trades that
+   race-safety away.**
 3. **Parser-load race (guard).** `process_injection_sync` returns an empty
    `Vec<RawToken>` when a region's parser is not yet loaded — indistinguishable
    from a genuinely empty region, so "never store on the parser-missing branch"
    first requires making that branch *observable*. **Mitigation: have
    `process_injection_sync` return a structured result that separates
    parser-missing from genuinely-empty (e.g. `Option`/`Result` or a
-   `parser_loaded` flag), or perform the cache write inside `process_injection_sync`
-   where the parser's presence is explicit — so a parser-missing result is never
-   stored.**
+   `parser_loaded` flag) and let the orchestration layer
+   (`collect_injection_tokens_parallel`) make the store decision — so a
+   parser-missing result is never stored. Prefer this over writing the cache
+   inside `process_injection_sync`: it runs in parallel Rayon workers, so an
+   in-function write would thread thread-safe cache-write access into parallel
+   tokenization and add side-effects there, whereas a pure structured return
+   keeps the store decision at the single-threaded orchestration boundary.**
 4. **Row-0 `start_column` re-anchoring (guard, sidestepped by v1 scope).** A
    same-line-before edit shifts row-0 columns without changing the content hash.
    Out of scope for v1 by the `content_start_col == 0` predicate; required only
