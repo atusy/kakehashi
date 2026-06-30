@@ -230,24 +230,34 @@ ranges, `region_id`s minted against the `NodeTracker`), which text equality only
 *identify*. So the design ties the discovery to the **tree itself**, two ways in
 preference order:
 
-- **Preferred — couple it to the parse result.** Store the discovered contexts
-  *alongside the tree* in the document's parse result, set in the same CAS that
-  publishes the tree (`set_parse_result_if_text_and_incarnation_unchanged`,
-  `coordinator/parse.rs`). The semantic path then reads `(tree, discovery)` from a
-  single atomic document snapshot — they are physically one unit, so **there is no
-  gate to get wrong**: a snapshot either carries discovery (reuse) or does not
-  (the on-demand-parse fallback tree → discover inline). Collision, `A→B→A`, and
-  region_id-orphan all vanish because the cached discovery cannot outlive or
-  mismatch its tree.
+- **Preferred — couple it to the parse result.** Make the discovered contexts
+  part of the document's parse result so the semantic path reads `(tree, discovery)`
+  from one atomic snapshot — physically one unit, **no gate to get wrong**: a
+  snapshot carries discovery (reuse) or does not (the on-demand-parse fallback tree
+  → discover inline). The realizability constraint is the current ordering:
+  `populate_injections` runs *after* the tree CAS
+  (`set_parse_result_if_text_and_incarnation_unchanged`, `coordinator/parse.rs`),
+  and the full build calls `tracker.get_or_create`, which must **not** run for a
+  parse that loses the CAS (it would mint ids from stale-tree coordinates against
+  the shared `NodeTracker` — the side effect today's "build only after the CAS
+  lands" ordering avoids). So the publication scheme is: **publish the tree first;
+  build discovery; then attach it via a second CAS that no-ops unless the tree /
+  parse epoch is still the one just published.** Discovery is therefore briefly
+  *absent* between the two CASes (a request in that window re-discovers inline),
+  but never mismatched. `tracker.get_or_create` runs only on the winning parse.
 - **Alternative — a parse epoch.** If coupling into the parse result is too
-  invasive, key a separate `DiscoveredInjectionCache` on the monotonic
-  per-document **parse epoch / incarnation** that `mark_parse_finished` already
-  carries (not the text hash), and have the semantic path confirm the tree it
-  snapshotted is that epoch. An epoch is exact (no collision) and distinct across
-  an `A→B→A` cycle.
+  invasive, key a separate `DiscoveredInjectionCache` on a **fresh monotonic
+  per-parse epoch** — *not* `incarnation` (preserved across edits, so it cannot
+  distinguish `A→B→A`) and *not* a separately-read "current" epoch (tree
+  replacement races the read). The epoch must be stamped onto the tree
+  *atomically* in the publication CAS (`(tree, epoch)`), and the semantic path must
+  snapshot tree and epoch together; reuse only when the stored discovery's epoch
+  equals the snapshot's. An epoch is exact (no collision) and distinct across an
+  `A→B→A` cycle.
 
 Either way the settings `generation` still gates the injected-query / highlight
-validity (a reload must miss), and ordering (below) affects only hit-rate.
+validity (a reload must miss; see correctness surface 7 for the reload-ordering
+obligation), and parse ordering (below) affects only hit-rate.
 
 **Currency — hit-rate, not correctness.** Correctness rests on the tree-identity
 binding above; ordering only governs how often a reusable discovery is *available*
@@ -371,14 +381,18 @@ everywhere the existing `injection_map` / `injection_token_cache` are —
 `populate_injections` (`src/lsp/cache.rs`). Memory grows by a second per-region
 owned structure (the `included_ranges` / prefix / exclusion vectors) beyond the
 token half's per-region token vector, bounded by the same `clear_document` / close
-path; the Consequences section needs that addendum. (7) **Generation snapshot
-protocol.** Registry/query mutation precedes the `bump_semantic_token_generation`
-bump (`src/lsp/lsp_impl.rs`), so a `populate_injections` racing a reload could
-observe new registry/query state while tagging the result with the *old*
-generation. populate must snapshot the generation *before* building and re-check
-it *after* (or treat registry state + generation as one atomic epoch) — the same
-store-after-reload discipline the token half applies — so a stale-tagged-fresh
-discovery entry is never stored, then served, post-reload.
+path; the Consequences section needs that addendum. (7) **Generation / registry
+must be one atomic config epoch.** Registry/query mutation currently *precedes* the
+`bump_semantic_token_generation` bump (`src/lsp/lsp_impl.rs`), so
+snapshot-before-build / recheck-after is **not** sufficient on its own: a build can
+observe new (or mixed) registry state while both the before- and after-reads still
+return the *old* generation, tagging stale-query discovery as current. Closing this
+requires making the registry swap and the generation bump a single atomic
+configuration epoch — bump-*before*-mutation, an odd/even seqlock around the swap,
+or a config lock — so that any build observing new registry state necessarily reads
+a new generation. (This ordering also tightens the shipped token half, whose
+`generation` validity rests on the same assumption; the discovery lever makes it
+load-bearing because populate resolves queries and builds contexts off-ingress.)
 
 ## Considered Options
 
@@ -538,7 +552,9 @@ generation folded into validity). The whole-document layer (Option C) shipped as
 PR #530.
 
 What remains a gap is the **injection-discovery companion lever** (the
-don't-discover-twice design above): not implemented. Its `DiscoveredInjectionCache`,
-the content-hash/generation currency gate, the `discovery_complete`-gated store,
-and the lifecycle wiring are the open work; until it lands, an edit still runs the
+don't-discover-twice design above): not implemented. Its shared `Q →
+build_contexts_from_regions` stage, the tree-identity binding (parse-result
+coupling or a per-parse epoch stamped atomically with the tree), the atomic
+config-epoch reload protocol, the `discovery_complete`-gated store, and the
+lifecycle wiring are the open work; until it lands, an edit still runs the
 injection query twice (off-ingress `populate_injections` + the semantic request).
