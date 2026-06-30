@@ -214,14 +214,15 @@ Failure shape depends on **direction**, because the declared return types differ
   surfaces this failure, because workspace-resolver §2 **skips the resolver
   entirely** for a document whose path is not representable. So inside a running
   resolver `document_info.path` is always valid.
-- **Lua → host (a Lua byte-string path argument).** `path.*` are pure
-  byte-string functions — they operate on the bytes and keep their declared
-  return types (`boolean`, or `string | nil` mirroring Rust `None`), with no
-  encoding-failure case. The `fs.*` predicates (`exists`/`is_file`/`is_dir`)
-  must materialize an OS path from the argument; a byte string that is not a
-  valid path on the platform (only reachable on Windows via a deliberately
-  fabricated non-UTF-8 string) raises a **Lua error** rather than a misleading
-  `false`. The error fails the resolver closed (§6), which is the safe outcome.
+- **Lua → host (a Lua byte-string path argument).** *Every* path consumer —
+  all `path.*` and all `fs.*` — must decode the argument into an OS `Path` to
+  apply `std::path` semantics, so they share one validation rule: on Unix any
+  byte string is a valid path (infallible); on **Windows** the argument must be
+  valid UTF-8, and a fabricated non-UTF-8 string raises a **Lua error**. The
+  error is out-of-band, so declared return types are unchanged — `path.*` stay
+  pure (deterministic, no I/O) and the `fs.*` predicates keep `boolean` instead
+  of leaking a misleading `false`. The error fails the resolver closed (§6),
+  which is the safe outcome.
 
 Not yet implemented; the Windows surrogate edge is recorded as an open question.
 
