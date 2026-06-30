@@ -4,17 +4,18 @@ use url::Url;
 
 use crate::document::DocumentStore;
 use crate::language::injection::{InjectionResolver, collect_all_injections};
-use crate::language::{DocumentParserPool, LanguageCoordinator};
+use crate::language::{DocumentParserPool, LanguageCoordinator, LanguageEvent};
 use crate::lsp::auto_install::AutoInstallManager;
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::bridge::coordinator::BridgeInjection;
 use crate::lsp::cache::CacheCoordinator;
+use crate::lsp::client::ClientNotifier;
 use crate::lsp::diagnostic_cache::{DiagnosticAggregator, DiagnosticSource};
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
 
-use crate::lsp::lsp_impl::detect_document_language;
+use crate::lsp::lsp_impl::{build_notifier, detect_document_language};
 
 use super::InstallCoordinator;
 use super::install::InstallCoordinatorDeps;
@@ -216,6 +217,30 @@ impl InjectionCoordinator {
             install.auto_install_disabled_reason()
         };
 
+        // Events emitted while loading an injected-language parser that was on disk
+        // but not yet loaded — a one-time `Log` plus (when the language has queries)
+        // a `SemanticTokensRefresh`. These were previously dropped here, so a freshly
+        // loaded injected language never nudged the editor to re-pull its tokens
+        // (#532). Collected and forwarded once after the loop; #531's batch dedup
+        // collapses multiple refresh events into a single workspace-wide request.
+        //
+        // Scope/value: this only matters in the narrow window where the editor
+        // already pulled tokens before this background install-check loaded the
+        // parser. The async auto-install case is already covered by
+        // `reload_language_after_install`, and when a parser is on disk the
+        // token-collection path loads it inline and returns the injected tokens in
+        // the same `semanticTokens/full` response. So this is a defensive nudge, not
+        // a hot path.
+        //
+        // Only the success path is collected: the failure path delegates to
+        // `notify_parser_missing` / `maybe_auto_install_language`, which emit their
+        // own user-facing messages (and the install path forwards its own load
+        // events), so forwarding failure events here would double-message. The whole
+        // success vector is forwarded (log + refresh) for consistency with the
+        // host/derived load path; it fires at most once per language (a re-load of
+        // an already-registered language returns no events).
+        let mut load_events: Vec<LanguageEvent> = Vec::new();
+
         for lang in languages {
             let resolved_lang = if self.language.has_parser_available(lang) {
                 lang.clone()
@@ -227,6 +252,7 @@ impl InjectionCoordinator {
 
             let load_result = self.language.ensure_language_loaded(&resolved_lang);
             if load_result.success {
+                load_events.extend(load_result.events);
                 continue;
             }
 
@@ -244,6 +270,16 @@ impl InjectionCoordinator {
                     .await;
             }
         }
+
+        // Forward the collected load events (deduped to ≤1 refresh by #531) so the
+        // editor re-pulls tokens for any injected language loaded just now.
+        if !load_events.is_empty() {
+            self.notifier().log_language_events(&load_events).await;
+        }
+    }
+
+    fn notifier(&self) -> ClientNotifier<'_> {
+        build_notifier(&self.client, &self.settings_manager)
     }
 
     /// Eagerly spawn bridge servers and open virtual documents for detected injections.
