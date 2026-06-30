@@ -277,9 +277,15 @@ paths; an audit surfaced four the original design did not address:
    signatures. The alternative — a new global `clear()` on `InjectionTokenCache`
    called from `bump_semantic_token_generation` — is a single new method, but
    flushes every region on any reload.**
-3. **Parser-load race (guard).** `process_injection_sync` returns empty tokens
-   when a region's parser is not yet loaded — indistinguishable from a genuinely
-   empty region. **Mitigation: never store on the parser-missing branch.**
+3. **Parser-load race (guard).** `process_injection_sync` returns an empty
+   `Vec<RawToken>` when a region's parser is not yet loaded — indistinguishable
+   from a genuinely empty region, so "never store on the parser-missing branch"
+   first requires making that branch *observable*. **Mitigation: have
+   `process_injection_sync` return a structured result that separates
+   parser-missing from genuinely-empty (e.g. `Option`/`Result` or a
+   `parser_loaded` flag), or perform the cache write inside `process_injection_sync`
+   where the parser's presence is explicit — so a parser-missing result is never
+   stored.**
 4. **Row-0 `start_column` re-anchoring (guard, sidestepped by v1 scope).** A
    same-line-before edit shifts row-0 columns without changing the content hash.
    Out of scope for v1 by the `content_start_col == 0` predicate; required only
