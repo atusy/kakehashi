@@ -313,7 +313,7 @@ impl BridgeLanguageConfig {
     }
 }
 
-/// A single `rootMarkers` entry, mirroring Neovim's `vim.fs.root`
+/// A single `workspaceMarkers` entry, mirroring Neovim's `vim.fs.root`
 /// `(string|string[])[]` shape: a bare string is its own priority tier; a
 /// nested array is an equal-priority group. Entries are tried in list order
 /// (earlier wins); within a group all names are equal and the nearest
@@ -381,7 +381,11 @@ pub struct BridgeServerConfig {
     /// `None` = inherit (built-in default `[".git"]`); an explicit `[]`
     /// disables the search (the client-supplied root is forwarded as-is).
     /// When no marker matches, the client-supplied root is the fallback.
-    pub root_markers: Option<Vec<RootMarker>>,
+    ///
+    /// The wire key is `workspaceMarkers`; the pre-rename key `rootMarkers` is
+    /// kept as a deprecated serde alias for backward compatibility.
+    #[serde(alias = "rootMarkers")]
+    pub workspace_markers: Option<Vec<RootMarker>>,
     /// Trigger characters for bridged `textDocument/onTypeFormatting` (#354).
     ///
     /// kakehashi cannot know downstream trigger characters at initialize time
@@ -1444,7 +1448,7 @@ mod tests {
             cmd: vec!["x".to_string()],
             languages: vec![],
             initialization_options: None,
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
@@ -1484,7 +1488,7 @@ mod tests {
                 cmd: vec!["x".to_string()],
                 languages: vec![],
                 initialization_options: None,
-                root_markers: None,
+                workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
                 settings: None,
@@ -1526,13 +1530,33 @@ mod tests {
         assert!(wildcard.cmd.is_empty());
         assert!(wildcard.languages.is_empty());
         assert_eq!(
-            wildcard.root_markers,
+            wildcard.workspace_markers,
             Some(vec![RootMarker::Single(".git".to_string())])
         );
     }
 
     #[test]
-    fn should_parse_language_server_root_markers_camel_case() {
+    fn should_parse_workspace_markers_camel_case() {
+        let config_json = r#"{
+            "cmd": ["rust-analyzer"],
+            "languages": ["rust"],
+            "workspaceMarkers": [".git", "Cargo.toml"]
+        }"#;
+
+        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
+        assert_eq!(
+            config.workspace_markers,
+            Some(vec![
+                RootMarker::Single(".git".to_string()),
+                RootMarker::Single("Cargo.toml".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn should_parse_deprecated_root_markers_alias() {
+        // `rootMarkers` is the pre-rename key, kept as a deprecated serde alias
+        // for backward compatibility; it deserializes into `workspace_markers`.
         let config_json = r#"{
             "cmd": ["rust-analyzer"],
             "languages": ["rust"],
@@ -1541,7 +1565,7 @@ mod tests {
 
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
         assert_eq!(
-            config.root_markers,
+            config.workspace_markers,
             Some(vec![
                 RootMarker::Single(".git".to_string()),
                 RootMarker::Single("Cargo.toml".to_string()),
@@ -1559,7 +1583,7 @@ mod tests {
 
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
         assert_eq!(
-            config.root_markers,
+            config.workspace_markers,
             Some(vec![
                 RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
                 RootMarker::Single(".git".to_string()),
@@ -1576,7 +1600,7 @@ mod tests {
             cmd: vec![],
             languages: vec![],
             initialization_options: None,
-            root_markers: Some(vec![
+            workspace_markers: Some(vec![
                 RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
                 RootMarker::Single(".git".to_string()),
             ]),
@@ -1587,12 +1611,14 @@ mod tests {
 
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(
-            json["rootMarkers"],
+            json["workspaceMarkers"],
             serde_json::json!([["stylua.toml", ".luarc.json"], ".git"])
         );
+        // The deprecated key is never *emitted* (alias is deserialize-only).
+        assert!(json.get("rootMarkers").is_none());
 
         let reparsed: BridgeServerConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(reparsed.root_markers, config.root_markers);
+        assert_eq!(reparsed.workspace_markers, config.workspace_markers);
     }
 
     #[test]
@@ -1608,7 +1634,7 @@ mod tests {
         let servers = settings.language_servers.unwrap();
         let wildcard = &servers["_"];
         assert_eq!(
-            wildcard.root_markers,
+            wildcard.workspace_markers,
             Some(vec![
                 RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
                 RootMarker::Single(".git".to_string()),

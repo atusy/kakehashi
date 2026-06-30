@@ -663,7 +663,7 @@ mod tests {
                 cmd: vec!["true".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                root_markers: None,
+                workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 settings: None,

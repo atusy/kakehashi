@@ -12,7 +12,7 @@ expression: settings.language_servers
       "python"
     ],
     "initializationOptions": null,
-    "rootMarkers": null,
+    "workspaceMarkers": null,
     "onTypeFormattingTriggers": null,
     "preferSharedInstance": null
   },
@@ -24,7 +24,7 @@ expression: settings.language_servers
       "rust"
     ],
     "initializationOptions": null,
-    "rootMarkers": null,
+    "workspaceMarkers": null,
     "onTypeFormattingTriggers": null,
     "preferSharedInstance": null
   }

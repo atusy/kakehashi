@@ -13,7 +13,7 @@
 //! (which knows only its own).
 //!
 //! Two sibling projects each carry their own `.git` marker root, so the
-//! default `rootMarkers = [".git"]` resolves each host document to a distinct
+//! default `workspaceMarkers = [".git"]` resolves each host document to a distinct
 //! root.
 
 #![cfg(feature = "e2e")]

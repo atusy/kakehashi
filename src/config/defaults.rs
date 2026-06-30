@@ -26,7 +26,7 @@ pub fn default_settings() -> RawWorkspaceSettings {
 }
 
 /// Returns the default languageServers map: a defaults-only `_` wildcard
-/// entry documenting the built-in `rootMarkers` and `preferSharedInstance`
+/// entry documenting the built-in `workspaceMarkers` and `preferSharedInstance`
 /// defaults that every concrete server inherits (wildcard-config-inheritance).
 /// Not spawnable itself — lookups skip the wildcard key and any server with an
 /// empty resolved cmd.
@@ -37,7 +37,7 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             cmd: vec![],
             languages: vec![],
             initialization_options: None,
-            root_markers: Some(vec![RootMarker::Single(".git".to_string())]),
+            workspace_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
             // Spell out the built-in default (per-root instances) so the
             // generated template documents the opt-in and the knob is
@@ -408,7 +408,7 @@ mod tests {
             .expect("should have languageServers");
         let wildcard = servers.get(WILDCARD_KEY).expect("should have '_' entry");
         assert_eq!(
-            wildcard.root_markers,
+            wildcard.workspace_markers,
             Some(vec![RootMarker::Single(".git".to_string())])
         );
         assert!(

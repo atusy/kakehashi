@@ -87,10 +87,10 @@ pub(crate) fn merge_bridge_server_configs(
             (Some(b), Some(o)) => Some(deep_merge_json(b, o)),
             _ => overlay.settings.clone().or(base.settings.clone()),
         },
-        root_markers: overlay
-            .root_markers
+        workspace_markers: overlay
+            .workspace_markers
             .clone()
-            .or_else(|| base.root_markers.clone()),
+            .or_else(|| base.workspace_markers.clone()),
         on_type_formatting_triggers: overlay
             .on_type_formatting_triggers
             .clone()
@@ -522,7 +522,7 @@ mod tests {
                         cmd: vec!["rust-analyzer".to_string()],
                         languages: vec!["rust".to_string()],
                         initialization_options: Some(json!({"checkOnSave": true})),
-                        root_markers: None,
+                        workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
                         settings: None,
@@ -534,7 +534,7 @@ mod tests {
                         cmd: vec!["lua-language-server".to_string()],
                         languages: vec!["lua".to_string()],
                         initialization_options: None,
-                        root_markers: None,
+                        workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
                         settings: None,
@@ -606,7 +606,7 @@ mod tests {
                         cmd: vec![],
                         languages: vec![],
                         initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
-                        root_markers: None,
+                        workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
                         settings: None,
@@ -619,7 +619,7 @@ mod tests {
                         cmd: vec!["pyright-langserver".to_string(), "--stdio".to_string()],
                         languages: vec!["python".to_string()],
                         initialization_options: None,
-                        root_markers: None,
+                        workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
                         settings: None,
@@ -687,7 +687,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec!["rust".to_string()],
                     initialization_options: None,
-                    root_markers: None,
+                    workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     settings: None,
@@ -1077,7 +1077,7 @@ mod tests {
                 cmd: vec!["default-lsp".to_string()],
                 languages: vec!["any".to_string()],
                 initialization_options: None,
-                root_markers: None,
+                workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 settings: None,
@@ -1094,7 +1094,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                root_markers: None,
+                workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 settings: None,
@@ -1112,7 +1112,7 @@ mod tests {
                     cmd: vec!["default-lsp".to_string()],
                     languages: vec!["any".to_string()],
                     initialization_options: Some(json!({"defaultOption": true})),
-                    root_markers: None,
+                    workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     settings: None,
@@ -1124,7 +1124,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec![],
                     initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
-                    root_markers: None,
+                    workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     settings: None,
@@ -1142,7 +1142,7 @@ mod tests {
         );
     }
 
-    /// rootMarkers merges overlay-wins like other Option fields, and the
+    /// workspaceMarkers merges overlay-wins like other Option fields, and the
     /// explicit `Some([])` kill switch must survive the merge — collapsing
     /// it to "inherit" would silently re-enable the marker search a user
     /// turned off per server.
@@ -1154,7 +1154,7 @@ mod tests {
             cmd: vec![],
             languages: vec![],
             initialization_options: None,
-            root_markers: Some(vec![RootMarker::Single(".git".to_string())]),
+            workspace_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             settings: None,
@@ -1165,35 +1165,35 @@ mod tests {
             cmd: vec!["rust-analyzer".to_string()],
             languages: vec!["rust".to_string()],
             initialization_options: None,
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             settings: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
         assert_eq!(
-            merged.root_markers,
+            merged.workspace_markers,
             Some(vec![RootMarker::Single(".git".to_string())])
         );
 
         // Set overlay wins over base
         let overriding = BridgeServerConfig {
-            root_markers: Some(vec![RootMarker::Single("Cargo.toml".to_string())]),
+            workspace_markers: Some(vec![RootMarker::Single("Cargo.toml".to_string())]),
             ..inheriting.clone()
         };
         let merged = merge_bridge_server_configs(&base, &overriding);
         assert_eq!(
-            merged.root_markers,
+            merged.workspace_markers,
             Some(vec![RootMarker::Single("Cargo.toml".to_string())])
         );
 
         // Explicit [] survives as the per-server kill switch
         let disabling = BridgeServerConfig {
-            root_markers: Some(vec![]),
+            workspace_markers: Some(vec![]),
             ..inheriting
         };
         let merged = merge_bridge_server_configs(&base, &disabling);
-        assert_eq!(merged.root_markers, Some(vec![]));
+        assert_eq!(merged.workspace_markers, Some(vec![]));
     }
 
     /// `preferSharedInstance` merges overlay-wins-when-present like
@@ -1209,7 +1209,7 @@ mod tests {
             cmd: vec![],
             languages: vec![],
             initialization_options: None,
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: prefer,
             settings: None,
@@ -1257,7 +1257,7 @@ mod tests {
                 "shared_opt": "base",
                 "nested": { "base_only": 1, "shared": "base" }
             })),
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             settings: None,
@@ -1270,7 +1270,7 @@ mod tests {
                 "shared_opt": "overlay",
                 "nested": { "overlay_only": 2, "shared": "overlay" }
             })),
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             settings: None,
@@ -1358,7 +1358,7 @@ mod tests {
             cmd: vec![],
             languages: vec![],
             initialization_options: None,
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
@@ -1511,7 +1511,7 @@ mod tests {
                     cmd: vec![],
                     languages: vec![],
                     initialization_options: Some(json!({ "checkOnSave": true })),
-                    root_markers: None,
+                    workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     settings: None,
@@ -1524,7 +1524,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec!["rust".to_string()],
                     initialization_options: None, // Should inherit from wildcard
-                    root_markers: None,
+                    workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     settings: None,
@@ -1564,7 +1564,7 @@ mod tests {
                     cmd: vec!["default-lsp".to_string()],
                     languages: vec!["rust".to_string(), "python".to_string()],
                     initialization_options: None,
-                    root_markers: None,
+                    workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     settings: None,
@@ -1577,7 +1577,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec![], // Empty - should inherit from wildcard
                     initialization_options: None,
-                    root_markers: None,
+                    workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     settings: None,

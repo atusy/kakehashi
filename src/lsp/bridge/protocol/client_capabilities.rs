@@ -89,7 +89,7 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
                 refresh_support: Some(true),
             }),
             // The bridge sends InitializeParams.workspaceFolders (upstream
-            // passthrough or the rootMarkers-derived folder), which LSP makes
+            // passthrough or the workspaceMarkers-derived folder), which LSP makes
             // conditional on this capability.
             workspace_folders: Some(true),
             // The bridge owns and serves each server's workspace settings
