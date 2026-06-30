@@ -102,10 +102,11 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
   elapsed time and raises. This bounds Lua-level loops.
   - **Caveat:** an instruction hook cannot interrupt time spent inside a host
     C-call (`kakehashi.fs.find_ancestor`'s filesystem walk, `read_to_string`)
-    or the lazy `document_info` metatable `__index`. Those host operations must
-    carry **their own bounds** (e.g. a capped `read_to_string`, see
-    lua-host-api) — the §6 "must not tie up a worker thread" guarantee depends
-    on both the hook and these host-side limits.
+    or the lazy `document_info` metatable `__index`. Host operations carry their
+    own bounds (a capped `read_to_string`, see lua-host-api) — but those bound
+    *memory*, not *syscall latency*: a synchronous fs call stalled on a hung
+    NFS/FUSE mount is bounded by neither the hook nor a size cap. §6 states the
+    liveness guarantee honestly and points at stuck-worker replacement.
 - The `text` snapshot is **owned in Rust** (`Arc<str>` or equivalent) before
   entering Lua; the metatable only defers *materialization into Lua*, never
   performs async I/O. A metatable `__index` must not await (and, per the caveat,
@@ -117,20 +118,27 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
   language-based server selection in `src/lsp/bridge/coordinator.rs` (the
   `c.languages.iter().any(...)` filters). Language match first, resolver
   refinement second.
-- **Result application is inferred from server state**, not signaled by the
-  resolver:
-  - Server not yet running, this document triggers the spawn → resolved
-    workspace **seeds `InitializeParams`** via `build_initialize_request`
-    (`protocol/lifecycle.rs`), replacing the `marker` argument that
-    `workspace_from_marker` (defined in `root_markers.rs`, called from `pool.rs`)
-    would otherwise supply.
-  - Server already running, a new document arrives → a returned folder is added
-    via `workspace/didChangeWorkspaceFolders` (the `WorkspaceFolderSet`, defined
-    in `workspace/folder_set.rs` and driven from `pool.rs`). **Precondition:** this only reaches a server that advertised
-    `workspace.workspaceFolders.changeNotifications` (or dynamically registered
-    it); the implementation already gates on `supports_workspace_folder_changes`,
-    so for a non-supporting running server a resolver's returned folder is
-    **silently dropped**. See Open Questions.
+- **The resolved workspace replaces the marker in the existing acquire flow**,
+  not signaled separately by the resolver. It is exactly what
+  `resolve_marker_and_key` / `resolve_acquire` (`pool.rs`) would otherwise
+  compute from `workspaceMarkers` via `workspace_from_marker` (defined in
+  `root_markers.rs`); everything downstream is unchanged. The workspace is thus
+  part of the connection's identity, not a late add-on:
+  - **Per-root (default).** `ConnectionKey` is `(server, root)`
+    (`connection_key.rs`), so a distinct resolved workspace is a distinct
+    `Marker(root)` key → its own connection: reused if one already runs for that
+    root, else spawned with the workspace seeding `InitializeParams` via
+    `build_initialize_request` (`protocol/lifecycle.rs`). A `nil` workspace maps
+    to the `ClientFallback` key (attach, no folder).
+  - **Shared instance (`preferSharedInstance`, #391).** Marker-rooted documents
+    join one `Shared` connection via `workspace/didChangeWorkspaceFolders` (the
+    `WorkspaceFolderSet`, defined in `workspace/folder_set.rs`, driven from
+    `pool.rs`). If that shared connection came up **without**
+    `workspace.workspaceFolders.changeNotifications`
+    (`supports_workspace_folder_changes` reads static `InitializeResult`
+    capabilities only — there is no dynamic `client/registerCapability`
+    tracking), `resolve_acquire` **diverts the document to its own per-root
+    process** rather than dropping it.
 
 ### 5. Cache contract
 
@@ -144,9 +152,17 @@ document text.
 
 A Lua error **or** a timeout overrun is treated as **fail-closed**: do not
 attach the document to that server, and log. A broken or slow resolver must not
-silently misroute. "Tie up a worker thread indefinitely" is prevented by the
-in-VM hook **plus** the host-side bounds of §3 — a hook alone cannot stop a
-runaway host call, so both are load-bearing for this guarantee.
+silently misroute.
+
+**Scope of the liveness guarantee, honestly stated.** The in-VM hook bounds
+runaway *Lua compute*; the host-side size cap bounds *memory / read volume*.
+Neither time-bounds a synchronous host **syscall** stalled on a pathological
+filesystem (a hung NFS/FUSE mount can block `find_ancestor`/`read_to_string`
+indefinitely). So "never tie up a worker thread" is **not** an absolute
+in-process guarantee. Defending against arbitrary I/O latency requires
+abandoning and replacing a stuck worker — the dedicated-thread model of §3
+permits this (spawn a replacement, leak the wedged thread), but the policy is
+left to implementation (see Open Questions).
 
 ### 7. Open questions
 
@@ -161,9 +177,11 @@ Deferred to implementation, recorded so they are not lost:
   path. What `document_info.path` (and the path-based host API) yield for
   `untitled:` and other non-`file://` URIs is undefined; likely the resolver
   should be skipped (fall back to `workspaceMarkers`/no folder) for those.
-- **Folder dropped on a non-supporting running server** (§4): whether to fall
-  back (e.g. respawn with the folder, or surface a warning) instead of silently
-  dropping is open.
+- **Stuck-worker recovery** (§3, §6): the policy for abandoning and replacing a
+  worker wedged in a hung filesystem syscall — timeout, replacement, and what to
+  leak — is left open.
+- **Windows path encoding** (see lua-host-api § Path encoding contract): the
+  exact fail-closed policy for paths not representable as UTF-8/WTF-8 is open.
 
 ## Considered Options
 

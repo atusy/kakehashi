@@ -118,8 +118,10 @@ workspace-specific function — finding a project root is just one use. It reuse
 reimplement the walk:
 
 - `start`: a path. The search's **base directory** is `start` itself when it is
-  a directory, or `start`'s parent when it is a file (Neovim `vim.fs.root`
-  semantics). The walk checks the base directory **and** each ancestor.
+  an existing directory, or `start`'s parent otherwise — including when `start`
+  does **not** exist (e.g. an unsaved/new document path), which is treated as a
+  file path, matching `find_marker_root`. The walk checks the base directory
+  **and** each ancestor.
 - `markers`: `(string | string[])[]` — a nested array is an equal-priority
   group. This is the **same shape** as `workspaceMarkers`, but the function
   does not assume the result is a workspace. (The resolver's return no longer
@@ -130,9 +132,11 @@ reimplement the walk:
 > **Implementation note:** the reused `root_markers.rs::find_marker_root` takes
 > a *document file* and starts at `parent().ancestors()`, so it never inspects
 > the passed path itself. Generalizing it to `fs.find_ancestor` must check the
-> base directory when `start` is a directory — otherwise a marker sitting *in*
-> a directory `start` (e.g. `find_ancestor(kakehashi.env.current_dir(), …)`)
-> is missed.
+> base directory when `start` is an existing directory — otherwise a marker
+> sitting *in* a directory `start` (e.g.
+> `find_ancestor(kakehashi.env.current_dir(), …)`) is missed. The file-vs-dir
+> test reads filesystem metadata; a nonexistent `start` skips the probe and is
+> treated as a file path (base = parent).
 
 Named for what it returns (a directory among the base + ancestors) and the
 mechanism, **not** for the workspace use case — `find_workspace`/`find_root`
@@ -186,6 +190,24 @@ To keep resolvers in path-space and avoid a URI module:
 
 Percent-decoding and `file://` handling thus happen once, in Rust, not in every
 resolver.
+
+#### Path encoding contract
+
+Lua strings are arbitrary **byte** strings, but Rust `Path`/`OsStr` are not
+universally byte-representable, so the boundary needs a defined encoding:
+
+- **Unix:** an `OsStr` path *is* bytes, so paths cross the boundary losslessly
+  as raw byte strings — including non-UTF-8 paths (which Lua holds fine, though
+  `string.*` pattern functions may behave oddly on them).
+- **Windows:** paths are UTF-16 and are passed as UTF-8 (WTF-8). A path that is
+  not representable (an unpaired surrogate) **fails closed** — the host function
+  returns `nil`/error rather than handing back a lossy, non-round-trippable
+  string. Callers that pass a path string back to `kakehashi.fs`/`path` get
+  byte-for-byte the value they received, so round-tripping holds for every path
+  that crossed the boundary in the first place.
+
+This is a recorded contract, not yet implemented; the exact Windows policy is
+an open question (see workspace-resolver Open Questions).
 
 ## Considered Options
 
