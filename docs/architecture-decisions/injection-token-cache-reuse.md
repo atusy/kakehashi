@@ -232,9 +232,11 @@ preference order:
 
 - **Preferred — couple it to the parse result.** Make the discovered contexts
   part of the document's parse result so the semantic path reads `(tree, discovery)`
-  from one atomic snapshot — physically one unit, **no gate to get wrong**: a
-  snapshot carries discovery (reuse) or does not (the on-demand-parse fallback tree
-  → discover inline). Realizability, given `populate_injections` runs *after* the
+  from one atomic snapshot — physically one unit, so there is **no reader-side gate
+  to get wrong**: a snapshot carries discovery (reuse) or does not (the
+  on-demand-parse fallback tree → discover inline). The only gate is on the
+  *writer* side — the second CAS below that attaches discovery only to the tree it
+  was built for. Realizability, given `populate_injections` runs *after* the
   tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`,
   `coordinator/parse.rs`):
   - **No *new* `NodeTracker` mutation.** `populate_injections` *already* calls
@@ -354,10 +356,13 @@ trivial `C`), so the ~0.3 ms relocated `C` at 300 blocks is a best case; a
 document dominated by prefixed/blockquote regions relocates a larger `C` to the
 off-ingress path (the node-walks), though the per-edit total-CPU saving is still
 ≈ `Q` regardless of eligibility, since `C` is relocated, not added. Per-*request*
-latency improves by `Q` (if the request blocks on populate's watermark) up to
-`Q`+`C` (if populate finished during the debounce gap); which regime dominates is
-timing-dependent and shifts as parsing moves off-ingress, so the stable,
-defensible figure is the ~`Q` total-CPU saving. **The no-regression gate must
+latency improvement is timing-dependent and *not* the figure to quote: it
+approaches `Q`+`C` when populate finished during the debounce gap (the request
+reuses without waiting) and shrinks toward zero when the request blocks on an
+as-yet-unfinished populate (it waits out the work it would otherwise have done
+itself). Which regime dominates shifts as parsing moves off-ingress, so the
+stable, defensible figure is the ~`Q` total-CPU saving. **The no-regression gate
+must
 therefore measure a prefixed-region-heavy document too**, not only eligible
 fences, since that is where the relocated `C` could lengthen the off-ingress
 reparse the semantic settle waits on.
@@ -393,14 +398,19 @@ everywhere the existing `injection_map` / `injection_token_cache` are —
 owned structure (the `included_ranges` / prefix / exclusion vectors) beyond the
 token half's per-region token vector, bounded by the same `clear_document` / close
 path; the Consequences section needs that addendum. (7) **Generation / registry
-must be one atomic config epoch.** Registry/query mutation currently *precedes* the
-`bump_semantic_token_generation` bump (`src/lsp/lsp_impl.rs`), so
-snapshot-before-build / recheck-after is **not** sufficient on its own: a build can
-observe new (or mixed) registry state while both the before- and after-reads still
-return the *old* generation, tagging stale-query discovery as current. Closing this
-requires making registry state and generation one *indivisible* configuration
-epoch — an **atomic immutable registry swap** carrying its generation (a single
-pointer/`Arc` swap, so no build ever observes a half-mutated registry), or a
+should be one atomic config epoch (narrow reload race).** The settings `generation`
+gate already handles the common reload: a bump means the cached discovery's
+generation no longer matches, so it misses and re-discovers. What it does *not*
+cover by itself is a `populate_injections` running *concurrently* with the reload:
+registry/query mutation currently *precedes* the `bump_semantic_token_generation`
+bump (`src/lsp/lsp_impl.rs`), so snapshot-before-build / recheck-after can still
+observe new (or mixed) registry state while both reads return the *old* generation,
+tagging stale-query discovery as current. The blast radius is small and
+self-healing — a transient mis-coloring on the next request after a *concurrent*
+reload, gone on the next edit — but closing it cleanly means making registry state
+and generation one *indivisible* configuration epoch: an **atomic immutable
+registry swap** carrying its generation (a single pointer/`Arc` swap, so no build
+ever observes a half-mutated registry), or a
 seqlock / config lock that **rejects any snapshot taken mid-mutation**. A bare
 "bump before mutation" is *not* sufficient on its own: a build can still snapshot
 the already-bumped generation partway through a multi-step registry mutation,
@@ -553,6 +563,10 @@ two showstopper mitigations are the price of correctness, not optional polish.
 
 - Memory grows by one token vector per live injection region per open document,
   bounded by `clear_document` on close and `remove` on region change.
+- *(Discovery lever, if implemented.)* A second per-region owned structure — the
+  `included_ranges` / prefix / exclusion vectors of the stored discovery — beyond
+  the token half's per-region token vector, bounded by the same close / reparse
+  clear paths.
 
 ## Decision–Implementation Gap
 
