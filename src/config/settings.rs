@@ -564,6 +564,10 @@ pub struct RawWorkspaceSettings {
     pub capture_mappings: CaptureMappings,
     /// Whether to automatically install missing parsers and queries.
     pub auto_install: Option<bool>,
+    /// Debounce delay, in milliseconds, between a `didChange` and the diagnostic
+    /// pull it triggers. Higher values cut refresh/pull volume during rapid typing
+    /// at the cost of latency. Defaults to [`DEFAULT_DEBOUNCE_MS`] when unset.
+    pub diagnostics_debounce_ms: Option<u64>,
     /// Language servers for bridging LSP requests to injection regions.
     /// Map of server name to server configuration.
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
@@ -704,6 +708,7 @@ pub struct WorkspaceSettings {
     pub languages: HashMap<String, LanguageSettings>,
     pub capture_mappings: CaptureMappings,
     pub auto_install: bool,
+    pub diagnostics_debounce_ms: u64,
     pub language_servers: HashMap<String, BridgeServerConfig>,
 }
 
@@ -714,10 +719,16 @@ impl Default for WorkspaceSettings {
             languages: HashMap::new(),
             capture_mappings: CaptureMappings::default(),
             auto_install: true, // Default to true for zero-config experience
+            diagnostics_debounce_ms: DEFAULT_DEBOUNCE_MS,
             language_servers: HashMap::new(),
         }
     }
 }
+
+/// Default `didChange`→diagnostic debounce, in milliseconds. The runtime default
+/// (used when `diagnostics_debounce_ms` is unset) and the `config init` template
+/// both resolve to this; [`crate::config::defaults`] asserts the mirror.
+pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
 
 #[cfg(test)]
 mod tests {
@@ -1080,6 +1091,7 @@ mod tests {
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
 

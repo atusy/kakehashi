@@ -913,6 +913,7 @@ mod tests {
             languages,
             capture_mappings: Default::default(),
             auto_install: false,
+            diagnostics_debounce_ms: crate::config::settings::DEFAULT_DEBOUNCE_MS,
             language_servers: HashMap::new(),
         }
     }

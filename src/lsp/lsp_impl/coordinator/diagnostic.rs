@@ -78,6 +78,15 @@ impl DiagnosticScheduler {
     pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
 
+        // Apply the current `diagnostics_debounce_ms` setting (#533). The snapshot
+        // is a cheap arc-swap clone, so reading it per schedule keeps the debounce
+        // in sync with config reloads without a dedicated apply hook.
+        self.debounced_diagnostics.set_debounce_millis(
+            self.settings_manager
+                .load_settings()
+                .diagnostics_debounce_ms,
+        );
+
         self.debounced_diagnostics.schedule(
             uri,
             snapshot_data,

@@ -14,7 +14,7 @@ pub(crate) use merge::{
     merge_aggregation_configs, merge_bridge_language_configs, merge_bridge_server_configs,
     merge_layer_aggregation_configs, merge_workspace_settings, resolve_with_wildcard,
 };
-pub(crate) use settings::{CaptureMappings, QueryTypeMappings};
+pub(crate) use settings::{CaptureMappings, DEFAULT_DEBOUNCE_MS, QueryTypeMappings};
 pub use settings::{LanguageSettings, RawWorkspaceSettings, WorkspaceSettings, json_schema};
 pub(crate) use user::load_user_config;
 
@@ -67,6 +67,9 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
         languages,
         capture_mappings,
         auto_install: settings.auto_install.unwrap_or(true),
+        diagnostics_debounce_ms: settings
+            .diagnostics_debounce_ms
+            .unwrap_or(DEFAULT_DEBOUNCE_MS),
         language_servers: settings.language_servers.clone().unwrap_or_default(),
     }
 }
@@ -358,6 +361,7 @@ impl From<&WorkspaceSettings> for RawWorkspaceSettings {
             languages,
             capture_mappings,
             auto_install: Some(settings.auto_install),
+            diagnostics_debounce_ms: Some(settings.diagnostics_debounce_ms),
             language_servers: Some(settings.language_servers.clone()),
         }
     }
@@ -496,6 +500,7 @@ mod tests {
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
 
@@ -524,6 +529,7 @@ mod tests {
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
 
@@ -545,6 +551,7 @@ mod tests {
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
 
@@ -570,11 +577,31 @@ mod tests {
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
 
         let workspace: WorkspaceSettings = base_convert(&settings);
         assert_eq!(workspace.auto_install, expected);
+    }
+
+    #[rstest]
+    #[case::default(None, DEFAULT_DEBOUNCE_MS)]
+    #[case::explicit(Some(50), 50)]
+    #[case::explicit_zero(Some(0), 0)]
+    fn test_diagnostics_debounce_ms(#[case] raw: Option<u64>, #[case] expected: u64) {
+        // Unset resolves to the runtime default; explicit values (incl. 0) honored.
+        let settings = RawWorkspaceSettings {
+            search_paths: None,
+            languages: HashMap::new(),
+            capture_mappings: HashMap::new(),
+            auto_install: None,
+            diagnostics_debounce_ms: raw,
+            language_servers: None,
+        };
+
+        let workspace: WorkspaceSettings = base_convert(&settings);
+        assert_eq!(workspace.diagnostics_debounce_ms, expected);
     }
 
     #[test]
@@ -857,6 +884,7 @@ mod try_from_settings_tests {
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
         let env = make_env(&[("TEST_VAR", "/home/user")]);
@@ -879,6 +907,7 @@ mod try_from_settings_tests {
             languages,
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
         let env = make_env(&[("TEST_VAR", "/opt/parsers")]);
@@ -907,6 +936,7 @@ mod try_from_settings_tests {
             languages,
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
         let env = make_env(&[("TEST_VAR", "/queries")]);
@@ -941,6 +971,7 @@ mod try_from_settings_tests {
             languages,
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
 
@@ -961,6 +992,7 @@ mod try_from_settings_tests {
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
         let env = make_env(&[]);
@@ -989,6 +1021,7 @@ mod try_from_settings_tests {
             languages,
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
         let env = make_env(&[]);
@@ -1007,6 +1040,7 @@ mod try_from_settings_tests {
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None,
+            diagnostics_debounce_ms: None,
             language_servers: None,
         };
         let env = make_env(&[]);
