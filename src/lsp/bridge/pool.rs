@@ -52,7 +52,8 @@ use crate::error::LockResultExt;
 
 use super::protocol::{
     JsonRpcNotification, RequestId, VirtualDocumentUri,
-    build_did_change_workspace_folders_notification, build_didopen_notification,
+    build_did_change_configuration_notification, build_did_change_workspace_folders_notification,
+    build_didopen_notification,
 };
 
 /// Timeout for the LSP initialize handshake and for wait-for-ready on an
@@ -458,6 +459,65 @@ impl LanguageServerPool {
         &self,
     ) -> tokio::sync::MutexGuard<'_, HashMap<ConnectionKey, Arc<ConnectionHandle>>> {
         self.connections.lock().await
+    }
+
+    /// Propagate a workspace-settings change to every live connection whose
+    /// settings changed (downstream-settings-propagation, path c).
+    ///
+    /// `resolve` maps a server name to its newly merged settings. For each
+    /// connection the resolved value is diffed against the connection's current
+    /// settings cell; on a change the cell is re-stored — so a later
+    /// `workspace/configuration` re-pull reflects it — and a best-effort
+    /// `workspace/didChangeConfiguration` is pushed (carrying the new value, or
+    /// `null` when settings were cleared). Unchanged servers get nothing, so a
+    /// global reload does not storm every connection. The cell is updated before
+    /// the push so a pull-model server's re-pull never races onto the old value.
+    ///
+    /// Returns the number of connections that changed (and were pushed), so the
+    /// anti-storm behavior is observable to callers and tests.
+    pub(crate) async fn propagate_settings(
+        &self,
+        resolve: impl Fn(&str) -> Option<serde_json::Value>,
+    ) -> usize {
+        let connections = self.connections.lock().await;
+        let mut pushed = 0;
+        for handle in connections.values() {
+            let resolved = resolve(handle.key().server());
+            // Diff by value (Arc identity is irrelevant); skip unchanged servers
+            // so an unchanged config reload pushes nothing.
+            if resolved.as_ref() == handle.current_settings().as_deref() {
+                continue;
+            }
+            // Always advance the cell so a later pull / the post-`initialized`
+            // push (path a) reflects the change, even for a connection we don't
+            // notify yet. Wrap once in `Arc` and store a cheap `Arc` clone; the
+            // inner `Value` is cloned only for an actual push below.
+            let resolved = resolved.map(Arc::new);
+            handle.store_settings(resolved.clone());
+            // Only notify a Ready connection: sending
+            // `workspace/didChangeConfiguration` to a still-initializing server
+            // would precede its `initialized` and violate LSP ordering. An
+            // Initializing connection instead gets its (now-updated) cell pushed
+            // by path (a) once the handshake completes. Count only a successful
+            // enqueue, so the returned count never reports a dropped push.
+            //
+            // No `Arc::ptr_eq`-against-the-map liveness recheck is needed here:
+            // this loop holds the `connections` lock and iterates the map's live
+            // values directly (never retrieve-then-release), so a respawn — which
+            // takes the same lock — cannot replace a handle mid-iteration.
+            if handle.state() == ConnectionState::Ready {
+                let payload = resolved
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let result =
+                    handle.send_notification(build_did_change_configuration_notification(payload));
+                if result == NotificationSendResult::Queued {
+                    pushed += 1;
+                }
+            }
+        }
+        pushed
     }
 
     /// Among `candidates`, the server names that have a **live connection
@@ -1392,6 +1452,14 @@ impl LanguageServerPool {
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
         // Server name is passed for structured logging and notification prefixes
+        // Per-connection settings cell, shared between the reader (answers
+        // workspace/configuration pulls, path b) and the handle (re-stored on a
+        // merge change, path c). Seeded from the resolved config
+        // (downstream-settings-propagation).
+        let settings_cell = Arc::new(arc_swap::ArcSwapOption::from(
+            server_config.settings.clone().map(Arc::new),
+        ));
+
         let liveness_timeout = liveness_timeout::LivenessTimeout::default();
         let reader_handle = spawn_reader_task_for_server(
             reader,
@@ -1411,6 +1479,7 @@ impl LanguageServerPool {
                 progress_registry: Arc::clone(&self.progress_registry),
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
                 progress_connection_id: self.progress_registry.new_connection_id(),
+                settings: Arc::clone(&settings_cell),
             },
         );
 
@@ -1427,6 +1496,7 @@ impl LanguageServerPool {
             dynamic_capabilities,
             connection_key.clone(),
             workspace_folders,
+            settings_cell,
         ));
 
         // Insert into pool immediately so concurrent requests see Initializing state
@@ -1446,6 +1516,11 @@ impl LanguageServerPool {
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
         let client_capabilities = self.client_capabilities();
+        // Only advertise `workspace.configuration` when this server actually has
+        // settings to serve. Advertising it otherwise would flip an
+        // `initializationOptions`-configured server to pull and get every
+        // section answered `null` (downstream-settings-propagation).
+        let advertise_configuration = server_config.settings.is_some();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let handshake_task = tokio::spawn(async move {
@@ -1459,6 +1534,7 @@ impl LanguageServerPool {
                     root_uri,
                     init_folders,
                     client_capabilities,
+                    advertise_configuration,
                 ),
             )
             .await;
@@ -1473,6 +1549,32 @@ impl LanguageServerPool {
                         server_name_for_log
                     );
                     handle_for_handshake.set_server_capabilities(capabilities);
+                    // Path a: push this server's settings now that `initialized`
+                    // has been sent, so push-model servers are configured even
+                    // before they pull (downstream-settings-propagation). Queue it
+                    // *before* flipping to Ready: a waiter unblocked by the Ready
+                    // transition may enqueue `didOpen`, and the single-writer FIFO
+                    // must carry the settings ahead of it so the server never
+                    // processes a document under default config. Read the *live*
+                    // cell, not the spawn-time value, so a path-c re-propagation
+                    // that landed during the handshake is reflected and the push
+                    // agrees with what (b) would answer. Best-effort: a dropped
+                    // notification self-heals on the next pull.
+                    //
+                    // Push when we advertised `configuration` (so a clear to
+                    // `None` during the handshake still reaches the server as
+                    // `null` instead of leaving it on stale settings) OR when the
+                    // cell now holds settings (added during the handshake). When
+                    // neither holds there is nothing to communicate.
+                    let current = handle_for_handshake.current_settings();
+                    if advertise_configuration || current.is_some() {
+                        let payload = current
+                            .map(|s| (*s).clone())
+                            .unwrap_or(serde_json::Value::Null);
+                        handle_for_handshake.send_notification(
+                            build_did_change_configuration_notification(payload),
+                        );
+                    }
                     handle_for_handshake.set_state(ConnectionState::Ready);
                     Ok(())
                 }
@@ -2072,6 +2174,7 @@ mod tests {
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
+            settings: None,
             ..devnull_config()
         }
     }
@@ -2677,6 +2780,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            settings: None,
         };
 
         let result = pool
@@ -3420,6 +3524,7 @@ mod tests {
             Arc::new(DynamicCapabilityRegistry::new()),
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         ));
 
         // Add connection to pool
@@ -5055,5 +5160,113 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// Path c: `propagate_settings` re-stores each live connection's cell from the
+    /// resolver, so a later `workspace/configuration` re-pull reflects the change.
+    /// A connection whose resolved value is unchanged keeps its cell as-is.
+    #[tokio::test]
+    async fn propagate_settings_updates_changed_connections() {
+        use serde_json::json;
+
+        let pool = LanguageServerPool::new();
+
+        // Two live connections: "rust-analyzer" gets new settings; "lua" already
+        // holds its value and the resolver returns the same thing (unchanged).
+        let ra = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("rust-analyzer"),
+        )
+        .await;
+        let lua_value = Arc::new(json!({ "Lua": { "telemetry": { "enable": false } } }));
+        let lua =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
+        lua.store_settings(Some(Arc::clone(&lua_value)));
+        {
+            let mut conns = pool.connections().await;
+            conns.insert(ConnectionKey::for_server("rust-analyzer"), Arc::clone(&ra));
+            conns.insert(ConnectionKey::for_server("lua"), Arc::clone(&lua));
+        }
+
+        let ra_value = json!({ "rust-analyzer": { "cargo": { "features": "all" } } });
+        let ra_value_for_resolve = ra_value.clone();
+        let lua_value_for_resolve = (*lua_value).clone();
+        let pushed = pool
+            .propagate_settings(move |name| match name {
+                "rust-analyzer" => Some(ra_value_for_resolve.clone()),
+                "lua" => Some(lua_value_for_resolve.clone()),
+                _ => None,
+            })
+            .await;
+
+        assert_eq!(
+            pushed, 1,
+            "only the changed connection is pushed — the unchanged one does not storm"
+        );
+        assert_eq!(
+            ra.current_settings().as_deref(),
+            Some(&ra_value),
+            "changed connection's cell is updated to the resolved value"
+        );
+        assert_eq!(
+            lua.current_settings().as_deref(),
+            Some(lua_value.as_ref()),
+            "unchanged connection keeps its settings"
+        );
+
+        // Re-running with the same resolver now pushes nothing: both cells match.
+        let lua_again = (*lua_value).clone();
+        let ra_again = ra_value.clone();
+        let pushed_again = pool
+            .propagate_settings(move |name| match name {
+                "rust-analyzer" => Some(ra_again.clone()),
+                "lua" => Some(lua_again.clone()),
+                _ => None,
+            })
+            .await;
+        assert_eq!(pushed_again, 0, "an unchanged reload pushes nothing");
+    }
+
+    /// Path c does NOT notify a still-initializing connection (that would
+    /// precede its `initialized` and break LSP ordering), but it DOES advance the
+    /// cell so the post-`initialized` push (path a) carries the latest value.
+    #[tokio::test]
+    async fn propagate_settings_updates_but_does_not_notify_initializing_connection() {
+        use serde_json::json;
+
+        let pool = LanguageServerPool::new();
+        let initializing = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("rust-analyzer"),
+        )
+        .await;
+        pool.connections().await.insert(
+            ConnectionKey::for_server("rust-analyzer"),
+            Arc::clone(&initializing),
+        );
+
+        let value = json!({ "rust-analyzer": { "cargo": { "features": "all" } } });
+        let value_for_resolve = value.clone();
+        let pushed = pool
+            .propagate_settings(move |_| Some(value_for_resolve.clone()))
+            .await;
+
+        assert_eq!(pushed, 0, "an initializing connection is not notified");
+        assert_eq!(
+            initializing.current_settings().as_deref(),
+            Some(&value),
+            "but its cell is advanced so path (a) pushes the latest value",
+        );
+    }
+
+    /// Path c with no live connections (e.g. initialize-time apply) is a clean
+    /// no-op, not a panic.
+    #[tokio::test]
+    async fn propagate_settings_no_connections_is_noop() {
+        let pool = LanguageServerPool::new();
+        let pushed = pool
+            .propagate_settings(|_| Some(serde_json::json!({ "x": 1 })))
+            .await;
+        assert_eq!(pushed, 0, "no live connections → nothing pushed");
     }
 }

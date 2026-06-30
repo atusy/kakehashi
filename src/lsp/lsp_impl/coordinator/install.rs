@@ -218,6 +218,7 @@ impl InstallCoordinator {
             &self.language,
             &self.settings_manager,
             &self.cache,
+            &self.bridge,
             Some(raw_settings),
             settings,
         )

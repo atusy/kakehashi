@@ -8,7 +8,7 @@ use tower_lsp_server::ls_types::ClientCapabilities;
 /// Build the baseline client capabilities the bridge declares to downstream servers.
 ///
 /// Returns typed `ClientCapabilities` for use with [`merge_upstream_capabilities`].
-fn build_baseline_capabilities() -> ClientCapabilities {
+fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilities {
     use tower_lsp_server::ls_types::{
         CompletionClientCapabilities, CompletionItemCapability, DiagnosticClientCapabilities,
         DiagnosticWorkspaceClientCapabilities, DocumentLinkClientCapabilities,
@@ -92,6 +92,14 @@ fn build_baseline_capabilities() -> ClientCapabilities {
             // passthrough or the rootMarkers-derived folder), which LSP makes
             // conditional on this capability.
             workspace_folders: Some(true),
+            // The bridge owns and serves each server's workspace settings
+            // (downstream-settings-propagation): advertise `configuration` so a
+            // spec-compliant downstream server pulls via `workspace/configuration`,
+            // answered from the per-connection settings cell. Gated per-server on
+            // having settings to serve: advertising it for a server with no
+            // `settings` would flip an `initializationOptions`-configured server
+            // to pull and answer every section `null`, clobbering config it held.
+            configuration: advertise_configuration.then_some(true),
             ..Default::default()
         }),
         general: Some(GeneralClientCapabilities {
@@ -283,8 +291,12 @@ fn merge_upstream_capabilities(
 /// See [`merge_upstream_capabilities`] for merge semantics.
 pub(super) fn build_bridge_client_capabilities(
     upstream: Option<&ClientCapabilities>,
+    advertise_configuration: bool,
 ) -> ClientCapabilities {
-    merge_upstream_capabilities(build_baseline_capabilities(), upstream)
+    merge_upstream_capabilities(
+        build_baseline_capabilities(advertise_configuration),
+        upstream,
+    )
 }
 
 #[cfg(test)]
@@ -301,7 +313,7 @@ mod tests {
 
     #[test]
     fn bridge_client_capabilities_snapshot() {
-        let capabilities = build_bridge_client_capabilities(None);
+        let capabilities = build_bridge_client_capabilities(None, true);
         insta::with_settings!({snapshot_suffix => feature_suffix()}, {
             insta::assert_json_snapshot!(capabilities);
         });
@@ -309,7 +321,7 @@ mod tests {
 
     #[test]
     fn merge_with_none_upstream_equals_baseline() {
-        let base = build_baseline_capabilities();
+        let base = build_baseline_capabilities(true);
         let merged = merge_upstream_capabilities(base.clone(), None);
         // Serializing both should produce identical JSON
         assert_eq!(
@@ -330,7 +342,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let base = build_baseline_capabilities();
+        let base = build_baseline_capabilities(true);
         let base_json = serde_json::to_value(&base).unwrap();
         let merged = merge_upstream_capabilities(base, Some(&upstream));
         let merged_json = serde_json::to_value(&merged).unwrap();
@@ -386,7 +398,7 @@ mod tests {
             ..Default::default()
         };
 
-        let base = build_baseline_capabilities();
+        let base = build_baseline_capabilities(true);
         let merged = merge_upstream_capabilities(base, Some(&upstream));
         let item = merged
             .text_document
@@ -458,7 +470,7 @@ mod tests {
             ..Default::default()
         };
 
-        let base = build_baseline_capabilities();
+        let base = build_baseline_capabilities(true);
         let merged = merge_upstream_capabilities(base, Some(&upstream));
         let td = merged.text_document.as_ref().unwrap();
 
@@ -536,7 +548,7 @@ mod tests {
             ..Default::default()
         };
 
-        let base = build_baseline_capabilities();
+        let base = build_baseline_capabilities(true);
         let base_json = serde_json::to_value(&base).unwrap();
         let merged = merge_upstream_capabilities(base, Some(&upstream));
         let merged_json = serde_json::to_value(&merged).unwrap();
@@ -588,7 +600,7 @@ mod tests {
         use tower_lsp_server::ls_types::WindowClientCapabilities;
 
         // Baseline declares no window capability, so no upstream → none downstream.
-        let baseline = build_baseline_capabilities();
+        let baseline = build_baseline_capabilities(true);
         assert!(
             baseline.window.is_none(),
             "baseline must not advertise window.workDoneProgress on its own"
@@ -602,7 +614,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let merged = merge_upstream_capabilities(build_baseline_capabilities(), Some(&supporting));
+        let merged =
+            merge_upstream_capabilities(build_baseline_capabilities(true), Some(&supporting));
         assert_eq!(
             merged.window.and_then(|w| w.work_done_progress),
             Some(true),
@@ -612,7 +625,7 @@ mod tests {
         // Upstream omits it → not advertised downstream (gated).
         let non_supporting = ClientCapabilities::default();
         let merged =
-            merge_upstream_capabilities(build_baseline_capabilities(), Some(&non_supporting));
+            merge_upstream_capabilities(build_baseline_capabilities(true), Some(&non_supporting));
         assert!(
             merged.window.and_then(|w| w.work_done_progress).is_none(),
             "must not invite progress the editor can't handle"
@@ -628,7 +641,7 @@ mod tests {
             ..Default::default()
         };
         let merged =
-            merge_upstream_capabilities(build_baseline_capabilities(), Some(&explicit_false));
+            merge_upstream_capabilities(build_baseline_capabilities(true), Some(&explicit_false));
         assert!(
             merged.window.is_none(),
             "explicit false must leave window unadvertised, not materialize workDoneProgress:false"
@@ -649,7 +662,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let merged = merge_upstream_capabilities(build_baseline_capabilities(), Some(&supporting));
+        let merged =
+            merge_upstream_capabilities(build_baseline_capabilities(true), Some(&supporting));
         assert_eq!(
             merged
                 .window
@@ -667,7 +681,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let merged = merge_upstream_capabilities(build_baseline_capabilities(), Some(&unsupported));
+        let merged =
+            merge_upstream_capabilities(build_baseline_capabilities(true), Some(&unsupported));
         assert!(
             merged.window.is_none(),
             "support=false must leave window unadvertised (bridge would only answer success:false)"
@@ -692,7 +707,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let merged = merge_upstream_capabilities(build_baseline_capabilities(), Some(&upstream));
+        let merged =
+            merge_upstream_capabilities(build_baseline_capabilities(true), Some(&upstream));
         assert_eq!(
             merged
                 .window
@@ -776,9 +792,32 @@ mod tests {
             ..Default::default()
         };
 
-        let merged = build_bridge_client_capabilities(Some(&upstream));
+        let merged = build_bridge_client_capabilities(Some(&upstream), true);
         insta::with_settings!({snapshot_suffix => feature_suffix()}, {
             insta::assert_json_snapshot!(merged);
         });
+    }
+
+    #[test]
+    fn configuration_capability_is_gated_on_advertise_flag() {
+        // Advertised only when the server has settings to serve
+        // (downstream-settings-propagation): otherwise an
+        // initializationOptions-configured server would be flipped to pull and
+        // answered `null`.
+        let advertised = build_bridge_client_capabilities(None, true);
+        assert_eq!(
+            advertised.workspace.as_ref().and_then(|w| w.configuration),
+            Some(true),
+        );
+
+        let not_advertised = build_bridge_client_capabilities(None, false);
+        assert_eq!(
+            not_advertised
+                .workspace
+                .as_ref()
+                .and_then(|w| w.configuration),
+            None,
+            "no settings to serve → capability withheld",
+        );
     }
 }

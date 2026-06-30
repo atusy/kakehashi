@@ -96,10 +96,23 @@ pub(super) async fn apply_shared_settings(
     language: &LanguageCoordinator,
     settings_manager: &SettingsManager,
     cache: &CacheCoordinator,
+    bridge: &BridgeCoordinator,
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
 ) {
     let summary = language.load_settings(&settings);
+    // Path c: push the new per-server settings to live downstream connections
+    // at this single reload choke point (initialize, didChangeConfiguration,
+    // auto-install reload), before `settings` is consumed by the apply below.
+    // At initialize time there are no connections yet, so it is a clean no-op
+    // (downstream-settings-propagation).
+    let pushed = bridge.propagate_settings(&settings).await;
+    if pushed > 0 {
+        log::debug!(
+            target: "kakehashi::bridge",
+            "Propagated settings change to {} downstream connection(s)", pushed
+        );
+    }
     match raw_settings {
         Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
         None => settings_manager.apply_settings(settings),
@@ -304,6 +317,7 @@ impl Kakehashi {
             &self.language,
             &self.settings_manager,
             &self.cache,
+            &self.bridge,
             Some(raw_settings),
             settings,
         )

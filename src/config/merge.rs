@@ -83,6 +83,10 @@ pub(crate) fn merge_bridge_server_configs(
                 .clone()
                 .or(base.initialization_options.clone()),
         },
+        settings: match (&base.settings, &overlay.settings) {
+            (Some(b), Some(o)) => Some(deep_merge_json(b, o)),
+            _ => overlay.settings.clone().or(base.settings.clone()),
+        },
         root_markers: overlay
             .root_markers
             .clone()
@@ -517,6 +521,7 @@ mod tests {
                         root_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        settings: None,
                     },
                 ),
                 (
@@ -528,6 +533,7 @@ mod tests {
                         root_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        settings: None,
                     },
                 ),
             ])),
@@ -598,6 +604,7 @@ mod tests {
                         root_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        settings: None,
                     },
                 ),
                 (
@@ -610,6 +617,7 @@ mod tests {
                         root_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        settings: None,
                     },
                 ),
             ])),
@@ -677,6 +685,7 @@ mod tests {
                     root_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    settings: None,
                 },
             )])),
             ..Default::default()
@@ -1066,6 +1075,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1082,6 +1092,7 @@ mod tests {
                 root_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                settings: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1099,6 +1110,7 @@ mod tests {
                     root_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    settings: None,
                 },
             ),
             (
@@ -1110,6 +1122,7 @@ mod tests {
                     root_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    settings: None,
                 },
             ),
         ]);
@@ -1139,6 +1152,7 @@ mod tests {
             root_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            settings: None,
         };
 
         // Unset overlay inherits from base (wildcard default applies)
@@ -1149,6 +1163,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            settings: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
         assert_eq!(
@@ -1192,6 +1207,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: prefer,
+            settings: None,
         };
 
         // Unset overlay inherits the base (wildcard) value.
@@ -1239,6 +1255,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            settings: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
@@ -1251,6 +1268,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            settings: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1259,6 +1277,69 @@ mod tests {
         snap_settings.bind(|| {
             insta::assert_json_snapshot!(resolved.initialization_options);
         });
+    }
+
+    #[test]
+    fn test_merge_bridge_server_configs_settings_deep_merge() {
+        use serde_json::json;
+        use settings::BridgeServerConfig;
+
+        // `settings` composes across config layers exactly like
+        // `initialization_options`: nested objects deep-merge, scalars take the
+        // overlay (downstream-settings-propagation).
+        let base = BridgeServerConfig {
+            settings: Some(json!({
+                "rust-analyzer": {
+                    "cargo": { "features": "all", "noDefaultFeatures": false },
+                    "check": { "command": "clippy" }
+                }
+            })),
+            ..Default::default()
+        };
+        let overlay = BridgeServerConfig {
+            settings: Some(json!({
+                "rust-analyzer": {
+                    "cargo": { "features": ["foo"] }
+                }
+            })),
+            ..Default::default()
+        };
+
+        let resolved = merge_bridge_server_configs(&base, &overlay);
+
+        assert_eq!(
+            resolved.settings,
+            Some(json!({
+                "rust-analyzer": {
+                    "cargo": { "features": ["foo"], "noDefaultFeatures": false },
+                    "check": { "command": "clippy" }
+                }
+            })),
+            "overlay scalar replaces, sibling keys are preserved by deep merge"
+        );
+    }
+
+    #[test]
+    fn test_merge_bridge_server_configs_settings_overlay_or_base_when_one_side_none() {
+        use serde_json::json;
+        use settings::BridgeServerConfig;
+
+        let with_settings = BridgeServerConfig {
+            settings: Some(json!({ "Lua": { "diagnostics": { "globals": ["vim"] } } })),
+            ..Default::default()
+        };
+        let without = BridgeServerConfig::default();
+
+        // base has settings, overlay does not → base survives.
+        assert_eq!(
+            merge_bridge_server_configs(&with_settings, &without).settings,
+            with_settings.settings,
+        );
+        // overlay has settings, base does not → overlay wins.
+        assert_eq!(
+            merge_bridge_server_configs(&without, &with_settings).settings,
+            with_settings.settings,
+        );
     }
 
     /// `onTypeFormattingTriggers` merges overlay-wins-when-present, so a
@@ -1276,6 +1357,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            settings: None,
         };
 
         let base = server(Some(vec!["}"]));
@@ -1427,6 +1509,7 @@ mod tests {
                     root_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    settings: None,
                 },
             ),
             // rust-analyzer: only specifies cmd and languages
@@ -1439,6 +1522,7 @@ mod tests {
                     root_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    settings: None,
                 },
             ),
         ]);
@@ -1478,6 +1562,7 @@ mod tests {
                     root_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    settings: None,
                 },
             ),
             // rust-analyzer: specifies only cmd, inherits languages from wildcard
@@ -1490,6 +1575,7 @@ mod tests {
                     root_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    settings: None,
                 },
             ),
         ]);

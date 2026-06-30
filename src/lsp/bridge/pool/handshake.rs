@@ -27,6 +27,7 @@ use crate::lsp::bridge::protocol::{
 /// `ServerCapabilities`. Invoked by `get_or_create_connection_with_timeout`
 /// once the connection has spawned and the reader task is up; goes through
 /// the single-writer channel (ls-bridge-message-ordering) for FIFO ordering.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn perform_lsp_handshake(
     handle: &ConnectionHandle,
     init_request_id: RequestId,
@@ -35,6 +36,7 @@ pub(super) async fn perform_lsp_handshake(
     root_uri: Option<String>,
     workspace_folders: Option<Vec<WorkspaceFolder>>,
     client_capabilities: Option<ClientCapabilities>,
+    advertise_configuration: bool,
 ) -> io::Result<ServerCapabilities> {
     // 1. Build and send initialize request via the single-writer loop
     let init_request = build_initialize_request(
@@ -43,6 +45,7 @@ pub(super) async fn perform_lsp_handshake(
         root_uri,
         workspace_folders,
         client_capabilities.as_ref(),
+        advertise_configuration,
     );
     handle
         .send_request(init_request, init_request_id)

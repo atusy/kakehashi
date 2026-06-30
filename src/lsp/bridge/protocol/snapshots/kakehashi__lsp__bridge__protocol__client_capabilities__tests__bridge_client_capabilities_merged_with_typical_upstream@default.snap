@@ -5,6 +5,7 @@ expression: merged
 {
   "workspace": {
     "workspaceFolders": true,
+    "configuration": true,
     "diagnostics": {
       "refreshSupport": true
     }

@@ -14,6 +14,7 @@
 //! The dispatcher in [`actor::reader`](super::actor) owns the shared transport
 //! and routes each method here.
 
+pub(in crate::lsp::bridge) mod configuration;
 pub(in crate::lsp::bridge) mod diagnostic_refresh;
 mod folder_set;
 pub(in crate::lsp::bridge) mod workspace_folders;
