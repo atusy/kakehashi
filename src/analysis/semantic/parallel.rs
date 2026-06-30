@@ -994,15 +994,16 @@ fn to_region_local(tokens: &[RawToken], line_start: u32) -> Vec<RawToken> {
 /// only the line shifts by the region's current first host line — so an edit
 /// *above* an unchanged region (which leaves its content hash, hence the cache
 /// entry, intact but moves it) is re-anchored exactly.
-fn reanchor_to_host(tokens: Vec<RawToken>, line_start: u32) -> Vec<RawToken> {
+fn reanchor_to_host(mut tokens: Vec<RawToken>, line_start: u32) -> Vec<RawToken> {
     let line_start = line_start as usize;
+    // Only the line shifts (column/length/identity unchanged), so mutate in place
+    // rather than allocating a fresh vector. `saturating_add` mirrors
+    // `to_region_local`'s `saturating_sub` — line numbers never approach usize
+    // overflow in practice, but the two stay symmetric and wrap-free.
+    for t in &mut tokens {
+        t.line = t.line.saturating_add(line_start);
+    }
     tokens
-        .into_iter()
-        .map(|t| {
-            let line = t.line;
-            t.with_span(line + line_start, t.column, t.length)
-        })
-        .collect()
 }
 
 /// Convert byte-based exclusion ranges to line/column `ActiveInjectionBounds`s,
