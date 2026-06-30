@@ -44,6 +44,25 @@ pub(crate) fn check_diagnostic_refresh_support(caps: &ClientCapabilities) -> boo
         .unwrap_or(false)
 }
 
+/// Whether a batch of language events asks for a `workspace/semanticTokens/refresh`.
+///
+/// The refresh request is parameterless and workspace-wide, so every
+/// `SemanticTokensRefresh` event in a single batch is interchangeable: the batch
+/// either wants a refresh or it doesn't. [`ClientNotifier::log_language_events`]
+/// uses this to collapse N refresh events into a single request (#531) — firing N
+/// would only force `(N-1)` redundant workspace re-tokenizations and leak that many
+/// tower-lsp pending entries on a non-responding client.
+///
+/// Extracted as a pure function for unit testing (the notifier cannot be built in
+/// unit tests). Note: this tests the *trigger* (does the batch want a refresh), not
+/// the N→1 *collapse* — the collapse is guaranteed structurally by the single spawn
+/// site in `log_language_events`.
+fn batch_requests_semantic_tokens_refresh(events: &[LanguageEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, LanguageEvent::SemanticTokensRefresh { .. }))
+}
+
 /// Server→client notifier: logging, progress, semantic-token refresh. `Clone`
 /// and thread-safe (the underlying `Client` synchronizes internally, and
 /// `client_capabilities` is a shared `OnceLock`).
@@ -114,6 +133,40 @@ impl<'a> ClientNotifier<'a> {
     /// `SemanticTokensRefresh` only fires when the client declared support, since
     /// sending the request unconditionally would violate the LSP capability gate.
     pub(crate) async fn log_language_events(&self, events: &[LanguageEvent]) {
+        // Send at most one workspace/semanticTokens/refresh for the whole batch,
+        // and spawn it BEFORE the per-event log/show-message awaits below so a
+        // slow/blocked client log channel can't delay when the refresh task starts
+        // (the refresh is detached, so it then runs concurrently with the logs).
+        // The request is parameterless and workspace-wide, so multiple refresh
+        // events (e.g. one per derived language on a config reload) collapse into a
+        // single request: firing N would only force (N-1) redundant workspace
+        // re-tokenizations and leak that many tower-lsp pending entries on a
+        // non-responding client. See #531 (twin of #497).
+        if batch_requests_semantic_tokens_refresh(events) {
+            if self.supports_semantic_tokens_refresh() {
+                // Fire-and-forget because the response is just null
+                //
+                // Keep the receiver alive without dropping by timeout in order to
+                // avoid tower-lsp panics (see commit b902e28d)
+                //
+                // Trade-off: If a client never responds (e.g., vim-lsp), this causes:
+                // - A small memory leak in tower-lsp's pending requests map
+                // - A spawned task waiting indefinitely
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = client.semantic_tokens_refresh().await {
+                        log::debug!("semantic_tokens_refresh failed: {}", err);
+                    }
+                });
+            } else {
+                // Only send refresh if client supports it (LSP @since 3.16.0 compliance).
+                log::debug!(
+                    "Skipping semantic_tokens_refresh - client does not support it (batch of {} event(s))",
+                    events.len()
+                );
+            }
+        }
+
         for event in events {
             match event {
                 LanguageEvent::Log { level, message } => {
@@ -134,33 +187,8 @@ impl<'a> ClientNotifier<'a> {
                         .show_message(message_type, message.clone())
                         .await;
                 }
-                LanguageEvent::SemanticTokensRefresh { language_id } => {
-                    // Only send refresh if client supports it (LSP @since 3.16.0 compliance).
-                    // Check MUST be before tokio::spawn - can't `continue` from async block.
-                    if !self.supports_semantic_tokens_refresh() {
-                        log::debug!(
-                            "Skipping semantic_tokens_refresh for {} - client does not support it",
-                            language_id
-                        );
-                        continue;
-                    }
-
-                    // Fire-and-forget because the response is just null
-                    //
-                    // Keep the receiver alive without dropping by timeout in order to
-                    // avoid tower-lsp panics (see commit b902e28d)
-                    //
-                    // Trade-off: If a client never responds (e.g., vim-lsp), this causes:
-                    // - A small memory leak in tower-lsp's pending requests map
-                    // - A spawned task waiting indefinitely
-                    let client = self.client.clone();
-                    let lang_id = language_id.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = client.semantic_tokens_refresh().await {
-                            log::debug!("semantic_tokens_refresh failed for {}: {}", lang_id, err);
-                        }
-                    });
-                }
+                // Refresh requests are handled once, before the loop — see above.
+                LanguageEvent::SemanticTokensRefresh { .. } => {}
             }
         }
     }
@@ -300,5 +328,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(check_diagnostic_refresh_support(&caps), expected);
+    }
+
+    /// Tests for `batch_requests_semantic_tokens_refresh` (#531).
+    ///
+    /// This tests the *trigger* — whether a batch wants a refresh at all. The N→1
+    /// collapse itself is guaranteed structurally (a single spawn site after the
+    /// loop in `log_language_events`), not by this predicate.
+    #[test]
+    fn batch_requests_refresh_when_any_refresh_event_present() {
+        let events = vec![
+            LanguageEvent::log(LanguageLogLevel::Info, "loaded a"),
+            LanguageEvent::semantic_tokens_refresh("python"),
+            LanguageEvent::log(LanguageLogLevel::Info, "loaded b"),
+            LanguageEvent::semantic_tokens_refresh("lua"),
+        ];
+        assert!(batch_requests_semantic_tokens_refresh(&events));
+    }
+
+    #[test]
+    fn batch_requests_refresh_for_single_refresh_event() {
+        let events = vec![LanguageEvent::semantic_tokens_refresh("python")];
+        assert!(batch_requests_semantic_tokens_refresh(&events));
+    }
+
+    #[test]
+    fn batch_does_not_request_refresh_without_refresh_event() {
+        let events = vec![
+            LanguageEvent::log(LanguageLogLevel::Info, "info"),
+            LanguageEvent::show_message(LanguageLogLevel::Warning, "warn"),
+        ];
+        assert!(!batch_requests_semantic_tokens_refresh(&events));
+    }
+
+    #[test]
+    fn batch_does_not_request_refresh_when_empty() {
+        assert!(!batch_requests_semantic_tokens_refresh(&[]));
     }
 }
