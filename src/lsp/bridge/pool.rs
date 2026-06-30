@@ -52,7 +52,8 @@ use crate::error::LockResultExt;
 
 use super::protocol::{
     JsonRpcNotification, RequestId, VirtualDocumentUri,
-    build_did_change_workspace_folders_notification, build_didopen_notification,
+    build_did_change_configuration_notification, build_did_change_workspace_folders_notification,
+    build_didopen_notification,
 };
 
 /// Timeout for the LSP initialize handshake and for wait-for-ready on an
@@ -1452,6 +1453,11 @@ impl LanguageServerPool {
         // - If this function's caller is cancelled, only the JoinHandle await is dropped
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
+        // Seed value for the post-`initialized` settings push (path a). Same
+        // value the reader's settings cell was seeded with; push-model servers
+        // read it directly, pull-model servers re-request via
+        // workspace/configuration (downstream-settings-propagation).
+        let seed_settings = server_config.settings.clone();
         let client_capabilities = self.client_capabilities();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
@@ -1481,6 +1487,16 @@ impl LanguageServerPool {
                     );
                     handle_for_handshake.set_server_capabilities(capabilities);
                     handle_for_handshake.set_state(ConnectionState::Ready);
+                    // Path a: push this server's seed settings now that it is
+                    // initialized, so push-model servers are configured even
+                    // before they pull (downstream-settings-propagation).
+                    // Best-effort: a dropped notification self-heals when a
+                    // pull-model server re-requests via workspace/configuration.
+                    if let Some(settings) = seed_settings {
+                        handle_for_handshake.send_notification(
+                            build_did_change_configuration_notification(settings),
+                        );
+                    }
                     Ok(())
                 }
                 Ok(Err(e)) => {

@@ -92,6 +92,11 @@ fn build_baseline_capabilities() -> ClientCapabilities {
             // passthrough or the rootMarkers-derived folder), which LSP makes
             // conditional on this capability.
             workspace_folders: Some(true),
+            // The bridge owns and serves each server's workspace settings
+            // (downstream-settings-propagation): advertise `configuration` so a
+            // spec-compliant downstream server pulls via `workspace/configuration`,
+            // answered from the per-connection settings cell.
+            configuration: Some(true),
             ..Default::default()
         }),
         general: Some(GeneralClientCapabilities {

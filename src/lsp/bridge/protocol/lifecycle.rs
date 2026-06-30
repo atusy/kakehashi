@@ -6,9 +6,9 @@
 use std::str::FromStr;
 
 use tower_lsp_server::ls_types::{
-    ClientCapabilities, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
-    InitializeParams, InitializedParams, TextDocumentIdentifier, Uri, WorkspaceFolder,
-    WorkspaceFoldersChangeEvent,
+    ClientCapabilities, DidChangeConfigurationParams, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, InitializeParams, InitializedParams, TextDocumentIdentifier, Uri,
+    WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 
 use super::client_capabilities::build_bridge_client_capabilities;
@@ -104,6 +104,21 @@ pub(crate) fn build_did_change_workspace_folders_notification(
         },
     };
     JsonRpcNotification::new("workspace/didChangeWorkspaceFolders", params)
+}
+
+/// Build a `workspace/didChangeConfiguration` notification carrying this
+/// server's workspace settings (downstream-settings-propagation).
+///
+/// Sent after `initialized` to seed push-model servers, and again whenever the
+/// merged settings for this server change. Pull-model servers ignore the
+/// `settings` payload and re-request via `workspace/configuration` instead.
+pub(crate) fn build_did_change_configuration_notification(
+    settings: serde_json::Value,
+) -> JsonRpcNotification<DidChangeConfigurationParams> {
+    JsonRpcNotification::new(
+        "workspace/didChangeConfiguration",
+        DidChangeConfigurationParams { settings },
+    )
 }
 
 /// Validates a JSON-RPC initialize response.
@@ -462,5 +477,15 @@ mod tests {
             expected_message,
             err_msg
         );
+    }
+
+    #[test]
+    fn did_change_configuration_notification_carries_settings_verbatim() {
+        let settings = serde_json::json!({ "rust-analyzer": { "cargo": { "features": "all" } } });
+        let notif = build_did_change_configuration_notification(settings.clone());
+        let wire = serde_json::to_value(&notif).expect("serializable");
+
+        assert_eq!(wire["method"], "workspace/didChangeConfiguration");
+        assert_eq!(wire["params"]["settings"], settings);
     }
 }

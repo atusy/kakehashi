@@ -5,6 +5,7 @@ expression: capabilities
 {
   "workspace": {
     "workspaceFolders": true,
+    "configuration": true,
     "diagnostics": {
       "refreshSupport": true
     }
