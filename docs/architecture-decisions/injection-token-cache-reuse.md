@@ -260,8 +260,8 @@ paths; an audit surfaced four the original design did not address:
    injections are discovered as separate `region_id`s but tokenized *jointly*
    (multiple blocks parsed as one document). Editing one block does not change a
    sibling's content hash, so the sibling would serve a hit computed in the
-   *old* joint context. **Mitigation (v1): exclude combined groups from the
-   cache** — the v1 predicate already does, and the vendored Markdown query
+   *old* joint context. **Mitigation (v1):** exclude combined groups from the
+   cache — the v1 predicate already does, and the vendored Markdown query
    reserves `combined` for HTML anyway.
 
    *Caching them later (follow-up)* means treating the whole group as one cache
@@ -282,7 +282,7 @@ paths; an audit surfaced four the original design did not address:
    (PR #530) clears the whole-doc cache but never touches `InjectionTokenCache`,
    which has no generation in its key. A query/settings reload with unchanged
    text would serve tokens computed under the *old* highlight query.
-   **Mitigation: fold the settings generation into the entry's validity, the
+   **Mitigation:** fold the settings generation into the entry's validity, the
    same fix PR #530 applied to the whole-doc cache (where the inner cache takes a
    derived `cache_key`). This is preferred for a concrete correctness reason, not
    just neatness: a bare global `clear()` on reload has a store-after-clear race —
@@ -296,11 +296,11 @@ paths; an audit surfaced four the original design did not address:
    `Vec<RawToken>` (Option A), and the generation rides along on those same
    signatures. A one-method global `clear()` from `bump_semantic_token_generation`
    is simpler and the flush is cheap on a rare reload, but it trades that
-   race-safety away.**
+   race-safety away.
 3. **Parser-load race (guard).** `process_injection_sync` returns an empty
    `Vec<RawToken>` when a region's parser is not yet loaded — indistinguishable
    from a genuinely empty region, so "never store on the parser-missing branch"
-   first requires making that branch *observable*. **Mitigation: have
+   first requires making that branch *observable*. **Mitigation:** have
    `process_injection_sync` return a structured result that separates
    parser-missing from genuinely-empty (e.g. `Option`/`Result` or a
    `parser_loaded` flag) and let the orchestration layer
@@ -309,7 +309,7 @@ paths; an audit surfaced four the original design did not address:
    inside `process_injection_sync`: it runs in parallel Rayon workers, so an
    in-function write would thread thread-safe cache-write access into parallel
    tokenization and add side-effects there, whereas a pure structured return
-   keeps the store decision at the single-threaded orchestration boundary.**
+   keeps the store decision at the single-threaded orchestration boundary.
 4. **Row-0 `start_column` re-anchoring (guard, sidestepped by v1 scope).** A
    same-line-before edit shifts row-0 columns without changing the content hash.
    Out of scope for v1 by the `content_start_col == 0` predicate; required only
