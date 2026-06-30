@@ -19,8 +19,13 @@ pub(super) struct RegionCacheInfo {
     /// Position-based ULID, byte-identical to the one `populate_injections` mints,
     /// so `invalidate_for_edits` evicts the same entry this stores under.
     pub region_id: String,
-    /// Hash of the region's (effective) content — distinguishes a content edit.
-    pub content_hash: u64,
+    /// Validity hash: the region's content hash folded with its resolved injection
+    /// language. Content distinguishes an edit; the language fold makes a hit
+    /// impossible across two regions that share a position-stable `region_id` and
+    /// identical content bytes but inject *different* languages — including a
+    /// stale ULID minted by a superseded request, which `populate_injections`
+    /// never sees and so can't evict by language change.
+    pub validity_hash: u64,
     /// `line_range.start`: the region's first host line, added back on reuse
     /// (`host_line = line_start + token.line`).
     pub line_start: u32,

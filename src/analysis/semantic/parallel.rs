@@ -26,6 +26,7 @@ use crate::language::injection::{
     compute_included_ranges_clipped, effective_offset_for_pattern, has_combined_for_pattern,
     intersect_included_ranges, parse_with_ranges, sub_select_included_ranges,
 };
+use crate::text::fnv1a_hash;
 use crate::text::position::byte_to_utf16_col;
 
 /// Minimum number of top-level single injection regions before injection-token
@@ -252,18 +253,21 @@ pub(crate) fn process_injection_sync(
     // exclusion ranges. This suppresses this level's captures within regions
     // that will be handled by deeper injection languages. Nested regions are
     // never cached in v1, so no cache context is threaded into the recursion.
-    let (nested_contexts, nested_exclusion_ranges) = collect_injection_contexts_sync(
-        ctx.content_text,
-        &tree,
-        Some(&ctx.resolved_lang),
-        coordinator,
-        ctx.host_start_byte,
-        ctx.included_ranges.as_deref(),
-        None,
-    );
+    let (nested_contexts, nested_exclusion_ranges, nested_discovery_complete) =
+        collect_injection_contexts_sync(
+            ctx.content_text,
+            &tree,
+            Some(&ctx.resolved_lang),
+            coordinator,
+            ctx.host_start_byte,
+            ctx.included_ranges.as_deref(),
+            None,
+        );
 
     let mut tokens = Vec::new();
-    let mut fully_loaded = true;
+    // A nested injection dropped during discovery (its parser/query not loaded)
+    // leaves this subtree incomplete, so it must not be cached as a hit.
+    let mut fully_loaded = nested_discovery_complete;
 
     // Collect tokens from this injection's highlight query, excluding
     // regions covered by nested injections. Combined contexts force per-line
@@ -390,10 +394,14 @@ fn clip_tokens_to_included_ranges(
 /// works without mutable parser access. It discovers all injections in the
 /// given tree and returns their contexts for processing.
 ///
-/// Returns `(contexts, exclusion_ranges)` where exclusion_ranges are the
-/// content-local byte ranges of each resolved injection. These ranges
-/// correspond to the regions where child injections produce their own tokens,
-/// so parent captures overlapping these ranges should be suppressed.
+/// Returns `(contexts, exclusion_ranges, discovery_complete)`. `exclusion_ranges`
+/// are the content-local byte ranges of each resolved injection (regions where
+/// child injections produce their own tokens, so parent captures overlapping
+/// them should be suppressed). `discovery_complete` is `false` when any injection
+/// was dropped because its parser/highlight query was unavailable — a *transient*
+/// gap that re-fills when the parser loads without the content changing. A caller
+/// that caches a region must taint it with this so an incomplete subtree is never
+/// stored (and then served stale once the missing parser arrives, #529 Hazard 3).
 fn collect_injection_contexts_sync<'a>(
     text: &'a str,
     tree: &Tree,
@@ -402,21 +410,26 @@ fn collect_injection_contexts_sync<'a>(
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
     cache_ctx: Option<(&Url, &NodeTracker)>,
-) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>) {
+) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>, bool) {
     use crate::language::injection::collect_all_injections;
 
     let current_lang = filetype.unwrap_or("unknown");
     let Some(injection_query) = coordinator.injection_query(current_lang) else {
-        return (Vec::new(), Vec::new());
+        // No injection query: there is nothing to discover, so discovery is
+        // trivially complete (no region was dropped).
+        return (Vec::new(), Vec::new(), true);
     };
 
     let Some(injections) = collect_all_injections(&tree.root_node(), text, Some(&injection_query))
     else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), true);
     };
 
     let mut contexts = Vec::with_capacity(injections.len());
     let mut exclusion_ranges = Vec::with_capacity(injections.len());
+    // Tainted to `false` when an injection is skipped because its parser or
+    // highlight query isn't loaded yet (vs. a permanently malformed region).
+    let mut discovery_complete = true;
 
     // Partition out `injection.combined` regions: every capture of one
     // (language, pattern) pair parses as a single document so cross-block
@@ -445,9 +458,13 @@ fn collect_injection_contexts_sync<'a>(
     }
 
     // Resolve cache identity only when a cache handle is threaded in (top-level
-    // request, not a nested pass) AND the region count clears the gate. Below the
-    // gate, `region_cache` stays `None` for every context, so the store/reuse
-    // path is skipped entirely and output matches the pre-#529 code exactly.
+    // request, not a nested pass) AND the region count clears the gate. The count
+    // is `singles.len()` — the raw single captures, an upper bound on the regions
+    // that will actually be cacheable (some may later fail bounds/language/query
+    // resolution). Below the gate, `region_cache` stays `None` for every context,
+    // so the store/reuse path is skipped entirely. The gate only governs whether
+    // the (cheap) bookkeeping runs; output is byte-identical to the pre-#529 code
+    // either way, so the upper-bound count is a safe, conservative trigger.
     let cache_for_singles = cache_ctx.filter(|_| singles.len() >= INJECTION_CACHE_MIN_REGIONS);
 
     for injection in singles {
@@ -462,15 +479,19 @@ fn collect_injection_contexts_sync<'a>(
         // Extract injection content for language detection
         let injection_content = &text[start..end];
 
-        // Resolve injection language
+        // Resolve injection language. A failure here means no parser could be
+        // loaded for it yet — a transient gap, so discovery is incomplete.
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&injection.language, injection_content)
         else {
+            discovery_complete = false;
             continue;
         };
 
-        // Get highlight query for resolved language
+        // Get highlight query for resolved language. Missing query is likewise
+        // transient (loads with the language), so taint discovery.
         let Some(highlight_query) = coordinator.highlight_query(&resolved_lang) else {
+            discovery_complete = false;
             continue;
         };
 
@@ -575,9 +596,16 @@ fn collect_injection_contexts_sync<'a>(
             let cacheable =
                 CacheableInjectionRegion::from_region_info(&injection, &region_id, text);
             let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
+            // Fold the resolved language into the validity hash so a position-
+            // stable region_id with identical content but a different injected
+            // language can never serve a stale hit (defends the cross-language
+            // hazard from a superseded request's orphaned ULID; same fold style as
+            // the generation fold in cache_key).
+            let validity_hash =
+                cacheable.content_hash ^ fnv1a_hash(&resolved_lang).wrapping_mul(0x100000001b3);
             RegionCacheInfo {
                 region_id,
-                content_hash: cacheable.content_hash,
+                validity_hash,
                 line_start: cacheable.line_range.start,
                 eligible,
             }
@@ -608,7 +636,7 @@ fn collect_injection_contexts_sync<'a>(
         }
     }
 
-    (contexts, exclusion_ranges)
+    (contexts, exclusion_ranges, discovery_complete)
 }
 
 /// Per-line byte prefix widths from included ranges: each range's
@@ -777,7 +805,10 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Collect top-level injection contexts and their byte ranges. The cache
     // handle (if any) lets the discovery phase resolve region identities
     // single-threaded, before the fan-out.
-    let (contexts, exclusion_byte_ranges) = collect_injection_contexts_sync(
+    // A top-level region dropped during discovery isn't cached (no region_cache
+    // is built for it), so the top-level completeness flag is irrelevant here —
+    // only nested completeness, threaded through process_injection_sync, matters.
+    let (contexts, exclusion_byte_ranges, _discovery_complete) = collect_injection_contexts_sync(
         host_text,
         host_tree,
         host_filetype,
@@ -812,7 +843,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                 && rc.eligible
                 && let Some(local) =
                     cc.cache
-                        .get(cc.uri, &rc.region_id, rc.content_hash, cc.generation)
+                        .get(cc.uri, &rc.region_id, rc.validity_hash, cc.generation)
             {
                 hit_tokens.extend(reanchor_to_host(local, rc.line_start));
             } else {
@@ -878,8 +909,13 @@ pub(crate) fn collect_injection_tokens_parallel(
                 && res.fully_loaded
             {
                 let local = to_region_local(&res.tokens, rc.line_start);
-                cc.cache
-                    .store(cc.uri, &rc.region_id, rc.content_hash, cc.generation, local);
+                cc.cache.store(
+                    cc.uri,
+                    &rc.region_id,
+                    rc.validity_hash,
+                    cc.generation,
+                    local,
+                );
             }
         }
     }
@@ -1844,7 +1880,7 @@ local b = 2
             .expect("markdown must parse");
         parser_pool.release("markdown".to_string(), parser);
 
-        let (contexts, exclusions) = collect_injection_contexts_sync(
+        let (contexts, exclusions, _complete) = collect_injection_contexts_sync(
             COMBINED_LUA_DOC,
             &tree,
             Some("markdown"),
@@ -1921,7 +1957,7 @@ local b = 2
         let tree = parser.parse(doc, None).expect("markdown must parse");
         parser_pool.release("markdown".to_string(), parser);
 
-        let (contexts, _exclusions) = collect_injection_contexts_sync(
+        let (contexts, _exclusions, _complete) = collect_injection_contexts_sync(
             doc,
             &tree,
             Some("markdown"),

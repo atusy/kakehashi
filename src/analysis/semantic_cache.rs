@@ -208,13 +208,14 @@ impl Default for InjectionMap {
 /// hot path can reuse them across edits that don't touch the region, re-anchoring
 /// them to the region's current host line at read time.
 ///
-/// The key carries the region's validity inline: `(uri, region_id, content_hash,
-/// generation)`. `content_hash` distinguishes a region whose *content* changed
-/// (a stale entry simply isn't found) and `generation` is the settings/query
-/// generation (a config reload changes it, so old-query tokens stop matching) —
-/// the same race-safe fold `SemanticTokenCache` applies to its own key, rather
-/// than a bare `clear()`. A lookup is therefore an exact key match; no separate
-/// read-time validity check is needed.
+/// The key carries the region's validity inline: `(uri, region_id, validity_hash,
+/// generation)`. `validity_hash` folds the region's content hash with its
+/// resolved injection language (a content edit OR a language change at the same
+/// position misses), and `generation` is the settings/query generation (a config
+/// reload changes it, so old-query tokens stop matching) — the same race-safe
+/// fold `SemanticTokenCache` applies to its own key, rather than a bare
+/// `clear()`. A lookup is therefore an exact key match; no separate read-time
+/// validity check is needed.
 ///
 /// `supports_multiline` is deliberately *not* part of the key: it changes
 /// multiline-token emission, but it comes from the client capabilities snapshot
@@ -238,12 +239,17 @@ impl InjectionTokenCache {
         &self,
         uri: &Url,
         region_id: &str,
-        content_hash: u64,
+        validity_hash: u64,
         generation: u64,
         tokens: Vec<RawToken>,
     ) {
         self.cache.insert(
-            (uri.clone(), region_id.to_string(), content_hash, generation),
+            (
+                uri.clone(),
+                region_id.to_string(),
+                validity_hash,
+                generation,
+            ),
             tokens,
         );
     }
@@ -254,12 +260,17 @@ impl InjectionTokenCache {
         &self,
         uri: &Url,
         region_id: &str,
-        content_hash: u64,
+        validity_hash: u64,
         generation: u64,
     ) -> Option<Vec<RawToken>> {
         let result = self
             .cache
-            .get(&(uri.clone(), region_id.to_string(), content_hash, generation))
+            .get(&(
+                uri.clone(),
+                region_id.to_string(),
+                validity_hash,
+                generation,
+            ))
             .map(|entry| entry.clone());
 
         if result.is_some() {
