@@ -238,7 +238,7 @@ preference order:
   *writer* side — the second CAS below that attaches discovery only to the tree it
   was built for. Realizability, given `populate_injections` runs *after* the
   tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`,
-  `coordinator/parse.rs`):
+  `src/lsp/lsp_impl/coordinator/parse.rs`):
   - **No *new* `NodeTracker` mutation.** `populate_injections` *already* calls
     `tracker.get_or_create` today, to mint the `region_id` on each
     `CacheableInjectionRegion` it inserts into the `InjectionMap` (which
@@ -246,7 +246,8 @@ preference order:
     must **reuse that same id** — it is produced by the same shared stage, from the
     same `Q`, so the lever adds *no* off-ingress `get_or_create` beyond today's.
     (The pre-existing off-ingress minting, and its interaction with a concurrent
-    subsequent edit, is governed by [lazy-node-identity-tracking] and is neither
+    subsequent edit, is governed by
+    [lazy-node-identity-tracking](lazy-node-identity-tracking.md) and is neither
     worsened nor in scope to fix here.) Because reuse is bound to the tree
     identity, a stored `region_id` is only ever served for the exact tree it was
     minted on — consistent with the `InjectionMap` / tracker state for that tree;
@@ -274,9 +275,9 @@ obligation), and parse ordering (below) affects only hit-rate.
 binding above; ordering only governs how often a reusable discovery is *available*
 when the request runs. In the reparse loop, when a tree lands the order is
 set-tree → `populate_injections` → `advance_watermark` / `mark_parse_finished`
-(`coordinator/parse.rs`), and the semantic handler's settle waits on the parse
+(`src/lsp/lsp_impl/coordinator/parse.rs`), and the semantic handler's settle waits on the parse
 watermark + parse-completion before snapshotting the tree
-(`text_document/semantic_tokens.rs`), so in the common debounced case the
+(`src/lsp/lsp_impl/text_document/semantic_tokens.rs`), so in the common debounced case the
 snapshot already carries (or its epoch already matches) the populated discovery.
 On the branches where `populate_injections` is skipped (the CAS-fail `if stored`
 guard, the no-tree / error paths — `advance_watermark` still runs there), when the
@@ -299,9 +300,18 @@ is load-bearing.
   the discovery, so the lever mints no new ids) — rather than calling
   `collect_injection_contexts_sync` (which would run `Q` a second time and defeat
   the whole lever). The semantic miss-path uses the same stage.
-- `populate_injections` runs that stage and stores the owned discovery (coupled to
-  the tree, or epoch-tagged), **only when `discovery_complete` is true** (see
-  correctness surface 5).
+- **`R` (the `InjectionMap`) stays complete; only the discovery is gated.** Today
+  `from_region_info` builds `R` for *every* region `collect_all_injections`
+  returns, regardless of parser/query load state, because `invalidate_for_edits`
+  must be able to evict any region. The shared stage must preserve that: it builds
+  `R` for all regions, while a region whose parser/highlight query is unavailable
+  is dropped only from the *discovery contexts* and taints `discovery_complete`.
+  So the refactor must not let the discovery's region-dropping shrink the
+  `InjectionMap`.
+- `populate_injections` runs that stage, always inserts the complete `R` into the
+  `InjectionMap` as today, and stores the owned discovery (coupled to the tree, or
+  epoch-tagged) **only when `discovery_complete` is true** (see correctness
+  surface 5).
 - The `semanticTokens` path, before discovering, takes the discovery carried by
   its tree snapshot (or epoch-matched entry). **Present** → rebuild the
   `InjectionContext`s from the owned data (re-slice `content_text` from the
@@ -397,7 +407,7 @@ everywhere the existing `injection_map` / `injection_token_cache` are —
 `populate_injections` (`src/lsp/cache.rs`). Memory grows by a second per-region
 owned structure (the `included_ranges` / prefix / exclusion vectors) beyond the
 token half's per-region token vector, bounded by the same `clear_document` / close
-path; the Consequences section needs that addendum. (7) **Generation / registry
+path (see Consequences/Neutral). (7) **Generation / registry
 should be one atomic config epoch (narrow reload race).** The settings `generation`
 gate already handles the common reload: a bump means the cached discovery's
 generation no longer matches, so it misses and re-discovers. What it does *not*
