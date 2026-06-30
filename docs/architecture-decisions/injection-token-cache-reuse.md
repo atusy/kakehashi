@@ -40,6 +40,10 @@ build, warm, on Markdown with N fenced code blocks (rust/lua/yaml):
 | delta diff | 0.002 | 0.004 | 0.008 | no — negligible |
 | **per-keystroke total** | **1.89** | **4.90** | **10.54** | |
 
+(Each cell is an independently measured-and-rounded average; the total is the
+measured per-keystroke total, so a column may not sum *exactly* to it — e.g. the
+300-block phases round-sum to 10.55 vs a measured 10.54.)
+
 Two structural facts fall out:
 
 1. **The delta diff and incremental parse are nearly free.** The per-keystroke
