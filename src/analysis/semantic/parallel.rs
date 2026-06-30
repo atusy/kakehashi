@@ -598,9 +598,10 @@ fn collect_injection_contexts_sync<'a>(
             let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
             // Fold the resolved language into the validity hash so a position-
             // stable region_id with identical content but a different injected
-            // language can never serve a stale hit (defends the cross-language
-            // hazard from a superseded request's orphaned ULID; same fold style as
-            // the generation fold in cache_key).
+            // language gets a different key (barring a 64-bit collision) and won't
+            // serve a stale hit — defends the cross-language hazard from a
+            // superseded request's orphaned ULID; same fold style as the
+            // generation fold in cache_key.
             let validity_hash =
                 cacheable.content_hash ^ fnv1a_hash(&resolved_lang).wrapping_mul(0x100000001b3);
             RegionCacheInfo {
@@ -624,7 +625,7 @@ fn collect_injection_contexts_sync<'a>(
     }
 
     for (_group_key, regions) in combined_groups {
-        if let Some(ctx) = build_combined_context(
+        match build_combined_context(
             &regions,
             text,
             coordinator,
@@ -632,7 +633,12 @@ fn collect_injection_contexts_sync<'a>(
             parent_included_ranges,
             &mut exclusion_ranges,
         ) {
-            contexts.push(ctx);
+            Ok(Some(ctx)) => contexts.push(ctx),
+            // Permanently empty/invalid/clipped-away group — nothing dropped.
+            Ok(None) => {}
+            // Parser/highlight query for the group isn't loaded yet — a transient
+            // drop, same as the single-region case, so taint discovery.
+            Err(CombinedDiscoveryIncomplete) => discovery_complete = false,
         }
     }
 
@@ -662,6 +668,11 @@ fn derive_prefix_byte_widths(ranges: &[tree_sitter::Range]) -> Vec<usize> {
     widths
 }
 
+/// A combined-injection group was dropped because its parser/highlight query
+/// isn't loaded yet — a transient gap the caller taints into `discovery_complete`
+/// (distinct from a permanent `Ok(None)` empty/invalid group).
+struct CombinedDiscoveryIncomplete;
+
 /// Build one [`InjectionContext`] covering every region of an
 /// `injection.combined` group (#187): the content slice spans from the first
 /// block's start to the last block's end, and `included_ranges` restricts the
@@ -669,9 +680,11 @@ fn derive_prefix_byte_widths(ranges: &[tree_sitter::Range]) -> Vec<usize> {
 /// opened in one `html_block` and closed in another) while the host text
 /// between blocks stays invisible to the injected parser.
 ///
-/// Returns `None` when the group's language/query doesn't resolve or every
-/// range is clipped away by the parent's exclusions — the regions then simply
-/// produce no tokens, like any unresolvable injection.
+/// Returns `Ok(None)` for a permanently empty/invalid/clipped-away group (no
+/// tokens, nothing dropped) and `Err(CombinedDiscoveryIncomplete)` when the
+/// group's language/query isn't loaded yet — a *transient* drop the caller must
+/// taint into `discovery_complete` so a parent injection isn't cached with an
+/// incomplete combined subtree.
 fn build_combined_context<'a>(
     regions: &[InjectionRegionInfo<'_>],
     text: &'a str,
@@ -679,22 +692,32 @@ fn build_combined_context<'a>(
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
     exclusion_ranges: &mut Vec<(usize, usize)>,
-) -> Option<InjectionContext<'a>> {
+) -> Result<Option<InjectionContext<'a>>, CombinedDiscoveryIncomplete> {
     // collect_all_injections sorts by start byte, so `first` anchors the group.
-    let first = regions.first()?;
+    let Some(first) = regions.first() else {
+        return Ok(None);
+    };
     let group_start = first.content_node.start_byte();
     let group_start_pos = first.content_node.start_position();
-    let group_end = regions.iter().map(|r| r.content_node.end_byte()).max()?;
+    let Some(group_end) = regions.iter().map(|r| r.content_node.end_byte()).max() else {
+        return Ok(None);
+    };
     if group_start >= group_end || group_end > text.len() {
-        return None;
+        return Ok(None);
     }
 
     // Resolve the language once from the first block's content — the grouping
-    // key guarantees every region shares the raw injection language.
+    // key guarantees every region shares the raw injection language. A missing
+    // language/query is transient (loads later without the content changing).
     let first_content = &text[first.content_node.start_byte()..first.content_node.end_byte()];
-    let (resolved_lang, _) =
-        coordinator.resolve_injection_language(&first.language, first_content)?;
-    let highlight_query = coordinator.highlight_query(&resolved_lang)?;
+    let Some((resolved_lang, _)) =
+        coordinator.resolve_injection_language(&first.language, first_content)
+    else {
+        return Err(CombinedDiscoveryIncomplete);
+    };
+    let Some(highlight_query) = coordinator.highlight_query(&resolved_lang) else {
+        return Err(CombinedDiscoveryIncomplete);
+    };
 
     // Rebase an absolute point into the combined content's coordinate space.
     let to_relative_point = |abs: tree_sitter::Point| tree_sitter::Point {
@@ -748,7 +771,7 @@ fn build_combined_context<'a>(
         Some(parent_ranges) => {
             let intersected = intersect_included_ranges(&group_ranges, &parent_ranges);
             if intersected.is_empty() {
-                return None;
+                return Ok(None);
             }
             intersected
         }
@@ -762,7 +785,7 @@ fn build_combined_context<'a>(
 
     let prefix_byte_widths = derive_prefix_byte_widths(&included_ranges);
 
-    Some(InjectionContext {
+    Ok(Some(InjectionContext {
         resolved_lang,
         highlight_query,
         content_text: &text[group_start..group_end],
@@ -773,7 +796,7 @@ fn build_combined_context<'a>(
         // Combined groups are excluded from the v1 cache (sibling
         // cross-contamination hazard); see the ADR's correctness hazards.
         region_cache: None,
-    })
+    }))
 }
 
 /// Walk top-level injections of the host doc in parallel via Rayon work-stealing,
