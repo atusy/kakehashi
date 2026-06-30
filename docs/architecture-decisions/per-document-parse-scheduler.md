@@ -451,15 +451,32 @@ scheduler keeps the text in the store in the first place.
 
 ## Decision–Implementation Gap
 
-Realized as Option 3, the per-document coalescing scheduler. The parse runs off
-the ingress ticket, a burst collapses to one reparse, install is off-ingress,
-readers wait on the epoch watermark rather than on tree presence, store writes are
-resurrection-safe (non-inserting), and injection orchestration is re-homed off the
-ingress path.
+The decision is realized as Option 3, the per-document coalescing scheduler. The
+parse runs off the ingress ticket on both the open and change paths; a burst
+collapses to one reparse; install is off-ingress, behind a killable-subprocess
+deadline — compilation re-execs a `__compile-parser` subprocess whose process group
+the installer kills when the deadline fires, with an in-subprocess watchdog that
+group-kills the compile even if the parent dies first. Readers wait on the
+`(incarnation, ticket)` epoch watermark rather than on tree presence. Every tree
+write is a non-inserting CAS that checks the captured incarnation alongside the
+text/language it parsed, and the watermark advance is incarnation-guarded, so a
+close-then-reopen during an in-flight parse fails its epoch check at the write
+rather than resurrecting the closed document. Injection orchestration runs
+downstream of the parse, off the ingress path. The text-owning actor of Option 4 is
+not pursued; see Considered Options.
 
-Two architectural elements of the decision remain deferred. The epoch's
-**incarnation** axis is not yet enforced on tree writes — only the intra-lifetime
-ticket is — so a close-then-reopen race during an in-flight parse is not yet fully
-closed. And the `didOpen` parse still runs on the ingress ticket rather than off
-it (a one-time open cost; change-path immediacy is already covered). The
-text-owning actor of Option 4 is not pursued; see Considered Options.
+One narrow divergence remains, in injection publication: a close+reopen can slip
+between a successful tree CAS and the subsequent unguarded `injection_map` publish,
+together with a pass-B-no-tree edge. It is benign, and deliberately left scoped-out,
+for three reasons. First, blast radius: `injection_map` is invalidation bookkeeping —
+read only by `invalidate_for_edits`/`get_injections`, never on the semantic-token
+render path, which re-derives regions from the tree — so a stale entry is at worst a
+transient mis-invalidation for a live document or an unread leak for a closed one
+(no reader touches a gone URI), never a wrong LSP response. Second, it self-heals:
+the single-flight scheduler lets the freshest populate win, and any stale entry is
+replaced on the next successful parse or cleared on reopen. Third, the principled fix —
+tagging `injection_map` with the incarnation — costs a representation change and reader
+threading to close a near-unreachable case (the cross-incarnation overwrite is already
+closed: there is no `.await` between the tree CAS and `populate_injections`, so a fresh
+incarnation cannot squeeze in), and would still miss the same-incarnation
+pass-B-no-tree edge — a net-negative trade.
