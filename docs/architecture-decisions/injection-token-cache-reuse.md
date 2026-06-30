@@ -126,13 +126,22 @@ is a pure uniform translation:
   whole lines — no host bytes interleaved per row), **and**
 - the region is not part of an `injection.combined` group.
 
-These are **geometry predicates on the region's included ranges, not
-language-specific**. A fenced code block that starts at column 0 qualifies; a
-region that interleaves host bytes per row (blockquote-style, line-continuation
-markers, etc.) does not — the predicate self-selects regardless of language. For
-a qualifying region, re-anchoring after any content-preserving edit is a single
-additive `line += Δ`, and a same-line-before edit is impossible because the
-content starts at column 0 on its own line.
+These three conditions are **language-agnostic** — they turn on the region's
+coordinate geometry and injection mode, not on which language is injected. A
+fenced code block that starts at column 0 qualifies; a region that interleaves
+host bytes per row (blockquote-style, line-continuation markers, etc.) does not
+— the predicate self-selects regardless of language. For a qualifying region,
+re-anchoring after any content-preserving edit is a single additive `line += Δ`,
+and a same-line-before edit is impossible because the content starts at column 0
+on its own line.
+
+Implementation note: these facts (start column, per-row prefix widths,
+combined-ness) live today on the transient `InjectionContext` that tokenization
+builds, not on the persisted `CacheableInjectionRegion`, and `injection.combined`
+is a query property rather than range geometry. v1 must therefore evaluate
+eligibility from the injection context tokenization actually uses and carry it
+alongside the cached entry — not infer it from `CacheableInjectionRegion`
+metadata alone.
 
 **v1 scope: cache only regions satisfying the predicate; recompute the rest.**
 This eliminates the row-0 / prefix re-anchoring correctness surface entirely
@@ -200,11 +209,14 @@ complementary, not a substitute.
 
 ## Correctness hazards
 
-The cache is **push-based / evict-on-mutation**: `get` does no read-time
-validity check, so every mutation path that can change a region's tokens must
-evict its entry before it is re-served. The existing eviction (edit-overlap,
-content/language change, region removed, close) covers most paths. An audit
-surfaced four the original design did not address:
+Today's `get` does no read-time validity check (it keys on `(uri, region_id)`
+only), so the cache is **push-based / evict-on-mutation**: every mutation path
+that can change a region's tokens must evict its entry before it is re-served.
+v1 adds a `content_hash` gate on read (Decision step 1), but `content_hash` is
+text-only — it does *not* change when a region's surrounding *context* changes,
+so that gate alone misses the first two hazards below. The existing eviction
+(edit-overlap, content/language change, region removed, close) covers most
+paths; an audit surfaced four the original design did not address:
 
 1. **`injection.combined` sibling cross-contamination (showstopper).** Combined
    injections are discovered as separate `region_id`s but tokenized *jointly*
