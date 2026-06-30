@@ -175,6 +175,14 @@ impl BridgeCoordinator {
         &self.node_tracker
     }
 
+    /// Share the node tracker for use on the blocking semantic-token pool.
+    ///
+    /// Returns an owned `Arc` so the tracker can be moved into `spawn_blocking`
+    /// (injection-token-cache region-id resolution, #529) without borrowing `self`.
+    pub(crate) fn node_tracker_arc(&self) -> Arc<NodeTracker> {
+        Arc::clone(&self.node_tracker)
+    }
+
     /// Access the underlying language server pool.
     ///
     /// Used by handlers for `send_*_request()` methods.

@@ -7,6 +7,30 @@ use std::sync::Arc;
 
 use tree_sitter::Query;
 
+/// Cache identity for a top-level injection region (#529).
+///
+/// Populated only for top-level singles when injection-token caching is active
+/// (a cache handle is threaded in and the region count clears the gate). Carries
+/// everything the reuse path needs without re-touching the tree-sitter node:
+/// the position-stable `region_id` (minted the same way as `populate_injections`),
+/// the content hash + the region's first host line for re-anchoring, and whether
+/// the region satisfies the language-agnostic translation predicate this request.
+pub(super) struct RegionCacheInfo {
+    /// Position-based ULID, byte-identical to the one `populate_injections` mints,
+    /// so `invalidate_for_edits` evicts the same entry this stores under.
+    pub region_id: String,
+    /// Hash of the region's (effective) content — distinguishes a content edit.
+    pub content_hash: u64,
+    /// `line_range.start`: the region's first host line, added back on reuse
+    /// (`host_line = line_start + token.line`).
+    pub line_start: u32,
+    /// Whether this region qualifies for the trivial re-anchor this request:
+    /// `start_column == 0` ∧ no per-row prefix widths ∧ not `injection.combined`.
+    /// Recomputed every request from the fresh context, so a region that stopped
+    /// qualifying is recomputed rather than served a stale hit.
+    pub eligible: bool,
+}
+
 /// Data for processing a single injection (parser-agnostic).
 ///
 /// This struct captures all the information needed to process an injection
@@ -32,4 +56,9 @@ pub(super) struct InjectionContext<'a> {
     /// clip tokens to `included_ranges`, because a capture node may span the
     /// excluded text between blocks.
     pub combined: bool,
+    /// Cache identity for the injection-token cache (#529), or `None` when this
+    /// context is nested, combined, or caching is gated off for this request.
+    /// Index-aligned with the per-context token results so the store/reuse
+    /// decision is made single-threaded outside the Rayon fan-out.
+    pub region_cache: Option<RegionCacheInfo>,
 }

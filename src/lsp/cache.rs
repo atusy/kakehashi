@@ -269,6 +269,12 @@ impl CacheCoordinator {
         self.injection_map.get(uri)
     }
 
+    /// Share the per-region injection token cache for use on the blocking
+    /// semantic-token pool (#529), where the hot path reuses/stores region tokens.
+    pub(crate) fn injection_token_cache_arc(&self) -> std::sync::Arc<InjectionTokenCache> {
+        std::sync::Arc::clone(&self.injection_token_cache)
+    }
+
     // ========================================================================
     // Semantic tokens (semantic_tokens.rs)
     // ========================================================================

@@ -229,7 +229,6 @@ impl InjectionTokenCache {
 
     /// Store region-local tokens for an injection region under its validity key
     /// (`content_hash` + settings `generation`).
-    #[cfg(test)]
     pub fn store(
         &self,
         uri: &Url,

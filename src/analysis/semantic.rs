@@ -16,7 +16,18 @@ pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
 pub(crate) use range::handle_semantic_tokens_range_parallel_async;
 
 // Re-export for parallel processing
-use parallel::collect_injection_tokens_parallel;
+use parallel::{InjectionCacheCtx, collect_injection_tokens_parallel};
+
+/// Owned handle the LSP layer passes into [`handle_semantic_tokens_full`] to
+/// enable per-region injection-token caching (#529). `None` disables caching
+/// (range requests, tests), reproducing the pre-#529 behavior. Borrowed into an
+/// [`InjectionCacheCtx`] inside the blocking task.
+pub(crate) struct InjectionCacheParams {
+    pub uri: url::Url,
+    pub tracker: std::sync::Arc<crate::language::NodeTracker>,
+    pub cache: std::sync::Arc<crate::analysis::InjectionTokenCache>,
+    pub generation: u64,
+}
 
 // Internal re-exports for production code
 use finalize::finalize_tokens;
@@ -48,6 +59,7 @@ pub(crate) async fn handle_semantic_tokens_full(
     capture_mappings: Option<std::sync::Arc<CaptureMappings>>,
     coordinator: std::sync::Arc<crate::language::LanguageCoordinator>,
     supports_multiline: bool,
+    injection_cache: Option<InjectionCacheParams>,
 ) -> Option<SemanticTokensResult> {
     tokio::task::spawn_blocking(move || {
         let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
@@ -72,6 +84,15 @@ pub(crate) async fn handle_semantic_tokens_full(
             &mut all_tokens,
         );
 
+        // Borrow the owned cache handle into a request-scoped context for the
+        // injection pass (#529); `None` keeps the uncached behavior.
+        let cache_ctx = injection_cache.as_ref().map(|p| InjectionCacheCtx {
+            uri: &p.uri,
+            tracker: p.tracker.as_ref(),
+            cache: p.cache.as_ref(),
+            generation: p.generation,
+        });
+
         // Collect injection tokens in parallel using Rayon.
         // Also returns active injection regions for finalize-time exclusion.
         let (injection_tokens, active_injection_regions) = collect_injection_tokens_parallel(
@@ -83,6 +104,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             &coordinator,
             capture_mappings.as_deref(),
             supports_multiline,
+            cache_ctx.as_ref(),
         );
 
         // Merge injection tokens with host tokens
@@ -570,6 +592,7 @@ local x = 42
             None,
             coordinator,
             false,
+            None,
         )
         .await;
 
@@ -637,6 +660,7 @@ local x = 42
             None,
             coordinator,
             false,
+            None,
         )
         .await;
 
@@ -708,6 +732,7 @@ local x = 42
             Some(capture_mappings),
             coordinator,
             false,
+            None,
         )
         .await;
 
@@ -820,6 +845,7 @@ local x = 42
             Some(capture_mappings),
             coordinator,
             false,
+            None,
         )
         .await;
 
@@ -931,6 +957,7 @@ local x = 42
             Some(capture_mappings),
             coordinator,
             false,
+            None,
         )
         .await;
 
@@ -1042,6 +1069,7 @@ local x = 42
             Some(capture_mappings),
             coordinator,
             true, // multiline support enabled!
+            None,
         )
         .await;
 
@@ -1172,6 +1200,7 @@ foo
             Some(capture_mappings),
             coordinator,
             false,
+            None,
         )
         .await;
 
@@ -1281,6 +1310,7 @@ foo
             Some(capture_mappings),
             coordinator,
             false,
+            None,
         )
         .await;
 

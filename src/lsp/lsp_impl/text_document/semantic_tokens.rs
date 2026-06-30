@@ -382,6 +382,17 @@ impl Kakehashi {
             // instead of the shared parser pool, avoiding lock contention.
             let coordinator = std::sync::Arc::clone(&self.language);
 
+            // Enable per-region injection-token reuse (#529). The generation is
+            // the one snapshotted at the top of the handler (same value folded
+            // into `cache_key`), so a config reload racing this request can't make
+            // it serve or store stale-query tokens.
+            let injection_cache = Some(crate::analysis::semantic::InjectionCacheParams {
+                uri: uri.clone(),
+                tracker: self.bridge.node_tracker_arc(),
+                cache: self.cache.injection_token_cache_arc(),
+                generation: token_generation,
+            });
+
             // Compute tokens, racing against cancel notification if provided
             let compute_future = handle_semantic_tokens_full(
                 text.clone(),
@@ -391,6 +402,7 @@ impl Kakehashi {
                 Some(capture_mappings),
                 coordinator,
                 supports_multiline,
+                injection_cache,
             );
 
             let result = if let Some(cancel_rx) = cancel_rx {
@@ -646,6 +658,16 @@ impl Kakehashi {
                 // parallel injection processing (SAME as semanticTokens/full).
                 let coordinator = std::sync::Arc::clone(&self.language);
 
+                // Enable per-region injection-token reuse (#529) on the delta
+                // path too — this is the steady-state typing path the cache
+                // targets. Generation pinned to the top-of-handler snapshot.
+                let injection_cache = Some(crate::analysis::semantic::InjectionCacheParams {
+                    uri: uri.clone(),
+                    tracker: self.bridge.node_tracker_arc(),
+                    cache: self.cache.injection_token_cache_arc(),
+                    generation: token_generation,
+                });
+
                 // Compute tokens, racing against cancel notification if provided
                 let compute_future = handle_semantic_tokens_full(
                     text.clone(),
@@ -655,6 +677,7 @@ impl Kakehashi {
                     Some(capture_mappings),
                     coordinator,
                     supports_multiline,
+                    injection_cache,
                 );
 
                 let result = if let Some(cancel_rx) = cancel_rx {
