@@ -303,6 +303,14 @@ impl Kakehashi {
             })));
         };
 
+        // Read the remaining settings-dependent tokenization inputs HERE — together
+        // with the query above and BEFORE the get_tree_with_wait().await below — so
+        // a settings reload during that await can't split them into an inconsistent
+        // mix (e.g. old query + new capture mappings). All are consistent with the
+        // `token_generation` snapshotted at the top.
+        let capture_mappings = self.language.capture_mappings();
+        let supports_multiline = self.settings_manager.supports_multiline_tokens();
+
         // Early exit check before expensive computation
         if !self.cache.is_request_active(&uri, request_id) {
             log::debug!(
@@ -368,13 +376,10 @@ impl Kakehashi {
                 return Ok(Some(SemanticTokensResult::Tokens(cached)));
             }
 
-            // Get capture mappings for token type resolution
-            let capture_mappings = self.language.capture_mappings();
-
-            // Use Rayon-based parallel injection processing.
-            // This uses thread-local parser caching instead of the shared parser pool,
-            // avoiding lock contention during parallel processing.
-            let supports_multiline = self.settings_manager.supports_multiline_tokens();
+            // capture_mappings and supports_multiline were read before the await
+            // above (consistent with the query and token_generation). Rayon-based
+            // parallel injection processing uses thread-local parser caching
+            // instead of the shared parser pool, avoiding lock contention.
             let coordinator = std::sync::Arc::clone(&self.language);
 
             // Compute tokens, racing against cancel notification if provided
@@ -559,6 +564,13 @@ impl Kakehashi {
             )));
         };
 
+        // Read the remaining settings-dependent tokenization inputs HERE — with the
+        // query above and BEFORE the get_tree_with_wait().await below — so a settings
+        // reload during that await can't split them into an inconsistent mix
+        // (same as semanticTokens/full; all consistent with `token_generation`).
+        let capture_mappings = self.language.capture_mappings();
+        let supports_multiline = self.settings_manager.supports_multiline_tokens();
+
         // Early exit check before expensive computation
         if !self.cache.is_request_active(&uri, request_id) {
             log::debug!(
@@ -629,11 +641,9 @@ impl Kakehashi {
                 // the client's `previous_result_id` (still skips re-tokenization).
                 (Some(SemanticTokensResult::Tokens(cached)), text)
             } else {
-                // Get capture mappings for token type resolution
-                let capture_mappings = self.language.capture_mappings();
-
-                // Use Rayon-based parallel injection processing (SAME as semanticTokens/full)
-                let supports_multiline = self.settings_manager.supports_multiline_tokens();
+                // capture_mappings and supports_multiline were read before the await
+                // above (consistent with the query and token_generation). Rayon-based
+                // parallel injection processing (SAME as semanticTokens/full).
                 let coordinator = std::sync::Arc::clone(&self.language);
 
                 // Compute tokens, racing against cancel notification if provided
