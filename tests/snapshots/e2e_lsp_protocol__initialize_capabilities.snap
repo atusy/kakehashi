@@ -40,6 +40,7 @@ expression: capabilities
   "documentSymbolProvider": {
     "workDoneProgress": true
   },
+  "codeActionProvider": true,
   "codeLensProvider": {
     "resolveProvider": true
   },
