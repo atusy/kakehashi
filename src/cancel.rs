@@ -40,6 +40,14 @@ impl CancelToken {
     }
 }
 
+/// Checkpoint helper for the pervasive optional-token case: `true` only when a
+/// token is present *and* cancelled. A `None` token (cancellation disabled, e.g.
+/// range requests and tests) is never cancelled, so callers collapse to their
+/// pre-cancellation behavior.
+pub(crate) fn is_cancelled(token: Option<&CancelToken>) -> bool {
+    token.is_some_and(|t| t.is_cancelled())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -479,7 +479,7 @@ fn collect_injection_contexts_sync<'a>(
         // fetch per injection region), so a newer keystroke must be able to
         // abort it here rather than after all regions are resolved. The
         // caller discards the partial contexts returned on this early break.
-        if cancel.is_some_and(|c| c.is_cancelled()) {
+        if crate::cancel::is_cancelled(cancel) {
             break;
         }
 
@@ -839,9 +839,8 @@ pub(crate) fn collect_injection_tokens_parallel(
     cache_ctx: Option<&InjectionCacheCtx>,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
+    use crate::cancel::is_cancelled;
     use rayon::prelude::*;
-
-    let is_cancelled = || cancel.is_some_and(|c| c.is_cancelled());
 
     // Collect top-level injection contexts and their byte ranges. The cache
     // handle (if any) lets the discovery phase resolve region identities
@@ -865,7 +864,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Discovery bailed (or genuinely found nothing): either way there is nothing
     // to tokenize. A cancelled discovery returns partial contexts the caller
     // discards, so skip the fan-out entirely.
-    if contexts.is_empty() || is_cancelled() {
+    if contexts.is_empty() || is_cancelled(cancel) {
         return (Vec::new(), Vec::new());
     }
 
@@ -910,7 +909,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     // cache store-half below never persists it. Under a rapid-typing pile-up the
     // remaining Rayon closures drain almost immediately once the token trips.
     let process_one = |i: usize| -> (usize, InjectionTokens) {
-        if cancel.is_some_and(|c| c.is_cancelled()) {
+        if is_cancelled(cancel) {
             return (
                 i,
                 InjectionTokens {
@@ -2331,12 +2330,13 @@ local b = 2
     }
 
     /// The dominant per-compute cost on a large document is the single-threaded
-    /// discovery loop (one language resolution + query fetch per region). A
-    /// superseded request must abort *inside* that loop, not merely at the pass
-    /// boundary — otherwise a supersede still pays the full discovery. Assert a
-    /// pre-cancelled token collapses discovery to zero contexts, while an
-    /// uncancelled run finds all eight. This guards against a regression that
-    /// moves the checkpoint out of the discovery loop.
+    /// discovery loop (one language resolution + query fetch per region), so a
+    /// superseded request must abort there rather than pay the full discovery.
+    /// Assert a pre-cancelled token collapses discovery to zero contexts while an
+    /// uncancelled run finds all eight. (A pre-set flag can't distinguish a
+    /// per-iteration check from one hoisted just above the loop — both yield
+    /// zero — but it does catch the checkpoint being removed entirely, which
+    /// would let all eight regions resolve under cancellation.)
     #[test]
     fn cancelled_token_aborts_injection_discovery() {
         let Some(coordinator) = markdown_lua_coordinator() else {
@@ -2381,7 +2381,12 @@ local b = 2
 
     /// End-to-end: a cancelled injection pass must produce no tokens AND persist
     /// nothing to the region cache — a partial store would later serve an
-    /// incomplete region as a stale hit. Contrast the uncancelled run, which
+    /// incomplete region as a stale-empty hit. A pre-cancelled token here bails
+    /// at the post-discovery guard (before the fan-out), so this pins the
+    /// outer-guard path; the in-fan-out `fully_loaded:false` skip for a mid-pass
+    /// supersede rides on the pre-existing #529 store gate (`res.fully_loaded`),
+    /// which the reuse tests exercise for the stored case. Contrast the
+    /// uncancelled run in `injection_cache_reuse_matches_uncached_output`, which
     /// stores all eight regions.
     #[test]
     fn cancelled_token_stores_no_injection_regions() {

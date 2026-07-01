@@ -5,8 +5,14 @@
 //! This module supports immediate cancellation of semantic token requests:
 //! - When `$/cancelRequest` is received, the handler aborts and returns `RequestCancelled` (-32800)
 //! - Uses `tokio::select!` to race between cancel notification and token computation
-//! - The Rayon computation cannot be cancelled mid-execution and will continue to
-//!   completion in the thread pool, consuming CPU resources, but its result is discarded
+//! - The blocking Rayon computation is cancelled *cooperatively*: the handler
+//!   flips a [`CancelToken`](crate::cancel) (also flipped when a newer request
+//!   supersedes this one, or the document closes) and the compute polls it at
+//!   coarse checkpoints — after the host pass, inside the injection discovery
+//!   loop, and at each per-region fan-out entry — bailing early. A region
+//!   already mid-parse runs to completion, but not-yet-started work returns
+//!   immediately, so an obsolete request stops burning CPU instead of computing
+//!   a result that is only discarded.
 //!
 //! This is achieved by subscribing to cancel notifications via `CancelForwarder::subscribe()`
 //! and using biased `tokio::select!` to prioritize cancel handling.
@@ -444,8 +450,8 @@ impl Kakehashi {
         }; // doc reference is dropped here
 
         // A supersede/close between compute start and here flips the token; the
-        // compute may have bailed early (returning empty tokens), so drop the
-        // result rather than storing a partial set over the cache.
+        // compute then bailed at a checkpoint and returned `None`, so drop the
+        // request rather than storing an unwanted result over the cache.
         if cancel_token.is_cancelled() {
             self.cache.finish_request(&uri, request_id);
             log::debug!(
@@ -745,8 +751,8 @@ impl Kakehashi {
         };
 
         // A supersede/close between compute start and here flips the token; the
-        // compute may have bailed early (returning empty tokens), so drop the
-        // result rather than diffing/storing a partial set over the cache.
+        // compute then bailed at a checkpoint and returned `None`, so drop the
+        // request rather than diffing/storing an unwanted result over the cache.
         if cancel_token.is_cancelled() {
             self.cache.finish_request(&uri, request_id);
             log::debug!(

@@ -69,7 +69,7 @@ pub(crate) async fn handle_semantic_tokens_full(
     cancel: Option<crate::cancel::CancelToken>,
 ) -> Option<SemanticTokensResult> {
     tokio::task::spawn_blocking(move || {
-        let is_cancelled = || cancel.as_ref().is_some_and(|c| c.is_cancelled());
+        let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
 
         let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
