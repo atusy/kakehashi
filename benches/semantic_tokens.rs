@@ -317,6 +317,54 @@ fn gen_markdown_injections(blocks: usize) -> String {
     s
 }
 
+/// Markdown where every fenced code block sits inside a blockquote, so each
+/// injection carries a `> ` prefix on every line. This forces the heavier
+/// `compute_included_ranges` gap node-walk (the relocated `C` the discovery
+/// lever moves off-ingress) — the no-regression case the injection-token-cache
+/// ADR calls out, distinct from the trivial column-0 fences of
+/// `gen_markdown_injections`.
+fn gen_markdown_blockquote_injections(blocks: usize) -> String {
+    let mut s = String::with_capacity(blocks * 340);
+    s.push_str("# Blockquote Injection Benchmark\n\nIntro paragraph.\n\n");
+    for i in 0..blocks {
+        s.push_str(&format!(
+            "## Section {i}\n\nProse before the quoted fence.\n\n"
+        ));
+        match i % 3 {
+            0 => s.push_str(&format!(
+                "> ```rust\n\
+                 > fn rust_block_{i}(x: i32) -> i32 {{\n\
+                 >     let doubled = x * 2; // a comment\n\
+                 >     let label = \"section {i}\";\n\
+                 >     println!(\"{{}} {{}}\", label, doubled);\n\
+                 >     doubled + {i}\n\
+                 > }}\n\
+                 > ```\n\n"
+            )),
+            1 => s.push_str(&format!(
+                "> ```lua\n\
+                 > local function lua_block_{i}(x)\n\
+                 >     local doubled = x * 2 -- a comment\n\
+                 >     local label = \"section {i}\"\n\
+                 >     print(label, doubled)\n\
+                 >     return doubled + {i}\n\
+                 > end\n\
+                 > ```\n\n"
+            )),
+            _ => s.push_str(&format!(
+                "> ```python\n\
+                 > def python_block_{i}(x):\n\
+                 >     doubled = x * 2  # a comment\n\
+                 >     label = \"section {i}\"\n\
+                 >     print(label, doubled)\n\
+                 >     return doubled + {i}\n\
+                 > ```\n\n"
+            )),
+        }
+    }
+    s
+}
+
 /// Rust source whose comments and string literals are full of multi-byte UTF-8,
 /// forcing the non-ASCII branch of byte→UTF-16 column conversion on most lines.
 fn gen_unicode_rust(funcs: usize) -> String {
@@ -641,6 +689,26 @@ fn main() {
             content: gen_markdown_injections(60),
             kind: Kind::EditDelta,
             targets: "edit→reparse→injection re-detect→cache invalidation→delta (typing)",
+        },
+        // Prefix-heavy (blockquote) injections: the discovery lever relocates the
+        // heavier compute_included_ranges gap walk (`C`) off-ingress here, so this
+        // is the no-regression case the ADR calls out — the off-ingress reparse the
+        // semantic settle can wait on does strictly more work per edit.
+        Scenario {
+            name: "markdown_blockquote_injections/full",
+            language_id: "markdown",
+            uri: "file:///bench/blockquote_injections.md",
+            content: gen_markdown_blockquote_injections(60),
+            kind: Kind::Full,
+            targets: "prefixed-region discovery reuse (relocated included-range walk)",
+        },
+        Scenario {
+            name: "markdown_blockquote_injections/edit_delta",
+            language_id: "markdown",
+            uri: "file:///bench/blockquote_injections_edit.md",
+            content: gen_markdown_blockquote_injections(60),
+            kind: Kind::EditDelta,
+            targets: "prefixed-region typing path (relocated C off-ingress vs saved Q)",
         },
         // Cold-open latency scenarios for the #6 off-ingress flip. The reader gates
         // on the **host parse** via the watermark (≤200ms budget), then falls back to
