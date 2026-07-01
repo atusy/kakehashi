@@ -80,6 +80,18 @@ pub struct Document {
     /// incarnation is only meaningful relative to that store's counter, and the
     /// store assigns every document it owns a nonzero value.
     incarnation: u64,
+    /// Monotonic per-lifetime counter bumped on **every write to `tree`** —
+    /// install (`set_tree` / `set_parse_result` / `update_tree_and_text`) *and*
+    /// clear (`apply_edit_and_seed` / `update_text`). It identifies the exact tree
+    /// currently published: the off-ingress injection-discovery write-back
+    /// (`set_injections_if_epoch_unchanged`) captures the epoch a tree-CAS stamped
+    /// and refuses to attach discovery unless it still matches, so a discovery
+    /// built on one tree is never served against a later one — including the
+    /// same-`(text, incarnation)` tree swap `update_tree_if_text_and_language_unchanged`
+    /// permits and an `A→B→A` edit cycle (every install bumps, so the epochs are
+    /// distinct even when the text returns). Paired with `incarnation` at the
+    /// write-back so a value reused across a close+reopen can't false-match.
+    parse_epoch: u64,
 }
 
 impl Document {
@@ -91,6 +103,7 @@ impl Document {
             tree: None,
             pending_seed: None,
             incarnation,
+            parse_epoch: 0,
         }
     }
 
@@ -102,6 +115,7 @@ impl Document {
             tree: None,
             pending_seed: None,
             incarnation,
+            parse_epoch: 0,
         }
     }
 
@@ -118,7 +132,15 @@ impl Document {
             tree: Some(tree),
             pending_seed: None,
             incarnation,
+            parse_epoch: 0,
         }
+    }
+
+    /// Bump [`parse_epoch`](Self::parse_epoch) on every write to `tree`. Saturating
+    /// (a wrap would need 2^64 installs between a write-back's capture and its
+    /// check — impossible), matching `ParseState::generation`.
+    fn bump_parse_epoch(&mut self) {
+        self.parse_epoch = self.parse_epoch.saturating_add(1);
     }
 
     /// Get the text content
@@ -149,6 +171,13 @@ impl Document {
         self.incarnation
     }
 
+    /// The current [`parse_epoch`](Self::parse_epoch) — the identity of the tree
+    /// presently published, captured by a tree-CAS and rechecked by the injection
+    /// discovery write-back.
+    pub(crate) fn parse_epoch(&self) -> u64 {
+        self.parse_epoch
+    }
+
     /// Get a position mapper for this document
     pub(crate) fn position_mapper(&self) -> crate::text::PositionMapper {
         crate::text::PositionMapper::new(self.text())
@@ -175,6 +204,7 @@ impl Document {
         // later `reparse_latest` can't seed from a tree that predates this text
         // (the #348 contract hazard).
         self.pending_seed = None;
+        self.bump_parse_epoch();
     }
 
     /// Attach a parsed tree **without** touching the text.
@@ -189,6 +219,7 @@ impl Document {
     pub(crate) fn set_tree(&mut self, tree: Tree) {
         self.tree = Some(tree);
         self.pending_seed = None;
+        self.bump_parse_epoch();
     }
 
     /// Store the open-time parse result — the detected `language` and the parsed
@@ -203,6 +234,7 @@ impl Document {
         self.language_id = language;
         self.tree = tree;
         self.pending_seed = None;
+        self.bump_parse_epoch();
     }
 
     /// Apply an edit's new text and stash an **incremental parse seed** for the
@@ -233,6 +265,9 @@ impl Document {
             _ => None,
         };
         self.text = Arc::from(new_text);
+        // Clearing the reader-visible tree is a tree write too: bump so a
+        // discovery write-back that captured the pre-edit epoch no-ops.
+        self.bump_parse_epoch();
     }
 
     /// The off-ingress incremental parse seed, if any. **Read only by
@@ -248,6 +283,7 @@ impl Document {
         // Note: Tree needs to be rebuilt after text change
         self.tree = None;
         self.pending_seed = None;
+        self.bump_parse_epoch();
     }
 }
 
@@ -261,6 +297,43 @@ mod tests {
         assert_eq!(doc.text(), "hello world");
         assert_eq!(doc.text().len(), 11);
         assert!(!doc.text().is_empty());
+    }
+
+    fn parse_rust(text: &str) -> Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    #[test]
+    fn parse_epoch_bumps_on_every_tree_write_and_stays_distinct_across_a_b_a() {
+        // Starts at 0; each tree write (install OR clear) bumps it monotonically,
+        // so an A→B→A edit cycle yields strictly increasing, distinct epochs even
+        // though the text returns to its original value.
+        let mut doc = Document::new("a".to_string(), 0);
+        assert_eq!(doc.parse_epoch(), 0);
+
+        doc.set_parse_result(Some("rust".to_string()), Some(parse_rust("a")));
+        let e_a = doc.parse_epoch();
+        assert!(e_a > 0, "install must bump");
+
+        doc.apply_edit_and_seed("b".to_string(), &[]); // clear (edit to B)
+        let e_clear_b = doc.parse_epoch();
+        assert!(e_clear_b > e_a, "clear must bump");
+
+        doc.set_tree(parse_rust("b")); // reparse B
+        let e_b = doc.parse_epoch();
+        assert!(e_b > e_clear_b);
+
+        doc.apply_edit_and_seed("a".to_string(), &[]); // edit back to A
+        doc.set_tree(parse_rust("a")); // reparse A again
+        let e_a2 = doc.parse_epoch();
+        assert!(
+            e_a2 > e_b,
+            "the second A parse must not reuse the first A's epoch"
+        );
     }
 
     #[test]

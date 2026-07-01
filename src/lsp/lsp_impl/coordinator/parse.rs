@@ -239,6 +239,7 @@ impl ParseCoordinator {
                         Some(&language_name),
                         None,
                     )
+                    .is_some()
                 {
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, false);
@@ -290,7 +291,7 @@ impl ParseCoordinator {
                         Some(&language_name),
                         Some(tree.clone()),
                     );
-                if stored {
+                if stored.is_some() {
                     self.cache.populate_injections(
                         &uri,
                         &text,
@@ -304,11 +305,11 @@ impl ParseCoordinator {
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                // `stored` is exactly "this call's CAS landed the tree": false when a
-                // racing `didChange`/reopen moved the text or incarnation on and the
-                // edit reparse won, in which case the open downstream must NOT re-run
-                // over the edit's tree.
-                return stored;
+                // `stored.is_some()` is exactly "this call's CAS landed the tree":
+                // `None` when a racing `didChange`/reopen moved the text or incarnation
+                // on and the edit reparse won, in which case the open downstream must
+                // NOT re-run over the edit's tree.
+                return stored.is_some();
             }
 
             // Parse produced no tree (timeout / parser unavailable / join error) but
@@ -325,6 +326,7 @@ impl ParseCoordinator {
                     Some(&language_name),
                     None,
                 )
+                .is_some()
             {
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, false);
@@ -344,6 +346,7 @@ impl ParseCoordinator {
                 None,
                 None,
             )
+            .is_some()
         {
             self.documents
                 .mark_parse_finished(&uri, parse_generation, false);
@@ -480,7 +483,7 @@ impl ParseCoordinator {
                 expected_incarnation,
                 tree.clone(),
             );
-            if stored {
+            if stored.is_some() {
                 self.cache.populate_injections(
                     &uri,
                     &text,
@@ -609,7 +612,7 @@ impl ParseCoordinator {
                 incarnation,
                 tree.clone(),
             );
-            if stored {
+            if stored.is_some() {
                 self.cache.populate_injections(
                     uri,
                     &text,
