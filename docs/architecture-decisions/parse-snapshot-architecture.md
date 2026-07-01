@@ -104,7 +104,7 @@ mapping is not one-to-one and must be stated precisely:
 
 - Two distinct predicates replace the old single `has_tree`: **`resolved`** =
   `slot.snapshot.is_some()` (a parse for this lifetime has completed at least once)
-  and **`has_tree`** = `slot.snapshot.and_then(|s| s.tree.as_ref()).is_some()`. A
+  and **`has_tree`** = `slot.snapshot.as_ref().and_then(|s| s.tree.as_ref()).is_some()`. A
   **resolved-but-tree-less** outcome — a parse that completed with no usable tree
   (no parser installed, install failed, or a quarantined crashed grammar), distinct
   from the pre-first-parse `None` — is `resolved && !has_tree`; it advances
@@ -349,7 +349,7 @@ future decision forks the tracker per snapshot, they can move to serve-stale.)*
 
 ### 4. All tree-CPU runs on one bounded compute pool
 
-A single dedicated `rayon` pool sized `available_parallelism().saturating_sub(2).max(1)`
+A single dedicated `rayon` pool sized `available_parallelism().map(|n| n.get()).unwrap_or(2).saturating_sub(2).max(1)`
 — strictly below `available_parallelism` whenever there are ≥3 cores, and reserving
 at least one core for the tokio workers + timer driver on 2-core machines (on a
 1-core host no isolation is achievable and the pool degrades to shared time-slicing)
@@ -527,7 +527,7 @@ inside the existing safety contracts at each step:
   by one or more edits, and knows it via the version tag." Correctness now rests on
   the version tag + refresh rather than on the reader having waited.
 - Folding the semantic fan-out from the process-global Rayon pool (all cores) into
-  the bounded `available_parallelism().saturating_sub(2).max(1)` pool caps
+  the bounded `available_parallelism().map(|n| n.get()).unwrap_or(2).saturating_sub(2).max(1)` pool caps
   single-document tokenization throughput (e.g. ~2 of 4 cores for one huge file) in
   exchange for
   cross-document isolation. Acceptable given the isolation goal, but a real
