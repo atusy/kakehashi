@@ -159,6 +159,10 @@ pub struct Kakehashi {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
     parser_pool: std::sync::Arc<Mutex<DocumentParserPool>>,
+    /// Bounded compute pool for all synchronous tree-CPU (parse-snapshot ADR §4):
+    /// keeps tree work off the tokio workers so timers and unrelated documents'
+    /// handlers stay pollable.
+    compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     documents: std::sync::Arc<DocumentStore>,
     /// Unified cache coordinator for semantic tokens, injections, and request tracking
     cache: std::sync::Arc<CacheCoordinator>,
@@ -268,6 +272,7 @@ impl Kakehashi {
             client,
             language,
             parser_pool: std::sync::Arc::new(Mutex::new(parser_pool)),
+            compute_pool: std::sync::Arc::new(crate::compute_pool::ComputePool::new()),
             documents: std::sync::Arc::new(DocumentStore::new()),
             cache: std::sync::Arc::new(CacheCoordinator::new()),
             settings_manager: std::sync::Arc::new(SettingsManager::new()),

@@ -10,7 +10,7 @@ use url::Url;
 use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
-/// Timeout for spawn_blocking parse operations to prevent hangs on pathological inputs.
+/// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -18,6 +18,7 @@ pub(super) struct ParseCoordinatorDeps {
     pub(super) client: Client,
     pub(super) language: std::sync::Arc<LanguageCoordinator>,
     pub(super) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(super) compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     pub(super) documents: std::sync::Arc<DocumentStore>,
     pub(super) cache: std::sync::Arc<CacheCoordinator>,
     pub(super) settings_manager: std::sync::Arc<SettingsManager>,
@@ -29,6 +30,7 @@ pub(crate) struct ParseCoordinator {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
     parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     documents: std::sync::Arc<DocumentStore>,
     cache: std::sync::Arc<CacheCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
@@ -42,6 +44,7 @@ impl ParseCoordinator {
             client: server.client.clone(),
             language: std::sync::Arc::clone(&server.language),
             parser_pool: std::sync::Arc::clone(&server.parser_pool),
+            compute_pool: std::sync::Arc::clone(&server.compute_pool),
             documents: std::sync::Arc::clone(&server.documents),
             cache: std::sync::Arc::clone(&server.cache),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
@@ -55,6 +58,7 @@ impl ParseCoordinator {
             client: deps.client,
             language: deps.language,
             parser_pool: deps.parser_pool,
+            compute_pool: deps.compute_pool,
             documents: deps.documents,
             cache: deps.cache,
             settings_manager: deps.settings_manager,
@@ -63,18 +67,18 @@ impl ParseCoordinator {
         }
     }
 
-    /// Shared parsing orchestration: acquire parser from pool, run parse logic in
-    /// `spawn_blocking` with timeout, release parser back to pool.
+    /// Shared parsing orchestration: acquire parser from pool, run parse logic on
+    /// the bounded compute pool with timeout, release parser back to pool.
     ///
     /// The caller provides the actual parse logic via `parse_fn`, which receives a
     /// `tree_sitter::Parser` and must return it along with an optional result.
     /// On normal completion, this ensures the parser is returned to the pool.
-    /// The parser is not returned if the blocking task times out (it keeps
-    /// running) or if the task fails or is cancelled and yields a `JoinError`.
+    /// The parser is not returned if the work-unit times out (it keeps
+    /// running) or panicked on the pool.
     ///
     /// Returns `None` if:
     /// - No parser is available for the language
-    /// - The parse task panicked or was cancelled (JoinError; parser not returned)
+    /// - The parse work-unit panicked (parser not returned)
     /// - The parse timed out after `PARSE_TIMEOUT` (parser not returned)
     /// - The closure returned `None`
     pub(crate) async fn parse_with_pool<T, F>(
@@ -97,32 +101,24 @@ impl ParseCoordinator {
 
         let result = tokio::time::timeout(
             PARSE_TIMEOUT,
-            tokio::task::spawn_blocking(move || parse_fn(parser)),
+            self.compute_pool.run(None, move || parse_fn(parser)),
         )
         .await;
 
         match result {
-            Ok(Ok((parser, value))) => {
+            Ok(Some((parser, value))) => {
                 let mut pool = self.parser_pool.lock().await;
                 pool.release(language_name.to_string(), parser);
                 value
             }
-            Ok(Err(join_error)) => {
-                if join_error.is_panic() {
-                    log::error!(
-                        "Parse task panicked for language '{}' on document {}: {}",
-                        language_name,
-                        uri,
-                        join_error
-                    );
-                } else {
-                    log::warn!(
-                        "Parse task was cancelled for language '{}' on document {}: {}",
-                        language_name,
-                        uri,
-                        join_error
-                    );
-                }
+            Ok(None) => {
+                // The work-unit panicked (logged with its payload by the pool);
+                // the parser inside it is lost, matching the old JoinError path.
+                log::error!(
+                    "Parse task panicked for language '{}' on document {}",
+                    language_name,
+                    uri
+                );
                 None
             }
             Err(_timeout) => {
