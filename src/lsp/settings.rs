@@ -634,7 +634,8 @@ mod tests {
         std::fs::write(&path, "autoInstall = false\n").unwrap();
 
         let mut events = Vec::new();
-        let result = load_toml_file(&path, &mut events, &mut false);
+        let mut ignored_deprecation = false;
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         assert!(result.is_some(), "valid TOML should parse");
         assert_eq!(result.unwrap().auto_install, Some(false));
@@ -651,10 +652,11 @@ mod tests {
     #[test]
     fn test_load_toml_file_missing() {
         let mut events = Vec::new();
+        let mut ignored_deprecation = false;
         let result = load_toml_file(
             Path::new("/nonexistent/config.toml"),
             &mut events,
-            &mut false,
+            &mut ignored_deprecation,
         );
 
         assert!(result.is_none(), "missing file should return None");
@@ -674,7 +676,8 @@ mod tests {
         std::fs::write(&path, "this is not [valid toml").unwrap();
 
         let mut events = Vec::new();
-        let result = load_toml_file(&path, &mut events, &mut false);
+        let mut ignored_deprecation = false;
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         assert!(result.is_none(), "invalid TOML should return None");
         assert!(
