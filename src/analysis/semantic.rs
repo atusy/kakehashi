@@ -16,8 +16,6 @@ pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
 pub(crate) use range::handle_semantic_tokens_range_parallel_async;
 
 // Re-export for parallel processing
-#[cfg(test)]
-pub(crate) use parallel::DISCOVERY_REUSE_HITS;
 pub(crate) use parallel::build_document_discovery;
 use parallel::{InjectionCacheCtx, collect_injection_tokens_parallel};
 

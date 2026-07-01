@@ -495,6 +495,8 @@ fn collect_injection_contexts_sync<'a>(
             coordinator,
             parent_included_ranges,
             cache_for_singles,
+            // Inline path: early-out a query-missing region (no wasted range work).
+            true,
         ) {
             SingleDiscovery::Region(region) => {
                 match rebuild_context(
@@ -567,6 +569,12 @@ fn discover_single_region(
     coordinator: &LanguageCoordinator,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
     cache_for_singles: Option<(&Url, &NodeTracker)>,
+    // On the inline path, skip a region whose highlight query isn't loaded
+    // *before* the per-region range/prefix/id work, exactly as the pre-refactor
+    // code did (`rebuild_context` would otherwise discard it only after that
+    // work). The producer passes `false`: it stores the region regardless and
+    // lets reuse re-resolve the query (self-healing), so it must not gate here.
+    require_highlight_query: bool,
 ) -> SingleDiscovery {
     let start = injection.content_node.start_byte();
     let end = injection.content_node.end_byte();
@@ -586,6 +594,18 @@ fn discover_single_region(
     else {
         return SingleDiscovery::Incomplete;
     };
+
+    // Highlight-query early-out (inline path only): a resolvable language with no
+    // loaded highlight query produces no tokens, so skip it before the range/id
+    // work — cheap `has_highlight_query` (no `Arc` clone). Matches the pre-refactor
+    // taint-and-continue ordering.
+    if require_highlight_query
+        && !coordinator
+            .query_store()
+            .has_highlight_query(&resolved_lang)
+    {
+        return SingleDiscovery::Incomplete;
+    }
 
     // Offset directive resolved at collection time (single source of truth
     // with the bridge path, which applies it in from_region_info)
@@ -805,7 +825,16 @@ pub(crate) fn build_document_discovery(
 
     let mut discovered = Vec::with_capacity(singles.len());
     for injection in singles {
-        match discover_single_region(injection, text, coordinator, None, Some((uri, tracker))) {
+        // Producer: don't gate on the highlight query — store the region and let
+        // reuse re-resolve the query (a load without a generation bump self-heals).
+        match discover_single_region(
+            injection,
+            text,
+            coordinator,
+            None,
+            Some((uri, tracker)),
+            false,
+        ) {
             SingleDiscovery::Region(region) => discovered.push(region),
             // A not-yet-loaded parser/language taints discovery — never store a
             // partial region set (the discovery analogue of the fully_loaded gate).
