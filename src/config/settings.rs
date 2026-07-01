@@ -447,6 +447,20 @@ impl BridgeServerConfig {
     pub(crate) fn is_spawnable(&self) -> bool {
         !self.cmd.is_empty() && self.is_enabled()
     }
+
+    /// Same as [`Self::is_spawnable`], but resolves `cmd`/`enabled`
+    /// inheritance against an already-looked-up `wildcard` instead of doing
+    /// its own `_` lookup — for callers (like [`crate::config::is_server_spawnable`]
+    /// and loops over every configured server) that can hoist the wildcard
+    /// lookup out of a loop instead of repeating it per server.
+    pub(crate) fn is_spawnable_with_wildcard(&self, wildcard: Option<&Self>) -> bool {
+        let cmd_non_empty = !self.cmd.is_empty() || wildcard.is_some_and(|w| !w.cmd.is_empty());
+        let enabled = self
+            .enabled
+            .or(wildcard.and_then(|w| w.enabled))
+            .unwrap_or(true);
+        cmd_non_empty && enabled
+    }
 }
 
 /// Union of every server's `onTypeFormattingTriggers`, shaped for the LSP
@@ -471,17 +485,17 @@ impl BridgeServerConfig {
 /// Resolves `cmd`/`enabled`/triggers inheritance directly (mirroring
 /// `merge_bridge_server_configs`'s per-field rules) rather than calling
 /// `resolve_with_wildcard`, to avoid cloning every server's full config just
-/// to read a couple of fields.
+/// to read a couple of fields — the wildcard itself is looked up once and
+/// reused across the iteration rather than re-looked-up per server.
 pub(crate) fn on_type_formatting_trigger_union(
     servers: &HashMap<String, BridgeServerConfig>,
 ) -> Option<(String, Vec<String>)> {
-    let wildcard_triggers = servers
-        .get(crate::config::WILDCARD_KEY)
-        .and_then(|w| w.on_type_formatting_triggers.as_ref());
+    let wildcard = servers.get(crate::config::WILDCARD_KEY);
+    let wildcard_triggers = wildcard.and_then(|w| w.on_type_formatting_triggers.as_ref());
     let mut triggers: Vec<String> = servers
         .iter()
         .filter(|(name, _)| name.as_str() != crate::config::WILDCARD_KEY)
-        .filter(|(name, _)| crate::config::is_server_spawnable(servers, name))
+        .filter(|(_, s)| s.is_spawnable_with_wildcard(wildcard))
         .filter_map(|(_, s)| s.on_type_formatting_triggers.as_ref().or(wildcard_triggers))
         .flatten()
         .filter(|t| t.chars().count() == 1)
@@ -1420,6 +1434,36 @@ mod tests {
         snap_settings.bind(|| {
             insta::assert_json_snapshot!(settings.language_servers);
         });
+    }
+
+    #[test]
+    fn is_spawnable_with_wildcard_resolves_cmd_and_enabled_inheritance() {
+        let server = |cmd: Vec<&str>, enabled: Option<bool>| BridgeServerConfig {
+            cmd: cmd.into_iter().map(String::from).collect(),
+            languages: vec![],
+            initialization_options: None,
+            root_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            enabled,
+            settings: None,
+        };
+
+        // Own cmd and enabled, no wildcard needed.
+        assert!(server(vec!["x"], Some(true)).is_spawnable_with_wildcard(None));
+
+        // cmd inherited from the wildcard.
+        let wildcard = server(vec!["shared-ls"], None);
+        assert!(server(vec![], None).is_spawnable_with_wildcard(Some(&wildcard)));
+
+        // enabled inherited (disabled) from the wildcard.
+        let disabling_wildcard = server(vec![], Some(false));
+        assert!(!server(vec!["x"], None).is_spawnable_with_wildcard(Some(&disabling_wildcard)));
+
+        // Own enabled: true overrides a disabling wildcard.
+        assert!(
+            server(vec!["x"], Some(true)).is_spawnable_with_wildcard(Some(&disabling_wildcard))
+        );
     }
 
     #[test]

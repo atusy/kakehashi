@@ -335,10 +335,11 @@ impl WorkspaceSettings {
     /// wildcard) is likewise not a consumer: it never spawns, so counting it
     /// would advertise willSave for a save that can only block on a no-op.
     pub(crate) fn any_bridge_server_runnable(&self) -> bool {
+        let wildcard = self.language_servers.get(WILDCARD_KEY);
         self.language_servers
-            .keys()
-            .filter(|name| name.as_str() != WILDCARD_KEY)
-            .any(|name| is_server_spawnable(&self.language_servers, name))
+            .iter()
+            .filter(|(name, _)| name.as_str() != WILDCARD_KEY)
+            .any(|(_, server)| server.is_spawnable_with_wildcard(wildcard))
     }
 }
 

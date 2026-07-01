@@ -28,14 +28,14 @@ pub(crate) fn resolve_with_wildcard<V: Clone>(
 }
 
 /// Cheaply checks whether `name`'s effective config is spawnable (non-empty
-/// `cmd` AND enabled), resolving `_` wildcard inheritance without cloning or
+/// `cmd` AND enabled), resolving `_` wildcard inheritance via
+/// [`BridgeServerConfig::is_spawnable_with_wildcard`] without cloning or
 /// merging the full `BridgeServerConfig` — a hot-path-friendly alternative to
 /// `resolve_with_wildcard(..., merge_bridge_server_configs).is_some_and(|c|
 /// c.is_spawnable())` for call sites that only need the boolean, not the
-/// resolved config. Mirrors `merge_bridge_server_configs`'s exact per-field
-/// rules (`cmd`: overlay wins only if non-empty, else base; `enabled`:
-/// overlay wins when present, else base, else the built-in default `true`) —
-/// keep the two in sync if either changes.
+/// resolved config. A loop over many servers should look up the wildcard once
+/// and call `is_spawnable_with_wildcard` directly instead of calling this
+/// function per server (which re-looks-up the wildcard every time).
 ///
 /// `name` should be a concrete server key, not the wildcard itself — the
 /// wildcard is a template, never a server in its own right, so this always
@@ -51,16 +51,9 @@ pub(crate) fn is_server_spawnable(
     if name == WILDCARD_KEY {
         return false;
     }
-    let Some(config) = servers.get(name) else {
-        return false;
-    };
-    let wildcard = servers.get(WILDCARD_KEY);
-    let cmd_non_empty = !config.cmd.is_empty() || wildcard.is_some_and(|w| !w.cmd.is_empty());
-    let enabled = config
-        .enabled
-        .or(wildcard.and_then(|w| w.enabled))
-        .unwrap_or(true);
-    cmd_non_empty && enabled
+    servers
+        .get(name)
+        .is_some_and(|config| config.is_spawnable_with_wildcard(servers.get(WILDCARD_KEY)))
 }
 
 /// Field-level merge of two BridgeLanguageConfig values.
