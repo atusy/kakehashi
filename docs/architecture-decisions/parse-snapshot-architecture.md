@@ -57,7 +57,10 @@ monotonic `content_version` (bumped on every edit, `0` at `didOpen`). It no
 longer holds `tree` or `pending_seed`, and `apply_edit` never clears a tree — it
 installs the new text and bumps the version. The document lifecycle
 (`didOpen`/`didChange`/`didClose`) becomes independent of parsing: it mutates
-inputs and returns, never awaiting or gating on a parse.
+inputs and returns, never awaiting or gating on a parse. `content_version` is a
+**new input-side field** that threads into `DocumentSnapshot` and (as
+`parsed_version`) into `ParseSnapshot` and `ComputedCaptures`; adding it and the
+`apply_edit` bump is a Stage 1 prerequisite for the version comparisons below.
 
 Two input-side concerns are explicitly **retained**, because they are not parse
 gates:
@@ -119,9 +122,14 @@ executed inside `send_if_modified` so the guard and the write are atomic under t
 channel's own lock (the co-location is what makes this a single atomic
 check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 
-> Install `snapshot` iff `snapshot.incarnation == slot.current_incarnation` **and**
-> `snapshot.parsed_version > slot.snapshot.parsed_version` (strict; `None` →
-> first snapshot is the sole bootstrap exception).
+> Install `snapshot` iff **both** clauses hold — the incarnation clause is never
+> bypassed:
+> 1. `snapshot.incarnation == slot.current_incarnation`, **and**
+> 2. `slot.snapshot.is_none()` (bootstrap) **or**
+>    `snapshot.parsed_version > slot.snapshot.parsed_version` (strict monotonic).
+>
+> The bootstrap case relaxes only the version compare (clause 2), never the
+> incarnation check (clause 1).
 
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
@@ -226,25 +234,36 @@ ULID**, so none needs a shared, edit-shifted mint off the parse path:
   for byte-identical regions (the ordinal disambiguates), so `(URI, region_id)`
   cannot alias two regions of one snapshot. It is **not** a cross-edit-stable handle
   and is not claimed to be — an edit that inserts a region renumbers ordinals.
-- **Cross-edit token reuse** (the injection-token-cache-reuse benefit) is re-keyed
-  off the ordinal onto **`(region content hash, validity_hash)`**: two snapshots'
-  byte-identical regions reuse tokens regardless of ordinal, which is what actually
-  makes reuse survive edits. Reworking that cache key is a **companion decision to
-  injection-token-cache-reuse**, not silently folded in here.
+- **Cross-edit token reuse** (the injection-token-cache-reuse benefit): the cache
+  is already content-validated at read (its entry carries `validity_hash` = content
+  ⊕ language, and `generation`), but its *key* is today the tracker ULID. The change
+  is to **drop `region_id` from the key** — key on `(uri, content_hash,
+  validity_hash, generation)` — so two snapshots' byte-identical regions reuse
+  tokens without any stable id. That in turn reworks **eviction**:
+  `invalidate_for_edits` currently point-deletes by `region_id` via the interval
+  tree, which has no target once the key drops it, so it must become a content-keyed
+  clear (or a side index) — losing the "typed region preserves reuse on an unrelated
+  edit" optimization measured by the injection-token-cache-reuse work unless that
+  index is added. Reworking the key **and** the eviction surface is a **companion
+  decision to injection-token-cache-reuse**, not silently folded in here.
 - **Cross-edit bridge / virtual-document identity** — the stable handle a
   downstream language server's virtual document is keyed by — **remains the shared
   `NodeTracker` ULID**, a live-position (`content_version`) concern. Because regions
   are only *discovered* by a parse, minting still originates from a parse pass, but
   as a distinct **current-version reconciliation step**, not off the stale-read
-  path: when a pass completes and (under `edit_lock`) its `parsed_version` still
-  equals `content_version`, a reconciliation maps the snapshot's region geometry to
-  tracker ULIDs — reusing an existing id by position, minting a fresh one for a
-  genuinely new region — exactly as discovery mints today. If the pass is stale
-  (`content_version` moved on), reconciliation is skipped and deferred to the next
-  current pass; the tracker is meanwhile kept live by the ordinary `didChange`
-  edit-shift, so the bridge always resolves against a `content_version`-consistent
-  index. A *stale-tree read* still never mints or mutates it — only the
-  current-version reconciliation does.
+  path: the tracker ULID mint that `populate_injections` performs inline today
+  **moves out of `populate` into a distinct reconciliation step**. When a pass
+  completes and (under `edit_lock`) its `parsed_version` still equals
+  `content_version`, that step maps the snapshot's region geometry to tracker ULIDs
+  — reusing an existing id by position, minting a fresh one for a genuinely new
+  region — exactly the mint discovery does today, just gated and relocated. If the
+  pass is stale (`content_version` moved on), reconciliation is skipped and deferred
+  to the next current pass; the tracker is meanwhile kept live by the ordinary
+  `didChange` edit-shift (`apply_input_edits`), so the bridge always resolves
+  against a `content_version`-consistent index. A *stale-tree read* still never
+  mints or mutates it — only the current-version reconciliation does. So `populate`
+  splits into two: derive the snapshot-owned ordinals + geometry (always), and (only
+  at current version) reconcile tracker ULIDs.
 
 So a stale-tree reader reads self-consistent ordinals + geometry from its own
 snapshot and touches no shared identity index (the mint-race and the
@@ -266,18 +285,28 @@ Any reader that must resolve against **live** positions is position-critical
   synchronous client (vim-lsp on Vim) cannot answer a server request while
   processing a notification; emitting from the off-ingress loop, after the
   notification returns, avoids that reentrancy.
-- **Serve-stale, passively refreshed** — `documentSymbol`, `documentColor`.
-  No server→client refresh exists for these, and adding one is out of scope; they
-  serve the latest snapshot and self-correct on the client's **next** request
-  (symbols/colors are re-requested on redraw/scroll, not held live). The staleness
-  window is one or more edits (unbounded under sustained typing) but
-  non-visual-jarring; this is the deliberate,
-  user-sanctioned relaxation.
-- **Staleness-reject** — `semanticTokens/range`, `kakehashi/node/*`,
-  `selectionRange`, `formatting`, `rangeFormatting`, and `captures` (full and
-  range). Their request positions/ranges are authored against the **live** text; a
-  stale tree cannot answer them, and captures/node additionally resolve against the
-  live `content_version` tracker. The rejection signal differs by protocol contract:
+- **Serve-stale, passively refreshed** — whole-document, no-position reads:
+  `documentSymbol`, `documentColor`, `documentLink`, `foldingRange`, `codeLens`
+  (the `whole_document_preferred_fan_out` family), and pull-mode
+  `textDocument/diagnostic` (the `virt_enabled` branch that calls
+  `ensure_document_parsed`). `did_save`'s synthetic-diagnostic effect is likewise
+  passive (a notification, not a request — its *diagnostics* may trail a snapshot,
+  self-healing on republish). No server→client refresh exists for these and adding
+  one is out of scope; they serve the latest snapshot and self-correct on the
+  client's **next** request (re-requested on redraw/scroll, not held live). The
+  staleness window is one or more edits (unbounded under sustained typing) but
+  non-visual-jarring; this is the deliberate, user-sanctioned relaxation.
+- **Staleness-reject** — every **position/range** reader, because its
+  coordinates are authored against the **live** text: `semanticTokens/range`,
+  `kakehashi/node/*`, `selectionRange`, `formatting`, `rangeFormatting`, `captures`
+  (full and range), **and the ~16 position/range bridge-context requests** that
+  resolve an injection region before forwarding to a downstream server (hover,
+  definition, references, declaration, typeDefinition, implementation, rename /
+  prepareRename, completion, signatureHelp, documentHighlight, linkedEditingRange,
+  moniker, on-type formatting, inlayHint, colorPresentation — the
+  `bridge_context` `ensure_document_parsed` site). A stale tree cannot answer them,
+  and captures/node/bridge additionally resolve against the live `content_version`
+  tracker. The rejection signal differs by protocol contract:
   - The LSP requests return **`ContentModified`** (-32801) when
     `content_version > parsed_version`. The spec does **not** mandate client
     auto-retry — a client that does not re-request simply gets the answer on its
@@ -359,14 +388,23 @@ inside the existing safety contracts at each step:
   `latest_snapshot` retains a servable tree across an edit's `tree.take()`; the two
   stores may transiently sit at different versions (a lost legacy CAS just reseeds
   next pass), but no **reader** sees the difference because every reader reads the
-  snapshot, not the legacy tree. Derive snapshot-owned region ids in
-  `populate` (no shared-tracker mint). Convert `semanticTokens` to serve-stale + the
-  refresh trigger; `documentSymbol`/`documentColor` to serve-stale + passive;
-  range/formatting/`node/*` to `ContentModified` and `captures` to `null` (its
-  re-sync signal). Removes `get_tree_with_wait` / `wait_for_epoch` /
-  `ensure_document_parsed` blocking. Delivers *instant reads* and *lifecycle
-  independent of parsing*. Without the dual-write this stage would reproduce the
-  empty-after-edit regression, so it is mandatory here, not deferred.
+  snapshot, not the legacy tree. Split `populate` into ordinal/geometry derivation
+  (snapshot-owned) and the current-version tracker reconciliation (§3), and move the
+  grammar auto-install that `compute_captures` does inline
+  (`ensure_injection_languages_loaded_for_document`) into that reconciliation under
+  `edit_lock` — the read handlers stop being install triggers. Convert
+  `semanticTokens` to serve-stale + the refresh trigger; the whole-document
+  passive-refresh family (`documentSymbol`/`documentColor`/`documentLink`/
+  `foldingRange`/`codeLens`/pull-`diagnostic`) to serve-stale; the position/range
+  family — `semanticTokens/range`, `node/*`, `formatting`/`rangeFormatting`, the
+  bridge-context requests, **and `selectionRange`, whose inline `parse_with_pool` +
+  `update_document` must be replaced by `latest_snapshot`** — to `ContentModified`;
+  and `captures` to `null` (its re-sync signal). Removes `get_tree_with_wait` /
+  `wait_for_epoch` / `ensure_document_parsed` **and** the inline-parse fallbacks
+  (`try_parse_and_update_document`, `selection_range_impl`) — closing the
+  resurrection vector. Delivers *instant reads* and *lifecycle independent of
+  parsing*. Without the dual-write this stage would reproduce the empty-after-edit
+  regression, so it is mandatory here, not deferred.
 - **Stage 3 — consolidation.** Remove `Document::tree` / `pending_seed` (the seed
   now lives on the scheduler), collapse the CAS methods into the one publish
   primitive, delete the watermark waits, and prune the now-superseded passages
@@ -419,9 +457,12 @@ inside the existing safety contracts at each step:
   pool itself additionally needs the fair-admission follow-on §4 names.)
 - High-performance reads: highlight requests return against the latest snapshot
   immediately instead of waiting hundreds of ms for a reparse + populate.
-- The scheduler ADR's residual **reader-fallback resurrection vector is
-  eliminated**: wait-free borrowing readers never parse inline, so there is no
-  reader path that can re-insert a document a `didClose` removed.
+- The scheduler ADR's residual **reader-fallback resurrection vector is eliminated
+  at Stage 2**: once every reader routes through wait-free `latest_snapshot` and no
+  reader parses inline, there is no reader path that can re-insert a document a
+  `didClose` removed. (It is *not* closed by Stage 1, which leaves the current
+  inline-parse fallbacks — `try_parse_and_update_document`, `selection_range_impl` —
+  in place; those are the vector, and they are removed in Stage 2.)
 - State and coupling shrink: two `watch` maps collapse to one, six store CAS /
   watermark methods to one publish primitive, and the `pending_seed` invariant
   surface on `Document` is deleted (favorable on the State > Coupling > Complexity
