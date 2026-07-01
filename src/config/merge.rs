@@ -102,6 +102,10 @@ pub(crate) fn merge_bridge_server_configs(
         prefer_shared_instance: overlay
             .prefer_shared_instance
             .or(base.prefer_shared_instance),
+        // Overlay-wins-when-present, mirroring `prefer_shared_instance`: a
+        // concrete server's explicit `enabled` overrides the wildcard, so
+        // `_.enabled: false` can be opted back into per server.
+        enabled: overlay.enabled.or(base.enabled),
     }
 }
 
@@ -525,6 +529,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        enabled: None,
                         settings: None,
                     },
                 ),
@@ -537,6 +542,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        enabled: None,
                         settings: None,
                     },
                 ),
@@ -609,6 +615,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        enabled: None,
                         settings: None,
                     },
                 ),
@@ -622,6 +629,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        enabled: None,
                         settings: None,
                     },
                 ),
@@ -690,6 +698,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             )])),
@@ -1080,6 +1089,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         )]);
@@ -1097,6 +1107,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         )]);
@@ -1115,6 +1126,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1127,6 +1139,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1157,6 +1170,7 @@ mod tests {
             workspace_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 
@@ -1168,6 +1182,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
@@ -1213,6 +1228,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: prefer,
             settings: None,
+            enabled: None,
         };
 
         // Unset overlay inherits the base (wildcard) value.
@@ -1238,6 +1254,48 @@ mod tests {
         );
     }
 
+    /// `enabled` merges overlay-wins-when-present, exactly like
+    /// `prefer_shared_instance`, so a `languageServers._.enabled: false` can
+    /// disable every server by default while a concrete server opts back in
+    /// with `enabled: true`.
+    #[test]
+    fn test_merge_bridge_server_configs_enabled() {
+        use settings::BridgeServerConfig;
+
+        let server = |enabled: Option<bool>| BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            settings: None,
+            enabled,
+        };
+
+        // Unset overlay inherits the base (wildcard) value.
+        let base = server(Some(false));
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(None)).enabled,
+            Some(false),
+            "unset overlay inherits the wildcard opt-out"
+        );
+
+        // Explicit overlay overrides the base — opting a specific server
+        // BACK IN over a wildcard opt-out.
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(Some(true))).enabled,
+            Some(true),
+            "explicit true opts a server back in over the wildcard opt-out"
+        );
+
+        // And opting a specific server out over a wildcard that left it unset.
+        assert_eq!(
+            merge_bridge_server_configs(&server(None), &server(Some(false))).enabled,
+            Some(false),
+        );
+    }
+
     // Deep merge for initialization_options (configuration-merging-strategy)
 
     /// configuration-merging-strategy: initialization_options deep merge covers three behaviors:
@@ -1260,6 +1318,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
         let overlay = BridgeServerConfig {
@@ -1273,6 +1332,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 
@@ -1362,6 +1422,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 
@@ -1514,6 +1575,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1527,6 +1589,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1567,6 +1630,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1580,6 +1644,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),

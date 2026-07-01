@@ -933,6 +933,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         }
     }
@@ -964,6 +965,27 @@ mod tests {
         assert!(
             unspawnable_language_servers(&settings).is_empty(),
             "cmd supplied by the '_' wildcard makes the entry spawnable"
+        );
+    }
+
+    #[test]
+    fn unspawnable_language_servers_excludes_deliberately_disabled_servers() {
+        // A server with `enabled: false` is a deliberate user opt-out, not a
+        // misconfiguration — it must not be flagged alongside genuinely
+        // broken (empty-cmd) entries.
+        let mut settings = settings_with(HashMap::new());
+        let mut disabled = server(&["lua-language-server"]);
+        disabled.enabled = Some(false);
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), server(&[])),
+            ("disabled".to_string(), disabled),
+            ("broken".to_string(), server(&[])),
+        ]);
+
+        assert_eq!(
+            unspawnable_language_servers(&settings),
+            vec!["broken".to_string()],
+            "a deliberately disabled server is not an unspawnable misconfiguration"
         );
     }
 

@@ -418,6 +418,13 @@ pub struct BridgeServerConfig {
     /// wildcard, so `_.preferSharedInstance: true` can be opted out of
     /// per server with `preferSharedInstance: false`.
     pub prefer_shared_instance: Option<bool>,
+    /// Whether this server is eligible to be spawned/used at all.
+    ///
+    /// `None` = inherit (built-in default `true`). Like `root_markers` and
+    /// `prefer_shared_instance`, a concrete server's explicit value overrides
+    /// the wildcard, so `_.enabled: false` can disable every server by
+    /// default while individual servers opt back in with `enabled: true`.
+    pub enabled: Option<bool>,
 }
 
 impl BridgeServerConfig {
@@ -425,6 +432,12 @@ impl BridgeServerConfig {
     /// (`None`) case to the built-in default `false` (per-root instances).
     pub(crate) fn prefers_shared_instance(&self) -> bool {
         self.prefer_shared_instance.unwrap_or(false)
+    }
+
+    /// Effective `enabled` state, resolving the inherit (`None`) case to the
+    /// built-in default `true`.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
     }
 }
 
@@ -1414,6 +1427,35 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_enabled() {
+        let config_json = r#"{
+            "languageServers": {
+                "tsgo": {
+                    "cmd": ["typescript-language-server", "--stdio"],
+                    "languages": ["typescript"],
+                    "enabled": false
+                },
+                "pyright": {
+                    "cmd": ["pyright-langserver", "--stdio"],
+                    "languages": ["python"]
+                }
+            }
+        }"#;
+
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
+        let servers = settings.language_servers.expect("languageServers parses");
+        assert_eq!(
+            servers["tsgo"].enabled,
+            Some(false),
+            "explicit enabled is preserved"
+        );
+        assert_eq!(
+            servers["pyright"].enabled, None,
+            "absent enabled parses as None (inherit -> default true)"
+        );
+    }
+
+    #[test]
     fn should_parse_on_type_formatting_triggers() {
         let config_json = r#"{
             "languageServers": {
@@ -1452,6 +1494,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
         let servers = HashMap::from([
@@ -1491,6 +1534,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         )]);
@@ -1668,6 +1712,7 @@ mod tests {
             ]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 
