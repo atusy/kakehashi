@@ -250,8 +250,9 @@ So a stale-tree reader reads self-consistent ordinals + geometry from its own
 snapshot and touches no shared identity index (the mint-race and the
 undefined-id-on-gate-failure both vanish); token reuse is content-keyed; and the
 one identity that genuinely needs cross-edit stability (the bridge's) keeps the
-tracker that already provides it. This ADR commits only to *not* minting shared
-identities off the parse/read path.
+tracker that already provides it. This ADR commits only to *not* mutating shared
+identities from a **stale** parse pass or any read path — the current-version
+reconciliation above is the one place a parse still mints them.
 
 Any reader that must resolve against **live** positions is position-critical
 (below).
