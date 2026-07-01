@@ -454,41 +454,33 @@ impl BridgeServerConfig {
 ///
 /// Sorted and deduplicated so the advertisement is deterministic regardless of
 /// `HashMap` iteration order. Returns `None` when no server declares any
-/// trigger (capability stays unadvertised). A `_` wildcard key is treated like
-/// any other entry: its triggers join the union as-is (wildcard merging into
-/// concrete servers happens at request dispatch, not here). Known edge case: a
-/// concrete server overriding the wildcard with an explicit empty list still
-/// leaves the wildcard's triggers advertised; the bridge-side trigger filter
-/// keeps such requests from reaching servers that don't declare the character.
+/// trigger (capability stays unadvertised).
 ///
-/// A concrete server whose effective `enabled` resolves to `false` is
-/// excluded: it will never spawn, so advertising its triggers would make the
-/// client send an `onTypeFormatting` *request* — not a fire-and-forget
-/// notification — on every matching keystroke, only to resolve to null.
+/// Every key (concrete server or the `_` wildcard itself) is independently
+/// resolved through wildcard-config-inheritance before its triggers are read,
+/// so a concrete server that overrides the wildcard's triggers (including
+/// with an explicit empty list) or its `enabled` state contributes its own
+/// *effective*, merged set — not the wildcard's raw one. A resolved config
+/// that isn't [`BridgeServerConfig::is_spawnable`] (no cmd, or disabled) is
+/// excluded entirely: advertising its triggers would make the client send an
+/// `onTypeFormatting` *request* — not a fire-and-forget notification — on
+/// every matching keystroke, only to resolve to null.
 pub(crate) fn on_type_formatting_trigger_union(
     servers: &HashMap<String, BridgeServerConfig>,
 ) -> Option<(String, Vec<String>)> {
     let mut triggers: Vec<String> = servers
-        .iter()
-        .filter(|(name, config)| {
-            if name.as_str() == crate::config::WILDCARD_KEY {
-                // The wildcard's own triggers still join the union as-is
-                // (see doc above), but only while the wildcard itself isn't
-                // the `_.enabled: false` disable-everything-by-default knob.
-                config.is_enabled()
-            } else {
-                crate::config::resolve_with_wildcard(
-                    servers,
-                    name,
-                    crate::config::merge_bridge_server_configs,
-                )
-                .is_some_and(|resolved| resolved.is_enabled())
-            }
+        .keys()
+        .filter_map(|name| {
+            crate::config::resolve_with_wildcard(
+                servers,
+                name,
+                crate::config::merge_bridge_server_configs,
+            )
         })
-        .filter_map(|(_, s)| s.on_type_formatting_triggers.as_ref())
+        .filter(BridgeServerConfig::is_spawnable)
+        .filter_map(|s| s.on_type_formatting_triggers)
         .flatten()
         .filter(|t| t.chars().count() == 1)
-        .cloned()
         .collect();
     triggers.sort();
     triggers.dedup();
@@ -1608,6 +1600,51 @@ mod tests {
             on_type_formatting_trigger_union(&wildcard_disables_itself),
             None,
             "the wildcard's own trigger must not be advertised while `_.enabled` is false"
+        );
+
+        // A concrete server that opts back IN over a disabled wildcard must
+        // still inherit — and advertise — the wildcard's trigger characters
+        // (the gate is per-server effective state, not raw wildcard state).
+        let reenabled_inherits_wildcard_triggers = HashMap::from([
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    enabled: Some(false),
+                    ..server(Some(vec!["}"]), None)
+                },
+            ),
+            ("lua_ls".to_string(), server(None, Some(true))),
+        ]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&reenabled_inherits_wildcard_triggers),
+            Some(("}".to_string(), Vec::new())),
+            "a server re-enabled over a disabled wildcard still inherits its triggers"
+        );
+    }
+
+    #[test]
+    fn on_type_formatting_trigger_union_excludes_empty_cmd_server() {
+        // Enabled but unspawnable (no resolved cmd) must be excluded exactly
+        // like a disabled server: gate on is_spawnable(), not is_enabled()
+        // alone, to match every other "is this server usable" call site.
+        let servers = HashMap::from([(
+            "tsgo".to_string(),
+            BridgeServerConfig {
+                cmd: vec![],
+                languages: vec![],
+                initialization_options: None,
+                root_markers: None,
+                on_type_formatting_triggers: Some(vec![";".to_string()]),
+                prefer_shared_instance: None,
+                enabled: None,
+                settings: None,
+            },
+        )]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&servers),
+            None,
+            "a server with no resolved cmd can never service the request, \
+             so its triggers must not be advertised"
         );
     }
 
