@@ -462,28 +462,35 @@ impl BridgeServerConfig {
 /// or its `enabled` state contributes its own *effective*, merged set — not
 /// the wildcard's raw one. The `_` wildcard key itself is never a direct
 /// contributor: it's excluded from iteration, since a wildcard-only config
-/// (no concrete servers) has nothing to advertise on its own. A resolved
-/// config that isn't [`BridgeServerConfig::is_spawnable`] (no cmd, or
-/// disabled) is excluded entirely: advertising its triggers would make the
-/// client send an `onTypeFormatting` *request* — not a fire-and-forget
-/// notification — on every matching keystroke, only to resolve to null.
+/// (no concrete servers) has nothing to advertise on its own. A server that
+/// isn't [`crate::config::is_server_spawnable`] (no cmd, or disabled) is
+/// excluded entirely: advertising its triggers would make the client send an
+/// `onTypeFormatting` *request* — not a fire-and-forget notification — on
+/// every matching keystroke, only to resolve to null.
+///
+/// Resolves `cmd`/`enabled`/triggers inheritance directly (mirroring
+/// `merge_bridge_server_configs`'s per-field rules) rather than calling
+/// `resolve_with_wildcard`, to avoid cloning every server's full config just
+/// to read a couple of fields.
 pub(crate) fn on_type_formatting_trigger_union(
     servers: &HashMap<String, BridgeServerConfig>,
 ) -> Option<(String, Vec<String>)> {
+    let wildcard_triggers = servers
+        .get(crate::config::WILDCARD_KEY)
+        .and_then(|w| w.on_type_formatting_triggers.as_ref());
     let mut triggers: Vec<String> = servers
         .keys()
         .filter(|name| name.as_str() != crate::config::WILDCARD_KEY)
+        .filter(|name| crate::config::is_server_spawnable(servers, name))
         .filter_map(|name| {
-            crate::config::resolve_with_wildcard(
-                servers,
-                name,
-                crate::config::merge_bridge_server_configs,
-            )
+            servers[name]
+                .on_type_formatting_triggers
+                .as_ref()
+                .or(wildcard_triggers)
         })
-        .filter(BridgeServerConfig::is_spawnable)
-        .filter_map(|s| s.on_type_formatting_triggers)
         .flatten()
         .filter(|t| t.chars().count() == 1)
+        .cloned()
         .collect();
     triggers.sort();
     triggers.dedup();

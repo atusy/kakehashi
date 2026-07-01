@@ -27,6 +27,36 @@ pub(crate) fn resolve_with_wildcard<V: Clone>(
     }
 }
 
+/// Cheaply checks whether `name`'s effective config is spawnable (non-empty
+/// `cmd` AND enabled), resolving `_` wildcard inheritance without cloning or
+/// merging the full `BridgeServerConfig` — a hot-path-friendly alternative to
+/// `resolve_with_wildcard(..., merge_bridge_server_configs).is_some_and(|c|
+/// c.is_spawnable())` for call sites that only need the boolean, not the
+/// resolved config. Mirrors `merge_bridge_server_configs`'s exact per-field
+/// rules (`cmd`: overlay wins only if non-empty, else base; `enabled`:
+/// overlay wins when present, else base, else the built-in default `true`) —
+/// keep the two in sync if either changes.
+///
+/// `name` must be a key already present in `servers` (not the wildcard
+/// itself); an absent name resolves to `false` rather than falling back to
+/// the wildcard's own config, since a server no longer listed in
+/// `languageServers` at all was never eligible in the first place.
+pub(crate) fn is_server_spawnable(
+    servers: &HashMap<String, BridgeServerConfig>,
+    name: &str,
+) -> bool {
+    let Some(config) = servers.get(name) else {
+        return false;
+    };
+    let wildcard = servers.get(WILDCARD_KEY);
+    let cmd_non_empty = !config.cmd.is_empty() || wildcard.is_some_and(|w| !w.cmd.is_empty());
+    let enabled = config
+        .enabled
+        .or(wildcard.and_then(|w| w.enabled))
+        .unwrap_or(true);
+    cmd_non_empty && enabled
+}
+
 /// Field-level merge of two BridgeLanguageConfig values.
 /// Overlay fields win when present; base provides defaults.
 pub(crate) fn merge_bridge_language_configs(
@@ -1829,6 +1859,81 @@ mod tests {
             resolved.aggregation.unwrap()["_"].priorities,
             Some(vec!["server_a".to_string()])
         );
+    }
+
+    /// `is_server_spawnable` is a hot-path shortcut for exactly what
+    /// `resolve_with_wildcard(..., merge_bridge_server_configs).is_some_and(|c|
+    /// c.is_spawnable())` computes — verify the two agree across the cases
+    /// that actually exercise wildcard inheritance (cmd AND enabled, each
+    /// independently), not just the trivial no-inheritance case.
+    #[test]
+    fn test_is_server_spawnable_matches_full_resolution() {
+        let server = |cmd: Vec<&str>, enabled: Option<bool>| settings::BridgeServerConfig {
+            cmd: cmd.into_iter().map(String::from).collect(),
+            languages: vec![],
+            initialization_options: None,
+            root_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            enabled,
+            settings: None,
+        };
+
+        let full_resolution = |servers: &HashMap<String, settings::BridgeServerConfig>,
+                               name: &str| {
+            resolve_with_wildcard(servers, name, merge_bridge_server_configs)
+                .is_some_and(|c| c.is_spawnable())
+        };
+
+        // Case 1: server has its own cmd and enabled — no inheritance needed.
+        let servers = HashMap::from([("a".to_string(), server(vec!["x"], Some(true)))]);
+        assert!(is_server_spawnable(&servers, "a"));
+        assert_eq!(
+            is_server_spawnable(&servers, "a"),
+            full_resolution(&servers, "a")
+        );
+
+        // Case 2: server's own cmd is empty, inherits a non-empty cmd from `_`.
+        let servers = HashMap::from([
+            ("_".to_string(), server(vec!["shared-ls"], None)),
+            ("a".to_string(), server(vec![], None)),
+        ]);
+        assert!(
+            is_server_spawnable(&servers, "a"),
+            "cmd inherited from the wildcard must count as non-empty"
+        );
+        assert_eq!(
+            is_server_spawnable(&servers, "a"),
+            full_resolution(&servers, "a")
+        );
+
+        // Case 3: server has its own cmd but the wildcard disables everything
+        // by default; server doesn't override enabled — inherits disabled.
+        let servers = HashMap::from([
+            ("_".to_string(), server(vec![], Some(false))),
+            ("a".to_string(), server(vec!["x"], None)),
+        ]);
+        assert!(!is_server_spawnable(&servers, "a"));
+        assert_eq!(
+            is_server_spawnable(&servers, "a"),
+            full_resolution(&servers, "a")
+        );
+
+        // Case 4: server re-enables itself over a disabled wildcard.
+        let servers = HashMap::from([
+            ("_".to_string(), server(vec![], Some(false))),
+            ("a".to_string(), server(vec!["x"], Some(true))),
+        ]);
+        assert!(is_server_spawnable(&servers, "a"));
+        assert_eq!(
+            is_server_spawnable(&servers, "a"),
+            full_resolution(&servers, "a")
+        );
+
+        // Case 5: name not present in the map at all — false, not a fallback
+        // to the wildcard's own config.
+        let servers = HashMap::from([("_".to_string(), server(vec!["x"], Some(true)))]);
+        assert!(!is_server_spawnable(&servers, "missing"));
     }
 
     #[test]

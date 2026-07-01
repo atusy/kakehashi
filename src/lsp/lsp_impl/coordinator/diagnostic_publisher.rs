@@ -260,24 +260,21 @@ impl DiagnosticPublisher {
             );
             return;
         };
-        // A server disabled (`enabled: false`) after it already spawned can
-        // still emit region pushes on its still-live connection; drop them
-        // rather than recording fresh diagnostics for a server the user no
-        // longer wants running (mirrors publish_host_push's is_host_server
-        // gate). `enabled` is a per-server-name property, so this only needs
-        // the pushing server's own resolved config, not the region's
-        // injection language.
+        // A server no longer spawnable (disabled via `enabled: false`, or no
+        // longer configured at all) after it already spawned can still emit
+        // region pushes on its still-live connection; drop them rather than
+        // recording fresh diagnostics for a server the user no longer wants
+        // running (mirrors publish_host_push's is_host_server gate).
+        // Spawnability is a per-server-name property, so this only needs the
+        // pushing server's own resolved config, not the region's injection
+        // language — checked via the allocation-free is_server_spawnable
+        // rather than a full resolve_with_wildcard merge, since this runs on
+        // every push.
         let settings = self.settings_manager.load_settings();
-        let is_enabled = crate::config::resolve_with_wildcard(
-            &settings.language_servers,
-            &server,
-            crate::config::merge_bridge_server_configs,
-        )
-        .is_some_and(|config| config.is_spawnable());
-        if !is_enabled {
+        if !crate::config::is_server_spawnable(&settings.language_servers, &server) {
             log::debug!(
                 target: LOG_TARGET,
-                "push from disabled server {server}, dropping"
+                "push from unspawnable server {server}, dropping"
             );
             return;
         }

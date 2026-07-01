@@ -12,8 +12,9 @@ pub(crate) mod user;
 
 pub use expand::{set_config_file_override, set_data_dir_override};
 pub(crate) use merge::{
-    merge_aggregation_configs, merge_bridge_language_configs, merge_bridge_server_configs,
-    merge_layer_aggregation_configs, merge_workspace_settings, resolve_with_wildcard,
+    is_server_spawnable, merge_aggregation_configs, merge_bridge_language_configs,
+    merge_bridge_server_configs, merge_layer_aggregation_configs, merge_workspace_settings,
+    resolve_with_wildcard,
 };
 pub(crate) use settings::{CaptureMappings, DEFAULT_DEBOUNCE_MS, QueryTypeMappings};
 pub use settings::{LanguageSettings, RawWorkspaceSettings, WorkspaceSettings, json_schema};
@@ -337,10 +338,7 @@ impl WorkspaceSettings {
         self.language_servers
             .keys()
             .filter(|name| name.as_str() != WILDCARD_KEY)
-            .any(|name| {
-                resolve_with_wildcard(&self.language_servers, name, merge_bridge_server_configs)
-                    .is_some_and(|server| server.is_spawnable())
-            })
+            .any(|name| is_server_spawnable(&self.language_servers, name))
     }
 }
 
