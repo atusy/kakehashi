@@ -1,8 +1,8 @@
 # Injection Token Cache Reuse
 
 <!--
-Status: Proposed (aspirational). The invalidation half described here is
-implemented; the reuse half is not. See "Decision–Implementation Gap".
+Status: Per-region token reuse IMPLEMENTED (PR #540). The injection-discovery
+companion lever is designed but NOT implemented. See "Decision–Implementation Gap".
 -->
 
 **Related Decisions**: [semantic-token-overlap-resolution](semantic-token-overlap-resolution.md), [lazy-node-identity-tracking](lazy-node-identity-tracking.md), [per-document-parse-scheduler](per-document-parse-scheduler.md)
@@ -72,17 +72,20 @@ The codebase already contains most of the machinery to avoid this, but only its
   for each touched region, and `clear_document` on close/reparse — so stale
   entries are evicted correctly.
 
-The gap: `InjectionTokenCache::store` and `::get` are `#[cfg(test)]`-only. In
-production nothing ever writes to or reads from the cache, so the eviction logic
-guards an always-empty cache. The hot path (`handle_semantic_tokens_full` in
-`src/analysis/semantic.rs`) unconditionally calls `collect_host_tokens` +
-`collect_injection_tokens_parallel` over the whole document.
+The gap this ADR was written to close (historical — **resolved by PR #540**):
+`InjectionTokenCache::store` and `::get` were `#[cfg(test)]`-only, so production
+never wrote to or read from the cache and the eviction logic guarded an
+always-empty cache; the hot path (`handle_semantic_tokens_full` in
+`src/analysis/semantic.rs`) recomputed `collect_host_tokens` +
+`collect_injection_tokens_parallel` over the whole document on every request.
 
-This is the largest remaining *typing-path* lever for injection-heavy documents
-(the whole-doc cache having already taken the unchanged-document case). The
-reason it has not been wired in is a genuine design question, not an oversight:
-what to cache, and how to keep coordinates correct when an edit above a region
-shifts that region's position in the host document.
+This was the largest *typing-path* lever for injection-heavy documents (the
+whole-doc cache having already taken the unchanged-document case). It was not
+wired in because of a genuine design question, not an oversight: what to cache,
+and how to keep coordinates correct when an edit above a region shifts that
+region's position in the host document. The rest of this ADR records how that was
+resolved (now implemented); the injection-discovery companion lever below is the
+remaining, still-unimplemented follow-up.
 
 ## Decision
 
@@ -196,19 +199,237 @@ Two implementation obligations follow, neither inferable from
   — and means a fallback parse that skips `populate_injections` stays safe and
   must not be "fixed" by calling it there.
 
-### Companion lever: injection discovery
+### Companion lever: injection discovery (don't-discover-twice)
 
 The per-keystroke table shows injection *discovery* (the injection query over
 the whole host tree, run every request to enumerate regions) costs as much as
-tokenize and is also recomputed every keystroke. It is not cached by v1, but the
-same position-stable `region_id` / `InjectionMap` identity that makes token
-reuse possible could let an edit reuse the previous region *set* instead of
-re-querying. Caching discovery + tokenize together roughly doubles the
-per-keystroke saving (measured projection: ~−1/3 for tokenize alone vs ~−60% for
-both at 150–300 blocks — the discovery figure is an optimistic ceiling, since
-the tracked region set still costs something to update per edit). Treated as a
-follow-up, not part of v1: skipping discovery means trusting the tracked set
-rather than re-deriving it from the tree, a larger correctness commitment.
+tokenize and is also recomputed every keystroke. The headline ~−60% projection
+above assumed the region *set* could be cached and reused across edits. **That
+framing is rejected.** `collect_all_injections` is the structural-change
+detector — it is what notices that *this* keystroke added, removed, or split a
+fenced block. Reusing a tracked set across an edit means either re-deriving it
+from the new tree (no saving) or trusting an incrementally-maintained set without
+re-querying (a categorically deeper correctness commitment than the token half,
+which never had to answer "what regions exist" — it took the freshly discovered
+set as given and only reused per-region *tokens*).
+
+What is sound is a narrower mechanism: **don't run discovery twice on the same
+tree.** An edit pays the injection query *twice* — once off-ingress in
+`populate_injections` (`src/lsp/cache.rs`) during the reparse, and again,
+independently, in the `semanticTokens` request
+(`collect_injection_contexts_sync`). Have the semantic request reuse what
+`populate_injections` already discovered, **bound to the exact tree it was
+discovered on** so it is never served for a different parse.
+
+**Identity, not a content hash.** An earlier draft of this section gated reuse on
+`fnv1a(snapshotted_text) + generation`. That is insufficient as the *sole*
+correctness backstop, for three converging reasons: a 64-bit hash can collide; it
+cannot tell a text `A → B → A` cycle apart from "no change" (so a stale entry from
+the first `A`, whose `region_id` the `NodeTracker` may have reissued in between,
+could be reused and then *leak* — eviction targets the id `get_or_create` returns
+now, not the orphaned stored one); and the cached data is *tree*-derived (points,
+ranges, `region_id`s minted against the `NodeTracker`), which text equality only
+*implies* via tree-sitter's deterministic incremental parse, it does not
+*identify*. So the design ties the discovery to the **tree itself**, two ways in
+preference order:
+
+- **Preferred — couple it to the parse result.** Make the discovered contexts
+  part of the document's parse result so the semantic path reads `(tree, discovery)`
+  from one atomic snapshot — physically one unit, so there is **no reader-side gate
+  to get wrong**: a snapshot carries discovery (reuse) or does not (the
+  on-demand-parse fallback tree → discover inline). The only gate is on the
+  *writer* side — the second CAS below that attaches discovery only to the tree it
+  was built for. Realizability, given `populate_injections` runs *after* the
+  tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`, defined in
+  `src/document/store.rs` and invoked from `src/lsp/lsp_impl/coordinator/parse.rs`):
+  - **No *new* `NodeTracker` mutation.** `populate_injections` *already* calls
+    `tracker.get_or_create` today, to mint the `region_id` on each
+    `CacheableInjectionRegion` it inserts into the `InjectionMap` (which
+    `invalidate_for_edits` needs for token-cache eviction). The discovery build
+    must **reuse that same id** — it is produced by the same shared stage, from the
+    same `Q`, so the lever adds *no* off-ingress `get_or_create` beyond today's.
+    (The pre-existing off-ingress minting, and its interaction with a concurrent
+    subsequent edit, is governed by
+    [lazy-node-identity-tracking](lazy-node-identity-tracking.md) and is neither
+    worsened nor in scope to fix here.) Because reuse is bound to the tree
+    identity, a stored `region_id` is only ever served for the exact tree it was
+    minted on — consistent with the `InjectionMap` / tracker state for that tree;
+    a changed tree misses and the miss-path mints fresh, as today.
+  - **Publication scheme:** publish the tree first; build discovery; then attach it
+    to the parse result via a *second* CAS that no-ops unless the tree / parse
+    epoch is still the one just published. Discovery is therefore briefly *absent*
+    between the two CASes (a request in that window re-discovers inline), but never
+    attached to the wrong tree.
+- **Alternative — a parse epoch.** If coupling into the parse result is too
+  invasive, key a separate `DiscoveredInjectionCache` on a **fresh monotonic
+  per-parse epoch** — *not* `incarnation` (preserved across edits, so it cannot
+  distinguish `A→B→A`) and *not* a separately-read "current" epoch (tree
+  replacement races the read). The epoch must be stamped onto the tree
+  *atomically* in the publication CAS (`(tree, epoch)`), and the semantic path must
+  snapshot tree and epoch together; reuse only when the stored discovery's epoch
+  equals the snapshot's. An epoch is exact (no collision) and distinct across an
+  `A→B→A` cycle.
+
+Either way the settings `generation` still gates the injected-query / highlight
+validity (a reload must miss; see correctness surface 7 for the reload-ordering
+obligation), and parse ordering (below) affects only hit-rate.
+
+**Currency — hit-rate, not correctness.** Correctness rests on the tree-identity
+binding above; ordering only governs how often a reusable discovery is *available*
+when the request runs. In the reparse loop, when a tree lands the order is
+set-tree → `populate_injections` → `advance_watermark` / `mark_parse_finished`
+(`src/lsp/lsp_impl/coordinator/parse.rs`), and the semantic handler's settle waits on the parse
+watermark + parse-completion before snapshotting the tree
+(`src/lsp/lsp_impl/text_document/semantic_tokens.rs`), so in the common debounced case the
+snapshot already carries (or its epoch already matches) the populated discovery.
+On the branches where `populate_injections` is skipped (the CAS-fail `if stored`
+guard, the no-tree / error paths — `advance_watermark` still runs there), when the
+200 ms settle budget expires, or on the on-demand-parse fallback, there is simply
+no discovery to reuse and the request re-discovers inline. No ordering guarantee
+is load-bearing.
+
+**Mechanism.**
+
+- A single **shared context-build stage** is extracted from
+  `collect_injection_contexts_sync`: `collect_all_injections` (the `Q` query) runs
+  once and feeds a `build_contexts_from_regions` step that produces, per region,
+  `resolved_lang`, `included_ranges` (owned `Vec<Range>`), `prefix_byte_widths`,
+  the `combined` flag/grouping, the content byte-range, `host_start_byte`, the
+  `region_cache` identity (`region_id` + `validity_hash` + `line_start` +
+  `eligible`), the host exclusion-ranges, **and a `discovery_complete` flag**. This
+  is the load-bearing refactor: it lets `populate_injections` produce *both* the
+  existing `CacheableInjectionRegion` (`R`) *and* the owned discovery — from one
+  `Q` and one `get_or_create` per region (the `region_id` is shared between `R` and
+  the discovery, so the lever mints no new ids) — rather than calling
+  `collect_injection_contexts_sync` (which would run `Q` a second time and defeat
+  the whole lever). The semantic miss-path uses the same stage.
+- **`R` (the `InjectionMap`) stays complete; only the discovery is gated.** Today
+  `from_region_info` builds `R` for *every* region `collect_all_injections`
+  returns, regardless of parser/query load state, because `invalidate_for_edits`
+  must be able to evict any region. The shared stage must preserve that: it builds
+  `R` for all regions, while a region whose parser/highlight query is unavailable
+  is dropped only from the *discovery contexts* and taints `discovery_complete`.
+  So the refactor must not let the discovery's region-dropping shrink the
+  `InjectionMap`.
+- `populate_injections` runs that stage, always inserts the complete `R` into the
+  `InjectionMap` as today, and stores the owned discovery (coupled to the tree, or
+  epoch-tagged) **only when `discovery_complete` is true** (see correctness
+  surface 5).
+- The `semanticTokens` path, before discovering, takes the discovery carried by
+  its tree snapshot (or epoch-matched entry). **Present** → rebuild the
+  `InjectionContext`s from the owned data (re-slice `content_text` from the
+  current text, look up `highlight_query` fresh by `resolved_lang`, and use the
+  stored `region_id`), skipping the `Q` query-match loop *and* the reader's own
+  `get_or_create` — the stored id is the one populate already minted for this same
+  tree. **Absent** → discover inline via the shared stage as today; never call
+  `populate_injections` off the reader path.
+
+The reuse is **whole-document, not eligibility-gated**: `collect_all_injections`
+is a single all-or-nothing query over the host tree, so to skip it on a hit
+`populate_injections` must store rebuildable contexts for *every* region,
+including non-eligible prefixed (blockquote) ones. The `eligible` predicate gates
+only the per-region *token* re-anchoring (the shipped half); it does **not**
+narrow the discovery reuse. Consequently the `C` that relocates to
+`populate_injections` is the full per-region context-build for all regions —
+trivial for eligible column-0 fences (no children to exclude), but a real
+`compute_included_ranges` node-walk for prefixed regions.
+
+**Why this is the same safety philosophy as the rest of this ADR.** Reuse is only
+ever served for discovery bound to the *exact tree* the request is tokenizing
+(coupled to the parse result, or epoch-confirmed) under the current settings
+`generation` — so a structural change (added / removed / moved fence) produces a
+new tree the old discovery is not bound to, and re-discovers. There is no "trust a
+stale tracked set" — the deeper commitment the naïve framing required is never
+taken on. The tree-identity binding is strictly stronger than the `fnv1a`-hash
+`cache_key` the token half (#540) and whole-doc cache (#530) accept; the earlier
+content-hash framing for *this* lever was retired in design review precisely
+because, as the sole backstop for tree-derived data, a hash identifies text, not
+the parse.
+
+**Magnitude (measured).** The saving is *not* a full discovery+context-build —
+the per-region context-build (`C`: `compute_included_ranges` node-walks, prefix
+widths, combined grouping) is built only in the semantic path today, so the lever
+*relocates* `C` into `populate_injections` rather than deduplicating it. What is
+genuinely deduplicated is the injection query-match loop (`Q` =
+`collect_all_injections`), which runs twice per edit today. A release
+microbenchmark (markdown, eligible column-0 lua fences) shows `Q` *dominates* the
+discovery bucket, because eligible fences have a trivial `C`:
+
+| blocks | `Q` (query match) | `Q`+`C` (full discovery) | `Q`/(`Q`+`C`) |
+|---|---|---|---|
+| 150 | 1.18 ms | 1.55 ms | 76% |
+| 300 | 2.41 ms | 2.73 ms | 88% |
+
+So the per-edit total-CPU saving ≈ `Q` ≈ 1.2 ms at 150 blocks — comparable to the
+shipped per-region-tokenize saving (1.66 ms), and combined with it reaches ≈ −58%
+of the per-keystroke budget, confirming this section's original ~−60% projection
+in *magnitude* (the projection mis-attributed the cost to the whole bucket, but
+`Q` carries it). The benchmark is the *eligible-heavy* case (column-0 fences,
+trivial `C`), so the ~0.3 ms relocated `C` at 300 blocks is a best case; a
+document dominated by prefixed/blockquote regions relocates a larger `C` to the
+off-ingress path (the node-walks), though the per-edit total-CPU saving is still
+≈ `Q` regardless of eligibility, since `C` is relocated, not added. Per-*request*
+latency improvement is timing-dependent and *not* the figure to quote: it
+approaches `Q`+`C` when populate finished during the debounce gap (the request
+reuses without waiting) and shrinks toward zero when the request blocks on an
+as-yet-unfinished populate (it waits out the work it would otherwise have done
+itself). Which regime dominates shifts as parsing moves off-ingress, so the
+stable, defensible figure is the ~`Q` total-CPU saving. **No-regression gate:**
+it must measure a prefixed-region-heavy document too, not only eligible fences,
+since that is where the relocated `C` could lengthen the off-ingress reparse the
+semantic settle waits on.
+
+**Open correctness surface (for the design review):** (1) the owned
+`included_ranges` are byte/point data computed on the populate tree — valid for
+the semantic path *only* under the tree-identity binding (parse-result coupling or
+epoch match), which is the whole point of that binding; (2) `highlight_query` /
+registry must be looked up fresh at reuse
+(don't persist the `Arc<Query>` across a possible reload — the settings
+generation already keys the token cache, but the discovery cache must not serve
+contexts built under an old query, so the generation has to gate the discovery
+cache too); (3) combined groups are stored whole; (4) gated by the same region
+count as the token half and measured for no regression, since `populate_injections`
+now does strictly more work per reparse even for edits with no following
+`semanticTokens` request.
+
+(5) **Transient parser/query-load state must not be cached** — the discovery
+analogue of Hazard 3. The shared context-build stage taints
+`discovery_complete = false` and *drops* a region when its parser/highlight query
+is not yet loaded; this is text-, tree-, and generation-independent, so neither
+the tree-identity binding nor the generation catches it. If `populate_injections`
+stores discovery built during a load gap, a later request bound to that same tree
+is served an **incomplete region set → missing tokens until the next edit**. The
+store must therefore be gated on `discovery_complete` (don't persist an incomplete
+discovery), exactly as the token half gates `store` on `fully_loaded` — and the
+shared stage is what makes that flag available to `populate_injections`, which
+does not compute it today. (6) **Lifecycle wiring**: the discovery carried by the
+parse result (or the separate `DiscoveredInjectionCache`) must be cleared/replaced
+everywhere the existing `injection_map` / `injection_token_cache` are —
+`remove_document` on close and the no-query / empty-regions branches of
+`populate_injections` (`src/lsp/cache.rs`). Memory grows by a second per-region
+owned structure (the `included_ranges` / prefix / exclusion vectors) beyond the
+token half's per-region token vector, bounded by the same `clear_document` / close
+path (see Consequences/Neutral). (7) **Generation / registry
+should be one atomic config epoch (narrow reload race).** The settings `generation`
+gate already handles the common reload: a bump means the cached discovery's
+generation no longer matches, so it misses and re-discovers. What it does *not*
+cover by itself is a `populate_injections` running *concurrently* with the reload:
+registry/query mutation currently *precedes* the `bump_semantic_token_generation`
+bump (`src/lsp/lsp_impl.rs`), so snapshot-before-build / recheck-after can still
+observe new (or mixed) registry state while both reads return the *old* generation,
+tagging stale-query discovery as current. The blast radius is small and
+self-healing — a transient mis-coloring on the next request after a *concurrent*
+reload, gone on the next edit — but closing it cleanly means making registry state
+and generation one *indivisible* configuration epoch: an **atomic immutable
+registry swap** carrying its generation (a single pointer/`Arc` swap, so no build
+ever observes a half-mutated registry), or a
+seqlock / config lock that **rejects any snapshot taken mid-mutation**. A bare
+"bump before mutation" is *not* sufficient on its own: a build can still snapshot
+the already-bumped generation partway through a multi-step registry mutation,
+observe mixed state, recheck the same generation, and store it. (This ordering also
+tightens the shipped token half, whose
+`generation` validity rests on the same assumption; the discovery lever makes it
+load-bearing because populate resolves queries and builds contexts off-ingress.)
 
 ## Considered Options
 
@@ -354,18 +575,27 @@ two showstopper mitigations are the price of correctness, not optional polish.
 
 - Memory grows by one token vector per live injection region per open document,
   bounded by `clear_document` on close and `remove` on region change.
+- *(Discovery lever, if implemented.)* A second per-region owned structure — the
+  `included_ranges` / prefix / exclusion vectors of the stored discovery — beyond
+  the token half's per-region token vector, bounded by the same close / reparse
+  clear paths.
 
 ## Decision–Implementation Gap
 
-Only the invalidation half is implemented today: `InjectionMap` population +
-`find_overlapping` + `InjectionTokenCache::{remove, clear_document}` are wired in
-`src/lsp/cache.rs`; `InjectionTokenCache::{store, get}` are `#[cfg(test)]`-only
-and never called from production. The whole-document layer (Option C) shipped
-separately as PR #530.
+The per-region token reuse half (Option A) is **implemented and merged (PR #540)**:
+`InjectionTokenCache::{store, get}` are production code keyed by `(uri, region_id)`
+with the validity (`validity_hash` = content ⊕ language, plus settings
+`generation`) in the value; `collect_injection_tokens_parallel` resolves hits
+before the Rayon fan-out and re-anchors them, scoped to the language-agnostic
+translation predicate (re-evaluated at read time), region-count-gated, with the
+two showstopper mitigations in place (combined groups excluded; settings
+generation folded into validity). The whole-document layer (Option C) shipped as
+PR #530.
 
-This ADR records the intended design for the per-region reuse half — scoped to
-the language-agnostic translation predicate (re-evaluated at read time), gated on
-the two showstopper mitigations (exclude `injection.combined`; fold the settings
-generation into injection-cache validity) — plus the injection-discovery
-companion as a follow-up. Until it lands, the cache is maintained-but-unread and
-the typing path recomputes in full.
+What remains a gap is the **injection-discovery companion lever** (the
+don't-discover-twice design above): not implemented. Its shared `Q →
+build_contexts_from_regions` stage, the tree-identity binding (parse-result
+coupling or a per-parse epoch stamped atomically with the tree), the atomic
+config-epoch reload protocol, the `discovery_complete`-gated store, and the
+lifecycle wiring are the open work; until it lands, an edit still runs the
+injection query twice (off-ingress `populate_injections` + the semantic request).
