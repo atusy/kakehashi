@@ -369,6 +369,9 @@ pub(crate) fn merge_workspace_settings(
                     overlay.capture_mappings,
                 ),
                 auto_install: overlay.auto_install.or(base.auto_install),
+                diagnostics_debounce_ms: overlay
+                    .diagnostics_debounce_ms
+                    .or(base.diagnostics_debounce_ms),
                 language_servers: merge_language_servers(
                     base.language_servers,
                     overlay.language_servers,
@@ -483,6 +486,7 @@ mod tests {
         let base = RawWorkspaceSettings {
             search_paths: Some(vec!["/base/path".to_string()]),
             auto_install: Some(true),
+            diagnostics_debounce_ms: None,
             languages: HashMap::from([
                 (
                     "python".to_string(),
@@ -572,6 +576,7 @@ mod tests {
         let overlay = RawWorkspaceSettings {
             search_paths: Some(vec!["/overlay/path".to_string()]),
             auto_install: Some(false),
+            diagnostics_debounce_ms: None,
             languages: HashMap::from([
                 (
                     // shared key: python — overlay overrides queries, inherits parser/bridge/aliases

@@ -516,6 +516,9 @@ impl DiagnosticPublisher {
         if !supported {
             return;
         }
+        // Count the ask before the gate so `requested - sent` measures what the
+        // single-flight + coverage gate saves (#533).
+        self.aggregator.record_refresh_requested();
         // Coalesce against any in-flight refresh and apply the coverage gate (#497):
         // `false` here means either one is already outstanding (recorded as `pending`,
         // so the outstanding task's loop fires the trailing) or — for a non-`forced`
@@ -553,6 +556,8 @@ impl DiagnosticPublisher {
                 // future change adds a *pre-shutdown* panic source to this task,
                 // revisit — it would wedge the guard (and a drop-guard "fix" would
                 // reopen the `finish_refresh` lost-wakeup, so clear it atomically).
+                // Count each wire send, including trailing fires (#533).
+                aggregator.record_refresh_sent();
                 if let Err(e) = client.workspace_diagnostic_refresh().await {
                     log::debug!(
                         target: LOG_TARGET,

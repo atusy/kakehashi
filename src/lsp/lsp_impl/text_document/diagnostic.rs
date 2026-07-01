@@ -79,7 +79,14 @@ impl Kakehashi {
         &self,
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
-        self.diagnostic_impl_with_error_sink(params, None).await
+        // Count every answered LSP pull and its handler latency (#533). Measured
+        // here (the LSP entry) rather than the shared inner so the one-shot CLI
+        // `diagnose` path, which calls `_with_error_sink` directly, is excluded.
+        let start = std::time::Instant::now();
+        let result = self.diagnostic_impl_with_error_sink(params, None).await;
+        self.diagnostics
+            .record_pull(start.elapsed().as_micros() as u64);
+        result
     }
 
     /// Like [`Self::diagnostic_impl`], but records request-time downstream

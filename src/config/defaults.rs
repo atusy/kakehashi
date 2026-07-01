@@ -6,8 +6,8 @@
 use super::WILDCARD_KEY;
 use super::settings::{
     AggregationConfig, AggregationStrategy, BridgeLanguageConfig, BridgeServerConfig,
-    CaptureMapping, CaptureMappings, LanguageSettings, LayerAggregationConfig, LayerSource,
-    LayersConfig, QueryTypeMappings, RawWorkspaceSettings, RootMarker,
+    CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS, LanguageSettings, LayerAggregationConfig,
+    LayerSource, LayersConfig, QueryTypeMappings, RawWorkspaceSettings, RootMarker,
 };
 use std::collections::HashMap;
 
@@ -20,6 +20,7 @@ pub fn default_settings() -> RawWorkspaceSettings {
         languages: default_languages(),
         capture_mappings: default_capture_mappings(),
         auto_install: Some(true),
+        diagnostics_debounce_ms: Some(DEFAULT_DEBOUNCE_MS),
         language_servers: Some(default_language_servers()),
     }
 }
@@ -452,6 +453,19 @@ mod tests {
             settings.auto_install,
             Some(true),
             "autoInstall should be Some(true) by default"
+        );
+    }
+
+    #[test]
+    fn default_settings_mirrors_runtime_debounce_default() {
+        // Convention: the `config init` template must spell out the same value the
+        // runtime resolves when the key is unset, so deleting it never changes
+        // behavior (see config-init-template-convention).
+        let settings = default_settings();
+        assert_eq!(
+            settings.diagnostics_debounce_ms,
+            Some(DEFAULT_DEBOUNCE_MS),
+            "template diagnosticsDebounceMs must mirror the runtime default"
         );
     }
 

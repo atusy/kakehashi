@@ -48,6 +48,7 @@
 //! into a reopen-resurrection hide); the stale-overwrite is left self-healing.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::ls_types::Diagnostic;
@@ -387,6 +388,13 @@ pub(crate) struct DiagnosticAggregator {
     /// `served`) sends no redundant nudge. Drives [`Self::bump_current`],
     /// [`Self::mark_served`], [`Self::is_dirty`]; forgotten on `didClose`.
     coverage: Mutex<HashMap<Url, HostCoverage>>,
+    /// Always-on counters for the diagnostic path (#533): push-origin republishes
+    /// in, `workspace/diagnostic/refresh` requested vs actually sent (the gap is
+    /// what the #497 single-flight + coverage gate saves), and pulls answered with
+    /// coarse latency. Read on shutdown / in tests to quantify refresh amplification
+    /// on a real session before/after a change. Relaxed atomics — free on the hot
+    /// path, and the counts need no cross-counter ordering.
+    metrics: DiagnosticMetrics,
 }
 
 /// Workspace-wide single-flight state for `workspace/diagnostic/refresh` (#497).
@@ -413,9 +421,106 @@ struct HostCoverage {
     served: u64,
 }
 
+/// Always-on diagnostic-path counters (#533). The four counts trace the refresh
+/// amplification chain — push-origin republishes in → refreshes requested vs sent →
+/// pulls answered — so one [`Self::snapshot`] reveals where volume is created or
+/// saved. Plain relaxed `AtomicU64`s: incrementing on the hot path is negligible and
+/// the counters carry no cross-counter invariant.
+#[derive(Default)]
+struct DiagnosticMetrics {
+    /// Push/eviction-origin republishes that changed the editor-visible set (the
+    /// ingress that can drive a refresh). Counted in [`DiagnosticAggregator::bump_current`].
+    push_republishes: AtomicU64,
+    /// `workspace/diagnostic/refresh` asks that passed the client capability gate
+    /// (entry to `request_pull_diagnostic_refresh`), *before* the single-flight /
+    /// coverage gate decides whether to actually send.
+    refreshes_requested: AtomicU64,
+    /// `workspace/diagnostic/refresh` requests actually written to the wire (post
+    /// single-flight + coverage gate, including trailing fires). `requested - sent`
+    /// is what the #497 gate saves.
+    refreshes_sent: AtomicU64,
+    /// `textDocument/diagnostic` pulls answered (every return of the LSP handler).
+    pulls_answered: AtomicU64,
+    /// Total wall time spent in the pull handler, microseconds.
+    /// `pull_micros_total / pulls_answered` = mean pull latency.
+    pull_micros_total: AtomicU64,
+}
+
+/// A point-in-time copy of [`DiagnosticMetrics`] for logging and assertions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DiagnosticMetricsSnapshot {
+    pub(crate) push_republishes: u64,
+    pub(crate) refreshes_requested: u64,
+    pub(crate) refreshes_sent: u64,
+    pub(crate) pulls_answered: u64,
+    pub(crate) pull_micros_total: u64,
+}
+
+impl DiagnosticMetrics {
+    fn record_push_republish(&self) {
+        self.push_republishes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refresh_requested(&self) {
+        self.refreshes_requested.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refresh_sent(&self) {
+        self.refreshes_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_pull(&self, micros: u64) {
+        self.pulls_answered.fetch_add(1, Ordering::Relaxed);
+        self.pull_micros_total.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Snapshot all counters. Not atomic across counters (a concurrent update may
+    /// land between reads), which is fine for monitoring — the chain ratios are
+    /// still representative.
+    fn snapshot(&self) -> DiagnosticMetricsSnapshot {
+        DiagnosticMetricsSnapshot {
+            push_republishes: self.push_republishes.load(Ordering::Relaxed),
+            refreshes_requested: self.refreshes_requested.load(Ordering::Relaxed),
+            refreshes_sent: self.refreshes_sent.load(Ordering::Relaxed),
+            pulls_answered: self.pulls_answered.load(Ordering::Relaxed),
+            pull_micros_total: self.pull_micros_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl DiagnosticMetricsSnapshot {
+    /// Mean pull-handler latency in microseconds (`0` when no pulls answered).
+    pub(crate) fn mean_pull_micros(&self) -> u64 {
+        self.pull_micros_total
+            .checked_div(self.pulls_answered)
+            .unwrap_or(0)
+    }
+}
+
 impl DiagnosticAggregator {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that a `workspace/diagnostic/refresh` was requested (passed the client
+    /// capability gate, before the single-flight/coverage gate). See [`DiagnosticMetrics`].
+    pub(crate) fn record_refresh_requested(&self) {
+        self.metrics.record_refresh_requested();
+    }
+
+    /// Record that a `workspace/diagnostic/refresh` was actually written to the wire.
+    pub(crate) fn record_refresh_sent(&self) {
+        self.metrics.record_refresh_sent();
+    }
+
+    /// Record an answered `textDocument/diagnostic` pull and its handler latency.
+    pub(crate) fn record_pull(&self, micros: u64) {
+        self.metrics.record_pull(micros);
+    }
+
+    /// Snapshot the diagnostic-path counters (#533) for logging or assertions.
+    pub(crate) fn metrics_snapshot(&self) -> DiagnosticMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Acquire the republish lock for `host`; held by the publisher across
@@ -666,6 +771,7 @@ impl DiagnosticAggregator {
     /// refresh storm — keep this property (and the push-origin-only rule) when adding
     /// bump sites.
     pub(crate) fn bump_current(&self, host: &Url) {
+        self.metrics.record_push_republish();
         let mut coverage = self
             .coverage
             .lock()
@@ -1924,5 +2030,47 @@ mod tests {
             "a closed host no longer keeps the workspace dirty"
         );
         assert_eq!(agg.current_version(&h), 0, "re-open starts fresh");
+    }
+
+    #[test]
+    fn metrics_start_at_zero() {
+        let agg = DiagnosticAggregator::new();
+        assert_eq!(agg.metrics_snapshot(), DiagnosticMetricsSnapshot::default());
+    }
+
+    #[test]
+    fn bump_current_counts_a_push_republish() {
+        let agg = DiagnosticAggregator::new();
+        agg.bump_current(&host());
+        agg.bump_current(&host());
+        assert_eq!(agg.metrics_snapshot().push_republishes, 2);
+    }
+
+    #[test]
+    fn refresh_and_pull_counters_track_each_record() {
+        let agg = DiagnosticAggregator::new();
+        agg.record_refresh_requested();
+        agg.record_refresh_requested();
+        agg.record_refresh_requested();
+        agg.record_refresh_sent(); // gate let one through; two coalesced away
+        agg.record_pull(100);
+        agg.record_pull(300);
+
+        let m = agg.metrics_snapshot();
+        assert_eq!(m.refreshes_requested, 3);
+        assert_eq!(m.refreshes_sent, 1);
+        assert_eq!(
+            m.refreshes_requested.saturating_sub(m.refreshes_sent),
+            2,
+            "requested - sent is what the gate saved"
+        );
+        assert_eq!(m.pulls_answered, 2);
+        assert_eq!(m.pull_micros_total, 400);
+        assert_eq!(m.mean_pull_micros(), 200);
+    }
+
+    #[test]
+    fn mean_pull_micros_is_zero_without_pulls() {
+        assert_eq!(DiagnosticMetricsSnapshot::default().mean_pull_micros(), 0);
     }
 }

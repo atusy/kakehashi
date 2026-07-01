@@ -9,6 +9,7 @@
 //! in-flight publishes via `SyntheticDiagnosticsManager`'s `AbortHandle`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -23,11 +24,14 @@ use super::lsp_impl::text_document::publish_diagnostic::{
 };
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
-/// Default debounce duration for `didChange` events (500ms).
+/// Default debounce duration for `didChange` events.
 ///
 /// This value balances responsiveness with avoiding excessive diagnostic
-/// requests during rapid typing. It matches common IDE debounce patterns.
-pub(crate) const DEFAULT_DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
+/// requests during rapid typing. It matches common IDE debounce patterns and is
+/// the fallback when `diagnostics_debounce_ms` is unset — shares the single source
+/// of truth with the config default ([`crate::config::settings::DEFAULT_DEBOUNCE_MS`]).
+pub(crate) const DEFAULT_DEBOUNCE_DURATION: Duration =
+    Duration::from_millis(crate::config::settings::DEFAULT_DEBOUNCE_MS);
 
 /// Logging target for debounced diagnostics.
 const LOG_TARGET: &str = "kakehashi::debounced_diag";
@@ -67,8 +71,11 @@ pub(crate) struct DebouncedDiagnosticsManager {
     /// The AbortHandle allows cancelling the timer when a new change arrives.
     active_timers: DashMap<Url, AbortHandle>,
 
-    /// Duration to wait after the last change before triggering diagnostics.
-    debounce_duration: Duration,
+    /// Milliseconds to wait after the last change before triggering diagnostics.
+    /// Atomic so a `diagnostics_debounce_ms` config change applies to subsequent
+    /// schedules without rebuilding the manager (it lives behind an `Arc`). Read at
+    /// schedule time; in-flight timers keep the value they were spawned with.
+    debounce_millis: AtomicU64,
 }
 
 impl Default for DebouncedDiagnosticsManager {
@@ -87,8 +94,20 @@ impl DebouncedDiagnosticsManager {
     pub(crate) fn with_duration(debounce_duration: Duration) -> Self {
         Self {
             active_timers: DashMap::new(),
-            debounce_duration,
+            debounce_millis: AtomicU64::new(debounce_duration.as_millis() as u64),
         }
+    }
+
+    /// Update the debounce delay (milliseconds) from the resolved
+    /// `diagnostics_debounce_ms` setting. Applies to subsequent schedules.
+    pub(crate) fn set_debounce_millis(&self, millis: u64) {
+        self.debounce_millis.store(millis, Ordering::Relaxed);
+    }
+
+    /// The debounce delay (milliseconds) the next schedule will use.
+    #[cfg(test)]
+    pub(crate) fn debounce_millis(&self) -> u64 {
+        self.debounce_millis.load(Ordering::Relaxed)
     }
 
     /// Schedule a debounced diagnostic for a document.
@@ -134,7 +153,7 @@ impl DebouncedDiagnosticsManager {
             documents,
         };
 
-        let duration = self.debounce_duration;
+        let duration = Duration::from_millis(self.debounce_millis.load(Ordering::Relaxed));
 
         // Spawn the debounce timer task
         let task = tokio::spawn(async move {
@@ -297,6 +316,24 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debounce_millis_defaults_and_reflects_config_updates() {
+        let manager = DebouncedDiagnosticsManager::new();
+        assert_eq!(
+            manager.debounce_millis(),
+            crate::config::settings::DEFAULT_DEBOUNCE_MS,
+            "a fresh manager uses the runtime default"
+        );
+
+        // A config reload pushes a new value via set_debounce_millis; the next
+        // schedule reads it (production wiring in `schedule_debounced_diagnostic`).
+        manager.set_debounce_millis(120);
+        assert_eq!(manager.debounce_millis(), 120);
+
+        manager.set_debounce_millis(0);
+        assert_eq!(manager.debounce_millis(), 0, "explicit zero is honored");
+    }
 
     #[tokio::test]
     async fn test_initial_state_and_cancel_noop() {
