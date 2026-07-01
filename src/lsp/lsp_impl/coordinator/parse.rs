@@ -136,6 +136,33 @@ impl ParseCoordinator {
         }
     }
 
+    /// Run `CacheCoordinator::populate_injections` as a compute-pool work-unit
+    /// and await it.
+    ///
+    /// The injection walk (injection-query execution + per-region ULID mint +
+    /// content hash) is O(regions) synchronous tree-CPU — hundreds of ms on an
+    /// injection-heavy document — and previously ran inline on a tokio worker
+    /// right after the parse, starving the runtime (parse-snapshot ADR, Context).
+    /// It is **awaited**, not detached, preserving the `populate → mark finished
+    /// → downstream` ordering the injection-map invalidation depends on (Stage-1
+    /// obligation). All parameters are cheap clones (refcount bumps).
+    async fn populate_injections_on_pool(
+        &self,
+        uri: Url,
+        text: std::sync::Arc<str>,
+        tree: tree_sitter::Tree,
+        language_name: String,
+    ) {
+        let cache = std::sync::Arc::clone(&self.cache);
+        let language = std::sync::Arc::clone(&self.language);
+        let tracker = self.bridge.node_tracker_arc();
+        self.compute_pool
+            .run(None, move || {
+                cache.populate_injections(&uri, &text, &tree, &language_name, &language, &tracker);
+            })
+            .await;
+    }
+
     /// Parse the (already-registered) document at `uri` and publish the result.
     ///
     /// The registering `didOpen` inserts the document — **with its text** — before
@@ -289,14 +316,13 @@ impl ParseCoordinator {
                         Some(tree.clone()),
                     );
                 if stored {
-                    self.cache.populate_injections(
-                        &uri,
-                        &text,
-                        &tree,
-                        &language_name,
-                        &self.language,
-                        self.bridge.node_tracker(),
-                    );
+                    self.populate_injections_on_pool(
+                        uri.clone(),
+                        text.clone(),
+                        tree.clone(),
+                        language_name.clone(),
+                    )
+                    .await;
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, true);
                 }
@@ -479,14 +505,13 @@ impl ParseCoordinator {
                 tree.clone(),
             );
             if stored {
-                self.cache.populate_injections(
-                    &uri,
-                    &text,
-                    &tree,
-                    &language_name,
-                    &self.language,
-                    self.bridge.node_tracker(),
-                );
+                self.populate_injections_on_pool(
+                    uri.clone(),
+                    text.clone(),
+                    tree.clone(),
+                    language_name.clone(),
+                )
+                .await;
                 break;
             }
             // CAS rejected: the text moved under us (a concurrent `didChange`).
@@ -608,14 +633,13 @@ impl ParseCoordinator {
                 tree.clone(),
             );
             if stored {
-                self.cache.populate_injections(
-                    uri,
-                    &text,
-                    &tree,
-                    &language_name,
-                    &self.language,
-                    self.bridge.node_tracker(),
-                );
+                self.populate_injections_on_pool(
+                    uri.clone(),
+                    text.clone(),
+                    tree.clone(),
+                    language_name.clone(),
+                )
+                .await;
             }
         }
 
