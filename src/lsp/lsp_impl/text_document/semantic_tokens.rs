@@ -822,6 +822,12 @@ impl Kakehashi {
 
         let domain_range = range;
 
+        // Snapshot the settings generation at the top, before any await (#535): a
+        // reload that bumps the generation after this leaves this request's stored
+        // key on the old generation — invisible to post-reload requests (which
+        // compute the new-generation key) — so a stale entry can never be served.
+        let generation = self.cache.semantic_token_generation();
+
         let Some(language_name) = self.document_language(&uri) else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -857,6 +863,19 @@ impl Kakehashi {
             })));
         };
 
+        // Short-circuit an identical-viewport re-request of an unchanged document
+        // (#535). `cache_key` folds the document text with the settings generation,
+        // and the entry also pins the viewport `range`, so a hit means re-tokenizing
+        // would reproduce these exact tokens. Misses (scroll, edit, or reload) fall
+        // through to the recompute below, which restores the entry.
+        let cache_key = self.cache.cache_key_for(text, generation);
+        if let Some(tokens) =
+            self.cache
+                .get_current_range_tokens(&uri, &domain_range, &language_name, cache_key)
+        {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(tokens)));
+        }
+
         // Get capture mappings for token type resolution
         let capture_mappings = self.language.capture_mappings();
 
@@ -876,21 +895,34 @@ impl Kakehashi {
         )
         .await;
 
-        // Convert to RangeResult, treating partial responses as empty for now
-        let domain_range_result = match result.unwrap_or_else(|| {
-            tower_lsp_server::ls_types::SemanticTokensResult::Tokens(
+        // Convert to RangeResult. Cache ONLY a clean `Tokens` result (#535); a
+        // `Partial` is passed through to the client as-is but NOT cached (it is a
+        // degraded response), and a `None` becomes an empty `Tokens` and is not
+        // cached either (transient miss/cancel) — caching either could serve a
+        // degraded set on a later identical-viewport re-request.
+        let domain_range_result = match result {
+            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens)) => {
+                // `uri` and `language_name` are unused after this arm, so move them
+                // (no clone); `tokens` is cloned because the store and the response
+                // below each need an owned copy.
+                self.cache.store_range_tokens(
+                    uri,
+                    domain_range,
+                    language_name,
+                    tokens.clone(),
+                    cache_key,
+                );
+                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(tokens)
+            }
+            Some(tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial)) => {
+                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial)
+            }
+            None => tower_lsp_server::ls_types::SemanticTokensRangeResult::Tokens(
                 tower_lsp_server::ls_types::SemanticTokens {
                     result_id: None,
                     data: Vec::new(),
                 },
-            )
-        }) {
-            tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens) => {
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(tokens)
-            }
-            tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial) => {
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial)
-            }
+            ),
         };
 
         Ok(Some(domain_range_result))

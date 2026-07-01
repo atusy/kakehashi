@@ -12,7 +12,7 @@ use crate::analysis::semantic::RawToken;
 use crate::language::injection::CacheableInjectionRegion;
 use dashmap::DashMap;
 use rust_lapper::{Interval, Lapper};
-use tower_lsp_server::ls_types::SemanticTokens;
+use tower_lsp_server::ls_types::{Range, SemanticTokens};
 use url::Url;
 
 /// Cached semantic tokens for delta calculations.
@@ -101,6 +101,105 @@ impl SemanticTokenCache {
 }
 
 impl Default for SemanticTokenCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Cached tokens for a `textDocument/semanticTokens/range` request (#535).
+///
+/// Unlike full/delta, the range path has no short-circuit and re-tokenizes the
+/// visible window on every request. Range is local kakehashi tree-sitter compute
+/// (no downstream fan-out), so the result is a pure function of the document text,
+/// the requested `range`, and the settings generation — keying by all three is
+/// safe. The hit is narrow (only an *identical-viewport* re-request of an unchanged
+/// document under unchanged settings), so a single most-recent entry per URI is
+/// kept rather than a per-range map.
+#[derive(Clone)]
+pub struct CachedRangeTokens {
+    pub tokens: SemanticTokens,
+    /// The viewport these tokens were computed for. A scroll changes the range, so
+    /// a differing range is a miss even when text/settings are unchanged.
+    pub range: Range,
+    /// The resolved language these tokens were computed for. The `cache_key` folds
+    /// only text + settings generation, so it cannot distinguish the same URI+text
+    /// re-opened under a DIFFERENT language (a `didClose`/`didOpen` language switch,
+    /// which neither edits the text nor bumps the generation). Pinning the language
+    /// makes such a request miss and recompute instead of serving wrong-language
+    /// tokens. (A *same*-language re-open yields identical tokens, so it correctly
+    /// still hits.)
+    pub language: String,
+    /// The `cache_key` (FNV-1a of text folded with the settings generation, built
+    /// by `CacheCoordinator::cache_key_for`) the tokens were computed under.
+    pub cache_key: u64,
+}
+
+/// Thread-safe most-recent `semanticTokens/range` result cache, one entry per URI.
+pub struct SemanticTokenRangeCache {
+    cache: DashMap<Url, CachedRangeTokens>,
+}
+
+impl SemanticTokenRangeCache {
+    pub fn new() -> Self {
+        Self {
+            cache: DashMap::new(),
+        }
+    }
+
+    /// Store the most-recent range tokens for a document, tagged with the viewport
+    /// `range`, resolved `language`, and the `cache_key` they were computed under.
+    pub fn store(
+        &self,
+        uri: Url,
+        range: Range,
+        language: String,
+        tokens: SemanticTokens,
+        cache_key: u64,
+    ) {
+        self.cache.insert(
+            uri,
+            CachedRangeTokens {
+                tokens,
+                range,
+                language,
+                cache_key,
+            },
+        );
+    }
+
+    /// Return the cached tokens iff the most-recent entry matches the requested
+    /// viewport `range`, the resolved `language`, AND the `cache_key` (text +
+    /// settings generation unchanged). None on a scroll, a language switch, a text
+    /// edit, a settings reload, or no entry.
+    pub fn get_if_current(
+        &self,
+        uri: &Url,
+        range: &Range,
+        language: &str,
+        cache_key: u64,
+    ) -> Option<SemanticTokens> {
+        self.cache.get(uri).and_then(|entry| {
+            if entry.cache_key == cache_key && entry.range == *range && entry.language == language {
+                Some(entry.tokens.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Drop every cached entry (on a settings/query reload, alongside the
+    /// generation bump that makes the invalidation race-safe).
+    pub fn clear(&self) {
+        self.cache.clear();
+    }
+
+    /// Remove the cached entry for a document (on `didClose`).
+    pub fn remove(&self, uri: &Url) {
+        self.cache.remove(uri);
+    }
+}
+
+impl Default for SemanticTokenRangeCache {
     fn default() -> Self {
         Self::new()
     }
