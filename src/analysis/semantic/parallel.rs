@@ -19,6 +19,7 @@ use super::injection::{InjectionContext, RegionCacheInfo};
 use super::token_collector::{ActiveInjectionBounds, RawToken, collect_host_tokens};
 use crate::analysis::InjectionTokenCache;
 use crate::config::CaptureMappings;
+use crate::document::{DiscoveredRegion, DiscoveredRegionCache};
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{
@@ -468,160 +469,37 @@ fn collect_injection_contexts_sync<'a>(
     let cache_for_singles = cache_ctx.filter(|_| singles.len() >= INJECTION_CACHE_MIN_REGIONS);
 
     for injection in singles {
-        let start = injection.content_node.start_byte();
-        let end = injection.content_node.end_byte();
-
-        // Validate bounds
-        if start > end || end > text.len() {
-            continue;
-        }
-
-        // Extract injection content for language detection
-        let injection_content = &text[start..end];
-
-        // Resolve injection language. A failure here means no parser could be
-        // loaded for it yet — a transient gap, so discovery is incomplete.
-        let Some((resolved_lang, _)) =
-            coordinator.resolve_injection_language(&injection.language, injection_content)
-        else {
-            discovery_complete = false;
-            continue;
-        };
-
-        // Get highlight query for resolved language. Missing query is likewise
-        // transient (loads with the language), so taint discovery.
-        let Some(highlight_query) = coordinator.highlight_query(&resolved_lang) else {
-            discovery_complete = false;
-            continue;
-        };
-
-        // Offset directive resolved at collection time (single source of truth
-        // with the bridge path, which applies it in from_region_info)
-        let offset = injection.offset;
-
-        // Calculate effective content range
-        let content_node = injection.content_node;
-        let (inj_start_byte, inj_end_byte) = if let Some(off) = offset {
-            use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
-            let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-            // calculate_effective_range clamps, snaps inward to char
-            // boundaries, and normalizes start <= end, so the content slice
-            // below cannot panic.
-            let effective = calculate_effective_range(text, byte_range, off);
-            (effective.start, effective.end)
-        } else {
-            (content_node.start_byte(), content_node.end_byte())
-        };
-
-        // Validate effective range after offset adjustment
-        if inj_start_byte > inj_end_byte || inj_end_byte > text.len() {
-            continue;
-        }
-
-        // Compute included ranges for the injection parser (Problem 1: blockquote prefixes).
-        // When include_children is false and content_node has named children
-        // (e.g., block_continuation), we compute gap ranges so the injection parser
-        // only sees actual code content.
-        //
-        // With an offset directive, content_text starts at inj_start_byte
-        // (offset-adjusted) rather than content_node.start_byte(), so gaps are
-        // clipped to the effective window and relativized to it (#186). The
-        // non-offset path keeps the node-anchored variant, which reuses the
-        // node's cached Points instead of rescanning text.
-        let from_children = if offset.is_some() {
-            compute_included_ranges_clipped(
-                &injection.content_node,
-                injection.include_children,
-                text,
-                inj_start_byte..inj_end_byte,
-            )
-        } else {
-            compute_included_ranges(&injection.content_node, injection.include_children)
-        };
-        let from_parent = parent_included_ranges.and_then(|parent_ranges| {
-            sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
-        });
-        let included_ranges = match (from_children, from_parent) {
-            (Some(child_ranges), Some(parent_ranges)) => {
-                let intersected = intersect_included_ranges(&child_ranges, &parent_ranges);
-                if intersected.is_empty() {
-                    None
-                } else {
-                    Some(intersected)
+        // Split into a query-independent owned discovery step and a
+        // context-rebuild step (the load-bearing refactor for the discovery
+        // lever, #529): the same two steps let `populate_injections` produce and
+        // store owned discovery, and a later semantic request rebuild contexts
+        // from it without re-running the injection query. The steps run
+        // back-to-back here, so collect output is unchanged.
+        match discover_single_region(
+            &injection,
+            text,
+            coordinator,
+            parent_included_ranges,
+            cache_for_singles,
+        ) {
+            SingleDiscovery::Region(region) => {
+                match rebuild_context(
+                    &region,
+                    text,
+                    content_start_byte,
+                    coordinator,
+                    &mut exclusion_ranges,
+                ) {
+                    Some(ctx) => contexts.push(ctx),
+                    // Highlight query not loaded yet — transient, taint discovery.
+                    None => discovery_complete = false,
                 }
             }
-            (Some(ranges), None) | (None, Some(ranges)) => Some(ranges),
-            (None, None) => None,
-        };
-
-        // Record exclusion ranges for parent token suppression (Problem 2: host token leaking).
-        // When we have per-gap included ranges, push EACH gap as a separate exclusion entry
-        // so that compute_active_injection_regions() produces per-line ActiveInjectionBounds values.
-        // Otherwise, push the single full content range as before.
-        if let Some(ref ranges) = included_ranges {
-            // Gap ranges are relative to the effective window start: with an
-            // offset directive that is inj_start_byte; without one,
-            // inj_start_byte == content_node.start_byte().
-            for r in ranges {
-                let abs_start = inj_start_byte + r.start_byte;
-                let abs_end = inj_start_byte + r.end_byte;
-                exclusion_ranges.push((abs_start, abs_end));
-            }
-        } else {
-            exclusion_ranges.push((inj_start_byte, inj_end_byte));
+            // Parser/language not loaded yet — transient, taint discovery.
+            SingleDiscovery::Incomplete => discovery_complete = false,
+            // Permanently invalid bounds — nothing dropped.
+            SingleDiscovery::Skip => {}
         }
-
-        // Derive per-line byte prefix widths from included_ranges.
-        // Each range's start_point.column tells us how many bytes of prefix
-        // (e.g., "> ") precede the actual content on that line.
-        let prefix_byte_widths = match &included_ranges {
-            Some(ranges) => derive_prefix_byte_widths(ranges),
-            None => Vec::new(),
-        };
-
-        // Resolve this single region's cache identity (#529). region_id is minted
-        // from the RAW content node — byte-identical to populate_injections
-        // (cache.rs) — so invalidate_for_edits evicts the same entry. Eligibility
-        // is this request's translation predicate: column-0 start AND no per-row
-        // prefixes (singles are never injection.combined).
-        let region_cache = cache_for_singles.map(|(uri, tracker)| {
-            let region_id = tracker
-                .get_or_create(
-                    uri,
-                    injection.content_node.start_byte(),
-                    injection.content_node.end_byte(),
-                    injection.content_node.kind(),
-                )
-                .to_string();
-            let cacheable =
-                CacheableInjectionRegion::from_region_info(&injection, &region_id, text);
-            let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
-            // Fold the resolved language into the validity hash so a position-
-            // stable region_id with identical content but a different injected
-            // language gets a different key (barring a 64-bit collision) and won't
-            // serve a stale hit — defends the cross-language hazard from a
-            // superseded request's orphaned ULID; same fold style as the
-            // generation fold in cache_key.
-            let validity_hash =
-                cacheable.content_hash ^ fnv1a_hash(&resolved_lang).wrapping_mul(0x100000001b3);
-            RegionCacheInfo {
-                region_id,
-                validity_hash,
-                line_start: cacheable.line_range.start,
-                eligible,
-            }
-        });
-
-        contexts.push(InjectionContext {
-            resolved_lang,
-            highlight_query,
-            content_text: &text[inj_start_byte..inj_end_byte],
-            host_start_byte: content_start_byte + inj_start_byte,
-            included_ranges,
-            prefix_byte_widths,
-            combined: false,
-            region_cache,
-        });
     }
 
     for (_group_key, regions) in combined_groups {
@@ -643,6 +521,229 @@ fn collect_injection_contexts_sync<'a>(
     }
 
     (contexts, exclusion_ranges, discovery_complete)
+}
+
+/// Outcome of [`discover_single_region`] for one top-level single injection.
+enum SingleDiscovery {
+    /// The region resolved to a language and is described by owned, query-free
+    /// discovery data (the highlight query is resolved later, in
+    /// [`rebuild_context`]).
+    Region(DiscoveredRegion),
+    /// The injection language/parser isn't loaded yet — a *transient* gap the
+    /// caller taints into `discovery_complete` (never cache such a discovery).
+    Incomplete,
+    /// The region is permanently invalid (out-of-bounds byte range) — nothing is
+    /// dropped, so discovery stays complete.
+    Skip,
+}
+
+/// Build the owned, query-independent discovery for one single injection region:
+/// everything `collect_injection_contexts_sync` needs to later reconstruct an
+/// `InjectionContext` **except** the highlight query (resolved in
+/// [`rebuild_context`]) and the borrowed content slice (stored as a byte range).
+///
+/// Deliberately does *not* look up the highlight query, so the normal collect
+/// path resolves it exactly once (in `rebuild_context`) — no extra lookup versus
+/// the pre-refactor code. The reuse path (`populate_injections` → semantic
+/// request) runs this once off-ingress and reconstructs contexts from the result,
+/// skipping the injection query-match loop entirely.
+fn discover_single_region(
+    injection: &InjectionRegionInfo<'_>,
+    text: &str,
+    coordinator: &LanguageCoordinator,
+    parent_included_ranges: Option<&[tree_sitter::Range]>,
+    cache_for_singles: Option<(&Url, &NodeTracker)>,
+) -> SingleDiscovery {
+    let start = injection.content_node.start_byte();
+    let end = injection.content_node.end_byte();
+
+    // Validate bounds
+    if start > end || end > text.len() {
+        return SingleDiscovery::Skip;
+    }
+
+    // Extract injection content for language detection
+    let injection_content = &text[start..end];
+
+    // Resolve injection language. A failure here means no parser could be
+    // loaded for it yet — a transient gap, so discovery is incomplete.
+    let Some((resolved_lang, _)) =
+        coordinator.resolve_injection_language(&injection.language, injection_content)
+    else {
+        return SingleDiscovery::Incomplete;
+    };
+
+    // Offset directive resolved at collection time (single source of truth
+    // with the bridge path, which applies it in from_region_info)
+    let offset = injection.offset;
+
+    // Calculate effective content range
+    let content_node = injection.content_node;
+    let (inj_start_byte, inj_end_byte) = if let Some(off) = offset {
+        use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
+        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
+        // calculate_effective_range clamps, snaps inward to char
+        // boundaries, and normalizes start <= end, so the content slice
+        // below cannot panic.
+        let effective = calculate_effective_range(text, byte_range, off);
+        (effective.start, effective.end)
+    } else {
+        (content_node.start_byte(), content_node.end_byte())
+    };
+
+    // Validate effective range after offset adjustment
+    if inj_start_byte > inj_end_byte || inj_end_byte > text.len() {
+        return SingleDiscovery::Skip;
+    }
+
+    // Compute included ranges for the injection parser (Problem 1: blockquote prefixes).
+    // When include_children is false and content_node has named children
+    // (e.g., block_continuation), we compute gap ranges so the injection parser
+    // only sees actual code content.
+    //
+    // With an offset directive, content_text starts at inj_start_byte
+    // (offset-adjusted) rather than content_node.start_byte(), so gaps are
+    // clipped to the effective window and relativized to it (#186). The
+    // non-offset path keeps the node-anchored variant, which reuses the
+    // node's cached Points instead of rescanning text.
+    let from_children = if offset.is_some() {
+        compute_included_ranges_clipped(
+            &injection.content_node,
+            injection.include_children,
+            text,
+            inj_start_byte..inj_end_byte,
+        )
+    } else {
+        compute_included_ranges(&injection.content_node, injection.include_children)
+    };
+    let from_parent = parent_included_ranges.and_then(|parent_ranges| {
+        sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
+    });
+    let included_ranges = match (from_children, from_parent) {
+        (Some(child_ranges), Some(parent_ranges)) => {
+            let intersected = intersect_included_ranges(&child_ranges, &parent_ranges);
+            if intersected.is_empty() {
+                None
+            } else {
+                Some(intersected)
+            }
+        }
+        (Some(ranges), None) | (None, Some(ranges)) => Some(ranges),
+        (None, None) => None,
+    };
+
+    // Derive per-line byte prefix widths from included_ranges.
+    // Each range's start_point.column tells us how many bytes of prefix
+    // (e.g., "> ") precede the actual content on that line.
+    let prefix_byte_widths = match &included_ranges {
+        Some(ranges) => derive_prefix_byte_widths(ranges),
+        None => Vec::new(),
+    };
+
+    // Resolve this single region's cache identity (#529). region_id is minted
+    // from the RAW content node — byte-identical to populate_injections
+    // (cache.rs) — so invalidate_for_edits evicts the same entry. Eligibility
+    // is this request's translation predicate: column-0 start AND no per-row
+    // prefixes (singles are never injection.combined).
+    let token_cache = cache_for_singles.map(|(uri, tracker)| {
+        let region_id = tracker
+            .get_or_create(
+                uri,
+                injection.content_node.start_byte(),
+                injection.content_node.end_byte(),
+                injection.content_node.kind(),
+            )
+            .to_string();
+        let cacheable = CacheableInjectionRegion::from_region_info(injection, &region_id, text);
+        let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
+        // Fold the resolved language into the validity hash so a position-
+        // stable region_id with identical content but a different injected
+        // language gets a different key (barring a 64-bit collision) and won't
+        // serve a stale hit — defends the cross-language hazard from a
+        // superseded request's orphaned ULID; same fold style as the
+        // generation fold in cache_key.
+        let validity_hash =
+            cacheable.content_hash ^ fnv1a_hash(&resolved_lang).wrapping_mul(0x100000001b3);
+        DiscoveredRegionCache {
+            region_id,
+            validity_hash,
+            line_start: cacheable.line_range.start,
+            eligible,
+        }
+    });
+
+    SingleDiscovery::Region(DiscoveredRegion {
+        resolved_lang,
+        content_start_byte: inj_start_byte,
+        content_end_byte: inj_end_byte,
+        included_ranges,
+        prefix_byte_widths,
+        token_cache,
+    })
+}
+
+/// Reconstruct an [`InjectionContext`] from owned [`DiscoveredRegion`] data,
+/// pushing the region's parent-token exclusion ranges. Resolves the highlight
+/// query fresh (never persisted across a possible settings reload) and re-slices
+/// the content from the current `text`; `content_start_byte` is the host byte
+/// offset of the text the discovery ran over (0 at the top level).
+///
+/// Returns `None` when the highlight query isn't loaded yet (a transient gap the
+/// caller taints into `discovery_complete`, exactly as the pre-refactor
+/// query-missing branch did — and, for a reused discovery, the same query the
+/// settings `generation` gate would already have missed on a reload). No
+/// exclusion is recorded for a dropped region.
+fn rebuild_context<'a>(
+    region: &DiscoveredRegion,
+    text: &'a str,
+    content_start_byte: usize,
+    coordinator: &LanguageCoordinator,
+    exclusion_ranges: &mut Vec<(usize, usize)>,
+) -> Option<InjectionContext<'a>> {
+    let inj_start_byte = region.content_start_byte;
+    let inj_end_byte = region.content_end_byte;
+
+    // Guard the re-slice: on the collect path the bounds were just validated; on
+    // the reuse path they were validated against the tree this discovery is bound
+    // to, but a defensive check keeps a corrupt entry from panicking.
+    if inj_start_byte > inj_end_byte || inj_end_byte > text.len() {
+        return None;
+    }
+
+    // Highlight query for the resolved language. Missing = transient (loads with
+    // the language), so drop the region and let the caller taint discovery.
+    let highlight_query = coordinator.highlight_query(&region.resolved_lang)?;
+
+    // Record exclusion ranges for parent token suppression (Problem 2: host token
+    // leaking). Per-gap when included_ranges are present so
+    // compute_active_injection_regions() produces per-line bounds; otherwise the
+    // single full content range. Byte ranges are relative to the effective window
+    // start (inj_start_byte).
+    if let Some(ref ranges) = region.included_ranges {
+        for r in ranges {
+            exclusion_ranges.push((inj_start_byte + r.start_byte, inj_start_byte + r.end_byte));
+        }
+    } else {
+        exclusion_ranges.push((inj_start_byte, inj_end_byte));
+    }
+
+    let region_cache = region.token_cache.as_ref().map(|tc| RegionCacheInfo {
+        region_id: tc.region_id.clone(),
+        validity_hash: tc.validity_hash,
+        line_start: tc.line_start,
+        eligible: tc.eligible,
+    });
+
+    Some(InjectionContext {
+        resolved_lang: region.resolved_lang.clone(),
+        highlight_query,
+        content_text: &text[inj_start_byte..inj_end_byte],
+        host_start_byte: content_start_byte + inj_start_byte,
+        included_ranges: region.included_ranges.clone(),
+        prefix_byte_widths: region.prefix_byte_widths.clone(),
+        combined: false,
+        region_cache,
+    })
 }
 
 /// Per-line byte prefix widths from included ranges: each range's
