@@ -406,7 +406,9 @@ inside the existing safety contracts at each step:
 ### Positive
 
 - Document lifecycle is fully decoupled from parsing: `didChange` never awaits a
-  parse; readers never block on one.
+  parse, and a reader never blocks on a parse once a snapshot exists (the sole
+  exception is the brief, bounded first-parse wait after `didOpen`, when no
+  snapshot exists yet).
 - The async runtime is never blocked by tree-CPU: with all synchronous tree work
   on the bounded pool, a slow parse on one document cannot freeze the request loop,
   timers, diagnostics, or another document's async handlers — the specific defect
