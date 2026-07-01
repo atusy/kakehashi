@@ -706,13 +706,14 @@ impl ParseCoordinator {
             })
             .await;
 
+        let mut events = load_result.events;
         if let Some(tree) = parsed {
             // Snapshot publish first (the Stage-2 commit point, ADR §2). The
             // cell guard admits this even when the legacy CAS below rejects a
             // text that moved on — a stale-but-consistent snapshot is exactly
             // what serve-stale readers consume; the scheduler's dirty loop
             // reparses the newer text and supersedes it.
-            self.publish_parse_snapshot(
+            let published = self.publish_parse_snapshot(
                 uri,
                 crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
@@ -722,6 +723,19 @@ impl ParseCoordinator {
                     incarnation,
                 },
             );
+            // Serve-stale's heal signal (ADR §3): a fresh publish re-drives the
+            // client with workspace/semanticTokens/refresh so a request served
+            // one edit behind is re-requested against this snapshot. Emitted
+            // HERE — at the parse-loop publish point, after the notification
+            // returned — never from didChange, whose synchronous clients
+            // (vim-lsp) cannot answer a server request mid-notification. Gated
+            // on the publish landing: a rejected publish emits nothing. The
+            // notifier batches and capability-gates the actual request.
+            if published {
+                events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
+                    language_name.clone(),
+                ));
+            }
             // Text + language + incarnation CAS (non-inserting), all three checked
             // atomically under the tree-write shard lock. Text rejects a
             // within-lifetime stale parse (a `didChange` landed mid-parse);
@@ -748,9 +762,7 @@ impl ParseCoordinator {
         }
 
         advance_watermark();
-        self.notifier()
-            .log_language_events(&load_result.events)
-            .await;
+        self.notifier().log_language_events(&events).await;
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {

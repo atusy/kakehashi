@@ -21,7 +21,7 @@ use super::handle_semantic_tokens_full;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_range_parallel_async(
     pool: std::sync::Arc<crate::compute_pool::ComputePool>,
-    text: String,
+    text: std::sync::Arc<str>,
     tree: Tree,
     query: std::sync::Arc<Query>,
     range: Range,

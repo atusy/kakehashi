@@ -238,6 +238,7 @@ impl Document {
     /// which may or may not equal the stored text; bumping unconditionally
     /// keeps the version a safe upper bound — a spurious bump only marks a
     /// snapshot stale early, never serves a wrong one).
+    #[cfg(test)]
     pub(crate) fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
         self.text = Arc::from(new_text);
         self.content_version += 1;
@@ -316,6 +317,7 @@ impl Document {
     }
 
     /// Update text and clear layers/state
+    #[cfg(test)]
     pub(crate) fn update_text(&mut self, text: String) {
         self.text = Arc::from(text);
         // Note: Tree needs to be rebuilt after text change

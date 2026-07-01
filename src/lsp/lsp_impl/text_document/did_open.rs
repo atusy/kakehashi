@@ -1058,16 +1058,9 @@ print("hello")
             server.documents.get(&uri).unwrap().tree().is_some(),
             "the off-ingress reparse attaches a tree to the edited document"
         );
-        // The watermark reached the edit's ticket, so a reader gated behind it is
-        // released (wait_for_epoch returns immediately for target <= 3).
-        timeout(
-            Duration::from_millis(100),
-            server
-                .documents
-                .wait_for_epoch(&uri, 3, Duration::from_secs(5)),
-        )
-        .await
-        .expect("watermark must have advanced to the reparse ticket");
+        // The watermark advance itself is still exercised by the store's own
+        // watermark tests; the reader-side wait (`wait_for_epoch`) was removed
+        // with the snapshot conversion (parse-snapshot ADR Stage 2).
     }
 
     /// If a concurrent `didChange` already parsed the document (a tree is

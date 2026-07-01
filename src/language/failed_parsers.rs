@@ -121,12 +121,6 @@ impl FailedParserRegistry {
         self.save_failed_parsers()
     }
 
-    /// Clear a failed parser (e.g., after reinstallation).
-    pub fn clear_failed(&self, language: &str) -> io::Result<()> {
-        self.failed.remove(language);
-        self.save_failed_parsers()
-    }
-
     /// Record that parsing is starting for a language.
     ///
     /// This updates in-memory state only. Crash detection happens by checking
@@ -232,19 +226,6 @@ mod tests {
         assert!(registry.is_failed("lua"));
         assert!(!registry.is_failed("rust"));
         assert_eq!(registry.failed_parsers(), vec!["lua"]);
-    }
-
-    #[test]
-    fn test_clear_failed() {
-        let temp = tempdir().unwrap();
-        let registry = FailedParserRegistry::new(temp.path());
-        registry.init().unwrap();
-
-        registry.mark_failed("lua").unwrap();
-        assert!(registry.is_failed("lua"));
-
-        registry.clear_failed("lua").unwrap();
-        assert!(!registry.is_failed("lua"));
     }
 
     #[test]

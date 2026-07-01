@@ -64,7 +64,7 @@ use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::Semanti
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
     pool: std::sync::Arc<crate::compute_pool::ComputePool>,
-    text: String,
+    text: std::sync::Arc<str>,
     tree: Tree,
     query: std::sync::Arc<Query>,
     filetype: Option<String>,
@@ -615,7 +615,7 @@ local x = 42
         // Call the async handler
         let result = handle_semantic_tokens_full(
             crate::compute_pool::test_pool(),
-            text,
+            std::sync::Arc::from(text),
             tree,
             query,
             Some("markdown".to_string()),
@@ -685,7 +685,7 @@ local x = 42
         // Call the async handler with empty document
         let result = handle_semantic_tokens_full(
             crate::compute_pool::test_pool(),
-            text,
+            std::sync::Arc::from(text),
             tree,
             query,
             Some("markdown".to_string()),
@@ -759,7 +759,7 @@ local x = 42
         // Use the full pipeline — exclusion now happens in finalize_tokens
         let result = handle_semantic_tokens_full(
             crate::compute_pool::test_pool(),
-            text,
+            std::sync::Arc::from(text),
             tree,
             md_query,
             Some("markdown".to_string()),
@@ -874,7 +874,7 @@ local x = 42
 
         let result = handle_semantic_tokens_full(
             crate::compute_pool::test_pool(),
-            text,
+            std::sync::Arc::from(text),
             tree,
             md_query,
             Some("markdown".to_string()),
@@ -988,7 +988,7 @@ local x = 42
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
             crate::compute_pool::test_pool(),
-            text,
+            std::sync::Arc::from(text),
             tree,
             md_query,
             Some("markdown".to_string()),
@@ -1102,7 +1102,7 @@ local x = 42
         // KEY: supports_multiline = true
         let result = handle_semantic_tokens_full(
             crate::compute_pool::test_pool(),
-            text,
+            std::sync::Arc::from(text),
             tree,
             md_query,
             Some("markdown".to_string()),
@@ -1235,7 +1235,7 @@ foo
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
             crate::compute_pool::test_pool(),
-            text,
+            std::sync::Arc::from(text),
             tree,
             md_query,
             Some("markdown".to_string()),
@@ -1347,7 +1347,7 @@ foo
 
         let result = handle_semantic_tokens_full(
             crate::compute_pool::test_pool(),
-            text,
+            std::sync::Arc::from(text),
             tree,
             md_query,
             Some("markdown".to_string()),
