@@ -108,10 +108,12 @@ mapping is not one-to-one and must be stated precisely:
   not express.
 - `parsed_version` is the watermark ticket; `current_incarnation` is the
   per-lifetime guard.
-- `ParseState`'s other fields do **not** vanish: the settings **`generation`**
-  (token-cache invalidation) and the **`in_progress`** flag re-home onto
-  `ParseScheduler`'s per-document state (which already owns the parse lifecycle),
-  not onto the read-side slot. Deleting `parse_states` is contingent on that move.
+- `ParseState`'s three fields are each accounted for, none silently dropped:
+  `has_tree` is **replaced** by the two slot predicates above (not re-homed); the
+  settings **`generation`** (token-cache invalidation) and the **`in_progress`**
+  flag **re-home** onto `ParseScheduler`'s per-document state (which already owns the
+  parse lifecycle), not onto the read-side slot. Deleting `parse_states` is
+  contingent on those two moves.
 
 The store's tree/watermark CAS methods (four tree writes —
 `update_tree_if_text_unchanged`, `update_tree_if_text_and_language_unchanged`,
@@ -486,6 +488,11 @@ inside the existing safety contracts at each step:
   `didClose` removed. (It is *not* closed by Stage 1, which leaves the current
   inline-parse fallbacks — `try_parse_and_update_document`, `selection_range_impl` —
   in place; those are the vector, and they are removed in Stage 2.)
+- Latent language-detection staleness is closed as a side effect: today a delayed
+  open parse racing an early `didChange` can leave `Document::language_id` at the
+  path-based guess for the document's lifetime even though the reparse's tree was
+  detected correctly. `ParseSnapshot.language` carries the *parse's* detected
+  language, so readers see the right one without a re-`didOpen`.
 - State and coupling shrink: two `watch` maps collapse to one, six store CAS /
   watermark methods to one publish primitive, and the `pending_seed` invariant
   surface on `Document` is deleted (favorable on the State > Coupling > Complexity
