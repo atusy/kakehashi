@@ -1374,8 +1374,11 @@ mod tests {
             )
             .expect("tree stored");
 
-        // Close + reopen: a fresh lifetime restarts parse_epoch from 0, so the same
-        // epoch value is reachable, but the incarnation differs.
+        // Close + reopen, then install a tree in the fresh lifetime so it reaches
+        // the SAME parse_epoch value the prior lifetime captured (epoch restarts at
+        // 0 per lifetime) AND has a tree present. This isolates the incarnation
+        // guard: with epoch and tree-present both matching, only the differing
+        // incarnation can reject the stale write-back.
         store.remove(&uri);
         store.insert(
             uri.clone(),
@@ -1383,8 +1386,25 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
-        let new_incarnation = store.get(&uri).unwrap().incarnation();
+        let (new_incarnation, new_text) = {
+            let d = store.get(&uri).unwrap();
+            (d.incarnation(), d.text_arc())
+        };
         assert_ne!(stale_incarnation, new_incarnation);
+        let new_epoch = store
+            .set_parse_result_if_text_and_incarnation_unchanged(
+                &uri,
+                &new_text,
+                new_incarnation,
+                Some("rust"),
+                Some(parse_rust("fn main() {}")),
+            )
+            .expect("tree stored in the reopened lifetime");
+        assert_eq!(
+            new_epoch, epoch,
+            "the reopened lifetime reaches the same epoch value, so only the \
+             incarnation distinguishes the prior-lifetime write-back"
+        );
 
         let disc = crate::document::DiscoveredInjections {
             generation: 1,
@@ -1392,7 +1412,8 @@ mod tests {
         };
         assert!(
             !store.set_injections_if_epoch_unchanged(&uri, stale_incarnation, epoch, disc),
-            "a prior-lifetime write-back must not attach across a reopen even if the epoch matches"
+            "the incarnation guard alone must reject a prior-lifetime write-back even when \
+             the epoch matches and a tree is present"
         );
     }
 

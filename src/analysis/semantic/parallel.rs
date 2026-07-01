@@ -2580,7 +2580,11 @@ local b = 2
         let cache = InjectionTokenCache::new();
         let tracker = NodeTracker::new();
 
-        // Baseline: inline discovery (no owned discovery threaded in).
+        // Baseline: inline discovery (no owned discovery threaded in). Reset the
+        // reuse counter FIRST and assert the inline call leaves it at 0, so an
+        // "always-increment" bug (firing the reuse counter even without reuse)
+        // can't slip past the `>= 1` assertion on the reuse call below.
+        DISCOVERY_REUSE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
         let inline = collect_injection_tokens_parallel(
             &text,
             &lines,
@@ -2593,6 +2597,11 @@ local b = 2
             None,
         )
         .0;
+        assert_eq!(
+            DISCOVERY_REUSE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "inline discovery (no discovery threaded in) must not touch the reuse counter"
+        );
 
         // Build the owned discovery exactly as populate_injections does, on the
         // same tree.
@@ -2625,7 +2634,8 @@ local b = 2
             generation: 0,
             discovery: Some(&discovery),
         };
-        DISCOVERY_REUSE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        // Counter still 0 here (top reset; inline asserted 0; build_document_discovery
+        // doesn't tokenize), so this reuse call is the only thing that can bump it.
         let reused = collect_injection_tokens_parallel(
             &text,
             &lines,
@@ -2644,9 +2654,10 @@ local b = 2
         );
         // Prove the reuse branch actually fired (skipped Q) rather than silently
         // falling back inline — the safety net the latency bench can't provide.
-        assert!(
-            DISCOVERY_REUSE_HITS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
-            "reuse branch must fire when a generation-current discovery is present"
+        assert_eq!(
+            DISCOVERY_REUSE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly one reuse-branch entry: the single generation-current reuse call"
         );
 
         // Second reuse pass composes the two #529 halves: the first pass stored
