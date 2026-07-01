@@ -942,6 +942,19 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Store region-local tokens for newly computed eligible, fully-loaded regions
     // (#529, write half), single-threaded after fan-in so cache writes never run
     // inside a Rayon worker.
+    //
+    // This store deliberately does NOT re-check `is_cancelled(cancel)`. A region
+    // reaches here with `fully_loaded: true` only if its `process_injection_sync`
+    // actually completed (the `process_one` entry check already zeroed out
+    // regions skipped by a cancel). A completed region's tokens are correct for
+    // its content and keyed by `validity_hash` (content + language) and
+    // `generation`, so caching them is valid even when this request was
+    // superseded mid-pass: a later request hits only when content+generation
+    // still match, i.e. only when the tokens are still right. Adding a cancel
+    // recheck here would instead drop these valid entries on every keystroke,
+    // forcing the next request to recompute them — a regression against the very
+    // reuse the cache exists for. (A closed document's residual entry is handled
+    // by the cancel-first ordering in `CacheCoordinator::remove_document`.)
     if let Some(cc) = cache_ctx {
         for (i, res) in &processed {
             if let Some(rc) = &contexts[*i].region_cache
@@ -2380,14 +2393,17 @@ local b = 2
     }
 
     /// End-to-end: a cancelled injection pass must produce no tokens AND persist
-    /// nothing to the region cache — a partial store would later serve an
-    /// incomplete region as a stale-empty hit. A pre-cancelled token here bails
-    /// at the post-discovery guard (before the fan-out), so this pins the
-    /// outer-guard path; the in-fan-out `fully_loaded:false` skip for a mid-pass
-    /// supersede rides on the pre-existing #529 store gate (`res.fully_loaded`),
-    /// which the reuse tests exercise for the stored case. Contrast the
-    /// uncancelled run in `injection_cache_reuse_matches_uncached_output`, which
-    /// stores all eight regions.
+    /// nothing to the region cache. A pre-cancelled token bails at the
+    /// post-discovery guard (before the fan-out), so this pins the outer-guard
+    /// path. The fan-out's own cancel skip is narrower: `process_one`'s entry
+    /// check zeroes only regions whose tokenization had NOT started when the
+    /// token flipped (returning `fully_loaded: false`, which the #529 store gate
+    /// then drops). A region already inside `process_injection_sync` has no inner
+    /// poll — it completes and IS stored, which is correct: its tokens are
+    /// content-keyed (`validity_hash` + `generation`) and so valid for any later
+    /// matching request (see the store-half comment). Contrast the uncancelled
+    /// run in `injection_cache_reuse_matches_uncached_output`, which stores all
+    /// eight regions.
     #[test]
     fn cancelled_token_stores_no_injection_regions() {
         let Some(coordinator) = markdown_lua_coordinator() else {
