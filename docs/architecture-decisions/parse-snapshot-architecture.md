@@ -70,10 +70,15 @@ gates:
   `didClose`). Removing it reopens the stale-base race that pre-clamping panicked
   on in `replace_range`; "mutates inputs and returns" must not be read as
   dropping it.
-- Content-based **language detection** stays an input concern: `didOpen`/the
-  language-detect path writes `language_id` on the `Document`. Derivation reads
-  it and copies it into the snapshot; derivation never writes back to the input
-  (that would be the layering violation the model exists to avoid).
+- **Language detection is split by layer.** The input `language_id` is the
+  client-declared / path-based value `didOpen` records and never changes within a
+  lifetime (a genuine relabel is a reopen → new incarnation, which is why the CAS
+  in §2 folds language into incarnation). The *parse* additionally re-runs
+  content-based detection (its `detect_language(path, text, language_id)`) and
+  records the result as the snapshot's own **derived** `language` — which may refine
+  the input guess. Derivation never writes that refinement **back** to the input
+  (the layering violation the model avoids); the snapshot simply carries the
+  more-accurate detected language, and readers use the snapshot's.
 
 ### 2. Parsing publishes a versioned `ParseSnapshot`
 
