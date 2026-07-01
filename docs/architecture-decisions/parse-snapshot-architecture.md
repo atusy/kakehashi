@@ -323,11 +323,12 @@ Any reader that must resolve against **live** positions is position-critical
     *implicit/background* requests (hover, signatureHelp, documentHighlight, inlayHint,
     …) reject immediately and get their answer on the client's next natural request.
     *Explicit, user-initiated, infrequent* actions (`formatting`, `rangeFormatting`,
-    `rename`/`prepareRename`) take a **brief bounded wait** (the reader's only
-    permitted wait besides first-parse) for the in-flight parse to land before
-    falling back to `ContentModified` — because a silent no-op on an action the user
-    consciously triggered is jarring, and the wait is affordable exactly because
-    these are not per-keystroke.
+    `rename`/`prepareRename`, and `selectionRange` — keyboard-triggered
+    expand/shrink) take a **brief bounded wait** (the reader's only permitted wait
+    besides first-parse) for the in-flight parse to land before falling back to
+    `ContentModified` — because a silent no-op on an action the user consciously
+    triggered is jarring, and the wait is affordable exactly because these are not
+    per-keystroke.
   - `kakehashi/captures` returns **`null`**, which is precisely the re-sync signal
     captures-protocol already defines ("on null, call full again") — a JSON-RPC
     *error* would violate that contract, since a captures client is only contracted
@@ -402,12 +403,20 @@ inside the existing safety contracts at each step:
 - **Stage 1 — tree-CPU off the async workers onto the bounded pool.** Move
   `populate` (all call sites) and the captures / node layer walks off the tokio
   workers; introduce the bounded pool and route parse + populate + walks + fan-out
-  through it; convert `parser_pool` to a sync mutex. Delivers *the async runtime is
-  never blocked by tree-CPU* (killing the cross-document freeze) and most of
-  *high-performance parsing*; fair admission on the compute pool is a later stage.
-  The read path and the
-  clear-tree-on-edit contract are untouched, so the stale-tree guarantee is not at
-  risk; the sole new obligation is that `populate` is **awaited** (not detached),
+  through it; convert `parser_pool` to a sync mutex. **All** `parse_with_pool` call
+  sites move onto the pool, including the reader on-demand parse fallbacks
+  (`try_parse_and_update_document`, `selection_range_impl`) — this is required, not
+  optional: converting `parser_pool` to a sync mutex while a reader still parses
+  *inline on a tokio worker* would let that worker synchronously block on the mutex
+  a Rayon thread holds, reintroducing exactly the block Stage 1 removes. Routing
+  those fallbacks through the pool means the sync mutex is only ever acquired on a
+  Rayon thread. The reader *contract* is otherwise unchanged (a fallback still
+  blocks its own request on the parse — Stage 2 is what makes reads non-blocking);
+  Stage 1 only relocates the CPU. Delivers *the async runtime is never blocked by
+  tree-CPU* (killing the cross-document freeze) and most of *high-performance
+  parsing*; fair admission on the compute pool is a later stage. The
+  clear-tree-on-edit contract is untouched, so the stale-tree guarantee is not at
+  risk; a further obligation is that `populate` is **awaited** (not detached),
   preserving the `populate → finish` ordering the injection-map invalidation
   depends on.
 - **Stage 2 — versioned snapshot reads.** Introduce `SnapshotSlot` + the `watch`
