@@ -1024,14 +1024,20 @@ mod tests {
         );
     }
 
-    /// End-to-end proof that discovery reuse actually *fires* on the server's
-    /// `semanticTokens` path — not merely that reuse == inline when the discovery
-    /// is forced in (the parallel.rs unit test). Replicates the parse
-    /// coordinator's attach sequence (parse → tree CAS → `populate_injections` →
-    /// epoch-guarded write-back), then drives the real handler and asserts the
-    /// reuse branch engaged. Guards against silently shipping the "reuse never
-    /// fires, `C` relocated for nothing" regression the latency benchmark cannot
-    /// distinguish from a win.
+    /// Verifies the server-side *read seam* of discovery reuse: after replicating
+    /// the parse coordinator's attach sequence (parse → tree CAS →
+    /// `populate_injections` → epoch-guarded write-back), the real settle-gated
+    /// reader `get_tree_with_wait` returns the attached discovery as a unit with the
+    /// tree, and its generation matches the current one. That combination is exactly
+    /// the reuse-branch gate (`discovery.filter(|d| d.generation == generation)`), so
+    /// a real request would take the reuse path and skip `Q`. It asserts the *read*
+    /// (attachment + generation match), not tokenization — the tokenization is proven
+    /// equivalent-to-inline, and its reuse counter asserted, by the standalone
+    /// `discovery_reuse_matches_inline_output` in parallel.rs (driving full
+    /// tokenization through the whole server here is prone to tree-sitter/libloading
+    /// crashes under the whole-suite parser load). Together they guard against
+    /// silently shipping the "reuse never fires, `C` relocated for nothing"
+    /// regression the latency benchmark cannot distinguish from a win.
     #[tokio::test]
     async fn semantic_tokens_full_reuses_attached_injection_discovery() {
         let (service, _socket) = LspService::new(Kakehashi::new);
