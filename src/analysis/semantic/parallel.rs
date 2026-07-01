@@ -498,13 +498,14 @@ fn collect_injection_contexts_sync<'a>(
             // Inline path: early-out a query-missing region (no wasted range work).
             true,
         ) {
-            SingleDiscovery::Region(region) => {
+            SingleDiscovery::Region(region, prebuilt_query) => {
                 match rebuild_context(
                     &region,
                     text,
                     content_start_byte,
                     coordinator,
                     &mut exclusion_ranges,
+                    prebuilt_query,
                 ) {
                     Some(ctx) => contexts.push(ctx),
                     // Highlight query not loaded yet — transient, taint discovery.
@@ -541,10 +542,12 @@ fn collect_injection_contexts_sync<'a>(
 
 /// Outcome of [`discover_single_region`] for one top-level single injection.
 enum SingleDiscovery {
-    /// The region resolved to a language and is described by owned, query-free
-    /// discovery data (the highlight query is resolved later, in
-    /// [`rebuild_context`]).
-    Region(DiscoveredRegion),
+    /// The region resolved to a language and owned discovery data. The
+    /// `Option<Arc<Query>>` is the already-resolved highlight query on the inline
+    /// path (so [`rebuild_context`] reuses it rather than looking it up a second
+    /// time), or `None` on the producer path (which stores no query and lets reuse
+    /// re-resolve it).
+    Region(DiscoveredRegion, Option<std::sync::Arc<tree_sitter::Query>>),
     /// The injection language/parser isn't loaded yet — a *transient* gap the
     /// caller taints into `discovery_complete` (never cache such a discovery).
     Incomplete,
@@ -597,15 +600,18 @@ fn discover_single_region(
 
     // Highlight-query early-out (inline path only): a resolvable language with no
     // loaded highlight query produces no tokens, so skip it before the range/id
-    // work — cheap `has_highlight_query` (no `Arc` clone). Matches the pre-refactor
-    // taint-and-continue ordering.
-    if require_highlight_query
-        && !coordinator
-            .query_store()
-            .has_highlight_query(&resolved_lang)
-    {
-        return SingleDiscovery::Incomplete;
-    }
+    // work, matching the pre-refactor taint-and-continue ordering. Resolve the
+    // `Arc<Query>` here (one lookup) and thread it to `rebuild_context`, which then
+    // doesn't look it up again. The producer passes `require_highlight_query = false`
+    // and stores no query (reuse re-resolves it, self-healing).
+    let prebuilt_query = if require_highlight_query {
+        match coordinator.highlight_query(&resolved_lang) {
+            Some(query) => Some(query),
+            None => return SingleDiscovery::Incomplete,
+        }
+    } else {
+        None
+    };
 
     // Offset directive resolved at collection time (single source of truth
     // with the bridge path, which applies it in from_region_info)
@@ -706,14 +712,17 @@ fn discover_single_region(
         }
     });
 
-    SingleDiscovery::Region(DiscoveredRegion {
-        resolved_lang,
-        content_start_byte: inj_start_byte,
-        content_end_byte: inj_end_byte,
-        included_ranges,
-        prefix_byte_widths,
-        token_cache,
-    })
+    SingleDiscovery::Region(
+        DiscoveredRegion {
+            resolved_lang,
+            content_start_byte: inj_start_byte,
+            content_end_byte: inj_end_byte,
+            included_ranges,
+            prefix_byte_widths,
+            token_cache,
+        },
+        prebuilt_query,
+    )
 }
 
 /// Reconstruct an [`InjectionContext`] from owned [`DiscoveredRegion`] data,
@@ -733,6 +742,11 @@ fn rebuild_context<'a>(
     content_start_byte: usize,
     coordinator: &LanguageCoordinator,
     exclusion_ranges: &mut Vec<(usize, usize)>,
+    // The highlight query already resolved by `discover_single_region` on the
+    // inline path (reused here so the query is looked up once), or `None` on the
+    // reuse path, where it is re-resolved fresh (never persisted across a possible
+    // settings reload — the generation gate ensures a reload misses).
+    prebuilt_query: Option<std::sync::Arc<tree_sitter::Query>>,
 ) -> Option<InjectionContext<'a>> {
     let inj_start_byte = region.content_start_byte;
     let inj_end_byte = region.content_end_byte;
@@ -746,7 +760,10 @@ fn rebuild_context<'a>(
 
     // Highlight query for the resolved language. Missing = transient (loads with
     // the language), so drop the region and let the caller taint discovery.
-    let highlight_query = coordinator.highlight_query(&region.resolved_lang)?;
+    let highlight_query = match prebuilt_query {
+        Some(query) => query,
+        None => coordinator.highlight_query(&region.resolved_lang)?,
+    };
 
     // Record exclusion ranges for parent token suppression (Problem 2: host token
     // leaking). Per-gap when included_ranges are present so
@@ -835,7 +852,9 @@ pub(crate) fn build_document_discovery(
             Some((uri, tracker)),
             false,
         ) {
-            SingleDiscovery::Region(region) => discovered.push(region),
+            // Producer path passes `require_highlight_query = false`, so no query
+            // is resolved here (the `None` companion is ignored); reuse resolves it.
+            SingleDiscovery::Region(region, _) => discovered.push(region),
             // A not-yet-loaded parser/language taints discovery — never store a
             // partial region set (the discovery analogue of the fully_loaded gate).
             SingleDiscovery::Incomplete => return None,
@@ -1055,6 +1074,8 @@ pub(crate) fn collect_injection_tokens_parallel(
                 0,
                 coordinator,
                 &mut exclusion_byte_ranges,
+                // Reuse path: re-resolve the query fresh (generation-gated).
+                None,
             ) {
                 contexts.push(ctx);
             }
