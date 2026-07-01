@@ -318,8 +318,8 @@ Any reader that must resolve against **live** positions is position-critical
   non-visual-jarring; this is the deliberate, user-sanctioned relaxation.
 - **Staleness-reject** — every **position/range** reader, because its
   coordinates are authored against the **live** text: `semanticTokens/range`,
-  `kakehashi/node/*`, `selectionRange`, `formatting`, `rangeFormatting`, `captures`
-  (full and range), **and the ~16 position/range bridge-context requests** that
+  `kakehashi/node/*`, `selectionRange`, `formatting`, `rangeFormatting`,
+  `captures/range`, **and the ~16 position/range bridge-context requests** that
   resolve an injection region before forwarding to a downstream server (hover,
   definition, references, declaration, typeDefinition, implementation, rename /
   prepareRename, completion, signatureHelp, documentHighlight, linkedEditingRange,
@@ -339,16 +339,24 @@ Any reader that must resolve against **live** positions is position-critical
     `ContentModified` — because a silent no-op on an action the user consciously
     triggered is jarring, and the wait is affordable exactly because these are not
     per-keystroke.
-  - `kakehashi/captures` returns **`null`**, which is precisely the re-sync signal
-    captures-protocol already defines ("on null, call full again") — a JSON-RPC
-    *error* would violate that contract, since a captures client is only contracted
-    to re-request on null. So a stale captures request serves `null` and the client
-    re-issues, self-healing on its next request. A captures `full` that *does*
-    compute (snapshot current at entry) can still race an edit during its async
-    compute; its lineage store must therefore carry the computed `parsed_version`
-    and, under `edit_lock`, install the lineage **only if `incarnation` and the current `content_version` still match it** (today `store_lineage` re-checks only
-    incarnation) — otherwise it stores nothing and returns `null`, so the lineage
-    never records matches for a text the client no longer has.
+  - `kakehashi/captures/range` uses `null` where the LSP requests use
+    `ContentModified` — `null` is the re-sync signal captures-protocol already
+    defines ("on null, call full again"), and a JSON-RPC *error* would violate that
+    contract. But `null`-**on-routine-staleness must be avoided for `captures/full`**:
+    it is a per-keystroke highlighter, so returning `null` while the snapshot merely
+    trails, against a client contracted to re-request on `null`, is a busy-spin
+    (edit → stale → `null` → re-request → still stale → …). So `captures/full`
+    instead **serves-stale**, like `semanticTokens`: it returns the latest snapshot's
+    matches (one edit behind, healing on the next edit's captures request, which the
+    client sends per keystroke anyway), and reserves `null` for the cases the
+    protocol actually means it — no snapshot yet (pre-first-parse) or a delta with no
+    lineage. The match node-ids are the snapshot's own; a one-edit-stale id
+    self-heals, the same relaxation `semanticTokens` takes. When a served `full`
+    installs lineage, it carries the computed `parsed_version` and — under
+    `edit_lock` — stores it **only if `incarnation` and the current `content_version`
+    still match** (today `store_lineage` re-checks only incarnation), else stores
+    nothing and returns `null`, so the lineage never records matches for a text the
+    client no longer has.
 
 Only two bounded waits remain, both deliberate: the **first parse after `didOpen`**
 (the snapshot is `None`; it waits briefly on `watch::changed()` then serves `null` —
@@ -356,10 +364,13 @@ the same decoupling parse-decoupled-document-lifecycle applies to its host tier)
 and the **explicit-action wait** above (`formatting`/`rename`). No *per-keystroke*
 read ever waits.
 
-*(Reclassifying `captures/full` and `kakehashi/node/*` off serve-stale is a
-deliberate scope choice: making them serve-stale would require the snapshot to own
-a versioned tracker view, a larger change than this decision commits to. If a
-future decision forks the tracker per snapshot, they can move to serve-stale.)*
+*(`kakehashi/node/*` stays staleness-reject rather than serve-stale: a node
+request resolves to a specific live-position node, so a stale-position answer is
+wrong, not merely late — and unlike `captures/full` it has no per-keystroke
+re-request to heal it. `captures/full` can afford serve-stale precisely because its
+matches are snapshot-consistent and its per-edit re-request heals a one-edit-stale
+node-id; giving `node/*` the same would need a per-snapshot tracker view, which
+this decision does not commit to.)*
 
 ### 4. All tree-CPU runs on one bounded compute pool
 
@@ -447,12 +458,15 @@ inside the existing safety contracts at each step:
   not block concurrent `didChange` edits — with the region re-minted on a later
   reconciliation once the grammar lands. Only the fast tracker-mint itself runs
   under `edit_lock`. Convert
-  `semanticTokens` to serve-stale + the refresh trigger; the whole-document
+  `semanticTokens` **and `captures/full`** to serve-stale (the latter reserving
+  `null` for no-snapshot / no-lineage, not routine staleness); the whole-document
   passive-refresh family (`documentSymbol`/`documentColor`/`documentLink`/
   `foldingRange`/`codeLens`/pull-`diagnostic`) to serve-stale; the position/range
-  family — `semanticTokens/range`, `node/*`, `formatting`/`rangeFormatting`, the
-  bridge-context requests, **and `selectionRange`, whose inline `parse_with_pool` + `update_document` must be replaced by `latest_snapshot`** — to `ContentModified`;
-  and `captures` to `null` (its re-sync signal). Removes `get_tree_with_wait` /
+  family — `semanticTokens/range`, `node/*`, `captures/range`,
+  `formatting`/`rangeFormatting`, the bridge-context requests, **and
+  `selectionRange`, whose inline `parse_with_pool` + `update_document` must be
+  replaced by `latest_snapshot`** — to `ContentModified` (or `null` for
+  `captures/range`). Removes `get_tree_with_wait` /
   `wait_for_epoch` / `ensure_document_parsed` **and** the inline-parse fallbacks
   (`try_parse_and_update_document`, `selection_range_impl`) — closing the
   resurrection vector. Delivers *instant reads* and *lifecycle independent of
@@ -534,14 +548,15 @@ inside the existing safety contracts at each step:
   synchronous-client reentrancy that keeps it out of `didChange`);
   `documentSymbol`/`documentColor` self-correct only on the client's next natural
   request (no active refresh added).
-- Staleness-reject requests (`kakehashi/node/*`, range, formatting) return
-  `ContentModified` during the reparse window, and `kakehashi/captures` returns
-  `null` (its protocol re-sync signal). The LSP spec does not mandate retry on
-  `ContentModified`, so on a client that does not re-request (e.g. Neovim's built-in
-  client for formatting) that keystroke's request **no-ops** until the next natural
-  request; the captures `null` path is contracted to re-request. Reclassifying
-  captures/node from the original serve-stale intent is the
-  cost of not forking a per-snapshot tracker view now.
+- Staleness-reject requests (`kakehashi/node/*`, range requests, formatting) return
+  `ContentModified` during the reparse window (`captures/range` returns `null`, its
+  protocol re-sync signal). The LSP spec does not mandate retry on `ContentModified`,
+  so on a client that does not re-request (e.g. Neovim's built-in client for
+  formatting) that keystroke's request **no-ops** until the next natural request;
+  `formatting`/`rename`/`selectionRange` mitigate with the brief bounded wait.
+  `captures/full` is *not* in this class — it serves-stale (§3) to avoid a
+  null-then-re-request busy-spin during typing. Keeping `node/*` staleness-reject
+  rather than serve-stale is the cost of not forking a per-snapshot tracker view now.
 - The `#342`/`#374` stale-tree guarantee (a reader observes at least its own edit)
   is relaxed to "a reader observes a *consistent* snapshot that may trail the input
   by one or more edits, and knows it via the version tag." Correctness now rests on
