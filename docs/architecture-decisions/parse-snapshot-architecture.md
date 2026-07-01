@@ -356,8 +356,10 @@ inside the existing safety contracts at each step:
   under the same `(incarnation, parsed_version)` guard, and the **snapshot publish
   is the sole commit point** — all downstream (refresh, forwarding, diagnostics,
   shared cache writes) gates on the *publish* result, never the legacy CAS (§2). So
-  `latest_snapshot` retains a servable tree across an edit's `tree.take()` and the
-  two writes cannot expose different versions. Derive snapshot-owned region ids in
+  `latest_snapshot` retains a servable tree across an edit's `tree.take()`; the two
+  stores may transiently sit at different versions (a lost legacy CAS just reseeds
+  next pass), but no **reader** sees the difference because every reader reads the
+  snapshot, not the legacy tree. Derive snapshot-owned region ids in
   `populate` (no shared-tracker mint). Convert `semanticTokens` to serve-stale + the
   refresh trigger; `documentSymbol`/`documentColor` to serve-stale + passive;
   range/formatting/`node/*` to `ContentModified` and `captures` to `null` (its
