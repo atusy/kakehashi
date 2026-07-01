@@ -136,6 +136,30 @@ impl ParseCoordinator {
         }
     }
 
+    /// Publish a parse pass's [`ParseSnapshot`](crate::document::snapshot::ParseSnapshot)
+    /// into the document's snapshot cell (parse-snapshot ADR §2, Stage-2
+    /// dual-write). The cell's own guard (incarnation + strict version) decides
+    /// admission; a document a `didClose` already removed simply has no cell to
+    /// publish into (its detached cell holds the closed sentinel). Returns
+    /// whether the publish landed.
+    ///
+    /// During the dual-write stage this runs alongside the legacy tree CAS and
+    /// may admit a snapshot the legacy CAS rejects — deliberately: a parse of
+    /// text an edit has since moved on from is *stale but consistent*, exactly
+    /// what serve-stale readers consume, while the legacy tree must stay
+    /// current-text-only. No reader observes the divergence (every reader still
+    /// reads the legacy tree until Stage 2's reader conversion).
+    fn publish_parse_snapshot(
+        &self,
+        uri: &Url,
+        snapshot: crate::document::snapshot::ParseSnapshot,
+    ) -> bool {
+        self.documents
+            .get(uri)
+            .map(|doc| doc.publish_snapshot(std::sync::Arc::new(snapshot)))
+            .unwrap_or(false)
+    }
+
     /// Run `CacheCoordinator::populate_injections` as a compute-pool work-unit
     /// and await it.
     ///
@@ -215,10 +239,10 @@ impl ParseCoordinator {
         // wakes its readers (they fall back). Unreachable while this parse is inline on
         // the writer ticket (a `didClose` is gated behind the open); the guard is for
         // the off-ingress open flip (#6), where a `didClose`/reopen can race it.
-        let Some((text, incarnation)) = self
+        let Some((text, incarnation, content_version)) = self
             .documents
             .get(&uri)
-            .map(|doc| (doc.text_arc(), doc.incarnation()))
+            .map(|doc| (doc.text_arc(), doc.incarnation(), doc.content_version()))
         else {
             return false;
         };
@@ -268,6 +292,19 @@ impl ParseCoordinator {
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, false);
                 }
+                // Resolved-but-tree-less snapshot (ADR §2): the parse completed
+                // with no usable tree; publishing it advances parsed_version so
+                // a first-parse waiter releases to its empty fallback.
+                self.publish_parse_snapshot(
+                    &uri,
+                    crate::document::snapshot::ParseSnapshot {
+                        text: text.clone(),
+                        tree: None,
+                        language: Some(language_name.clone()),
+                        parsed_version: content_version,
+                        incarnation,
+                    },
+                );
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 // No tree landed (the parser previously crashed): the open caller
@@ -299,7 +336,20 @@ impl ParseCoordinator {
                 .await;
 
             if let Some(tree) = parsed_tree {
-                // Persist FIRST through the text + incarnation CAS (non-inserting), so
+                // Snapshot publish first (the Stage-2 commit point, ADR §2); the
+                // cell guard rejects it if a newer parse already published or
+                // the lifetime moved on.
+                self.publish_parse_snapshot(
+                    &uri,
+                    crate::document::snapshot::ParseSnapshot {
+                        text: text.clone(),
+                        tree: Some(tree.clone()),
+                        language: Some(language_name.clone()),
+                        parsed_version: content_version,
+                        incarnation,
+                    },
+                );
+                // Persist through the text + incarnation CAS (non-inserting), so
                 // a tree parsed from open-time text/lifetime is dropped when a
                 // `didChange` moved the text on or a `didClose`/reopen changed the
                 // incarnation — instead of clobbering the newer state. Only populate
@@ -353,6 +403,16 @@ impl ParseCoordinator {
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, false);
             }
+            self.publish_parse_snapshot(
+                &uri,
+                crate::document::snapshot::ParseSnapshot {
+                    text: text.clone(),
+                    tree: None,
+                    language: Some(language_name.clone()),
+                    parsed_version: content_version,
+                    incarnation,
+                },
+            );
             advance_watermark();
             self.notifier().log_language_events(&events).await;
             return false;
@@ -372,6 +432,16 @@ impl ParseCoordinator {
             self.documents
                 .mark_parse_finished(&uri, parse_generation, false);
         }
+        self.publish_parse_snapshot(
+            &uri,
+            crate::document::snapshot::ParseSnapshot {
+                text: text.clone(),
+                tree: None,
+                language: None,
+                parsed_version: content_version,
+                incarnation,
+            },
+        );
         advance_watermark();
         self.notifier().log_language_events(&events).await;
         false
@@ -455,7 +525,7 @@ impl ParseCoordinator {
             // than parse its text with this lifetime's (possibly relabelled-away)
             // grammar (the CAS would reject it anyway; this just avoids the wasted
             // parses).
-            let text = {
+            let (text, content_version) = {
                 let Some(doc) = self.documents.get(&uri) else {
                     break;
                 };
@@ -468,7 +538,7 @@ impl ParseCoordinator {
                 // `text_arc()` is a refcount bump, not a full copy (#498) — the
                 // original stays here for the CAS while a cheap clone goes to the
                 // blocking parse closure.
-                doc.text_arc()
+                (doc.text_arc(), doc.content_version())
             };
 
             let text_len = text.len();
@@ -489,6 +559,18 @@ impl ParseCoordinator {
 
             let Some(tree) = parsed else { break };
 
+            // Snapshot publish first (Stage-2 commit point, ADR §2); the cell
+            // guard rejects a stale lifetime or an out-of-order version.
+            self.publish_parse_snapshot(
+                &uri,
+                crate::document::snapshot::ParseSnapshot {
+                    text: text.clone(),
+                    tree: Some(tree.clone()),
+                    language: Some(language_name.clone()),
+                    parsed_version: content_version,
+                    incarnation: expected_incarnation,
+                },
+            );
             // Persist FIRST through the non-inserting, tree-absent CAS: a closed
             // (Vacant) document, one whose text moved (a concurrent `didChange`),
             // or one a concurrent parse already gave a tree all drop this tree —
@@ -556,7 +638,7 @@ impl ParseCoordinator {
         // `pending_seed` (a cheap `Tree` refcount-clone) is the edit's incremental
         // parse seed stashed by `didChange`; `None` for a full-text sync / freshly
         // installed parse, in which case we parse from scratch.
-        let (language_name, language_id, text, seed, incarnation) = {
+        let (language_name, language_id, text, seed, incarnation, content_version) = {
             let Some(doc) = self.documents.get(uri) else {
                 return;
             };
@@ -572,7 +654,14 @@ impl ParseCoordinator {
             let language_name =
                 self.language
                     .detect_language(uri.path(), &text, None, language_id.as_deref());
-            (language_name, language_id, text, seed, incarnation)
+            (
+                language_name,
+                language_id,
+                text,
+                seed,
+                incarnation,
+                doc.content_version(),
+            )
         };
 
         // Post-read resolutions advance the watermark **only if this lifetime is
@@ -618,6 +707,21 @@ impl ParseCoordinator {
             .await;
 
         if let Some(tree) = parsed {
+            // Snapshot publish first (the Stage-2 commit point, ADR §2). The
+            // cell guard admits this even when the legacy CAS below rejects a
+            // text that moved on — a stale-but-consistent snapshot is exactly
+            // what serve-stale readers consume; the scheduler's dirty loop
+            // reparses the newer text and supersedes it.
+            self.publish_parse_snapshot(
+                uri,
+                crate::document::snapshot::ParseSnapshot {
+                    text: text.clone(),
+                    tree: Some(tree.clone()),
+                    language: Some(language_name.clone()),
+                    parsed_version: content_version,
+                    incarnation,
+                },
+            );
             // Text + language + incarnation CAS (non-inserting), all three checked
             // atomically under the tree-write shard lock. Text rejects a
             // within-lifetime stale parse (a `didChange` landed mid-parse);

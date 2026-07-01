@@ -729,7 +729,17 @@ impl DocumentStore {
         // `wait_for_epoch` for this document, so a reader racing the close
         // proceeds into the empty fallback instead of stalling to the timeout.
         self.watermarks.remove(uri);
-        self.documents.remove(uri).map(|(_, doc)| doc)
+        let removed = self.documents.remove(uri).map(|(_, doc)| doc);
+        // Publish the terminal slot AFTER the entry is gone (parse-snapshot ADR
+        // §2): wakes first-parse waiters parked on the removed document's
+        // channel — stale parse-task `Sender` clones can keep it alive past
+        // this drop — and its reserved incarnation rejects any later stale
+        // publish that would otherwise pass the bootstrap branch and resurrect
+        // the closed document for those waiters.
+        if let Some(doc) = &removed {
+            doc.publish_closed();
+        }
+        removed
     }
 
     /// Draw the next process-wide-unique **open incarnation** (see
@@ -737,16 +747,170 @@ impl DocumentStore {
     /// — including a close-then-reopen of the same URI — always get distinct
     /// values, which is what lets a consumer detect a reopen by comparing a
     /// captured incarnation against the document's current one. Starts at 1, so
-    /// `0` is reserved for a document built outside any store.
+    /// `0` is reserved for a document built outside any store, and
+    /// [`CLOSED_INCARNATION`](super::snapshot::CLOSED_INCARNATION) (`u64::MAX`,
+    /// the closed-slot sentinel) is reserved and never drawn — the redraw loop
+    /// guards the (practically unreachable) wrap-around.
     pub(crate) fn next_incarnation(&self) -> u64 {
-        self.open_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        loop {
+            let drawn = self
+                .open_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if drawn != 0 && drawn != super::snapshot::CLOSED_INCARNATION {
+                return drawn;
+            }
+        }
     }
+
+    /// Resolve the current per-URI cell and read its latest snapshot slot,
+    /// wait-free, in a **single** `DashMap` lookup (parse-snapshot ADR §2's
+    /// isolation rule: per-request re-resolution + incarnation validation, not
+    /// cell identity). A snapshot from a prior lifetime — a wait-free borrow
+    /// racing close+reopen — is discarded here, so a cross-lifetime snapshot
+    /// degrades to the empty/`null` path rather than being served. `None` for
+    /// an unregistered/closed URI.
+    pub(crate) fn latest_snapshot(&self, uri: &Url) -> Option<SnapshotView> {
+        let doc = self.documents.get(uri)?;
+        let live_incarnation = doc.incarnation();
+        let mut slot = doc.latest_snapshot_slot();
+        if slot
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.incarnation != live_incarnation)
+        {
+            slot.snapshot = None;
+        }
+        Some(SnapshotView {
+            slot,
+            content_version: doc.content_version(),
+        })
+    }
+
+    /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the
+    /// first-parse and explicit-action waits, the only two the parse-snapshot
+    /// model permits). `None` for an unregistered/closed URI. The `Ref` is
+    /// dropped before the caller awaits.
+    pub(crate) fn subscribe_snapshots(
+        &self,
+        uri: &Url,
+    ) -> Option<tokio::sync::watch::Receiver<super::snapshot::SnapshotSlot>> {
+        Some(self.documents.get(uri)?.subscribe_snapshots())
+    }
+}
+
+/// One consistent read of a document's inputs + latest snapshot, resolved by
+/// [`DocumentStore::latest_snapshot`]: the live input version is captured under
+/// the same shard read lock as the slot borrow, so a reader can classify
+/// staleness (`snapshot.parsed_version < content_version`) without further
+/// lookups; the slot's snapshot is already validated against the live
+/// incarnation.
+pub(crate) struct SnapshotView {
+    pub(crate) slot: super::snapshot::SnapshotSlot,
+    pub(crate) content_version: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod snapshot_cell {
+        use super::super::*;
+        use crate::document::snapshot::{CLOSED_INCARNATION, ParseSnapshot};
+        use std::sync::Arc;
+
+        fn snap_for(store: &DocumentStore, uri: &Url, parsed_version: u64) -> ParseSnapshot {
+            let doc = store.get(uri).expect("registered");
+            ParseSnapshot {
+                text: doc.text_arc(),
+                tree: None,
+                language: Some("rust".to_string()),
+                parsed_version,
+                incarnation: doc.incarnation(),
+            }
+        }
+
+        fn publish(store: &DocumentStore, uri: &Url, snapshot: ParseSnapshot) -> bool {
+            store
+                .get(uri)
+                .map(|doc| doc.publish_snapshot(Arc::new(snapshot)))
+                .unwrap_or(false)
+        }
+
+        /// A reopen constructs a fresh cell at `snapshot: None`, which clears
+        /// the prior lifetime's version floor: the first post-reopen publish
+        /// (version 0) must land even though the prior lifetime reached 5.
+        #[test]
+        fn reopen_resets_the_version_floor() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///floor.rs").unwrap();
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            assert!(publish(&store, &uri, snap_for(&store, &uri, 5)));
+
+            let stale = snap_for(&store, &uri, 6); // prior-lifetime straggler
+            store.remove(&uri);
+            store.insert(uri.clone(), "b".into(), Some("rust".into()), None);
+
+            assert!(
+                !publish(&store, &uri, stale),
+                "a prior-lifetime publish must fail the incarnation clause"
+            );
+            assert!(
+                publish(&store, &uri, snap_for(&store, &uri, 0)),
+                "the new lifetime's bootstrap publish must land at version 0"
+            );
+        }
+
+        /// `remove` installs the closed sentinel on the detached cell: a
+        /// parked first-parse waiter wakes and unambiguously observes the
+        /// closed state instead of stalling or being resurrected.
+        #[tokio::test]
+        async fn remove_wakes_waiters_with_the_closed_sentinel() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///close.rs").unwrap();
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+
+            let mut receiver = store.subscribe_snapshots(&uri).expect("live");
+            store.remove(&uri);
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.changed())
+                .await
+                .expect("close must wake the waiter")
+                .expect("sender alive via the removed document");
+            let slot = receiver.borrow().clone();
+            assert_eq!(slot.current_incarnation, CLOSED_INCARNATION);
+            assert!(slot.snapshot.is_none());
+        }
+
+        /// The single-lookup read validates the snapshot against the live
+        /// incarnation: after close+reopen, a reader must not be handed the
+        /// prior lifetime's snapshot.
+        #[test]
+        fn latest_snapshot_discards_cross_lifetime_leftovers() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///xlife.rs").unwrap();
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            assert!(publish(&store, &uri, snap_for(&store, &uri, 0)));
+            assert!(
+                store
+                    .latest_snapshot(&uri)
+                    .expect("registered")
+                    .slot
+                    .snapshot
+                    .is_some()
+            );
+
+            store.remove(&uri);
+            assert!(store.latest_snapshot(&uri).is_none(), "closed → None");
+
+            store.insert(uri.clone(), "b".into(), Some("rust".into()), None);
+            let view = store.latest_snapshot(&uri).expect("reopened");
+            assert!(
+                view.slot.snapshot.is_none(),
+                "the reopened lifetime has no snapshot yet"
+            );
+            assert_eq!(view.content_version, 0);
+        }
+    }
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;

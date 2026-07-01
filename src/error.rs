@@ -20,6 +20,20 @@ pub enum LspError {
 /// Result type for LSP operations
 pub type LspResult<T> = Result<T, LspError>;
 
+/// LSP `ContentModified` (-32801): the staleness-reject signal of the
+/// parse-snapshot model (ADR §3) — a position/range request whose coordinates
+/// were authored against text newer than the latest parse snapshot cannot be
+/// answered correctly, so it is rejected rather than served at wrong positions.
+/// The spec does not mandate client auto-retry; the answer arrives on the
+/// client's next natural request.
+pub(crate) fn content_modified_error() -> tower_lsp_server::jsonrpc::Error {
+    tower_lsp_server::jsonrpc::Error {
+        code: tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32801),
+        message: std::borrow::Cow::Borrowed("content modified"),
+        data: None,
+    }
+}
+
 /// Helper trait to recover from poisoned locks with logging.
 pub trait LockResultExt<T> {
     /// Recover from a poisoned lock, logging a warning with the given context.

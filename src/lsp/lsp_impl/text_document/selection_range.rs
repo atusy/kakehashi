@@ -7,6 +7,13 @@ use crate::analysis::handle_selection_range;
 
 use super::super::{Kakehashi, uri_to_url};
 
+/// The explicit-action bounded wait (parse-snapshot ADR §3): `selectionRange`
+/// is keyboard-triggered expand/shrink — a silent no-op on a consciously
+/// triggered action is jarring, and the request is not per-keystroke, so it
+/// may briefly wait for the in-flight parse to land before falling back to
+/// `ContentModified`.
+const SELECTION_RANGE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl Kakehashi {
     pub(crate) async fn selection_range_impl(
         &self,
@@ -32,75 +39,60 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Take what the on-demand parse needs and drop the Ref at the block's
-        // end: a DashMap Ref held across an .await keeps the shard read-locked
-        // while this task is parked, stalling didOpen/didChange writers.
-        let unparsed_text = {
-            let Some(doc) = self.documents.get(&uri) else {
+        // Resolve the latest parse snapshot, waiting briefly (bounded) for a
+        // *current* one — this reader's coordinates are authored against the
+        // live text, so a trailing snapshot cannot answer it (ADR §3
+        // staleness-reject, with the explicit-action wait). This replaces the
+        // former reader on-demand parse: readers never parse inline.
+        let deadline = tokio::time::Instant::now() + SELECTION_RANGE_WAIT;
+        let snapshot = loop {
+            // Re-resolve per iteration (per-request re-resolution rule): a
+            // close/reopen between wakeups is observed here, never served.
+            let Some(view) = self.documents.latest_snapshot(&uri) else {
+                // Unregistered or closed.
                 return Ok(None);
             };
-            doc.tree().is_none().then(|| doc.text().to_string())
-        };
-
-        // Parse on-demand if the document has no tree yet
-        if let Some(text) = unparsed_text {
-            let text_clone = text.clone();
-
-            let sync_parse_result = self
-                .parse_coordinator()
-                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
-                    let parse_result = parser.parse(&text_clone, None);
-                    (parser, parse_result)
-                })
-                .await;
-
-            let Some(tree) = sync_parse_result else {
-                return Ok(None);
-            };
-
-            // Persist under the per-URI edit lock and only if the document is
-            // still alive with the text we parsed: a didClose racing the parse
-            // must not be undone by re-inserting the document, and a didChange
-            // must not be clobbered with the older text/tree. Block-scoped so
-            // the edit lock is released before the pool wait below.
-            {
-                let edit_lock = self.documents.edit_lock(&uri);
-                let _guard = edit_lock.lock().await;
-                let still_current = {
-                    let Some(doc) = self.documents.get(&uri) else {
-                        // edit_lock() get-or-inserts; a didClose that raced the
-                        // parse already removed the entry, so drop the one we
-                        // just recreated rather than leaking it (same miss-path
-                        // cleanup as semantic_tokens).
-                        drop(_guard);
-                        self.documents.remove_edit_lock(&uri);
+            match &view.slot.snapshot {
+                Some(snapshot) if snapshot.parsed_version == view.content_version => {
+                    break std::sync::Arc::clone(snapshot);
+                }
+                _ => {
+                    // No snapshot yet (first parse in flight) or trailing an
+                    // edit: wait for the next publish, bounded by the deadline.
+                    let Some(mut receiver) = self.documents.subscribe_snapshots(&uri) else {
                         return Ok(None);
                     };
-                    doc.text() == text
-                };
-                if still_current {
-                    self.documents
-                        .update_document(uri.clone(), text, Some(tree));
+                    let wait = tokio::time::timeout_at(deadline, receiver.changed()).await;
+                    match wait {
+                        // A publish (or close) landed — loop and re-resolve.
+                        Ok(Ok(())) => continue,
+                        // Channel closed: the document is gone.
+                        Ok(Err(_)) => return Ok(None),
+                        // Deadline passed. A stale snapshot exists → the
+                        // coordinates can't be answered: ContentModified. No
+                        // snapshot at all (first parse still running) → the
+                        // pre-snapshot behavior: null.
+                        Err(_elapsed) => {
+                            return if view.slot.snapshot.is_some() {
+                                Err(crate::error::content_modified_error())
+                            } else {
+                                Ok(None)
+                            };
+                        }
+                    }
                 }
             }
-        }
-
-        // Snapshot owned pieces of the document (cheap: Arc/Tree refcount bumps)
-        // and drop the Ref, then run the synchronous injection-aware walk as one
-        // work-unit on the compute pool. The parser-pool sync mutex is acquired
-        // only on the pool thread (Stage-1 obligation), and no DashMap shard
-        // read-lock is held for the walk's duration.
-        let (text, tree, language_id) = {
-            let Some(doc) = self.documents.get(&uri) else {
-                return Ok(None);
-            };
-            (
-                doc.text_arc(),
-                doc.tree().cloned(),
-                doc.language_id().map(|s| s.to_string()),
-            )
         };
 
+        // A resolved-but-tree-less snapshot (no parser installed / crashed
+        // grammar) cannot produce selection ranges.
+        if snapshot.tree.is_none() {
+            return Ok(None);
+        }
+
+        // Run the synchronous injection-aware walk as one work-unit on the
+        // compute pool against the snapshot's consistent (text, tree). The
+        // parser-pool sync mutex is acquired only on the pool thread.
         let language = std::sync::Arc::clone(&self.language);
         let parser_pool = std::sync::Arc::clone(&self.parser_pool);
         let result = self
@@ -111,9 +103,9 @@ impl Kakehashi {
                     .lock()
                     .recover_poison("Kakehashi::selection_range_impl");
                 handle_selection_range(
-                    &text,
-                    tree.as_ref(),
-                    language_id.as_deref(),
+                    &snapshot.text,
+                    snapshot.tree.as_ref(),
+                    snapshot.language.as_deref(),
                     &positions,
                     &language,
                     &mut pool,

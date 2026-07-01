@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
+use tokio::sync::watch;
 use tree_sitter::{InputEdit, Tree};
+
+use super::snapshot::{ParseSnapshot, SnapshotSlot};
 
 /// Immutable snapshot of document state for lock-free processing
 pub(crate) struct DocumentSnapshot {
@@ -81,6 +84,21 @@ pub struct Document {
     /// incarnation is only meaningful relative to that store's counter, and the
     /// store assigns every document it owns a nonzero value.
     incarnation: u64,
+    /// The document's monotonic **input version** (parse-snapshot ADR §1):
+    /// `0` at construction (didOpen), bumped on every text mutation —
+    /// incremental edit and full-text sync alike. Parse-result writes never
+    /// touch it: it versions the *inputs*, so a derived `ParseSnapshot` can
+    /// carry the `parsed_version` it was computed from and readers can compare
+    /// staleness (`parsed_version < content_version`) without any wait.
+    content_version: u64,
+    /// The per-URI snapshot cell (parse-snapshot ADR §2), co-located on the
+    /// document so one store lookup yields both the live inputs (incarnation,
+    /// `content_version`) and the latest [`ParseSnapshot`] — a single
+    /// authoritative incarnation, no cross-map TOCTOU. Seeded at bootstrap
+    /// (`snapshot: None`) for this lifetime; a reopen constructs a fresh
+    /// `Document` and with it a fresh cell, which is what clears the version
+    /// floor for the new lifetime.
+    snapshot_tx: watch::Sender<SnapshotSlot>,
 }
 
 impl Document {
@@ -92,6 +110,8 @@ impl Document {
             tree: None,
             pending_seed: None,
             incarnation,
+            content_version: 0,
+            snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
         }
     }
 
@@ -103,6 +123,8 @@ impl Document {
             tree: None,
             pending_seed: None,
             incarnation,
+            content_version: 0,
+            snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
         }
     }
 
@@ -119,6 +141,8 @@ impl Document {
             tree: Some(tree),
             pending_seed: None,
             incarnation,
+            content_version: 0,
+            snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
         }
     }
 
@@ -150,6 +174,51 @@ impl Document {
         self.incarnation
     }
 
+    /// The document's monotonic input version (see the
+    /// [`content_version`](Self::content_version) field).
+    pub(crate) fn content_version(&self) -> u64 {
+        self.content_version
+    }
+
+    /// Install `snapshot` in this document's cell iff the slot admits it —
+    /// the one publish primitive (parse-snapshot ADR §2), executed inside
+    /// `send_if_modified` so the guard and the write are atomic under the
+    /// channel's own lock. Returns whether the publish landed; a rejected
+    /// publish (a racing edit's newer snapshot, a reopen, a close) must make
+    /// the caller emit no downstream effects.
+    pub(crate) fn publish_snapshot(&self, snapshot: Arc<ParseSnapshot>) -> bool {
+        let mut installed = false;
+        self.snapshot_tx.send_if_modified(|slot| {
+            if slot.admits(&snapshot) {
+                slot.snapshot = Some(Arc::clone(&snapshot));
+                installed = true;
+            }
+            installed
+        });
+        installed
+    }
+
+    /// Install the terminal closed slot (see
+    /// [`CLOSED_INCARNATION`](super::snapshot::CLOSED_INCARNATION)): wakes any
+    /// reader parked on the first-parse `watch::changed()` and rejects every
+    /// later publish, including a stale same-lifetime one that would otherwise
+    /// pass the bootstrap branch. Explicit because stale parse tasks may hold
+    /// `Sender` clones that keep the channel alive past this document's drop.
+    pub(crate) fn publish_closed(&self) {
+        self.snapshot_tx.send_replace(SnapshotSlot::closed());
+    }
+
+    /// Borrow the latest snapshot slot, wait-free (cheap `Arc` clones).
+    pub(crate) fn latest_snapshot_slot(&self) -> SnapshotSlot {
+        self.snapshot_tx.borrow().clone()
+    }
+
+    /// Subscribe for slot changes — used only by the bounded first-parse wait
+    /// (and Stage 2's explicit-action wait); per-keystroke readers never wait.
+    pub(crate) fn subscribe_snapshots(&self) -> watch::Receiver<SnapshotSlot> {
+        self.snapshot_tx.subscribe()
+    }
+
     /// Create an immutable snapshot of current document state
     ///
     /// Returns None if document is not fully initialized (missing tree).
@@ -163,8 +232,15 @@ impl Document {
     }
 
     /// Install a freshly parsed tree together with its text.
+    ///
+    /// Replaces the text, so it counts as an input mutation and bumps
+    /// `content_version` (its callers pass the text the tree was parsed from,
+    /// which may or may not equal the stored text; bumping unconditionally
+    /// keeps the version a safe upper bound — a spurious bump only marks a
+    /// snapshot stale early, never serves a wrong one).
     pub(crate) fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
         self.text = Arc::from(new_text);
+        self.content_version += 1;
         self.tree = Some(new_tree);
         // Any pending incremental seed is for an edit superseded by this fresh
         // tree+text; keep the invariant "visible tree present ⟹ no stale seed" so a
@@ -229,6 +305,7 @@ impl Document {
             _ => None,
         };
         self.text = Arc::from(new_text);
+        self.content_version += 1;
     }
 
     /// The off-ingress incremental parse seed, if any. **Read only by
@@ -244,6 +321,7 @@ impl Document {
         // Note: Tree needs to be rebuilt after text change
         self.tree = None;
         self.pending_seed = None;
+        self.content_version += 1;
     }
 }
 
@@ -272,6 +350,44 @@ mod tests {
         assert_eq!(doc.text(), "fn main() {}");
         assert!(doc.tree().is_some());
         assert_eq!(doc.language_id(), Some("rust"));
+    }
+
+    /// The parse-snapshot model's input-side version (§1): `0` at construction,
+    /// bumped on every text mutation (incremental edit and full-text sync
+    /// alike), and NOT bumped by parse-result writes — the version tracks the
+    /// *inputs*, and a parse landing changes only derived state.
+    #[test]
+    fn content_version_tracks_text_mutations_only() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+
+        let mut doc = Document::new("fn main() {}".to_string(), 1);
+        assert_eq!(doc.content_version(), 0, "fresh document starts at 0");
+
+        // Full-text sync bumps.
+        doc.update_text("fn main() { }".to_string());
+        assert_eq!(doc.content_version(), 1);
+
+        // A parse-result write does not bump.
+        let tree = parser.parse("fn main() { }", None).unwrap();
+        doc.set_tree(tree.clone());
+        assert_eq!(
+            doc.content_version(),
+            1,
+            "set_tree is not an input mutation"
+        );
+        doc.set_parse_result(Some("rust".to_string()), Some(tree));
+        assert_eq!(
+            doc.content_version(),
+            1,
+            "set_parse_result is not an input mutation"
+        );
+
+        // An incremental edit bumps.
+        doc.apply_edit_and_seed("fn main() {  }".to_string(), &[]);
+        assert_eq!(doc.content_version(), 2);
     }
 
     #[test]
