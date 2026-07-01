@@ -284,7 +284,13 @@ Any reader that must resolve against **live** positions is position-critical
   `didChange` handler — `didChange` deliberately does not emit refresh because a
   synchronous client (vim-lsp on Vim) cannot answer a server request while
   processing a notification; emitting from the off-ingress loop, after the
-  notification returns, avoids that reentrancy.
+  notification returns, avoids that reentrancy. This **reverses the current
+  handler**, which *rejects* a stale/superseded `semanticTokens` full/delta with
+  `None` (via `check_text_staleness` and the merged compute-superseded
+  `is_cancelled` bail) rather than serving a trailing snapshot. Stage 2 replaces
+  reject-on-stale with serve-stale + refresh; the `CancelToken` bail then narrows to
+  reclaiming the superseded compute's CPU (§4) without also discarding the — now
+  servable — snapshot. This is a decision Stage 2 deliberately overwrites.
 - **Serve-stale, passively refreshed** — whole-document, no-position reads:
   `documentSymbol`, `documentColor`, `documentLink`, `foldingRange`, `codeLens`
   (the `whole_document_preferred_fan_out` family), and pull-mode
@@ -361,6 +367,23 @@ unrelated async I/O, diagnostics, or the request loop. Turning "no starvation" i
 a real guarantee requires **explicit fair admission** — a focused-document priority
 queue plus a per-document in-flight concurrency cap — which this decision names as
 required follow-on work, not something the bounded pool delivers on its own.
+
+**Cooperative cancellation is the complement to the pool, and it has already
+landed on the current architecture.** The pool isolates tree-CPU but cannot stop a
+*superseded* compute: Rayon does not preempt, and dropping the `oneshot`-bridged
+future leaves the work-unit running to completion — wasting a pool thread that is
+now scarcer than the process-global Rayon pool it replaces. The merged `CancelToken`
+(`src/cancel.rs`: an `Arc<AtomicBool>` flipped by `SemanticRequestTracker` on
+supersede, `$/cancelRequest`, or `didClose`, which the compute polls at coarse
+checkpoints — the injection discovery loop and the per-region fan-out — and bails)
+closes exactly that gap. It **composes with** this design rather than competing, so
+it is carried forward, not re-derived: the token is an architecture-independent
+primitive, **re-homed at Stage 1 as a cancellation hook on the bounded-pool
+work-unit (the `oneshot` bridge) contract**. Keep the split explicit — §2's terminal
+`SnapshotSlot` + incarnation rejection guarantees *correctness* on close/supersede
+(a stale or cross-lifetime result is never served), while the `CancelToken` is the
+orthogonal *CPU-reclamation* mechanism (a superseded compute stops burning a pool
+thread); both are wanted, and neither subsumes the other.
 
 ### 5. Staged rollout
 
@@ -529,3 +552,9 @@ populate off the async workers) and Stage 2 (which removes the reader wait) and 
 not carried forward on its own. The delete-on-supersede pruning of the overtaken
 per-document-parse-scheduler passages is deferred to Stage 3, when the behavior
 they describe is actually removed.
+
+One piece of the destination is **already merged** onto the current architecture:
+the cooperative-cancellation primitive (`CancelToken` + `SemanticRequestTracker`
+compute bail-out). It is not re-derived — Stage 1 re-homes it as the bounded-pool
+work-unit's cancellation hook (§4), and Stage 2 narrows its role from
+reject-on-stale to CPU-reclamation-under-serve-stale (§3).
