@@ -47,8 +47,8 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             settings: None,
             // Spell out the built-in default (every server enabled) so the
             // template documents the opt-out knob: setting this to `false`
-            // disables every server by default, with concrete servers able
-            // to opt back in individually via the wildcard.
+            // disables every server by default; a concrete server can then
+            // opt back in individually with its own `enabled: true`.
             enabled: Some(true),
         },
     )])
