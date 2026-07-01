@@ -261,7 +261,7 @@ The decision therefore **separates three concerns that today all ride the tracke
   completes and (under `edit_lock`) its `parsed_version` still equals
   `content_version`, that step maps the snapshot's region geometry to tracker ULIDs
   — reusing an existing id by position, minting a fresh one for a genuinely new
-  region — exactly the mint discovery does today, just gated and relocated. If the
+  region — exactly what the mint discovery does today, just gated and relocated. If the
   pass is stale (`content_version` moved on), reconciliation is skipped and deferred
   to the next current pass; the tracker is meanwhile kept live by the ordinary
   `didChange` edit-shift (`apply_input_edits`), so the bridge always resolves
@@ -415,7 +415,7 @@ inside the existing safety contracts at each step:
   legacy tree CAS (the incremental seed still reads `Document::tree`/`pending_seed`,
   which Stage 3 removes) is made strict-version like the publish, both writes run
   under the same `(incarnation, parsed_version)` guard, and the **snapshot publish is the sole commit point** — all downstream (refresh, forwarding, diagnostics,
-  shared cache writes) gates on the *publish* result, never the legacy CAS (§2). So
+  shared cache writes) gate on the *publish* result, never the legacy CAS (§2). So
   `latest_snapshot` retains a servable tree across an edit's `tree.take()`; the two
   stores may transiently sit at different versions (a lost legacy CAS just reseeds
   next pass), but no **reader** sees the difference because every reader reads the
