@@ -1517,11 +1517,11 @@ mod tests {
 
     #[test]
     fn should_parse_defaults_only_language_server_entry() {
-        // A wildcard `_` entry exists to supply defaults (e.g. rootMarkers)
+        // A wildcard `_` entry exists to supply defaults (e.g. workspaceMarkers)
         // to concrete servers, so cmd/languages must be optional in TOML.
         let toml_str = r#"
             [languageServers._]
-            rootMarkers = [".git"]
+            workspaceMarkers = [".git"]
         "#;
 
         let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();
@@ -1620,11 +1620,27 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_root_markers_mixed_string_and_group_json() {
+    fn toml_both_marker_keys_present_is_a_hard_error() {
+        // The toml crate's duplicate-key detection is independent of
+        // serde_json's, so pin the same fail-safe on the TOML load path too.
+        let toml_str = r#"
+            [languageServers._]
+            workspaceMarkers = [".git"]
+            rootMarkers = [".cargo"]
+        "#;
+        let err = toml::from_str::<RawWorkspaceSettings>(toml_str).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("duplicate"),
+            "expected a duplicate-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_parse_workspace_markers_mixed_string_and_group_json() {
         // Neovim's (string|string[])[] shape: a bare string is one tier, a
         // nested array is an equal-priority group.
         let config_json = r#"{
-            "rootMarkers": [["stylua.toml", ".luarc.json"], ".git"]
+            "workspaceMarkers": [["stylua.toml", ".luarc.json"], ".git"]
         }"#;
 
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
@@ -1638,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn root_markers_group_survives_json_serialize_round_trip() {
+    fn workspace_markers_group_survives_json_serialize_round_trip() {
         // `kakehashi/effectiveConfiguration` re-serializes the user's settings
         // via serde_json, so a Group must round-trip: array for a group, bare
         // string for a single, with entry order preserved.
@@ -1668,12 +1684,12 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_root_markers_mixed_string_and_group_toml() {
+    fn should_parse_workspace_markers_mixed_string_and_group_toml() {
         // TOML 1.0 allows heterogeneous arrays; the untagged enum must round
         // trip a mix of bare names and nested groups through the toml crate.
         let toml_str = r#"
             [languageServers._]
-            rootMarkers = [["stylua.toml", ".luarc.json"], ".git"]
+            workspaceMarkers = [["stylua.toml", ".luarc.json"], ".git"]
         "#;
 
         let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();

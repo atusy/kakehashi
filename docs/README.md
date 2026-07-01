@@ -316,6 +316,11 @@ Configure language servers for bridging LSP requests in injection regions.
 | `onTypeFormattingTriggers` | Trigger characters for bridged `textDocument/onTypeFormatting` (e.g. `["}", ";"]`). kakehashi advertises the sorted union across all servers at initialize and forwards a request to a downstream server only when that server's own capabilities declare the typed character. Unset everywhere (default) → the capability is not advertised. |
 | `preferSharedInstance` | Prefer reusing **one** downstream process across every workspace root for this server instead of the default one-process-per-marker-root (above). Default `false`. It is a *preference*, honored only when the downstream server advertises `workspace.workspaceFolders.{supported, changeNotifications}`: when it does, kakehashi routes all roots to a single connection and announces each new root with `workspace/didChangeWorkspaceFolders`; when it does not, kakehashi logs once and silently falls back to the per-root-instance model. Because that fallback is universal, a blanket `languageServers._.preferSharedInstance = true` is safe across a mixed set of servers. Use it to bound process count and get cross-root navigation for servers that key purely off `workspaceFolders`; leave it `false` for servers needing per-root isolation (per-root virtualenv, conflicting tool/package versions) or that key behavior off the immutable `rootUri`. Note: removal/idle-eviction of folders is not modeled yet — the set only grows. |
 
+> **Migration note**: `workspaceMarkers` was previously named `rootMarkers`
+> (aligning with the LSP spec's `workspaceFolders`). The old `rootMarkers` key
+> still works as a deprecated alias, so existing configs need no change; new
+> configs should prefer `workspaceMarkers`.
+
 A `languageServers._` wildcard entry supplies defaults that every server
 inherits field-by-field (wildcard-config-inheritance) — e.g. set
 `workspaceMarkers` or `preferSharedInstance` once for all servers. A concrete

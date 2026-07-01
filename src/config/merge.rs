@@ -1147,7 +1147,7 @@ mod tests {
     /// it to "inherit" would silently re-enable the marker search a user
     /// turned off per server.
     #[test]
-    fn test_merge_bridge_server_configs_root_markers() {
+    fn test_merge_bridge_server_configs_workspace_markers() {
         use settings::{BridgeServerConfig, RootMarker};
 
         let base = BridgeServerConfig {

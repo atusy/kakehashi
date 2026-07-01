@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_documents_root_markers_default() {
+    fn default_settings_documents_workspace_markers_default() {
         let settings = default_settings();
         let servers = settings
             .language_servers
