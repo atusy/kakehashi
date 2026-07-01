@@ -160,16 +160,16 @@ impl Kakehashi {
             .log_settings_events(&settings_outcome.events)
             .await;
 
-        // Nudge users off the deprecated `rootMarkers` config key. `initialize`
-        // runs once per session, so surfacing here gives the "once per session"
-        // behavior for free — no dedup flag needed.
-        if settings_outcome.used_deprecated_root_markers {
+        // Nudge users off the deprecated `rootMarkers` config key. The claim
+        // guard latches session-wide so a later didChangeConfiguration carrying
+        // `rootMarkers` does not warn a second time (and vice versa).
+        if settings_outcome.used_deprecated_root_markers
+            && self
+                .settings_manager
+                .claim_root_markers_deprecation_warning()
+        {
             self.notifier()
-                .show_warning(
-                    "kakehashi: the `rootMarkers` config key is deprecated; \
-                     rename it to `workspaceMarkers`. `rootMarkers` still works \
-                     for now but may be removed in a future release.",
-                )
+                .show_warning(crate::config::deprecation::ROOT_MARKERS_DEPRECATION_NOTICE)
                 .await;
         }
 

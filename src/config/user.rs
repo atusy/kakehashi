@@ -58,13 +58,25 @@ impl std::error::Error for UserConfigError {
     }
 }
 
+/// User configuration plus metadata gathered from the same read.
+///
+/// `uses_deprecated_root_markers` is detected from the very bytes that were
+/// parsed (not a second read), so it cannot disagree with `settings` under a
+/// concurrent file edit. Serde's alias erases which spelling was written, so
+/// this flag is the only way to know the deprecated key was used.
+#[derive(Debug)]
+pub(crate) struct UserConfig {
+    pub(crate) settings: RawWorkspaceSettings,
+    pub(crate) uses_deprecated_root_markers: bool,
+}
+
 /// Loads user configuration from the XDG config directory.
 ///
 /// Returns:
-/// - `Ok(Some(settings))` if the file exists and is valid TOML
+/// - `Ok(Some(config))` if the file exists and is valid TOML
 /// - `Ok(None)` if the file does not exist (zero-config experience preserved)
 /// - `Err(UserConfigError)` if the file exists but contains invalid TOML
-pub fn load_user_config() -> UserConfigResult<Option<RawWorkspaceSettings>> {
+pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     let path = match user_config_path() {
         Some(p) => p,
         None => return Ok(None), // No home directory, silently ignore
@@ -81,25 +93,15 @@ pub fn load_user_config() -> UserConfigResult<Option<RawWorkspaceSettings>> {
         source: e,
     })?;
 
+    let uses_deprecated_root_markers =
+        crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
     let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
         .map_err(|e| UserConfigError::ParseError { path, source: e })?;
 
-    Ok(Some(settings))
-}
-
-/// True if the user config file declares the deprecated `rootMarkers` key.
-///
-/// Read separately from [`load_user_config`] because serde's alias erases which
-/// spelling was used by the time it returns the parsed settings; an unreadable
-/// or missing file is simply `false` (no nudge). Config load is off the hot
-/// path, so the extra read of this small file is negligible.
-pub(crate) fn user_config_uses_deprecated_root_markers() -> bool {
-    user_config_path()
-        .filter(|path| path.exists())
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .is_some_and(|contents| {
-            crate::config::deprecation::toml_uses_deprecated_root_markers(&contents)
-        })
+    Ok(Some(UserConfig {
+        settings,
+        uses_deprecated_root_markers,
+    }))
 }
 
 /// Returns the path to the user configuration file.
@@ -323,7 +325,12 @@ mod tests {
             "load_user_config should return Some for existing file"
         );
 
-        let settings = settings.unwrap();
+        let config = settings.unwrap();
+        assert!(
+            !config.uses_deprecated_root_markers,
+            "no rootMarkers in this fixture"
+        );
+        let settings = config.settings;
         assert_eq!(
             settings.auto_install,
             Some(false),
@@ -333,6 +340,42 @@ mod tests {
             settings.search_paths,
             Some(vec!["/user/custom/path".to_string()]),
             "should parse searchPaths"
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn load_user_config_flags_deprecated_root_markers() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let original = env::var("XDG_CONFIG_HOME").ok();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let config_dir = temp_dir.path().join("kakehashi");
+        fs::create_dir_all(&config_dir).expect("failed to create config dir");
+        fs::write(
+            config_dir.join("kakehashi.toml"),
+            "[languageServers.rust-analyzer]\nrootMarkers = [\".git\"]\n",
+        )
+        .expect("failed to write config file");
+
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        }
+        let result = load_user_config();
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
+        unsafe {
+            match original {
+                Some(val) => env::set_var("XDG_CONFIG_HOME", val),
+                None => env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let config = result.unwrap().expect("config exists");
+        assert!(
+            config.uses_deprecated_root_markers,
+            "rootMarkers in the user config should be flagged"
         );
     }
 

@@ -9,6 +9,20 @@ use super::super::Kakehashi;
 impl Kakehashi {
     /// Handle workspace/didChangeConfiguration notification.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
+        // Nudge users off the deprecated `rootMarkers` key if this push carries
+        // it. Detect from the raw value before serde's alias erases which key
+        // was used; the claim guard shares the once-per-session slot with the
+        // initialize path.
+        if crate::config::deprecation::json_uses_deprecated_root_markers(&params.settings)
+            && self
+                .settings_manager
+                .claim_root_markers_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::ROOT_MARKERS_DEPRECATION_NOTICE)
+                .await;
+        }
+
         // Parse the incoming settings
         let parsed = match serde_json::from_value::<RawWorkspaceSettings>(params.settings) {
             Ok(settings) => settings,

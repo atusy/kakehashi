@@ -64,8 +64,9 @@ pub struct SettingsLoadOutcome {
     /// True if any loaded config layer used the deprecated `rootMarkers` key
     /// (superseded by `workspaceMarkers`). Serde's alias erases which spelling
     /// was written, so this is detected from the raw config value. The
-    /// once-per-session deprecation warning is surfaced by the `initialize`
-    /// handler, which reads this field; it is intentionally kept out of
+    /// `initialize` handler reads this field and surfaces a one-per-session
+    /// deprecation notice (gated by `SettingsManager`'s claim guard, shared
+    /// with the didChangeConfiguration path); it is intentionally kept out of
     /// `events` so the many callers that re-load settings do not re-warn.
     pub used_deprecated_root_markers: bool,
 }
@@ -95,14 +96,9 @@ pub fn load_settings(
                 .map(|p| load_toml_file(p, &mut events, &mut used_deprecated_root_markers))
                 .collect()
         } else {
-            // User config from XDG_CONFIG_HOME is read behind `load_user_config`,
-            // which does not expose the raw value, so detect the deprecated key
-            // via a dedicated read (config load is off the hot path).
-            used_deprecated_root_markers |=
-                crate::config::user::user_config_uses_deprecated_root_markers();
             vec![
                 // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-                load_user_config_with_events(&mut events),
+                load_user_config_with_events(&mut events, &mut used_deprecated_root_markers),
                 // Layer 3: Project config from root_path/kakehashi.toml
                 load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers),
             ]
@@ -151,13 +147,17 @@ pub fn load_settings(
 }
 
 /// Load user config and add appropriate events to the events vector.
-fn load_user_config_with_events(events: &mut Vec<SettingsEvent>) -> Option<RawWorkspaceSettings> {
+fn load_user_config_with_events(
+    events: &mut Vec<SettingsEvent>,
+    used_deprecated_root_markers: &mut bool,
+) -> Option<RawWorkspaceSettings> {
     match load_user_config() {
-        Ok(Some(settings)) => {
+        Ok(Some(config)) => {
             events.push(SettingsEvent::info(
                 "Loaded user config from XDG_CONFIG_HOME",
             ));
-            Some(settings)
+            *used_deprecated_root_markers |= config.uses_deprecated_root_markers;
+            Some(config.settings)
         }
         Ok(None) => {
             // No user config file exists - this is fine (zero-config experience)
