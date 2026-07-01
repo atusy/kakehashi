@@ -342,6 +342,10 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
 /// defaults-only `languageServers._` entry) this was a hard deserialization
 /// error; the warning restores that feedback at settings-apply time instead
 /// of leaving the user with a server that never runs.
+///
+/// A server that resolves to `enabled: false` is excluded even if its `cmd`
+/// is also empty: disabling a server is a deliberate choice, not the
+/// misconfiguration this warning exists to surface.
 pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<String> {
     let servers = &settings.language_servers;
     let mut names: Vec<String> = servers

@@ -1586,21 +1586,22 @@ mod tests {
             "a server disabled via the wildcard default contributes no triggers"
         );
 
-        // The wildcard's OWN triggers must also be excluded when the
-        // wildcard itself carries `enabled: false` (the documented
-        // disable-everything-by-default knob) — not just triggers inherited
-        // by concrete servers through it.
-        let wildcard_disables_itself = HashMap::from([(
+        // The wildcard key itself is never a direct contributor — it's
+        // excluded from iteration entirely (see the function's doc comment),
+        // so a config with only a `_` entry always advertises nothing,
+        // regardless of its own `enabled` or triggers: nothing inherits from
+        // it when there are no concrete servers.
+        let wildcard_only = HashMap::from([(
             "_".to_string(),
             BridgeServerConfig {
-                enabled: Some(false),
+                enabled: Some(true),
                 ..server(Some(vec!["}"]), None)
             },
         )]);
         assert_eq!(
-            on_type_formatting_trigger_union(&wildcard_disables_itself),
+            on_type_formatting_trigger_union(&wildcard_only),
             None,
-            "the wildcard's own trigger must not be advertised while `_.enabled` is false"
+            "a wildcard-only config has no concrete server to inherit its triggers"
         );
 
         // A concrete server that opts back IN over a disabled wildcard must
