@@ -185,15 +185,18 @@ impl LanguageServerPool {
         };
 
         // A server that is no longer configured, or that the user has since
-        // disabled, must not be respawned just to resolve a stale lens.
-        let config = resolve_with_wildcard(
+        // disabled, must not be respawned just to resolve a stale lens. Check
+        // the allocation-free predicate first to fail fast, before paying for
+        // resolve_with_wildcard's full config clone/merge.
+        if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
+        }
+        let Some(config) = resolve_with_wildcard(
             &settings.language_servers,
             &envelope.origin,
             merge_bridge_server_configs,
-        )
-        .filter(BridgeServerConfig::is_spawnable);
-
-        let Some(config) = config else {
+        ) else {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         };

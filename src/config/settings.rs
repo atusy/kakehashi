@@ -479,15 +479,10 @@ pub(crate) fn on_type_formatting_trigger_union(
         .get(crate::config::WILDCARD_KEY)
         .and_then(|w| w.on_type_formatting_triggers.as_ref());
     let mut triggers: Vec<String> = servers
-        .keys()
-        .filter(|name| name.as_str() != crate::config::WILDCARD_KEY)
-        .filter(|name| crate::config::is_server_spawnable(servers, name))
-        .filter_map(|name| {
-            servers[name]
-                .on_type_formatting_triggers
-                .as_ref()
-                .or(wildcard_triggers)
-        })
+        .iter()
+        .filter(|(name, _)| name.as_str() != crate::config::WILDCARD_KEY)
+        .filter(|(name, _)| crate::config::is_server_spawnable(servers, name))
+        .filter_map(|(_, s)| s.on_type_formatting_triggers.as_ref().or(wildcard_triggers))
         .flatten()
         .filter(|t| t.chars().count() == 1)
         .cloned()
