@@ -16,6 +16,7 @@ pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
 pub(crate) use range::handle_semantic_tokens_range_parallel_async;
 
 // Re-export for parallel processing
+pub(crate) use parallel::build_document_discovery;
 use parallel::{InjectionCacheCtx, collect_injection_tokens_parallel};
 
 /// Owned handle the LSP layer passes into [`handle_semantic_tokens_full`] to
@@ -27,6 +28,11 @@ pub(crate) struct InjectionCacheParams {
     pub tracker: std::sync::Arc<crate::language::NodeTracker>,
     pub cache: std::sync::Arc<crate::analysis::InjectionTokenCache>,
     pub generation: u64,
+    /// Owned injection discovery for the tree being tokenized (#529 companion
+    /// lever), read from the document alongside the tree, or `None`. When present
+    /// and its generation still matches, the injection pass rebuilds contexts from
+    /// it and skips the injection query.
+    pub discovery: Option<crate::document::DiscoveredInjections>,
 }
 
 // Internal re-exports for production code
@@ -91,6 +97,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             tracker: p.tracker.as_ref(),
             cache: p.cache.as_ref(),
             generation: p.generation,
+            discovery: p.discovery.as_ref(),
         });
 
         // Collect injection tokens in parallel using Rayon.

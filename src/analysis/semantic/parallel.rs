@@ -19,7 +19,7 @@ use super::injection::{InjectionContext, RegionCacheInfo};
 use super::token_collector::{ActiveInjectionBounds, RawToken, collect_host_tokens};
 use crate::analysis::InjectionTokenCache;
 use crate::config::CaptureMappings;
-use crate::document::{DiscoveredRegion, DiscoveredRegionCache};
+use crate::document::{DiscoveredInjections, DiscoveredRegion, DiscoveredRegionCache};
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{
@@ -58,6 +58,11 @@ pub(crate) struct InjectionCacheCtx<'a> {
     pub tracker: &'a NodeTracker,
     pub cache: &'a InjectionTokenCache,
     pub generation: u64,
+    /// Owned discovery for this tree (#529), or `None`. Reused — skipping the
+    /// injection query — only when its `generation` still matches `generation`
+    /// above (a settings reload bumps the generation, so stale-query discovery
+    /// misses and re-discovers inline).
+    pub discovery: Option<&'a DiscoveredInjections>,
 }
 
 /// Maximum number of parsers to cache per Rayon worker thread.
@@ -746,6 +751,68 @@ fn rebuild_context<'a>(
     })
 }
 
+/// Build the owned injection discovery for a freshly parsed document from the
+/// regions [`collect_all_injections`](crate::language::injection::collect_all_injections)
+/// already returned — the producer half of the "don't discover twice" lever
+/// (#529). Reuses the caller's single injection-query pass (`Q`, the dominant
+/// discovery cost); only the per-region `from_region_info` / `get_or_create`
+/// recompute, negligible beside `Q`.
+///
+/// Returns `None` (store nothing → the semantic path re-discovers inline) when:
+/// - the document has any `injection.combined` group — those keep the inline
+///   path in v1 (their whole-group contexts aren't part of the owned form yet);
+/// - fewer single regions than the token-cache gate, so caching wouldn't pay and
+///   the reuse path must stay byte-identical to pre-#529;
+/// - discovery is incomplete (a parser/language isn't loaded yet), matching the
+///   token half's `fully_loaded` gate — never persist a partial region set, or a
+///   later request bound to this tree would see missing tokens until the next edit.
+pub(crate) fn build_document_discovery(
+    regions: &[InjectionRegionInfo<'_>],
+    injection_query: &tree_sitter::Query,
+    text: &str,
+    coordinator: &LanguageCoordinator,
+    uri: &Url,
+    tracker: &NodeTracker,
+    generation: u64,
+) -> Option<DiscoveredInjections> {
+    // Partition exactly as collect_injection_contexts_sync does: an
+    // injection.combined pattern (with no effective #offset!) → bail, v1 keeps
+    // combined groups on the inline path.
+    let mut singles: Vec<&InjectionRegionInfo> = Vec::with_capacity(regions.len());
+    for injection in regions {
+        if has_combined_for_pattern(injection_query, injection.pattern_index)
+            && effective_offset_for_pattern(injection_query, injection.pattern_index).is_none()
+        {
+            return None;
+        }
+        singles.push(injection);
+    }
+
+    // Same region-count gate as the token half: below it, caching doesn't pay and
+    // the semantic reuse path stays byte-identical to the pre-#529 inline path.
+    if singles.len() < INJECTION_CACHE_MIN_REGIONS {
+        return None;
+    }
+
+    let mut discovered = Vec::with_capacity(singles.len());
+    for injection in singles {
+        match discover_single_region(injection, text, coordinator, None, Some((uri, tracker))) {
+            SingleDiscovery::Region(region) => discovered.push(region),
+            // A not-yet-loaded parser/language taints discovery — never store a
+            // partial region set (the discovery analogue of the fully_loaded gate).
+            SingleDiscovery::Incomplete => return None,
+            // Permanently invalid region: dropped from both discovery and the
+            // inline contexts, so omitting it keeps reuse equivalent.
+            SingleDiscovery::Skip => {}
+        }
+    }
+
+    Some(DiscoveredInjections {
+        generation,
+        regions: discovered,
+    })
+}
+
 /// Per-line byte prefix widths from included ranges: each range's
 /// `start_point.column` is the byte width of the excluded prefix (e.g. `> `)
 /// before the content on that line. Only the first range on a row sets it.
@@ -926,21 +993,52 @@ pub(crate) fn collect_injection_tokens_parallel(
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use rayon::prelude::*;
 
-    // Collect top-level injection contexts and their byte ranges. The cache
-    // handle (if any) lets the discovery phase resolve region identities
-    // single-threaded, before the fan-out.
-    // A top-level region dropped during discovery isn't cached (no region_cache
-    // is built for it), so the top-level completeness flag is irrelevant here —
-    // only nested completeness, threaded through process_injection_sync, matters.
-    let (contexts, exclusion_byte_ranges, _discovery_complete) = collect_injection_contexts_sync(
-        host_text,
-        host_tree,
-        host_filetype,
-        coordinator,
-        0,
-        None,
-        cache_ctx.map(|c| (c.uri, c.tracker)),
-    );
+    // Reuse the discovery `populate_injections` already ran on this exact tree,
+    // when present and still generation-current (#529 companion lever): rebuild
+    // the top-level contexts from the owned data and skip the injection query
+    // (`Q`) entirely. Otherwise discover inline exactly as before — the fallback
+    // is byte-identical to the pre-lever path (below the region-count gate, or
+    // with any `injection.combined` group, `populate_injections` stores no
+    // discovery, so this is `None` and we take the inline branch).
+    let reusable_discovery =
+        cache_ctx.and_then(|c| c.discovery.filter(|d| d.generation == c.generation));
+    let (contexts, exclusion_byte_ranges) = if let Some(discovery) = reusable_discovery {
+        let mut contexts = Vec::with_capacity(discovery.regions.len());
+        let mut exclusion_byte_ranges = Vec::with_capacity(discovery.regions.len());
+        for region in &discovery.regions {
+            // A region whose highlight query isn't loaded is dropped (rebuild
+            // returns None) — same as the inline path's query-missing branch. The
+            // generation match makes this near-impossible, but the drop is safe.
+            if let Some(ctx) = rebuild_context(
+                region,
+                host_text,
+                0,
+                coordinator,
+                &mut exclusion_byte_ranges,
+            ) {
+                contexts.push(ctx);
+            }
+        }
+        (contexts, exclusion_byte_ranges)
+    } else {
+        // Collect top-level injection contexts and their byte ranges. The cache
+        // handle (if any) lets the discovery phase resolve region identities
+        // single-threaded, before the fan-out.
+        // A top-level region dropped during discovery isn't cached (no region_cache
+        // is built for it), so the top-level completeness flag is irrelevant here —
+        // only nested completeness, threaded through process_injection_sync, matters.
+        let (contexts, exclusion_byte_ranges, _discovery_complete) =
+            collect_injection_contexts_sync(
+                host_text,
+                host_tree,
+                host_filetype,
+                coordinator,
+                0,
+                None,
+                cache_ctx.map(|c| (c.uri, c.tracker)),
+            );
+        (contexts, exclusion_byte_ranges)
+    };
 
     if contexts.is_empty() {
         return (Vec::new(), Vec::new());
@@ -2364,6 +2462,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            discovery: None,
         };
 
         let first = collect_injection_tokens_parallel(
@@ -2402,6 +2501,110 @@ local b = 2
         assert_eq!(second, uncached, "second (hit) pass must match uncached");
     }
 
+    /// The discovery-reuse path (skip the injection query, rebuild contexts from
+    /// the owned discovery `populate_injections` stored) produces byte-identical
+    /// tokens to inline discovery — and a stale generation falls back to inline.
+    #[test]
+    fn discovery_reuse_matches_inline_output() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
+        let uri = Url::parse("file:///discovery_reuse.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+
+        // Baseline: inline discovery (no owned discovery threaded in).
+        let inline = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            None,
+        )
+        .0;
+
+        // Build the owned discovery exactly as populate_injections does, on the
+        // same tree.
+        let injection_query = coordinator
+            .injection_query("markdown")
+            .expect("markdown injection query");
+        let regions = crate::language::injection::collect_all_injections(
+            &tree.root_node(),
+            &text,
+            Some(injection_query.as_ref()),
+        )
+        .expect("regions");
+        let discovery = build_document_discovery(
+            &regions,
+            injection_query.as_ref(),
+            &text,
+            &coordinator,
+            &uri,
+            &tracker,
+            0,
+        )
+        .expect("eight single lua blocks clear the gate and discovery completes");
+        assert_eq!(discovery.regions.len(), 8);
+
+        // Reuse path: discovery present and generation-current → skips the query.
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+            discovery: Some(&discovery),
+        };
+        let reused = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+        assert_eq!(
+            reused, inline,
+            "discovery reuse must match inline discovery byte-for-byte"
+        );
+
+        // A stale generation must ignore the discovery and re-discover inline.
+        let cc_stale = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 1,
+            discovery: Some(&discovery),
+        };
+        let fell_back = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc_stale),
+        )
+        .0;
+        assert_eq!(
+            fell_back, inline,
+            "a stale-generation discovery must fall back to inline discovery"
+        );
+    }
+
     /// Proof the reuse path actually *reads* the cache rather than recomputing:
     /// overwrite one region's stored entry with a sentinel token (length 999,
     /// which no real lua token has), then re-run. The sentinel can only appear in
@@ -2424,6 +2627,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            discovery: None,
         };
 
         // Populate.
@@ -2498,6 +2702,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            discovery: None,
         };
 
         // Populate against the original document.

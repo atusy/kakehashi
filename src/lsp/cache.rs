@@ -169,6 +169,16 @@ impl CacheCoordinator {
     /// enabling stable IDs across document edits when position adjustments are applied.
     ///
     /// Also clears stale InjectionTokenCache entries for removed regions.
+    ///
+    /// Returns the owned injection **discovery** for this parse (#529 companion
+    /// lever) when it should be reused by a following `semanticTokens` request —
+    /// `None` when there is nothing worth reusing (no query, no/empty regions,
+    /// below the region-count gate, an `injection.combined` group, or a
+    /// not-yet-loaded parser). The caller attaches a returned discovery to the
+    /// document via the epoch-guarded write-back, binding it to this tree; the
+    /// discovery query (`Q`) is run **once** here and shared, never re-run on the
+    /// request path.
+    #[must_use]
     pub(crate) fn populate_injections(
         &self,
         uri: &Url,
@@ -177,7 +187,7 @@ impl CacheCoordinator {
         language_name: &str,
         language: &LanguageCoordinator,
         tracker: &NodeTracker,
-    ) {
+    ) -> Option<crate::document::DiscoveredInjections> {
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
@@ -186,7 +196,7 @@ impl CacheCoordinator {
                 // Clear any stale injection caches
                 self.injection_map.clear(uri);
                 self.injection_token_cache.clear_document(uri);
-                return;
+                return None;
             }
         };
 
@@ -198,7 +208,7 @@ impl CacheCoordinator {
                 // Clear any existing regions and caches for this document
                 self.injection_map.clear(uri);
                 self.injection_token_cache.clear_document(uri);
-                return;
+                return None;
             }
 
             // Get existing regions for cache cleanup and content comparison
@@ -269,7 +279,24 @@ impl CacheCoordinator {
 
             // Store in injection map
             self.injection_map.insert(uri.clone(), cacheable_regions);
+
+            // Producer half of the discovery lever (#529): build the owned
+            // discovery from the SAME `regions` just collected — the injection
+            // query (`Q`) is not re-run — so a following `semanticTokens` request
+            // bound to this tree can rebuild its contexts without re-discovering.
+            // `None` when discovery isn't worth reusing (gate/combined/incomplete).
+            return crate::analysis::semantic::build_document_discovery(
+                &regions,
+                injection_query.as_ref(),
+                text,
+                language,
+                uri,
+                tracker,
+                self.semantic_token_generation(),
+            );
         }
+
+        None
     }
 
     /// Get all injection regions for a document (test helper).
@@ -646,7 +673,7 @@ print("hello")
         let tree = parser.parse(initial_text, None).expect("parse");
 
         // Populate injections - this should create a region with position-based ULID
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             initial_text,
             &tree,
@@ -704,7 +731,7 @@ print("hello")
         // Key insight: After apply_text_diff, the tracker's positions are adjusted,
         // so get_or_create returns the SAME ULID. The invalidation check in
         // populate_injections should detect language_changed and remove cached tokens.
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             edited_text,
             &edited_tree,
@@ -779,7 +806,7 @@ print("hello")
         let tree = parser.parse(initial_text, None).expect("parse");
 
         // Populate injections
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             initial_text,
             &tree,
@@ -824,7 +851,7 @@ print("goodbye")
         let edited_tree = parser.parse(edited_text, None).expect("parse edited");
 
         // Re-populate injections
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             edited_text,
             &edited_tree,

@@ -61,3 +61,24 @@ pub(crate) struct DiscoveredRegion {
     /// Token-cache identity, or `None` when the region isn't token-cacheable.
     pub token_cache: Option<DiscoveredRegionCache>,
 }
+
+/// The complete owned injection discovery for one parse of a document: every
+/// top-level single region plus the settings `generation` it was resolved under.
+///
+/// Stored on the [`Document`](super::Document) by the off-ingress write-back only
+/// when discovery was *complete* (no region dropped for a not-yet-loaded
+/// parser/query) and the document had no `injection.combined` group (those keep
+/// the inline path in v1), so a present value is always the full single-region
+/// set for the bound tree.
+#[derive(Clone)]
+pub(crate) struct DiscoveredInjections {
+    /// Settings generation at discovery time. The reader skips reuse when it no
+    /// longer matches the current generation — a reload rebuilt the injection /
+    /// highlight queries, so the owned contexts (and the language resolution
+    /// behind them) may be stale. One integer compare; the same discipline the
+    /// injection-token cache key uses. (On-`Document` discovery is not reached by
+    /// `bump_semantic_token_generation`, which clears the side caches only, so
+    /// this gate is what a reload relies on.)
+    pub generation: u64,
+    pub regions: Vec<DiscoveredRegion>,
+}

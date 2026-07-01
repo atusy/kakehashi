@@ -291,8 +291,8 @@ impl ParseCoordinator {
                         Some(&language_name),
                         Some(tree.clone()),
                     );
-                if stored.is_some() {
-                    self.cache.populate_injections(
+                if let Some(parse_epoch) = stored {
+                    let discovery = self.cache.populate_injections(
                         &uri,
                         &text,
                         &tree,
@@ -300,6 +300,17 @@ impl ParseCoordinator {
                         &self.language,
                         self.bridge.node_tracker(),
                     );
+                    // Attach the owned discovery to this exact tree (#529): the
+                    // epoch/incarnation-guarded write-back no-ops if a later parse
+                    // already moved the tree on, so a stale discovery is never served.
+                    if let Some(discovery) = discovery {
+                        self.documents.set_injections_if_epoch_unchanged(
+                            &uri,
+                            incarnation,
+                            parse_epoch,
+                            discovery,
+                        );
+                    }
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, true);
                 }
@@ -483,8 +494,8 @@ impl ParseCoordinator {
                 expected_incarnation,
                 tree.clone(),
             );
-            if stored.is_some() {
-                self.cache.populate_injections(
+            if let Some(parse_epoch) = stored {
+                let discovery = self.cache.populate_injections(
                     &uri,
                     &text,
                     &tree,
@@ -492,6 +503,14 @@ impl ParseCoordinator {
                     &self.language,
                     self.bridge.node_tracker(),
                 );
+                if let Some(discovery) = discovery {
+                    self.documents.set_injections_if_epoch_unchanged(
+                        &uri,
+                        expected_incarnation,
+                        parse_epoch,
+                        discovery,
+                    );
+                }
                 break;
             }
             // CAS rejected: the text moved under us (a concurrent `didChange`).
@@ -612,8 +631,8 @@ impl ParseCoordinator {
                 incarnation,
                 tree.clone(),
             );
-            if stored.is_some() {
-                self.cache.populate_injections(
+            if let Some(parse_epoch) = stored {
+                let discovery = self.cache.populate_injections(
                     uri,
                     &text,
                     &tree,
@@ -621,6 +640,14 @@ impl ParseCoordinator {
                     &self.language,
                     self.bridge.node_tracker(),
                 );
+                if let Some(discovery) = discovery {
+                    self.documents.set_injections_if_epoch_unchanged(
+                        uri,
+                        incarnation,
+                        parse_epoch,
+                        discovery,
+                    );
+                }
             }
         }
 

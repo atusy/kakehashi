@@ -541,6 +541,46 @@ impl DocumentStore {
         stamped
     }
 
+    /// Attach owned injection **discovery** to a document's parse result, but only
+    /// if the tree it was built on is still the one published — the off-ingress
+    /// write-back half of the "don't discover twice" lever (#529).
+    ///
+    /// `expected_epoch` is the [`parse_epoch`](Document::parse_epoch) a tree-CAS
+    /// stamped and returned when it stored the tree `populate_injections` then ran
+    /// the injection query over. Three axes, checked atomically under the same
+    /// `get_mut` shard lock as the write:
+    /// - **epoch** rejects a discovery built on a tree that a later parse has
+    ///   already replaced — including the same-`(text, incarnation)` tree swap
+    ///   [`update_tree_if_text_and_language_unchanged`] permits and an `A→B→A`
+    ///   edit cycle (every tree write bumps the epoch and clears the old
+    ///   discovery, so a stale write-back finds a moved epoch and no-ops);
+    /// - **incarnation** rejects an epoch value reused across a close+reopen — a
+    ///   fresh lifetime restarts `parse_epoch` from `0`, so the numbers could
+    ///   otherwise collide;
+    /// - **tree present** rejects attaching discovery while the reader-visible
+    ///   tree is cleared (mid-edit), so `injections.is_some()` always implies a
+    ///   tree to pair it with.
+    ///
+    /// **Non-inserting** (`get_mut`): a document a concurrent `didClose` removed is
+    /// left gone, never resurrected. Returns whether the discovery was attached.
+    pub(crate) fn set_injections_if_epoch_unchanged(
+        &self,
+        uri: &Url,
+        expected_incarnation: u64,
+        expected_epoch: u64,
+        injections: crate::document::DiscoveredInjections,
+    ) -> bool {
+        if let Some(mut doc) = self.documents.get_mut(uri)
+            && doc.incarnation() == expected_incarnation
+            && doc.parse_epoch() == expected_epoch
+            && doc.tree().is_some()
+        {
+            doc.set_injections(injections);
+            return true;
+        }
+        false
+    }
+
     /// Return the per-document `didChange` serialization lock, creating it on
     /// first use. Callers hold the guard across the document's edit critical
     /// section so concurrent edits to the same document apply in order. See the
@@ -1244,6 +1284,115 @@ mod tests {
         assert!(
             store.get(&uri).is_none(),
             "the off-ingress open parse must not resurrect a closed document"
+        );
+    }
+
+    #[test]
+    fn set_injections_attaches_only_under_the_stamping_epoch() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///inj.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let (incarnation, text) = {
+            let d = store.get(&uri).unwrap();
+            (d.incarnation(), d.text_arc())
+        };
+
+        // Install a tree; capture the epoch it stamped.
+        let epoch = store
+            .set_parse_result_if_text_and_incarnation_unchanged(
+                &uri,
+                &text,
+                incarnation,
+                Some("rust"),
+                Some(parse_rust("fn main() {}")),
+            )
+            .expect("tree stored");
+
+        let disc = crate::document::DiscoveredInjections {
+            generation: 7,
+            regions: Vec::new(),
+        };
+        assert!(store.set_injections_if_epoch_unchanged(&uri, incarnation, epoch, disc.clone()));
+        assert_eq!(
+            store.get(&uri).unwrap().injections().unwrap().generation,
+            7,
+            "discovery attaches under the stamping epoch"
+        );
+
+        // A later tree write bumps the epoch and clears the discovery; a
+        // write-back under the now-stale epoch must no-op.
+        let epoch2 = store
+            .update_tree_if_text_and_language_unchanged(
+                &uri,
+                "fn main() {}",
+                Some("rust"),
+                incarnation,
+                parse_rust("fn main() {}"),
+            )
+            .expect("tree stored");
+        assert_ne!(epoch, epoch2);
+        assert!(
+            store.get(&uri).unwrap().injections().is_none(),
+            "a tree write clears stale discovery"
+        );
+        assert!(
+            !store.set_injections_if_epoch_unchanged(&uri, incarnation, epoch, disc.clone()),
+            "a write-back under the old epoch is rejected"
+        );
+
+        // The fresh epoch attaches again.
+        assert!(store.set_injections_if_epoch_unchanged(&uri, incarnation, epoch2, disc));
+        assert!(store.get(&uri).unwrap().injections().is_some());
+    }
+
+    #[test]
+    fn set_injections_rejects_a_reopen_incarnation_that_reaches_the_same_epoch() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///inj_reopen.rs").unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let (stale_incarnation, text) = {
+            let d = store.get(&uri).unwrap();
+            (d.incarnation(), d.text_arc())
+        };
+        let epoch = store
+            .set_parse_result_if_text_and_incarnation_unchanged(
+                &uri,
+                &text,
+                stale_incarnation,
+                Some("rust"),
+                Some(parse_rust("fn main() {}")),
+            )
+            .expect("tree stored");
+
+        // Close + reopen: a fresh lifetime restarts parse_epoch from 0, so the same
+        // epoch value is reachable, but the incarnation differs.
+        store.remove(&uri);
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let new_incarnation = store.get(&uri).unwrap().incarnation();
+        assert_ne!(stale_incarnation, new_incarnation);
+
+        let disc = crate::document::DiscoveredInjections {
+            generation: 1,
+            regions: Vec::new(),
+        };
+        assert!(
+            !store.set_injections_if_epoch_unchanged(&uri, stale_incarnation, epoch, disc),
+            "a prior-lifetime write-back must not attach across a reopen even if the epoch matches"
         );
     }
 

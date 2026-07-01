@@ -63,7 +63,11 @@ impl Kakehashi {
     ///
     /// Returns `(tree, text)` tuple where tree was verified to be parsed from text,
     /// or `None` if the document is missing or parsing failed.
-    async fn get_tree_with_wait(&self, uri: &Url, language_name: &str) -> Option<(Tree, String)> {
+    async fn get_tree_with_wait(
+        &self,
+        uri: &Url,
+        language_name: &str,
+    ) -> Option<(Tree, String, Option<crate::document::DiscoveredInjections>)> {
         // If the document isn't open there is nothing to settle or snapshot.
         // Return before taking the edit lock so we don't create a lock entry for
         // a never-opened/closed URI (language detection can resolve a language
@@ -137,24 +141,33 @@ impl Kakehashi {
         if let Some(doc) = self.documents.get(uri) {
             let text = doc.text().to_string();
             if let Some(tree) = doc.tree().cloned() {
+                // Read the owned injection discovery from the SAME handle as the
+                // tree (#529): by the Document invariant it is `Some` only for
+                // exactly this tree, so `(tree, discovery)` is a consistent unit —
+                // the reader needs no tree-identity gate of its own.
+                let discovery = doc.injections().cloned();
                 log::debug!(
                     target: "kakehashi::semantic",
                     "Using existing tree from document store for {}",
                     uri.path()
                 );
-                return Some((tree, text));
+                return Some((tree, text, discovery));
             }
         }
 
         // Fallback: parse on-demand if no tree is available.
         // This handles race conditions where semantic tokens are requested before
-        // didOpen/didChange finishes parsing.
+        // didOpen/didChange finishes parsing. An on-demand parse does not populate
+        // injection discovery, so there is none to reuse — the injection pass
+        // re-discovers inline.
         log::debug!(
             target: "kakehashi::semantic",
             "Parsing on-demand for {} (no tree in store)",
             uri.path()
         );
-        self.try_parse_and_update_document(uri, language_name).await
+        self.try_parse_and_update_document(uri, language_name)
+            .await
+            .map(|(tree, text)| (tree, text, None))
     }
 
     /// Parse the document on-demand and update the store if successful.
@@ -322,7 +335,9 @@ impl Kakehashi {
         }
 
         // Get tree and text, waiting for parse completion or parsing on-demand
-        let Some((tree, text)) = self.get_tree_with_wait(&uri, &language_name).await else {
+        let Some((tree, text, injection_discovery)) =
+            self.get_tree_with_wait(&uri, &language_name).await
+        else {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -391,6 +406,9 @@ impl Kakehashi {
                 tracker: self.bridge.node_tracker_arc(),
                 cache: self.cache.injection_token_cache_arc(),
                 generation: token_generation,
+                // Owned discovery for this exact tree (or None) — lets the
+                // injection pass skip the query when it matches the generation (#529).
+                discovery: injection_discovery,
             });
 
             // Compute tokens, racing against cancel notification if provided
@@ -594,7 +612,9 @@ impl Kakehashi {
         }
 
         // Get tree and text, waiting for parse completion or parsing on-demand
-        let Some((tree, text)) = self.get_tree_with_wait(&uri, &language_name).await else {
+        let Some((tree, text, injection_discovery)) =
+            self.get_tree_with_wait(&uri, &language_name).await
+        else {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -666,6 +686,7 @@ impl Kakehashi {
                     tracker: self.bridge.node_tracker_arc(),
                     cache: self.cache.injection_token_cache_arc(),
                     generation: token_generation,
+                    discovery: injection_discovery,
                 });
 
                 // Compute tokens, racing against cancel notification if provided

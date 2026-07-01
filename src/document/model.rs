@@ -92,6 +92,14 @@ pub struct Document {
     /// distinct even when the text returns). Paired with `incarnation` at the
     /// write-back so a value reused across a close+reopen can't false-match.
     parse_epoch: u64,
+    /// Owned injection discovery for the currently published `tree` (#529
+    /// companion lever), or `None` when not yet computed / invalidated. Set only
+    /// by the off-ingress write-back
+    /// ([`set_injections_if_epoch_unchanged`](crate::document::DocumentStore::set_injections_if_epoch_unchanged)),
+    /// which binds it to the tree via `parse_epoch`; cleared on **every** tree
+    /// write by [`bump_parse_epoch`](Self::bump_parse_epoch), so a discovery is
+    /// never observed against a tree it was not built on.
+    injections: Option<crate::document::DiscoveredInjections>,
 }
 
 impl Document {
@@ -104,6 +112,7 @@ impl Document {
             pending_seed: None,
             incarnation,
             parse_epoch: 0,
+            injections: None,
         }
     }
 
@@ -116,6 +125,7 @@ impl Document {
             pending_seed: None,
             incarnation,
             parse_epoch: 0,
+            injections: None,
         }
     }
 
@@ -133,14 +143,19 @@ impl Document {
             pending_seed: None,
             incarnation,
             parse_epoch: 0,
+            injections: None,
         }
     }
 
-    /// Bump [`parse_epoch`](Self::parse_epoch) on every write to `tree`. Saturating
-    /// (a wrap would need 2^64 installs between a write-back's capture and its
-    /// check — impossible), matching `ParseState::generation`.
+    /// Bump [`parse_epoch`](Self::parse_epoch) on every write to `tree` and drop
+    /// any [`injections`](Self::injections) discovered against the previous tree —
+    /// the two invariants (fresh epoch, no stale discovery) a tree write must
+    /// maintain together. Saturating (a wrap would need 2^64 installs between a
+    /// write-back's capture and its check — impossible), matching
+    /// `ParseState::generation`.
     fn bump_parse_epoch(&mut self) {
         self.parse_epoch = self.parse_epoch.saturating_add(1);
+        self.injections = None;
     }
 
     /// Get the text content
@@ -176,6 +191,19 @@ impl Document {
     /// discovery write-back.
     pub(crate) fn parse_epoch(&self) -> u64 {
         self.parse_epoch
+    }
+
+    /// The owned injection discovery for the currently published tree, if any
+    /// (#529). See [`injections`](Self::injections).
+    pub(crate) fn injections(&self) -> Option<&crate::document::DiscoveredInjections> {
+        self.injections.as_ref()
+    }
+
+    /// Attach injection discovery to the current tree. Called **only** by the
+    /// epoch-guarded write-back so the discovery is bound to the tree it was built
+    /// on; not a tree write, so it does not bump `parse_epoch`.
+    pub(crate) fn set_injections(&mut self, injections: crate::document::DiscoveredInjections) {
+        self.injections = Some(injections);
     }
 
     /// Get a position mapper for this document
