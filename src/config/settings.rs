@@ -439,6 +439,14 @@ impl BridgeServerConfig {
     pub(crate) fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
     }
+
+    /// A resolved config is a real, usable server: it has a command to run
+    /// AND it hasn't been disabled. Every "is this server usable" call site
+    /// (spawn-resolution, capability advertisement, resolve-dispatch) should
+    /// share this single predicate rather than re-deriving it.
+    pub(crate) fn is_spawnable(&self) -> bool {
+        !self.cmd.is_empty() && self.is_enabled()
+    }
 }
 
 /// Union of every server's `onTypeFormattingTriggers`, shaped for the LSP
@@ -462,14 +470,20 @@ pub(crate) fn on_type_formatting_trigger_union(
 ) -> Option<(String, Vec<String>)> {
     let mut triggers: Vec<String> = servers
         .iter()
-        .filter(|(name, _)| {
-            name.as_str() == crate::config::WILDCARD_KEY
-                || crate::config::resolve_with_wildcard(
+        .filter(|(name, config)| {
+            if name.as_str() == crate::config::WILDCARD_KEY {
+                // The wildcard's own triggers still join the union as-is
+                // (see doc above), but only while the wildcard itself isn't
+                // the `_.enabled: false` disable-everything-by-default knob.
+                config.is_enabled()
+            } else {
+                crate::config::resolve_with_wildcard(
                     servers,
                     name,
                     crate::config::merge_bridge_server_configs,
                 )
                 .is_some_and(|resolved| resolved.is_enabled())
+            }
         })
         .filter_map(|(_, s)| s.on_type_formatting_triggers.as_ref())
         .flatten()
@@ -1577,6 +1591,23 @@ mod tests {
             on_type_formatting_trigger_union(&servers_wildcard_disabled),
             None,
             "a server disabled via the wildcard default contributes no triggers"
+        );
+
+        // The wildcard's OWN triggers must also be excluded when the
+        // wildcard itself carries `enabled: false` (the documented
+        // disable-everything-by-default knob) — not just triggers inherited
+        // by concrete servers through it.
+        let wildcard_disables_itself = HashMap::from([(
+            "_".to_string(),
+            BridgeServerConfig {
+                enabled: Some(false),
+                ..server(Some(vec!["}"]), None)
+            },
+        )]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&wildcard_disables_itself),
+            None,
+            "the wildcard's own trigger must not be advertised while `_.enabled` is false"
         );
     }
 

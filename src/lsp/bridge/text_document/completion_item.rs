@@ -44,15 +44,19 @@ impl LanguageServerPool {
             return item;
         };
 
-        // Look up the server config for the origin server
+        // Look up the server config for the origin server. A server that is
+        // no longer configured, or that the user has since disabled, must
+        // not be respawned just to resolve a stale item.
         let config = resolve_with_wildcard(
             &settings.language_servers,
             &envelope.origin,
             merge_bridge_server_configs,
-        );
+        )
+        .filter(BridgeServerConfig::is_spawnable);
 
         let Some(config) = config else {
-            // Server no longer configured — re-envelope and return as-is
+            // Server no longer configured (or disabled) — re-envelope and
+            // return as-is.
             re_envelope_item(&mut item, &envelope);
             return item;
         };
@@ -405,6 +409,34 @@ mod tests {
         // Should be re-enveloped (routing info preserved for future attempts)
         let envelope = extract_envelope(&result).expect("should have envelope");
         assert_eq!(envelope.origin, "nonexistent-ls");
+    }
+
+    /// dispatch must not respawn a server the user has since disabled just
+    /// to resolve a stale completion item — it should degrade the same way
+    /// as "server not configured" (re-envelope, return unresolved).
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_origin_server_disabled() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua-ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["lua-language-server".to_string()],
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let item = enveloped_item("lua-ls");
+        let result = pool
+            .dispatch_completion_resolve(item, &settings, None)
+            .await;
+
+        let envelope = extract_envelope(&result).expect("should have envelope");
+        assert_eq!(
+            envelope.origin, "lua-ls",
+            "a disabled server's item is returned unresolved, not respawned"
+        );
     }
 
     // ==========================================================================

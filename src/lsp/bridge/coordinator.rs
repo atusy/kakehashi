@@ -288,8 +288,7 @@ impl BridgeCoordinator {
             if let Some(resolved_config) =
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
-                    .filter(|c| !c.cmd.is_empty())
-                    .filter(|c| c.is_enabled())
+                    .filter(|c| c.is_spawnable())
             {
                 return Some(ResolvedServerConfig {
                     server_name: server_name.clone(),
@@ -340,8 +339,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
-                    .filter(|c| !c.cmd.is_empty())
-                    .filter(|c| c.is_enabled())
+                    .filter(|c| c.is_spawnable())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -382,8 +380,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == host_language))
-                    .filter(|c| !c.cmd.is_empty())
-                    .filter(|c| c.is_enabled())
+                    .filter(|c| c.is_spawnable())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),

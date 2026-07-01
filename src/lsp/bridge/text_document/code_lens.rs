@@ -184,11 +184,14 @@ impl LanguageServerPool {
             return lens;
         };
 
+        // A server that is no longer configured, or that the user has since
+        // disabled, must not be respawned just to resolve a stale lens.
         let config = resolve_with_wildcard(
             &settings.language_servers,
             &envelope.origin,
             merge_bridge_server_configs,
-        );
+        )
+        .filter(BridgeServerConfig::is_spawnable);
 
         let Some(config) = config else {
             re_envelope_lens(&mut lens, &envelope);
@@ -712,6 +715,40 @@ mod tests {
         let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
         assert_eq!(envelope.origin, "lua-ls");
         assert_eq!(envelope.inner, Some(json!({"kind": "references"})));
+        assert!(result.command.is_none(), "lens stays unresolved");
+    }
+
+    /// dispatch must not respawn a server the user has since disabled just
+    /// to resolve a stale lens — same fail-soft degradation as "not
+    /// configured".
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_origin_server_disabled() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua-ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["lua-language-server".to_string()],
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let offset = RegionOffset::new(3, 0);
+        let mut lens = CodeLens {
+            range: tower_lsp_server::ls_types::Range::default(),
+            command: None,
+            data: Some(json!({"kind": "references"})),
+        };
+        envelope_lens_data(&mut lens, &ctx_with(&offset));
+
+        let result = pool.dispatch_code_lens_resolve(lens, &settings, None).await;
+
+        let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
+        assert_eq!(
+            envelope.origin, "lua-ls",
+            "a disabled server's lens is returned unresolved, not respawned"
+        );
         assert!(result.command.is_none(), "lens stays unresolved");
     }
 

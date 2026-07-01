@@ -339,7 +339,7 @@ impl WorkspaceSettings {
             .filter(|name| name.as_str() != WILDCARD_KEY)
             .any(|name| {
                 resolve_with_wildcard(&self.language_servers, name, merge_bridge_server_configs)
-                    .is_some_and(|server| !server.cmd.is_empty() && server.is_enabled())
+                    .is_some_and(|server| server.is_spawnable())
             })
     }
 }
