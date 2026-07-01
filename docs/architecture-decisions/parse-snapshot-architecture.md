@@ -126,32 +126,34 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
   not swap the `Tree` under an already-issued `result_id` and fire a spurious
-  refresh. `didOpen` sets `current_incarnation`; a reopen **resets the same cell in
-  place** to `(current_incarnation = N+1, snapshot = None)` (never a new cell — see
-  the isolation bullet below). Resetting `snapshot` to `None` is what clears the
-  version floor — the first post-reopen publish takes the `None` bootstrap branch,
-  so a leftover `parsed_version = 5` from the prior lifetime cannot make a fresh
-  `0 > 5` fail forever; the incarnation bump alone would not reset the floor. The
-  `None` bootstrap still checks `incarnation == current_incarnation` (it is not an
-  unconditional early-return), so a straggler publish from lifetime N is rejected
-  against N+1 and the version compare is only ever within one lifetime.
+  refresh. `didOpen` sets `current_incarnation`; a reopen starts the URI's cell
+  fresh at `(current_incarnation = N+1, snapshot = None)` (whether the cell is reset
+  in place or recreated is a correctness-irrelevant implementation choice — see the
+  isolation bullet). Starting `snapshot` at `None` is what clears the version floor:
+  the first post-reopen publish takes the `None` bootstrap branch, so a leftover
+  `parsed_version = 5` from the prior lifetime cannot make a fresh `0 > 5` fail
+  forever; the incarnation bump alone would not reset the floor. The `None` bootstrap
+  still checks `incarnation == current_incarnation` (it is not an unconditional
+  early-return), so a straggler publish from lifetime N is rejected against N+1 and
+  the version compare is only ever within one lifetime.
 - **Language axis** is subsumed by incarnation: every reopen draws a fresh
   incarnation (so a relabel across lifetimes is already rejected), and within one
   lifetime the language does not change. The three-axis edit-path CAS
   (`incarnation && text && language`) therefore reduces to `incarnation && version`.
-- **One stable per-URI cell, reset in place — never replaced.** The channel must
-  **not** be swapped out on reopen: replacing it would leave a prior-lifetime parse
-  task or in-flight reader holding `Sender`/`Receiver` clones of the *old* cell
-  (whose `current_incarnation` stays `N`), so an `N` straggler would publish into
-  the old cell and pass its own `== N` check, and an old-cell reader would still
-  observe it. Instead the per-URI cell is stable for the URI's whole existence and
-  **reset in place** on reopen — `send_if_modified` sets `current_incarnation = N+1`
-  and `snapshot = None` atomically. Because every clone points at the *same* cell,
-  a straggler `N` publish now fails `incarnation == current_incarnation` (`N != N+1`)
-  and every reader's `snapshot.incarnation == cell.current_incarnation` check
-  discards a cross-lifetime snapshot rather than serving it. The cell and the
-  document inputs are the **single per-URI lifetime object**, so there is one
-  authoritative incarnation, not a cross-map compare.
+- **Isolation is per-request re-resolution + incarnation validation, not cell
+  identity.** A `latest_snapshot(uri)` call resolves the *current* cell from the
+  store each time and never caches a `Receiver` across requests, and it validates
+  `snapshot.incarnation == <live document incarnation>` before serving — the cell
+  and the document inputs are one per-URI lifetime object, so there is one
+  authoritative incarnation. This makes cell lifecycle irrelevant to correctness:
+  on reopen the store may drop and recreate the cell, and a prior-lifetime parse
+  task holding a stale `Sender` clone can still publish — but only into that now
+  **detached** old cell, which no current-request reader resolves, so the publish
+  is unobservable; and a reader mid-compute holding a lifetime-`N` `Arc<ParseSnapshot>`
+  rejects it against the live `N+1` incarnation. The one reader that *does* hold a
+  `Receiver` — a first-parse waiter parked on `watch::changed()` — is woken when
+  `didClose` drops the sender (`Err` → falls through to `null`), exactly as today's
+  watermark-drop wakes parked `wait_for_epoch` readers.
 
 The incremental-parse **seed** re-homes onto `ParseScheduler`'s per-document state
 (accumulated `InputEdit`s + the `base_version` they extend). Two obligations,
@@ -175,9 +177,13 @@ exact publish succeeded** (the shared `NodeTracker` is not mutated on this path 
 all; see §3), in the order the
 per-document-parse-scheduler loop already uses (`populate → mark finished →
 downstream`). A rejected publish (a racing edit or reopen advanced the slot) emits
-nothing and mutates no shared state. During Stage 2's dual-write window the legacy
-tree CAS is the commit point the snapshot publish and downstream both gate on, so
-the two writes cannot expose different versions.
+nothing and mutates no shared state. During Stage 2's dual-write window the
+**snapshot publish is the sole commit point**: the legacy tree CAS is made
+strict-version too (it must not replace an equal-or-newer tree), a pass performs
+both writes under the same `(incarnation, parsed_version)` guard, and **all**
+downstream gates on the *snapshot publish* result — never on the legacy CAS. So the
+two writes cannot land for different versions, and no downstream effect fires for a
+snapshot the publish rejected even if the legacy CAS happened to win.
 
 ### 3. Reader contract — non-blocking, three classes
 
@@ -203,29 +209,35 @@ edit-shifted to `content_version` — cannot be made atomic without holding
 shared, edit-shifted identity index off the derivation path is fundamentally at
 odds with the snapshot model.
 
-The decision therefore **separates the two identities**:
+The decision therefore **separates three concerns that today all ride the tracker
+ULID**, so none needs a shared, edit-shifted mint off the parse path:
 
-- **Injection region identity is snapshot-owned and derived — it does not touch
-  the shared tracker.** `populate` computes each snapshot's `injection_regions`
-  (id + geometry) deterministically from *that snapshot's own tree* (a
-  content/structure-addressed id, stable for a given region content, computed with
-  no shared mutation). A reader reads region ids from its own snapshot, internally
-  consistent by construction; nothing is minted on the read path or written to the
-  shared tracker, so F2/F3's races do not arise.
-- **The shared `NodeTracker` stays exactly as-is, for the `kakehashi/node/*`
-  protocol only.** Those readers are position-critical (they resolve against live
-  positions), so they run at `content_version` and staleness-reject when the
-  snapshot trails — they never consult a stale snapshot, and the parse path never
-  mutates the tracker on their behalf.
+- **Within-snapshot enumeration** — the id `populate` puts in `injection_regions`
+  is a **document-order ordinal** (the region's index in the injection-query match
+  order over the snapshot's tree), paired with the region's byte geometry. It is
+  deterministic from the snapshot's own tree and unique within the snapshot even
+  for byte-identical regions (the ordinal disambiguates), so `(URI, region_id)`
+  cannot alias two regions of one snapshot. It is **not** a cross-edit-stable handle
+  and is not claimed to be — an edit that inserts a region renumbers ordinals.
+- **Cross-edit token reuse** (the injection-token-cache-reuse benefit) is re-keyed
+  off the ordinal onto **`(region content hash, validity_hash)`**: two snapshots'
+  byte-identical regions reuse tokens regardless of ordinal, which is what actually
+  makes reuse survive edits. Reworking that cache key is a **companion decision to
+  injection-token-cache-reuse**, not silently folded in here.
+- **Cross-edit bridge / virtual-document identity** — the stable handle a
+  downstream language server's virtual document is keyed by — **remains the shared
+  `NodeTracker` ULID**, which is a live-position (`content_version`) concern: it is
+  minted/adjusted on the `didChange` edit path (as today) and consumed by the
+  bridge and `kakehashi/node/*`, all of which operate on the live document and
+  staleness-reject rather than serve a stale snapshot. The parse/stale-read path
+  neither mints nor mutates it.
 
-The cost is a **changed interaction with injection-token-cache-reuse**, which today
-keys the injection-token cache on the tracker's position-stable ULID so token
-reuse survives across edits. With snapshot-owned ids, cross-edit reuse must be
-re-keyed on the derived (content-addressed) region id + the existing
-`validity_hash`; content-identical regions still reuse, but the reuse key changes.
-Reworking that cache key is scoped as a **companion decision to
-injection-token-cache-reuse**, not silently folded in here — this ADR commits only
-to *not* minting shared identities off the parse/read path.
+So a stale-tree reader reads self-consistent ordinals + geometry from its own
+snapshot and touches no shared identity index (the mint-race and the
+undefined-id-on-gate-failure both vanish); token reuse is content-keyed; and the
+one identity that genuinely needs cross-edit stability (the bridge's) keeps the
+tracker that already provides it. This ADR commits only to *not* minting shared
+identities off the parse/read path.
 
 Any reader that must resolve against **live** positions is position-critical
 (below).
@@ -323,17 +335,21 @@ inside the existing safety contracts at each step:
   preserving the `populate → finish` ordering the injection-map invalidation
   depends on.
 - **Stage 2 — versioned snapshot reads.** Introduce `SnapshotSlot` + the `watch`
-  channel + `latest_snapshot`. **The parse loop dual-writes**: it keeps the legacy
-  tree CAS (the incremental seed still reads `Document::tree`/`pending_seed`, which
-  Stage 3 removes) **and** publishes a `ParseSnapshot` to the new channel, so
-  `latest_snapshot` retains a servable tree across an edit's `tree.take()`. Move
-  region minting into `populate`. Convert `semanticTokens` to serve-stale + the
+  channel + `latest_snapshot`. **The parse loop dual-writes under one guard**: the
+  legacy tree CAS (the incremental seed still reads `Document::tree`/`pending_seed`,
+  which Stage 3 removes) is made strict-version like the publish, both writes run
+  under the same `(incarnation, parsed_version)` guard, and the **snapshot publish
+  is the sole commit point** — all downstream (refresh, forwarding, diagnostics,
+  shared cache writes) gates on the *publish* result, never the legacy CAS (§2). So
+  `latest_snapshot` retains a servable tree across an edit's `tree.take()` and the
+  two writes cannot expose different versions. Derive snapshot-owned region ids in
+  `populate` (no shared-tracker mint). Convert `semanticTokens` to serve-stale + the
   refresh trigger; `documentSymbol`/`documentColor` to serve-stale + passive;
   range/formatting/`node/*` to `ContentModified` and `captures` to `null` (its
-  re-sync signal). Removes `get_tree_with_wait`
-  / `wait_for_epoch` / `ensure_document_parsed` blocking. Delivers *instant reads*
-  and *lifecycle independent of parsing*. Without the dual-write this stage would
-  reproduce the empty-after-edit regression, so it is mandatory here, not deferred.
+  re-sync signal). Removes `get_tree_with_wait` / `wait_for_epoch` /
+  `ensure_document_parsed` blocking. Delivers *instant reads* and *lifecycle
+  independent of parsing*. Without the dual-write this stage would reproduce the
+  empty-after-edit regression, so it is mandatory here, not deferred.
 - **Stage 3 — consolidation.** Remove `Document::tree` / `pending_seed` (the seed
   now lives on the scheduler), collapse the CAS methods into the one publish
   primitive, delete the watermark waits, and prune the now-superseded passages
