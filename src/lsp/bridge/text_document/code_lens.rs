@@ -752,6 +752,45 @@ mod tests {
         assert!(result.command.is_none(), "lens stays unresolved");
     }
 
+    /// The disabled gate must also apply when the server inherits `enabled:
+    /// false` from the `_` wildcard rather than setting it directly.
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_origin_server_disabled_via_wildcard() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "_".to_string(),
+            BridgeServerConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        settings.language_servers.insert(
+            "lua-ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["lua-language-server".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let offset = RegionOffset::new(3, 0);
+        let mut lens = CodeLens {
+            range: tower_lsp_server::ls_types::Range::default(),
+            command: None,
+            data: Some(json!({"kind": "references"})),
+        };
+        envelope_lens_data(&mut lens, &ctx_with(&offset));
+
+        let result = pool.dispatch_code_lens_resolve(lens, &settings, None).await;
+
+        let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
+        assert_eq!(
+            envelope.origin, "lua-ls",
+            "a server disabled via the wildcard default is not respawned either"
+        );
+        assert!(result.command.is_none(), "lens stays unresolved");
+    }
+
     /// dispatch returns a non-envelope lens unchanged (host-layer or foreign).
     #[tokio::test]
     async fn dispatch_returns_non_envelope_lens_unchanged() {

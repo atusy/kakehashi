@@ -439,6 +439,39 @@ mod tests {
         );
     }
 
+    /// The disabled gate must also apply when the server inherits `enabled:
+    /// false` from the `_` wildcard rather than setting it directly.
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_origin_server_disabled_via_wildcard() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "_".to_string(),
+            BridgeServerConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        settings.language_servers.insert(
+            "lua-ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["lua-language-server".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let item = enveloped_item("lua-ls");
+        let result = pool
+            .dispatch_completion_resolve(item, &settings, None)
+            .await;
+
+        let envelope = extract_envelope(&result).expect("should have envelope");
+        assert_eq!(
+            envelope.origin, "lua-ls",
+            "a server disabled via the wildcard default is not respawned either"
+        );
+    }
+
     // ==========================================================================
     // strip_envelope round-trip (used in lsp_impl layer)
     // ==========================================================================
