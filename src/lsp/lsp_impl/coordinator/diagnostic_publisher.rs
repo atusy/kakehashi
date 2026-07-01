@@ -104,15 +104,14 @@ impl DiagnosticPublisher {
             // configured host server for it — not a host-layer contribution. This
             // also covers a server disabled (`enabled: false`) after it already
             // spawned and pushed: its live connection can still emit pushes here,
-            // which must not be recorded, but its previously-published diagnostics
-            // may still be cached and displayed. Still republish so
-            // `filter_stale_host_slots` (already keyed off the same
-            // `get_host_configs_for_language` result) evicts that now-stale slot
-            // instead of leaving it stuck until an unrelated republish trigger.
-            if self.republish(&host).await {
-                self.bump_current_if_open(&host);
-                self.request_pull_diagnostic_refresh(false);
-            }
+            // but they must not be recorded. Its previously-published diagnostics
+            // can linger until some other trigger republishes this host — the same
+            // deferred config-change re-merge gap `_self`-disable and empty-cmd
+            // already have (see `republish`'s doc comment); `didChangeConfiguration`
+            // does not proactively republish open hosts. Not fixed here: doing so
+            // unconditionally on every rejected push previously cost a full
+            // lock+snapshot+merge republish per push for the life of the document
+            // (caught by review), for a gap this branch didn't introduce.
             return;
         }
         self.aggregator.record(
@@ -983,14 +982,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_push_from_disabled_server_evicts_stale_published_diagnostics() {
+    async fn host_push_dropped_after_server_disabled_but_stale_slot_lingers() {
         // A server disabled via `languageServers.*.enabled: false` after it
-        // already spawned and pushed must not leave its last-published
-        // diagnostics stuck: the still-live connection's next push is
-        // dropped (not recorded), but must still trigger a republish so
-        // filter_stale_host_slots evicts the now-stale slot from what's
-        // *published* — the cache itself deliberately keeps it (cleared on
-        // didClose), matching `host_slots_filtered_from_publish_after_self_disabled`.
+        // already spawned and pushed: its still-live connection's next push
+        // must be dropped (not recorded as new data), matching every other
+        // "not a host server" case. Whether the *previously* published
+        // diagnostics get proactively cleared is a separate, pre-existing,
+        // deferred concern (`republish`'s doc comment; `_self`-disable and
+        // empty-cmd have the identical gap) — not asserted here.
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         register_rust(server);
@@ -1005,7 +1004,7 @@ mod tests {
         );
         let publisher = DiagnosticPublisher::new(server);
 
-        // Enabled: the push is recorded and published.
+        // Enabled: the push is recorded.
         publisher
             .publish_host_push(
                 uri.as_str(),
@@ -1014,13 +1013,6 @@ mod tests {
                 vec![diag("boom")],
             )
             .await;
-        assert!(
-            server
-                .diagnostics
-                .snapshot(&uri)
-                .contains_key(&DiagnosticSource::Host),
-            "the enabled push was recorded"
-        );
 
         // Disable the server (not `_self` — the server itself).
         let (name, mut cfg) = rust_server_config();
@@ -1029,7 +1021,8 @@ mod tests {
         disabled_settings.language_servers.insert(name, cfg);
         server.settings_manager.apply_settings(disabled_settings);
 
-        // The still-live connection (not yet torn down) sends another push.
+        // The still-live connection (not yet torn down) sends another push
+        // with different diagnostics — must not be recorded.
         publisher
             .publish_host_push(
                 uri.as_str(),
@@ -1039,23 +1032,13 @@ mod tests {
             )
             .await;
 
-        // The cache still holds the stale slot by design (only the
-        // published view is filtered) — assert that instead of the cache
-        // being empty, then prove the *published* set was already cleared:
-        // an explicit republish now reports no further change, meaning
-        // publish_host_push's own republish already cleared it.
-        assert!(
-            server
-                .diagnostics
-                .snapshot(&uri)
-                .contains_key(&DiagnosticSource::Host),
-            "the cache still holds the stale slot; only the publish is filtered"
-        );
-        assert!(
-            !publisher.republish(&uri).await,
-            "a disabled server's stale diagnostics must already have been \
-             cleared from the published set by publish_host_push's own \
-             republish, not left stuck until some unrelated trigger"
+        let snap = server.diagnostics.snapshot(&uri);
+        let host_slots = snap
+            .get(&DiagnosticSource::Host)
+            .expect("the cache still holds the pre-disable slot");
+        assert_eq!(
+            host_slots["rust_ls"].diagnostics[0].message, "boom",
+            "the post-disable push must not overwrite the cached slot"
         );
     }
 

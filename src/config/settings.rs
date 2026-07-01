@@ -470,6 +470,7 @@ pub(crate) fn on_type_formatting_trigger_union(
 ) -> Option<(String, Vec<String>)> {
     let mut triggers: Vec<String> = servers
         .keys()
+        .filter(|name| name.as_str() != crate::config::WILDCARD_KEY)
         .filter_map(|name| {
             crate::config::resolve_with_wildcard(
                 servers,
