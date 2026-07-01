@@ -91,18 +91,24 @@ snapshot:
 SnapshotSlot { current_incarnation: u64, snapshot: Option<Arc<ParseSnapshot>> }
 ```
 
-This channel **subsumes** the current `parse_states` (`has_tree`) and `watermarks`
-(`(incarnation, ticket)`) maps: `snapshot.is_some()` is has-tree; `parsed_version`
-is the watermark ticket; `current_incarnation` is the per-lifetime guard.
+This channel **subsumes** the current `parse_states` and `watermarks` maps, but the
+mapping is not one-to-one and must be stated precisely:
 
-A **resolved-but-tree-less** outcome — a parse that completed with no usable tree
-(no parser installed, install failed, or a quarantined crashed grammar), distinct
-from the pre-first-parse `None` — must still release readers parked on the
-first-parse wait. It carries its own resolved-version marker: `ParseSnapshot.tree`
-is `Option` (`None` = resolved, no tree), so `snapshot.is_some()` means "resolved"
-and the inner `tree` distinguishes "resolved with a tree" from "resolved, none
-available"; a tree-less snapshot advances `parsed_version` like any other and
-readers fall through to their empty / `ContentModified` paths.
+- Two distinct predicates replace the old single `has_tree`: **`resolved`** =
+  `slot.snapshot.is_some()` (a parse for this lifetime has completed at least once)
+  and **`has_tree`** = `slot.snapshot.and_then(|s| s.tree.as_ref()).is_some()`. A
+  **resolved-but-tree-less** outcome — a parse that completed with no usable tree
+  (no parser installed, install failed, or a quarantined crashed grammar), distinct
+  from the pre-first-parse `None` — is `resolved && !has_tree`; it advances
+  `parsed_version` and releases first-parse waiters (who then fall through to their
+  empty / `null` / `ContentModified` paths), which the old boolean `has_tree` could
+  not express.
+- `parsed_version` is the watermark ticket; `current_incarnation` is the
+  per-lifetime guard.
+- `ParseState`'s other fields do **not** vanish: the settings **`generation`**
+  (token-cache invalidation) and the **`in_progress`** flag re-home onto
+  `ParseScheduler`'s per-document state (which already owns the parse lifecycle),
+  not onto the read-side slot. Deleting `parse_states` is contingent on that move.
 
 The store's tree/watermark CAS methods (four tree writes —
 `update_tree_if_text_unchanged`, `update_tree_if_text_and_language_unchanged`,
@@ -133,6 +139,19 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
   incarnation (so a relabel across lifetimes is already rejected), and within one
   lifetime the language does not change. The three-axis edit-path CAS
   (`incarnation && text && language`) therefore reduces to `incarnation && version`.
+- **Incarnation is the lifetime-isolation mechanism, not channel replacement.**
+  Replacing the URI's `watch` entry on reopen does not invalidate `Sender`/`Receiver`
+  clones a prior-lifetime parse task or in-flight reader already holds. So isolation
+  cannot rely on "the old channel is gone": every **publish** re-checks
+  `snapshot.incarnation == slot.current_incarnation` inside `send_if_modified`
+  (a straggler from lifetime N publishing into a clone of N's sender is rejected
+  once the slot carries N+1), and every **reader** validates
+  `snapshot.incarnation == <live incarnation>` on borrow and discards a
+  cross-lifetime snapshot rather than serving it. Because both the input
+  `incarnation` and `current_incarnation` denote the same per-URI lifetime, the
+  intended shape is a **single per-URI lifetime object** owning both the inputs and
+  the slot, so there is one authoritative incarnation rather than a cross-map
+  compare.
 
 The incremental-parse **seed** re-homes onto `ParseScheduler`'s per-document state
 (accumulated `InputEdit`s + the `base_version` they extend). Two obligations,
@@ -146,10 +165,30 @@ enforced by co-location today, become explicit scheduler invariants:
   scratch. "Leaves no accumulated edits" is an explicit reset, not an emergent
   property.
 
+A parse pass therefore has a **single version/incarnation-guarded commit
+sequence**, so no downstream effect ever escapes for a snapshot that lost the CAS:
+compute the tree, region map, and tokens **privately** (nothing shared mutated);
+revalidate `incarnation == current_incarnation`; run the one publish primitive; and
+emit the downstream — `semanticTokens/refresh`, injected-language forwarding,
+diagnostic republish, and (the deferred perf lever) any shared injection-cache /
+node-tracker mutation — **only if that exact publish succeeded**, in the order the
+per-document-parse-scheduler loop already uses (`populate → mark finished →
+downstream`). A rejected publish (a racing edit or reopen advanced the slot) emits
+nothing and mutates no shared state. During Stage 2's dual-write window the legacy
+tree CAS is the commit point the snapshot publish and downstream both gate on, so
+the two writes cannot expose different versions.
+
 ### 3. Reader contract — non-blocking, three classes
 
 Readers call a wait-free `latest_snapshot(uri)` (a `watch` borrow) and never parse
-inline. A reader is at most one edit stale when `parsed_version < content_version`.
+inline. A reader serves the **latest completed snapshot**; when
+`parsed_version < content_version` it is stale by however many edits the scheduler
+coalesced since — one under light typing, but **potentially several** under
+sustained typing (per-document-parse-scheduler deliberately coalesces, so the
+watermark can trail the input indefinitely under a fast enough edit stream). The
+refresh path re-drives the client each time a fresher snapshot lands; the model
+does not promise a bounded edit-lag without the fair-admission backpressure §4
+defers.
 
 Region identity is the load-bearing subtlety. The `NodeTracker`
 (lazy-node-identity-tracking) is edit-shifted **synchronously on `didChange`**, so
@@ -164,15 +203,21 @@ snapshot's `injection_regions` (this is the injection-token-cache-reuse
 change). A stale-tree reader then only **reads** region ids from its own snapshot
 — internally consistent with that snapshot's tree, minting nothing.
 
-This **relocates** the tracker-skew hazard rather than fully closing it: `populate`
-mints at `parsed_version` into a `NodeTracker` that has already been edit-shifted
-to `content_version`, so a mispositioned entry can still land when the tracker is
-ahead of the snapshot. Unlike the seed, the mint has no `parsed_version ==`-guard.
-The residual is **performance-only**, not correctness: region-cache reads are gated
-by a `validity_hash` (content + language), so a mispositioned id simply misses and
-recomputes — it never serves wrong tokens — and it accumulates orphan entries that
-lifecycle eviction reclaims. A future decision that forks a per-snapshot tracker
-view would close it entirely; this decision accepts the perf residual.
+This requires a **mint-time version guard**, because writing stale coordinates into
+the shared `NodeTracker` is not a mere cache miss — `get_or_create` mutates a
+bidirectional identity index that `kakehashi/node/*` resolution and captures also
+read, so a mispositioned entry is a correctness hazard for *those* consumers, not
+just degraded token-cache reuse. Therefore `populate` mutates the tracker **only
+when `parsed_version == content_version` at mint time** (mirroring the seed's
+`==`-guard): if an edit raced the parse and moved `content_version` ahead, the
+pass computes the snapshot's own `injection_regions` (private to the snapshot, used
+by that snapshot's readers) but **skips the shared-tracker mutation**, deferring it
+to the next reparse, which mints at a matching version. The live tracker is thus
+never written with coordinates that disagree with its own `content_version`. (A
+future decision that forks a per-snapshot tracker view would let even the shared
+identities update every pass; this decision keeps the shared tracker
+edit-`content_version`-consistent and defers cross-pass identity refresh to the
+current-version passes.)
 
 Any reader that must resolve against **live** positions is position-critical
 (below).
@@ -207,7 +252,13 @@ Any reader that must resolve against **live** positions is position-critical
     captures-protocol already defines ("on null, call full again") — a JSON-RPC
     *error* would violate that contract, since a captures client is only contracted
     to re-request on null. So a stale captures request serves `null` and the client
-    re-issues, self-healing on its next request.
+    re-issues, self-healing on its next request. A captures `full` that *does*
+    compute (snapshot current at entry) can still race an edit during its async
+    compute; its lineage store must therefore carry the computed `parsed_version`
+    and, under `edit_lock`, install the lineage **only if `incarnation` and the
+    current `content_version` still match it** (today `store_lineage` re-checks only
+    incarnation) — otherwise it stores nothing and returns `null`, so the lineage
+    never records matches for a text the client no longer has.
 
 The only bounded wait that remains is the **first parse after `didOpen`** (the
 snapshot is `None`); it waits briefly on `watch::changed()` then serves `null` —
@@ -220,28 +271,31 @@ future decision forks the tracker per snapshot, they can move to serve-stale.)*
 
 ### 4. All tree-CPU runs on one bounded compute pool
 
-A single dedicated `rayon` pool sized `max(2, num_cpus - 2)` — reserving at least
-two cores for the tokio workers and the timer driver — runs **all** synchronous
-tree work: the parse, `populate` (region minting + content hash), the
-`compute_captures` / node layer walks, and the semantic-token injection fan-out
-(folded off the process-global Rayon pool into this one). Async handlers hand a
-whole work-unit to the pool (bridged by a `oneshot`) and `await` the result, so no
-tree-CPU ever executes on a tokio worker. `DocumentParserPool`'s guard becomes a
-sync mutex (`std`/`parking_lot`) since acquisition now runs on pool threads that
-cannot `.await`.
+A single dedicated `rayon` pool sized `available_parallelism().saturating_sub(2).max(1)`
+— strictly below `available_parallelism` whenever there are ≥3 cores, and reserving
+at least one core for the tokio workers + timer driver on 2-core machines (on a
+1-core host no isolation is achievable and the pool degrades to shared time-slicing)
+— runs **all** synchronous tree work: the parse, `populate` (region minting +
+content hash), the `compute_captures` / node layer walks, and the semantic-token
+injection fan-out (folded off the process-global Rayon pool into this one). Async
+handlers hand a whole work-unit to the pool (bridged by a `oneshot`) and `await`
+the result, so no tree-CPU ever executes on a tokio worker. `DocumentParserPool`'s
+guard becomes a sync mutex (`std`/`parking_lot`) since acquisition now runs on pool
+threads that cannot `.await`.
 
-The guarantee that document A cannot **starve** document B rests on two legs that
-hold unconditionally: (1) no synchronous tree-CPU on the tokio workers, so B's
-handler and the timer driver are always pollable; (2) the pool is bounded below
-`num_cpus`, so A cannot oversubscribe the CPU and starve those workers. What
-remains is bounded **queueing** on the compute pool itself: A's parse burst can sit
-ahead of B's fan-out. `ParseScheduler` coalescing (already built) caps each
-document to one queued parse, giving fairness across documents; a focused-document
-priority — not yet built — would order *admission* so the document the user edits
-drains first (rayon has no preemption, so this orders queueing, it cannot preempt
-in-flight sub-tasks). The strong claim is therefore **no cross-document
-starvation**; residual queue latency under many simultaneous large parses is
-bounded by the coalescing + pool size, and the priority queue is a later knob.
+The guarantee this design **actually** makes is narrow and unconditional: **the
+async runtime is never blocked by synchronous tree-CPU** — leg (1), no tree-work on
+the tokio workers, so B's handler and the timer driver are always pollable and the
+timeouts that were being defeated now fire. It does **not** by itself guarantee
+"no cross-document starvation" in the strong sense: the pool has finite threads,
+Rayon does not preempt, `ParseScheduler` coalescing caps *parse submissions* per
+document but not fan-out task count, task duration, or the number of documents, and
+a fan-out on A can still occupy every pool thread ahead of B's work. What Stage 1
+buys is that this contention is confined to the compute pool and no longer freezes
+unrelated async I/O, diagnostics, or the request loop. Turning "no starvation" into
+a real guarantee requires **explicit fair admission** — a focused-document priority
+queue plus a per-document in-flight concurrency cap — which this decision names as
+required follow-on work, not something the bounded pool delivers on its own.
 
 ### 5. Staged rollout
 
@@ -251,8 +305,10 @@ inside the existing safety contracts at each step:
 - **Stage 1 — tree-CPU off the async workers onto the bounded pool.** Move
   `populate` (all call sites) and the captures / node layer walks off the tokio
   workers; introduce the bounded pool and route parse + populate + walks + fan-out
-  through it; convert `parser_pool` to a sync mutex. Delivers *no cross-document
-  starvation* and most of *high-performance parsing*. The read path and the
+  through it; convert `parser_pool` to a sync mutex. Delivers *the async runtime is
+  never blocked by tree-CPU* (killing the cross-document freeze) and most of
+  *high-performance parsing*; fair admission on the compute pool is a later stage.
+  The read path and the
   clear-tree-on-edit contract are untouched, so the stale-tree guarantee is not at
   risk; the sole new obligation is that `populate` is **awaited** (not detached),
   preserving the `populate → finish` ordering the injection-map invalidation
@@ -312,9 +368,11 @@ inside the existing safety contracts at each step:
 
 - Document lifecycle is fully decoupled from parsing: `didChange` never awaits a
   parse; readers never block on one.
-- No cross-document starvation: with all tree-CPU on a bounded pool below
-  `num_cpus`, a slow parse on one document cannot starve the async runtime or
-  another document's requests.
+- The async runtime is never blocked by tree-CPU: with all synchronous tree work
+  on the bounded pool, a slow parse on one document cannot freeze the request loop,
+  timers, diagnostics, or another document's async handlers — the specific defect
+  behind the 0.5–1.4 s cross-document waits. (Full *no-starvation* on the compute
+  pool itself additionally needs the fair-admission follow-on §4 names.)
 - High-performance reads: highlight requests return against the latest snapshot
   immediately instead of waiting hundreds of ms for a reparse + populate.
 - The scheduler ADR's residual **reader-fallback resurrection vector is
@@ -327,8 +385,9 @@ inside the existing safety contracts at each step:
 
 ### Negative
 
-- Highlight-class results may be **one edit stale for a few milliseconds** until
-  the fresh snapshot publishes. `semanticTokens` is re-driven by an added
+- Highlight-class results may be **stale — usually one edit, potentially several
+  under sustained typing** (the scheduler coalesces) — until a fresh snapshot
+  publishes. `semanticTokens` is re-driven by an added
   post-edit `semanticTokens/refresh` (emitted from the parse loop to dodge the
   synchronous-client reentrancy that keeps it out of `didChange`);
   `documentSymbol`/`documentColor` self-correct only on the client's next natural
@@ -342,9 +401,9 @@ inside the existing safety contracts at each step:
   captures/node from the original serve-stale intent is the
   cost of not forking a per-snapshot tracker view now.
 - The `#342`/`#374` stale-tree guarantee (a reader observes at least its own edit)
-  is relaxed to "a reader observes a *consistent* but possibly one-edit-old
-  snapshot, and knows it via the version tag." Correctness now rests on the version
-  tag + refresh rather than on the reader having waited.
+  is relaxed to "a reader observes a *consistent* snapshot that may trail the input
+  by one or more edits, and knows it via the version tag." Correctness now rests on
+  the version tag + refresh rather than on the reader having waited.
 - Folding the semantic fan-out from the process-global Rayon pool (all cores) into
   the bounded `max(2, num_cpus - 2)` pool caps single-document tokenization
   throughput (≈ −50 % on a 4-core machine for one huge file) in exchange for
@@ -359,10 +418,11 @@ inside the existing safety contracts at each step:
 ### Neutral
 
 - `didClose` drops the single channel (waking any reader parked on the first-parse
-  `watch::changed()`); a reopen replaces it with a fresh `SnapshotSlot`. A wait-free
-  `latest_snapshot` borrow racing close+reopen may observe the prior lifetime's
-  snapshot momentarily — bounded and self-healing via the next publish, the same
-  class as today's borrow-then-reopen races.
+  `watch::changed()`); a reopen installs a fresh `SnapshotSlot`. A wait-free
+  `latest_snapshot` borrow racing close+reopen may hand back the prior lifetime's
+  snapshot momentarily, but the reader's mandatory `snapshot.incarnation == <live
+  incarnation>` check (§2) rejects it, so a cross-lifetime snapshot is discarded
+  rather than served — it degrades to the empty/`null` path, not stale data.
 - The `ParseScheduler` (one loop per document, coalescing, panic re-arm),
   `incarnation`, the `edit_lock`, and the incremental-seed concept are retained —
   re-homed, not removed.
