@@ -66,10 +66,12 @@ pub(crate) struct DiscoveredRegion {
 /// top-level single region plus the settings `generation` it was resolved under.
 ///
 /// Stored on the [`Document`](super::Document) by the off-ingress write-back only
-/// when discovery was *complete* (no region dropped for a not-yet-loaded
-/// parser/query) and the document had no `injection.combined` group (those keep
-/// the inline path in v1), so a present value is always the full single-region
-/// set for the bound tree.
+/// when discovery was *complete* (no region dropped because its injected language
+/// couldn't be resolved to a parser) and the document had no `injection.combined`
+/// group (those keep the inline path in v1), so a present value is always the full
+/// single-region set for the bound tree. A resolvable language whose highlight
+/// query isn't loaded is *not* excluded — the query is re-resolved fresh at reuse,
+/// so that case self-heals rather than persisting an incomplete set.
 #[derive(Clone)]
 pub(crate) struct DiscoveredInjections {
     /// Settings generation at discovery time. The reader skips reuse when it no

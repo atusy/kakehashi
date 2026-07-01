@@ -188,6 +188,19 @@ impl CacheCoordinator {
         language: &LanguageCoordinator,
         tracker: &NodeTracker,
     ) -> Option<crate::document::DiscoveredInjections> {
+        // Snapshot the generation FIRST — before reading the injection query or
+        // resolving any language below — so the stamp can never be *newer* than the
+        // queries the discovery was built with. A reload swaps queries and then
+        // bumps the generation (`lsp_impl::apply_shared_settings`); if we read the
+        // generation last, a reload landing mid-`populate` would stamp a stale-query
+        // region set with the *new* generation, and a post-reload request's
+        // `discovery.generation == cache_ctx.generation` gate would then accept it
+        // (a reload doesn't reparse, so the epoch guard doesn't catch it). Reading
+        // it first leaves a raced discovery stamped with the *old* generation, so
+        // the post-reload consumer rejects it and re-discovers inline — the same
+        // "snapshot generation at the top" discipline the token handlers use.
+        let generation = self.semantic_token_generation();
+
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
@@ -292,7 +305,7 @@ impl CacheCoordinator {
                 language,
                 uri,
                 tracker,
-                self.semantic_token_generation(),
+                generation,
             );
         }
 

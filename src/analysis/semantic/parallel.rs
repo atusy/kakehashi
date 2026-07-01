@@ -1064,10 +1064,12 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Resolve cache hits before the fan-out (#529, read half): an eligible region
     // whose content hash and settings generation still match a stored entry is
     // re-anchored to its current host line and never re-tokenized; only misses go
-    // to the Rayon workers. Eligibility is evaluated against THIS request's fresh
-    // context, so a region that stopped qualifying recomputes rather than serving
-    // a stale hit. Below the region-count gate `region_cache` is `None`, so every
-    // context misses and the path matches the uncached behavior exactly.
+    // to the Rayon workers. Eligibility comes from each context's `region_cache`:
+    // computed fresh when contexts were discovered inline, or carried in the owned
+    // `DiscoveredRegion` when they were rebuilt from reused discovery — identical
+    // either way, since the discovery is bound to the same tree by `parse_epoch`.
+    // Below the region-count gate `region_cache` is `None`, so every context misses
+    // and the path matches the uncached behavior exactly.
     let mut hit_tokens: Vec<RawToken> = Vec::new();
     let mut miss_indices: Vec<usize> = Vec::with_capacity(contexts.len());
     if let Some(cc) = cache_ctx {
@@ -2573,6 +2575,7 @@ local b = 2
             generation: 0,
             discovery: Some(&discovery),
         };
+        DISCOVERY_REUSE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
         let reused = collect_injection_tokens_parallel(
             &text,
             &lines,
@@ -2588,6 +2591,33 @@ local b = 2
         assert_eq!(
             reused, inline,
             "discovery reuse must match inline discovery byte-for-byte"
+        );
+        // Prove the reuse branch actually fired (skipped Q) rather than silently
+        // falling back inline — the safety net the latency bench can't provide.
+        assert!(
+            DISCOVERY_REUSE_HITS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "reuse branch must fire when a generation-current discovery is present"
+        );
+
+        // Second reuse pass composes the two #529 halves: the first pass stored
+        // eligible region tokens, so now the discovery-reuse path (skip Q) also
+        // serves those regions from the token cache (hit), not recompute. Still
+        // byte-identical.
+        let reused_with_token_hits = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+        )
+        .0;
+        assert_eq!(
+            reused_with_token_hits, inline,
+            "discovery reuse composed with token-cache hits must still match inline"
         );
 
         // A stale generation must ignore the discovery and re-discover inline.
@@ -2613,6 +2643,99 @@ local b = 2
         assert_eq!(
             fell_back, inline,
             "a stale-generation discovery must fall back to inline discovery"
+        );
+    }
+
+    /// `build_document_discovery` stores nothing when the document has any
+    /// `injection.combined` group: v1 keeps combined groups on the inline path, so
+    /// persisting a singles-only discovery would drop the combined captures on
+    /// reuse (missing/wrong tokens for e.g. HTML-in-markdown).
+    #[test]
+    fn build_document_discovery_bails_on_combined_groups() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+        let injection_query = coordinator
+            .injection_query("markdown")
+            .expect("combined injection query");
+        let mut pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = pool.acquire("markdown") else {
+            return;
+        };
+        let tree = parser
+            .parse(COMBINED_LUA_DOC, None)
+            .expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+        let regions = crate::language::injection::collect_all_injections(
+            &tree.root_node(),
+            COMBINED_LUA_DOC,
+            Some(injection_query.as_ref()),
+        )
+        .expect("regions");
+        let uri = Url::parse("file:///combined_bail.md").unwrap();
+        let tracker = NodeTracker::new();
+        assert!(
+            build_document_discovery(
+                &regions,
+                injection_query.as_ref(),
+                COMBINED_LUA_DOC,
+                &coordinator,
+                &uri,
+                &tracker,
+                0,
+            )
+            .is_none(),
+            "a document with a combined group must not store discovery"
+        );
+    }
+
+    /// `build_document_discovery` stores nothing when an injected language can't
+    /// be resolved to a parser (the discovery analogue of the token half's
+    /// `fully_loaded` gate): a region whose language is unresolvable taints
+    /// discovery, so a partial region set is never persisted. (A resolvable
+    /// language whose *highlight query* isn't loaded is NOT gated — `rebuild_context`
+    /// re-resolves the query fresh at reuse, so that case self-heals.)
+    #[test]
+    fn build_document_discovery_bails_when_injected_language_unresolvable() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let injection_query = coordinator
+            .injection_query("markdown")
+            .expect("markdown injection query");
+        // Fences of a language with no parser anywhere: `collect_all_injections`
+        // still returns them (the query captures whatever the info string says),
+        // but `resolve_injection_language` fails → SingleDiscovery::Incomplete.
+        let mut text = String::from("# Unresolvable\n\n");
+        for i in 0..10 {
+            text.push_str(&format!("```zzznotalang\ncontent {i}\n```\n\n"));
+        }
+        let mut pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = pool.acquire("markdown") else {
+            return;
+        };
+        let tree = parser.parse(text.as_str(), None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+        let regions = crate::language::injection::collect_all_injections(
+            &tree.root_node(),
+            &text,
+            Some(injection_query.as_ref()),
+        )
+        .expect("regions");
+        let uri = Url::parse("file:///incomplete_bail.md").unwrap();
+        let tracker = NodeTracker::new();
+        assert!(
+            build_document_discovery(
+                &regions,
+                injection_query.as_ref(),
+                &text,
+                &coordinator,
+                &uri,
+                &tracker,
+                0,
+            )
+            .is_none(),
+            "an unresolvable injected language must taint discovery and store nothing"
         );
     }
 

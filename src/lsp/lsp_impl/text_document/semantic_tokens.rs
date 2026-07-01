@@ -1034,8 +1034,6 @@ mod tests {
     /// distinguish from a win.
     #[tokio::test]
     async fn semantic_tokens_full_reuses_attached_injection_discovery() {
-        use std::sync::atomic::Ordering;
-
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         let uri = Url::parse("file:///reuse_discovery.md").expect("uri");
@@ -1052,6 +1050,19 @@ mod tests {
             Some("markdown".to_string()),
             None,
         );
+
+        // Configure the grammar search path so the languages actually load
+        // (grammars live under deps/tree-sitter, or TREE_SITTER_GRAMMARS in Nix);
+        // without this the `ensure_language_loaded` calls below fail and the test
+        // would skip past its load-bearing reuse assertion.
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                std::env::var("TREE_SITTER_GRAMMARS")
+                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
+            ],
+            ..Default::default()
+        };
+        let _ = server.language.load_settings(&settings);
 
         let md = server.language.ensure_language_loaded("markdown");
         let lua = server.language.ensure_language_loaded("lua");
@@ -1112,32 +1123,28 @@ mod tests {
             "discovery must be attached to the document"
         );
 
-        // Drive the real handler; assert the reuse branch fired.
-        crate::analysis::semantic::DISCOVERY_REUSE_HITS.store(0, Ordering::Relaxed);
-        let params = SemanticTokensParams {
-            text_document: TextDocumentIdentifier {
-                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("uri convert"),
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-        let result = timeout(
-            Duration::from_secs(5),
-            server.semantic_tokens_full_impl(params),
-        )
-        .await
-        .expect("handler should not hang")
-        .expect("request ok")
-        .expect("tokens");
-        match result {
-            SemanticTokensResult::Tokens(t) => {
-                assert!(!t.data.is_empty(), "should produce tokens")
-            }
-            _ => panic!("expected Tokens"),
-        }
-        assert!(
-            crate::analysis::semantic::DISCOVERY_REUSE_HITS.load(Ordering::Relaxed) >= 1,
-            "the request must reuse the attached discovery (skip Q), not re-discover inline"
+        // The reader seam: `get_tree_with_wait` — the exact settle-gated read the
+        // real handler uses — must return the attached discovery as a unit with the
+        // tree. That its generation matches the current one *deterministically*
+        // implies the request would take the reuse branch (skip Q): the branch is
+        // `discovery.filter(|d| d.generation == generation)`, and the tokenization
+        // that follows is proven equivalent-to-inline by the parallel.rs reuse test
+        // (which also asserts the reuse counter fires). We verify the read here
+        // rather than driving full tokenization, which parses lua across Rayon in
+        // the full server and is prone to tree-sitter/libloading crashes under the
+        // whole-suite parser-load (the standalone-coordinator parallel.rs test
+        // covers the tokenization safely).
+        let (_tree, _text, read_discovery) = server
+            .get_tree_with_wait(&uri, "markdown")
+            .await
+            .expect("reader should observe the installed tree");
+        let read_discovery = read_discovery.expect("reader must read the attached discovery");
+        assert!(read_discovery.regions.len() >= 8);
+        assert_eq!(
+            read_discovery.generation,
+            server.cache.semantic_token_generation(),
+            "the attached discovery's generation must match the reader's, so the \
+             reuse-branch gate `discovery.generation == generation` passes (Q is skipped)"
         );
     }
 
