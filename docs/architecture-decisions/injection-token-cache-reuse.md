@@ -240,8 +240,8 @@ preference order:
   on-demand-parse fallback tree → discover inline). The only gate is on the
   *writer* side — the second CAS below that attaches discovery only to the tree it
   was built for. Realizability, given `populate_injections` runs *after* the
-  tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`,
-  `src/lsp/lsp_impl/coordinator/parse.rs`):
+  tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`, defined in
+  `src/document/store.rs` and invoked from `src/lsp/lsp_impl/coordinator/parse.rs`):
   - **No *new* `NodeTracker` mutation.** `populate_injections` *already* calls
     `tracker.get_or_create` today, to mint the `region_id` on each
     `CacheableInjectionRegion` it inserts into the `InjectionMap` (which
