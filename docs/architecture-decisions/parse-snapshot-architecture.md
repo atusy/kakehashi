@@ -168,12 +168,19 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
   is unobservable; and a reader mid-compute holding a lifetime-`N` `Arc<ParseSnapshot>`
   rejects it against the live `N+1` incarnation. The one reader that *does* hold a
   `Receiver` — a first-parse waiter parked on `watch::changed()` — must be woken by
-  an **explicit close publish**: `didClose` sends a terminal `SnapshotSlot` state
-  (incarnation-invalidated / closed sentinel) rather than relying on the channel's
-  senders dropping, since stale parse tasks may still hold `Sender` clones that keep
-  the channel alive. The parked waiter observes the close state and falls through to
-  `null` — this is the wake the current `wait_for_epoch` gets from the watermark
-  sender dropping, made explicit because the snapshot channel outlives more clones.
+  an **explicit close publish**: `didClose` sets the slot to a terminal state whose
+  `current_incarnation` is a **reserved sentinel** (`u64::MAX`, never drawn by the
+  monotonic incarnation counter) with `snapshot = None`, rather than relying on the
+  channel's senders dropping — stale parse tasks may still hold `Sender` clones that
+  keep the channel alive. Setting the sentinel is load-bearing: keeping
+  `current_incarnation = N` would let a stale lifetime-`N` publish pass *both* the
+  incarnation check (`N == N`) and the bootstrap branch (`snapshot` is now `None`),
+  overwriting the terminal state with `Some(_)` and resurrecting the closed document
+  for the parked waiter. With the sentinel, that publish fails `incarnation ==
+  current_incarnation` (`N != u64::MAX`) and the waiter unambiguously observes the
+  closed state and falls through to `null` — the wake the current `wait_for_epoch`
+  gets from the watermark sender dropping, made explicit because the snapshot channel
+  outlives more clones.
 
 The incremental-parse **seed** re-homes onto `ParseScheduler`'s per-document state
 (accumulated `InputEdit`s + the `base_version` they extend). Two obligations,
@@ -551,10 +558,11 @@ inside the existing safety contracts at each step:
 
 ### Neutral
 
-- `didClose` publishes an explicit terminal/incarnation-invalidated `SnapshotSlot`
-  state (§2) — not merely dropping the channel, since stale parse-task `Sender`
-  clones can keep it alive — which wakes any reader parked on the first-parse
-  `watch::changed()`; a reopen starts the cell fresh at the next incarnation. A
+- `didClose` publishes a terminal `SnapshotSlot` with the sentinel
+  `current_incarnation = u64::MAX` and `snapshot = None` (§2) — not merely dropping
+  the channel, since stale parse-task `Sender` clones can keep it alive — which
+  wakes any reader parked on the first-parse `watch::changed()` and rejects any
+  stale-lifetime publish; a reopen starts the cell fresh at the next incarnation. A
   wait-free `latest_snapshot` borrow racing close+reopen may hand back the prior
   lifetime's snapshot momentarily, but the reader's mandatory
   `snapshot.incarnation == <live incarnation>` check (§2) rejects it, so a
