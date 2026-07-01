@@ -76,11 +76,20 @@ impl CacheCoordinator {
     /// - Injection token cache
     /// - Request tracking state
     pub(crate) fn remove_document(&self, uri: &Url) {
+        // Cancel any in-flight compute for this URI FIRST, so it has the best
+        // chance to observe the flipped token and bail before its injection
+        // store-half runs — otherwise a compute already past its last checkpoint
+        // could repopulate the caches we clear just below, orphaning entries for
+        // a now-closed document. This narrows but does not fully close that
+        // window (a compute already inside the store-half still writes); the
+        // residual is the same deferred per-document lifecycle-epoch race as the
+        // rest of didClose (see `did_close.rs`), and only leaks a bounded set of
+        // entries for a closed doc that no request can read.
+        self.request_tracker.cancel_all_for_uri(uri);
         self.semantic_cache.remove(uri);
         self.semantic_range_cache.remove(uri);
         self.injection_map.clear(uri);
         self.injection_token_cache.clear_document(uri);
-        self.request_tracker.cancel_all_for_uri(uri);
     }
 
     // ========================================================================
