@@ -37,14 +37,20 @@ pub(crate) fn resolve_with_wildcard<V: Clone>(
 /// overlay wins when present, else base, else the built-in default `true`) —
 /// keep the two in sync if either changes.
 ///
-/// `name` must be a key already present in `servers` (not the wildcard
-/// itself); an absent name resolves to `false` rather than falling back to
-/// the wildcard's own config, since a server no longer listed in
-/// `languageServers` at all was never eligible in the first place.
+/// `name` should be a concrete server key, not the wildcard itself — the
+/// wildcard is a template, never a server in its own right, so this always
+/// returns `false` for `WILDCARD_KEY` regardless of its own cmd/enabled
+/// (enforced, not just documented). An absent name likewise resolves to
+/// `false` rather than falling back to the wildcard's own config, since a
+/// server no longer listed in `languageServers` at all was never eligible in
+/// the first place.
 pub(crate) fn is_server_spawnable(
     servers: &HashMap<String, BridgeServerConfig>,
     name: &str,
 ) -> bool {
+    if name == WILDCARD_KEY {
+        return false;
+    }
     let Some(config) = servers.get(name) else {
         return false;
     };
@@ -1934,6 +1940,15 @@ mod tests {
         // to the wildcard's own config.
         let servers = HashMap::from([("_".to_string(), server(vec!["x"], Some(true)))]);
         assert!(!is_server_spawnable(&servers, "missing"));
+
+        // Case 6: called with the wildcard key itself — false, per the
+        // documented contract (the wildcard is a template, never a server in
+        // its own right), even when it has a non-empty cmd and enabled: true.
+        let servers = HashMap::from([("_".to_string(), server(vec!["x"], Some(true)))]);
+        assert!(
+            !is_server_spawnable(&servers, WILDCARD_KEY),
+            "the wildcard key itself must never report as spawnable"
+        );
     }
 
     #[test]
