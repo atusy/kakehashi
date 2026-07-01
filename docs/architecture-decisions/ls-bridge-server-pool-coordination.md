@@ -40,7 +40,7 @@ Each language maps to a `server_name` via configuration. The pool is keyed by
   documents with no marker root share the client-root fallback connection.
 
 Routing: `language` → `server_name` (via config) + document's resolved root → connection.
-The root is resolved from the triggering document's `rootMarkers` walk
+The root is resolved from the triggering document's `workspaceMarkers` walk
 (`root_markers::resolve_marker_workspace`), the single source shared with the
 spawn handshake so a connection's key always matches the root it was spawned at.
 The `ConnectionKey` is stored on each connection handle, so the request,
@@ -481,6 +481,12 @@ languageServers:
 
 ## Amendment History
 
+- **2026-07-01**: Renamed the `languageServers.*.rootMarkers` config key to
+  `workspaceMarkers` (aligning with the LSP spec's `workspaceFolders`); the old
+  `rootMarkers` is accepted as a deprecated serde alias for backward
+  compatibility. The marker walk itself and the pool-keying behavior are
+  unchanged; only the config key name moved. Earlier amendment entries below
+  still reference the pre-rename key as the historical record of their date.
 - **2026-06-20**: Added the per-server `preferSharedInstance` opt-in (#391): capability-gated routing to one `ConnectionKey::shared` connection across roots, a mutable per-connection `WorkspaceFolderSet`, and `workspace/didChangeWorkspaceFolders` emission ahead of `didOpen` for newly joined roots. Default stays per-root (#382); incapable servers (no `workspace.workspaceFolders.{supported, changeNotifications}`) log once and fall back to per-root.
 - **2026-06-20**: Extended pool keying from `server_name` to `(server_name, resolved workspace root)` (`ConnectionKey`) for multi-root monorepos (#382). The root is resolved from the triggering document's `rootMarkers` walk, shared with the spawn handshake, and stored on the connection handle so all per-connection state routes via `handle.key()`. Documents under different marker roots get separate downstream processes; marker-less documents share the client-root fallback. Follow-up: idle-eviction policy to bound process growth.
 - **2026-01-24**: Changed from language-based to server-name-based pool keying to enable process sharing for related languages (e.g., ts/tsx sharing tsgo). Connection pool is now keyed by `server_name` instead of `languageId`, with configuration resolving `language` → `server_name`.

@@ -1,4 +1,5 @@
 pub mod defaults;
+pub(crate) mod deprecation;
 pub(crate) mod expand;
 pub(crate) mod merge;
 pub mod settings;
@@ -431,7 +432,7 @@ mod tests {
             cmd: cmd.into_iter().map(String::from).collect(),
             languages: vec![],
             initialization_options: None,
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             settings: None,

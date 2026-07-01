@@ -160,6 +160,19 @@ impl Kakehashi {
             .log_settings_events(&settings_outcome.events)
             .await;
 
+        // Nudge users off the deprecated `rootMarkers` config key. The claim
+        // guard latches session-wide so a later didChangeConfiguration carrying
+        // `rootMarkers` does not warn a second time (and vice versa).
+        if settings_outcome.used_deprecated_root_markers
+            && self
+                .settings_manager
+                .claim_root_markers_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::ROOT_MARKERS_DEPRECATION_NOTICE)
+                .await;
+        }
+
         // Always apply settings (use defaults if none were loaded)
         // This ensures auto_install=true, default capture_mappings, and other defaults are active
         // for zero-config experience. Use default_settings() instead of RawWorkspaceSettings::default()

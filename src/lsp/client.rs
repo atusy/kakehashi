@@ -114,6 +114,15 @@ impl<'a> ClientNotifier<'a> {
         self.log(MessageType::WARNING, message).await;
     }
 
+    /// Surface a warning as a visible `window/showMessage` popup (not just the
+    /// output panel), for messages the user should notice — e.g. a one-time
+    /// deprecation notice.
+    pub(crate) async fn show_warning(&self, message: impl Into<String>) {
+        self.client
+            .show_message(MessageType::WARNING, message.into())
+            .await;
+    }
+
     /// Log a debug/trace message (LOG level in LSP).
     pub(crate) async fn log_trace(&self, message: impl Into<String>) {
         self.log(MessageType::LOG, message).await;

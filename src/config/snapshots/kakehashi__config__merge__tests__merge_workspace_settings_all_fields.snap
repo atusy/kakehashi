@@ -85,7 +85,7 @@ expression: result
         "lua"
       ],
       "initializationOptions": null,
-      "rootMarkers": null,
+      "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null
     },
@@ -98,7 +98,7 @@ expression: result
         "python"
       ],
       "initializationOptions": null,
-      "rootMarkers": null,
+      "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null
     },
@@ -115,7 +115,7 @@ expression: result
           "./Cargo.toml"
         ]
       },
-      "rootMarkers": null,
+      "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null
     }

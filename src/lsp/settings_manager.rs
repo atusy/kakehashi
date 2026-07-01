@@ -5,6 +5,7 @@
 use arc_swap::ArcSwap;
 use path_clean::PathClean;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tower_lsp_server::ls_types::{
     ClientCapabilities, GotoCapability, TextDocumentClientCapabilities,
@@ -28,6 +29,10 @@ pub(crate) struct SettingsManager {
     /// Client capabilities from initialize() - immutable after initialization.
     /// Uses OnceLock to enforce "set once, read many" semantics per LSP protocol.
     client_capabilities: OnceLock<ClientCapabilities>,
+    /// Latches once the deprecated `rootMarkers` config key has been warned
+    /// about, so the notice is shown at most once per session regardless of
+    /// which path (initialize or didChangeConfiguration) first sees it.
+    root_markers_deprecation_warned: AtomicBool,
 }
 
 impl std::fmt::Debug for SettingsManager {
@@ -71,7 +76,19 @@ impl SettingsManager {
                 settings: Arc::new(settings),
             })),
             client_capabilities: OnceLock::new(),
+            root_markers_deprecation_warned: AtomicBool::new(false),
         }
+    }
+
+    /// Claim the one-per-session slot for the `rootMarkers` deprecation notice.
+    ///
+    /// Returns `true` exactly once — for the first caller that has actually seen
+    /// the deprecated key — and `false` thereafter, so initialize and
+    /// didChangeConfiguration can share a single notice without double-warning.
+    pub(crate) fn claim_root_markers_deprecation_warning(&self) -> bool {
+        !self
+            .root_markers_deprecation_warned
+            .swap(true, Ordering::Relaxed)
     }
 
     /// Store client capabilities from initialize().
@@ -624,6 +641,20 @@ mod tests {
         let manager = SettingsManager::new();
         // Should return false (safe default - use Location[] for compatibility)
         assert!(!manager.supports_declaration_link());
+    }
+
+    #[test]
+    fn claim_root_markers_deprecation_warning_is_true_exactly_once() {
+        let manager = SettingsManager::new();
+        assert!(
+            manager.claim_root_markers_deprecation_warning(),
+            "first claim should win the once-per-session slot"
+        );
+        assert!(
+            !manager.claim_root_markers_deprecation_warning(),
+            "subsequent claims must not re-warn"
+        );
+        assert!(!manager.claim_root_markers_deprecation_warning());
     }
 
     /// Parameterized tests for supports_*_link() capability checking.

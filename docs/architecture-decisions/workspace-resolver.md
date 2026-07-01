@@ -4,7 +4,7 @@
 
 A bridged language server needs a workspace root to base its `rootUri`/
 `workspaceFolders` on at initialization. Today this is decided statically by
-`languageServers.<name>.rootMarkers` (see `src/config/settings.rs`, default
+`languageServers.<name>.workspaceMarkers` (see `src/config/settings.rs`, default
 `[".git"]` in `src/config/defaults.rs`), resolved upward from the document path
 by `src/lsp/bridge/root_markers.rs`.
 
@@ -297,13 +297,15 @@ Deferred to implementation, recorded so they are not lost:
 
 ## Decision–Implementation Gap
 
-Not yet implemented. As of this record:
+Partially implemented. As of this record:
 
-- The config key is still `rootMarkers`; the rename and `#[serde(alias)]` are
-  pending.
-- No Lua VM dependency is present; `workspaceResolver` evaluation, the lazy
-  `document_info` metatable, the worker-thread/timeout harness, the
-  coordinator-level veto, and the cache contract are all unbuilt.
+- §1 (rename `rootMarkers` → `workspaceMarkers` with `#[serde(alias =
+  "rootMarkers")]`) is **done** — the wire key is `workspaceMarkers`, old
+  configs still parse via the deprecated alias.
+- §2 is **not yet implemented**: no Lua VM dependency is present, so
+  `workspaceResolver` evaluation, the lazy `document_info` metatable, the
+  worker-thread/timeout harness, the coordinator-level veto, and the cache
+  contract are all unbuilt.
 
 ## Related Decisions
 

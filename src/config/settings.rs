@@ -313,7 +313,7 @@ impl BridgeLanguageConfig {
     }
 }
 
-/// A single `rootMarkers` entry, mirroring Neovim's `vim.fs.root`
+/// A single `workspaceMarkers` entry, mirroring Neovim's `vim.fs.root`
 /// `(string|string[])[]` shape: a bare string is its own priority tier; a
 /// nested array is an equal-priority group. Entries are tried in list order
 /// (earlier wins); within a group all names are equal and the nearest
@@ -381,7 +381,11 @@ pub struct BridgeServerConfig {
     /// `None` = inherit (built-in default `[".git"]`); an explicit `[]`
     /// disables the search (the client-supplied root is forwarded as-is).
     /// When no marker matches, the client-supplied root is the fallback.
-    pub root_markers: Option<Vec<RootMarker>>,
+    ///
+    /// The wire key is `workspaceMarkers`; the pre-rename key `rootMarkers` is
+    /// kept as a deprecated serde alias for backward compatibility.
+    #[serde(alias = "rootMarkers")]
+    pub workspace_markers: Option<Vec<RootMarker>>,
     /// Trigger characters for bridged `textDocument/onTypeFormatting` (#354).
     ///
     /// kakehashi cannot know downstream trigger characters at initialize time
@@ -410,7 +414,7 @@ pub struct BridgeServerConfig {
     /// universal fallback makes a blanket `languageServers._` opt-in safe.
     ///
     /// `None` = inherit (built-in default `false` = per-root instances). Like
-    /// `root_markers`, a concrete server's explicit value overrides the
+    /// `workspace_markers`, a concrete server's explicit value overrides the
     /// wildcard, so `_.preferSharedInstance: true` can be opted out of
     /// per server with `preferSharedInstance: false`.
     pub prefer_shared_instance: Option<bool>,
@@ -1444,7 +1448,7 @@ mod tests {
             cmd: vec!["x".to_string()],
             languages: vec![],
             initialization_options: None,
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
@@ -1484,7 +1488,7 @@ mod tests {
                 cmd: vec!["x".to_string()],
                 languages: vec![],
                 initialization_options: None,
-                root_markers: None,
+                workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
                 settings: None,
@@ -1513,11 +1517,11 @@ mod tests {
 
     #[test]
     fn should_parse_defaults_only_language_server_entry() {
-        // A wildcard `_` entry exists to supply defaults (e.g. rootMarkers)
+        // A wildcard `_` entry exists to supply defaults (e.g. workspaceMarkers)
         // to concrete servers, so cmd/languages must be optional in TOML.
         let toml_str = r#"
             [languageServers._]
-            rootMarkers = [".git"]
+            workspaceMarkers = [".git"]
         "#;
 
         let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();
@@ -1526,22 +1530,22 @@ mod tests {
         assert!(wildcard.cmd.is_empty());
         assert!(wildcard.languages.is_empty());
         assert_eq!(
-            wildcard.root_markers,
+            wildcard.workspace_markers,
             Some(vec![RootMarker::Single(".git".to_string())])
         );
     }
 
     #[test]
-    fn should_parse_language_server_root_markers_camel_case() {
+    fn should_parse_workspace_markers_camel_case() {
         let config_json = r#"{
             "cmd": ["rust-analyzer"],
             "languages": ["rust"],
-            "rootMarkers": [".git", "Cargo.toml"]
+            "workspaceMarkers": [".git", "Cargo.toml"]
         }"#;
 
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
         assert_eq!(
-            config.root_markers,
+            config.workspace_markers,
             Some(vec![
                 RootMarker::Single(".git".to_string()),
                 RootMarker::Single("Cargo.toml".to_string()),
@@ -1550,16 +1554,98 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_root_markers_mixed_string_and_group_json() {
-        // Neovim's (string|string[])[] shape: a bare string is one tier, a
-        // nested array is an equal-priority group.
+    fn should_parse_workspace_markers_toml() {
+        // The canonical key via TOML (the primary path users type), not just
+        // the JSON/serde_json round-trip.
+        let toml_str = r#"
+            [languageServers._]
+            workspaceMarkers = [".git", "Cargo.toml"]
+        "#;
+
+        let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();
+        let servers = settings.language_servers.unwrap();
+        assert_eq!(
+            servers["_"].workspace_markers,
+            Some(vec![
+                RootMarker::Single(".git".to_string()),
+                RootMarker::Single("Cargo.toml".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn should_parse_deprecated_root_markers_alias() {
+        // `rootMarkers` is the pre-rename key, kept as a deprecated serde alias
+        // for backward compatibility; it deserializes into `workspace_markers`.
         let config_json = r#"{
-            "rootMarkers": [["stylua.toml", ".luarc.json"], ".git"]
+            "cmd": ["rust-analyzer"],
+            "languages": ["rust"],
+            "rootMarkers": [".git", "Cargo.toml"]
         }"#;
 
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
         assert_eq!(
-            config.root_markers,
+            config.workspace_markers,
+            Some(vec![
+                RootMarker::Single(".git".to_string()),
+                RootMarker::Single("Cargo.toml".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn empty_workspace_markers_deserializes_to_some_empty_kill_switch() {
+        // The kill-switch contract (explicit `[]` disables the marker search)
+        // rests on `[]` deserializing to `Some(vec![])`, not `None`. Pin it on
+        // the deserialize path directly, not just via the merge test.
+        let config: BridgeServerConfig =
+            serde_json::from_str(r#"{ "workspaceMarkers": [] }"#).unwrap();
+        assert_eq!(config.workspace_markers, Some(vec![]));
+    }
+
+    #[test]
+    fn both_marker_keys_present_is_a_hard_error() {
+        // `workspaceMarkers` and its `rootMarkers` alias are the same field, so
+        // supplying both is a deterministic serde "duplicate field" error (no
+        // silent last-wins). A mid-migration config that sets both fails safe:
+        // the offending config layer is dropped with a warning, not merged.
+        let err = serde_json::from_str::<BridgeServerConfig>(
+            r#"{ "workspaceMarkers": [".git"], "rootMarkers": [".git"] }"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn toml_both_marker_keys_present_is_a_hard_error() {
+        // The toml crate's duplicate-key detection is independent of
+        // serde_json's, so pin the same fail-safe on the TOML load path too.
+        let toml_str = r#"
+            [languageServers._]
+            workspaceMarkers = [".git"]
+            rootMarkers = [".cargo"]
+        "#;
+        let err = toml::from_str::<RawWorkspaceSettings>(toml_str).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("duplicate"),
+            "expected a duplicate-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_parse_workspace_markers_mixed_string_and_group_json() {
+        // Neovim's (string|string[])[] shape: a bare string is one tier, a
+        // nested array is an equal-priority group.
+        let config_json = r#"{
+            "workspaceMarkers": [["stylua.toml", ".luarc.json"], ".git"]
+        }"#;
+
+        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
+        assert_eq!(
+            config.workspace_markers,
             Some(vec![
                 RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
                 RootMarker::Single(".git".to_string()),
@@ -1568,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn root_markers_group_survives_json_serialize_round_trip() {
+    fn workspace_markers_group_survives_json_serialize_round_trip() {
         // `kakehashi/effectiveConfiguration` re-serializes the user's settings
         // via serde_json, so a Group must round-trip: array for a group, bare
         // string for a single, with entry order preserved.
@@ -1576,7 +1662,7 @@ mod tests {
             cmd: vec![],
             languages: vec![],
             initialization_options: None,
-            root_markers: Some(vec![
+            workspace_markers: Some(vec![
                 RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
                 RootMarker::Single(".git".to_string()),
             ]),
@@ -1587,28 +1673,30 @@ mod tests {
 
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(
-            json["rootMarkers"],
+            json["workspaceMarkers"],
             serde_json::json!([["stylua.toml", ".luarc.json"], ".git"])
         );
+        // The deprecated key is never *emitted* (alias is deserialize-only).
+        assert!(json.get("rootMarkers").is_none());
 
         let reparsed: BridgeServerConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(reparsed.root_markers, config.root_markers);
+        assert_eq!(reparsed.workspace_markers, config.workspace_markers);
     }
 
     #[test]
-    fn should_parse_root_markers_mixed_string_and_group_toml() {
+    fn should_parse_workspace_markers_mixed_string_and_group_toml() {
         // TOML 1.0 allows heterogeneous arrays; the untagged enum must round
         // trip a mix of bare names and nested groups through the toml crate.
         let toml_str = r#"
             [languageServers._]
-            rootMarkers = [["stylua.toml", ".luarc.json"], ".git"]
+            workspaceMarkers = [["stylua.toml", ".luarc.json"], ".git"]
         "#;
 
         let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();
         let servers = settings.language_servers.unwrap();
         let wildcard = &servers["_"];
         assert_eq!(
-            wildcard.root_markers,
+            wildcard.workspace_markers,
             Some(vec![
                 RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
                 RootMarker::Single(".git".to_string()),

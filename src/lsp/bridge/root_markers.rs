@@ -2,7 +2,7 @@
 //!
 //! Downstream language servers historically received the client-supplied
 //! workspace root verbatim, which points at the *editor's* workspace — in a
-//! monorepo that is rarely the project the document belongs to. `rootMarkers`
+//! monorepo that is rarely the project the document belongs to. `workspaceMarkers`
 //! locates the root the way Neovim's `vim.fs.root` does: marker entries are
 //! tried in configured order, each searched up the triggering document's
 //! ancestors before the next entry, so a higher-priority marker in a far
@@ -16,10 +16,10 @@ use url::Url;
 
 use crate::config::settings::RootMarker;
 
-/// Built-in default applied when a server config has no `rootMarkers`.
+/// Built-in default applied when a server config has no `workspaceMarkers`.
 /// Mirrored as a literal by the `config init` template
 /// (`config::defaults::default_language_servers`), which cannot reference
-/// this bridge-private module; `default_settings_documents_root_markers_default`
+/// this bridge-private module; `default_settings_documents_workspace_markers_default`
 /// pins the template side.
 const DEFAULT_ROOT_MARKERS: &[&str] = &[".git"];
 
@@ -56,7 +56,7 @@ fn find_marker_root(document_path: &Path, markers: &[RootMarker]) -> Option<Path
             // Spawn-time only (not per request), so a plain warn does not flood.
             log::warn!(
                 target: "kakehashi::bridge::init",
-                "ignoring invalid rootMarkers entries (must be plain relative names): {:?}",
+                "ignoring invalid workspaceMarkers entries (must be plain relative names): {:?}",
                 invalid
             );
         }

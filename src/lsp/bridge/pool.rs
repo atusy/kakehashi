@@ -850,7 +850,7 @@ impl LanguageServerPool {
     /// `(server_name, root)` key (root_markers module), so documents under
     /// different marker roots get their own downstream process while documents
     /// sharing a root (or the client-root fallback) share one (issue #382). On a
-    /// spawn it also seeds that connection's `rootMarkers` workspace root for the
+    /// spawn it also seeds that connection's `workspaceMarkers` workspace root for the
     /// LSP handshake.
     pub(super) async fn get_or_create_connection(
         &self,
@@ -1046,7 +1046,7 @@ impl LanguageServerPool {
         ConnectionKey,
     ) {
         let marker = super::root_markers::resolve_marker_workspace(
-            server_config.root_markers.as_deref(),
+            server_config.workspace_markers.as_deref(),
             document_uri,
         );
         let key = ConnectionKey::new(
@@ -1425,7 +1425,7 @@ impl LanguageServerPool {
         // Create dynamic capability registry (shared between reader and connection handle)
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
 
-        // rootMarkers workspace-root detection (root_markers module): the same
+        // workspaceMarkers workspace-root detection (root_markers module): the same
         // marker workspace resolved for the pool key above (entry-priority
         // order) also seeds the handshake — a marker hit overrides the
         // client-supplied root and folders; otherwise both fall back. Reusing
@@ -2101,7 +2101,7 @@ mod tests {
         let doc_b = Url::from_file_path(proj_b.join("src/main.py")).unwrap();
 
         let pool = LanguageServerPool::new();
-        let config = devnull_config(); // root_markers: None → default [".git"]
+        let config = devnull_config(); // workspace_markers: None → default [".git"]
 
         let key_a = pool.connection_key("pyright", &config, Some(&doc_a));
         let key_b = pool.connection_key("pyright", &config, Some(&doc_b));
@@ -2777,7 +2777,7 @@ mod tests {
             ],
             languages: vec!["lua".to_string()],
             initialization_options: None,
-            root_markers: None,
+            workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             settings: None,
