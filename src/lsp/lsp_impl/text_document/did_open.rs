@@ -681,6 +681,7 @@ print("hello")
         let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);
 
         let wait_version = |want: i32| {
+            let server = server;
             let uri = &uri;
             async move {
                 timeout(Duration::from_secs(1), async {

@@ -477,10 +477,13 @@ fn collect_injection_contexts_sync<'a>(
         // Poll for supersession per region: this resolve loop is the dominant
         // discovery cost on a large document (one language resolution + query
         // fetch per injection region), so a newer keystroke must be able to
-        // abort it here rather than after all regions are resolved. The
-        // caller discards the partial contexts returned on this early break.
+        // abort it here rather than after all regions are resolved. Return
+        // rather than `break`: the `combined_groups` pass below is itself
+        // expensive (per-group language resolution + query lookups), so a
+        // supersede should skip it too. Discovery is definitionally incomplete
+        // here, hence `false`; the caller discards the partial result on cancel.
         if crate::cancel::is_cancelled(cancel) {
-            break;
+            return (contexts, exclusion_ranges, false);
         }
 
         let start = injection.content_node.start_byte();
