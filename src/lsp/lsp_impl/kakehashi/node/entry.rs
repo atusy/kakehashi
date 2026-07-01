@@ -242,13 +242,12 @@ impl Kakehashi {
                 return Ok(Value::Null);
             }
         };
-        let text = snapshot.text();
-        let tree = snapshot.tree();
+        let (text, tree, _incarnation) = snapshot.into_parts();
         let doc_len = text.len();
         if doc_len == 0 {
             return Ok(Value::Null);
         }
-        let mapper = PositionMapper::new(text);
+        let mapper = PositionMapper::new(&text);
         let Some(byte) = mapper.position_to_byte(position) else {
             return Ok(Value::Null);
         };
@@ -256,48 +255,63 @@ impl Kakehashi {
             return Ok(Value::Null);
         }
 
-        let stack = injection_stack_at(&self.language, &host_language, text, tree, byte);
+        // The stack enumeration re-runs the injection query over the host tree
+        // (O(regions)) and re-parses each containing layer — synchronous
+        // tree-CPU, run as a compute-pool work-unit (parse-snapshot ADR §4),
+        // together with the layer selection and the mint over its result.
+        let language = std::sync::Arc::clone(&self.language);
+        let tracker = self.bridge.node_tracker_arc();
+        let result = self
+            .compute_pool
+            .run(None, move || {
+                let stack = injection_stack_at(&language, &host_language, &text, &tree, byte);
 
-        let layer_index = match selector {
-            InjectionSelector::Host => unreachable!("handled above"),
-            InjectionSelector::Invalid => unreachable!("handled above"),
-            InjectionSelector::Saturating => {
-                // `true` saturates to the deepest layer. The stack always
-                // contains at least the host (layer 0), so this never
-                // under-indexes.
-                stack.len() - 1
-            }
-            InjectionSelector::Index(n) => {
-                let Some(idx) = resolve_index(n, stack.len()) else {
-                    return Ok(Value::Null);
+                let layer_index = match selector {
+                    InjectionSelector::Host => unreachable!("handled above"),
+                    InjectionSelector::Invalid => unreachable!("handled above"),
+                    InjectionSelector::Saturating => {
+                        // `true` saturates to the deepest layer. The stack always
+                        // contains at least the host (layer 0), so this never
+                        // under-indexes.
+                        stack.len() - 1
+                    }
+                    InjectionSelector::Index(n) => {
+                        let Some(idx) = resolve_index(n, stack.len()) else {
+                            return Value::Null;
+                        };
+                        idx
+                    }
                 };
-                idx
-            }
-        };
 
-        let Some(layer) = stack.get(layer_index) else {
-            return Ok(Value::Null);
-        };
+                let Some(layer) = stack.get(layer_index) else {
+                    return Value::Null;
+                };
 
-        let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
-            return Ok(Value::Null);
-        };
+                let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
+                    return Value::Null;
+                };
 
-        // Mint with the resolved layer index so a host and injected node sharing
-        // (start, end, kind) get distinct ULIDs and stay navigable in their own
-        // tree (lazy-node-identity-tracking §"Node Uniqueness Key", issue #313).
-        let ulid = self.bridge.node_tracker().get_or_create_in_layer(
-            &uri,
-            node.start_byte(),
-            node.end_byte(),
-            node.kind(),
-            layer_index,
-        );
+                // Mint with the resolved layer index so a host and injected node
+                // sharing (start, end, kind) get distinct ULIDs and stay navigable
+                // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
+                // Key", issue #313).
+                let ulid = tracker.get_or_create_in_layer(
+                    &uri,
+                    node.start_byte(),
+                    node.end_byte(),
+                    node.kind(),
+                    layer_index,
+                );
 
-        Ok(json!({
-            "id": ulid.to_string(),
-            "kind": node.kind(),
-        }))
+                json!({
+                    "id": ulid.to_string(),
+                    "kind": node.kind(),
+                })
+            })
+            .await;
+
+        // None = the work-unit panicked (logged by the pool) → protocol null.
+        Ok(result.unwrap_or(Value::Null))
     }
 
     /// Host-layer lookup, factored out so the no-injection request keeps

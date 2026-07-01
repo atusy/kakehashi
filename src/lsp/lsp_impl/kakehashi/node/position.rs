@@ -37,7 +37,7 @@ impl Kakehashi {
     /// `null`.
     pub async fn kakehashi_node_range(&self, params: NodeIdParams) -> Result<Value> {
         let value = self
-            .with_node_text(&params.text_document.uri, &params.id, |n, text| {
+            .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 let mapper = PositionMapper::new(text);
                 Some((
                     mapper.byte_to_position(n.start_byte())?,
@@ -56,7 +56,7 @@ impl Kakehashi {
     /// `null`.
     pub async fn kakehashi_node_start_position(&self, params: NodeIdParams) -> Result<Value> {
         let value = self
-            .with_node_text(&params.text_document.uri, &params.id, |n, text| {
+            .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 PositionMapper::new(text).byte_to_position(n.start_byte())
             })
             .await
@@ -70,7 +70,7 @@ impl Kakehashi {
     /// `Node::end_position`. Returns `{ "endPosition": Position }` or `null`.
     pub async fn kakehashi_node_end_position(&self, params: NodeIdParams) -> Result<Value> {
         let value = self
-            .with_node_text(&params.text_document.uri, &params.id, |n, text| {
+            .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 PositionMapper::new(text).byte_to_position(n.end_byte())
             })
             .await
@@ -115,32 +115,39 @@ impl Kakehashi {
         let start = params.start;
         let end = params.end;
         let resolved = self
-            .with_node_text_ranges(&params.text_document.uri, &params.id, |n, text, ranges| {
-                let mapper = PositionMapper::new(text);
-                // Strict conversion: a `character` past a line's end must mean
-                // "no such location" (null), NOT spill onto a later line as plain
-                // `position_to_byte` would (it computes line_start + character).
-                let start_byte = mapper.position_to_byte_strict(start)?;
-                let end_byte = mapper.position_to_byte_strict(end)?;
-                // Mirror the byte-range guards: reject inverted ranges and any
-                // range not contained in the node's own span, whose tree-sitter
-                // behaviour is unspecified (see navigation.rs / lookup::find_node_at).
-                if start_byte < n.start_byte() || start_byte > end_byte || end_byte > n.end_byte() {
-                    return None;
-                }
-                // And reject coordinates landing in an injected layer's
-                // excluded gaps (e.g. blockquote `> ` prefixes) — they are not
-                // injected content (#341; same rule as the byte accessors).
-                if !range_bounds_in_ranges(ranges, start_byte, end_byte, text.len()) {
-                    return None;
-                }
-                let descendant = if named {
-                    n.named_descendant_for_byte_range(start_byte, end_byte)
-                } else {
-                    n.descendant_for_byte_range(start_byte, end_byte)
-                };
-                descendant.map(|d| (d.start_byte(), d.end_byte(), d.kind()))
-            })
+            .with_node_text_ranges(
+                &params.text_document.uri,
+                &params.id,
+                move |n, text, ranges| {
+                    let mapper = PositionMapper::new(text);
+                    // Strict conversion: a `character` past a line's end must mean
+                    // "no such location" (null), NOT spill onto a later line as plain
+                    // `position_to_byte` would (it computes line_start + character).
+                    let start_byte = mapper.position_to_byte_strict(start)?;
+                    let end_byte = mapper.position_to_byte_strict(end)?;
+                    // Mirror the byte-range guards: reject inverted ranges and any
+                    // range not contained in the node's own span, whose tree-sitter
+                    // behaviour is unspecified (see navigation.rs / lookup::find_node_at).
+                    if start_byte < n.start_byte()
+                        || start_byte > end_byte
+                        || end_byte > n.end_byte()
+                    {
+                        return None;
+                    }
+                    // And reject coordinates landing in an injected layer's
+                    // excluded gaps (e.g. blockquote `> ` prefixes) — they are not
+                    // injected content (#341; same rule as the byte accessors).
+                    if !range_bounds_in_ranges(ranges, start_byte, end_byte, text.len()) {
+                        return None;
+                    }
+                    let descendant = if named {
+                        n.named_descendant_for_byte_range(start_byte, end_byte)
+                    } else {
+                        n.descendant_for_byte_range(start_byte, end_byte)
+                    };
+                    descendant.map(|d| (d.start_byte(), d.end_byte(), d.kind()))
+                },
+            )
             .await;
 
         let value = match resolved {

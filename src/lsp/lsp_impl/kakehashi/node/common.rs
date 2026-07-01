@@ -139,11 +139,11 @@ impl Kakehashi {
     /// The `layer` is handed back so navigation handlers can re-mint result
     /// nodes (children, siblings, descendants) in the **same** layer — they live
     /// in the same tree as the resolved node.
-    pub(super) async fn with_node_by_id<R>(
+    pub(super) async fn with_node_by_id<R: Send + 'static>(
         &self,
         lsp_uri: &Uri,
         id: &str,
-        mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
+        mut f: impl FnMut(tree_sitter::Node<'_>) -> R + Send + 'static,
     ) -> Option<(Url, usize, R)> {
         // Most accessors don't need the document text; ignore it.
         self.with_node_text(lsp_uri, id, move |node, _text| f(node))
@@ -160,11 +160,11 @@ impl Kakehashi {
     /// unconditionally here would tax every scalar/navigation accessor that never
     /// touches positions. Only the handful of position accessors build the mapper,
     /// inside their own closure.
-    pub(super) async fn with_node_text<R>(
+    pub(super) async fn with_node_text<R: Send + 'static>(
         &self,
         lsp_uri: &Uri,
         id: &str,
-        mut f: impl FnMut(tree_sitter::Node<'_>, &str) -> R,
+        mut f: impl FnMut(tree_sitter::Node<'_>, &str) -> R + Send + 'static,
     ) -> Option<(Url, usize, R)> {
         // Most accessors don't need the minting layer's included ranges.
         self.with_node_text_ranges(lsp_uri, id, move |node, text, _ranges| f(node, text))
@@ -177,11 +177,11 @@ impl Kakehashi {
     /// accessors use them to reject byte/point arguments that land in an
     /// injected layer's excluded gaps — e.g. blockquote `> ` prefixes — which
     /// are inside a node's contiguous span but are not injected content (#341).
-    pub(super) async fn with_node_text_ranges<R>(
+    pub(super) async fn with_node_text_ranges<R: Send + 'static>(
         &self,
         lsp_uri: &Uri,
         id: &str,
-        mut f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> R,
+        mut f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> R + Send + 'static,
     ) -> Option<(Url, usize, R)> {
         // An unparseable URI signals a misbehaving client; warn for parity with
         // `node` / `node/text` / `node/parent` / `node/children` while still
@@ -204,7 +204,7 @@ impl Kakehashi {
 
         // Snapshot so we operate on a consistent (text, tree) pair.
         let snapshot = self.documents.get(&uri).and_then(|doc| doc.snapshot())?;
-        let host_text = snapshot.text();
+        let (host_text, host_tree, _incarnation) = snapshot.into_parts();
 
         // Defensively reject an invalid or out-of-bounds tracked range before any
         // tree work: an inverted range or one extending past the current text
@@ -214,8 +214,29 @@ impl Kakehashi {
             return None;
         }
 
-        let host_tree = snapshot.tree();
         let host_language = self.document_language(&uri)?;
+
+        // Resolving the minting layer re-runs the injection query over the host
+        // tree (O(regions)) and re-parses the containing layer chain —
+        // synchronous tree-CPU, run as a compute-pool work-unit together with
+        // the accessor closure over the resolved node (parse-snapshot ADR §4).
+        let language = std::sync::Arc::clone(&self.language);
+        let resolved = self
+            .compute_pool
+            .run(None, move || {
+                with_resolved_node_ranges(
+                    &language,
+                    &host_language,
+                    &host_text,
+                    &host_tree,
+                    start,
+                    end,
+                    kind,
+                    layer,
+                    |node, ranges| f(node, &host_text, ranges),
+                )
+            })
+            .await?; // outer None = the work-unit panicked (logged by the pool)
 
         // A tracker hit that fails to resolve in its minting layer means the
         // tree drifted out from under the tracked range (e.g. an edit
@@ -223,17 +244,7 @@ impl Kakehashi {
         // diagnosing drift — mirroring `node/parent` and `node/children` — and
         // is distinct from the silent `None` cases above (never-issued ULID,
         // unparsed document), which are expected and collapse to `null` quietly.
-        let Some(result) = with_resolved_node_ranges(
-            &self.language,
-            &host_language,
-            host_text,
-            host_tree,
-            start,
-            end,
-            kind,
-            layer,
-            |node, ranges| f(node, host_text, ranges),
-        ) else {
+        let Some(result) = resolved else {
             log::warn!(
                 target: "kakehashi::node",
                 "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
@@ -274,7 +285,7 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         id: &str,
-        f: impl FnMut(tree_sitter::Node<'_>) -> Option<NodeTriple>,
+        f: impl FnMut(tree_sitter::Node<'_>) -> Option<NodeTriple> + Send + 'static,
     ) -> Value {
         let Some((uri, layer, picked)) = self.with_node_by_id(lsp_uri, id, f).await else {
             return Value::Null;
@@ -293,7 +304,9 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         id: &str,
-        f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> Option<NodeTriple>,
+        f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> Option<NodeTriple>
+        + Send
+        + 'static,
     ) -> Value {
         let Some((uri, layer, picked)) = self.with_node_text_ranges(lsp_uri, id, f).await else {
             return Value::Null;
@@ -320,7 +333,9 @@ impl Kakehashi {
         lsp_uri: &Uri,
         id: &str,
         descendant_id: &str,
-        f: impl FnMut(tree_sitter::Node<'_>, tree_sitter::Node<'_>) -> Option<NodeTriple>,
+        f: impl FnMut(tree_sitter::Node<'_>, tree_sitter::Node<'_>) -> Option<NodeTriple>
+        + Send
+        + 'static,
     ) -> Value {
         let Ok(uri) = uri_to_url(lsp_uri) else {
             log::warn!(target: "kakehashi::node", "invalid URI: {}", lsp_uri.as_str());
@@ -412,7 +427,7 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         id: &str,
-        f: impl FnMut(tree_sitter::Node<'_>) -> Vec<NodeTriple>,
+        f: impl FnMut(tree_sitter::Node<'_>) -> Vec<NodeTriple> + Send + 'static,
     ) -> Value {
         let Some((uri, layer, items)) = self.with_node_by_id(lsp_uri, id, f).await else {
             return Value::Null;
