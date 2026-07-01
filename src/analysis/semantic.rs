@@ -50,6 +50,12 @@ use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::Semanti
 /// blocking pool, distributing injections across Rayon workers. Thread-local
 /// parser caches avoid cross-thread synchronization on parse. Returns `None`
 /// on cancellation/failure. `text` and `tree` are moved into `spawn_blocking`.
+///
+/// `cancel` (when provided) is polled at coarse boundaries — after the host
+/// pass, after the injection pass, and per region inside the injection pass — so
+/// a superseded/cancelled request stops instead of running to completion.
+/// Returns `None` once cancelled: the caller drops the (partial) result rather
+/// than storing it (see the compute-superseded checkpoints in the handlers).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
     text: String,
@@ -60,8 +66,11 @@ pub(crate) async fn handle_semantic_tokens_full(
     coordinator: std::sync::Arc<crate::language::LanguageCoordinator>,
     supports_multiline: bool,
     injection_cache: Option<InjectionCacheParams>,
+    cancel: Option<crate::cancel::CancelToken>,
 ) -> Option<SemanticTokensResult> {
     tokio::task::spawn_blocking(move || {
+        let is_cancelled = || cancel.as_ref().is_some_and(|c| c.is_cancelled());
+
         let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
         let line_starts = build_line_start_bytes(&text);
@@ -84,6 +93,12 @@ pub(crate) async fn handle_semantic_tokens_full(
             &mut all_tokens,
         );
 
+        // Bail before the injection pass — the dominant cost on a large document
+        // — if this request has already been superseded.
+        if is_cancelled() {
+            return None;
+        }
+
         // Borrow the owned cache handle into a request-scoped context for the
         // injection pass (#529); `None` keeps the uncached behavior.
         let cache_ctx = injection_cache.as_ref().map(|p| InjectionCacheCtx {
@@ -95,6 +110,8 @@ pub(crate) async fn handle_semantic_tokens_full(
 
         // Collect injection tokens in parallel using Rayon.
         // Also returns active injection regions for finalize-time exclusion.
+        // `cancel` is polled inside discovery and the per-region fan-out so a
+        // supersede lands mid-pass, not just at these outer boundaries.
         let (injection_tokens, active_injection_regions) = collect_injection_tokens_parallel(
             &text,
             &lines,
@@ -105,7 +122,14 @@ pub(crate) async fn handle_semantic_tokens_full(
             capture_mappings.as_deref(),
             supports_multiline,
             cache_ctx.as_ref(),
+            cancel.as_ref(),
         );
+
+        // A supersede observed during the injection pass leaves a partial token
+        // set; drop it so the handler never stores partial results.
+        if is_cancelled() {
+            return None;
+        }
 
         // Merge injection tokens with host tokens
         all_tokens.extend(injection_tokens);
@@ -593,6 +617,7 @@ local x = 42
             coordinator,
             false,
             None,
+            None,
         )
         .await;
 
@@ -660,6 +685,7 @@ local x = 42
             None,
             coordinator,
             false,
+            None,
             None,
         )
         .await;
@@ -732,6 +758,7 @@ local x = 42
             Some(capture_mappings),
             coordinator,
             false,
+            None,
             None,
         )
         .await;
@@ -846,6 +873,7 @@ local x = 42
             coordinator,
             false,
             None,
+            None,
         )
         .await;
 
@@ -958,6 +986,7 @@ local x = 42
             coordinator,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1069,6 +1098,7 @@ local x = 42
             Some(capture_mappings),
             coordinator,
             true, // multiline support enabled!
+            None,
             None,
         )
         .await;
@@ -1201,6 +1231,7 @@ foo
             coordinator,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1310,6 +1341,7 @@ foo
             Some(capture_mappings),
             coordinator,
             false,
+            None,
             None,
         )
         .await;

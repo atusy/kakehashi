@@ -41,6 +41,9 @@ pub(crate) async fn handle_semantic_tokens_range_parallel_async(
         coordinator,
         supports_multiline,
         None,
+        // Range requests compute a one-shot slice and aren't part of the
+        // rapid-typing pile-up, so no cancellation token is threaded in.
+        None,
     )
     .await?;
 

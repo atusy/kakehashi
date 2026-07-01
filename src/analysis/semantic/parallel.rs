@@ -262,6 +262,10 @@ pub(crate) fn process_injection_sync(
             ctx.host_start_byte,
             ctx.included_ranges.as_deref(),
             None,
+            // Nested discovery for a single region is bounded; cancellation is
+            // enforced at the per-region fan-out entry (this region was already
+            // committed there), so no token is threaded into the recursion.
+            None,
         );
 
     let mut tokens = Vec::new();
@@ -402,6 +406,7 @@ fn clip_tokens_to_included_ranges(
 /// gap that re-fills when the parser loads without the content changing. A caller
 /// that caches a region must taint it with this so an incomplete subtree is never
 /// stored (and then served stale once the missing parser arrives, #529 Hazard 3).
+#[allow(clippy::too_many_arguments)]
 fn collect_injection_contexts_sync<'a>(
     text: &'a str,
     tree: &Tree,
@@ -410,6 +415,7 @@ fn collect_injection_contexts_sync<'a>(
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
     cache_ctx: Option<(&Url, &NodeTracker)>,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>, bool) {
     use crate::language::injection::collect_all_injections;
 
@@ -468,6 +474,15 @@ fn collect_injection_contexts_sync<'a>(
     let cache_for_singles = cache_ctx.filter(|_| singles.len() >= INJECTION_CACHE_MIN_REGIONS);
 
     for injection in singles {
+        // Poll for supersession per region: this resolve loop is the dominant
+        // discovery cost on a large document (one language resolution + query
+        // fetch per injection region), so a newer keystroke must be able to
+        // abort it here rather than after all regions are resolved. The
+        // caller discards the partial contexts returned on this early break.
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            break;
+        }
+
         let start = injection.content_node.start_byte();
         let end = injection.content_node.end_byte();
 
@@ -822,12 +837,17 @@ pub(crate) fn collect_injection_tokens_parallel(
     capture_mappings: Option<&CaptureMappings>,
     supports_multiline: bool,
     cache_ctx: Option<&InjectionCacheCtx>,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use rayon::prelude::*;
 
+    let is_cancelled = || cancel.is_some_and(|c| c.is_cancelled());
+
     // Collect top-level injection contexts and their byte ranges. The cache
     // handle (if any) lets the discovery phase resolve region identities
-    // single-threaded, before the fan-out.
+    // single-threaded, before the fan-out. `cancel` is polled inside the
+    // per-region discovery loop — that resolve loop is the dominant cost on a
+    // large document, so a supersede must be able to abort it mid-loop.
     // A top-level region dropped during discovery isn't cached (no region_cache
     // is built for it), so the top-level completeness flag is irrelevant here —
     // only nested completeness, threaded through process_injection_sync, matters.
@@ -839,9 +859,13 @@ pub(crate) fn collect_injection_tokens_parallel(
         0,
         None,
         cache_ctx.map(|c| (c.uri, c.tracker)),
+        cancel,
     );
 
-    if contexts.is_empty() {
+    // Discovery bailed (or genuinely found nothing): either way there is nothing
+    // to tokenize. A cancelled discovery returns partial contexts the caller
+    // discards, so skip the fan-out entirely.
+    if contexts.is_empty() || is_cancelled() {
         return (Vec::new(), Vec::new());
     }
 
@@ -880,46 +904,40 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Tokenize only the misses: parallel above the threshold, sequential below.
     // Each result carries its context index so the store decision can pair it
     // with the region's cache identity off the Rayon workers.
+    //
+    // A supersede observed at region entry skips the expensive parse+query for
+    // that region; the empty stand-in is marked `fully_loaded: false` so the
+    // cache store-half below never persists it. Under a rapid-typing pile-up the
+    // remaining Rayon closures drain almost immediately once the token trips.
+    let process_one = |i: usize| -> (usize, InjectionTokens) {
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            return (
+                i,
+                InjectionTokens {
+                    tokens: Vec::new(),
+                    fully_loaded: false,
+                },
+            );
+        }
+        (
+            i,
+            process_injection_sync(
+                &contexts[i],
+                &factory,
+                coordinator,
+                capture_mappings,
+                host_text,
+                host_lines,
+                host_line_starts,
+                1, // depth 1 (first level of injection, host is 0)
+                supports_multiline,
+            ),
+        )
+    };
     let processed: Vec<(usize, InjectionTokens)> = if miss_indices.len() >= PARALLEL_THRESHOLD {
-        miss_indices
-            .par_iter()
-            .map(|&i| {
-                (
-                    i,
-                    process_injection_sync(
-                        &contexts[i],
-                        &factory,
-                        coordinator,
-                        capture_mappings,
-                        host_text,
-                        host_lines,
-                        host_line_starts,
-                        1, // depth 1 (first level of injection, host is 0)
-                        supports_multiline,
-                    ),
-                )
-            })
-            .collect()
+        miss_indices.par_iter().map(|&i| process_one(i)).collect()
     } else {
-        miss_indices
-            .iter()
-            .map(|&i| {
-                (
-                    i,
-                    process_injection_sync(
-                        &contexts[i],
-                        &factory,
-                        coordinator,
-                        capture_mappings,
-                        host_text,
-                        host_lines,
-                        host_line_starts,
-                        1,
-                        supports_multiline,
-                    ),
-                )
-            })
-            .collect()
+        miss_indices.iter().map(|&i| process_one(i)).collect()
     };
 
     // Store region-local tokens for newly computed eligible, fully-loaded regions
@@ -1461,6 +1479,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
 
         assert!(tokens.is_empty(), "Empty document should have no tokens");
@@ -1516,6 +1535,7 @@ local x = 42
             &coordinator,
             None,
             false,
+            None,
             None,
         );
 
@@ -1614,6 +1634,7 @@ local x = 42
             None,
             false,
             None,
+            None,
         );
 
         // The surviving `local` keyword maps to host line 2, col 2 (after the
@@ -1706,6 +1727,7 @@ local b = 2
             &coordinator,
             None,
             false,
+            None,
             None,
         );
 
@@ -1923,6 +1945,7 @@ local b = 2
             0,
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -2000,6 +2023,7 @@ local b = 2
             0,
             None,
             None,
+            None,
         );
 
         // The vendored query injects more than html (markdown_inline for the
@@ -2061,6 +2085,7 @@ local b = 2
             &coordinator,
             None,
             false,
+            None,
             None,
         );
 
@@ -2125,6 +2150,7 @@ local b = 2
             // Multiline client support must not let the spanning string token
             // bleed across the gap either.
             true,
+            None,
             None,
         );
 
@@ -2252,6 +2278,7 @@ local b = 2
             None,
             false,
             None,
+            None,
         )
         .0;
 
@@ -2275,6 +2302,7 @@ local b = 2
             None,
             false,
             Some(&cc),
+            None,
         )
         .0;
         assert_eq!(first, uncached, "first (store) pass must match uncached");
@@ -2296,9 +2324,106 @@ local b = 2
             None,
             false,
             Some(&cc),
+            None,
         )
         .0;
         assert_eq!(second, uncached, "second (hit) pass must match uncached");
+    }
+
+    /// The dominant per-compute cost on a large document is the single-threaded
+    /// discovery loop (one language resolution + query fetch per region). A
+    /// superseded request must abort *inside* that loop, not merely at the pass
+    /// boundary — otherwise a supersede still pays the full discovery. Assert a
+    /// pre-cancelled token collapses discovery to zero contexts, while an
+    /// uncancelled run finds all eight. This guards against a regression that
+    /// moves the checkpoint out of the discovery loop.
+    #[test]
+    fn cancelled_token_aborts_injection_discovery() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+
+        let (live, _excl, _complete) = collect_injection_contexts_sync(
+            &text,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            live.len(),
+            8,
+            "sanity: the eight lua blocks are discovered without cancellation"
+        );
+
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+        let (aborted, _excl, _complete) = collect_injection_contexts_sync(
+            &text,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+            None,
+            Some(&cancel),
+        );
+        assert!(
+            aborted.is_empty(),
+            "a pre-cancelled token must break the discovery loop before resolving any region"
+        );
+    }
+
+    /// End-to-end: a cancelled injection pass must produce no tokens AND persist
+    /// nothing to the region cache — a partial store would later serve an
+    /// incomplete region as a stale hit. Contrast the uncancelled run, which
+    /// stores all eight regions.
+    #[test]
+    fn cancelled_token_stores_no_injection_regions() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
+
+        let uri = Url::parse("file:///cancel_no_store.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+        };
+
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+        let (tokens, regions) = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+            Some(&cancel),
+        );
+        assert!(tokens.is_empty(), "a cancelled pass must yield no tokens");
+        assert!(regions.is_empty(), "a cancelled pass must yield no regions");
+        assert_eq!(
+            cache.test_keys(&uri).len(),
+            0,
+            "a cancelled pass must not persist any (partial) region to the cache"
+        );
     }
 
     /// Proof the reuse path actually *reads* the cache rather than recomputing:
@@ -2336,6 +2461,7 @@ local b = 2
             None,
             false,
             Some(&cc),
+            None,
         );
 
         // Overwrite one region with a region-local sentinel token.
@@ -2366,6 +2492,7 @@ local b = 2
             None,
             false,
             Some(&cc),
+            None,
         )
         .0;
 
@@ -2410,6 +2537,7 @@ local b = 2
             None,
             false,
             Some(&cc),
+            None,
         );
 
         // Insert a blank line at the very top: every region shifts down one line,
@@ -2431,6 +2559,7 @@ local b = 2
             None,
             false,
             Some(&cc),
+            None,
         )
         .0;
 
@@ -2443,6 +2572,7 @@ local b = 2
             &coordinator,
             None,
             false,
+            None,
             None,
         )
         .0;

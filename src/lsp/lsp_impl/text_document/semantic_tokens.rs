@@ -409,6 +409,7 @@ impl Kakehashi {
                 coordinator,
                 supports_multiline,
                 injection_cache,
+                Some(cancel_token.clone()),
             );
 
             let result = if let Some(cancel_rx) = cancel_rx {
@@ -707,6 +708,7 @@ impl Kakehashi {
                     coordinator,
                     supports_multiline,
                     injection_cache,
+                    Some(cancel_token.clone()),
                 );
 
                 let result = if let Some(cancel_rx) = cancel_rx {
