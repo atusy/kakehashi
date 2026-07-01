@@ -1,4 +1,5 @@
 pub mod defaults;
+pub(crate) mod deprecation;
 pub(crate) mod expand;
 pub(crate) mod merge;
 pub mod settings;

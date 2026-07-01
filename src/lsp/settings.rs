@@ -61,6 +61,13 @@ pub struct SettingsLoadOutcome {
     pub settings: Option<WorkspaceSettings>,
     pub raw_settings: Option<RawWorkspaceSettings>,
     pub events: Vec<SettingsEvent>,
+    /// True if any loaded config layer used the deprecated `rootMarkers` key
+    /// (superseded by `workspaceMarkers`). Serde's alias erases which spelling
+    /// was written, so this is detected from the raw config value. The
+    /// once-per-session deprecation warning is surfaced by the `initialize`
+    /// handler, which reads this field; it is intentionally kept out of
+    /// `events` so the many callers that re-load settings do not re-warn.
+    pub used_deprecated_root_markers: bool,
 }
 
 pub fn load_settings(
@@ -71,6 +78,7 @@ pub fn load_settings(
 ) -> SettingsLoadOutcome {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
+    let mut used_deprecated_root_markers = false;
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
@@ -84,20 +92,31 @@ pub fn load_settings(
             )));
             files
                 .iter()
-                .map(|p| load_toml_file(p, &mut events))
+                .map(|p| load_toml_file(p, &mut events, &mut used_deprecated_root_markers))
                 .collect()
         } else {
+            // User config from XDG_CONFIG_HOME is read behind `load_user_config`,
+            // which does not expose the raw value, so detect the deprecated key
+            // via a dedicated read (config load is off the hot path).
+            used_deprecated_root_markers |=
+                crate::config::user::user_config_uses_deprecated_root_markers();
             vec![
                 // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
                 load_user_config_with_events(&mut events),
                 // Layer 3: Project config from root_path/kakehashi.toml
-                load_toml_settings(root_path, &mut events),
+                load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers),
             ]
         };
 
     // Layer 4: Override settings from initialization options or client configuration
-    let override_settings = override_settings
-        .and_then(|(source, value)| parse_override_settings(source, value, &mut events));
+    let override_settings = override_settings.and_then(|(source, value)| {
+        parse_override_settings(
+            source,
+            value,
+            &mut events,
+            &mut used_deprecated_root_markers,
+        )
+    });
 
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
     let mut layers = vec![defaults];
@@ -127,6 +146,7 @@ pub fn load_settings(
         settings,
         raw_settings,
         events,
+        used_deprecated_root_markers,
     }
 }
 
@@ -157,7 +177,11 @@ fn load_user_config_with_events(events: &mut Vec<SettingsEvent>) -> Option<RawWo
 ///
 /// Unlike `load_toml_settings`, non-existent files are treated as errors
 /// because explicit paths represent user intent (configuration-merging-strategy).
-fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<RawWorkspaceSettings> {
+fn load_toml_file(
+    path: &Path,
+    events: &mut Vec<SettingsEvent>,
+    used_deprecated_root_markers: &mut bool,
+) -> Option<RawWorkspaceSettings> {
     if !path.exists() {
         events.push(SettingsEvent::error(format!(
             "Config file not found: {}",
@@ -172,23 +196,27 @@ fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<RawWor
     )));
 
     match fs::read_to_string(path) {
-        Ok(contents) => match toml::from_str::<RawWorkspaceSettings>(&contents) {
-            Ok(settings) => {
-                events.push(SettingsEvent::info(format!(
-                    "Successfully loaded {}",
-                    path.display()
-                )));
-                Some(settings)
+        Ok(contents) => {
+            *used_deprecated_root_markers |=
+                crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
+            match toml::from_str::<RawWorkspaceSettings>(&contents) {
+                Ok(settings) => {
+                    events.push(SettingsEvent::info(format!(
+                        "Successfully loaded {}",
+                        path.display()
+                    )));
+                    Some(settings)
+                }
+                Err(err) => {
+                    events.push(SettingsEvent::error(format!(
+                        "Failed to parse {}: {}",
+                        path.display(),
+                        err
+                    )));
+                    None
+                }
             }
-            Err(err) => {
-                events.push(SettingsEvent::error(format!(
-                    "Failed to parse {}: {}",
-                    path.display(),
-                    err
-                )));
-                None
-            }
-        },
+        }
         Err(err) => {
             events.push(SettingsEvent::error(format!(
                 "Failed to read {}: {}",
@@ -203,6 +231,7 @@ fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<RawWor
 fn load_toml_settings(
     root_path: Option<&Path>,
     events: &mut Vec<SettingsEvent>,
+    used_deprecated_root_markers: &mut bool,
 ) -> Option<RawWorkspaceSettings> {
     let root = root_path?;
     let config_path = root.join("kakehashi.toml");
@@ -216,19 +245,23 @@ fn load_toml_settings(
     )));
 
     match fs::read_to_string(&config_path) {
-        Ok(contents) => match toml::from_str::<RawWorkspaceSettings>(&contents) {
-            Ok(settings) => {
-                events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
-                Some(settings)
+        Ok(contents) => {
+            *used_deprecated_root_markers |=
+                crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
+            match toml::from_str::<RawWorkspaceSettings>(&contents) {
+                Ok(settings) => {
+                    events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
+                    Some(settings)
+                }
+                Err(err) => {
+                    events.push(SettingsEvent::warning(format!(
+                        "Failed to parse kakehashi.toml: {}",
+                        err
+                    )));
+                    None
+                }
             }
-            Err(err) => {
-                events.push(SettingsEvent::warning(format!(
-                    "Failed to parse kakehashi.toml: {}",
-                    err
-                )));
-                None
-            }
-        },
+        }
         Err(err) => {
             events.push(SettingsEvent::warning(format!(
                 "Failed to read kakehashi.toml: {}",
@@ -243,7 +276,10 @@ fn parse_override_settings(
     source: SettingsSource,
     value: Value,
     events: &mut Vec<SettingsEvent>,
+    used_deprecated_root_markers: &mut bool,
 ) -> Option<RawWorkspaceSettings> {
+    *used_deprecated_root_markers |=
+        crate::config::deprecation::json_uses_deprecated_root_markers(&value);
     match serde_json::from_value::<RawWorkspaceSettings>(value) {
         Ok(settings) => {
             events.push(SettingsEvent::info(format!(
@@ -533,6 +569,63 @@ mod tests {
         );
     }
 
+    /// A config layer using the deprecated `rootMarkers` key sets the outcome
+    /// flag (surfaced once per session by `initialize`), while the canonical
+    /// `workspaceMarkers` key does not. XDG is pointed at an empty temp dir so
+    /// the developer's real user config cannot pollute the result.
+    #[test]
+    #[serial(xdg_env)]
+    fn load_settings_flags_deprecated_root_markers_in_override() {
+        use crate::config::make_env;
+        use std::env;
+
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
+        let empty_config = TempDir::new().expect("failed to create temp dir");
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", empty_config.path());
+        }
+
+        let deprecated = serde_json::json!({
+            "languageServers": { "rust-analyzer": { "rootMarkers": [".git"] } }
+        });
+        let flagged = load_settings(
+            None,
+            Some((SettingsSource::InitializationOptions, deprecated)),
+            None,
+            make_env(&[]),
+        )
+        .used_deprecated_root_markers;
+
+        let canonical = serde_json::json!({
+            "languageServers": { "rust-analyzer": { "workspaceMarkers": [".git"] } }
+        });
+        let unflagged = load_settings(
+            None,
+            Some((SettingsSource::InitializationOptions, canonical)),
+            None,
+            make_env(&[]),
+        )
+        .used_deprecated_root_markers;
+
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe {
+            match original_xdg {
+                Some(val) => env::set_var("XDG_CONFIG_HOME", val),
+                None => env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            flagged,
+            "rootMarkers in the override layer should set the deprecation flag"
+        );
+        assert!(
+            !unflagged,
+            "workspaceMarkers must not set the deprecation flag"
+        );
+    }
+
     /// load_toml_file: valid TOML parses correctly.
     #[test]
     fn test_load_toml_file_valid() {
@@ -541,7 +634,7 @@ mod tests {
         std::fs::write(&path, "autoInstall = false\n").unwrap();
 
         let mut events = Vec::new();
-        let result = load_toml_file(&path, &mut events);
+        let result = load_toml_file(&path, &mut events, &mut false);
 
         assert!(result.is_some(), "valid TOML should parse");
         assert_eq!(result.unwrap().auto_install, Some(false));
@@ -558,7 +651,11 @@ mod tests {
     #[test]
     fn test_load_toml_file_missing() {
         let mut events = Vec::new();
-        let result = load_toml_file(Path::new("/nonexistent/config.toml"), &mut events);
+        let result = load_toml_file(
+            Path::new("/nonexistent/config.toml"),
+            &mut events,
+            &mut false,
+        );
 
         assert!(result.is_none(), "missing file should return None");
         assert!(
@@ -577,7 +674,7 @@ mod tests {
         std::fs::write(&path, "this is not [valid toml").unwrap();
 
         let mut events = Vec::new();
-        let result = load_toml_file(&path, &mut events);
+        let result = load_toml_file(&path, &mut events, &mut false);
 
         assert!(result.is_none(), "invalid TOML should return None");
         assert!(

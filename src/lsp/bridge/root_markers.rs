@@ -19,7 +19,7 @@ use crate::config::settings::RootMarker;
 /// Built-in default applied when a server config has no `workspaceMarkers`.
 /// Mirrored as a literal by the `config init` template
 /// (`config::defaults::default_language_servers`), which cannot reference
-/// this bridge-private module; `default_settings_documents_root_markers_default`
+/// this bridge-private module; `default_settings_documents_workspace_markers_default`
 /// pins the template side.
 const DEFAULT_ROOT_MARKERS: &[&str] = &[".git"];
 

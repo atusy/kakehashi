@@ -319,7 +319,8 @@ Configure language servers for bridging LSP requests in injection regions.
 > **Migration note**: `workspaceMarkers` was previously named `rootMarkers`
 > (aligning with the LSP spec's `workspaceFolders`). The old `rootMarkers` key
 > still works as a deprecated alias, so existing configs need no change; new
-> configs should prefer `workspaceMarkers`.
+> configs should prefer `workspaceMarkers`. When a config still uses
+> `rootMarkers`, kakehashi shows a one-time deprecation notice per session.
 
 A `languageServers._` wildcard entry supplies defaults that every server
 inherits field-by-field (wildcard-config-inheritance) — e.g. set

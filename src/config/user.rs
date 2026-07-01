@@ -87,6 +87,21 @@ pub fn load_user_config() -> UserConfigResult<Option<RawWorkspaceSettings>> {
     Ok(Some(settings))
 }
 
+/// True if the user config file declares the deprecated `rootMarkers` key.
+///
+/// Read separately from [`load_user_config`] because serde's alias erases which
+/// spelling was used by the time it returns the parsed settings; an unreadable
+/// or missing file is simply `false` (no nudge). Config load is off the hot
+/// path, so the extra read of this small file is negligible.
+pub(crate) fn user_config_uses_deprecated_root_markers() -> bool {
+    user_config_path()
+        .filter(|path| path.exists())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|contents| {
+            crate::config::deprecation::toml_uses_deprecated_root_markers(&contents)
+        })
+}
+
 /// Returns the path to the user configuration file.
 ///
 /// The path is determined by:

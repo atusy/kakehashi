@@ -160,6 +160,19 @@ impl Kakehashi {
             .log_settings_events(&settings_outcome.events)
             .await;
 
+        // Nudge users off the deprecated `rootMarkers` config key. `initialize`
+        // runs once per session, so surfacing here gives the "once per session"
+        // behavior for free — no dedup flag needed.
+        if settings_outcome.used_deprecated_root_markers {
+            self.notifier()
+                .show_warning(
+                    "kakehashi: the `rootMarkers` config key is deprecated; \
+                     rename it to `workspaceMarkers`. `rootMarkers` still works \
+                     for now but may be removed in a future release.",
+                )
+                .await;
+        }
+
         // Always apply settings (use defaults if none were loaded)
         // This ensures auto_install=true, default capture_mappings, and other defaults are active
         // for zero-config experience. Use default_settings() instead of RawWorkspaceSettings::default()
