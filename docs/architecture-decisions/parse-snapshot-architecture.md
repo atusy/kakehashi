@@ -457,12 +457,15 @@ inside the existing safety contracts at each step:
 
 ### Neutral
 
-- `didClose` drops the single channel (waking any reader parked on the first-parse
-  `watch::changed()`); a reopen installs a fresh `SnapshotSlot`. A wait-free
-  `latest_snapshot` borrow racing close+reopen may hand back the prior lifetime's
-  snapshot momentarily, but the reader's mandatory `snapshot.incarnation == <live
-  incarnation>` check (§2) rejects it, so a cross-lifetime snapshot is discarded
-  rather than served — it degrades to the empty/`null` path, not stale data.
+- `didClose` publishes an explicit terminal/incarnation-invalidated `SnapshotSlot`
+  state (§2) — not merely dropping the channel, since stale parse-task `Sender`
+  clones can keep it alive — which wakes any reader parked on the first-parse
+  `watch::changed()`; a reopen starts the cell fresh at the next incarnation. A
+  wait-free `latest_snapshot` borrow racing close+reopen may hand back the prior
+  lifetime's snapshot momentarily, but the reader's mandatory
+  `snapshot.incarnation == <live incarnation>` check (§2) rejects it, so a
+  cross-lifetime snapshot is discarded rather than served — it degrades to the
+  empty/`null` path, not stale data.
 - The `ParseScheduler` (one loop per document, coalescing, panic re-arm),
   `incarnation`, the `edit_lock`, and the incremental-seed concept are retained —
   re-homed, not removed.
