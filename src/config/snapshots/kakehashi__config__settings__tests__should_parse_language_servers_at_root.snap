@@ -14,7 +14,8 @@ expression: settings.language_servers
     "initializationOptions": null,
     "workspaceMarkers": null,
     "onTypeFormattingTriggers": null,
-    "preferSharedInstance": null
+    "preferSharedInstance": null,
+    "enabled": null
   },
   "rust-analyzer": {
     "cmd": [
@@ -26,6 +27,7 @@ expression: settings.language_servers
     "initializationOptions": null,
     "workspaceMarkers": null,
     "onTypeFormattingTriggers": null,
-    "preferSharedInstance": null
+    "preferSharedInstance": null,
+    "enabled": null
   }
 }

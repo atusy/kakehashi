@@ -44,15 +44,25 @@ impl LanguageServerPool {
             return item;
         };
 
-        // Look up the server config for the origin server
-        let config = resolve_with_wildcard(
+        // Look up the server config for the origin server. A server that is
+        // no longer configured, or that the user has since disabled, must
+        // not be respawned just to resolve a stale item. Check the
+        // allocation-free predicate first to fail fast, before paying for
+        // resolve_with_wildcard's full config clone/merge.
+        if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        }
+        let Some(config) = resolve_with_wildcard(
             &settings.language_servers,
             &envelope.origin,
             merge_bridge_server_configs,
-        );
-
-        let Some(config) = config else {
-            // Server no longer configured — re-envelope and return as-is
+        ) else {
+            // Structurally unreachable: is_server_spawnable already
+            // confirmed the origin key exists (and isn't the wildcard), so
+            // resolve_with_wildcard's only None case (both wildcard and
+            // specific missing) can't happen here. Kept as a defensive
+            // fallback rather than an unwrap.
             re_envelope_item(&mut item, &envelope);
             return item;
         };
@@ -405,6 +415,67 @@ mod tests {
         // Should be re-enveloped (routing info preserved for future attempts)
         let envelope = extract_envelope(&result).expect("should have envelope");
         assert_eq!(envelope.origin, "nonexistent-ls");
+    }
+
+    /// dispatch must not respawn a server the user has since disabled just
+    /// to resolve a stale completion item — it should degrade the same way
+    /// as "server not configured" (re-envelope, return unresolved).
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_origin_server_disabled() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua-ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["lua-language-server".to_string()],
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let item = enveloped_item("lua-ls");
+        let result = pool
+            .dispatch_completion_resolve(item, &settings, None)
+            .await;
+
+        let envelope = extract_envelope(&result).expect("should have envelope");
+        assert_eq!(
+            envelope.origin, "lua-ls",
+            "a disabled server's item is returned unresolved, not respawned"
+        );
+    }
+
+    /// The disabled gate must also apply when the server inherits `enabled:
+    /// false` from the `_` wildcard rather than setting it directly.
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_origin_server_disabled_via_wildcard() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "_".to_string(),
+            BridgeServerConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        settings.language_servers.insert(
+            "lua-ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["lua-language-server".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let item = enveloped_item("lua-ls");
+        let result = pool
+            .dispatch_completion_resolve(item, &settings, None)
+            .await;
+
+        let envelope = extract_envelope(&result).expect("should have envelope");
+        assert_eq!(
+            envelope.origin, "lua-ls",
+            "a server disabled via the wildcard default is not respawned either"
+        );
     }
 
     // ==========================================================================

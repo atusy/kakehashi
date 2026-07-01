@@ -101,7 +101,17 @@ impl DiagnosticPublisher {
             .any(|config| config.server_name == server);
         if !is_host_server {
             // `_self` host bridging is off for this language, or `server` is not a
-            // configured host server for it — not a host-layer contribution.
+            // configured host server for it — not a host-layer contribution. This
+            // also covers a server disabled (`enabled: false`) after it already
+            // spawned and pushed: its live connection can still emit pushes here,
+            // but they must not be recorded. Its previously-published diagnostics
+            // can linger until some other trigger republishes this host — the same
+            // deferred config-change re-merge gap `_self`-disable and empty-cmd
+            // already have (see `republish`'s doc comment); `didChangeConfiguration`
+            // does not proactively republish open hosts. Not fixed here: doing so
+            // unconditionally on every rejected push previously cost a full
+            // lock+snapshot+merge republish per push for the life of the document
+            // (caught by review), for a gap this branch didn't introduce.
             return;
         }
         self.aggregator.record(
@@ -250,6 +260,24 @@ impl DiagnosticPublisher {
             );
             return;
         };
+        // A server no longer spawnable (disabled via `enabled: false`, or no
+        // longer configured at all) after it already spawned can still emit
+        // region pushes on its still-live connection; drop them rather than
+        // recording fresh diagnostics for a server the user no longer wants
+        // running (mirrors publish_host_push's is_host_server gate).
+        // Spawnability is a per-server-name property, so this only needs the
+        // pushing server's own resolved config, not the region's injection
+        // language — checked via the allocation-free is_server_spawnable
+        // rather than a full resolve_with_wildcard merge, since this runs on
+        // every push.
+        let settings = self.settings_manager.load_settings();
+        if !crate::config::is_server_spawnable(&settings.language_servers, &server) {
+            log::debug!(
+                target: LOG_TARGET,
+                "push from unspawnable server {server}, dropping"
+            );
+            return;
+        }
         self.aggregator.record(
             &host,
             DiagnosticSource::Region(region_id),
@@ -666,6 +694,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         )
@@ -707,6 +736,64 @@ mod tests {
             .language
             .language_registry_for_parallel()
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+    }
+
+    #[tokio::test]
+    async fn region_push_dropped_when_origin_server_disabled() {
+        // Unlike publish_host_push, publish_region_push previously had no
+        // config-validity check at all: a disabled server's still-live
+        // connection could keep pushing region diagnostics indefinitely.
+        // `enabled` is a per-server-name property (not per-language), so the
+        // gate only needs the pushing server's own resolved config.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        let host_uri = Url::parse("file:///test/region_disabled.rs").unwrap();
+        server.documents.insert(
+            host_uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "sql",
+            "region-1",
+        );
+        server
+            .bridge
+            .register_opened_document_for_test(
+                &host_uri,
+                &virtual_uri,
+                &crate::lsp::bridge::ConnectionKey::for_server("sql_ls"),
+            )
+            .await;
+
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "sql_ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["sql-ls".to_string()],
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(settings);
+
+        DiagnosticPublisher::new(server)
+            .publish_region_push(
+                &virtual_uri.to_uri_string(),
+                "sql_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("boom")],
+            )
+            .await;
+
+        assert!(
+            server.diagnostics.snapshot(&host_uri).is_empty(),
+            "a disabled server's region push must not be recorded"
+        );
     }
 
     #[tokio::test]
@@ -967,6 +1054,67 @@ mod tests {
                 .snapshot(&uri)
                 .contains_key(&DiagnosticSource::Host),
             "the cache still holds the slot; only the publish snapshot is filtered"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_push_dropped_after_server_disabled_but_stale_slot_lingers() {
+        // A server disabled via `languageServers.*.enabled: false` after it
+        // already spawned and pushed: its still-live connection's next push
+        // must be dropped (not recorded as new data), matching every other
+        // "not a host server" case. Whether the *previously* published
+        // diagnostics get proactively cleared is a separate, pre-existing,
+        // deferred concern (`republish`'s doc comment; `_self`-disable and
+        // empty-cmd have the identical gap) — not asserted here.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/host_disabled.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        // Enabled: the push is recorded.
+        publisher
+            .publish_host_push(
+                uri.as_str(),
+                "rust_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("boom")],
+            )
+            .await;
+
+        // Disable the server (not `_self` — the server itself).
+        let (name, mut cfg) = rust_server_config();
+        cfg.enabled = Some(false);
+        let mut disabled_settings = rust_settings(true);
+        disabled_settings.language_servers.insert(name, cfg);
+        server.settings_manager.apply_settings(disabled_settings);
+
+        // The still-live connection (not yet torn down) sends another push
+        // with different diagnostics — must not be recorded.
+        publisher
+            .publish_host_push(
+                uri.as_str(),
+                "rust_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("still-live-push")],
+            )
+            .await;
+
+        let snap = server.diagnostics.snapshot(&uri);
+        let host_slots = snap
+            .get(&DiagnosticSource::Host)
+            .expect("the cache still holds the pre-disable slot");
+        assert_eq!(
+            host_slots["rust_ls"].diagnostics[0].message, "boom",
+            "the post-disable push must not overwrite the cached slot"
         );
     }
 

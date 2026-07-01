@@ -243,6 +243,21 @@ impl BridgeCoordinator {
         self.pool.insert_connection(handle).await;
     }
 
+    /// Register a virtual document as opened, so [`Self::resolve_virtual_uri`]
+    /// can recover its host and region for a test-driven region push, without
+    /// a real downstream connection.
+    #[cfg(test)]
+    pub(crate) async fn register_opened_document_for_test(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &crate::lsp::bridge::protocol::VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+    ) {
+        self.pool
+            .register_opened_document(host_uri, virtual_uri, connection_key)
+            .await
+    }
+
     // ========================================
     // Config lookup (moved from Kakehashi)
     // ========================================
@@ -287,8 +302,8 @@ impl BridgeCoordinator {
 
             if let Some(resolved_config) =
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
+                    .filter(|c| c.is_spawnable())
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
-                    .filter(|c| !c.cmd.is_empty())
             {
                 return Some(ResolvedServerConfig {
                     server_name: server_name.clone(),
@@ -338,8 +353,8 @@ impl BridgeCoordinator {
             .filter(|name| *name != "_")
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
+                    .filter(|c| c.is_spawnable())
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
-                    .filter(|c| !c.cmd.is_empty())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -379,8 +394,8 @@ impl BridgeCoordinator {
             .filter(|name| *name != "_")
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
+                    .filter(|c| c.is_spawnable())
                     .filter(|c| c.languages.iter().any(|l| l == host_language))
-                    .filter(|c| !c.cmd.is_empty())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -1095,6 +1110,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1132,6 +1148,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1173,6 +1190,7 @@ mod tests {
                 )]),
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1185,6 +1203,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1234,6 +1253,131 @@ mod tests {
     }
 
     #[test]
+    fn test_get_config_skips_disabled_server() {
+        // A server explicitly disabled (or disabled via the `_` wildcard)
+        // must never be selected, even when it is otherwise fully
+        // configured (non-empty cmd, matching languages).
+        let coordinator = BridgeCoordinator::new();
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "_".to_string(),
+            BridgeServerConfig {
+                cmd: vec![],
+                languages: vec![],
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                enabled: Some(false),
+                settings: None,
+            },
+        );
+        servers.insert(
+            "rust-analyzer".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["rust-analyzer".to_string()],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                enabled: None,
+                settings: None,
+            },
+        );
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rust".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    "_self".to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        assert!(
+            coordinator
+                .get_config_for_language(&settings, "markdown", "rust")
+                .is_none(),
+            "a server disabled via the wildcard must be skipped"
+        );
+        assert!(
+            coordinator
+                .get_all_configs_for_language(&settings, "markdown", "rust")
+                .is_empty(),
+            "fan-out must also skip servers disabled via the wildcard"
+        );
+        assert!(
+            coordinator
+                .get_host_configs_for_language(&settings, "rust")
+                .is_empty(),
+            "the host lookup must also skip servers disabled via the wildcard"
+        );
+    }
+
+    #[test]
+    fn test_get_config_reenables_server_over_disabled_wildcard() {
+        // A concrete server can opt back in with `enabled: true` even when
+        // the `_` wildcard disables everything by default.
+        let coordinator = BridgeCoordinator::new();
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "_".to_string(),
+            BridgeServerConfig {
+                cmd: vec![],
+                languages: vec![],
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                enabled: Some(false),
+                settings: None,
+            },
+        );
+        servers.insert(
+            "rust-analyzer".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["rust-analyzer".to_string()],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                enabled: Some(true),
+                settings: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        assert!(
+            coordinator
+                .get_config_for_language(&settings, "markdown", "rust")
+                .is_some(),
+            "a server with an explicit enabled: true must override a disabled wildcard"
+        );
+    }
+
+    #[test]
     fn test_get_all_configs_returns_multiple_servers_for_same_language() {
         let coordinator = BridgeCoordinator::new();
 
@@ -1251,6 +1395,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1263,6 +1408,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1317,6 +1463,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1354,6 +1501,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1472,6 +1620,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -1697,6 +1846,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );

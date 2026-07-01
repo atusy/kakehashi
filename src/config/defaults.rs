@@ -26,10 +26,11 @@ pub fn default_settings() -> RawWorkspaceSettings {
 }
 
 /// Returns the default languageServers map: a defaults-only `_` wildcard
-/// entry documenting the built-in `workspaceMarkers` and `preferSharedInstance`
-/// defaults that every concrete server inherits (wildcard-config-inheritance).
-/// Not spawnable itself — lookups skip the wildcard key and any server with an
-/// empty resolved cmd.
+/// entry documenting the built-in `workspaceMarkers`, `preferSharedInstance`,
+/// and `enabled` defaults that every concrete server inherits
+/// (wildcard-config-inheritance). Not spawnable itself — lookups skip the
+/// wildcard key and any server that isn't [`BridgeServerConfig::is_spawnable`]
+/// (empty resolved cmd, or resolved `enabled: false`).
 fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
     HashMap::from([(
         WILDCARD_KEY.to_string(),
@@ -44,6 +45,11 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             // discoverable (#391). Concrete servers inherit it via the wildcard.
             prefer_shared_instance: Some(false),
             settings: None,
+            // Spell out the built-in default (every server enabled) so the
+            // template documents the opt-out knob: setting this to `false`
+            // disables every server by default; a concrete server can then
+            // opt back in individually with its own `enabled: true`.
+            enabled: Some(true),
         },
     )])
 }
@@ -424,6 +430,22 @@ mod tests {
         assert!(
             !toml_string.contains("cmd = []"),
             "empty cmd/languages must not clutter the template. Got:\n{toml_string}"
+        );
+    }
+
+    #[test]
+    fn default_settings_documents_language_server_enabled_default() {
+        let settings = default_settings();
+        let servers = settings
+            .language_servers
+            .as_ref()
+            .expect("should have languageServers");
+        let wildcard = servers.get(WILDCARD_KEY).expect("should have '_' entry");
+        assert_eq!(
+            wildcard.enabled,
+            Some(true),
+            "the template documents the built-in enabled default so servers \
+             can be opted out individually or en masse via the wildcard"
         );
     }
 

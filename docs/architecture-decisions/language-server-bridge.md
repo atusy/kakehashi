@@ -182,6 +182,7 @@ The bridge requires knowing which server to use for each language. Language serv
 | `languageServers.*.languages` | Yes | Languages this server handles |
 | `languageServers.*.initializationOptions` | No | Passed to server's `initialize` request |
 | `languageServers.*.onTypeFormattingTriggers` | No | Trigger characters for bridged `textDocument/onTypeFormatting`; the sorted union is advertised at initialize, and requests are forwarded only when the downstream also declares the typed character (#354) |
+| `languageServers.*.enabled` | No | Whether this server is eligible to spawn/use at all. Default `true`; inheritable via the `_` wildcard, so `_.enabled: false` disables every server by default while individual servers opt back in with `enabled: true` |
 
 #### Per-Host Language Bridge Configuration
 

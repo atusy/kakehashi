@@ -27,6 +27,35 @@ pub(crate) fn resolve_with_wildcard<V: Clone>(
     }
 }
 
+/// Cheaply checks whether `name`'s effective config is spawnable (non-empty
+/// `cmd` AND enabled), resolving `_` wildcard inheritance via
+/// [`BridgeServerConfig::is_spawnable_with_wildcard`] without cloning or
+/// merging the full `BridgeServerConfig` — a hot-path-friendly alternative to
+/// `resolve_with_wildcard(..., merge_bridge_server_configs).is_some_and(|c|
+/// c.is_spawnable())` for call sites that only need the boolean, not the
+/// resolved config. A loop over many servers should look up the wildcard once
+/// and call `is_spawnable_with_wildcard` directly instead of calling this
+/// function per server (which re-looks-up the wildcard every time).
+///
+/// `name` should be a concrete server key, not the wildcard itself — the
+/// wildcard is a template, never a server in its own right, so this always
+/// returns `false` for `WILDCARD_KEY` regardless of its own cmd/enabled
+/// (enforced, not just documented). An absent name likewise resolves to
+/// `false` rather than falling back to the wildcard's own config, since a
+/// server no longer listed in `languageServers` at all was never eligible in
+/// the first place.
+pub(crate) fn is_server_spawnable(
+    servers: &HashMap<String, BridgeServerConfig>,
+    name: &str,
+) -> bool {
+    if name == WILDCARD_KEY {
+        return false;
+    }
+    servers
+        .get(name)
+        .is_some_and(|config| config.is_spawnable_with_wildcard(servers.get(WILDCARD_KEY)))
+}
+
 /// Field-level merge of two BridgeLanguageConfig values.
 /// Overlay fields win when present; base provides defaults.
 pub(crate) fn merge_bridge_language_configs(
@@ -102,6 +131,10 @@ pub(crate) fn merge_bridge_server_configs(
         prefer_shared_instance: overlay
             .prefer_shared_instance
             .or(base.prefer_shared_instance),
+        // Overlay-wins-when-present, mirroring `prefer_shared_instance`: a
+        // concrete server's explicit `enabled` overrides the wildcard, so
+        // `_.enabled: false` can be opted back into per server.
+        enabled: overlay.enabled.or(base.enabled),
     }
 }
 
@@ -525,6 +558,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        enabled: None,
                         settings: None,
                     },
                 ),
@@ -537,6 +571,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        enabled: None,
                         settings: None,
                     },
                 ),
@@ -609,6 +644,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        enabled: None,
                         settings: None,
                     },
                 ),
@@ -622,6 +658,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        enabled: None,
                         settings: None,
                     },
                 ),
@@ -690,6 +727,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             )])),
@@ -1080,6 +1118,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         )]);
@@ -1097,6 +1136,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         )]);
@@ -1115,6 +1155,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1127,6 +1168,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1157,6 +1199,7 @@ mod tests {
             workspace_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 
@@ -1168,6 +1211,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
@@ -1213,6 +1257,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: prefer,
             settings: None,
+            enabled: None,
         };
 
         // Unset overlay inherits the base (wildcard) value.
@@ -1238,6 +1283,48 @@ mod tests {
         );
     }
 
+    /// `enabled` merges overlay-wins-when-present, exactly like
+    /// `prefer_shared_instance`, so a `languageServers._.enabled: false` can
+    /// disable every server by default while a concrete server opts back in
+    /// with `enabled: true`.
+    #[test]
+    fn test_merge_bridge_server_configs_enabled() {
+        use settings::BridgeServerConfig;
+
+        let server = |enabled: Option<bool>| BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            settings: None,
+            enabled,
+        };
+
+        // Unset overlay inherits the base (wildcard) value.
+        let base = server(Some(false));
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(None)).enabled,
+            Some(false),
+            "unset overlay inherits the wildcard opt-out"
+        );
+
+        // Explicit overlay overrides the base — opting a specific server
+        // BACK IN over a wildcard opt-out.
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(Some(true))).enabled,
+            Some(true),
+            "explicit true opts a server back in over the wildcard opt-out"
+        );
+
+        // And opting a specific server out over a wildcard that left it unset.
+        assert_eq!(
+            merge_bridge_server_configs(&server(None), &server(Some(false))).enabled,
+            Some(false),
+        );
+    }
+
     // Deep merge for initialization_options (configuration-merging-strategy)
 
     /// configuration-merging-strategy: initialization_options deep merge covers three behaviors:
@@ -1260,6 +1347,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
         let overlay = BridgeServerConfig {
@@ -1273,6 +1361,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 
@@ -1362,6 +1451,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 
@@ -1514,6 +1604,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1527,6 +1618,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1567,6 +1659,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1580,6 +1673,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    enabled: None,
                     settings: None,
                 },
             ),
@@ -1763,6 +1857,90 @@ mod tests {
         assert_eq!(
             resolved.aggregation.unwrap()["_"].priorities,
             Some(vec!["server_a".to_string()])
+        );
+    }
+
+    /// `is_server_spawnable` is a hot-path shortcut for exactly what
+    /// `resolve_with_wildcard(..., merge_bridge_server_configs).is_some_and(|c|
+    /// c.is_spawnable())` computes — verify the two agree across the cases
+    /// that actually exercise wildcard inheritance (cmd AND enabled, each
+    /// independently), not just the trivial no-inheritance case.
+    #[test]
+    fn test_is_server_spawnable_matches_full_resolution() {
+        let server = |cmd: Vec<&str>, enabled: Option<bool>| settings::BridgeServerConfig {
+            cmd: cmd.into_iter().map(String::from).collect(),
+            languages: vec![],
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            enabled,
+            settings: None,
+        };
+
+        let full_resolution = |servers: &HashMap<String, settings::BridgeServerConfig>,
+                               name: &str| {
+            resolve_with_wildcard(servers, name, merge_bridge_server_configs)
+                .is_some_and(|c| c.is_spawnable())
+        };
+
+        // Case 1: server has its own cmd and enabled — no inheritance needed.
+        let servers = HashMap::from([("a".to_string(), server(vec!["x"], Some(true)))]);
+        assert!(is_server_spawnable(&servers, "a"));
+        assert_eq!(
+            is_server_spawnable(&servers, "a"),
+            full_resolution(&servers, "a")
+        );
+
+        // Case 2: server's own cmd is empty, inherits a non-empty cmd from `_`.
+        let servers = HashMap::from([
+            ("_".to_string(), server(vec!["shared-ls"], None)),
+            ("a".to_string(), server(vec![], None)),
+        ]);
+        assert!(
+            is_server_spawnable(&servers, "a"),
+            "cmd inherited from the wildcard must count as non-empty"
+        );
+        assert_eq!(
+            is_server_spawnable(&servers, "a"),
+            full_resolution(&servers, "a")
+        );
+
+        // Case 3: server has its own cmd but the wildcard disables everything
+        // by default; server doesn't override enabled — inherits disabled.
+        let servers = HashMap::from([
+            ("_".to_string(), server(vec![], Some(false))),
+            ("a".to_string(), server(vec!["x"], None)),
+        ]);
+        assert!(!is_server_spawnable(&servers, "a"));
+        assert_eq!(
+            is_server_spawnable(&servers, "a"),
+            full_resolution(&servers, "a")
+        );
+
+        // Case 4: server re-enables itself over a disabled wildcard.
+        let servers = HashMap::from([
+            ("_".to_string(), server(vec![], Some(false))),
+            ("a".to_string(), server(vec!["x"], Some(true))),
+        ]);
+        assert!(is_server_spawnable(&servers, "a"));
+        assert_eq!(
+            is_server_spawnable(&servers, "a"),
+            full_resolution(&servers, "a")
+        );
+
+        // Case 5: name not present in the map at all — false, not a fallback
+        // to the wildcard's own config.
+        let servers = HashMap::from([("_".to_string(), server(vec!["x"], Some(true)))]);
+        assert!(!is_server_spawnable(&servers, "missing"));
+
+        // Case 6: called with the wildcard key itself — false, per the
+        // documented contract (the wildcard is a template, never a server in
+        // its own right), even when it has a non-empty cmd and enabled: true.
+        let servers = HashMap::from([("_".to_string(), server(vec!["x"], Some(true)))]);
+        assert!(
+            !is_server_spawnable(&servers, WILDCARD_KEY),
+            "the wildcard key itself must never report as spawnable"
         );
     }
 

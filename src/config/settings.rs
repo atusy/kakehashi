@@ -418,6 +418,13 @@ pub struct BridgeServerConfig {
     /// wildcard, so `_.preferSharedInstance: true` can be opted out of
     /// per server with `preferSharedInstance: false`.
     pub prefer_shared_instance: Option<bool>,
+    /// Whether this server is eligible to be spawned/used at all.
+    ///
+    /// `None` = inherit (built-in default `true`). Like `root_markers` and
+    /// `prefer_shared_instance`, a concrete server's explicit value overrides
+    /// the wildcard, so `_.enabled: false` can disable every server by
+    /// default while individual servers opt back in with `enabled: true`.
+    pub enabled: Option<bool>,
 }
 
 impl BridgeServerConfig {
@@ -426,6 +433,34 @@ impl BridgeServerConfig {
     pub(crate) fn prefers_shared_instance(&self) -> bool {
         self.prefer_shared_instance.unwrap_or(false)
     }
+
+    /// Effective `enabled` state, resolving the inherit (`None`) case to the
+    /// built-in default `true`.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// A resolved config is a real, usable server: it has a command to run
+    /// AND it hasn't been disabled. Every "is this server usable" call site
+    /// (spawn-resolution, capability advertisement, resolve-dispatch) should
+    /// share this single predicate rather than re-deriving it.
+    pub(crate) fn is_spawnable(&self) -> bool {
+        !self.cmd.is_empty() && self.is_enabled()
+    }
+
+    /// Same as [`Self::is_spawnable`], but resolves `cmd`/`enabled`
+    /// inheritance against an already-looked-up `wildcard` instead of doing
+    /// its own `_` lookup — for callers (like [`crate::config::is_server_spawnable`]
+    /// and loops over every configured server) that can hoist the wildcard
+    /// lookup out of a loop instead of repeating it per server.
+    pub(crate) fn is_spawnable_with_wildcard(&self, wildcard: Option<&Self>) -> bool {
+        let cmd_non_empty = !self.cmd.is_empty() || wildcard.is_some_and(|w| !w.cmd.is_empty());
+        let enabled = self
+            .enabled
+            .or(wildcard.and_then(|w| w.enabled))
+            .unwrap_or(true);
+        cmd_non_empty && enabled
+    }
 }
 
 /// Union of every server's `onTypeFormattingTriggers`, shaped for the LSP
@@ -433,18 +468,35 @@ impl BridgeServerConfig {
 ///
 /// Sorted and deduplicated so the advertisement is deterministic regardless of
 /// `HashMap` iteration order. Returns `None` when no server declares any
-/// trigger (capability stays unadvertised). A `_` wildcard key is treated like
-/// any other entry: its triggers join the union as-is (wildcard merging into
-/// concrete servers happens at request dispatch, not here). Known edge case: a
-/// concrete server overriding the wildcard with an explicit empty list still
-/// leaves the wildcard's triggers advertised; the bridge-side trigger filter
-/// keeps such requests from reaching servers that don't declare the character.
+/// trigger (capability stays unadvertised).
+///
+/// Every concrete server key is independently resolved through
+/// wildcard-config-inheritance before its triggers are read, so a server that
+/// overrides the wildcard's triggers (including with an explicit empty list)
+/// or its `enabled` state contributes its own *effective*, merged set — not
+/// the wildcard's raw one. The `_` wildcard key itself is never a direct
+/// contributor: it's excluded from iteration, since a wildcard-only config
+/// (no concrete servers) has nothing to advertise on its own. A server that
+/// isn't [`crate::config::is_server_spawnable`] (no cmd, or disabled) is
+/// excluded entirely: advertising its triggers would make the client send an
+/// `onTypeFormatting` *request* — not a fire-and-forget notification — on
+/// every matching keystroke, only to resolve to null.
+///
+/// Resolves `cmd`/`enabled`/triggers inheritance directly (mirroring
+/// `merge_bridge_server_configs`'s per-field rules) rather than calling
+/// `resolve_with_wildcard`, to avoid cloning every server's full config just
+/// to read a couple of fields — the wildcard itself is looked up once and
+/// reused across the iteration rather than re-looked-up per server.
 pub(crate) fn on_type_formatting_trigger_union(
     servers: &HashMap<String, BridgeServerConfig>,
 ) -> Option<(String, Vec<String>)> {
+    let wildcard = servers.get(crate::config::WILDCARD_KEY);
+    let wildcard_triggers = wildcard.and_then(|w| w.on_type_formatting_triggers.as_ref());
     let mut triggers: Vec<String> = servers
-        .values()
-        .filter_map(|s| s.on_type_formatting_triggers.as_ref())
+        .iter()
+        .filter(|(name, _)| name.as_str() != crate::config::WILDCARD_KEY)
+        .filter(|(_, s)| s.is_spawnable_with_wildcard(wildcard))
+        .filter_map(|(_, s)| s.on_type_formatting_triggers.as_ref().or(wildcard_triggers))
         .flatten()
         .filter(|t| t.chars().count() == 1)
         .cloned()
@@ -1385,6 +1437,36 @@ mod tests {
     }
 
     #[test]
+    fn is_spawnable_with_wildcard_resolves_cmd_and_enabled_inheritance() {
+        let server = |cmd: Vec<&str>, enabled: Option<bool>| BridgeServerConfig {
+            cmd: cmd.into_iter().map(String::from).collect(),
+            languages: vec![],
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            enabled,
+            settings: None,
+        };
+
+        // Own cmd and enabled, no wildcard needed.
+        assert!(server(vec!["x"], Some(true)).is_spawnable_with_wildcard(None));
+
+        // cmd inherited from the wildcard.
+        let wildcard = server(vec!["shared-ls"], None);
+        assert!(server(vec![], None).is_spawnable_with_wildcard(Some(&wildcard)));
+
+        // enabled inherited (disabled) from the wildcard.
+        let disabling_wildcard = server(vec![], Some(false));
+        assert!(!server(vec!["x"], None).is_spawnable_with_wildcard(Some(&disabling_wildcard)));
+
+        // Own enabled: true overrides a disabling wildcard.
+        assert!(
+            server(vec!["x"], Some(true)).is_spawnable_with_wildcard(Some(&disabling_wildcard))
+        );
+    }
+
+    #[test]
     fn should_parse_prefer_shared_instance() {
         let config_json = r#"{
             "languageServers": {
@@ -1410,6 +1492,35 @@ mod tests {
         assert_eq!(
             servers["pyright"].prefer_shared_instance, None,
             "absent preferSharedInstance parses as None (inherit -> per-root)"
+        );
+    }
+
+    #[test]
+    fn should_parse_enabled() {
+        let config_json = r#"{
+            "languageServers": {
+                "tsgo": {
+                    "cmd": ["typescript-language-server", "--stdio"],
+                    "languages": ["typescript"],
+                    "enabled": false
+                },
+                "pyright": {
+                    "cmd": ["pyright-langserver", "--stdio"],
+                    "languages": ["python"]
+                }
+            }
+        }"#;
+
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
+        let servers = settings.language_servers.expect("languageServers parses");
+        assert_eq!(
+            servers["tsgo"].enabled,
+            Some(false),
+            "explicit enabled is preserved"
+        );
+        assert_eq!(
+            servers["pyright"].enabled, None,
+            "absent enabled parses as None (inherit -> default true)"
         );
     }
 
@@ -1452,6 +1563,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
         let servers = HashMap::from([
@@ -1481,6 +1593,112 @@ mod tests {
     }
 
     #[test]
+    fn on_type_formatting_trigger_union_excludes_disabled_server() {
+        let server = |triggers: Option<Vec<&str>>, enabled: Option<bool>| BridgeServerConfig {
+            cmd: vec!["x".to_string()],
+            languages: vec![],
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: triggers
+                .map(|t| t.into_iter().map(String::from).collect()),
+            prefer_shared_instance: None,
+            enabled,
+            settings: None,
+        };
+
+        // A disabled server's own trigger never spawns anything, so it must
+        // not be advertised (it would cause per-keystroke dead requests).
+        let servers = HashMap::from([
+            ("a".to_string(), server(Some(vec!["}"]), Some(false))),
+            ("b".to_string(), server(Some(vec![";"]), None)),
+        ]);
+        let (first, more) =
+            on_type_formatting_trigger_union(&servers).expect("enabled server has a trigger");
+        assert_eq!(first, ";");
+        assert_eq!(more, Vec::<String>::new());
+
+        // Disabled via the wildcard's inherited default, too.
+        let servers_wildcard_disabled = HashMap::from([
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    enabled: Some(false),
+                    ..server(None, None)
+                },
+            ),
+            ("a".to_string(), server(Some(vec!["}"]), None)),
+        ]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&servers_wildcard_disabled),
+            None,
+            "a server disabled via the wildcard default contributes no triggers"
+        );
+
+        // The wildcard key itself is never a direct contributor — it's
+        // excluded from iteration entirely (see the function's doc comment),
+        // so a config with only a `_` entry always advertises nothing,
+        // regardless of its own `enabled` or triggers: nothing inherits from
+        // it when there are no concrete servers.
+        let wildcard_only = HashMap::from([(
+            "_".to_string(),
+            BridgeServerConfig {
+                enabled: Some(true),
+                ..server(Some(vec!["}"]), None)
+            },
+        )]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&wildcard_only),
+            None,
+            "a wildcard-only config has no concrete server to inherit its triggers"
+        );
+
+        // A concrete server that opts back IN over a disabled wildcard must
+        // still inherit — and advertise — the wildcard's trigger characters
+        // (the gate is per-server effective state, not raw wildcard state).
+        let reenabled_inherits_wildcard_triggers = HashMap::from([
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    enabled: Some(false),
+                    ..server(Some(vec!["}"]), None)
+                },
+            ),
+            ("lua_ls".to_string(), server(None, Some(true))),
+        ]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&reenabled_inherits_wildcard_triggers),
+            Some(("}".to_string(), Vec::new())),
+            "a server re-enabled over a disabled wildcard still inherits its triggers"
+        );
+    }
+
+    #[test]
+    fn on_type_formatting_trigger_union_excludes_empty_cmd_server() {
+        // Enabled but unspawnable (no resolved cmd) must be excluded exactly
+        // like a disabled server: gate on is_spawnable(), not is_enabled()
+        // alone, to match every other "is this server usable" call site.
+        let servers = HashMap::from([(
+            "tsgo".to_string(),
+            BridgeServerConfig {
+                cmd: vec![],
+                languages: vec![],
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: Some(vec![";".to_string()]),
+                prefer_shared_instance: None,
+                enabled: None,
+                settings: None,
+            },
+        )]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&servers),
+            None,
+            "a server with no resolved cmd can never service the request, \
+             so its triggers must not be advertised"
+        );
+    }
+
+    #[test]
     fn on_type_formatting_trigger_union_without_triggers_is_none() {
         let servers = HashMap::from([(
             "a".to_string(),
@@ -1491,6 +1709,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         )]);
@@ -1668,6 +1887,7 @@ mod tests {
             ]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 

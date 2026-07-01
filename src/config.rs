@@ -12,8 +12,9 @@ pub(crate) mod user;
 
 pub use expand::{set_config_file_override, set_data_dir_override};
 pub(crate) use merge::{
-    merge_aggregation_configs, merge_bridge_language_configs, merge_bridge_server_configs,
-    merge_layer_aggregation_configs, merge_workspace_settings, resolve_with_wildcard,
+    is_server_spawnable, merge_aggregation_configs, merge_bridge_language_configs,
+    merge_bridge_server_configs, merge_layer_aggregation_configs, merge_workspace_settings,
+    resolve_with_wildcard,
 };
 pub(crate) use settings::{CaptureMappings, DEFAULT_DEBOUNCE_MS, QueryTypeMappings};
 pub use settings::{LanguageSettings, RawWorkspaceSettings, WorkspaceSettings, json_schema};
@@ -322,18 +323,23 @@ impl WorkspaceSettings {
             .any(LanguageSettings::is_host_bridging_enabled)
     }
 
-    /// True if any configured language server has a runnable command. The
-    /// built-in `_` wildcard defaults entry carries an empty `cmd` and is thus
-    /// excluded, so this is false on a blank config but true once a real server
-    /// (host- or virt-capable) is configured.
+    /// True if any configured language server has a runnable command AND is
+    /// enabled. The built-in `_` wildcard defaults entry carries an empty
+    /// `cmd` and is thus excluded, so this is false on a blank config but
+    /// true once a real server (host- or virt-capable) is configured.
     ///
     /// Gates willSave advertisement (#357): willSave now fans out to both host
     /// and virt bridges, so a single runnable bridge server is a potential
     /// consumer — but a config with only the empty defaults entry has none.
+    /// A server disabled via `enabled: false` (directly or inherited from the
+    /// wildcard) is likewise not a consumer: it never spawns, so counting it
+    /// would advertise willSave for a save that can only block on a no-op.
     pub(crate) fn any_bridge_server_runnable(&self) -> bool {
+        let wildcard = self.language_servers.get(WILDCARD_KEY);
         self.language_servers
-            .values()
-            .any(|server| !server.cmd.is_empty())
+            .iter()
+            .filter(|(name, _)| name.as_str() != WILDCARD_KEY)
+            .any(|(_, server)| server.is_spawnable_with_wildcard(wildcard))
     }
 }
 
@@ -435,6 +441,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            enabled: None,
             settings: None,
         };
 
@@ -453,6 +460,64 @@ mod tests {
             language_servers: HashMap::from([
                 (WILDCARD_KEY.to_string(), server(vec![])),
                 ("lua_ls".to_string(), server(vec!["lua-language-server"])),
+            ]),
+            ..Default::default()
+        };
+        assert!(settings.any_bridge_server_runnable());
+    }
+
+    #[test]
+    fn any_bridge_server_runnable_excludes_disabled_server() {
+        use crate::config::settings::BridgeServerConfig;
+
+        let server = |cmd: Vec<&str>, enabled: Option<bool>| BridgeServerConfig {
+            cmd: cmd.into_iter().map(String::from).collect(),
+            languages: vec![],
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            enabled,
+            settings: None,
+        };
+
+        // Directly disabled: not a willSave consumer even with a real cmd.
+        let settings = WorkspaceSettings {
+            language_servers: HashMap::from([(
+                "lua_ls".to_string(),
+                server(vec!["lua-language-server"], Some(false)),
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            !settings.any_bridge_server_runnable(),
+            "a disabled server never spawns, so it must not count as runnable"
+        );
+
+        // Disabled via the wildcard's inherited default.
+        let settings = WorkspaceSettings {
+            language_servers: HashMap::from([
+                (WILDCARD_KEY.to_string(), server(vec![], Some(false))),
+                (
+                    "lua_ls".to_string(),
+                    server(vec!["lua-language-server"], None),
+                ),
+            ]),
+            ..Default::default()
+        };
+        assert!(
+            !settings.any_bridge_server_runnable(),
+            "a server disabled via the wildcard default must not count as runnable"
+        );
+
+        // A server can opt back in over a disabled wildcard.
+        let settings = WorkspaceSettings {
+            language_servers: HashMap::from([
+                (WILDCARD_KEY.to_string(), server(vec![], Some(false))),
+                (
+                    "lua_ls".to_string(),
+                    server(vec!["lua-language-server"], Some(true)),
+                ),
             ]),
             ..Default::default()
         };

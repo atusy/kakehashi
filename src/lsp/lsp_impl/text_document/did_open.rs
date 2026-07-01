@@ -323,6 +323,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -416,6 +417,7 @@ print("hello")
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                enabled: None,
                 settings: None,
             },
         );
@@ -679,7 +681,6 @@ print("hello")
         let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);
 
         let wait_version = |want: i32| {
-            let server = server;
             let uri = &uri;
             async move {
                 timeout(Duration::from_secs(1), async {
