@@ -75,9 +75,12 @@ gates:
 ### 2. Parsing publishes a versioned `ParseSnapshot`
 
 ```
-ParseSnapshot { text: Arc<str>, tree: Tree, language: String, parsed_version: u64,
+ParseSnapshot { text: Arc<str>, tree: Option<Tree>, language: String,
+                parsed_version: u64, incarnation: u64,
                 injection_regions: /* region-id + geometry, minted here (see §3) */ }
 ```
+
+(`tree: Option` so a resolved-but-parser-less outcome is representable — see below.)
 
 A snapshot's `text` is exactly the text its `tree` was parsed from — the two
 always agree (the gopls immutable-snapshot property). Snapshots live per-URI in a
@@ -91,6 +94,15 @@ SnapshotSlot { current_incarnation: u64, snapshot: Option<Arc<ParseSnapshot>> }
 This channel **subsumes** the current `parse_states` (`has_tree`) and `watermarks`
 (`(incarnation, ticket)`) maps: `snapshot.is_some()` is has-tree; `parsed_version`
 is the watermark ticket; `current_incarnation` is the per-lifetime guard.
+
+A **resolved-but-tree-less** outcome — a parse that completed with no usable tree
+(no parser installed, install failed, or a quarantined crashed grammar), distinct
+from the pre-first-parse `None` — must still release readers parked on the
+first-parse wait. It carries its own resolved-version marker: `ParseSnapshot.tree`
+is `Option` (`None` = resolved, no tree), so `snapshot.is_some()` means "resolved"
+and the inner `tree` distinguishes "resolved with a tree" from "resolved, none
+available"; a tree-less snapshot advances `parsed_version` like any other and
+readers fall through to their empty / `ContentModified` paths.
 
 The store's tree/watermark CAS methods (four tree writes —
 `update_tree_if_text_unchanged`, `update_tree_if_text_and_language_unchanged`,
@@ -108,10 +120,15 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
   not swap the `Tree` under an already-issued `result_id` and fire a spurious
-  refresh. `didOpen` sets `current_incarnation`; a reopen bumps it, so a straggler
-  publish from lifetime N is rejected against N+1, and the version compare is only
-  ever within one lifetime (fixing the reopen-regression where a leftover
-  `parsed_version = 5` would make a fresh `0 > 5` fail forever).
+  refresh. `didOpen` sets `current_incarnation`; a reopen **installs a fresh
+  `SnapshotSlot` (next incarnation, `snapshot = None`)**. Resetting `snapshot` to
+  `None` is what clears the version floor — the first post-reopen publish takes the
+  `None` bootstrap branch, so a leftover `parsed_version = 5` from the prior
+  lifetime cannot make a fresh `0 > 5` fail forever; the incarnation bump alone
+  would not reset the floor. The `None` bootstrap still checks
+  `incarnation == current_incarnation` (it is not an unconditional early-return), so
+  a straggler publish from lifetime N is rejected against N+1 and the version
+  compare is only ever within one lifetime.
 - **Language axis** is subsumed by incarnation: every reopen draws a fresh
   incarnation (so a relabel across lifetimes is already rejected), and within one
   lifetime the language does not change. The three-axis edit-path CAS
@@ -144,9 +161,21 @@ The decision therefore moves **region-id minting off every reader path**: the
 parse-loop `populate` mints region ids once, at `parsed_version`, into the
 snapshot's `injection_regions` (this is the injection-token-cache-reuse
 "don't discover twice" lever, realized here as a consequence, not a separate
-change). Readers only **read** region ids from their snapshot, so a stale-tree read
-is self-consistent and mints nothing. Any reader that would still need to mint
-against live positions is position-critical (below).
+change). A stale-tree reader then only **reads** region ids from its own snapshot
+— internally consistent with that snapshot's tree, minting nothing.
+
+This **relocates** the tracker-skew hazard rather than fully closing it: `populate`
+mints at `parsed_version` into a `NodeTracker` that has already been edit-shifted
+to `content_version`, so a mispositioned entry can still land when the tracker is
+ahead of the snapshot. Unlike the seed, the mint has no `parsed_version ==`-guard.
+The residual is **performance-only**, not correctness: region-cache reads are gated
+by a `validity_hash` (content + language), so a mispositioned id simply misses and
+recomputes — it never serves wrong tokens — and it accumulates orphan entries that
+lifecycle eviction reclaims. A future decision that forks a per-snapshot tracker
+view would close it entirely; this decision accepts the perf residual.
+
+Any reader that must resolve against **live** positions is position-critical
+(below).
 
 - **Serve-stale, actively refreshed** — `semanticTokens` full/delta. Compute
   against the snapshot's consistent `(text, tree, injection_regions)`; caches key
@@ -163,21 +192,28 @@ against live positions is position-critical (below).
   (symbols/colors are re-requested on redraw/scroll, not held live). The staleness
   window is one edit and non-visual-jarring; this is the deliberate,
   user-sanctioned relaxation.
-- **Position-critical → `ContentModified`** — `semanticTokens/range`,
-  `captures` (full and range), `kakehashi/node/*`, selectionRange, formatting,
-  rangeFormatting. Their request positions/ranges are authored against the **live**
-  text; a stale tree cannot answer them, and captures/node additionally resolve
-  against the live `content_version` tracker. When `content_version > parsed_version`
-  return LSP **`ContentModified`** (-32801). Note: the spec does **not** mandate
-  client auto-retry — a client that does not re-request simply gets the answer on
-  its next natural request; formatting may no-op for that keystroke. This is
-  acceptable because these are not per-keystroke-critical, and it never serves a
-  wrong-position result.
+- **Staleness-reject** — `semanticTokens/range`, `kakehashi/node/*`,
+  `selectionRange`, `formatting`, `rangeFormatting`, and `captures` (full and
+  range). Their request positions/ranges are authored against the **live** text; a
+  stale tree cannot answer them, and captures/node additionally resolve against the
+  live `content_version` tracker. The rejection signal differs by protocol contract:
+  - The LSP requests return **`ContentModified`** (-32801) when
+    `content_version > parsed_version`. The spec does **not** mandate client
+    auto-retry — a client that does not re-request simply gets the answer on its
+    next natural request; formatting may no-op for that keystroke. Acceptable
+    because these are not per-keystroke-critical, and it never serves a
+    wrong-position result.
+  - `kakehashi/captures` returns **`null`**, which is precisely the re-sync signal
+    captures-protocol already defines ("on null, call full again") — a JSON-RPC
+    *error* would violate that contract, since a captures client is only contracted
+    to re-request on null. So a stale captures request serves `null` and the client
+    re-issues, self-healing on its next request.
 
 The only bounded wait that remains is the **first parse after `didOpen`** (the
-snapshot is `None`); it waits briefly on `watch::changed()` then serves `null`.
+snapshot is `None`); it waits briefly on `watch::changed()` then serves `null` —
+the same decoupling parse-decoupled-document-lifecycle applies to its host tier.
 
-*(Reclassifying `captures/full` and `kakehashi/node/*` as position-critical is a
+*(Reclassifying `captures/full` and `kakehashi/node/*` off serve-stale is a
 deliberate scope choice: making them serve-stale would require the snapshot to own
 a versioned tracker view, a larger change than this decision commits to. If a
 future decision forks the tracker per snapshot, they can move to serve-stale.)*
@@ -228,7 +264,8 @@ inside the existing safety contracts at each step:
   `latest_snapshot` retains a servable tree across an edit's `tree.take()`. Move
   region minting into `populate`. Convert `semanticTokens` to serve-stale + the
   refresh trigger; `documentSymbol`/`documentColor` to serve-stale + passive;
-  range/formatting/captures/node to `ContentModified`. Removes `get_tree_with_wait`
+  range/formatting/`node/*` to `ContentModified` and `captures` to `null` (its
+  re-sync signal). Removes `get_tree_with_wait`
   / `wait_for_epoch` / `ensure_document_parsed` blocking. Delivers *instant reads*
   and *lifecycle independent of parsing*. Without the dual-write this stage would
   reproduce the empty-after-edit regression, so it is mandatory here, not deferred.
@@ -296,11 +333,13 @@ inside the existing safety contracts at each step:
   synchronous-client reentrancy that keeps it out of `didChange`);
   `documentSymbol`/`documentColor` self-correct only on the client's next natural
   request (no active refresh added).
-- Position-critical requests (`captures`, `kakehashi/node/*`, range, formatting)
-  return `ContentModified` during the reparse window. The LSP spec does not mandate
-  client retry, so on a client that does not re-request (e.g. Neovim's built-in
+- Staleness-reject requests (`kakehashi/node/*`, range, formatting) return
+  `ContentModified` during the reparse window, and `kakehashi/captures` returns
+  `null` (its protocol re-sync signal). The LSP spec does not mandate retry on
+  `ContentModified`, so on a client that does not re-request (e.g. Neovim's built-in
   client for formatting) that keystroke's request **no-ops** until the next natural
-  request. Reclassifying captures/node from the original serve-stale intent is the
+  request; the captures `null` path is contracted to re-request. Reclassifying
+  captures/node from the original serve-stale intent is the
   cost of not forking a per-snapshot tracker view now.
 - The `#342`/`#374` stale-tree guarantee (a reader observes at least its own edit)
   is relaxed to "a reader observes a *consistent* but possibly one-edit-old
