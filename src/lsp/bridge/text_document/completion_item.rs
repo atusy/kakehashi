@@ -58,8 +58,11 @@ impl LanguageServerPool {
             &envelope.origin,
             merge_bridge_server_configs,
         ) else {
-            // Server no longer configured (or disabled) — re-envelope and
-            // return as-is.
+            // Structurally unreachable: is_server_spawnable already
+            // confirmed the origin key exists (and isn't the wildcard), so
+            // resolve_with_wildcard's only None case (both wildcard and
+            // specific missing) can't happen here. Kept as a defensive
+            // fallback rather than an unwrap.
             re_envelope_item(&mut item, &envelope);
             return item;
         };
