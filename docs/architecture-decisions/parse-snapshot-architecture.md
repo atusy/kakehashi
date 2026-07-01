@@ -155,8 +155,11 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
   (`incarnation && text && language`) therefore reduces to `incarnation && version`.
 - **Isolation is per-request re-resolution + incarnation validation, not cell identity.** A `latest_snapshot(uri)` call resolves the *current* cell from the
   store each time and never caches a `Receiver` across requests, and it validates
-  `snapshot.incarnation == <live document incarnation>` before serving — the cell
-  and the document inputs are one per-URI lifetime object, so there is one
+  `snapshot.incarnation == <live document incarnation>` before serving. To keep that
+  a **single `DashMap` lookup** (not a `documents` lookup *plus* a separate
+  channel-map lookup), the `SnapshotSlot` `watch` channel lives **on the `Document`
+  entry itself** — inputs and slot are one per-URI lifetime object, so one lookup
+  yields both the live incarnation and the latest snapshot, and there is one
   authoritative incarnation. This makes cell lifecycle irrelevant to correctness:
   on reopen the store may drop and recreate the cell, and a prior-lifetime parse
   task holding a stale `Sender` clone can still publish — but only into that now
@@ -165,8 +168,9 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
   rejects it against the live `N+1` incarnation. The one reader that *does* hold a
   `Receiver` — a first-parse waiter parked on `watch::changed()` — must be woken by
   an **explicit close publish**: `didClose` sets the slot to a terminal state whose
-  `current_incarnation` is a **reserved sentinel** (`u64::MAX`, never drawn by the
-  monotonic incarnation counter) with `snapshot = None`, rather than relying on the
+  `current_incarnation` is a **reserved sentinel** (`u64::MAX` — the counter starts
+  at 1 and must reserve this value, guarding its `fetch_add` against ever drawing
+  it) with `snapshot = None`, rather than relying on the
   channel's senders dropping — stale parse tasks may still hold `Sender` clones that
   keep the channel alive. Setting the sentinel is load-bearing: keeping
   `current_incarnation = N` would let a stale lifetime-`N` publish pass *both* the
@@ -253,10 +257,16 @@ The decision therefore **separates three concerns that today all ride the tracke
   and is not claimed to be — an edit that inserts a region renumbers ordinals.
 - **Cross-edit token reuse** (the injection-token-cache-reuse benefit): the cache
   is already content-validated at read (its entry carries `validity_hash` = content
-  ⊕ language, and `generation`), but its *key* is today the tracker ULID. The change
-  is to **drop `region_id` from the key** — key on `(uri, content_hash,
-  validity_hash, generation)` — so two snapshots' byte-identical regions reuse
-  tokens without any stable id. That in turn reworks **eviction**:
+  ⊕ language, and the settings `generation`), but its *key* is today the tracker
+  ULID. The change is to **drop `region_id` from the key** — key on
+  `(uri, content_hash)`, keeping `validity_hash` and the settings `generation` as
+  entry metadata checked at read, not as key components. The key **must stay stable
+  across edits** for reuse to work, so it must not include anything that turns over
+  per edit; the `generation` here is the **config/settings epoch** (bumped only on a
+  settings reload, the #530 discipline — *not* the per-edit parse-run counter), so a
+  byte-identical region reuses across edits and is invalidated only on a real config
+  change. Two snapshots' byte-identical regions thus reuse tokens without any stable
+  id. That in turn reworks **eviction**:
   `invalidate_for_edits` currently point-deletes by `region_id` via the interval
   tree, which has no target once the key drops it, so it must become a content-keyed
   clear (or a side index) — losing the "typed region preserves reuse on an unrelated
@@ -453,11 +463,12 @@ inside the existing safety contracts at each step:
   (snapshot-owned) and the current-version tracker reconciliation (§3). Take the
   grammar auto-install off the read handlers (`compute_captures` no longer triggers
   `ensure_injection_languages_loaded_for_document` inline): the parse loop
-  *detects* a missing injected grammar and **spawns the install asynchronously,
-  never under `edit_lock`** — an install is seconds of download + compile and must
-  not block concurrent `didChange` edits — with the region re-minted on a later
-  reconciliation once the grammar lands. Only the fast tracker-mint itself runs
-  under `edit_lock`. Convert
+  *detects* a missing injected grammar and spawns the install as a **detached
+  off-ingress task**. The download + compile (seconds) runs entirely on that task,
+  **never on the ingress path and never under `edit_lock`** — only the O(1)
+  detect-and-spawn is near the lock, and even that need not hold it. The region is
+  re-minted on a later reconciliation once the grammar lands. Only the fast
+  tracker-mint itself runs under `edit_lock`. Convert
   `semanticTokens` **and `captures/full`** to serve-stale (the latter reserving
   `null` for no-snapshot / no-lineage, not routine staleness); the whole-document
   passive-refresh family (`documentSymbol`/`documentColor`/`documentLink`/
@@ -477,7 +488,11 @@ inside the existing safety contracts at each step:
   primitive, delete the watermark waits, and prune the now-superseded passages
   from per-document-parse-scheduler (its tree-clear-on-edit and watermark/epoch
   sections) per delete-on-supersede — done **here**, when the behavior actually
-  changes, not before.
+  changes, not before. Per the repo's structural-vs-behavioral separation
+  guideline, the **pure dead-code / doc-pruning** parts of this stage (dropping the
+  now-unused fields, deleting the superseded ADR passages) land as **separate PRs**
+  from the behavioral collapse (the CAS→publish merge, scheduler seed re-homing),
+  each shipped only after its behavioral prerequisite is in.
 
 ## Considered Options
 
