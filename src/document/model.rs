@@ -149,11 +149,6 @@ impl Document {
         self.incarnation
     }
 
-    /// Get a position mapper for this document
-    pub(crate) fn position_mapper(&self) -> crate::text::PositionMapper {
-        crate::text::PositionMapper::new(self.text())
-    }
-
     /// Create an immutable snapshot of current document state
     ///
     /// Returns None if document is not fully initialized (missing tree).

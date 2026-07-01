@@ -85,14 +85,44 @@ impl Kakehashi {
             }
         }
 
-        // Lock the pool before re-acquiring the document so the Ref is never
-        // held across an await, then run the full injection parsing handler.
-        let mut pool = self.parser_pool.lock().await;
-        let Some(doc) = self.documents.get(&uri) else {
-            return Ok(None);
+        // Snapshot owned pieces of the document (cheap: Arc/Tree refcount bumps)
+        // and drop the Ref, then run the synchronous injection-aware walk as one
+        // work-unit on the compute pool. The parser-pool sync mutex is acquired
+        // only on the pool thread (Stage-1 obligation), and no DashMap shard
+        // read-lock is held for the walk's duration.
+        let (text, tree, language_id) = {
+            let Some(doc) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            (
+                doc.text_arc(),
+                doc.tree().cloned(),
+                doc.language_id().map(|s| s.to_string()),
+            )
         };
-        let result = handle_selection_range(&doc, &positions, &self.language, &mut pool);
 
-        Ok(Some(result))
+        let language = std::sync::Arc::clone(&self.language);
+        let parser_pool = std::sync::Arc::clone(&self.parser_pool);
+        let result = self
+            .compute_pool
+            .run(None, move || {
+                use crate::error::LockResultExt;
+                let mut pool = parser_pool
+                    .lock()
+                    .recover_poison("Kakehashi::selection_range_impl");
+                handle_selection_range(
+                    &text,
+                    tree.as_ref(),
+                    language_id.as_deref(),
+                    &positions,
+                    &language,
+                    &mut pool,
+                )
+            })
+            .await;
+
+        // None = the work-unit panicked (logged by the pool); serve the
+        // no-result fallback rather than an error.
+        Ok(result)
     }
 }

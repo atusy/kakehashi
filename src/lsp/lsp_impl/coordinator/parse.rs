@@ -17,7 +17,7 @@ const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub(super) struct ParseCoordinatorDeps {
     pub(super) client: Client,
     pub(super) language: std::sync::Arc<LanguageCoordinator>,
-    pub(super) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(super) parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
     pub(super) compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     pub(super) documents: std::sync::Arc<DocumentStore>,
     pub(super) cache: std::sync::Arc<CacheCoordinator>,
@@ -29,7 +29,7 @@ pub(super) struct ParseCoordinatorDeps {
 pub(crate) struct ParseCoordinator {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
-    parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
     compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     documents: std::sync::Arc<DocumentStore>,
     cache: std::sync::Arc<CacheCoordinator>,
@@ -67,19 +67,23 @@ impl ParseCoordinator {
         }
     }
 
-    /// Shared parsing orchestration: acquire parser from pool, run parse logic on
-    /// the bounded compute pool with timeout, release parser back to pool.
+    /// Shared parsing orchestration: run parser acquisition + parse logic as one
+    /// work-unit on the bounded compute pool, with timeout.
     ///
     /// The caller provides the actual parse logic via `parse_fn`, which receives a
     /// `tree_sitter::Parser` and must return it along with an optional result.
-    /// On normal completion, this ensures the parser is returned to the pool.
-    /// The parser is not returned if the work-unit times out (it keeps
-    /// running) or panicked on the pool.
+    /// The `parser_pool` sync mutex is acquired **only on the pool thread** (the
+    /// parse-snapshot ADR's Stage-1 obligation: a tokio worker must never block on
+    /// a mutex a compute thread holds), briefly around acquire and release; the
+    /// parse itself runs unlocked. On normal completion the parser returns to the
+    /// pool — including after this caller timed out, since the release runs inside
+    /// the work-unit. A panicking work-unit loses its parser.
     ///
     /// Returns `None` if:
     /// - No parser is available for the language
-    /// - The parse work-unit panicked (parser not returned)
-    /// - The parse timed out after `PARSE_TIMEOUT` (parser not returned)
+    /// - The parse work-unit panicked
+    /// - The parse timed out after `PARSE_TIMEOUT` (the work-unit keeps running
+    ///   and still releases the parser, but the result is discarded)
     /// - The closure returned `None`
     pub(crate) async fn parse_with_pool<T, F>(
         &self,
@@ -92,35 +96,33 @@ impl ParseCoordinator {
         F: FnOnce(tree_sitter::Parser) -> (tree_sitter::Parser, Option<T>) + Send + 'static,
         T: Send + 'static,
     {
-        let parser = {
-            let mut pool = self.parser_pool.lock().await;
-            pool.acquire(language_name)
-        };
+        use crate::error::LockResultExt;
 
-        let parser = parser?;
-
+        let parser_pool = std::sync::Arc::clone(&self.parser_pool);
+        let language_name_owned = language_name.to_string();
         let result = tokio::time::timeout(
             PARSE_TIMEOUT,
-            self.compute_pool.run(None, move || parse_fn(parser)),
+            self.compute_pool.run(None, move || {
+                let parser = parser_pool
+                    .lock()
+                    .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
+                    .acquire(&language_name_owned)?;
+                let (parser, value) = parse_fn(parser);
+                parser_pool
+                    .lock()
+                    .recover_poison("ParseCoordinator::parse_with_pool(release)")
+                    .release(language_name_owned, parser);
+                value
+            }),
         )
         .await;
 
         match result {
-            Ok(Some((parser, value))) => {
-                let mut pool = self.parser_pool.lock().await;
-                pool.release(language_name.to_string(), parser);
-                value
-            }
-            Ok(None) => {
-                // The work-unit panicked (logged with its payload by the pool);
-                // the parser inside it is lost, matching the old JoinError path.
-                log::error!(
-                    "Parse task panicked for language '{}' on document {}",
-                    language_name,
-                    uri
-                );
-                None
-            }
+            // Outer Option: None = the work-unit panicked (logged with its
+            // payload by the pool). Inner Option: None = no parser available
+            // for this language, or the closure itself yielded nothing.
+            Ok(Some(value)) => value,
+            Ok(None) => None,
             Err(_timeout) => {
                 log::warn!(
                     "Parse timeout after {:?} for language '{}' on document {} ({} bytes)",

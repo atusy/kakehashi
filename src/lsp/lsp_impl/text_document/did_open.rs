@@ -1119,6 +1119,10 @@ print("hello")
     /// host doc still attaches while the parse is blocked — proving it does not wait
     /// for the parse. (Before the hoist the attach sat *after* the parse, so with the
     /// pool lock held the host doc would never open and this test would time out.)
+    // Holding the sync parser-pool guard across awaits is this test's blocking
+    // mechanism (the parked parse blocks a compute-pool thread, not this task,
+    // so no deadlock): the lint's advice would defeat the test.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn host_document_attaches_before_parse_completes() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1130,8 +1134,13 @@ print("hello")
         let uri = Url::parse("file:///test/host_attach_no_wait.rs").unwrap();
         let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
 
-        // Hold the parser-pool lock so the spawned parse parks indefinitely (above).
-        let pool_guard = server.parser_pool.lock().await;
+        // Hold the parser-pool lock so the spawned parse parks indefinitely
+        // (above) — its compute-pool work-unit blocks acquiring this sync mutex.
+        use crate::error::LockResultExt;
+        let pool_guard = server
+            .parser_pool
+            .lock()
+            .recover_poison("test:host_document_attaches_before_parse_completes");
 
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {

@@ -42,7 +42,7 @@ fn updated_settings_after_install(
 pub(super) struct InstallCoordinatorDeps {
     pub(super) client: Client,
     pub(super) language: std::sync::Arc<LanguageCoordinator>,
-    pub(super) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(super) parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
     pub(super) compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     pub(super) documents: std::sync::Arc<DocumentStore>,
     pub(super) cache: std::sync::Arc<CacheCoordinator>,
@@ -54,7 +54,7 @@ pub(super) struct InstallCoordinatorDeps {
 pub(crate) struct InstallCoordinator {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
-    parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
     compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     documents: std::sync::Arc<DocumentStore>,
     cache: std::sync::Arc<CacheCoordinator>,

@@ -45,7 +45,6 @@ use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::bridge::ResolvedServerConfig;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::settings_manager::SettingsManager;
-use tokio::sync::Mutex;
 
 use super::auto_install::{AutoInstallManager, InstallingLanguages};
 use super::cache::CacheCoordinator;
@@ -158,7 +157,7 @@ pub(crate) fn url_to_uri(url: &Url) -> std::result::Result<Uri, crate::error::Ls
 pub struct Kakehashi {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
-    parser_pool: std::sync::Arc<Mutex<DocumentParserPool>>,
+    parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
     /// Bounded compute pool for all synchronous tree-CPU (parse-snapshot ADR §4):
     /// keeps tree work off the tokio workers so timers and unrelated documents'
     /// handlers stay pollable.
@@ -271,7 +270,7 @@ impl Kakehashi {
         Self {
             client,
             language,
-            parser_pool: std::sync::Arc::new(Mutex::new(parser_pool)),
+            parser_pool: std::sync::Arc::new(std::sync::Mutex::new(parser_pool)),
             compute_pool: std::sync::Arc::new(crate::compute_pool::ComputePool::new()),
             documents: std::sync::Arc::new(DocumentStore::new()),
             cache: std::sync::Arc::new(CacheCoordinator::new()),

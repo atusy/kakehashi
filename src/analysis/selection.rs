@@ -9,7 +9,6 @@ use injection_aware::is_cursor_within_effective_range;
 #[cfg(test)]
 use range_builder::build_from_node;
 
-use crate::document::DocumentHandle;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use context::{DocumentContext, InjectionContext};
 use tower_lsp_server::ls_types::{Position, Range, SelectionRange};
@@ -18,16 +17,21 @@ use tower_lsp_server::ls_types::{Position, Range, SelectionRange};
 ///
 /// Parses injected content and builds selection hierarchies from the injected
 /// language's AST. Returns one SelectionRange per position (LSP Spec 3.17 alignment).
+///
+/// Takes owned/borrowed document pieces rather than a store handle so the
+/// synchronous walk can run on the compute pool, off the tokio workers and
+/// without holding a `DashMap` shard read-lock for its duration.
 pub fn handle_selection_range(
-    document: &DocumentHandle,
+    text: &str,
+    tree: Option<&tree_sitter::Tree>,
+    language_id: Option<&str>,
     positions: &[Position],
     coordinator: &LanguageCoordinator,
     parser_pool: &mut DocumentParserPool,
 ) -> Vec<SelectionRange> {
-    let text = document.text();
-    let mapper = document.position_mapper();
-    let root = document.tree().map(|t| t.root_node());
-    let lang = document.language_id();
+    let mapper = crate::text::PositionMapper::new(text);
+    let root = tree.map(|t| t.root_node());
+    let lang = language_id;
 
     positions
         .iter()
@@ -632,7 +636,14 @@ array: ["xxxx"]"#;
         let coordinator = LanguageCoordinator::new();
         let mut parser_pool = coordinator.create_document_parser_pool();
         let document = store.get(&url).expect("document should exist");
-        let ranges = handle_selection_range(&document, &positions, &coordinator, &mut parser_pool);
+        let ranges = handle_selection_range(
+            document.text(),
+            document.tree(),
+            document.language_id(),
+            &positions,
+            &coordinator,
+            &mut parser_pool,
+        );
 
         assert_eq!(ranges.len(), positions.len());
         assert!(ranges[0].range.start.line == 0);
@@ -804,7 +815,14 @@ array: ["xxxx"]"#;
         let coordinator = LanguageCoordinator::new();
         let mut parser_pool = coordinator.create_document_parser_pool();
         let document = store.get(&url).expect("document should exist");
-        let ranges = handle_selection_range(&document, &positions, &coordinator, &mut parser_pool);
+        let ranges = handle_selection_range(
+            document.text(),
+            document.tree(),
+            document.language_id(),
+            &positions,
+            &coordinator,
+            &mut parser_pool,
+        );
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].range.start, Position::new(0, 0));
