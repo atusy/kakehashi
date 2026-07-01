@@ -356,11 +356,18 @@ impl CacheCoordinator {
         crate::text::fnv1a_hash(text) ^ generation.wrapping_mul(0x100000001b3)
     }
 
-    /// Store semantic tokens for a document, tagged with the `cache_key` they
-    /// were computed under so an unchanged-document repeat request (same text and
-    /// settings) can skip re-tokenizing via [`get_current_tokens`](Self::get_current_tokens).
-    pub(crate) fn store_tokens(&self, uri: Url, tokens: SemanticTokens, cache_key: u64) {
-        self.semantic_cache.store(uri, tokens, cache_key);
+    /// Store semantic tokens for a document, tagged with the resolved `language`
+    /// and the `cache_key` they were computed under so an unchanged-document
+    /// repeat request (same language, text, and settings) can skip re-tokenizing
+    /// via [`get_current_tokens`](Self::get_current_tokens).
+    pub(crate) fn store_tokens(
+        &self,
+        uri: Url,
+        tokens: SemanticTokens,
+        language: String,
+        cache_key: u64,
+    ) {
+        self.semantic_cache.store(uri, tokens, language, cache_key);
     }
 
     /// Store the most-recent `semanticTokens/range` result for a document (#535),
@@ -392,12 +399,18 @@ impl CacheCoordinator {
             .get_if_current(uri, range, language, cache_key)
     }
 
-    /// Return the cached tokens iff they were computed under this `cache_key`
-    /// (same text and settings generation), letting the caller skip the full
-    /// re-tokenization. None on a text edit, a settings reload, or no entry.
-    pub(crate) fn get_current_tokens(&self, uri: &Url, cache_key: u64) -> Option<SemanticTokens> {
+    /// Return the cached tokens iff they were computed for this `language` under
+    /// this `cache_key` (same text and settings generation), letting the caller
+    /// skip the full re-tokenization. None on a language switch, a text edit, a
+    /// settings reload, or no entry.
+    pub(crate) fn get_current_tokens(
+        &self,
+        uri: &Url,
+        language: &str,
+        cache_key: u64,
+    ) -> Option<SemanticTokens> {
         self.semantic_cache
-            .get_if_current(uri, cache_key)
+            .get_if_current(uri, language, cache_key)
             .map(|cached| cached.tokens)
     }
 
@@ -496,7 +509,7 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store_tokens(uri.clone(), tokens, 0);
+        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0);
 
         // Start a request
         let _request_id = cache.start_request(&uri);
@@ -522,15 +535,15 @@ mod tests {
         // A request snapshots the generation, then builds its key (generation 0).
         let gen_before = cache.semantic_token_generation();
         let key_before = cache.cache_key_for(text, gen_before);
-        cache.store_tokens(uri.clone(), tokens.clone(), key_before);
-        assert!(cache.get_current_tokens(&uri, key_before).is_some());
+        cache.store_tokens(uri.clone(), tokens.clone(), "rust".to_string(), key_before);
+        assert!(cache.get_current_tokens(&uri, "rust", key_before).is_some());
 
         // A settings/query reload bumps the generation (and clears the map).
         cache.bump_semantic_token_generation();
 
         // Race: a request that began tokenizing under the OLD queries (it captured
         // `key_before`) stores its now-stale tokens AFTER the reload's clear.
-        cache.store_tokens(uri.clone(), tokens, key_before);
+        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), key_before);
 
         // A fresh post-reload request snapshots the new generation and builds its
         // key for the same text. The stale, old-generation tokens must NOT be
@@ -542,7 +555,7 @@ mod tests {
             "the generation bump must change the key for identical text"
         );
         assert!(
-            cache.get_current_tokens(&uri, key_after).is_none(),
+            cache.get_current_tokens(&uri, "rust", key_after).is_none(),
             "tokens stored under the pre-reload generation must not survive a reload"
         );
     }
@@ -557,7 +570,7 @@ mod tests {
             result_id: Some("test-id".to_string()),
             data: vec![],
         };
-        cache.store_tokens(uri.clone(), tokens, 0);
+        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0);
 
         // Verify stored
         assert!(cache.get_tokens_if_valid(&uri, "test-id").is_some());
