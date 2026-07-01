@@ -456,15 +456,17 @@ impl BridgeServerConfig {
 /// `HashMap` iteration order. Returns `None` when no server declares any
 /// trigger (capability stays unadvertised).
 ///
-/// Every key (concrete server or the `_` wildcard itself) is independently
-/// resolved through wildcard-config-inheritance before its triggers are read,
-/// so a concrete server that overrides the wildcard's triggers (including
-/// with an explicit empty list) or its `enabled` state contributes its own
-/// *effective*, merged set — not the wildcard's raw one. A resolved config
-/// that isn't [`BridgeServerConfig::is_spawnable`] (no cmd, or disabled) is
-/// excluded entirely: advertising its triggers would make the client send an
-/// `onTypeFormatting` *request* — not a fire-and-forget notification — on
-/// every matching keystroke, only to resolve to null.
+/// Every concrete server key is independently resolved through
+/// wildcard-config-inheritance before its triggers are read, so a server that
+/// overrides the wildcard's triggers (including with an explicit empty list)
+/// or its `enabled` state contributes its own *effective*, merged set — not
+/// the wildcard's raw one. The `_` wildcard key itself is never a direct
+/// contributor: it's excluded from iteration, since a wildcard-only config
+/// (no concrete servers) has nothing to advertise on its own. A resolved
+/// config that isn't [`BridgeServerConfig::is_spawnable`] (no cmd, or
+/// disabled) is excluded entirely: advertising its triggers would make the
+/// client send an `onTypeFormatting` *request* — not a fire-and-forget
+/// notification — on every matching keystroke, only to resolve to null.
 pub(crate) fn on_type_formatting_trigger_union(
     servers: &HashMap<String, BridgeServerConfig>,
 ) -> Option<(String, Vec<String>)> {

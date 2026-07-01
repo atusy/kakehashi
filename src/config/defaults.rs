@@ -29,7 +29,8 @@ pub fn default_settings() -> RawWorkspaceSettings {
 /// entry documenting the built-in `workspaceMarkers`, `preferSharedInstance`,
 /// and `enabled` defaults that every concrete server inherits
 /// (wildcard-config-inheritance). Not spawnable itself — lookups skip the
-/// wildcard key and any server with an empty resolved cmd.
+/// wildcard key and any server that isn't [`BridgeServerConfig::is_spawnable`]
+/// (empty resolved cmd, or resolved `enabled: false`).
 fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
     HashMap::from([(
         WILDCARD_KEY.to_string(),
