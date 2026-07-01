@@ -1,6 +1,5 @@
 ---
 source: src/config/merge.rs
-assertion_line: 674
 expression: result
 ---
 {

@@ -1,6 +1,5 @@
 ---
 source: src/config/settings.rs
-assertion_line: 1376
 expression: settings.language_servers
 ---
 {

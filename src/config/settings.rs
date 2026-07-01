@@ -452,12 +452,26 @@ impl BridgeServerConfig {
 /// concrete server overriding the wildcard with an explicit empty list still
 /// leaves the wildcard's triggers advertised; the bridge-side trigger filter
 /// keeps such requests from reaching servers that don't declare the character.
+///
+/// A concrete server whose effective `enabled` resolves to `false` is
+/// excluded: it will never spawn, so advertising its triggers would make the
+/// client send an `onTypeFormatting` *request* — not a fire-and-forget
+/// notification — on every matching keystroke, only to resolve to null.
 pub(crate) fn on_type_formatting_trigger_union(
     servers: &HashMap<String, BridgeServerConfig>,
 ) -> Option<(String, Vec<String>)> {
     let mut triggers: Vec<String> = servers
-        .values()
-        .filter_map(|s| s.on_type_formatting_triggers.as_ref())
+        .iter()
+        .filter(|(name, _)| {
+            name.as_str() == crate::config::WILDCARD_KEY
+                || crate::config::resolve_with_wildcard(
+                    servers,
+                    name,
+                    crate::config::merge_bridge_server_configs,
+                )
+                .is_some_and(|resolved| resolved.is_enabled())
+        })
+        .filter_map(|(_, s)| s.on_type_formatting_triggers.as_ref())
         .flatten()
         .filter(|t| t.chars().count() == 1)
         .cloned()
@@ -1520,6 +1534,49 @@ mod tests {
             on_type_formatting_trigger_union(&servers_reordered),
             Some((first, more)),
             "union must not depend on map construction order"
+        );
+    }
+
+    #[test]
+    fn on_type_formatting_trigger_union_excludes_disabled_server() {
+        let server = |triggers: Option<Vec<&str>>, enabled: Option<bool>| BridgeServerConfig {
+            cmd: vec!["x".to_string()],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: None,
+            on_type_formatting_triggers: triggers
+                .map(|t| t.into_iter().map(String::from).collect()),
+            prefer_shared_instance: None,
+            enabled,
+            settings: None,
+        };
+
+        // A disabled server's own trigger never spawns anything, so it must
+        // not be advertised (it would cause per-keystroke dead requests).
+        let servers = HashMap::from([
+            ("a".to_string(), server(Some(vec!["}"]), Some(false))),
+            ("b".to_string(), server(Some(vec![";"]), None)),
+        ]);
+        let (first, more) =
+            on_type_formatting_trigger_union(&servers).expect("enabled server has a trigger");
+        assert_eq!(first, ";");
+        assert_eq!(more, Vec::<String>::new());
+
+        // Disabled via the wildcard's inherited default, too.
+        let servers_wildcard_disabled = HashMap::from([
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    enabled: Some(false),
+                    ..server(None, None)
+                },
+            ),
+            ("a".to_string(), server(Some(vec!["}"]), None)),
+        ]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&servers_wildcard_disabled),
+            None,
+            "a server disabled via the wildcard default contributes no triggers"
         );
     }
 

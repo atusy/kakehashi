@@ -353,7 +353,9 @@ pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<
                 name,
                 crate::config::merge_bridge_server_configs,
             )
-            .is_none_or(|config| config.cmd.is_empty())
+            // A deliberately disabled server is not a misconfiguration —
+            // don't warn about its missing cmd.
+            .is_none_or(|config| config.cmd.is_empty() && config.is_enabled())
         })
         .cloned()
         .collect();
@@ -986,6 +988,27 @@ mod tests {
             unspawnable_language_servers(&settings),
             vec!["broken".to_string()],
             "a deliberately disabled server is not an unspawnable misconfiguration"
+        );
+    }
+
+    #[test]
+    fn unspawnable_language_servers_excludes_disabled_server_with_empty_cmd() {
+        // The meaningful case: a server disabled AND left with no cmd (e.g.
+        // a placeholder entry the user hasn't filled in yet, or one they
+        // turned off without deleting). Must not be flagged either.
+        let mut settings = settings_with(HashMap::new());
+        let mut disabled = server(&[]);
+        disabled.enabled = Some(false);
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), server(&[])),
+            ("disabled".to_string(), disabled),
+            ("broken".to_string(), server(&[])),
+        ]);
+
+        assert_eq!(
+            unspawnable_language_servers(&settings),
+            vec!["broken".to_string()],
+            "a disabled server with an empty cmd is an intentional no-op, not a misconfiguration"
         );
     }
 

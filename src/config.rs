@@ -322,18 +322,25 @@ impl WorkspaceSettings {
             .any(LanguageSettings::is_host_bridging_enabled)
     }
 
-    /// True if any configured language server has a runnable command. The
-    /// built-in `_` wildcard defaults entry carries an empty `cmd` and is thus
-    /// excluded, so this is false on a blank config but true once a real server
-    /// (host- or virt-capable) is configured.
+    /// True if any configured language server has a runnable command AND is
+    /// enabled. The built-in `_` wildcard defaults entry carries an empty
+    /// `cmd` and is thus excluded, so this is false on a blank config but
+    /// true once a real server (host- or virt-capable) is configured.
     ///
     /// Gates willSave advertisement (#357): willSave now fans out to both host
     /// and virt bridges, so a single runnable bridge server is a potential
     /// consumer — but a config with only the empty defaults entry has none.
+    /// A server disabled via `enabled: false` (directly or inherited from the
+    /// wildcard) is likewise not a consumer: it never spawns, so counting it
+    /// would advertise willSave for a save that can only block on a no-op.
     pub(crate) fn any_bridge_server_runnable(&self) -> bool {
         self.language_servers
-            .values()
-            .any(|server| !server.cmd.is_empty())
+            .keys()
+            .filter(|name| name.as_str() != WILDCARD_KEY)
+            .any(|name| {
+                resolve_with_wildcard(&self.language_servers, name, merge_bridge_server_configs)
+                    .is_some_and(|server| !server.cmd.is_empty() && server.is_enabled())
+            })
     }
 }
 
@@ -454,6 +461,64 @@ mod tests {
             language_servers: HashMap::from([
                 (WILDCARD_KEY.to_string(), server(vec![])),
                 ("lua_ls".to_string(), server(vec!["lua-language-server"])),
+            ]),
+            ..Default::default()
+        };
+        assert!(settings.any_bridge_server_runnable());
+    }
+
+    #[test]
+    fn any_bridge_server_runnable_excludes_disabled_server() {
+        use crate::config::settings::BridgeServerConfig;
+
+        let server = |cmd: Vec<&str>, enabled: Option<bool>| BridgeServerConfig {
+            cmd: cmd.into_iter().map(String::from).collect(),
+            languages: vec![],
+            initialization_options: None,
+            root_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            enabled,
+            settings: None,
+        };
+
+        // Directly disabled: not a willSave consumer even with a real cmd.
+        let settings = WorkspaceSettings {
+            language_servers: HashMap::from([(
+                "lua_ls".to_string(),
+                server(vec!["lua-language-server"], Some(false)),
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            !settings.any_bridge_server_runnable(),
+            "a disabled server never spawns, so it must not count as runnable"
+        );
+
+        // Disabled via the wildcard's inherited default.
+        let settings = WorkspaceSettings {
+            language_servers: HashMap::from([
+                (WILDCARD_KEY.to_string(), server(vec![], Some(false))),
+                (
+                    "lua_ls".to_string(),
+                    server(vec!["lua-language-server"], None),
+                ),
+            ]),
+            ..Default::default()
+        };
+        assert!(
+            !settings.any_bridge_server_runnable(),
+            "a server disabled via the wildcard default must not count as runnable"
+        );
+
+        // A server can opt back in over a disabled wildcard.
+        let settings = WorkspaceSettings {
+            language_servers: HashMap::from([
+                (WILDCARD_KEY.to_string(), server(vec![], Some(false))),
+                (
+                    "lua_ls".to_string(),
+                    server(vec!["lua-language-server"], Some(true)),
+                ),
             ]),
             ..Default::default()
         };
