@@ -260,6 +260,27 @@ impl DiagnosticPublisher {
             );
             return;
         };
+        // A server disabled (`enabled: false`) after it already spawned can
+        // still emit region pushes on its still-live connection; drop them
+        // rather than recording fresh diagnostics for a server the user no
+        // longer wants running (mirrors publish_host_push's is_host_server
+        // gate). `enabled` is a per-server-name property, so this only needs
+        // the pushing server's own resolved config, not the region's
+        // injection language.
+        let settings = self.settings_manager.load_settings();
+        let is_enabled = crate::config::resolve_with_wildcard(
+            &settings.language_servers,
+            &server,
+            crate::config::merge_bridge_server_configs,
+        )
+        .is_some_and(|config| config.is_spawnable());
+        if !is_enabled {
+            log::debug!(
+                target: LOG_TARGET,
+                "push from disabled server {server}, dropping"
+            );
+            return;
+        }
         self.aggregator.record(
             &host,
             DiagnosticSource::Region(region_id),
@@ -718,6 +739,64 @@ mod tests {
             .language
             .language_registry_for_parallel()
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+    }
+
+    #[tokio::test]
+    async fn region_push_dropped_when_origin_server_disabled() {
+        // Unlike publish_host_push, publish_region_push previously had no
+        // config-validity check at all: a disabled server's still-live
+        // connection could keep pushing region diagnostics indefinitely.
+        // `enabled` is a per-server-name property (not per-language), so the
+        // gate only needs the pushing server's own resolved config.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        let host_uri = Url::parse("file:///test/region_disabled.rs").unwrap();
+        server.documents.insert(
+            host_uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "sql",
+            "region-1",
+        );
+        server
+            .bridge
+            .register_opened_document_for_test(
+                &host_uri,
+                &virtual_uri,
+                &crate::lsp::bridge::ConnectionKey::for_server("sql_ls"),
+            )
+            .await;
+
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "sql_ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["sql-ls".to_string()],
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(settings);
+
+        DiagnosticPublisher::new(server)
+            .publish_region_push(
+                &virtual_uri.to_uri_string(),
+                "sql_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("boom")],
+            )
+            .await;
+
+        assert!(
+            server.diagnostics.snapshot(&host_uri).is_empty(),
+            "a disabled server's region push must not be recorded"
+        );
     }
 
     #[tokio::test]

@@ -243,6 +243,21 @@ impl BridgeCoordinator {
         self.pool.insert_connection(handle).await;
     }
 
+    /// Register a virtual document as opened, so [`Self::resolve_virtual_uri`]
+    /// can recover its host and region for a test-driven region push, without
+    /// a real downstream connection.
+    #[cfg(test)]
+    pub(crate) async fn register_opened_document_for_test(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &crate::lsp::bridge::protocol::VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+    ) {
+        self.pool
+            .register_opened_document(host_uri, virtual_uri, connection_key)
+            .await
+    }
+
     // ========================================
     // Config lookup (moved from Kakehashi)
     // ========================================
@@ -287,8 +302,8 @@ impl BridgeCoordinator {
 
             if let Some(resolved_config) =
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
-                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
                     .filter(|c| c.is_spawnable())
+                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
             {
                 return Some(ResolvedServerConfig {
                     server_name: server_name.clone(),
@@ -338,8 +353,8 @@ impl BridgeCoordinator {
             .filter(|name| *name != "_")
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
-                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
                     .filter(|c| c.is_spawnable())
+                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -379,8 +394,8 @@ impl BridgeCoordinator {
             .filter(|name| *name != "_")
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
-                    .filter(|c| c.languages.iter().any(|l| l == host_language))
                     .filter(|c| c.is_spawnable())
+                    .filter(|c| c.languages.iter().any(|l| l == host_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
