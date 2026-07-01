@@ -19,6 +19,18 @@ use url::Url;
 #[derive(Clone)]
 pub struct CachedSemanticTokens {
     pub tokens: SemanticTokens,
+    /// The resolved language these tokens were computed for. The `cache_key`
+    /// folds only text ⊕ settings generation, so it can't tell the same URL
+    /// re-opened under a DIFFERENT language apart. `didClose` evicts the entry
+    /// (`CacheCoordinator::remove_document`), but a pre-close request already
+    /// computing can `store` its tokens *after* that eviction under the unchanged
+    /// `cache_key`; the reopen under the new language neither edits the text nor
+    /// bumps the generation, so a bare `(uri, cache_key)` lookup would then serve
+    /// those wrong-language tokens. Pinning the language makes such a request miss
+    /// and recompute instead. (A *same*-language re-open yields identical tokens,
+    /// so it correctly hits.) Mirrors the range (#535) and injection (#529)
+    /// caches, which already fold their language in.
+    pub language: String,
     /// Opaque validity key these tokens were computed under (built by
     /// `CacheCoordinator::token_cache_key`: the FNV-1a hash of the document text
     /// folded with the settings generation). Lets a repeat request on an
@@ -42,11 +54,18 @@ impl SemanticTokenCache {
         }
     }
 
-    /// Store semantic tokens for a document, tagged with the `cache_key` they
-    /// were computed under (see [`get_if_current`](Self::get_if_current)).
-    pub fn store(&self, uri: Url, tokens: SemanticTokens, cache_key: u64) {
-        self.cache
-            .insert(uri, CachedSemanticTokens { tokens, cache_key });
+    /// Store semantic tokens for a document, tagged with the resolved `language`
+    /// and the `cache_key` they were computed under (see
+    /// [`get_if_current`](Self::get_if_current)).
+    pub fn store(&self, uri: Url, tokens: SemanticTokens, language: String, cache_key: u64) {
+        self.cache.insert(
+            uri,
+            CachedSemanticTokens {
+                tokens,
+                language,
+                cache_key,
+            },
+        );
     }
 
     /// Retrieve semantic tokens for a document.
@@ -54,13 +73,19 @@ impl SemanticTokenCache {
         self.cache.get(uri).map(|entry| entry.clone())
     }
 
-    /// Get cached tokens if they were computed under this `cache_key` — i.e. the
-    /// document text AND the settings generation are unchanged since they were
-    /// cached, so re-tokenizing would reproduce them. Returns None on a mismatch
-    /// (text edit or config reload) or no entry.
-    pub fn get_if_current(&self, uri: &Url, cache_key: u64) -> Option<CachedSemanticTokens> {
+    /// Get cached tokens if they were computed for this exact `language` under
+    /// this `cache_key` — i.e. the resolved language, document text, AND settings
+    /// generation are unchanged since they were cached, so re-tokenizing would
+    /// reproduce them. Returns None on a mismatch (language switch, text edit, or
+    /// config reload) or no entry.
+    pub fn get_if_current(
+        &self,
+        uri: &Url,
+        language: &str,
+        cache_key: u64,
+    ) -> Option<CachedSemanticTokens> {
         self.cache.get(uri).and_then(|entry| {
-            if entry.cache_key == cache_key {
+            if entry.cache_key == cache_key && entry.language == language {
                 Some(entry.clone())
             } else {
                 None
@@ -469,7 +494,7 @@ mod tests {
         };
 
         // Store tokens
-        cache.store(uri.clone(), tokens.clone(), 0);
+        cache.store(uri.clone(), tokens.clone(), "rust".to_string(), 0);
 
         // Retrieve tokens
         let retrieved = cache.get(&uri);
@@ -509,7 +534,7 @@ mod tests {
             }],
         };
 
-        cache.store(uri.clone(), tokens, 0);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
 
         // Matching result_id returns tokens
         let valid = cache.get_if_valid(&uri, "42");
@@ -542,22 +567,54 @@ mod tests {
             result_id: Some("7".to_string()),
             data: vec![],
         };
-        cache.store(uri.clone(), tokens, 0xABCD);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0xABCD);
 
-        // Same content hash => the document is unchanged => serve cached tokens.
-        let hit = cache.get_if_current(&uri, 0xABCD);
+        // Same content hash AND language => the document is unchanged => serve
+        // cached tokens.
+        let hit = cache.get_if_current(&uri, "rust", 0xABCD);
         assert!(hit.is_some(), "should hit when the content hash matches");
         assert_eq!(hit.unwrap().tokens.result_id, Some("7".to_string()));
 
         // Different content hash => the text changed => recompute (miss).
         assert!(
-            cache.get_if_current(&uri, 0x1234).is_none(),
+            cache.get_if_current(&uri, "rust", 0x1234).is_none(),
             "should miss when the content hash differs"
         );
 
         // Unknown URI => miss.
         let other = Url::parse("file:///o.rs").unwrap();
-        assert!(cache.get_if_current(&other, 0xABCD).is_none());
+        assert!(cache.get_if_current(&other, "rust", 0xABCD).is_none());
+    }
+
+    #[test]
+    fn get_if_current_misses_on_language_switch() {
+        // A `didClose`/`didOpen` that re-assigns the same URI to a different
+        // language keeps the text (and thus `cache_key`) identical, since the key
+        // folds only text ⊕ settings generation. `didClose` evicts, but a
+        // pre-close request still computing can store under the unchanged key
+        // after that eviction, and the reopen bumps no generation — so without the
+        // language guard the cache would serve the previous language's tokens for
+        // the new document (#549); with it, the request misses and recomputes.
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///t.txt").unwrap();
+        let tokens = SemanticTokens {
+            result_id: Some("1".to_string()),
+            data: vec![],
+        };
+        cache.store(uri.clone(), tokens, "lua".to_string(), 0xABCD);
+
+        // Same key, same language => hit.
+        assert!(
+            cache.get_if_current(&uri, "lua", 0xABCD).is_some(),
+            "should hit for the same language under the same key"
+        );
+
+        // Same key (unchanged text), different language => miss (no wrong-language
+        // tokens served).
+        assert!(
+            cache.get_if_current(&uri, "python", 0xABCD).is_none(),
+            "must miss when the resolved language differs even if the text is unchanged"
+        );
     }
 
     #[test]
@@ -568,14 +625,14 @@ mod tests {
             result_id: Some("1".to_string()),
             data: vec![],
         };
-        cache.store(uri.clone(), tokens, 0xAA);
-        assert!(cache.get_if_current(&uri, 0xAA).is_some());
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0xAA);
+        assert!(cache.get_if_current(&uri, "rust", 0xAA).is_some());
 
         // A config reload changes tokenization for the same text, so the whole
         // cache must drop — a later request recomputes against the new queries.
         cache.clear();
         assert!(
-            cache.get_if_current(&uri, 0xAA).is_none(),
+            cache.get_if_current(&uri, "rust", 0xAA).is_none(),
             "clear() must drop entries so stale-config tokens are not served"
         );
     }
@@ -596,7 +653,7 @@ mod tests {
         };
 
         // Store tokens
-        cache.store(uri.clone(), tokens, 0);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
         assert!(cache.get(&uri).is_some(), "Should have cached tokens");
 
         // Remove on close

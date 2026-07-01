@@ -371,7 +371,10 @@ impl Kakehashi {
             // that check. (The compute path below DOES await, which is why it
             // re-checks staleness after the block; this early return needs no such
             // re-check.)
-            if let Some(cached) = self.cache.get_current_tokens(&uri, cache_key) {
+            if let Some(cached) = self
+                .cache
+                .get_current_tokens(&uri, &language_name, cache_key)
+            {
                 self.cache.finish_request(&uri, request_id);
                 return Ok(Some(SemanticTokensResult::Tokens(cached)));
             }
@@ -474,9 +477,10 @@ impl Kakehashi {
         let stored_tokens = tokens_with_id.clone();
         let lsp_tokens = tokens_with_id;
         // Store keyed by result_id (delta baseline) AND cache_key (so an
-        // unchanged-document repeat request short-circuits the re-tokenization above).
+        // unchanged-document repeat request short-circuits the re-tokenization
+        // above). `language_name` is unused after this, so move it in.
         self.cache
-            .store_tokens(uri.clone(), stored_tokens, cache_key);
+            .store_tokens(uri.clone(), stored_tokens, language_name, cache_key);
 
         // Finish tracking this request
         self.cache.finish_request(&uri, request_id);
@@ -636,7 +640,10 @@ impl Kakehashi {
             // re-tokenizing. No `.await` runs between the staleness check above and
             // here, so the cached tokens stay consistent with it. Cleared wholesale
             // on a settings reload.
-            if let Some(cached) = self.cache.get_current_tokens(&uri, cache_key) {
+            if let Some(cached) = self
+                .cache
+                .get_current_tokens(&uri, &language_name, cache_key)
+            {
                 // Fast path: the client's baseline already IS these cached tokens,
                 // so the delta is necessarily empty — return it directly and skip
                 // the `previous_tokens` clone + O(N) `calculate_delta` below.
@@ -756,8 +763,12 @@ impl Kakehashi {
         let final_result = match delta_result {
             SemanticTokensFullDeltaResult::Tokens(mut tokens) => {
                 tokens.result_id = Some(next_result_id());
-                self.cache
-                    .store_tokens(uri.clone(), tokens.clone(), cache_key);
+                self.cache.store_tokens(
+                    uri.clone(),
+                    tokens.clone(),
+                    language_name.clone(),
+                    cache_key,
+                );
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
             SemanticTokensFullDeltaResult::TokensDelta(mut delta) if delta.edits.is_empty() => {
@@ -774,8 +785,12 @@ impl Kakehashi {
                 let mut stored_tokens = current_tokens;
                 stored_tokens.result_id = Some(next_result_id());
                 delta.result_id = stored_tokens.result_id.clone();
-                self.cache
-                    .store_tokens(uri.clone(), stored_tokens, cache_key);
+                self.cache.store_tokens(
+                    uri.clone(),
+                    stored_tokens,
+                    language_name.clone(),
+                    cache_key,
+                );
                 SemanticTokensFullDeltaResult::TokensDelta(delta)
             }
             SemanticTokensFullDeltaResult::PartialTokensDelta { .. } => {
@@ -789,8 +804,12 @@ impl Kakehashi {
                 );
                 let mut tokens = current_tokens;
                 tokens.result_id = Some(next_result_id());
-                self.cache
-                    .store_tokens(uri.clone(), tokens.clone(), cache_key);
+                self.cache.store_tokens(
+                    uri.clone(),
+                    tokens.clone(),
+                    language_name.clone(),
+                    cache_key,
+                );
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
         };
@@ -1397,6 +1416,76 @@ mod tests {
             first_id, second_id,
             "an unchanged document should reuse cached tokens (stable result_id), \
              not recompute with a fresh id"
+        );
+    }
+
+    /// End-to-end guard for #549: the same URI, re-assigned to a DIFFERENT
+    /// language without any text change, must recompute rather than serve the
+    /// first language's cached tokens. The text (and thus `cache_key`) is
+    /// identical across both requests, so only the language dimension of the key
+    /// prevents the collision. This deliberately does NOT go through `did_close`
+    /// (which evicts the entry): the bug it locks is the lingering entry being
+    /// re-read under the new language (the store-after-evict / reopen race), so
+    /// the entry must survive into the second request.
+    #[tokio::test]
+    async fn semantic_tokens_full_recomputes_after_language_switch_same_text() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///switch.txt").expect("should construct test uri");
+        // Text is only ever compared for equality across the two requests; it need
+        // not be valid in either grammar (tree-sitter still yields a tree + tokens).
+        let text = "local x = 1".to_string();
+
+        for lang in ["lua", "rust"] {
+            let load_result = server.language.ensure_language_loaded(lang);
+            if !load_result.success || server.language.highlight_query(lang).is_none() {
+                eprintln!("Skipping: {lang} parser or highlight query not available");
+                return;
+            }
+        }
+
+        let make_params = || SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        // Open as lua, compute + cache tokens under (uri, lua, cache_key).
+        server
+            .documents
+            .insert(uri.clone(), text.clone(), Some("lua".to_string()), None);
+        let lua_result = server
+            .semantic_tokens_full_impl(make_params())
+            .await
+            .expect("lua full request should succeed")
+            .expect("should return tokens");
+        let lua_id = match lua_result {
+            SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
+            _ => panic!("expected Tokens variant"),
+        };
+
+        // Re-assign the SAME uri + SAME text to rust WITHOUT closing (so the lua
+        // cache entry lingers). The cache_key is unchanged (text + generation are),
+        // so only the language guard can force a miss here.
+        server
+            .documents
+            .insert(uri.clone(), text, Some("rust".to_string()), None);
+        let rust_result = server
+            .semantic_tokens_full_impl(make_params())
+            .await
+            .expect("rust full request should succeed")
+            .expect("should return tokens");
+        let rust_id = match rust_result {
+            SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
+            _ => panic!("expected Tokens variant"),
+        };
+
+        assert_ne!(
+            lua_id, rust_id,
+            "switching the document's language (same text) must recompute, not \
+             serve the previous language's cached tokens"
         );
     }
 
