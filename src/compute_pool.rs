@@ -82,6 +82,14 @@ impl ComputePool {
     }
 }
 
+/// Shared pool for tests: building a fresh thread pool per test is wasteful
+/// and can exhaust process threads under the full suite's parallelism.
+#[cfg(test)]
+pub(crate) fn test_pool() -> std::sync::Arc<ComputePool> {
+    static POOL: std::sync::OnceLock<std::sync::Arc<ComputePool>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(POOL.get_or_init(|| std::sync::Arc::new(ComputePool::new())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,13 +15,14 @@ impl DocumentSnapshot {
         &self.text
     }
 
-    /// The open incarnation of the document this snapshot was taken from
-    /// (see [`Document::incarnation`]). Captured atomically with the text and
-    /// tree under the same shard read lock, so a consumer can later detect a
-    /// close-then-reopen that raced its request by comparing against the URI's
-    /// current incarnation.
-    pub(crate) fn incarnation(&self) -> u64 {
-        self.incarnation
+    /// Decompose into owned parts (cheap: `Arc<str>`/`Tree` refcount moves),
+    /// for handing the snapshot's pieces to a compute-pool work-unit. The
+    /// incarnation (see [`Document::incarnation`]) is captured atomically with
+    /// the text and tree under the same shard read lock, so a consumer can
+    /// later detect a close-then-reopen that raced its request by comparing
+    /// against the URI's current incarnation.
+    pub(crate) fn into_parts(self) -> (Arc<str>, Tree, u64) {
+        (self.text, self.tree, self.incarnation)
     }
 
     /// Cheaply clone the text as a shared `Arc<str>` (a refcount bump, no copy)

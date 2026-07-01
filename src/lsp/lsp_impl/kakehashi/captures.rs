@@ -531,155 +531,212 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::captures", "no parsed document for {uri}");
             return Ok(None);
         };
-        let incarnation = snapshot.incarnation();
-        let text = snapshot.text();
-        let tree = snapshot.tree();
+        let (text, tree, incarnation) = snapshot.into_parts();
 
-        let mapper = PositionMapper::new(text);
-
-        // Range scoping: clamped conversion (like other viewport-shaped
-        // requests) — an out-of-bounds position means "to the document edge",
-        // not an error. An inverted range is normalized to [min, max], the
-        // same forgiveness range_formatting applies, rather than collapsing
-        // to null (which the protocol reserves for unresolvable states).
-        let byte_range = lsp_range.map(|r| {
-            let a = mapper.position_to_byte_clamped(r.start);
-            let b = mapper.position_to_byte_clamped(r.end);
-            a.min(b)..a.max(b)
-        });
-
-        let registry = self.language.language_registry_for_parallel();
-        let search_paths = self.language.search_paths();
-        let file_name = format!("{kind}.scm");
-
-        // One kind-query load per language per request: with many regions of
-        // the same language (e.g. dozens of python blocks), the memo keeps
-        // file IO + compilation at one per language, and yields each
-        // language's `skipped` exactly once.
-        let mut kind_queries: HashMap<String, KindQueryLoad> = HashMap::new();
-        let mut matches: Vec<Value> = Vec::new();
-
-        let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
-            let entry = kind_queries
-                .entry(layer_language.to_string())
-                .or_insert_with(|| {
-                    load_kind_query(&registry, &search_paths, layer_language, &file_name)
-                });
-            let KindQueryLoad::Loaded(kind_query) = entry else {
-                return;
-            };
-            for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
-                let match_metadata = metadata_object(m.metadata);
-                let captures: Vec<Value> = m
-                    .captures
-                    .into_iter()
-                    .filter_map(|c| {
-                        // A capture whose bytes don't map to positions (corrupt
-                        // span) is dropped rather than failing the whole request.
-                        let start = mapper.byte_to_position(c.start_byte)?;
-                        let end = mapper.byte_to_position(c.end_byte)?;
-                        // Minted in the layer's depth, so the id resolves in
-                        // its minting layer via kakehashi/node/* (per-layer
-                        // Scope rule).
-                        let node =
-                            self.mint_node_info(&uri, depth, (c.start_byte, c.end_byte, c.kind));
-                        let mut capture = json!({
-                            "name": c.name,
-                            "node": node,
-                            "range": { "start": start, "end": end },
-                        });
-                        // Capture-scoped `#set! @cap key value` metadata,
-                        // only when the capture was annotated.
-                        if let Some(meta) = metadata_object(c.metadata) {
-                            capture["metadata"] = meta;
-                        }
-                        Some(capture)
-                    })
-                    .collect();
-                // Mirror execute_query's invariant: clients never see an empty
-                // match envelope, even when every capture span fails to map.
-                if captures.is_empty() {
-                    continue;
-                }
-                let mut envelope = json!({
-                    "patternIndex": m.pattern_index,
-                    "language": layer_language,
-                    "captures": captures,
-                });
-                // Match-level `#set!` metadata, only when the pattern set any
-                // (treesitter-directive-set!) — absent otherwise, so patterns
-                // without directives keep their pre-metadata wire shape.
-                if let Some(meta) = match_metadata {
-                    envelope["metadata"] = meta;
-                }
-                matches.push(envelope);
-            }
-        };
-
-        if injection {
-            walk_document_layers(
-                &self.language,
-                &language_id,
-                text,
-                tree,
-                byte_range.as_ref(),
-                &mut visit,
-            );
-        } else {
-            visit(&language_id, tree, 0);
-        }
-
-        // The kind is "available" when at least one visited language COMPILED
-        // the file — a host without a context.scm still surfaces the embedded
-        // layers' contexts. A `Broken` file does not make the kind available
-        // (a sole broken asset degrades to null, per the ADR), but its
-        // diagnostics are surfaced below whenever another language yields a
-        // result.
-        if !kind_queries
-            .values()
-            .any(|load| matches!(load, KindQueryLoad::Loaded(_)))
-        {
-            return Ok(None);
-        }
-
-        // Sort by language so the wire order is deterministic — the memo is a
-        // HashMap, whose iteration order would otherwise vary per process.
-        // Within a language, the loader already reports skipped patterns in
-        // file order. `Broken` languages contribute their diagnostics too:
-        // a wholly-invalid kind file would otherwise be silently invisible
-        // exactly when other layers still produce matches.
-        let mut reportable: Vec<(&String, &[crate::language::query_loader::SkippedPattern])> =
-            kind_queries
-                .iter()
-                .filter_map(|(lang, load)| match load {
-                    KindQueryLoad::Loaded(kq) => Some((lang, kq.skipped.as_slice())),
-                    KindQueryLoad::Broken(skipped) => Some((lang, skipped.as_slice())),
-                    KindQueryLoad::Unavailable => None,
-                })
-                .collect();
-        reportable.sort_by(|a, b| a.0.cmp(b.0));
-        let skipped: Vec<Value> = reportable
-            .into_iter()
-            .flat_map(|(lang, patterns)| {
-                patterns.iter().map(move |s| {
-                    json!({
-                        "language": lang,
-                        "startLine": s.start_line,
-                        "endLine": s.end_line,
-                        "reason": s.error,
-                    })
-                })
+        // The query-execution walk over every layer — including the injected
+        // layers' one-off re-parses — is synchronous tree-CPU; run it as one
+        // compute-pool work-unit instead of inline on this tokio worker
+        // (parse-snapshot ADR §4). Everything moved in is an owned snapshot
+        // piece or a cheap Arc clone; `None` from the pool (work-unit panic)
+        // degrades to the protocol's `null`.
+        let uri_for_walk = uri.clone();
+        let kind = kind.to_string();
+        let language = std::sync::Arc::clone(&self.language);
+        let tracker = self.bridge.node_tracker_arc();
+        let walked = self
+            .compute_pool
+            .run(None, move || {
+                execute_captures_walk(
+                    &uri_for_walk,
+                    &kind,
+                    lsp_range,
+                    injection,
+                    &language_id,
+                    &text,
+                    &tree,
+                    &language,
+                    &tracker,
+                )
             })
-            .collect();
-
-        Ok(Some(ComputedCaptures {
+            .await;
+        let Some(walked) = walked else {
+            return Ok(None);
+        };
+        Ok(walked.map(|(matches, skipped)| ComputedCaptures {
             uri,
             incarnation,
             matches,
             skipped,
         }))
     }
+}
 
+/// Synchronous half of the captures pipeline: load + compile the kind query
+/// per visited layer language, execute it over each layer, and shape the wire
+/// JSON. Runs as a compute-pool work-unit (never on a tokio worker).
+///
+/// Returns `None` when no visited language compiled a kind file (→ `null` on
+/// the wire), `Some((matches, skipped))` otherwise.
+#[allow(clippy::too_many_arguments)]
+fn execute_captures_walk(
+    uri: &Url,
+    kind: &str,
+    lsp_range: Option<Range>,
+    injection: bool,
+    language_id: &str,
+    text: &str,
+    tree: &tree_sitter::Tree,
+    language: &crate::language::LanguageCoordinator,
+    tracker: &crate::language::NodeTracker,
+) -> Option<(Vec<Value>, Vec<Value>)> {
+    let mapper = PositionMapper::new(text);
+
+    // Range scoping: clamped conversion (like other viewport-shaped
+    // requests) — an out-of-bounds position means "to the document edge",
+    // not an error. An inverted range is normalized to [min, max], the
+    // same forgiveness range_formatting applies, rather than collapsing
+    // to null (which the protocol reserves for unresolvable states).
+    let byte_range = lsp_range.map(|r| {
+        let a = mapper.position_to_byte_clamped(r.start);
+        let b = mapper.position_to_byte_clamped(r.end);
+        a.min(b)..a.max(b)
+    });
+
+    let registry = language.language_registry_for_parallel();
+    let search_paths = language.search_paths();
+    let file_name = format!("{kind}.scm");
+
+    // One kind-query load per language per request: with many regions of
+    // the same language (e.g. dozens of python blocks), the memo keeps
+    // file IO + compilation at one per language, and yields each
+    // language's `skipped` exactly once.
+    let mut kind_queries: HashMap<String, KindQueryLoad> = HashMap::new();
+    let mut matches: Vec<Value> = Vec::new();
+
+    let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
+        let entry = kind_queries
+            .entry(layer_language.to_string())
+            .or_insert_with(|| {
+                load_kind_query(&registry, &search_paths, layer_language, &file_name)
+            });
+        let KindQueryLoad::Loaded(kind_query) = entry else {
+            return;
+        };
+        for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
+            let match_metadata = metadata_object(m.metadata);
+            let captures: Vec<Value> = m
+                .captures
+                .into_iter()
+                .filter_map(|c| {
+                    // A capture whose bytes don't map to positions (corrupt
+                    // span) is dropped rather than failing the whole request.
+                    let start = mapper.byte_to_position(c.start_byte)?;
+                    let end = mapper.byte_to_position(c.end_byte)?;
+                    // Minted in the layer's depth, so the id resolves in
+                    // its minting layer via kakehashi/node/* (per-layer
+                    // Scope rule). Same mint as `mint_node_info`, done via
+                    // the tracker handle since this runs off `self`.
+                    let ulid = tracker.get_or_create_in_layer(
+                        uri,
+                        c.start_byte,
+                        c.end_byte,
+                        c.kind,
+                        depth,
+                    );
+                    let node = json!({ "id": ulid.to_string(), "kind": c.kind });
+                    let mut capture = json!({
+                        "name": c.name,
+                        "node": node,
+                        "range": { "start": start, "end": end },
+                    });
+                    // Capture-scoped `#set! @cap key value` metadata,
+                    // only when the capture was annotated.
+                    if let Some(meta) = metadata_object(c.metadata) {
+                        capture["metadata"] = meta;
+                    }
+                    Some(capture)
+                })
+                .collect();
+            // Mirror execute_query's invariant: clients never see an empty
+            // match envelope, even when every capture span fails to map.
+            if captures.is_empty() {
+                continue;
+            }
+            let mut envelope = json!({
+                "patternIndex": m.pattern_index,
+                "language": layer_language,
+                "captures": captures,
+            });
+            // Match-level `#set!` metadata, only when the pattern set any
+            // (treesitter-directive-set!) — absent otherwise, so patterns
+            // without directives keep their pre-metadata wire shape.
+            if let Some(meta) = match_metadata {
+                envelope["metadata"] = meta;
+            }
+            matches.push(envelope);
+        }
+    };
+
+    if injection {
+        walk_document_layers(
+            language,
+            language_id,
+            text,
+            tree,
+            byte_range.as_ref(),
+            &mut visit,
+        );
+    } else {
+        visit(language_id, tree, 0);
+    }
+
+    // The kind is "available" when at least one visited language COMPILED
+    // the file — a host without a context.scm still surfaces the embedded
+    // layers' contexts. A `Broken` file does not make the kind available
+    // (a sole broken asset degrades to null, per the ADR), but its
+    // diagnostics are surfaced below whenever another language yields a
+    // result.
+    if !kind_queries
+        .values()
+        .any(|load| matches!(load, KindQueryLoad::Loaded(_)))
+    {
+        return None;
+    }
+
+    // Sort by language so the wire order is deterministic — the memo is a
+    // HashMap, whose iteration order would otherwise vary per process.
+    // Within a language, the loader already reports skipped patterns in
+    // file order. `Broken` languages contribute their diagnostics too:
+    // a wholly-invalid kind file would otherwise be silently invisible
+    // exactly when other layers still produce matches.
+    let mut reportable: Vec<(&String, &[crate::language::query_loader::SkippedPattern])> =
+        kind_queries
+            .iter()
+            .filter_map(|(lang, load)| match load {
+                KindQueryLoad::Loaded(kq) => Some((lang, kq.skipped.as_slice())),
+                KindQueryLoad::Broken(skipped) => Some((lang, skipped.as_slice())),
+                KindQueryLoad::Unavailable => None,
+            })
+            .collect();
+    reportable.sort_by(|a, b| a.0.cmp(b.0));
+    let skipped: Vec<Value> = reportable
+        .into_iter()
+        .flat_map(|(lang, patterns)| {
+            patterns.iter().map(move |s| {
+                json!({
+                    "language": lang,
+                    "startLine": s.start_line,
+                    "endLine": s.end_line,
+                    "reason": s.error,
+                })
+            })
+        })
+        .collect();
+
+    Some((matches, skipped))
+}
+
+impl Kakehashi {
     /// Ensure the grammars for every injection language appearing in the
     /// document are loaded (auto-installing where configured), iterating to a
     /// fixpoint: each round can only discover one tier deeper than the

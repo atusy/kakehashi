@@ -46,18 +46,24 @@ pub(crate) use token_collector::TokenKind;
 #[cfg(test)]
 use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::SemanticTokens};
 
-/// Compute full-document semantic tokens (host + injections) on tokio's
-/// blocking pool, distributing injections across Rayon workers. Thread-local
-/// parser caches avoid cross-thread synchronization on parse. Returns `None`
-/// on cancellation/failure. `text` and `tree` are moved into `spawn_blocking`.
+/// Compute full-document semantic tokens (host + injections) as one work-unit
+/// on the bounded compute pool; the injection fan-out's `par_iter` runs on the
+/// same pool (a Rayon parallel iterator invoked from a pool thread stays on
+/// that pool), so tokenization can no longer occupy every core via the
+/// process-global Rayon pool (parse-snapshot ADR §4). Thread-local parser
+/// caches avoid cross-thread synchronization on parse. Returns `None` on
+/// cancellation/failure. `text` and `tree` are moved into the work-unit.
 ///
-/// `cancel` (when provided) is polled at coarse boundaries — after the host
-/// pass, after the injection pass, and per region inside the injection pass — so
-/// a superseded/cancelled request stops instead of running to completion.
-/// Returns `None` once cancelled: the caller drops the (partial) result rather
-/// than storing it (see the compute-superseded checkpoints in the handlers).
+/// `cancel` (when provided) doubles as the work-unit's dequeue hook (a request
+/// superseded while queued never starts) and is polled at coarse boundaries —
+/// after the host pass, after the injection pass, and per region inside the
+/// injection pass — so a superseded/cancelled request stops instead of running
+/// to completion. Returns `None` once cancelled: the caller drops the
+/// (partial) result rather than storing it (see the compute-superseded
+/// checkpoints in the handlers).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
+    pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     text: String,
     tree: Tree,
     query: std::sync::Arc<Query>,
@@ -68,7 +74,7 @@ pub(crate) async fn handle_semantic_tokens_full(
     injection_cache: Option<InjectionCacheParams>,
     cancel: Option<crate::cancel::CancelToken>,
 ) -> Option<SemanticTokensResult> {
-    tokio::task::spawn_blocking(move || {
+    pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
 
         let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
@@ -137,7 +143,6 @@ pub(crate) async fn handle_semantic_tokens_full(
         finalize_tokens(all_tokens, &active_injection_regions, &lines)
     })
     .await
-    .ok()
     .flatten()
 }
 
@@ -609,6 +614,7 @@ local x = 42
 
         // Call the async handler
         let result = handle_semantic_tokens_full(
+            crate::compute_pool::test_pool(),
             text,
             tree,
             query,
@@ -678,6 +684,7 @@ local x = 42
 
         // Call the async handler with empty document
         let result = handle_semantic_tokens_full(
+            crate::compute_pool::test_pool(),
             text,
             tree,
             query,
@@ -751,6 +758,7 @@ local x = 42
 
         // Use the full pipeline — exclusion now happens in finalize_tokens
         let result = handle_semantic_tokens_full(
+            crate::compute_pool::test_pool(),
             text,
             tree,
             md_query,
@@ -865,6 +873,7 @@ local x = 42
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
 
         let result = handle_semantic_tokens_full(
+            crate::compute_pool::test_pool(),
             text,
             tree,
             md_query,
@@ -978,6 +987,7 @@ local x = 42
 
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
+            crate::compute_pool::test_pool(),
             text,
             tree,
             md_query,
@@ -1091,6 +1101,7 @@ local x = 42
 
         // KEY: supports_multiline = true
         let result = handle_semantic_tokens_full(
+            crate::compute_pool::test_pool(),
             text,
             tree,
             md_query,
@@ -1223,6 +1234,7 @@ foo
 
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
+            crate::compute_pool::test_pool(),
             text,
             tree,
             md_query,
@@ -1334,6 +1346,7 @@ foo
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
 
         let result = handle_semantic_tokens_full(
+            crate::compute_pool::test_pool(),
             text,
             tree,
             md_query,
