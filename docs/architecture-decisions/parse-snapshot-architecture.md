@@ -151,9 +151,13 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
   **detached** old cell, which no current-request reader resolves, so the publish
   is unobservable; and a reader mid-compute holding a lifetime-`N` `Arc<ParseSnapshot>`
   rejects it against the live `N+1` incarnation. The one reader that *does* hold a
-  `Receiver` — a first-parse waiter parked on `watch::changed()` — is woken when
-  `didClose` drops the sender (`Err` → falls through to `null`), exactly as today's
-  watermark-drop wakes parked `wait_for_epoch` readers.
+  `Receiver` — a first-parse waiter parked on `watch::changed()` — must be woken by
+  an **explicit close publish**: `didClose` sends a terminal `SnapshotSlot` state
+  (incarnation-invalidated / closed sentinel) rather than relying on the channel's
+  senders dropping, since stale parse tasks may still hold `Sender` clones that keep
+  the channel alive. The parked waiter observes the close state and falls through to
+  `null` — this is the wake the current `wait_for_epoch` gets from the watermark
+  sender dropping, made explicit because the snapshot channel outlives more clones.
 
 The incremental-parse **seed** re-homes onto `ParseScheduler`'s per-document state
 (accumulated `InputEdit`s + the `base_version` they extend). Two obligations,
@@ -177,13 +181,16 @@ exact publish succeeded** (the shared `NodeTracker` is not mutated on this path 
 all; see §3), in the order the
 per-document-parse-scheduler loop already uses (`populate → mark finished →
 downstream`). A rejected publish (a racing edit or reopen advanced the slot) emits
-nothing and mutates no shared state. During Stage 2's dual-write window the
-**snapshot publish is the sole commit point**: the legacy tree CAS is made
-strict-version too (it must not replace an equal-or-newer tree), a pass performs
-both writes under the same `(incarnation, parsed_version)` guard, and **all**
-downstream gates on the *snapshot publish* result — never on the legacy CAS. So the
-two writes cannot land for different versions, and no downstream effect fires for a
-snapshot the publish rejected even if the legacy CAS happened to win.
+nothing and mutates no shared state. The two Stage-2 stores are **not** written in
+one cross-store transaction — that is unnecessary, because they are not co-equal:
+the **snapshot publish is the sole commit point and runs first**, and every
+downstream effect gates on *its* result. The legacy tree CAS that follows is a
+Stage-2-only compatibility shim feeding the incremental seed (which still reads
+`Document::tree` until Stage 3 removes it); it is made strict-version so it never
+regresses, but if it *loses* a race the only consequence is that the next pass
+reseeds from the current snapshot instead of the legacy tree — a self-correcting
+perf blip, never a served inconsistency, since readers already read the snapshot,
+not the legacy tree. So no reader-visible divergence can arise from the ordering.
 
 ### 3. Reader contract — non-blocking, three classes
 
@@ -226,11 +233,18 @@ ULID**, so none needs a shared, edit-shifted mint off the parse path:
   injection-token-cache-reuse**, not silently folded in here.
 - **Cross-edit bridge / virtual-document identity** — the stable handle a
   downstream language server's virtual document is keyed by — **remains the shared
-  `NodeTracker` ULID**, which is a live-position (`content_version`) concern: it is
-  minted/adjusted on the `didChange` edit path (as today) and consumed by the
-  bridge and `kakehashi/node/*`, all of which operate on the live document and
-  staleness-reject rather than serve a stale snapshot. The parse/stale-read path
-  neither mints nor mutates it.
+  `NodeTracker` ULID**, a live-position (`content_version`) concern. Because regions
+  are only *discovered* by a parse, minting still originates from a parse pass, but
+  as a distinct **current-version reconciliation step**, not off the stale-read
+  path: when a pass completes and (under `edit_lock`) its `parsed_version` still
+  equals `content_version`, a reconciliation maps the snapshot's region geometry to
+  tracker ULIDs — reusing an existing id by position, minting a fresh one for a
+  genuinely new region — exactly as discovery mints today. If the pass is stale
+  (`content_version` moved on), reconciliation is skipped and deferred to the next
+  current pass; the tracker is meanwhile kept live by the ordinary `didChange`
+  edit-shift, so the bridge always resolves against a `content_version`-consistent
+  index. A *stale-tree read* still never mints or mutates it — only the
+  current-version reconciliation does.
 
 So a stale-tree reader reads self-consistent ordinals + geometry from its own
 snapshot and touches no shared identity index (the mint-race and the
