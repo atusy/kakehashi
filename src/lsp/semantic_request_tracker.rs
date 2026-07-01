@@ -66,17 +66,26 @@ impl SemanticRequestTracker {
     pub fn start_request(&self, uri: &Url) -> (u64, CancelToken) {
         let request_id = next_request_id();
         let cancel = CancelToken::default();
-        let previous = self.active_requests.insert(
-            uri.clone(),
-            ActiveRequest {
-                id: request_id,
-                cancel: cancel.clone(),
-            },
-        );
+        let active = ActiveRequest {
+            id: request_id,
+            cancel: cancel.clone(),
+        };
         // Superseding a request means its result is no longer wanted: cancel its
         // in-flight compute so it stops burning CPU (the `is_active` checkpoints
         // alone can't interrupt the blocking work).
-        if let Some(previous) = previous {
+        //
+        // The steady-state path (rapid typing on an already-tracked document)
+        // updates in place via `get_mut`, so the `Url` key isn't re-cloned on
+        // every keystroke — only the first request for a document pays the clone.
+        if let Some(mut entry) = self.active_requests.get_mut(uri) {
+            let previous = std::mem::replace(entry.value_mut(), active);
+            previous.cancel.cancel();
+        } else if let Some(previous) = self.active_requests.insert(uri.clone(), active) {
+            // Race-safety: two concurrent first requests for the same URI can both
+            // observe `None` above and fall here. `insert` is atomic and returns
+            // whatever a racing thread inserted first, so cancel it — otherwise
+            // that superseded compute would never be told to bail. Do NOT
+            // "simplify" this branch to a return-value-less insert.
             previous.cancel.cancel();
         }
         (request_id, cancel)
