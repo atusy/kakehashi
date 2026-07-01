@@ -146,6 +146,35 @@ fn delta(client: &mut LspClient, uri: &str, kind: &str, previous_result_id: &str
     )
 }
 
+/// Follow the delta resultId chain until `pred` accepts a response (bounded).
+///
+/// Under the parse-snapshot model (serve-stale + heal, ADR §3) a delta issued
+/// right after an edit may serve a snapshot that still trails the edit (a
+/// delta without the edit's matches) or answer `null` when the edit raced the
+/// request mid-flight (the lineage gate). A real client simply re-requests —
+/// on `null` with the same id (the lineage is intact), otherwise following the
+/// rotated id — and converges once the off-ingress reparse publishes.
+fn delta_until(
+    client: &mut LspClient,
+    uri: &str,
+    kind: &str,
+    initial_id: &str,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut id = initial_id.to_string();
+    loop {
+        let d = delta(client, uri, kind, &id);
+        if pred(&d) || std::time::Instant::now() > deadline {
+            return d;
+        }
+        if let Some(next) = d.get("resultId").and_then(Value::as_str) {
+            id = next.to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn result_id_of(result: &Value) -> String {
     result
         .get("resultId")
@@ -332,7 +361,12 @@ fn delta_after_edit_returns_single_positional_edit() {
     let id1 = result_id_of(&full(&mut client, uri, "context"));
     change_full_text(&mut client, uri, 2, "# A\n\ntext\n\n## B\n");
 
-    let d = delta(&mut client, uri, "context", &id1);
+    // Serve-stale + heal (ADR §3): converge on the delta that carries the edit.
+    let d = delta_until(&mut client, uri, "context", &id1, |d| {
+        d.get("edits")
+            .and_then(Value::as_array)
+            .is_some_and(|e| !e.is_empty())
+    });
     let edits = d
         .get("edits")
         .and_then(Value::as_array)
@@ -552,7 +586,23 @@ fn delta_after_edit_carries_injected_matches() {
     let edited = format!("{DOC_WITH_PYTHON}\n```python\ndef g():\n    pass\n```\n");
     change_full_text(&mut client, uri, 2, &edited);
 
-    let d = delta(&mut client, uri, "context", &id1);
+    // Serve-stale + heal (ADR §3): converge on the delta carrying the python match.
+    let d = delta_until(&mut client, uri, "context", &id1, |d| {
+        d.get("edits")
+            .and_then(Value::as_array)
+            .is_some_and(|edits| {
+                edits
+                    .iter()
+                    .flat_map(|e| {
+                        e.get("data")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .filter_map(|m| m.get("language").and_then(Value::as_str))
+                    .any(|l| l == "python")
+            })
+    });
     let edits = d
         .get("edits")
         .and_then(Value::as_array)
@@ -634,7 +684,23 @@ fn per_mode_lineages_do_not_clobber_each_other() {
     let edited = format!("{DOC_WITH_PYTHON}\n```python\ndef g():\n    pass\n```\n");
     change_full_text(&mut client, uri, 2, &edited);
 
-    let d = delta(&mut client, uri, "context", &id_injection);
+    // Serve-stale + heal (ADR §3): converge on the delta carrying the python match.
+    let d = delta_until(&mut client, uri, "context", &id_injection, |d| {
+        d.get("edits")
+            .and_then(Value::as_array)
+            .is_some_and(|edits| {
+                edits
+                    .iter()
+                    .flat_map(|e| {
+                        e.get("data")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .filter_map(|m| m.get("language").and_then(Value::as_str))
+                    .any(|l| l == "python")
+            })
+    });
     let edits = d
         .get("edits")
         .and_then(Value::as_array)

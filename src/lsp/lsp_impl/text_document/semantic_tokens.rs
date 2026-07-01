@@ -48,7 +48,7 @@ impl Kakehashi {
     /// first-parse wait (no snapshot for this lifetime yet); no per-keystroke
     /// read ever waits on a reparse. `None` for an unregistered/closed URI or
     /// when no parse resolves within the wait.
-    async fn snapshot_for_tokens(
+    pub(crate) async fn snapshot_for_tokens(
         &self,
         uri: &Url,
     ) -> Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>> {
@@ -679,35 +679,37 @@ impl Kakehashi {
         // compute the new-generation key) — so a stale entry can never be served.
         let generation = self.cache.semantic_token_generation();
 
-        let Some(language_name) = self.document_language(&uri) else {
+        // Staleness-reject (parse-snapshot ADR §3): the request's `range` is
+        // authored against the LIVE text, so a trailing snapshot cannot answer
+        // it — unlike full/delta (whole-document, serve-stale). A stale
+        // snapshot → ContentModified; the client's next natural request (this
+        // is a per-redraw viewport read) gets the fresh one. No snapshot at
+        // all (pre-first-parse) keeps the empty-tokens fallback.
+        let Some(view) = self.documents.latest_snapshot(&uri) else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
             })));
         };
+        let Some(snapshot) = view.slot.snapshot else {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        };
+        if snapshot.parsed_version != view.content_version {
+            return Err(crate::error::content_modified_error());
+        }
+        let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
+        else {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        };
+        let text = std::sync::Arc::clone(&snapshot.text);
 
         let Some(query) = self.language.highlight_query(&language_name) else {
-            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
-        };
-
-        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
-        // reparses off-ingress, so without this the visible-range tokens go blank
-        // for the reparse window after every edit. (The full/delta paths get this
-        // via `get_tree_with_wait`; the range path reads the store directly.)
-        self.ensure_document_parsed(&uri).await;
-
-        let Some(doc) = self.documents.get(&uri) else {
-            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
-        };
-
-        let text = doc.text();
-        let Some(tree) = doc.tree() else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -719,7 +721,7 @@ impl Kakehashi {
         // and the entry also pins the viewport `range`, so a hit means re-tokenizing
         // would reproduce these exact tokens. Misses (scroll, edit, or reload) fall
         // through to the recompute below, which restores the entry.
-        let cache_key = self.cache.cache_key_for(text, generation);
+        let cache_key = self.cache.cache_key_for(&text, generation);
         if let Some(tokens) =
             self.cache
                 .get_current_range_tokens(&uri, &domain_range, &language_name, cache_key)
@@ -736,8 +738,8 @@ impl Kakehashi {
 
         let result = handle_semantic_tokens_range_parallel_async(
             std::sync::Arc::clone(&self.compute_pool),
-            std::sync::Arc::from(text.to_string()),
-            tree.clone(),
+            text,
+            tree,
             query,
             domain_range,
             Some(language_name.clone()),

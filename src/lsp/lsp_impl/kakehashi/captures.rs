@@ -49,9 +49,7 @@ use crate::analysis::next_result_id;
 use crate::language::query_exec::execute_query;
 use crate::language::query_loader::QueryLoader;
 use crate::language::registry::LanguageRegistry;
-use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{
-    collect_injection_languages_in_document, walk_document_layers,
-};
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::walk_document_layers;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 use crate::text::PositionMapper;
 
@@ -249,6 +247,13 @@ fn load_kind_query(
 struct ComputedCaptures {
     uri: Url,
     incarnation: u64,
+    /// The live `content_version` at request entry. The lineage store re-checks
+    /// it so an edit landing DURING the request voids the store: the response
+    /// was already outdated at delivery, and lineage must not record matches
+    /// for a text the client no longer has (ADR §3). A snapshot that merely
+    /// *trailed* at entry still serves and stores — that is the deliberate
+    /// serve-stale relaxation, healed by the client's per-keystroke re-request.
+    entry_content_version: u64,
     matches: Vec<Value>,
     skipped: Vec<Value>,
 }
@@ -276,16 +281,27 @@ impl Kakehashi {
             "matches": c.matches,
             "skipped": c.skipped,
         });
-        self.store_lineage(c, params.kind, params.injection, result_id)
-            .await;
+        // A full that cannot install lineage (the text moved past the computed
+        // snapshot, or a close/reopen raced) answers `null` instead: handing
+        // out a `resultId` with no stored lineage would make the client's next
+        // delta lie about its baseline. `null` is the protocol's re-sync
+        // signal; the client re-requests and converges once the reparse lands
+        // (ADR §3).
+        if !self
+            .store_lineage(c, params.kind, params.injection, result_id)
+            .await
+        {
+            return Ok(Value::Null);
+        }
         Ok(response)
     }
 
     /// Store a fresh lineage in this mode's slot, unless the document closed
-    /// (or closed-and-reopened) while the request was in flight.
+    /// (or closed-and-reopened) or its text moved past the computed snapshot
+    /// while the request was in flight. Returns whether the lineage landed.
     ///
-    /// Two guards, both under the same per-URI edit lock `didClose` holds
-    /// around its document removal:
+    /// Three guards, all under the same per-URI edit lock `didClose` and
+    /// `didChange` hold around their mutations:
     /// - liveness: a close that won the lock first leaves the document gone,
     ///   so the check skips the insert; an insert that won first is cleared by
     ///   the close's cache cleanup, which runs after the removal;
@@ -293,31 +309,34 @@ impl Kakehashi {
     ///   alive again, but the reopened document carries a fresh open incarnation,
     ///   so a stale request's snapshot-time incarnation no longer matches and
     ///   the insert is skipped — a reopened document starts its lineage fresh
-    ///   (captures-protocol §"Delta semantics").
+    ///   (captures-protocol §"Delta semantics");
+    /// - version: an edit that landed DURING the request (the live
+    ///   `content_version` moved past its request-entry value) makes the
+    ///   response outdated at delivery; storing it would record lineage for a
+    ///   text the client no longer has (parse-snapshot ADR §3), so nothing is
+    ///   stored and the caller answers `null`. A snapshot that merely trailed
+    ///   at entry still stores — the serve-stale relaxation.
     async fn store_lineage(
         &self,
         computed: ComputedCaptures,
         kind: String,
         injection: bool,
         result_id: String,
-    ) {
+    ) -> bool {
         let uri = computed.uri;
         let edit_lock = self.documents.edit_lock(&uri);
         let _guard = edit_lock.lock().await;
-        // A single `documents` lookup reads both liveness and the current
-        // incarnation atomically: a closed URI is `None` (skip), and a reopened
-        // one carries a fresh incarnation that no longer equals the snapshot's
-        // (skip). The incarnation lives on the document, so this no longer
-        // straddles two maps — the former ABBA-avoidance dance (drop the Ref
-        // before a separate `open_generations` write) is gone.
-        let still_current = self
-            .documents
-            .get(&uri)
-            .is_some_and(|doc| doc.incarnation() == computed.incarnation);
+        // A single `documents` lookup reads liveness, the current incarnation,
+        // and the current content_version atomically under one shard read lock.
+        let still_current = self.documents.get(&uri).is_some_and(|doc| {
+            doc.incarnation() == computed.incarnation
+                && doc.content_version() == computed.entry_content_version
+        });
         if still_current {
             let mut entry = self.captures_cache.entry((uri, kind)).or_default();
             entry[usize::from(injection)] = Some((result_id, computed.matches));
         }
+        still_current
     }
 
     /// Handler for `kakehashi/captures/full/delta`.
@@ -443,7 +462,13 @@ impl Kakehashi {
                 "skipped": c.skipped,
             }),
         };
-        self.store_lineage(c, key.1, injection, result_id).await;
+        // Same gate as `full`: a delta whose fresh lineage cannot install
+        // (text moved past the computed snapshot, or close/reopen) answers
+        // `null` — the client re-acquires via `full` (its baseline slot may
+        // have been superseded by the failed rotation's circumstances anyway).
+        if !self.store_lineage(c, key.1, injection, result_id).await {
+            return Ok(Value::Null);
+        }
         Ok(response)
     }
 
@@ -493,45 +518,50 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        // Same didOpen→async-parse race the node handlers guard against.
-        self.ensure_document_parsed(&uri).await;
-
-        let Some(language_id) = self.document_language(&uri) else {
-            log::debug!(target: "kakehashi::captures", "no host language detected for {uri}");
-            return Ok(None);
-        };
-
-        // Injection layers need their grammars loaded before the walk can
-        // parse them. The pre-await snapshot is only used for *discovery* —
-        // it must NOT feed minting: a didChange processed during the await
-        // would adjust the tracker while our byte ranges stay stale. We
-        // re-snapshot below, after the await (mirroring `kakehashi/node`).
-        if injection && let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot())
-        {
-            self.ensure_injection_languages_loaded_for_document(
-                &uri,
-                &language_id,
-                snapshot.text(),
-                snapshot.tree(),
-            )
-            .await;
-            // A didChange processed during the await above may have scheduled
-            // a reparse; wait for it like the initial prelude does, so the
-            // snapshot below is the settled (text, tree) pair and never a
-            // mid-parse combination.
-            self.ensure_document_parsed(&uri).await;
-        }
-
-        // The snapshot carries the document's open incarnation, captured under
-        // the same shard read lock as its text and tree — so there is no longer
-        // a separate "fetch the generation before snapshotting" ordering to get
-        // right. If a close+reopen races after this, store_lineage sees a fresh
-        // incarnation on the URI and skips the stale insert (conservative).
-        let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
+        // Resolve the latest parse snapshot, with only the bounded first-parse
+        // wait (parse-snapshot ADR §3). `full` SERVES-STALE — it is a
+        // per-keystroke highlighter, and `null`-on-routine-staleness against a
+        // client contracted to re-request on `null` would busy-spin; `null` is
+        // reserved for no-snapshot (pre-first-parse) and the lineage gate
+        // below. The injected-grammar install is no longer triggered inline
+        // here: the parse loop's downstream (`process_injections`) detects
+        // missing injected grammars and spawns the install as a detached task;
+        // a layer whose grammar is still installing is skipped by the walk and
+        // heals on a later request.
+        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
             log::debug!(target: "kakehashi::captures", "no parsed document for {uri}");
             return Ok(None);
         };
-        let (text, tree, incarnation) = snapshot.into_parts();
+        // The live input version at request entry: `range` staleness-rejects
+        // against it, and the lineage store re-checks it (see ComputedCaptures).
+        let Some(entry_content_version) = self
+            .documents
+            .latest_snapshot(&uri)
+            .map(|view| view.content_version)
+        else {
+            return Ok(None);
+        };
+        // `range` is the position/range class: its byte range is authored
+        // against the LIVE text, so a trailing snapshot cannot answer it.
+        // `null` — the captures protocol's re-sync signal — not ContentModified
+        // (a JSON-RPC error would violate the captures contract).
+        if lsp_range.is_some() && entry_content_version != snapshot.parsed_version {
+            log::debug!(
+                target: "kakehashi::captures",
+                "stale snapshot for range request on {uri}: re-sync via null"
+            );
+            return Ok(None);
+        }
+        let Some(language_id) = snapshot.language.clone() else {
+            log::debug!(target: "kakehashi::captures", "no host language detected for {uri}");
+            return Ok(None);
+        };
+        let incarnation = snapshot.incarnation;
+        let text = std::sync::Arc::clone(&snapshot.text);
+        let Some(tree) = snapshot.tree.clone() else {
+            // Resolved-but-tree-less (no parser installed / crashed grammar).
+            return Ok(None);
+        };
 
         // The query-execution walk over every layer — including the injected
         // layers' one-off re-parses — is synchronous tree-CPU; run it as one
@@ -565,6 +595,7 @@ impl Kakehashi {
         Ok(walked.map(|(matches, skipped)| ComputedCaptures {
             uri,
             incarnation,
+            entry_content_version,
             matches,
             skipped,
         }))
@@ -734,50 +765,6 @@ fn execute_captures_walk(
         .collect();
 
     Some((matches, skipped))
-}
-
-impl Kakehashi {
-    /// Ensure the grammars for every injection language appearing in the
-    /// document are loaded (auto-installing where configured), iterating to a
-    /// fixpoint: each round can only discover one tier deeper than the
-    /// grammars available in the previous round. Document-wide analog of
-    /// `kakehashi/node`'s position-based `ensure_injection_languages_loaded`
-    /// (see entry.rs for the registry re-read and `seen` rationale).
-    async fn ensure_injection_languages_loaded_for_document(
-        &self,
-        uri: &Url,
-        host_language: &str,
-        text: &str,
-        host_tree: &tree_sitter::Tree,
-    ) {
-        use std::collections::HashSet;
-
-        let coordinator = self.injection_coordinator();
-        let mut seen: HashSet<String> = HashSet::new();
-
-        for _round in 0..crate::language::injection::MAX_INJECTION_DEPTH {
-            let discovered = collect_injection_languages_in_document(
-                &self.language,
-                host_language,
-                text,
-                host_tree,
-            );
-            let registry = self.language.language_registry_for_parallel();
-            let fresh: HashSet<String> = discovered
-                .into_iter()
-                .filter(|lang| registry.get(lang).is_none())
-                .filter(|lang| !seen.contains(lang))
-                .collect();
-            drop(registry);
-            if fresh.is_empty() {
-                break;
-            }
-            coordinator
-                .check_injected_languages_auto_install(uri, &fresh)
-                .await;
-            seen.extend(fresh);
-        }
-    }
 }
 
 #[cfg(test)]
