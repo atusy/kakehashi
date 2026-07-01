@@ -99,7 +99,12 @@ pub struct Document {
     /// which binds it to the tree via `parse_epoch`; cleared on **every** tree
     /// write by [`bump_parse_epoch`](Self::bump_parse_epoch), so a discovery is
     /// never observed against a tree it was not built on.
-    injections: Option<crate::document::DiscoveredInjections>,
+    ///
+    /// `Arc`-wrapped so a reader can carry it out from under the shard lock with a
+    /// refcount bump rather than deep-copying every region's owned vectors — the
+    /// read is on the hot `semanticTokens` path and happens even when the request
+    /// then hits the whole-document cache and never uses the discovery.
+    injections: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
 }
 
 impl Document {
@@ -194,8 +199,11 @@ impl Document {
     }
 
     /// The owned injection discovery for the currently published tree, if any
-    /// (#529). See [`injections`](Self::injections).
-    pub(crate) fn injections(&self) -> Option<&crate::document::DiscoveredInjections> {
+    /// (#529). Returns the shared `Arc` so the caller clones a refcount, not the
+    /// region vectors. See [`injections`](Self::injections).
+    pub(crate) fn injections(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::document::DiscoveredInjections>> {
         self.injections.as_ref()
     }
 
@@ -203,7 +211,7 @@ impl Document {
     /// epoch-guarded write-back so the discovery is bound to the tree it was built
     /// on; not a tree write, so it does not bump `parse_epoch`.
     pub(crate) fn set_injections(&mut self, injections: crate::document::DiscoveredInjections) {
-        self.injections = Some(injections);
+        self.injections = Some(std::sync::Arc::new(injections));
     }
 
     /// Get a position mapper for this document

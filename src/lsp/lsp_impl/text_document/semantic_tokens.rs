@@ -67,7 +67,11 @@ impl Kakehashi {
         &self,
         uri: &Url,
         language_name: &str,
-    ) -> Option<(Tree, String, Option<crate::document::DiscoveredInjections>)> {
+    ) -> Option<(
+        Tree,
+        String,
+        Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
+    )> {
         // If the document isn't open there is nothing to settle or snapshot.
         // Return before taking the edit lock so we don't create a lock entry for
         // a never-opened/closed URI (language detection can resolve a language

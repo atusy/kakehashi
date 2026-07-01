@@ -31,8 +31,9 @@ pub(crate) struct InjectionCacheParams {
     /// Owned injection discovery for the tree being tokenized (#529 companion
     /// lever), read from the document alongside the tree, or `None`. When present
     /// and its generation still matches, the injection pass rebuilds contexts from
-    /// it and skips the injection query.
-    pub discovery: Option<crate::document::DiscoveredInjections>,
+    /// it and skips the injection query. `Arc` so carrying it here is a refcount
+    /// bump, not a deep copy of the region vectors.
+    pub discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
 }
 
 // Internal re-exports for production code
@@ -97,7 +98,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             tracker: p.tracker.as_ref(),
             cache: p.cache.as_ref(),
             generation: p.generation,
-            discovery: p.discovery.as_ref(),
+            discovery: p.discovery.as_deref(),
         });
 
         // Collect injection tokens in parallel using Rayon.
