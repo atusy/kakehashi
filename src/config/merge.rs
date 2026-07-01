@@ -95,7 +95,7 @@ pub(crate) fn merge_bridge_server_configs(
             .on_type_formatting_triggers
             .clone()
             .or_else(|| base.on_type_formatting_triggers.clone()),
-        // Overlay-wins-when-present, mirroring `root_markers`: a concrete
+        // Overlay-wins-when-present, mirroring `workspace_markers`: a concrete
         // server's explicit `preferSharedInstance` overrides the wildcard
         // (#391), so `_.preferSharedInstance: true` can be opted out of per
         // server. An unset overlay inherits the base (wildcard) value.
@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     /// `preferSharedInstance` merges overlay-wins-when-present like
-    /// `root_markers`, so a `languageServers._` opt-in applies to servers that
+    /// `workspace_markers`, so a `languageServers._` opt-in applies to servers that
     /// stay unset, yet a concrete server can override it either direction —
     /// crucially opting **out** of a blanket `_.preferSharedInstance: true`
     /// with an explicit `false` (#391).

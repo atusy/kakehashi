@@ -40,7 +40,7 @@ Each language maps to a `server_name` via configuration. The pool is keyed by
   documents with no marker root share the client-root fallback connection.
 
 Routing: `language` → `server_name` (via config) + document's resolved root → connection.
-The root is resolved from the triggering document's `rootMarkers` walk
+The root is resolved from the triggering document's `workspaceMarkers` walk
 (`root_markers::resolve_marker_workspace`), the single source shared with the
 spawn handshake so a connection's key always matches the root it was spawned at.
 The `ConnectionKey` is stored on each connection handle, so the request,

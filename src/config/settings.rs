@@ -414,7 +414,7 @@ pub struct BridgeServerConfig {
     /// universal fallback makes a blanket `languageServers._` opt-in safe.
     ///
     /// `None` = inherit (built-in default `false` = per-root instances). Like
-    /// `root_markers`, a concrete server's explicit value overrides the
+    /// `workspace_markers`, a concrete server's explicit value overrides the
     /// wildcard, so `_.preferSharedInstance: true` can be opted out of
     /// per server with `preferSharedInstance: false`.
     pub prefer_shared_instance: Option<bool>,
@@ -1554,6 +1554,26 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_workspace_markers_toml() {
+        // The canonical key via TOML (the primary path users type), not just
+        // the JSON/serde_json round-trip.
+        let toml_str = r#"
+            [languageServers._]
+            workspaceMarkers = [".git", "Cargo.toml"]
+        "#;
+
+        let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();
+        let servers = settings.language_servers.unwrap();
+        assert_eq!(
+            servers["_"].workspace_markers,
+            Some(vec![
+                RootMarker::Single(".git".to_string()),
+                RootMarker::Single("Cargo.toml".to_string()),
+            ])
+        );
+    }
+
+    #[test]
     fn should_parse_deprecated_root_markers_alias() {
         // `rootMarkers` is the pre-rename key, kept as a deprecated serde alias
         // for backward compatibility; it deserializes into `workspace_markers`.
@@ -1570,6 +1590,32 @@ mod tests {
                 RootMarker::Single(".git".to_string()),
                 RootMarker::Single("Cargo.toml".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn empty_workspace_markers_deserializes_to_some_empty_kill_switch() {
+        // The kill-switch contract (explicit `[]` disables the marker search)
+        // rests on `[]` deserializing to `Some(vec![])`, not `None`. Pin it on
+        // the deserialize path directly, not just via the merge test.
+        let config: BridgeServerConfig =
+            serde_json::from_str(r#"{ "workspaceMarkers": [] }"#).unwrap();
+        assert_eq!(config.workspace_markers, Some(vec![]));
+    }
+
+    #[test]
+    fn both_marker_keys_present_is_a_hard_error() {
+        // `workspaceMarkers` and its `rootMarkers` alias are the same field, so
+        // supplying both is a deterministic serde "duplicate field" error (no
+        // silent last-wins). A mid-migration config that sets both fails safe:
+        // the offending config layer is dropped with a warning, not merged.
+        let err = serde_json::from_str::<BridgeServerConfig>(
+            r#"{ "workspaceMarkers": [".git"], "rootMarkers": [".git"] }"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
         );
     }
 
