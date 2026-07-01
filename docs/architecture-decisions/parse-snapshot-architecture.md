@@ -348,9 +348,11 @@ A single dedicated `rayon` pool sized `available_parallelism().saturating_sub(2)
 — strictly below `available_parallelism` whenever there are ≥3 cores, and reserving
 at least one core for the tokio workers + timer driver on 2-core machines (on a
 1-core host no isolation is achievable and the pool degrades to shared time-slicing)
-— runs **all** synchronous tree work: the parse, `populate` (region minting +
-content hash), the `compute_captures` / node layer walks, and the semantic-token
-injection fan-out (folded off the process-global Rayon pool into this one). Async
+— runs **all** synchronous tree work: the parse, `populate` (snapshot
+ordinal/geometry derivation + content hash, and — only at current version — the
+tracker reconciliation, §3), the `compute_captures` / node layer walks, and the
+semantic-token injection fan-out (folded off the process-global Rayon pool into
+this one). Async
 handlers hand a whole work-unit to the pool (bridged by a `oneshot`) and `await`
 the result, so no tree-CPU ever executes on a tokio worker. `DocumentParserPool`'s
 guard becomes a sync mutex (`std`/`parking_lot`) since acquisition now runs on pool
