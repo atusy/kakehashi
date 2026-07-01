@@ -76,11 +76,20 @@ impl CacheCoordinator {
     /// - Injection token cache
     /// - Request tracking state
     pub(crate) fn remove_document(&self, uri: &Url) {
+        // Cancel any in-flight compute for this URI FIRST, so it has the best
+        // chance to observe the flipped token and bail before its injection
+        // store-half runs — otherwise a compute already past its last checkpoint
+        // could repopulate the caches we clear just below, orphaning entries for
+        // a now-closed document. This narrows but does not fully close that
+        // window (a compute already inside the store-half still writes); the
+        // residual is the same deferred per-document lifecycle-epoch race as the
+        // rest of didClose (see `did_close.rs`), and only leaks a bounded set of
+        // entries for a closed doc that no request can read.
+        self.request_tracker.cancel_all_for_uri(uri);
         self.semantic_cache.remove(uri);
         self.semantic_range_cache.remove(uri);
         self.injection_map.clear(uri);
         self.injection_token_cache.clear_document(uri);
-        self.request_tracker.cancel_all_for_uri(uri);
     }
 
     // ========================================================================
@@ -438,9 +447,11 @@ impl CacheCoordinator {
 
     /// Start tracking a new request for the given URI.
     ///
-    /// Returns a request ID that should be passed to subsequent operations.
-    /// Automatically supersedes any previous request for the same URI.
-    pub(crate) fn start_request(&self, uri: &Url) -> RequestId {
+    /// Returns the request ID (for `is_request_active` checkpoints) and a
+    /// [`CancelToken`](crate::cancel::CancelToken) the request's compute should
+    /// poll. Automatically supersedes any previous request for the same URI and
+    /// cancels its in-flight compute.
+    pub(crate) fn start_request(&self, uri: &Url) -> (RequestId, crate::cancel::CancelToken) {
         self.request_tracker.start_request(uri)
     }
 
@@ -512,7 +523,7 @@ mod tests {
         cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0);
 
         // Start a request
-        let _request_id = cache.start_request(&uri);
+        let (_request_id, _token) = cache.start_request(&uri);
 
         // Remove the document
         cache.remove_document(&uri);
@@ -588,11 +599,11 @@ mod tests {
         let uri = create_test_uri("test.rs");
 
         // Start a request
-        let req1 = cache.start_request(&uri);
+        let (req1, _t1) = cache.start_request(&uri);
         assert!(cache.is_request_active(&uri, req1));
 
         // Start another request - should supersede the first
-        let req2 = cache.start_request(&uri);
+        let (req2, _t2) = cache.start_request(&uri);
         assert!(!cache.is_request_active(&uri, req1));
         assert!(cache.is_request_active(&uri, req2));
 
@@ -607,7 +618,7 @@ mod tests {
         let uri = create_test_uri("test.rs");
 
         // Start a request
-        let req = cache.start_request(&uri);
+        let (req, _token) = cache.start_request(&uri);
         assert!(cache.is_request_active(&uri, req));
 
         // Cancel all requests

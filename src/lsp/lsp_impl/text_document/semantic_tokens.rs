@@ -5,8 +5,14 @@
 //! This module supports immediate cancellation of semantic token requests:
 //! - When `$/cancelRequest` is received, the handler aborts and returns `RequestCancelled` (-32800)
 //! - Uses `tokio::select!` to race between cancel notification and token computation
-//! - The Rayon computation cannot be cancelled mid-execution and will continue to
-//!   completion in the thread pool, consuming CPU resources, but its result is discarded
+//! - The blocking Rayon computation is cancelled *cooperatively*: the handler
+//!   flips a [`CancelToken`](crate::cancel::CancelToken) (also flipped when a
+//!   newer request supersedes this one, or the document closes) and the compute
+//!   polls it at coarse checkpoints — after the host pass, inside the injection
+//!   discovery loop, and at each per-region fan-out entry — bailing early. A region
+//!   already mid-parse runs to completion, but not-yet-started work returns
+//!   immediately, so an obsolete request stops burning CPU instead of computing
+//!   a result that is only discarded.
 //!
 //! This is achieved by subscribing to cancel notifications via `CancelForwarder::subscribe()`
 //! and using biased `tokio::select!` to prioritize cancel handling.
@@ -238,8 +244,11 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        // Start tracking this request - supersedes any previous request for this URI
-        let request_id = self.cache.start_request(&uri);
+        // Start tracking this request - supersedes any previous request for this URI.
+        // `cancel_token` is flipped when a newer request supersedes this one (or
+        // the document closes); it is threaded into the blocking compute so a
+        // superseded request stops mid-flight instead of running to completion.
+        let (request_id, cancel_token) = self.cache.start_request(&uri);
 
         // Snapshot the settings generation NOW, before reading any
         // settings-dependent tokenization input (language resolution, queries,
@@ -406,6 +415,7 @@ impl Kakehashi {
                 coordinator,
                 supports_multiline,
                 injection_cache,
+                Some(cancel_token.clone()),
             );
 
             let result = if let Some(cancel_rx) = cancel_rx {
@@ -414,8 +424,11 @@ impl Kakehashi {
                 tokio::select! {
                     biased;
 
-                    // Cancel notification received - abort immediately
+                    // Cancel notification received - abort immediately. Flip the
+                    // token so the now-detached blocking compute stops early
+                    // instead of running to completion for a discarded result.
                     _ = &mut cancel_rx => {
+                        cancel_token.cancel();
                         self.cache.finish_request(&uri, request_id);
                         log::debug!(
                             target: "kakehashi::semantic",
@@ -435,6 +448,19 @@ impl Kakehashi {
 
             (result, text)
         }; // doc reference is dropped here
+
+        // A supersede/close between compute start and here flips the token; the
+        // compute then bailed at a checkpoint and returned `None`, so drop the
+        // request rather than storing an unwanted result over the cache.
+        if cancel_token.is_cancelled() {
+            self.cache.finish_request(&uri, request_id);
+            log::debug!(
+                target: "kakehashi::semantic",
+                "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (compute superseded)",
+                uri, request_id
+            );
+            return Ok(None);
+        }
 
         if let Some(reason) = self.check_text_staleness(&uri, &text_used) {
             self.cache.finish_request(&uri, request_id);
@@ -512,8 +538,11 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        // Start tracking this request - supersedes any previous request for this URI
-        let request_id = self.cache.start_request(&uri);
+        // Start tracking this request - supersedes any previous request for this
+        // URI. `cancel_token` (flipped on supersede/close) is threaded into the
+        // blocking compute so a superseded delta stops mid-flight — this is the
+        // steady-state typing path where the pile-up is worst.
+        let (request_id, cancel_token) = self.cache.start_request(&uri);
 
         // Snapshot the settings generation NOW, before any settings-dependent
         // tokenization input is read below (same reload-race safety as
@@ -685,6 +714,7 @@ impl Kakehashi {
                     coordinator,
                     supports_multiline,
                     injection_cache,
+                    Some(cancel_token.clone()),
                 );
 
                 let result = if let Some(cancel_rx) = cancel_rx {
@@ -693,8 +723,12 @@ impl Kakehashi {
                     tokio::select! {
                         biased;
 
-                        // Cancel notification received - abort immediately
+                        // Cancel notification received - abort immediately. Flip
+                        // the token so the now-detached blocking compute stops
+                        // early instead of running to completion for a discarded
+                        // result.
                         _ = &mut cancel_rx => {
+                            cancel_token.cancel();
                             self.cache.finish_request(&uri, request_id);
                             log::debug!(
                                 target: "kakehashi::semantic",
@@ -715,6 +749,19 @@ impl Kakehashi {
                 (result, text)
             }
         };
+
+        // A supersede/close between compute start and here flips the token; the
+        // compute then bailed at a checkpoint and returned `None`, so drop the
+        // request rather than diffing/storing an unwanted result over the cache.
+        if cancel_token.is_cancelled() {
+            self.cache.finish_request(&uri, request_id);
+            log::debug!(
+                target: "kakehashi::semantic",
+                "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (compute superseded)",
+                uri, request_id
+            );
+            return Ok(None);
+        }
 
         if let Some(reason) = self.check_text_staleness(&uri, &text_used) {
             self.cache.finish_request(&uri, request_id);
