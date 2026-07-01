@@ -38,6 +38,15 @@ use crate::text::position::byte_to_utf16_col;
 /// exist that reusing the untouched ones outweighs the per-region bookkeeping.
 const INJECTION_CACHE_MIN_REGIONS: usize = 8;
 
+/// Test-only counter of how many times the discovery-reuse branch fired (skipped
+/// the injection query by reusing owned discovery). Lets an in-process server
+/// test assert reuse actually engages end-to-end after a real parse+attach —
+/// the latency benchmark cannot distinguish "reuse fired" from "reuse never
+/// fired, fell back inline" (both read as flat request latency).
+#[cfg(test)]
+pub(crate) static DISCOVERY_REUSE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Per-context output of [`process_injection_sync`]: the region's tokens plus
 /// whether every parser in its subtree (its own and all nested injections) was
 /// loaded. `fully_loaded == false` means at least one region produced an empty
@@ -1003,6 +1012,8 @@ pub(crate) fn collect_injection_tokens_parallel(
     let reusable_discovery =
         cache_ctx.and_then(|c| c.discovery.filter(|d| d.generation == c.generation));
     let (contexts, exclusion_byte_ranges) = if let Some(discovery) = reusable_discovery {
+        #[cfg(test)]
+        DISCOVERY_REUSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut contexts = Vec::with_capacity(discovery.regions.len());
         let mut exclusion_byte_ranges = Vec::with_capacity(discovery.regions.len());
         for region in &discovery.regions {

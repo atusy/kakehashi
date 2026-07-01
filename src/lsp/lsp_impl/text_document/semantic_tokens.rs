@@ -1024,6 +1024,123 @@ mod tests {
         );
     }
 
+    /// End-to-end proof that discovery reuse actually *fires* on the server's
+    /// `semanticTokens` path — not merely that reuse == inline when the discovery
+    /// is forced in (the parallel.rs unit test). Replicates the parse
+    /// coordinator's attach sequence (parse → tree CAS → `populate_injections` →
+    /// epoch-guarded write-back), then drives the real handler and asserts the
+    /// reuse branch engaged. Guards against silently shipping the "reuse never
+    /// fires, `C` relocated for nothing" regression the latency benchmark cannot
+    /// distinguish from a win.
+    #[tokio::test]
+    async fn semantic_tokens_full_reuses_attached_injection_discovery() {
+        use std::sync::atomic::Ordering;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///reuse_discovery.md").expect("uri");
+
+        // Enough lua fences to clear INJECTION_CACHE_MIN_REGIONS (8).
+        let mut text = String::from("# Reuse\n\n");
+        for i in 0..10 {
+            text.push_str(&format!("```lua\nlocal x{i} = {i}\nprint(x{i})\n```\n\n"));
+        }
+
+        server.documents.insert(
+            uri.clone(),
+            text.clone(),
+            Some("markdown".to_string()),
+            None,
+        );
+
+        let md = server.language.ensure_language_loaded("markdown");
+        let lua = server.language.ensure_language_loaded("lua");
+        if !md.success
+            || !lua.success
+            || server.language.injection_query("markdown").is_none()
+            || server.language.highlight_query("lua").is_none()
+        {
+            eprintln!("Skipping: markdown/lua parser or queries not available");
+            return;
+        }
+
+        // Replicate parse_document: parse, install the tree through the CAS
+        // (capturing the stamped epoch), build discovery from that same parse, and
+        // attach it under the epoch — the sequence the coordinator runs before
+        // advance_watermark, so the settle-gated reader observes it.
+        let (incarnation, text_arc) = {
+            let doc = server.documents.get(&uri).expect("doc");
+            (doc.incarnation(), doc.text_arc())
+        };
+        let tree = {
+            let mut pool = server.language.create_document_parser_pool();
+            let mut parser = pool.acquire("markdown").expect("markdown parser");
+            let tree = parser.parse(text.as_str(), None).expect("parse markdown");
+            pool.release("markdown".to_string(), parser);
+            tree
+        };
+        let epoch = server
+            .documents
+            .set_parse_result_if_text_and_incarnation_unchanged(
+                &uri,
+                &text_arc,
+                incarnation,
+                Some("markdown"),
+                Some(tree.clone()),
+            )
+            .expect("tree stored");
+        let discovery = server
+            .cache
+            .populate_injections(
+                &uri,
+                &text,
+                &tree,
+                "markdown",
+                &server.language,
+                server.bridge.node_tracker(),
+            )
+            .expect("discovery built for >=8 single lua fences");
+        assert!(discovery.regions.len() >= 8);
+        assert!(server.documents.set_injections_if_epoch_unchanged(
+            &uri,
+            incarnation,
+            epoch,
+            discovery
+        ));
+        assert!(
+            server.documents.get(&uri).unwrap().injections().is_some(),
+            "discovery must be attached to the document"
+        );
+
+        // Drive the real handler; assert the reuse branch fired.
+        crate::analysis::semantic::DISCOVERY_REUSE_HITS.store(0, Ordering::Relaxed);
+        let params = SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("uri convert"),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let result = timeout(
+            Duration::from_secs(5),
+            server.semantic_tokens_full_impl(params),
+        )
+        .await
+        .expect("handler should not hang")
+        .expect("request ok")
+        .expect("tokens");
+        match result {
+            SemanticTokensResult::Tokens(t) => {
+                assert!(!t.data.is_empty(), "should produce tokens")
+            }
+            _ => panic!("expected Tokens"),
+        }
+        assert!(
+            crate::analysis::semantic::DISCOVERY_REUSE_HITS.load(Ordering::Relaxed) >= 1,
+            "the request must reuse the attached discovery (skip Q), not re-discover inline"
+        );
+    }
+
     #[tokio::test]
     async fn semantic_tokens_full_times_out_but_parses_on_demand() {
         let (service, _socket) = LspService::new(Kakehashi::new);
