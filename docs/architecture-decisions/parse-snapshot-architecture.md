@@ -182,9 +182,12 @@ The incremental-parse **seed** re-homes onto `ParseScheduler`'s per-document sta
 (accumulated `InputEdit`s + the `base_version` they extend). Two obligations,
 enforced by co-location today, become explicit scheduler invariants:
 
-- The seed is applied to the snapshot's tree **iff `snapshot.parsed_version == base_version`**; on mismatch (a publish raced), it
-  reseeds from the current snapshot and parses — never applies edits to a tree
-  they do not match (the `#348` external-scanner corruption).
+- The seed is applied to the snapshot's tree **iff `snapshot.parsed_version ==
+  base_version` and `snapshot.tree` is `Some`**; on a version mismatch (a publish
+  raced) *or* a tree-less base snapshot (resolved-but-parser-less), there is nothing
+  to incrementally seed from, so it parses from scratch — it never applies edits to
+  a tree they do not match (the `#348` external-scanner corruption) nor to an absent
+  tree.
 - A full-text sync **resets** `(pending_edits, base_version)`, so it parses from
   scratch. "Leaves no accumulated edits" is an explicit reset, not an emergent
   property.
@@ -219,6 +222,13 @@ watermark can trail the input indefinitely under a fast enough edit stream). The
 refresh path re-drives the client each time a fresher snapshot lands; the model
 does not promise a bounded edit-lag without the fair-admission backpressure §4
 defers.
+
+A handler resolves `latest_snapshot(uri)` **once**, at entry, and threads the
+resulting `Arc<ParseSnapshot>` (a refcount clone) into any parallel fan-out —
+never calling `latest_snapshot` per fan-out task, which would hammer the store's
+`DashMap` shard from every worker. The single up-front resolution also pins one
+consistent snapshot for the whole request; a publish landing mid-fan-out is
+observed by the *next* request, not by half of this one.
 
 Region identity is the load-bearing subtlety, and it forces a clean split. The
 shared `NodeTracker` (lazy-node-identity-tracking) is a **mutable, edit-shifted**
@@ -429,10 +439,14 @@ inside the existing safety contracts at each step:
   stores may transiently sit at different versions (a lost legacy CAS just reseeds
   next pass), but no **reader** sees the difference because every reader reads the
   snapshot, not the legacy tree. Split `populate` into ordinal/geometry derivation
-  (snapshot-owned) and the current-version tracker reconciliation (§3), and move the
-  grammar auto-install that `compute_captures` does inline
-  (`ensure_injection_languages_loaded_for_document`) into that reconciliation under
-  `edit_lock` — the read handlers stop being install triggers. Convert
+  (snapshot-owned) and the current-version tracker reconciliation (§3). Take the
+  grammar auto-install off the read handlers (`compute_captures` no longer triggers
+  `ensure_injection_languages_loaded_for_document` inline): the parse loop
+  *detects* a missing injected grammar and **spawns the install asynchronously,
+  never under `edit_lock`** — an install is seconds of download + compile and must
+  not block concurrent `didChange` edits — with the region re-minted on a later
+  reconciliation once the grammar lands. Only the fast tracker-mint itself runs
+  under `edit_lock`. Convert
   `semanticTokens` to serve-stale + the refresh trigger; the whole-document
   passive-refresh family (`documentSymbol`/`documentColor`/`documentLink`/
   `foldingRange`/`codeLens`/pull-`diagnostic`) to serve-stale; the position/range
