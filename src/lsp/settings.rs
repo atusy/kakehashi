@@ -684,4 +684,40 @@ mod tests {
             "should emit error for invalid TOML in explicit config file"
         );
     }
+
+    /// load_toml_file (the --config-file layer) sets the deprecation flag when
+    /// the file uses `rootMarkers`; a regression dropping the detector `|=` in
+    /// this layer would otherwise slip through.
+    #[test]
+    fn load_toml_file_flags_deprecated_root_markers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("kakehashi.toml");
+        std::fs::write(&path, "[languageServers.x]\nrootMarkers = [\".git\"]\n").unwrap();
+
+        let mut events = Vec::new();
+        let mut used_deprecated = false;
+        let result = load_toml_file(&path, &mut events, &mut used_deprecated);
+
+        assert!(result.is_some(), "valid TOML should parse");
+        assert!(used_deprecated, "rootMarkers should set the flag");
+    }
+
+    /// load_toml_settings (the project kakehashi.toml layer) sets the flag when
+    /// the file uses `rootMarkers`.
+    #[test]
+    fn load_toml_settings_flags_deprecated_root_markers() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("kakehashi.toml"),
+            "[languageServers.x]\nrootMarkers = [\".git\"]\n",
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut used_deprecated = false;
+        let result = load_toml_settings(Some(dir.path()), &mut events, &mut used_deprecated);
+
+        assert!(result.is_some(), "valid project config should parse");
+        assert!(used_deprecated, "rootMarkers should set the flag");
+    }
 }

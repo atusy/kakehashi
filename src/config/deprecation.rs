@@ -109,4 +109,51 @@ mod tests {
         assert!(!json_uses_deprecated_root_markers(&canonical));
         assert!(!json_uses_deprecated_root_markers(&serde_json::json!({})));
     }
+
+    #[test]
+    fn scope_is_limited_to_languageservers_entries() {
+        // The walk is deliberately narrow: a `rootMarkers` key elsewhere (top
+        // level, an unrelated table, or a server's opaque passthrough blob) must
+        // not trip the deprecation warning. This pins that scope against a
+        // future change that broadens the walk and starts false-warning.
+        assert!(!toml_uses_deprecated_root_markers(
+            "rootMarkers = [\".git\"]"
+        ));
+        assert!(!toml_uses_deprecated_root_markers(
+            "[other]\nrootMarkers = [\".git\"]"
+        ));
+        assert!(!json_uses_deprecated_root_markers(&serde_json::json!({
+            "rootMarkers": [".git"],
+            "other": { "rootMarkers": [".git"] }
+        })));
+        // A downstream server's opaque `initializationOptions` blob may itself
+        // carry an unrelated `rootMarkers` key — must not be walked into.
+        assert!(!json_uses_deprecated_root_markers(&serde_json::json!({
+            "languageServers": {
+                "x": { "initializationOptions": { "rootMarkers": [".git"] } }
+            }
+        })));
+    }
+
+    #[test]
+    fn non_table_languageservers_is_ignored() {
+        assert!(!toml_uses_deprecated_root_markers(
+            "languageServers = \"oops\""
+        ));
+        assert!(!json_uses_deprecated_root_markers(&serde_json::json!({
+            "languageServers": ["oops"]
+        })));
+    }
+
+    #[test]
+    fn deprecated_key_is_flagged_regardless_of_value_shape() {
+        // Empty array and a both-keys table (which serde later rejects as a
+        // duplicate field) still count as "the deprecated key was written".
+        assert!(toml_uses_deprecated_root_markers(
+            "[languageServers.x]\nrootMarkers = []"
+        ));
+        assert!(toml_uses_deprecated_root_markers(
+            "[languageServers.x]\nrootMarkers = [\".git\"]\nworkspaceMarkers = [\".git\"]"
+        ));
+    }
 }
