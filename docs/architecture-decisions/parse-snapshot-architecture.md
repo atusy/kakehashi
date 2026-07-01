@@ -115,10 +115,11 @@ mapping is not one-to-one and must be stated precisely:
   per-lifetime guard.
 - `ParseState`'s three fields are each accounted for, none silently dropped:
   `has_tree` is **replaced** by the two slot predicates above (not re-homed); the
-  settings **`generation`** (token-cache invalidation) and the **`in_progress`**
-  flag **re-home** onto `ParseScheduler`'s per-document state (which already owns the
-  parse lifecycle), not onto the read-side slot. Deleting `parse_states` is
-  contingent on those two moves.
+  **`generation`** (a monotonic parse-run counter that `mark_parse_started` bumps
+  and `mark_parse_finished` checks to reject an out-of-order finish) and the
+  **`in_progress`** flag **re-home** onto `ParseScheduler`'s per-document state
+  (which already owns the parse lifecycle), not onto the read-side slot. Deleting
+  `parse_states` is contingent on those two moves.
 
 The store's tree/watermark CAS methods (four tree writes —
 `update_tree_if_text_unchanged`, `update_tree_if_text_and_language_unchanged`,
@@ -321,11 +322,16 @@ Any reader that must resolve against **live** positions is position-critical
   and captures/node/bridge additionally resolve against the live `content_version`
   tracker. The rejection signal differs by protocol contract:
   - The LSP requests return **`ContentModified`** (-32801) when
-    `content_version > parsed_version`. The spec does **not** mandate client
-    auto-retry — a client that does not re-request simply gets the answer on its
-    next natural request; formatting may no-op for that keystroke. Acceptable
-    because these are not per-keystroke-critical, and it never serves a
-    wrong-position result.
+    `content_version > parsed_version`, and never serve a wrong-position result.
+    The spec does not mandate client auto-retry, so the reject is split by trigger:
+    *implicit/background* requests (hover, signatureHelp, documentHighlight, inlayHint,
+    …) reject immediately and get their answer on the client's next natural request.
+    *Explicit, user-initiated, infrequent* actions (`formatting`, `rangeFormatting`,
+    `rename`/`prepareRename`) take a **brief bounded wait** (the reader's only
+    permitted wait besides first-parse) for the in-flight parse to land before
+    falling back to `ContentModified` — because a silent no-op on an action the user
+    consciously triggered is jarring, and the wait is affordable exactly because
+    these are not per-keystroke.
   - `kakehashi/captures` returns **`null`**, which is precisely the re-sync signal
     captures-protocol already defines ("on null, call full again") — a JSON-RPC
     *error* would violate that contract, since a captures client is only contracted
@@ -338,9 +344,11 @@ Any reader that must resolve against **live** positions is position-critical
     incarnation) — otherwise it stores nothing and returns `null`, so the lineage
     never records matches for a text the client no longer has.
 
-The only bounded wait that remains is the **first parse after `didOpen`** (the
-snapshot is `None`); it waits briefly on `watch::changed()` then serves `null` —
-the same decoupling parse-decoupled-document-lifecycle applies to its host tier.
+Only two bounded waits remain, both deliberate: the **first parse after `didOpen`**
+(the snapshot is `None`; it waits briefly on `watch::changed()` then serves `null` —
+the same decoupling parse-decoupled-document-lifecycle applies to its host tier),
+and the **explicit-action wait** above (`formatting`/`rename`). No *per-keystroke*
+read ever waits.
 
 *(Reclassifying `captures/full` and `kakehashi/node/*` off serve-stale is a
 deliberate scope choice: making them serve-stale would require the snapshot to own
@@ -451,8 +459,10 @@ inside the existing safety contracts at each step:
   read latency — with the tree still cleared on edit, readers keep blocking on the
   reparse (or fall into an on-demand full parse). And `spawn_blocking` **alone**
   trades HOL-blocking for CPU oversubscription on the default 512-thread blocking
-  pool, so it must be paired with a bounded pool regardless. It is adopted as
-  **Stage 1**, not the destination.
+  pool, so it must be paired with a bounded pool regardless. The *idea* — get the
+  CPU off the async workers — is what **Stage 1** adopts, but via the **bounded
+  Rayon pool** of §4, **not** raw `spawn_blocking`; and Stage 1 is a step toward the
+  snapshot destination, not the destination itself.
 - **Serve the pre-edit / seeded tree immediately without versioning
   (naive stale-serve).** Rejected. It is crash-safe (the `#348` hazard is a
   parse-seed/external-scanner issue, not a query-cursor issue, and the read paths
@@ -479,9 +489,10 @@ inside the existing safety contracts at each step:
 ### Positive
 
 - Document lifecycle is fully decoupled from parsing: `didChange` never awaits a
-  parse, and a reader never blocks on a parse once a snapshot exists (the sole
-  exception is the brief, bounded first-parse wait after `didOpen`, when no
-  snapshot exists yet).
+  parse, and no *per-keystroke* read blocks on a parse. The only two bounded waits
+  are deliberate and rare: the first-parse wait after `didOpen` (no snapshot yet)
+  and the explicit-action wait (`formatting`/`rename`) that trades a jarring no-op
+  for a short pause on a user-triggered command.
 - The async runtime is never blocked by tree-CPU: with all synchronous tree work
   on the bounded pool, a slow parse on one document cannot freeze the request loop,
   timers, diagnostics, or another document's async handlers — the specific defect
