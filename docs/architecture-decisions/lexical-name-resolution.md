@@ -502,6 +502,17 @@ the miss policy keeps the resolver silent.
 
 ## Decision–Implementation Gap
 
-Nothing is implemented: no `bindings.scm` kind, no engine, and
-`QueryKind::Locals` (slated for removal above) still loads and installs
-`locals.scm` today. This record precedes implementation.
+Implemented: `QueryKind::Bindings` replaces the removed `Locals` end-to-end
+(config, store, coordinator, auto-install set); the engine
+(`src/analysis/bindings/`) implements the full property vocabulary and
+resolution algorithm; the native layer feeds
+definition/references/documentHighlight/rename/prepareRename through the
+cross-layer walk's `native` slot; the embedded corpus ships
+bash/go/javascript/lua/python/rust/typescript with searchPaths-first
+per-file fallback and embedded `; inherits:` (typescript → javascript),
+validated by fixture tests against the real grammars.
+
+Remaining gap: resolution runs on the **host layer only** — a cursor inside
+an injected region gets no native answer yet (the bridge still owns those),
+pending injection-coordinate support in the native contributor. Cross-region
+resolution stays out of scope for v1 as decided above.
