@@ -9,23 +9,12 @@ use super::snapshot::{ParseSnapshot, SnapshotSlot};
 pub(crate) struct DocumentSnapshot {
     text: Arc<str>,
     tree: Tree,
-    incarnation: u64,
 }
 
 impl DocumentSnapshot {
     /// Get the text content
     pub(crate) fn text(&self) -> &str {
         &self.text
-    }
-
-    /// Decompose into owned parts (cheap: `Arc<str>`/`Tree` refcount moves),
-    /// for handing the snapshot's pieces to a compute-pool work-unit. The
-    /// incarnation (see [`Document::incarnation`]) is captured atomically with
-    /// the text and tree under the same shard read lock, so a consumer can
-    /// later detect a close-then-reopen that raced its request by comparing
-    /// against the URI's current incarnation.
-    pub(crate) fn into_parts(self) -> (Arc<str>, Tree, u64) {
-        (self.text, self.tree, self.incarnation)
     }
 
     /// Cheaply clone the text as a shared `Arc<str>` (a refcount bump, no copy)
@@ -227,7 +216,6 @@ impl Document {
         Some(DocumentSnapshot {
             text: self.text.clone(),
             tree: self.tree.as_ref()?.clone(),
-            incarnation: self.incarnation,
         })
     }
 

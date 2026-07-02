@@ -827,43 +827,29 @@ print("hello")
         );
     }
 
-    /// Regression (parse-actor flip): `ensure_document_parsed` — the shared
-    /// post-edit freshness helper that every snapshot-reading handler (pull
-    /// diagnostics, the position/range bridge preamble, formatting, node/captures)
-    /// now calls — must restore a tree that `did_change` cleared, so those handlers
-    /// don't return empty/null after every edit while the off-ingress reparse is
-    /// still pending. (Without it, a request racing the reparse sees
-    /// `snapshot() == None`.)
+    /// The shared freshness helper never parses inline (parse-snapshot ADR
+    /// §3: the reader on-demand parse was a resurrection vector). With no
+    /// reparse scheduled for a cleared tree, it returns within its bounded
+    /// wait and the caller degrades to its empty fallback instead of
+    /// resurrecting or restoring anything.
     #[tokio::test]
-    async fn ensure_document_parsed_restores_a_cleared_tree() {
+    async fn ensure_document_parsed_never_parses_inline() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
-        configure_rust_self_host(server);
 
-        let uri = Url::parse("file:///test/ensure_fresh.rs").unwrap();
+        let uri = Url::parse("file:///test/cleared.rs").unwrap();
         server.documents.insert(
             uri.clone(),
             "fn main() {}".to_string(),
             Some("rust".to_string()),
             None,
         );
-        server
-            .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
-            .await;
 
-        // did_change applies the edit and CLEARS the tree synchronously.
-        server
-            .documents
-            .update_document(uri.clone(), "fn changed() {}".to_string(), None);
-        assert!(server.documents.get(&uri).unwrap().tree().is_none());
-
-        // A reader's freshness call restores the tree (here via on-demand parse,
-        // since no off-ingress reparse is running in this unit test).
         server.ensure_document_parsed(&uri).await;
+
         assert!(
-            server.documents.get(&uri).unwrap().tree().is_some(),
-            "the freshness helper must restore the tree so post-edit readers aren't empty"
+            server.documents.get(&uri).unwrap().tree().is_none(),
+            "no reparse was scheduled, so no tree may appear — readers never parse inline"
         );
     }
 

@@ -64,38 +64,30 @@ impl Kakehashi {
 
             log::debug!("{} called for {}", method_name, uri);
 
-            // Tower-LSP runs requests concurrently, so a whole-document request can
-            // arrive before didOpen/didChange has finished parsing, and didChange
-            // now reparses off-ingress. Use the shared post-edit freshness helper
-            // (wait for the reparse, then parse on demand) before snapshotting —
-            // matching the other read handlers (semantic tokens, formatting, node
-            // lookups) — so an otherwise-valid request doesn't degrade to `Ok(None)`
-            // on a parse race or a reparse slower than the bounded wait.
-            self.ensure_document_parsed(&uri).await;
-
-            // Get document snapshot (minimizes lock duration)
-            let snapshot = match self.documents.get(&uri) {
-                None => {
-                    log::debug!("{}: No document found for {}", method_name, uri);
+            // Resolve a CURRENT parse snapshot with a bounded wait (parse-snapshot
+            // ADR §3). This family is nominally serve-stale, but the region
+            // resolution below MINTS tracker ULIDs — a live-position index — so a
+            // stale snapshot must not feed it (a stale read never mints); until the
+            // snapshot-owned region ordinals land, staleness degrades to `Ok(None)`
+            // (the native/empty fallback), self-correcting on the client's next
+            // request. The former parse-on-demand fallback is gone: readers never
+            // parse inline.
+            let snapshot = match self
+                .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(200))
+                .await
+            {
+                crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(snapshot) => snapshot,
+                _ => {
+                    log::debug!("{}: no current parse snapshot for {}", method_name, uri);
                     return Ok(None);
                 }
-                Some(doc) => match doc.snapshot() {
-                    None => {
-                        log::debug!(
-                            "{}: Document not fully initialized for {}",
-                            method_name,
-                            uri
-                        );
-                        return Ok(None);
-                    }
-                    Some(snapshot) => snapshot,
-                },
-                // doc automatically dropped here, lock released
             };
-
-            // Get the language for this document
-            let Some(language_name) = self.document_language(&uri) else {
+            let Some(language_name) = snapshot.language.clone() else {
                 log::debug!("{}: No language detected", method_name);
+                return Ok(None);
+            };
+            let Some(snapshot_tree) = snapshot.tree.as_ref() else {
+                log::debug!("{}: no tree (parser unavailable) for {}", method_name, uri);
                 return Ok(None);
             };
 
@@ -109,8 +101,8 @@ impl Kakehashi {
                 &self.language,
                 self.bridge.node_tracker(),
                 &uri,
-                snapshot.tree(),
-                snapshot.text(),
+                snapshot_tree,
+                &snapshot.text,
                 injection_query.as_ref(),
             );
 

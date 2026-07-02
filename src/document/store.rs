@@ -181,29 +181,6 @@ impl DocumentStore {
         sender.send_replace(state);
     }
 
-    pub async fn wait_for_parse_completion(&self, uri: &Url, timeout: std::time::Duration) {
-        let mut receiver = self.parse_sender(uri).subscribe();
-
-        let wait_future = async {
-            loop {
-                let state = *receiver.borrow();
-
-                // Already have a tree - done waiting
-                if state.has_tree {
-                    return;
-                }
-
-                // No tree yet - wait for state change
-                // (either parse starts, or parse finishes with a tree)
-                if receiver.changed().await.is_err() {
-                    return; // Channel closed
-                }
-            }
-        };
-
-        let _ = tokio::time::timeout(timeout, wait_future).await;
-    }
-
     // Lock safety: Single insert() call - no read lock held before or during write
     pub fn insert(&self, uri: Url, text: String, language_id: Option<String>, tree: Option<Tree>) {
         let has_tree = tree.is_some();
@@ -361,6 +338,10 @@ impl DocumentStore {
     /// than associated with the newer text. The availability update is likewise
     /// non-inserting (see `mark_tree_available_if_tracked`), so the parse-state
     /// isn't resurrected either.
+    /// Test-only since the snapshot conversion removed the last production
+    /// caller (the node handlers' on-demand parse); store tests still exercise
+    /// the CAS semantics its non-test siblings share.
+    #[cfg(test)]
     pub(crate) fn update_tree_if_text_unchanged(
         &self,
         uri: &Url,
@@ -879,7 +860,6 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use tokio::time::timeout;
 
     #[test]
     fn insert_stamps_a_fresh_nonzero_incarnation() {
@@ -1741,54 +1721,5 @@ mod tests {
         let doc = store.get(&uri).unwrap();
         assert_eq!(doc.text(), new_text);
         assert!(doc.tree().is_some());
-    }
-
-    #[tokio::test]
-    async fn wait_for_parse_completion_blocks_until_finished() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///parse-wait.lua").unwrap();
-
-        let generation = store.mark_parse_started(&uri);
-        let wait_future = store.wait_for_parse_completion(&uri, Duration::from_secs(1));
-        let mut wait_future = Box::pin(wait_future);
-
-        assert!(
-            timeout(Duration::from_millis(10), &mut wait_future)
-                .await
-                .is_err(),
-            "wait should block while parse is in progress"
-        );
-
-        store.mark_parse_finished(&uri, generation, true);
-
-        assert!(
-            timeout(Duration::from_millis(200), wait_future)
-                .await
-                .is_ok(),
-            "wait should complete after parse finishes"
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_for_parse_completion_returns_when_tree_available() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///parse-ready.rs").unwrap();
-
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let text = "fn main() {}".to_string();
-        let tree = parser.parse(&text, None).unwrap();
-
-        store.insert(uri.clone(), text, Some("rust".to_string()), Some(tree));
-
-        let wait_future = store.wait_for_parse_completion(&uri, Duration::from_secs(1));
-        assert!(
-            timeout(Duration::from_millis(10), wait_future)
-                .await
-                .is_ok(),
-            "wait should return immediately when a tree is already available"
-        );
     }
 }

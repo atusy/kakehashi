@@ -72,17 +72,21 @@ impl Kakehashi {
         // `Document::tree()` populated with a stale tree while NodeTracker has
         // already been adjusted. The helper waits on the parse-state watch
         // channel and re-parses on demand so the snapshot below is consistent.
-        self.ensure_document_parsed(&uri).await;
-
-        // Snapshot the document so we operate on a consistent (text, tree) pair.
-        let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
-            log::debug!(target: "kakehashi::node::children", "no parsed document for {}", uri);
+        // Resolve a CURRENT parse snapshot (parse-snapshot ADR §3): a node id
+        // names a live-position node, so a trailing snapshot rejects
+        // immediately with the protocol's universal null; only the bounded
+        // first-parse wait applies. Currency is also what keeps the layer
+        // re-mints below sound (a stale read never mints).
+        let Some(snapshot) = self.current_snapshot(&uri).await else {
+            log::debug!(target: "kakehashi::node::children", "no current parse snapshot for {}", uri);
             return Ok(Value::Null);
         };
-        let host_text = snapshot.text();
-        let host_tree = snapshot.tree();
+        let host_text: &str = &snapshot.text;
+        let Some(host_tree) = snapshot.tree.as_ref() else {
+            return Ok(Value::Null);
+        };
 
-        let Some(host_language) = self.document_language(&uri) else {
+        let Some(host_language) = snapshot.language.clone() else {
             log::debug!(target: "kakehashi::node::children", "no host language for {}", uri);
             return Ok(Value::Null);
         };

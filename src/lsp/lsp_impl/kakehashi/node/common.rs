@@ -198,13 +198,14 @@ impl Kakehashi {
         // language tree that minted the node so navigation stays in-layer.
         let (start, end, kind, layer) = self.bridge.node_tracker().lookup_node(&uri, &ulid)?;
 
-        // Same race as the other handlers: didOpen schedules an async parse, so
-        // a request issued immediately after must not see `tree: None`.
-        self.ensure_document_parsed(&uri).await;
-
-        // Snapshot so we operate on a consistent (text, tree) pair.
-        let snapshot = self.documents.get(&uri).and_then(|doc| doc.snapshot())?;
-        let (host_text, host_tree, _incarnation) = snapshot.into_parts();
+        // Resolve a CURRENT snapshot (parse-snapshot ADR §3): the tracked
+        // `(start, end)` lives at the current `content_version` (the tracker
+        // is edit-shifted synchronously), so resolving it against a trailing
+        // tree would be wrong, not merely late — reject immediately with the
+        // universal null; only the bounded first-parse wait applies.
+        let snapshot = self.current_snapshot(&uri).await?;
+        let host_text = std::sync::Arc::clone(&snapshot.text);
+        let host_tree = snapshot.tree.clone()?;
 
         // Defensively reject an invalid or out-of-bounds tracked range before any
         // tree work: an inverted range or one extending past the current text
@@ -214,7 +215,7 @@ impl Kakehashi {
             return None;
         }
 
-        let host_language = self.document_language(&uri)?;
+        let host_language = snapshot.language.clone()?;
 
         // Resolving the minting layer re-runs the injection query over the host
         // tree (O(regions)) and re-parses the containing layer chain —
@@ -365,14 +366,15 @@ impl Kakehashi {
             return Value::Null;
         }
 
-        // Same didOpen race guard as the single-id prelude.
-        self.ensure_document_parsed(&uri).await;
-        let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
+        // Same current-snapshot prelude as the single-id path (ADR §3).
+        let Some(snapshot) = self.current_snapshot(&uri).await else {
             return Value::Null;
         };
-        let host_text = snapshot.text();
-        let host_tree = snapshot.tree();
-        let Some(host_language) = self.document_language(&uri) else {
+        let host_text: &str = &snapshot.text;
+        let Some(host_tree) = snapshot.tree.as_ref() else {
+            return Value::Null;
+        };
+        let Some(host_language) = snapshot.language.clone() else {
             return Value::Null;
         };
 
