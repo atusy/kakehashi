@@ -1,3 +1,4 @@
+pub(crate) mod bindings;
 pub(crate) mod offset_calculator;
 pub(crate) mod result_id;
 pub(crate) mod selection;
