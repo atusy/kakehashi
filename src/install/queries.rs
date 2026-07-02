@@ -13,7 +13,7 @@ pub(crate) const NVIM_TREESITTER_QUERIES_URL: &str =
     "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/main/runtime/queries";
 
 /// Query file types to download.
-const QUERY_FILES: &[&str] = &["highlights.scm", "locals.scm", "injections.scm"];
+const QUERY_FILES: &[&str] = &["highlights.scm", "injections.scm"];
 
 /// HTTP timeout for query file downloads; keeps installs bounded when a
 /// response stalls (query files are small text files, so 60s is generous).

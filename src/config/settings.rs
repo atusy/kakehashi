@@ -514,9 +514,6 @@ pub struct QueryTypeMappings {
     /// Capture mappings for highlights queries.
     #[serde(default)]
     pub highlights: CaptureMapping,
-    /// Capture mappings for locals queries.
-    #[serde(default)]
-    pub locals: CaptureMapping,
     /// Capture mappings for folds queries.
     /// Reserved for future folding range support — populated and merged but not yet consumed by analysis.
     #[serde(default)]
@@ -1103,9 +1100,6 @@ mod tests {
                 "rust": {
                     "highlights": {
                         "type.builtin": "type.defaultLibrary"
-                    },
-                    "locals": {
-                        "definition.var": "definition.variable"
                     }
                 }
             }

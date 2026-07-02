@@ -158,7 +158,6 @@ pub fn default_capture_mappings() -> CaptureMappings {
     let highlights = default_highlight_mappings();
     let wildcard = QueryTypeMappings {
         highlights,
-        locals: CaptureMapping::new(),
         folds: CaptureMapping::new(),
     };
 
