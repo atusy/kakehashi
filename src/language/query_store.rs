@@ -7,7 +7,7 @@ use tree_sitter::Query;
 /// Stores and manages Tree-sitter queries for different languages
 pub(crate) struct QueryStore {
     highlight_queries: RwLock<HashMap<String, Arc<Query>>>,
-    locals_queries: RwLock<HashMap<String, Arc<Query>>>,
+    bindings_queries: RwLock<HashMap<String, Arc<Query>>>,
     injection_queries: RwLock<HashMap<String, Arc<Query>>>,
 }
 
@@ -15,7 +15,7 @@ impl QueryStore {
     pub(crate) fn new() -> Self {
         Self {
             highlight_queries: RwLock::new(HashMap::new()),
-            locals_queries: RwLock::new(HashMap::new()),
+            bindings_queries: RwLock::new(HashMap::new()),
             injection_queries: RwLock::new(HashMap::new()),
         }
     }
@@ -35,7 +35,7 @@ impl QueryStore {
             .write()
             .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
             .remove(lang_name);
-        self.locals_queries
+        self.bindings_queries
             .write()
             .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
             .remove(lang_name);
@@ -63,20 +63,20 @@ impl QueryStore {
             .contains_key(lang_name)
     }
 
-    pub(crate) fn insert_locals_query(&self, lang_name: String, query: Arc<Query>) {
-        self.locals_queries
+    pub(crate) fn insert_bindings_query(&self, lang_name: String, query: Arc<Query>) {
+        self.bindings_queries
             .write()
             .recover_poison(format_args!(
-                "QueryStore::insert_locals_query({})",
+                "QueryStore::insert_bindings_query({})",
                 lang_name
             ))
             .insert(lang_name, query);
     }
 
-    pub(crate) fn locals_query(&self, lang_name: &str) -> Option<Arc<Query>> {
-        self.locals_queries
+    pub(crate) fn bindings_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+        self.bindings_queries
             .read()
-            .recover_poison(format_args!("QueryStore::locals_query({})", lang_name))
+            .recover_poison(format_args!("QueryStore::bindings_query({})", lang_name))
             .get(lang_name)
             .cloned()
     }
@@ -103,7 +103,7 @@ impl QueryStore {
     pub(crate) fn insert_query(&self, kind: QueryKind, lang_name: String, query: Arc<Query>) {
         match kind {
             QueryKind::Highlights => self.insert_highlight_query(lang_name, query),
-            QueryKind::Locals => self.insert_locals_query(lang_name, query),
+            QueryKind::Bindings => self.insert_bindings_query(lang_name, query),
             QueryKind::Injections => self.insert_injection_query(lang_name, query),
         }
     }
@@ -112,7 +112,7 @@ impl QueryStore {
     pub(crate) fn get_query(&self, kind: QueryKind, lang_name: &str) -> Option<Arc<Query>> {
         match kind {
             QueryKind::Highlights => self.highlight_query(lang_name),
-            QueryKind::Locals => self.locals_query(lang_name),
+            QueryKind::Bindings => self.bindings_query(lang_name),
             QueryKind::Injections => self.injection_query(lang_name),
         }
     }
@@ -142,8 +142,8 @@ mod tests {
         assert!(store.has_highlight_query("rust"));
         assert_eq!(store.highlight_query("rust").unwrap(), query);
 
-        // Test locals queries - verify insert doesn't panic
-        store.insert_locals_query("rust".to_string(), query.clone());
+        // Test bindings queries - verify insert doesn't panic
+        store.insert_bindings_query("rust".to_string(), query.clone());
     }
 
     #[test]

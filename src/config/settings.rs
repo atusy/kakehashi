@@ -534,8 +534,8 @@ pub type CaptureMappings = HashMap<String, QueryTypeMappings>;
 pub enum QueryKind {
     /// Syntax highlighting queries
     Highlights,
-    /// Local definitions/references queries (for scope analysis)
-    Locals,
+    /// Lexical name-binding queries (scopes, definitions, references)
+    Bindings,
     /// Language injection queries (for embedded languages)
     Injections,
 }
@@ -544,7 +544,7 @@ impl QueryKind {
     /// All query kinds in standard processing order.
     pub const ALL: [QueryKind; 3] = [
         QueryKind::Highlights,
-        QueryKind::Locals,
+        QueryKind::Bindings,
         QueryKind::Injections,
     ];
 
@@ -552,7 +552,7 @@ impl QueryKind {
     pub fn name(self) -> &'static str {
         match self {
             QueryKind::Highlights => "highlights",
-            QueryKind::Locals => "locals",
+            QueryKind::Bindings => "bindings",
             QueryKind::Injections => "injections",
         }
     }
@@ -561,7 +561,7 @@ impl QueryKind {
     pub fn filename(self) -> &'static str {
         match self {
             QueryKind::Highlights => "highlights.scm",
-            QueryKind::Locals => "locals.scm",
+            QueryKind::Bindings => "bindings.scm",
             QueryKind::Injections => "injections.scm",
         }
     }
@@ -575,7 +575,7 @@ impl QueryKind {
 pub struct QueryItem {
     /// Path to the query file (required)
     pub path: String,
-    /// Query type: highlights, locals, or injections (optional - inferred from filename if omitted)
+    /// Query type: highlights, bindings, or injections (optional - inferred from filename if omitted)
     pub kind: Option<QueryKind>,
 }
 
@@ -583,9 +583,10 @@ pub struct QueryItem {
 ///
 /// Rules:
 /// - Exact match `highlights.scm` -> `Some(Highlights)`
-/// - Exact match `locals.scm` -> `Some(Locals)`
+/// - Exact match `bindings.scm` -> `Some(Bindings)`
 /// - Exact match `injections.scm` -> `Some(Injections)`
-/// - Otherwise -> `None`
+/// - Otherwise -> `None` (including `locals.scm`, whose kind was removed —
+///   stale entries degrade to silently skipped rather than erroring)
 ///
 /// Examples:
 /// - `injections.scm` -> matches
@@ -601,7 +602,7 @@ pub(crate) fn infer_query_kind(path: &str) -> Option<QueryKind> {
     // Only match exact filenames
     match filename {
         "injections.scm" => Some(QueryKind::Injections),
-        "locals.scm" => Some(QueryKind::Locals),
+        "bindings.scm" => Some(QueryKind::Bindings),
         "highlights.scm" => Some(QueryKind::Highlights),
         _ => None,
     }
@@ -923,7 +924,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::locals("locals", QueryKind::Locals)]
+    #[case::bindings("bindings", QueryKind::Bindings)]
     #[case::injections("injections", QueryKind::Injections)]
     fn should_parse_configuration_with_query_kind(
         #[case] kind_str: &str,
@@ -2003,21 +2004,30 @@ mod tests {
 
     #[test]
     fn should_parse_query_kind_enum_variants() {
-        // QueryKind enum should have Highlights, Locals, Injections variants
+        // QueryKind enum should have Highlights, Bindings, Injections variants
         let highlights_toml = r#"path = "/a.scm"
 kind = "highlights""#;
-        let locals_toml = r#"path = "/b.scm"
-kind = "locals""#;
+        let bindings_toml = r#"path = "/b.scm"
+kind = "bindings""#;
         let injections_toml = r#"path = "/c.scm"
 kind = "injections""#;
 
         let h: QueryItem = toml::from_str(highlights_toml).unwrap();
-        let l: QueryItem = toml::from_str(locals_toml).unwrap();
+        let b: QueryItem = toml::from_str(bindings_toml).unwrap();
         let i: QueryItem = toml::from_str(injections_toml).unwrap();
 
         assert_eq!(h.kind, Some(QueryKind::Highlights));
-        assert_eq!(l.kind, Some(QueryKind::Locals));
+        assert_eq!(b.kind, Some(QueryKind::Bindings));
         assert_eq!(i.kind, Some(QueryKind::Injections));
+    }
+
+    #[test]
+    fn should_reject_removed_locals_query_kind() {
+        // QueryKind::Locals was removed (lexical-name-resolution ADR): an
+        // explicit kind = "locals" is a hard deserialization error, not an alias.
+        let locals_toml = r#"path = "/b.scm"
+kind = "locals""#;
+        assert!(toml::from_str::<QueryItem>(locals_toml).is_err());
     }
 
     #[test]
@@ -2029,8 +2039,8 @@ kind = "injections""#;
             path = "/path/to/highlights.scm"
 
             [[queries]]
-            path = "/path/to/locals.scm"
-            kind = "locals"
+            path = "/path/to/bindings.scm"
+            kind = "bindings"
         "#;
 
         let config: LanguageSettings = toml::from_str(config_toml).unwrap();
@@ -2039,8 +2049,8 @@ kind = "injections""#;
         assert_eq!(queries.len(), 2);
         assert_eq!(queries[0].path, "/path/to/highlights.scm");
         assert!(queries[0].kind.is_none());
-        assert_eq!(queries[1].path, "/path/to/locals.scm");
-        assert_eq!(queries[1].kind, Some(QueryKind::Locals));
+        assert_eq!(queries[1].path, "/path/to/bindings.scm");
+        assert_eq!(queries[1].kind, Some(QueryKind::Bindings));
     }
 
     // Type inference for query kinds
@@ -2066,17 +2076,25 @@ kind = "injections""#;
     }
 
     #[test]
-    fn should_infer_locals_from_filename_pattern() {
-        // Only exact match "locals.scm" -> Some(Locals)
-        assert_eq!(infer_query_kind("locals.scm"), Some(QueryKind::Locals));
+    fn should_infer_bindings_from_filename_pattern() {
+        // Only exact match "bindings.scm" -> Some(Bindings)
+        assert_eq!(infer_query_kind("bindings.scm"), Some(QueryKind::Bindings));
         assert_eq!(
-            infer_query_kind("/path/to/locals.scm"),
-            Some(QueryKind::Locals)
+            infer_query_kind("/path/to/bindings.scm"),
+            Some(QueryKind::Bindings)
         );
         // Prefixed variants should NOT match (only exact filename)
-        assert_eq!(infer_query_kind("./queries/rust-locals.scm"), None);
-        assert_eq!(infer_query_kind("/usr/share/python-locals.scm"), None);
-        assert_eq!(infer_query_kind("javascript-locals.scm"), None);
+        assert_eq!(infer_query_kind("./queries/rust-bindings.scm"), None);
+        assert_eq!(infer_query_kind("/usr/share/python-bindings.scm"), None);
+        assert_eq!(infer_query_kind("javascript-bindings.scm"), None);
+    }
+
+    #[test]
+    fn should_not_infer_removed_locals_filename() {
+        // locals.scm inference was removed with QueryKind::Locals: stale paths
+        // degrade to silently skipped (no kind inferred), not an error.
+        assert_eq!(infer_query_kind("locals.scm"), None);
+        assert_eq!(infer_query_kind("/path/to/locals.scm"), None);
     }
 
     #[test]

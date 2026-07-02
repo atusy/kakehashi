@@ -1187,14 +1187,14 @@ impl LanguageCoordinator {
 
         // Group query paths by their effective kind
         let mut highlights: Vec<String> = Vec::new();
-        let mut locals: Vec<String> = Vec::new();
+        let mut bindings: Vec<String> = Vec::new();
         let mut injections: Vec<String> = Vec::new();
 
         for query in queries {
             let effective_kind = query.kind.or_else(|| infer_query_kind(&query.path));
             match effective_kind {
                 Some(QueryKind::Highlights) => highlights.push(query.path.clone()),
-                Some(QueryKind::Locals) => locals.push(query.path.clone()),
+                Some(QueryKind::Bindings) => bindings.push(query.path.clone()),
                 Some(QueryKind::Injections) => injections.push(query.path.clone()),
                 None => {
                     // Skip unrecognized patterns silently
@@ -1204,7 +1204,7 @@ impl LanguageCoordinator {
 
         for (query_kind, paths) in [
             (QueryKind::Highlights, &highlights),
-            (QueryKind::Locals, &locals),
+            (QueryKind::Bindings, &bindings),
             (QueryKind::Injections, &injections),
         ] {
             if !paths.is_empty() {
@@ -1712,10 +1712,10 @@ mod tests {
         let mut highlights_file = fs::File::create(&highlights_path).unwrap();
         writeln!(highlights_file, "(identifier) @variable").unwrap();
 
-        // Locals query
-        let locals_path = temp_dir.path().join("locals.scm");
-        let mut locals_file = fs::File::create(&locals_path).unwrap();
-        writeln!(locals_file, "(identifier) @local.definition").unwrap();
+        // Bindings query
+        let bindings_path = temp_dir.path().join("bindings.scm");
+        let mut bindings_file = fs::File::create(&bindings_path).unwrap();
+        writeln!(bindings_file, "(identifier) @reference").unwrap();
 
         // Injections query
         let injections_path = temp_dir.path().join("injections.scm");
@@ -1729,8 +1729,8 @@ mod tests {
                 kind: None, // Will be inferred as Highlights
             },
             QueryItem {
-                path: locals_path.to_str().unwrap().to_string(),
-                kind: Some(QueryKind::Locals), // Explicit kind
+                path: bindings_path.to_str().unwrap().to_string(),
+                kind: Some(QueryKind::Bindings), // Explicit kind
             },
             QueryItem {
                 path: injections_path.to_str().unwrap().to_string(),
@@ -1762,7 +1762,7 @@ mod tests {
             );
         }
 
-        // Verify highlight query was loaded (locals and injections confirmed by events)
+        // Verify highlight query was loaded (bindings and injections confirmed by events)
         assert!(
             coordinator.highlight_query("rust").is_some(),
             "Highlight query should be loaded"
