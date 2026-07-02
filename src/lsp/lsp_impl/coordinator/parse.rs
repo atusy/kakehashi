@@ -230,21 +230,27 @@ impl ParseCoordinator {
     /// It is **awaited**, not detached, preserving the `populate → mark finished
     /// → downstream` ordering the injection-map invalidation depends on (Stage-1
     /// obligation). All parameters are cheap clones (refcount bumps).
+    /// Returns the owned injection discovery for this parse (`None` when not
+    /// reusable — or when the pool work-unit panicked), destined for the
+    /// snapshot this pass publishes (ADR §3, don't-discover-twice).
     async fn populate_injections_on_pool(
         &self,
         uri: Url,
         text: std::sync::Arc<str>,
         tree: tree_sitter::Tree,
         language_name: String,
-    ) {
+    ) -> Option<std::sync::Arc<crate::document::DiscoveredInjections>> {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
         self.compute_pool
             .run(None, move || {
-                cache.populate_injections(&uri, &text, &tree, &language_name, &language, &tracker);
+                cache
+                    .populate_injections(&uri, &text, &tree, &language_name, &language, &tracker)
+                    .map(std::sync::Arc::new)
             })
-            .await;
+            .await
+            .flatten()
     }
 
     /// Parse the (already-registered) document at `uri` and publish the result.
@@ -363,6 +369,7 @@ impl ParseCoordinator {
                         language: Some(language_name.clone()),
                         parsed_version: content_version,
                         incarnation,
+                        injection_regions: None,
                     },
                 );
                 advance_watermark();
@@ -428,6 +435,26 @@ impl ParseCoordinator {
                         Some(&language_name),
                         Some(tree.clone()),
                     );
+                // Populate BEFORE the publish so the derived discovery rides the
+                // snapshot (ADR §3 don't-discover-twice); readers keep serving
+                // the previous snapshot meanwhile. A rejected CAS (raced) skips
+                // populate — the snapshot then publishes without discovery and
+                // readers discover inline for that (already-superseded) snapshot.
+                let discovery = if stored {
+                    let discovery = self
+                        .populate_injections_on_pool(
+                            uri.clone(),
+                            text.clone(),
+                            tree.clone(),
+                            language_name.clone(),
+                        )
+                        .await;
+                    self.documents
+                        .mark_parse_finished(&uri, parse_generation, true);
+                    discovery
+                } else {
+                    None
+                };
                 self.publish_parse_snapshot(
                     &uri,
                     crate::document::snapshot::ParseSnapshot {
@@ -436,19 +463,9 @@ impl ParseCoordinator {
                         language: Some(language_name.clone()),
                         parsed_version: content_version,
                         incarnation,
+                        injection_regions: discovery,
                     },
                 );
-                if stored {
-                    self.populate_injections_on_pool(
-                        uri.clone(),
-                        text.clone(),
-                        tree.clone(),
-                        language_name.clone(),
-                    )
-                    .await;
-                    self.documents
-                        .mark_parse_finished(&uri, parse_generation, true);
-                }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 // `stored` is exactly "this call's CAS landed the tree": false when a
@@ -484,6 +501,7 @@ impl ParseCoordinator {
                     language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation,
+                    injection_regions: None,
                 },
             );
             advance_watermark();
@@ -513,6 +531,7 @@ impl ParseCoordinator {
                 language: None,
                 parsed_version: content_version,
                 incarnation,
+                injection_regions: None,
             },
         );
         advance_watermark();
@@ -659,8 +678,21 @@ impl ParseCoordinator {
                 expected_incarnation,
                 tree.clone(),
             );
-            // The cell guard rejects a stale lifetime or an out-of-order
-            // version on its own.
+            // Populate BEFORE the publish so the discovery rides the snapshot
+            // (ADR §3); the cell guard still rejects a stale lifetime or an
+            // out-of-order version at publish. A rejected CAS skips populate —
+            // the snapshot still publishes as stale-but-consistent.
+            let discovery = if stored {
+                self.populate_injections_on_pool(
+                    uri.clone(),
+                    text.clone(),
+                    tree.clone(),
+                    language_name.clone(),
+                )
+                .await
+            } else {
+                None
+            };
             let published = self.publish_parse_snapshot(
                 &uri,
                 crate::document::snapshot::ParseSnapshot {
@@ -669,6 +701,7 @@ impl ParseCoordinator {
                     language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation: expected_incarnation,
+                    injection_regions: discovery,
                 },
             );
             // Serve-stale's heal signal, mirroring reparse_latest: a token
@@ -682,13 +715,6 @@ impl ParseCoordinator {
                 ));
             }
             if stored {
-                self.populate_injections_on_pool(
-                    uri.clone(),
-                    text.clone(),
-                    tree.clone(),
-                    language_name.clone(),
-                )
-                .await;
                 break;
             }
             // CAS rejected: the text moved under us (a concurrent `didChange`).
@@ -840,10 +866,23 @@ impl ParseCoordinator {
                 incarnation,
                 tree.clone(),
             );
-            // The cell guard admits this even when the legacy CAS above
-            // rejected a text that moved on — a stale-but-consistent snapshot
-            // is exactly what serve-stale readers consume; the scheduler's
-            // dirty loop reparses the newer text and supersedes it.
+            // Populate BEFORE the publish so the derived discovery rides the
+            // snapshot (ADR §3, don't-discover-twice); readers keep serving the
+            // previous snapshot for populate's duration. A rejected legacy CAS
+            // (the text moved on mid-parse) skips populate — the snapshot still
+            // publishes as stale-but-consistent (its readers discover inline;
+            // the scheduler's dirty loop is already reparsing the newer text).
+            let discovery = if stored {
+                self.populate_injections_on_pool(
+                    uri.clone(),
+                    text.clone(),
+                    tree.clone(),
+                    language_name.clone(),
+                )
+                .await
+            } else {
+                None
+            };
             let published = self.publish_parse_snapshot(
                 uri,
                 crate::document::snapshot::ParseSnapshot {
@@ -852,6 +891,7 @@ impl ParseCoordinator {
                     language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation,
+                    injection_regions: discovery,
                 },
             );
             // Serve-stale's heal signal (ADR §3): a fresh publish re-drives the
@@ -866,15 +906,6 @@ impl ParseCoordinator {
                 events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
                     language_name.clone(),
                 ));
-            }
-            if stored {
-                self.populate_injections_on_pool(
-                    uri.clone(),
-                    text.clone(),
-                    tree.clone(),
-                    language_name.clone(),
-                )
-                .await;
             }
         }
 

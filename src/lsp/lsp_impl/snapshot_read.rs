@@ -150,6 +150,7 @@ mod tests {
                     language: Some("rust".to_string()),
                     parsed_version: version,
                     incarnation: inc,
+                    injection_regions: None,
                 }))
             })
             .unwrap_or(false);

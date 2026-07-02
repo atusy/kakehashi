@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use tree_sitter::Tree;
 
+use super::injections::DiscoveredInjections;
+
 /// The reserved terminal incarnation `didClose` installs in a slot
 /// (`u64::MAX`). Keeping the closed slot at its old incarnation would let a
 /// stale same-lifetime publish pass both the incarnation check and the
@@ -40,6 +42,16 @@ pub(crate) struct ParseSnapshot {
     pub(crate) parsed_version: u64,
     /// The document lifetime the parse belongs to.
     pub(crate) incarnation: u64,
+    /// Owned injection discovery derived from THIS snapshot's tree by the
+    /// parse pass (ADR §3, don't-discover-twice): readers rebuild injection
+    /// contexts from it instead of re-running the injection query per request.
+    /// `None` when discovery didn't run or didn't qualify (tree-less snapshot,
+    /// below the region gate, combined groups, or a not-yet-loaded injected
+    /// parser tainted it) — readers then discover inline, byte-identically to
+    /// the pre-lever path. Immutability of the snapshot is the tree-identity
+    /// binding: text, tree, and regions are one value, so the regions can
+    /// never be consumed against a different tree.
+    pub(crate) injection_regions: Option<Arc<DiscoveredInjections>>,
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -113,6 +125,7 @@ mod tests {
             language: None,
             parsed_version,
             incarnation,
+            injection_regions: None,
         }
     }
 
@@ -156,6 +169,7 @@ mod tests {
             language: Some("rust".to_string()),
             parsed_version,
             incarnation,
+            injection_regions: None,
         }
     }
 

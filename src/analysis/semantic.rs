@@ -13,6 +13,9 @@ use tree_sitter::{Query, Tree};
 // Re-export crate-internal API from submodules
 pub(crate) use delta::calculate_delta_or_full;
 pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
+#[cfg(test)]
+pub(crate) use parallel::DISCOVERY_REUSE_HITS;
+pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::handle_semantic_tokens_range_parallel_async;
 
 // Re-export for parallel processing
@@ -34,6 +37,13 @@ pub(crate) struct InjectionCacheParams {
     pub documents: std::sync::Arc<crate::document::DocumentStore>,
     pub parsed_version: u64,
     pub incarnation: u64,
+    /// Owned injection discovery from the snapshot being tokenized
+    /// (parse-snapshot ADR §3, the don't-discover-twice lever): rebuilt into
+    /// contexts instead of re-running the injection query, when its
+    /// `generation` still matches `generation` above. `None` re-discovers
+    /// inline (below the region gate, combined groups, or discovery
+    /// incomplete at parse time).
+    pub discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
 }
 
 // Internal re-exports for production code
@@ -127,6 +137,7 @@ pub(crate) async fn handle_semantic_tokens_full(
                 view.slot.current_incarnation == p.incarnation
                     && view.content_version == p.parsed_version
             }),
+            discovery: p.discovery.as_deref(),
         });
 
         // Collect injection tokens in parallel using Rayon.

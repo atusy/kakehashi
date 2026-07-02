@@ -756,6 +756,7 @@ impl DocumentStore {
             language: doc.language_id().map(|s| s.to_string()),
             parsed_version: doc.content_version(),
             incarnation: doc.incarnation(),
+            injection_regions: None,
         };
         doc.publish_snapshot(Arc::new(snapshot));
     }
@@ -800,6 +801,7 @@ mod tests {
                 language: Some("rust".to_string()),
                 parsed_version,
                 incarnation: doc.incarnation(),
+                injection_regions: None,
             }
         }
 

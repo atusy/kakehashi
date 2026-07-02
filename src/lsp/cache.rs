@@ -178,6 +178,15 @@ impl CacheCoordinator {
     /// enabling stable IDs across document edits when position adjustments are applied.
     ///
     /// Also clears stale InjectionTokenCache entries for removed regions.
+    ///
+    /// Returns the owned injection **discovery** for this parse (parse-snapshot
+    /// ADR §3, the don't-discover-twice lever) when it should ride the
+    /// [`ParseSnapshot`](crate::document::snapshot::ParseSnapshot) for readers
+    /// to reuse — `None` when there is nothing worth reusing (no query,
+    /// no/empty regions, below the region-count gate, an `injection.combined`
+    /// group, or a not-yet-loaded parser). The discovery query (`Q`) is run
+    /// **once** here and shared; the request path never re-runs it.
+    #[must_use]
     pub(crate) fn populate_injections(
         &self,
         uri: &Url,
@@ -186,7 +195,19 @@ impl CacheCoordinator {
         language_name: &str,
         language: &LanguageCoordinator,
         tracker: &NodeTracker,
-    ) {
+    ) -> Option<crate::document::DiscoveredInjections> {
+        // Snapshot the generation FIRST — before reading the injection query or
+        // resolving any language below — so the stamp can never be *newer* than
+        // the queries the discovery was built with. A reload swaps queries and
+        // then bumps the generation (`lsp_impl::apply_shared_settings`); reading
+        // the generation last would let a reload landing mid-`populate` stamp a
+        // stale-query region set with the *new* generation, which the consumer's
+        // generation gate would then wrongly accept. Read first, a raced
+        // discovery carries the *old* generation and the post-reload consumer
+        // re-discovers inline — the "snapshot generation at the top" discipline
+        // the token handlers use.
+        let generation = self.semantic_token_generation();
+
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
@@ -195,7 +216,7 @@ impl CacheCoordinator {
                 // Clear any stale injection caches
                 self.injection_map.clear(uri);
                 self.injection_token_cache.clear_document(uri);
-                return;
+                return None;
             }
         };
 
@@ -207,7 +228,7 @@ impl CacheCoordinator {
                 // Clear any existing regions and caches for this document
                 self.injection_map.clear(uri);
                 self.injection_token_cache.clear_document(uri);
-                return;
+                return None;
             }
 
             // Get existing regions for cache cleanup and content comparison
@@ -278,7 +299,25 @@ impl CacheCoordinator {
 
             // Store in injection map
             self.injection_map.insert(uri.clone(), cacheable_regions);
+
+            // Producer half of the discovery lever: build the owned discovery
+            // from the SAME `regions` just collected — the injection query (`Q`)
+            // is not re-run — so a semanticTokens request bound to the snapshot
+            // this parse publishes can rebuild its contexts without
+            // re-discovering. `None` when not worth reusing
+            // (gate/combined/incomplete).
+            return crate::analysis::semantic::build_document_discovery(
+                &regions,
+                injection_query.as_ref(),
+                text,
+                language,
+                uri,
+                tracker,
+                generation,
+            );
         }
+
+        None
     }
 
     /// Get all injection regions for a document (test helper).
@@ -670,7 +709,7 @@ print("hello")
         let tree = parser.parse(initial_text, None).expect("parse");
 
         // Populate injections - this should create a region with position-based ULID
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             initial_text,
             &tree,
@@ -728,7 +767,7 @@ print("hello")
         // Key insight: After apply_text_diff, the tracker's positions are adjusted,
         // so get_or_create returns the SAME ULID. The invalidation check in
         // populate_injections should detect language_changed and remove cached tokens.
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             edited_text,
             &edited_tree,
@@ -803,7 +842,7 @@ print("hello")
         let tree = parser.parse(initial_text, None).expect("parse");
 
         // Populate injections
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             initial_text,
             &tree,
@@ -848,7 +887,7 @@ print("goodbye")
         let edited_tree = parser.parse(edited_text, None).expect("parse edited");
 
         // Re-populate injections
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             edited_text,
             &edited_tree,
