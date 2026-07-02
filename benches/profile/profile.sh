@@ -38,6 +38,7 @@ while [ $# -gt 0 ]; do
     --size) SIZE="$2"; shift 2;;
     --requests) REQUESTS="$2"; shift 2;;
     --edits) EDITS="$2"; shift 2;;
+    --file) FILE_ARG="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
@@ -69,7 +70,7 @@ dsymutil "$BIN"
 
 echo "==> Recording with samply (lang=$LANG_ARG size=$SIZE requests=$REQUESTS)"
 samply record -s -o "$OUT/profile.json.gz" \
-  -- python3 "$HERE/drive.py" --bin "./$BIN" --lang "$LANG_ARG" --size "$SIZE" --requests "$REQUESTS" --edits "${EDITS:-0}"
+  -- python3 "$HERE/drive.py" --bin "./$BIN" --lang "$LANG_ARG" --size "$SIZE" --requests "$REQUESTS" --edits "${EDITS:-0}" ${FILE_ARG:+--file "$FILE_ARG"}
 
 echo "==> Analyzing + writing collapsed stacks"
 python3 "$HERE/analyze.py" "$OUT/profile.json.gz" --dsym "$DWARF" --arch "$ARCH" \
