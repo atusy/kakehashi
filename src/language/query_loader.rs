@@ -218,7 +218,11 @@ impl QueryLoader {
         None
     }
 
-    /// Load a query file from search paths
+    /// Load a query file from search paths, falling back to the embedded
+    /// corpus for `bindings.scm` (lexical-name-resolution ADR, "Asset
+    /// distribution"): a user-provided file wins per file — `; inherits:`
+    /// parents resolve through this same lookup, so an embedded child can
+    /// inherit a search-path parent and vice versa.
     fn load_query_file<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
@@ -232,12 +236,20 @@ impl QueryLoader {
                     e
                 ))
             }),
-            None => Err(LspError::query(format!(
-                "Query file {} not found for language {} in search paths: {}",
-                file_name,
-                lang_name,
-                format_search_paths(runtime_bases)
-            ))),
+            None => {
+                if file_name == crate::config::settings::QueryKind::Bindings.filename()
+                    && let Some(embedded) =
+                        crate::language::embedded_queries::embedded_bindings_query(lang_name)
+                {
+                    return Ok(embedded.to_string());
+                }
+                Err(LspError::query(format!(
+                    "Query file {} not found for language {} in search paths: {}",
+                    file_name,
+                    lang_name,
+                    format_search_paths(runtime_bases)
+                )))
+            }
         }
     }
 

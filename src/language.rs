@@ -1,5 +1,6 @@
 pub(crate) mod config_store;
 pub(crate) mod coordinator;
+pub(crate) mod embedded_queries;
 pub(crate) mod events;
 pub(crate) mod failed_parsers;
 pub(crate) mod filetypes;
