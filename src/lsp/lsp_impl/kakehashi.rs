@@ -1,3 +1,3 @@
 mod captures;
 mod internal;
-mod node;
+pub(crate) mod node;

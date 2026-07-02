@@ -394,6 +394,7 @@ impl ParseCoordinator {
                         injection_regions: None,
                         bridge_regions: None,
                         resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
                     },
                 );
                 advance_watermark();
@@ -490,6 +491,7 @@ impl ParseCoordinator {
                         injection_regions: regions.discovery,
                         bridge_regions: regions.bridge_regions,
                         resolved_regions: regions.resolved_regions,
+                        layer_trees: std::sync::OnceLock::new(),
                     },
                 );
                 advance_watermark();
@@ -530,6 +532,7 @@ impl ParseCoordinator {
                     injection_regions: None,
                     bridge_regions: None,
                     resolved_regions: None,
+                    layer_trees: std::sync::OnceLock::new(),
                 },
             );
             advance_watermark();
@@ -562,6 +565,7 @@ impl ParseCoordinator {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
             },
         );
         advance_watermark();
@@ -734,6 +738,7 @@ impl ParseCoordinator {
                     injection_regions: regions.discovery,
                     bridge_regions: regions.bridge_regions,
                     resolved_regions: regions.resolved_regions,
+                    layer_trees: std::sync::OnceLock::new(),
                 },
             );
             // Serve-stale's heal signal, mirroring reparse_latest: a token
@@ -926,6 +931,7 @@ impl ParseCoordinator {
                     injection_regions: regions.discovery,
                     bridge_regions: regions.bridge_regions,
                     resolved_regions: regions.resolved_regions,
+                    layer_trees: std::sync::OnceLock::new(),
                 },
             );
             // Serve-stale's heal signal (ADR §3): a fresh publish re-drives the

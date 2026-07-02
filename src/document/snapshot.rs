@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tree_sitter::Tree;
 
-use super::injections::{DiscoveredBridgeRegion, DiscoveredInjections};
+use super::injections::{DiscoveredBridgeRegion, DiscoveredInjections, SnapshotLayerTree};
 use crate::language::injection::ResolvedInjection;
 
 /// The reserved terminal incarnation `didClose` installs in a slot
@@ -63,6 +63,16 @@ pub(crate) struct ParseSnapshot {
     /// which previously each re-ran the injection query per request. Same
     /// `None`/`Some(empty)` semantics as `bridge_regions`.
     pub(crate) resolved_regions: Option<Arc<Vec<ResolvedInjection>>>,
+    /// Lazily-built, per-snapshot injection layer trees (document-order DFS,
+    /// depth ≥ 1) for the captures/node layer walk: the FIRST walking request
+    /// on this snapshot builds them (on the compute pool — the same cost the
+    /// inline walk paid), and every subsequent walk on the same snapshot —
+    /// captures full + delta both walk per keystroke, plus range and node
+    /// lookups — reuses the parsed trees instead of re-running the injection
+    /// query and re-parsing every region. Deliberately lazy rather than
+    /// populate-built: non-captures users never pay, and the parse loop's
+    /// publish latency is untouched.
+    pub(crate) layer_trees: std::sync::OnceLock<Arc<Vec<SnapshotLayerTree>>>,
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -139,6 +149,7 @@ mod tests {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
         }
     }
 
@@ -185,6 +196,7 @@ mod tests {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
         }
     }
 

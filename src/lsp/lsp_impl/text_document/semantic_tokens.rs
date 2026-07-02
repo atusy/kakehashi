@@ -928,6 +928,7 @@ mod tests {
                         injection_regions: None,
                         bridge_regions: None,
                         resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
                     },
                 ))
             })

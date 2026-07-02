@@ -104,3 +104,29 @@ pub(crate) struct DiscoveredBridgeRegion {
     /// document text the bridge opens downstream.
     pub content: String,
 }
+
+/// One pre-parsed injection layer of a document, in document-order DFS —
+/// the owned product of the captures/node layer walk
+/// (`walk_document_layers`), built ONCE per parse by `populate_injections`
+/// and carried on the `ParseSnapshot` so the per-keystroke `kakehashi/captures`
+/// requests (full AND delta both walk) iterate these instead of re-running
+/// the injection query, re-resolving every region's language, and re-parsing
+/// every injected region per request.
+///
+/// `tree` is parsed with the exact absolute included ranges the inline walk
+/// computes (same code, run at populate time), so consuming these is
+/// byte-identical to walking inline over the same snapshot.
+#[derive(Clone)]
+pub(crate) struct SnapshotLayerTree {
+    /// Resolved injection language (e.g. `"markdown_inline"`).
+    pub language: String,
+    /// The layer's tree, parsed against the host text with the layer's
+    /// absolute included ranges (`Tree::included_ranges` recovers them).
+    pub tree: tree_sitter::Tree,
+    /// Injection depth (host is 0; these start at 1).
+    pub depth: usize,
+    /// Host-byte span covering the layer's included ranges, for cheap
+    /// range-request pruning (conservative: a false-positive visit only makes
+    /// the layer's query yield nothing for the clipped range).
+    pub span: std::ops::Range<usize>,
+}

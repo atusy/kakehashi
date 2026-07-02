@@ -35,6 +35,10 @@ def main() -> None:
                                    "generated document (language inferred from the "
                                    "extension, falling back to --lang)")
     ap.add_argument(
+        "--captures", action="store_true",
+        help="also send kakehashi/captures/full (injection mode) per request, "
+             "mirroring a captures-protocol highlighter client")
+    ap.add_argument(
         "--settle", type=float, default=0.3,
         help="seconds to wait after didOpen before the first request "
              "(0 reproduces a client that requests immediately)")
@@ -155,6 +159,12 @@ def main() -> None:
                 time.sleep(0.01)
             t_req = time.time()
             resp = request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
+            if args.captures:
+                request("kakehashi/captures/full",
+                        {"textDocument": {"uri": uri}, "kind": "highlights", "injection": True})
+                request("kakehashi/captures/full/delta",
+                        {"textDocument": {"uri": uri}, "kind": "highlights",
+                         "previousResultId": "warm-miss"})
             req_times.append(time.time() - t_req)
             if "error" in resp:
                 # Only -32800 (request cancelled) is expected here; any other

@@ -759,6 +759,7 @@ impl DocumentStore {
             injection_regions: None,
             bridge_regions: None,
             resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
         };
         doc.publish_snapshot(Arc::new(snapshot));
     }
@@ -822,6 +823,7 @@ mod tests {
                 injection_regions: None,
                 bridge_regions: None,
                 resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
             }
         }
 

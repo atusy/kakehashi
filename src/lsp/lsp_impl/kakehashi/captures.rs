@@ -173,6 +173,46 @@ struct KindQuery {
     skipped: Vec<crate::language::query_loader::SkippedPattern>,
 }
 
+/// Compiled-kind-query cache keyed by `(language, kind file, settings
+/// generation)`. `load_kind_query` re-read and re-COMPILED every visited
+/// language's kind file on every request — for a per-keystroke highlighter
+/// over an injection-heavy document that meant re-compiling several large
+/// query files per keystroke, dwarfing the walk itself. The generation key
+/// gives the same hot-reload discipline as the highlight-query store: a
+/// settings reload (which also re-resolves search paths) starts a fresh
+/// generation and old entries become unreachable garbage (bounded by the
+/// handful of (language, kind) pairs a session touches).
+type KindQueryCache = dashmap::DashMap<(String, String, u64), std::sync::Arc<KindQueryLoad>>;
+
+fn kind_query_cache() -> &'static KindQueryCache {
+    static CACHE: std::sync::OnceLock<KindQueryCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(KindQueryCache::default)
+}
+
+/// Generation-cached wrapper around [`load_kind_query`].
+fn load_kind_query_cached(
+    registry: &LanguageRegistry,
+    search_paths: &[PathBuf],
+    language_id: &str,
+    file_name: &str,
+    generation: u64,
+) -> std::sync::Arc<KindQueryLoad> {
+    let key = (language_id.to_string(), file_name.to_string(), generation);
+    if let Some(hit) = kind_query_cache().get(&key) {
+        return std::sync::Arc::clone(&hit);
+    }
+    let loaded = std::sync::Arc::new(load_kind_query(
+        registry,
+        search_paths,
+        language_id,
+        file_name,
+    ));
+    kind_query_cache()
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::clone(&loaded));
+    loaded
+}
+
 /// Per-language outcome of resolving `queries/<lang>/<kind>.scm`.
 ///
 /// `Broken` is distinct from `Unavailable` so a kind file that exists but
@@ -580,9 +620,32 @@ impl Kakehashi {
         let tracker = self.bridge.node_tracker_arc();
         let documents = std::sync::Arc::clone(&self.documents);
         let parsed_version = snapshot.parsed_version;
+        // Settings generation for the kind-query compile cache — the same
+        // reload discipline the token caches use.
+        let generation = self.cache.semantic_token_generation();
+        let snapshot_for_layers = std::sync::Arc::clone(&snapshot);
         let walked = self
             .compute_pool
             .run(None, move || {
+                // Lazily build the snapshot's layer trees on first use (this
+                // is the same walk the inline path would run) and share them
+                // across every subsequent walk on this snapshot — captures
+                // full + delta both walk per keystroke. Concurrent walkers on
+                // one snapshot block on the OnceLock and reuse the winner's.
+                let layers = if injection {
+                    Some(snapshot_for_layers.layer_trees.get_or_init(|| {
+                        std::sync::Arc::new(
+                            crate::lsp::lsp_impl::kakehashi::node::injection_stack::collect_document_layer_trees(
+                                &language,
+                                &language_id,
+                                &text,
+                                &tree,
+                            ),
+                        )
+                    }))
+                } else {
+                    None
+                };
                 execute_captures_walk(
                     &uri_for_walk,
                     &kind,
@@ -591,11 +654,13 @@ impl Kakehashi {
                     &language_id,
                     &text,
                     &tree,
+                    layers.map(|l| l.as_slice()),
                     &language,
                     &tracker,
                     &documents,
                     parsed_version,
                     incarnation,
+                    generation,
                 )
             })
             .await;
@@ -627,11 +692,13 @@ fn execute_captures_walk(
     language_id: &str,
     text: &str,
     tree: &tree_sitter::Tree,
+    layer_trees: Option<&[crate::document::SnapshotLayerTree]>,
     language: &crate::language::LanguageCoordinator,
     tracker: &crate::language::NodeTracker,
     documents: &crate::document::DocumentStore,
     parsed_version: u64,
     incarnation: u64,
+    generation: u64,
 ) -> Option<(Vec<Value>, Vec<Value>)> {
     // Tracker minting is currency-gated: the NodeTracker is a LIVE-coordinate
     // index (didChange shifts every entry before the reparse), so a trailing
@@ -679,20 +746,27 @@ fn execute_captures_walk(
     let search_paths = language.search_paths();
     let file_name = format!("{kind}.scm");
 
-    // One kind-query load per language per request: with many regions of
-    // the same language (e.g. dozens of python blocks), the memo keeps
-    // file IO + compilation at one per language, and yields each
-    // language's `skipped` exactly once.
-    let mut kind_queries: HashMap<String, KindQueryLoad> = HashMap::new();
+    // One kind-query load per language per request — served from the
+    // process-wide generation-keyed compile cache, so across requests each
+    // (language, kind) compiles once per settings generation instead of once
+    // per keystroke. The per-request map still yields each language's
+    // `skipped` exactly once.
+    let mut kind_queries: HashMap<String, std::sync::Arc<KindQueryLoad>> = HashMap::new();
     let mut matches: Vec<Value> = Vec::new();
 
     let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
         let entry = kind_queries
             .entry(layer_language.to_string())
             .or_insert_with(|| {
-                load_kind_query(&registry, &search_paths, layer_language, &file_name)
+                load_kind_query_cached(
+                    &registry,
+                    &search_paths,
+                    layer_language,
+                    &file_name,
+                    generation,
+                )
             });
-        let KindQueryLoad::Loaded(kind_query) = entry else {
+        let KindQueryLoad::Loaded(kind_query) = entry.as_ref() else {
             return;
         };
         for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
@@ -775,14 +849,32 @@ fn execute_captures_walk(
     };
 
     if injection {
-        walk_document_layers(
-            language,
-            language_id,
-            text,
-            tree,
-            byte_range.as_ref(),
-            &mut visit,
-        );
+        if let Some(layers) = layer_trees {
+            // Pre-parsed layers from the snapshot's populate pass (the
+            // layer-tree half of never-discover-twice): identical to the
+            // inline walk below by construction — populate built them with
+            // that walk over this same (text, tree). The span check mirrors
+            // the walk's byte_filter pruning: a false-positive visit only
+            // makes the layer's query yield nothing for the clipped range.
+            visit(language_id, tree, 0);
+            for layer in layers {
+                if let Some(filter) = &byte_range
+                    && (layer.span.end <= filter.start || layer.span.start >= filter.end)
+                {
+                    continue;
+                }
+                visit(&layer.language, &layer.tree, layer.depth);
+            }
+        } else {
+            walk_document_layers(
+                language,
+                language_id,
+                text,
+                tree,
+                byte_range.as_ref(),
+                &mut visit,
+            );
+        }
     } else {
         visit(language_id, tree, 0);
     }
@@ -818,7 +910,7 @@ fn execute_captures_walk(
     // result.
     if !kind_queries
         .values()
-        .any(|load| matches!(load, KindQueryLoad::Loaded(_)))
+        .any(|load| matches!(load.as_ref(), KindQueryLoad::Loaded(_)))
     {
         return None;
     }
@@ -832,7 +924,7 @@ fn execute_captures_walk(
     let mut reportable: Vec<(&String, &[crate::language::query_loader::SkippedPattern])> =
         kind_queries
             .iter()
-            .filter_map(|(lang, load)| match load {
+            .filter_map(|(lang, load)| match load.as_ref() {
                 KindQueryLoad::Loaded(kq) => Some((lang, kq.skipped.as_slice())),
                 KindQueryLoad::Broken(skipped) => Some((lang, skipped.as_slice())),
                 KindQueryLoad::Unavailable => None,
@@ -929,11 +1021,13 @@ mod tests {
             "rust",
             text,
             &tree,
+            None,
             &coordinator,
             &tracker,
             &store,
             0,
             incarnation,
+            0,
         )
         .expect("kind query should load");
         assert!(!matches.is_empty(), "identifiers should match");
@@ -955,11 +1049,13 @@ mod tests {
             "rust",
             text,
             &tree,
+            None,
             &coordinator,
             &tracker,
             &store,
             0,
             incarnation,
+            0,
         )
         .expect("kind query should load");
         assert!(
@@ -983,11 +1079,13 @@ mod tests {
             "rust",
             text,
             &tree,
+            None,
             &coordinator,
             &stale_tracker,
             &store,
             0,
             incarnation,
+            0,
         )
         .expect("kind query should load");
         let id = first_node_id(&stale_matches);
