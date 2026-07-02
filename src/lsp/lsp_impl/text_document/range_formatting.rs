@@ -116,14 +116,17 @@ impl Kakehashi {
                 return Ok(None);
             };
 
-            let all_regions = InjectionResolver::resolve_all(
-                &self.language,
-                self.bridge.node_tracker(),
-                &uri,
-                snapshot.tree(),
-                snapshot.text(),
-                injection_query.as_ref(),
-            );
+            let all_regions = match self.documents.current_resolved_regions(&uri) {
+                Some(regions) => regions.as_ref().clone(),
+                None => InjectionResolver::resolve_all(
+                    &self.language,
+                    self.bridge.node_tracker(),
+                    &uri,
+                    snapshot.tree(),
+                    snapshot.text(),
+                    injection_query.as_ref(),
+                ),
+            };
 
             if all_regions.is_empty() {
                 return Ok(None);

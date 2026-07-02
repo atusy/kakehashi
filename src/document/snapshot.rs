@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tree_sitter::Tree;
 
 use super::injections::{DiscoveredBridgeRegion, DiscoveredInjections};
+use crate::language::injection::ResolvedInjection;
 
 /// The reserved terminal incarnation `didClose` installs in a slot
 /// (`u64::MAX`). Keeping the closed slot at its old incarnation would let a
@@ -56,6 +57,12 @@ pub(crate) struct ParseSnapshot {
     /// (`None` when populate didn't run for this snapshot — the downstream
     /// then resolves inline; `Some(empty)` means genuinely no regions).
     pub(crate) bridge_regions: Option<Arc<Vec<DiscoveredBridgeRegion>>>,
+    /// Fully resolved injection regions (`InjectionResolver::resolve_all`'s
+    /// shape) from the same populate pass, for the whole-document readers —
+    /// pull/push diagnostics, documentSymbol/Color, formatting's virt layer —
+    /// which previously each re-ran the injection query per request. Same
+    /// `None`/`Some(empty)` semantics as `bridge_regions`.
+    pub(crate) resolved_regions: Option<Arc<Vec<ResolvedInjection>>>,
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -131,6 +138,7 @@ mod tests {
             incarnation,
             injection_regions: None,
             bridge_regions: None,
+            resolved_regions: None,
         }
     }
 
@@ -176,6 +184,7 @@ mod tests {
             incarnation,
             injection_regions: None,
             bridge_regions: None,
+            resolved_regions: None,
         }
     }
 

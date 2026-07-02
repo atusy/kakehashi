@@ -185,14 +185,20 @@ impl DiagnosticScheduler {
                 self.language
                     .injection_query(&language_name)
                     .map(|injection_query| {
-                        let all_regions = InjectionResolver::resolve_all(
-                            &self.language,
-                            self.bridge.node_tracker(),
-                            uri,
-                            snapshot.tree(),
-                            snapshot.text(),
-                            injection_query.as_ref(),
-                        );
+                        // Prefer the populate pass's regions riding the current
+                        // parse snapshot (never discover twice, ADR §3); fall
+                        // back to the inline resolution when absent/stale.
+                        let all_regions = match self.documents.current_resolved_regions(uri) {
+                            Some(regions) => regions.as_ref().clone(),
+                            None => InjectionResolver::resolve_all(
+                                &self.language,
+                                self.bridge.node_tracker(),
+                                uri,
+                                snapshot.tree(),
+                                snapshot.text(),
+                                injection_query.as_ref(),
+                            ),
+                        };
 
                         let mut contexts = Vec::new();
                         // Configs + aggregation are keyed by injection language, so

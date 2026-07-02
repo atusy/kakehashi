@@ -58,6 +58,7 @@ pub(crate) struct CacheCoordinator {
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<crate::document::DiscoveredInjections>,
     pub(crate) bridge_regions: Vec<crate::document::DiscoveredBridgeRegion>,
+    pub(crate) resolved_regions: Vec<crate::language::injection::ResolvedInjection>,
 }
 
 impl PopulatedInjections {
@@ -67,6 +68,7 @@ impl PopulatedInjections {
         Self {
             discovery: None,
             bridge_regions: Vec::new(),
+            resolved_regions: Vec::new(),
         }
     }
 }
@@ -361,9 +363,16 @@ impl CacheCoordinator {
                 tracker,
                 generation,
             );
+            // The whole-document readers' fully resolved regions, again from
+            // the same single query run.
+            let resolved_regions =
+                crate::language::injection::InjectionResolver::resolve_from_regions(
+                    language, tracker, uri, &regions, text,
+                );
             return PopulatedInjections {
                 discovery,
                 bridge_regions,
+                resolved_regions,
             };
         }
 

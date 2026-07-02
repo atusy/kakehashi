@@ -189,16 +189,19 @@ impl Kakehashi {
             (true, Some(snapshot)) => self
                 .language
                 .injection_query(&language_name)
-                .map(|injection_query| {
-                    InjectionResolver::resolve_all(
-                        &self.language,
-                        self.bridge.node_tracker(),
-                        &uri,
-                        snapshot.tree(),
-                        snapshot.text(),
-                        injection_query.as_ref(),
-                    )
-                })
+                .map(
+                    |injection_query| match self.documents.current_resolved_regions(&uri) {
+                        Some(regions) => regions.as_ref().clone(),
+                        None => InjectionResolver::resolve_all(
+                            &self.language,
+                            self.bridge.node_tracker(),
+                            &uri,
+                            snapshot.tree(),
+                            snapshot.text(),
+                            injection_query.as_ref(),
+                        ),
+                    },
+                )
                 .unwrap_or_default(),
             // Virt gated off, or no tree yet (the host layer still pulls). The
             // wait+on-demand above already tried, so a missing tree here is the

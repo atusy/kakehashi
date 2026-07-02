@@ -10,6 +10,17 @@ use url::Url;
 use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
+/// Everything one populate pass derives for the snapshot it rides on
+/// (parse-snapshot ADR §3): all `None` when populate was skipped (raced CAS)
+/// or the pool work-unit panicked — readers then fall back to inline
+/// resolution for that snapshot.
+#[derive(Default)]
+struct PopulatedSnapshotRegions {
+    discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
+    bridge_regions: Option<std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>>,
+    resolved_regions: Option<std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>>,
+}
+
 /// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 /// THE SAME constant bounds the injected-layer re-parses (`parse_with_ranges`),
@@ -240,10 +251,7 @@ impl ParseCoordinator {
         text: std::sync::Arc<str>,
         tree: tree_sitter::Tree,
         language_name: String,
-    ) -> (
-        Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
-        Option<std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>>,
-    ) {
+    ) -> PopulatedSnapshotRegions {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
@@ -257,13 +265,14 @@ impl ParseCoordinator {
                     &language,
                     &tracker,
                 );
-                (
-                    populated.discovery.map(std::sync::Arc::new),
-                    Some(std::sync::Arc::new(populated.bridge_regions)),
-                )
+                PopulatedSnapshotRegions {
+                    discovery: populated.discovery.map(std::sync::Arc::new),
+                    bridge_regions: Some(std::sync::Arc::new(populated.bridge_regions)),
+                    resolved_regions: Some(std::sync::Arc::new(populated.resolved_regions)),
+                }
             })
             .await
-            .unwrap_or((None, None))
+            .unwrap_or_default()
     }
 
     /// Parse the (already-registered) document at `uri` and publish the result.
@@ -384,6 +393,7 @@ impl ParseCoordinator {
                         incarnation,
                         injection_regions: None,
                         bridge_regions: None,
+                        resolved_regions: None,
                     },
                 );
                 advance_watermark();
@@ -454,7 +464,7 @@ impl ParseCoordinator {
                 // the previous snapshot meanwhile. A rejected CAS (raced) skips
                 // populate — the snapshot then publishes without discovery and
                 // readers discover inline for that (already-superseded) snapshot.
-                let (discovery, bridge_regions) = if stored {
+                let regions = if stored {
                     let populated = self
                         .populate_injections_on_pool(
                             uri.clone(),
@@ -467,7 +477,7 @@ impl ParseCoordinator {
                         .mark_parse_finished(&uri, parse_generation, true);
                     populated
                 } else {
-                    (None, None)
+                    PopulatedSnapshotRegions::default()
                 };
                 self.publish_parse_snapshot(
                     &uri,
@@ -477,8 +487,9 @@ impl ParseCoordinator {
                         language: Some(language_name.clone()),
                         parsed_version: content_version,
                         incarnation,
-                        injection_regions: discovery,
-                        bridge_regions,
+                        injection_regions: regions.discovery,
+                        bridge_regions: regions.bridge_regions,
+                        resolved_regions: regions.resolved_regions,
                     },
                 );
                 advance_watermark();
@@ -518,6 +529,7 @@ impl ParseCoordinator {
                     incarnation,
                     injection_regions: None,
                     bridge_regions: None,
+                    resolved_regions: None,
                 },
             );
             advance_watermark();
@@ -549,6 +561,7 @@ impl ParseCoordinator {
                 incarnation,
                 injection_regions: None,
                 bridge_regions: None,
+                resolved_regions: None,
             },
         );
         advance_watermark();
@@ -699,7 +712,7 @@ impl ParseCoordinator {
             // (ADR §3); the cell guard still rejects a stale lifetime or an
             // out-of-order version at publish. A rejected CAS skips populate —
             // the snapshot still publishes as stale-but-consistent.
-            let (discovery, bridge_regions) = if stored {
+            let regions = if stored {
                 self.populate_injections_on_pool(
                     uri.clone(),
                     text.clone(),
@@ -708,7 +721,7 @@ impl ParseCoordinator {
                 )
                 .await
             } else {
-                (None, None)
+                PopulatedSnapshotRegions::default()
             };
             let published = self.publish_parse_snapshot(
                 &uri,
@@ -718,8 +731,9 @@ impl ParseCoordinator {
                     language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation: expected_incarnation,
-                    injection_regions: discovery,
-                    bridge_regions,
+                    injection_regions: regions.discovery,
+                    bridge_regions: regions.bridge_regions,
+                    resolved_regions: regions.resolved_regions,
                 },
             );
             // Serve-stale's heal signal, mirroring reparse_latest: a token
@@ -890,7 +904,7 @@ impl ParseCoordinator {
             // (the text moved on mid-parse) skips populate — the snapshot still
             // publishes as stale-but-consistent (its readers discover inline;
             // the scheduler's dirty loop is already reparsing the newer text).
-            let (discovery, bridge_regions) = if stored {
+            let regions = if stored {
                 self.populate_injections_on_pool(
                     uri.clone(),
                     text.clone(),
@@ -899,7 +913,7 @@ impl ParseCoordinator {
                 )
                 .await
             } else {
-                (None, None)
+                PopulatedSnapshotRegions::default()
             };
             let published = self.publish_parse_snapshot(
                 uri,
@@ -909,8 +923,9 @@ impl ParseCoordinator {
                     language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation,
-                    injection_regions: discovery,
-                    bridge_regions,
+                    injection_regions: regions.discovery,
+                    bridge_regions: regions.bridge_regions,
+                    resolved_regions: regions.resolved_regions,
                 },
             );
             // Serve-stale's heal signal (ADR §3): a fresh publish re-drives the

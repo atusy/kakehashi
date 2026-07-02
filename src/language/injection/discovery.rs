@@ -444,6 +444,7 @@ fn find_injection_at_position<'a>(
 }
 
 /// Resolved injection region with all necessary context for LSP bridge requests
+#[derive(Clone)]
 pub(crate) struct ResolvedInjection {
     /// Cacheable injection region with line range information
     pub region: CacheableInjectionRegion,
@@ -579,7 +580,20 @@ impl InjectionResolver {
             return Vec::new();
         };
 
-        injections
+        Self::resolve_from_regions(coordinator, tracker, uri, &injections, text)
+    }
+
+    /// [`resolve_all`](Self::resolve_all) minus the injection-query run, for a
+    /// caller that already collected the regions (the populate pass — never
+    /// discover twice, parse-snapshot ADR §3).
+    pub(crate) fn resolve_from_regions(
+        coordinator: &LanguageCoordinator,
+        tracker: &NodeTracker,
+        uri: &Url,
+        regions: &[InjectionRegionInfo<'_>],
+        text: &str,
+    ) -> Vec<ResolvedInjection> {
+        regions
             .iter()
             .map(|region| Self::build_resolved_injection(coordinator, tracker, uri, region, text))
             .collect()

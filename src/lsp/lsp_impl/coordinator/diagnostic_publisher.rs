@@ -624,14 +624,18 @@ impl DiagnosticPublisher {
             return offsets;
         };
 
-        for resolved in InjectionResolver::resolve_all(
-            &self.language,
-            self.bridge.node_tracker(),
-            host,
-            snapshot.tree(),
-            snapshot.text(),
-            injection_query.as_ref(),
-        ) {
+        let resolved_regions = match self.documents.current_resolved_regions(host) {
+            Some(regions) => regions.as_ref().clone(),
+            None => InjectionResolver::resolve_all(
+                &self.language,
+                self.bridge.node_tracker(),
+                host,
+                snapshot.tree(),
+                snapshot.text(),
+                injection_query.as_ref(),
+            ),
+        };
+        for resolved in resolved_regions {
             offsets.insert(
                 resolved.region.region_id.clone(),
                 RegionOffset::with_per_line_offsets(

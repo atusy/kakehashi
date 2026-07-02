@@ -758,8 +758,25 @@ impl DocumentStore {
             incarnation: doc.incarnation(),
             injection_regions: None,
             bridge_regions: None,
+            resolved_regions: None,
         };
         doc.publish_snapshot(Arc::new(snapshot));
+    }
+
+    /// The CURRENT snapshot's fully resolved injection regions, or `None` when
+    /// there is no current snapshot or its populate pass didn't derive them —
+    /// the caller then resolves inline against the live tree, exactly as
+    /// before (parse-snapshot ADR §3, never discover twice).
+    pub(crate) fn current_resolved_regions(
+        &self,
+        uri: &Url,
+    ) -> Option<std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>> {
+        let view = self.latest_snapshot(uri)?;
+        let snapshot = view.slot.snapshot?;
+        if snapshot.parsed_version != view.content_version {
+            return None;
+        }
+        snapshot.resolved_regions.clone()
     }
 
     /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the
@@ -804,6 +821,7 @@ mod tests {
                 incarnation: doc.incarnation(),
                 injection_regions: None,
                 bridge_regions: None,
+                resolved_regions: None,
             }
         }
 

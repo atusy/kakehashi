@@ -927,6 +927,7 @@ mod tests {
                         incarnation,
                         injection_regions: None,
                         bridge_regions: None,
+                        resolved_regions: None,
                     },
                 ))
             })

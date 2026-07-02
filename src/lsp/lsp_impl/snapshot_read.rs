@@ -152,6 +152,7 @@ mod tests {
                     incarnation: inc,
                     injection_regions: None,
                     bridge_regions: None,
+                    resolved_regions: None,
                 }))
             })
             .unwrap_or(false);
