@@ -24,12 +24,20 @@ from gen_session import gen_rust, gen_markdown_injections  # noqa: E402
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
+    ap.add_argument("--server-arg", action="append", default=[],
+                    help="extra argument passed to the server (repeatable), e.g. "
+                         "--server-arg=--config-file --server-arg=/path/lsp.toml "
+                         "to reproduce a real user configuration")
     ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
     ap.add_argument("--file", help="drive with this file's content instead of a "
                                    "generated document (language inferred from the "
                                    "extension, falling back to --lang)")
+    ap.add_argument(
+        "--settle", type=float, default=0.3,
+        help="seconds to wait after didOpen before the first request "
+             "(0 reproduces a client that requests immediately)")
     ap.add_argument(
         "--edits", type=int, default=0,
         help="simulate typing: before each request, send this many incremental "
@@ -64,7 +72,7 @@ def main() -> None:
     env = dict(os.environ, KAKEHASHI_DATA_DIR=args.data_dir)
     # Let the server's stderr through (it's silent unless RUST_LOG is set) so a
     # crash or panic is visible instead of being swallowed during profiling.
-    srv = subprocess.Popen([args.bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    srv = subprocess.Popen([args.bin, *args.server_arg], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                            env=env)
     rid = 0
 
@@ -118,12 +126,14 @@ def main() -> None:
         notify("initialized", {})
         notify("textDocument/didOpen", {"textDocument": {
             "uri": uri, "languageId": lang, "version": 1, "text": text}})
-        time.sleep(0.3)  # let the initial parse settle
+        if args.settle > 0:
+            time.sleep(args.settle)  # let the initial parse settle
 
         ok, canceled, tokens = 0, 0, 0
         version = 1
         first_line_len = len(text.split("\n", 1)[0])
         t0 = time.time()
+        req_times = []
         for i in range(args.requests):
             for j in range(args.edits):
                 # Toggle a trailing char on line 0 so the text genuinely changes
@@ -143,7 +153,9 @@ def main() -> None:
                     "contentChanges": [change]})
                 # a beat for the off-ingress reparse to run (the profiled work)
                 time.sleep(0.01)
+            t_req = time.time()
             resp = request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
+            req_times.append(time.time() - t_req)
             if "error" in resp:
                 # Only -32800 (request cancelled) is expected here; any other
                 # error means a broken setup that would make the profile
@@ -173,6 +185,8 @@ def main() -> None:
     n_lines = len(text.splitlines())
     source = (f"file={args.file} ({n_bytes}B/{n_lines}L)"
               if args.file else f"size={args.size}")
+    firsts = " ".join(f"{t*1000:.0f}" for t in req_times[:5])
+    sys.stderr.write(f"[drive] first-request ms: {firsts}\n")
     sys.stderr.write(
         f"[drive] lang={lang} {source} requests={args.requests} "
         f"ok={ok} canceled={canceled} tokens/req={tokens} "

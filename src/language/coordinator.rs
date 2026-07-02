@@ -37,6 +37,14 @@ pub(crate) struct LanguageCoordinator {
     base_map: RwLock<HashMap<String, String>>,
     derived_languages: RwLock<HashSet<String>>,
     config_warnings: RwLock<Vec<String>>,
+    /// Negative cache for parser-load attempts: a language whose load failed
+    /// (no library found on the search paths) is recorded here so repeated
+    /// resolution attempts — e.g. per injection region, per compute, for a
+    /// not-installed injected language like `latex` inside `markdown_inline` —
+    /// return immediately instead of re-scanning the filesystem every time.
+    /// Cleared on every `load_settings` (settings reload / post-install
+    /// reload), which is the only event that can make a failed load succeed.
+    failed_loads: dashmap::DashSet<String>,
 }
 
 impl Default for LanguageCoordinator {
@@ -55,6 +63,7 @@ impl LanguageCoordinator {
             parser_loader: RwLock::new(ParserLoader::new()),
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
+            failed_loads: dashmap::DashSet::new(),
             config_warnings: RwLock::new(Vec::new()),
         }
     }
@@ -65,10 +74,18 @@ impl LanguageCoordinator {
     /// and analysis modules to ensure parsers are available before use.
     pub(crate) fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
         if self.language_registry.contains(language_id) {
-            LanguageLoadResult::success_with(Vec::new())
-        } else {
-            self.try_load_language_by_id(language_id)
+            return LanguageLoadResult::success_with(Vec::new());
         }
+        // Known-failed load: skip the filesystem scan (and the warning events —
+        // the first attempt already surfaced them). See `failed_loads`.
+        if self.failed_loads.contains(language_id) {
+            return LanguageLoadResult::default();
+        }
+        let result = self.try_load_language_by_id(language_id);
+        if !result.success {
+            self.failed_loads.insert(language_id.to_string());
+        }
+        result
     }
 
     /// Initialize from workspace-level settings and return coordination events.
@@ -78,6 +95,9 @@ impl LanguageCoordinator {
     pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
         self.config_store.update_from_settings(settings);
         self.clear_derived_languages();
+        // A reload (new search paths, or the post-install reload) is the only
+        // event that can turn a failed load into a success — retry everything.
+        self.failed_loads.clear();
 
         // Build base map from language configs
         self.build_base_map(&settings.languages);

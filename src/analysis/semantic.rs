@@ -93,6 +93,7 @@ pub(crate) async fn handle_semantic_tokens_full(
 ) -> Option<SemanticTokensResult> {
     pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
+        let t_start = std::time::Instant::now();
 
         let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
@@ -115,6 +116,8 @@ pub(crate) async fn handle_semantic_tokens_full(
             &[],
             &mut all_tokens,
         );
+
+        let host_elapsed = t_start.elapsed();
 
         // Bail before the injection pass — the dominant cost on a large document
         // — if this request has already been superseded.
@@ -162,6 +165,21 @@ pub(crate) async fn handle_semantic_tokens_full(
         if is_cancelled() {
             return None;
         }
+
+        // Phase timing at debug level: pinpoints where a slow compute spends
+        // its time (host query pass vs injection fan-out) without a profiler
+        // attached — the numbers a user-supplied log needs.
+        log::debug!(
+            target: "kakehashi::semantic",
+            "[SEMANTIC_TOKENS] compute phases: host={}ms injections={}ms regions_reused={} ",
+            host_elapsed.as_millis(),
+            t_start.elapsed().saturating_sub(host_elapsed).as_millis(),
+            injection_cache
+                .as_ref()
+                .and_then(|p| p.discovery.as_ref())
+                .map(|d| d.regions.len() as i64)
+                .unwrap_or(-1),
+        );
 
         // Merge injection tokens with host tokens
         all_tokens.extend(injection_tokens);
