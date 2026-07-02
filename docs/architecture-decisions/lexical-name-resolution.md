@@ -512,7 +512,9 @@ bash/go/javascript/lua/python/rust/typescript with searchPaths-first
 per-file fallback and embedded `; inherits:` (typescript → javascript),
 validated by fixture tests against the real grammars.
 
-Remaining gap: resolution runs on the **host layer only** — a cursor inside
-an injected region gets no native answer yet (the bridge still owns those),
-pending injection-coordinate support in the native contributor. Cross-region
-resolution stays out of scope for v1 as decided above.
+Injected layers resolve natively too: the region under the cursor is parsed
+with included ranges and results map back through the region's content
+offset, per-layer and never crossing regions. Remaining gap:
+`#offset!`-shifted regions stay bridge-only (the native path does not clip
+effective windows yet). Cross-region resolution stays out of scope for v1 as
+decided above.

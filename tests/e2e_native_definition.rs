@@ -82,6 +82,60 @@ fn native_definition_resolves_without_a_bridge_server() {
 }
 
 #[test]
+fn native_definition_resolves_inside_markdown_lua_block() {
+    let mut client = LspClient::new();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // line 3: `local v = 1`; line 4: `print(v)` — inside a lua fence.
+    let markdown = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
+    let md_uri = "file:///native_bindings_test.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": md_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": markdown
+            }
+        }),
+    );
+
+    let response = client.send_request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": md_uri },
+            "position": { "line": 4, "character": 6 }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response:?}");
+    let result = &response["result"];
+    assert!(
+        !result.is_null(),
+        "injected-layer cursor must resolve natively: {response:?}"
+    );
+    let location = if result.is_array() {
+        result[0].clone()
+    } else {
+        result.clone()
+    };
+    let range = location
+        .get("range")
+        .or_else(|| location.get("targetRange"))
+        .expect("range");
+    assert_eq!(range["start"]["line"], 3, "definition in host coordinates");
+    assert_eq!(range["start"]["character"], 6);
+}
+
+#[test]
 fn native_references_and_rename_span_definition_and_use() {
     let mut client = client_with_open_doc();
 

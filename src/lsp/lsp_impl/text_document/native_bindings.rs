@@ -7,8 +7,9 @@
 //! policy is silence, so an unresolved cursor contributes nothing and the
 //! bridge/aggregation path owns the answer.
 //!
-//! v1 scope: the host layer only. Injected layers resolve through the bridge
-//! until the native path learns injection coordinates (tracked follow-up).
+//! Layers: the host document and offset-free injected regions (the region's
+//! tree is parsed with included ranges; results map back through the
+//! region's content offset). `#offset!`-shifted regions stay bridge-only.
 
 use std::ops::Range;
 
@@ -24,18 +25,44 @@ use crate::analysis::bindings::model::BindingsModel;
 use crate::text::PositionMapper;
 
 /// Everything a native answer is computed from: the resolved model, the
-/// cursor's byte offset, and the mapper for byte→position conversion.
+/// cursor's byte offset **within the layer**, the host-text mapper, and the
+/// layer's byte offset into the host text (0 for the host layer).
 pub(crate) struct NativeBindingsContext<'a> {
     pub(crate) model: &'a BindingsModel,
     pub(crate) byte: usize,
     pub(crate) mapper: &'a PositionMapper,
+    pub(crate) layer_offset: usize,
 }
 
+impl NativeBindingsContext<'_> {
+    /// A layer-relative byte range as a host-document LSP range.
+    fn to_host_range(&self, range: &Range<usize>) -> Option<tower_lsp_server::ls_types::Range> {
+        Some(tower_lsp_server::ls_types::Range {
+            start: self
+                .mapper
+                .byte_to_position(range.start + self.layer_offset)?,
+            end: self
+                .mapper
+                .byte_to_position(range.end + self.layer_offset)?,
+        })
+    }
+}
+
+/// The bindings inputs of the layer under the cursor: the layer's query, its
+/// text, its tree, and its byte offset into the host text.
+type LayerInputs = (
+    std::sync::Arc<tree_sitter::Query>,
+    String,
+    tree_sitter::Tree,
+    usize,
+);
+
 impl Kakehashi {
-    /// Build the bindings model for the host layer under the cursor and
-    /// answer with `f`. `Ok(None)` — the layer contributes nothing — when the
-    /// language has no bindings query, the document is unavailable, or `f`
-    /// itself answers `None` (miss policy: silence).
+    /// Build the bindings model for the layer under the cursor — the injected
+    /// region's tree when the cursor sits inside one, the host tree otherwise
+    /// — and answer with `f`. `Ok(None)` — the layer contributes nothing —
+    /// when the layer's language has no bindings query, the document is
+    /// unavailable, or `f` itself answers `None` (miss policy: silence).
     pub(crate) async fn native_bindings_answer<R>(
         &self,
         lsp_uri: &Uri,
@@ -51,9 +78,6 @@ impl Kakehashi {
         if !self.language.ensure_language_loaded(&language).success {
             return Ok(None);
         }
-        let Some(query) = self.language.bindings_query(&language) else {
-            return Ok(None);
-        };
 
         // Wait for / trigger the off-ingress parse, then snapshot text and
         // tree without holding the store Ref across compute.
@@ -73,23 +97,108 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let model = BindingsModel::build(collect(&text, tree.root_node(), &query));
+        // Scope trees are per layer and resolution never crosses layer
+        // boundaries: a cursor inside an injected region resolves in that
+        // region's layer alone.
+        let (query, layer_text, layer_tree, layer_offset) = match self
+            .injected_bindings_layer(&text, &tree, &language, byte)
+            .await
+        {
+            Some(Some(layer)) => layer,
+            // Inside a region the resolver cannot serve: silence, never
+            // a host-layer answer for an injected-code cursor.
+            Some(None) => return Ok(None),
+            None => {
+                let Some(query) = self.language.bindings_query(&language) else {
+                    return Ok(None);
+                };
+                (query, text.clone(), tree.clone(), 0)
+            }
+        };
+
+        let model = BindingsModel::build(collect(&layer_text, layer_tree.root_node(), &query));
         Ok(f(NativeBindingsContext {
             model: &model,
-            byte,
+            byte: byte - layer_offset,
             mapper: &mapper,
+            layer_offset,
         }))
     }
-}
 
-fn to_lsp_range(
-    mapper: &PositionMapper,
-    range: &Range<usize>,
-) -> Option<tower_lsp_server::ls_types::Range> {
-    Some(tower_lsp_server::ls_types::Range {
-        start: mapper.byte_to_position(range.start)?,
-        end: mapper.byte_to_position(range.end)?,
-    })
+    /// The injected layer under the cursor, prepared for resolution.
+    ///
+    /// - `None`: the cursor is not inside any injection region → host layer.
+    /// - `Some(None)`: inside a region, but the layer cannot answer (no
+    ///   resolvable language, no bindings query, offset-shifted region, or
+    ///   parse failure) → silence.
+    /// - `Some(Some(inputs))`: the region's layer, parsed with included
+    ///   ranges so node offsets are relative to the region's content start.
+    async fn injected_bindings_layer(
+        &self,
+        text: &str,
+        tree: &tree_sitter::Tree,
+        host_language: &str,
+        byte: usize,
+    ) -> Option<Option<LayerInputs>> {
+        use crate::language::injection::{
+            collect_all_injections, compute_included_ranges, parse_with_ranges,
+        };
+
+        let injection_query = self.language.injection_query(host_language)?;
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&injection_query))?;
+        let region = regions
+            .iter()
+            .find(|r| r.content_node.start_byte() <= byte && byte < r.content_node.end_byte())?;
+
+        // From here on the cursor IS in a region: every bail is silence.
+        if region.offset.is_some() {
+            // `#offset!`-shifted regions need window clipping the native
+            // path does not do yet; the bridge keeps owning them.
+            return Some(None);
+        }
+        let content_range = region.content_node.byte_range();
+        let Some(content_text) = text.get(content_range.clone()).map(str::to_string) else {
+            return Some(None);
+        };
+        let Some((layer_language, load)) = self
+            .language
+            .resolve_injection_language(&region.language, &content_text)
+        else {
+            return Some(None);
+        };
+        if !load.success {
+            return Some(None);
+        }
+        let Some(query) = self.language.bindings_query(&layer_language) else {
+            return Some(None);
+        };
+
+        let included_ranges =
+            compute_included_ranges(&region.content_node, region.include_children);
+        let mut parser = {
+            let mut pool = self.parser_pool.lock().await;
+            match pool.acquire(&layer_language) {
+                Some(parser) => parser,
+                None => return Some(None),
+            }
+        };
+        let parsed = parse_with_ranges(
+            &mut parser,
+            &content_text,
+            included_ranges.as_deref(),
+            "kakehashi::bindings",
+            &layer_language,
+        );
+        self.parser_pool
+            .lock()
+            .await
+            .release(layer_language.clone(), parser);
+
+        match parsed {
+            Some(layer_tree) => Some(Some((query, content_text, layer_tree, content_range.start))),
+            None => Some(None),
+        }
+    }
 }
 
 /// `textDocument/definition`: the definition site the resolution rules report
@@ -99,12 +208,12 @@ pub(crate) fn native_definition(
     lsp_uri: &Uri,
 ) -> Option<Vec<LocationLink>> {
     let target = ctx.model.definition_range_at(ctx.byte)?;
-    let range = to_lsp_range(ctx.mapper, &target)?;
+    let range = ctx.to_host_range(&target)?;
     Some(vec![LocationLink {
         origin_selection_range: ctx
             .model
             .resolvable_identifier_at(ctx.byte)
-            .and_then(|r| to_lsp_range(ctx.mapper, &r)),
+            .and_then(|r| ctx.to_host_range(&r)),
         target_uri: lsp_uri.clone(),
         target_range: range,
         target_selection_range: range,
@@ -121,7 +230,7 @@ pub(crate) fn native_references(
     let ranges = binding_ranges(&ctx, include_declaration)?;
     let locations: Vec<Location> = ranges
         .iter()
-        .filter_map(|r| to_lsp_range(ctx.mapper, r))
+        .filter_map(|r| ctx.to_host_range(r))
         .map(|range| Location {
             uri: lsp_uri.clone(),
             range,
@@ -139,7 +248,7 @@ pub(crate) fn native_document_highlight(
     let ranges = binding_ranges(&ctx, true)?;
     let highlights: Vec<DocumentHighlight> = ranges
         .iter()
-        .filter_map(|r| to_lsp_range(ctx.mapper, r))
+        .filter_map(|r| ctx.to_host_range(r))
         .map(|range| DocumentHighlight {
             range,
             kind: Some(DocumentHighlightKind::TEXT),
@@ -159,7 +268,7 @@ pub(crate) fn native_rename(
     let ranges = binding_ranges(&ctx, true)?;
     let edits: Vec<TextEdit> = ranges
         .iter()
-        .filter_map(|r| to_lsp_range(ctx.mapper, r))
+        .filter_map(|r| ctx.to_host_range(r))
         .map(|range| TextEdit {
             range,
             new_text: new_name.to_string(),
@@ -182,7 +291,7 @@ pub(crate) fn native_prepare_rename(
     ctx: NativeBindingsContext<'_>,
 ) -> Option<PrepareRenameResponse> {
     let range = ctx.model.resolvable_identifier_at(ctx.byte)?;
-    to_lsp_range(ctx.mapper, &range).map(PrepareRenameResponse::Range)
+    ctx.to_host_range(&range).map(PrepareRenameResponse::Range)
 }
 
 /// The byte ranges of the cursor binding's references (and, when included,
@@ -339,5 +448,111 @@ mod tests {
                 .iter()
                 .all(|h| h.kind == Some(DocumentHighlightKind::TEXT))
         );
+    }
+
+    /// A server with markdown (host, injection query, no bindings) and lua
+    /// (embedded bindings asset) registered, and one open markdown document.
+    fn server_with_markdown_doc(text: &str) -> (LspService<Kakehashi>, Uri) {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("lua".to_string(), tree_sitter_lua::LANGUAGE.into());
+        let injection_query = Query::new(
+            &tree_sitter_md::LANGUAGE.into(),
+            r#"
+            (fenced_code_block
+              (info_string (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(injection_query));
+        let lua_bindings = Query::new(
+            &tree_sitter_lua::LANGUAGE.into(),
+            crate::language::embedded_queries::embedded_bindings_query("lua").unwrap(),
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_bindings_query("lua".to_string(), Arc::new(lua_bindings));
+
+        let url = Url::parse("file:///test/native_bindings.md").unwrap();
+        let uri = Uri::from_str(url.as_str()).unwrap();
+        server.documents.insert(
+            url.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        (service, uri)
+    }
+
+    #[tokio::test]
+    async fn native_definition_resolves_inside_an_injected_layer() {
+        // line 3: `local v = 1`; line 4: `print(v)`.
+        let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
+        let (service, uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+
+        let links = server
+            .native_bindings_answer(&uri, Position::new(4, 6), |ctx| {
+                native_definition(ctx, &uri)
+            })
+            .await
+            .unwrap()
+            .expect("the injected-layer reference must resolve natively");
+        assert_eq!(
+            links[0].target_range.start,
+            Position::new(3, 6),
+            "definition is `local v` in host coordinates"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_layers_never_cross_regions() {
+        // Two lua blocks: the second reads a name only the first defines.
+        let text = "```lua\nlocal shared = 1\n```\n\n```lua\nprint(shared)\n```\n";
+        let (service, uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+
+        let links = server
+            .native_bindings_answer(&uri, Position::new(5, 8), |ctx| {
+                native_definition(ctx, &uri)
+            })
+            .await
+            .unwrap();
+        assert!(
+            links.is_none(),
+            "cross-region resolution is out of scope for v1: {links:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_cursor_never_gets_a_host_layer_answer() {
+        // The host (markdown) has no bindings query; even if it did, an
+        // injected-code cursor must resolve in its own layer only. Here the
+        // injected language (yaml-ish unknown) has no bindings query either:
+        // silence.
+        let text = "```nosuchlang\nkey\n```\n";
+        let (service, uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+
+        let links = server
+            .native_bindings_answer(&uri, Position::new(1, 1), |ctx| {
+                native_definition(ctx, &uri)
+            })
+            .await
+            .unwrap();
+        assert!(links.is_none());
     }
 }
