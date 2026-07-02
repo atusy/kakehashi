@@ -154,6 +154,7 @@ impl Kakehashi {
                     &layer_cfg.priorities,
                     virt,
                     host,
+                    std::future::ready(Ok(None)),
                     |edits: &Vec<TextEdit>| !edits.is_empty(),
                 )
                 .await?

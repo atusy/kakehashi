@@ -43,7 +43,6 @@ pub(crate) struct Site {
 
 #[derive(Debug)]
 struct Binding {
-    scope: usize,
     sites: Vec<Site>,
 }
 
@@ -220,10 +219,7 @@ impl BindingsModel {
             Some(id) => self.bindings[id].sites.push(site),
             None => {
                 let id = self.bindings.len();
-                self.bindings.push(Binding {
-                    scope: target_scope,
-                    sites: vec![site],
-                });
+                self.bindings.push(Binding { sites: vec![site] });
                 self.scopes[target_scope]
                     .bindings
                     .entry(key)
@@ -351,6 +347,19 @@ impl BindingsModel {
             .filter(|r| self.resolve_reference(r) == Some(id))
             .map(|r| r.byte_range.clone())
             .collect()
+    }
+
+    /// The identifier node the cursor is on, when it identifies a resolvable
+    /// binding: a definition site's own range, or a reference's range when
+    /// the reference resolves. This is `prepareRename`'s gate — nothing is
+    /// offered for an identifier the resolver cannot ground.
+    pub(crate) fn resolvable_identifier_at(&self, byte: usize) -> Option<Range<usize>> {
+        if let Some((_, site)) = self.site_containing(byte) {
+            return Some(site.byte_range.clone());
+        }
+        let reference = self.reference_containing(byte)?;
+        self.resolve_reference(reference)?;
+        Some(reference.byte_range.clone())
     }
 
     /// The definition site reported for `binding` as seen from position `p`:

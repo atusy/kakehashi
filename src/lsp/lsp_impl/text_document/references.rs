@@ -28,12 +28,16 @@ impl Kakehashi {
 
         let virt =
             self.references_virt_layer(&lsp_uri, position, include_declaration, work_done_token);
-        self.walk_layers(
+        let native = self.native_bindings_answer(&lsp_uri, position, |ctx| {
+            super::native_bindings::native_references(ctx, &lsp_uri, include_declaration)
+        });
+        self.walk_layers_with_native(
             &lsp_uri,
             METHOD,
             METHOD,
             raw_params,
             virt,
+            native,
             parse_host_verbatim::<Vec<Location>>,
             |locations: &Vec<Location>| !locations.is_empty(),
         )

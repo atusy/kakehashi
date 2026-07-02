@@ -1110,6 +1110,14 @@ impl LanguageCoordinator {
         self.query_store().injection_query(lang_name)
     }
 
+    /// Get bindings query for a language (lexical name resolution).
+    ///
+    /// Visibility: pub(crate) - called by the LSP layer's native
+    /// definition/references/documentHighlight/rename contributors.
+    pub(crate) fn bindings_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
+        self.query_store().bindings_query(lang_name)
+    }
+
     /// Get capture mappings.
     ///
     /// Visibility: pub(crate) - called by LSP layer (semantic_tokens) and analysis
