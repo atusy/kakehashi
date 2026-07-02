@@ -873,6 +873,11 @@ pub(crate) fn build_document_discovery(
         if has_combined_for_pattern(injection_query, injection.pattern_index)
             && effective_offset_for_pattern(injection_query, injection.pattern_index).is_none()
         {
+            log::debug!(
+                target: "kakehashi::semantic",
+                "discovery not stored: combined-group region (lang={})",
+                injection.language
+            );
             return None;
         }
         singles.push(injection);
@@ -881,6 +886,12 @@ pub(crate) fn build_document_discovery(
     // Same region-count gate as the token half: below it, caching doesn't pay and
     // the semantic reuse path stays byte-identical to the pre-#529 inline path.
     if singles.len() < INJECTION_CACHE_MIN_REGIONS {
+        log::debug!(
+            target: "kakehashi::semantic",
+            "discovery not stored: {} single region(s) below the {} gate",
+            singles.len(),
+            INJECTION_CACHE_MIN_REGIONS
+        );
         return None;
     }
 
@@ -902,9 +913,16 @@ pub(crate) fn build_document_discovery(
             // Producer path passes `require_highlight_query = false`, so no query
             // is resolved here (the `None` companion is ignored); reuse resolves it.
             SingleDiscovery::Region(region, _) => discovered.push(region),
-            // A not-yet-loaded parser/language taints discovery — never store a
-            // partial region set (the discovery analogue of the fully_loaded gate).
-            SingleDiscovery::Incomplete => return None,
+            // A language whose parser isn't loadable is DROPPED, matching the
+            // inline path's own drop of that region — the reuse output stays
+            // byte-identical. Storing (rather than the reference impl's
+            // never-store-partial taint) is sound because a failed load can
+            // only become a success through a settings/post-install reload
+            // (`ensure_language_loaded` negative-caches failures until
+            // `load_settings`), and that reload bumps the semantic-token
+            // generation — which invalidates this discovery and forces the
+            // inline re-discovery that picks the region back up.
+            SingleDiscovery::Incomplete => {}
             // Permanently invalid region: dropped from both discovery and the
             // inline contexts, so omitting it keeps reuse equivalent.
             SingleDiscovery::Skip => {}
@@ -2927,12 +2945,14 @@ local b = 2
         );
     }
 
-    /// `build_document_discovery` stores nothing when an injected language can't
-    /// be resolved to a parser (the discovery analogue of the token half's
-    /// `fully_loaded` gate): a region whose language is unresolvable taints
-    /// discovery, so a partial region set is never persisted. (A resolvable
-    /// language whose *highlight query* isn't loaded is NOT gated — `rebuild_context`
-    /// re-resolves the query fresh at reuse, so that case self-heals.)
+    /// A region whose injected language can't be resolved to a parser is
+    /// DROPPED from the stored discovery — matching the inline path, which
+    /// drops it too, so reuse output stays byte-identical. Storing (rather
+    /// than the former never-store-partial taint) is sound because a failed
+    /// load is negative-cached until a settings/post-install reload, and that
+    /// reload bumps the semantic-token generation, invalidating this
+    /// discovery. Here EVERY region is unresolvable, so the stored discovery
+    /// is present but empty.
     #[test]
     fn build_document_discovery_bails_when_injected_language_unresolvable() {
         let Some(coordinator) = markdown_lua_coordinator() else {
@@ -2962,18 +2982,27 @@ local b = 2
         .expect("regions");
         let uri = Url::parse("file:///incomplete_bail.md").unwrap();
         let tracker = NodeTracker::new();
+        let discovery = build_document_discovery(
+            &regions,
+            injection_query.as_ref(),
+            &text,
+            &coordinator,
+            &uri,
+            &tracker,
+            0,
+        )
+        .expect("discovery is stored with the unresolvable regions dropped");
         assert!(
-            build_document_discovery(
-                &regions,
-                injection_query.as_ref(),
-                &text,
-                &coordinator,
-                &uri,
-                &tracker,
-                0,
-            )
-            .is_none(),
-            "an unresolvable injected language must taint discovery and store nothing"
+            discovery
+                .regions
+                .iter()
+                .all(|r| r.resolved_lang == "markdown_inline"),
+            "the unresolvable fenced regions are dropped; only the document's \
+             own markdown_inline regions remain"
+        );
+        assert!(
+            discovery.regions.len() < regions.len(),
+            "the ten zzznotalang fences must not be stored"
         );
     }
 
