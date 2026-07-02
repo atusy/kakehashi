@@ -609,17 +609,43 @@ inside the existing safety contracts at each step:
 
 ## Decision–Implementation Gap
 
-Not yet implemented — this decision is aspirational and rolls out over the three
-stages above. An interim fix advancing the parse watermark before `populate` (so
-readers wake on the tree rather than after the populate) was prototyped and
-measured as a partial improvement; it is subsumed by Stage 1 (which moves the
-populate off the async workers) and Stage 2 (which removes the reader wait) and is
-not carried forward on its own. The delete-on-supersede pruning of the overtaken
-per-document-parse-scheduler passages is deferred to Stage 3, when the behavior
-they describe is actually removed.
+**Stage 1 is implemented**: the bounded compute pool (`src/compute_pool.rs`)
+runs the parse, `populate`, the captures/node layer walks, and the semantic
+fan-out (its `par_iter` schedules on the bounded pool, not the process-global
+one); `parser_pool` is a sync mutex acquired only on pool threads; all
+`parse_with_pool` call sites — including the former reader fallbacks — route
+through the pool. The merged `CancelToken` is re-homed as the pool work-unit's
+dequeue hook (§4).
 
-One piece of the destination is **already merged** onto the current architecture:
-the cooperative-cancellation primitive (`CancelToken` + `SemanticRequestTracker`
-compute bail-out). It is not re-derived — Stage 1 re-homes it as the bounded-pool
-work-unit's cancellation hook (§4), and Stage 2 narrows its role from
-reject-on-stale to CPU-reclamation-under-serve-stale (§3).
+**Stage 2 is implemented in its core**: `content_version` on `Document`;
+`ParseSnapshot` published into the `SnapshotSlot` `watch` cell on the
+`Document` entry through the §2 publish primitive (bootstrap/strict-version/
+incarnation guard, `u64::MAX` close sentinel, reserved in `next_incarnation`
+and refused by the guard itself); the parse loop dual-writes on every
+resolution path and emits `semanticTokens/refresh` at its publish point;
+`semanticTokens` full/delta and `captures/full` serve-stale (the lineage store
+gains the §3 request-entry version guard); `semanticTokens/range` and the
+bridge/formatting/node families staleness-reject (`ContentModified`, or the
+protocol-appropriate `null`); `formatting` and `selectionRange` take the
+explicit-action bounded wait; and **every** reader inline-parse fallback is
+removed — `get_tree_with_wait`, `wait_for_epoch`, and the on-demand parse in
+`ensure_document_parsed` are gone, closing the resurrection vector.
+
+Two Stage-2 pieces remain deliberately open:
+
+- The **§3 identity split** (snapshot-owned region ordinals + the
+  current-version tracker reconciliation, and the companion
+  injection-token-cache key rework). Until it lands, the readers whose region
+  resolution mints tracker ULIDs — the whole-document fan-out family and the
+  bridge-context requests — require a **current** snapshot (bounded wait,
+  degrade on staleness) instead of serving stale: a stale read must never
+  mint, and currency is the interim way to guarantee that.
+- Several notification-path consumers (pull diagnostics, `did_save`,
+  `documentSymbol`/`documentColor`) still read the legacy store tree after the
+  bounded current-wait; they migrate to `latest_snapshot` with the Stage-3
+  consolidation.
+
+**Stage 3 is not started**: `Document::tree`/`pending_seed` removal, the
+CAS-methods → publish-primitive collapse, watermark deletion, and the
+delete-on-supersede pruning of the overtaken per-document-parse-scheduler
+passages all happen there (structural PRs separate from behavioral, per §5).
