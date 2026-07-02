@@ -6,3 +6,4 @@
 //! language-specific is declared in per-language query assets.
 
 pub(crate) mod collect;
+pub(crate) mod model;
