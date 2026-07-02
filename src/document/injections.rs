@@ -84,3 +84,23 @@ pub(crate) struct DiscoveredInjections {
     pub generation: u64,
     pub regions: Vec<DiscoveredRegion>,
 }
+
+/// One discovered injection region in the owned form the **bridge** downstream
+/// (`process_injections` → eager spawn / didChange forwarding / auto-install)
+/// consumes — the parse-pass twin of `BridgeInjection`, kept here so `document`
+/// need not depend on `lsp::bridge`. Built by `populate_injections` from the
+/// same single injection-query pass as everything else (never re-discovered on
+/// the downstream path), and carried on the `ParseSnapshot`.
+#[derive(Clone)]
+pub(crate) struct DiscoveredBridgeRegion {
+    /// The RAW injection language identifier (e.g. `"py"`), exactly as the
+    /// query captured it — bridge config lookup and auto-install resolve it
+    /// themselves, so no canonicalization here (identical to the inline path).
+    pub raw_language: String,
+    /// Position-stable tracker ULID, byte-identical to the one minted for the
+    /// `InjectionMap` (same `get_or_create` on the same node).
+    pub region_id: String,
+    /// The region's clean content (gap ranges removed), the exact virtual-
+    /// document text the bridge opens downstream.
+    pub content: String,
+}

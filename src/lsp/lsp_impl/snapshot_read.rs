@@ -151,6 +151,7 @@ mod tests {
                     parsed_version: version,
                     incarnation: inc,
                     injection_regions: None,
+                    bridge_regions: None,
                 }))
             })
             .unwrap_or(false);

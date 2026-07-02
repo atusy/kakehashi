@@ -97,6 +97,28 @@ impl InjectionCoordinator {
         uri: &Url,
         host_language: &str,
     ) -> Vec<BridgeInjection> {
+        // Fast path (parse-snapshot ADR §3, never discover twice): the parse
+        // pass that scheduled this downstream already derived the bridge
+        // regions from its single injection-query run and published them on
+        // the snapshot. Consume them when the snapshot is CURRENT — this
+        // downstream runs right after the publish, so it virtually always is;
+        // a raced edit falls back to the inline resolution below (which reads
+        // the live tree, exactly as before).
+        if let Some(view) = self.documents.latest_snapshot(uri)
+            && let Some(snapshot) = &view.slot.snapshot
+            && snapshot.parsed_version == view.content_version
+            && let Some(bridge_regions) = &snapshot.bridge_regions
+        {
+            return bridge_regions
+                .iter()
+                .map(|region| BridgeInjection {
+                    language: region.raw_language.clone(),
+                    region_id: region.region_id.clone(),
+                    content: region.content.clone(),
+                })
+                .collect();
+        }
+
         let Some(injection_query) = self.language.injection_query(host_language) else {
             return Vec::new();
         };

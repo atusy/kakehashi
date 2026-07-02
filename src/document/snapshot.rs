@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tree_sitter::Tree;
 
-use super::injections::DiscoveredInjections;
+use super::injections::{DiscoveredBridgeRegion, DiscoveredInjections};
 
 /// The reserved terminal incarnation `didClose` installs in a slot
 /// (`u64::MAX`). Keeping the closed slot at its old incarnation would let a
@@ -52,6 +52,10 @@ pub(crate) struct ParseSnapshot {
     /// binding: text, tree, and regions are one value, so the regions can
     /// never be consumed against a different tree.
     pub(crate) injection_regions: Option<Arc<DiscoveredInjections>>,
+    /// The bridge downstream's region list, derived by the same populate pass
+    /// (`None` when populate didn't run for this snapshot — the downstream
+    /// then resolves inline; `Some(empty)` means genuinely no regions).
+    pub(crate) bridge_regions: Option<Arc<Vec<DiscoveredBridgeRegion>>>,
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -126,6 +130,7 @@ mod tests {
             parsed_version,
             incarnation,
             injection_regions: None,
+            bridge_regions: None,
         }
     }
 
@@ -170,6 +175,7 @@ mod tests {
             parsed_version,
             incarnation,
             injection_regions: None,
+            bridge_regions: None,
         }
     }
 

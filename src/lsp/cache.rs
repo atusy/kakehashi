@@ -51,6 +51,26 @@ pub(crate) struct CacheCoordinator {
     semantic_token_generation: std::sync::atomic::AtomicU64,
 }
 
+/// Everything one `populate_injections` pass derives from its single
+/// injection-query run (parse-snapshot ADR §3, never discover twice): the
+/// semantic-path discovery (gated) and the bridge-downstream region list
+/// (ungated). Both ride the `ParseSnapshot` the parse publishes.
+pub(crate) struct PopulatedInjections {
+    pub(crate) discovery: Option<crate::document::DiscoveredInjections>,
+    pub(crate) bridge_regions: Vec<crate::document::DiscoveredBridgeRegion>,
+}
+
+impl PopulatedInjections {
+    /// No regions (no injection query, or none matched): the downstream skips
+    /// its work, exactly as the inline resolution's empty result did.
+    pub(crate) fn empty() -> Self {
+        Self {
+            discovery: None,
+            bridge_regions: Vec::new(),
+        }
+    }
+}
+
 impl CacheCoordinator {
     /// Create a new cache coordinator with empty caches.
     pub(crate) fn new() -> Self {
@@ -195,7 +215,7 @@ impl CacheCoordinator {
         language_name: &str,
         language: &LanguageCoordinator,
         tracker: &NodeTracker,
-    ) -> Option<crate::document::DiscoveredInjections> {
+    ) -> PopulatedInjections {
         // Snapshot the generation FIRST — before reading the injection query or
         // resolving any language below — so the stamp can never be *newer* than
         // the queries the discovery was built with. A reload swaps queries and
@@ -216,7 +236,7 @@ impl CacheCoordinator {
                 // Clear any stale injection caches
                 self.injection_map.clear(uri);
                 self.injection_token_cache.clear_document(uri);
-                return None;
+                return PopulatedInjections::empty();
             }
         };
 
@@ -228,7 +248,7 @@ impl CacheCoordinator {
                 // Clear any existing regions and caches for this document
                 self.injection_map.clear(uri);
                 self.injection_token_cache.clear_document(uri);
-                return None;
+                return PopulatedInjections::empty();
             }
 
             // Get existing regions for cache cleanup and content comparison
@@ -297,6 +317,32 @@ impl CacheCoordinator {
                 }
             }
 
+            // Bridge-downstream regions from the SAME collected `regions`
+            // (parse-snapshot ADR §3, never discover twice): the exact
+            // (raw language, region_id, clean content) triple
+            // `resolve_injection_data` used to re-derive by re-running the
+            // injection query per downstream pass.
+            let bridge_regions: Vec<crate::document::DiscoveredBridgeRegion> = regions
+                .iter()
+                .zip(cacheable_regions.iter())
+                .map(|(info, cacheable)| {
+                    let included_ranges = crate::language::injection::compute_included_ranges(
+                        &info.content_node,
+                        info.include_children,
+                    );
+                    let content = crate::language::injection::extract_clean_content(
+                        text,
+                        info.content_node.byte_range(),
+                        included_ranges.as_deref(),
+                    );
+                    crate::document::DiscoveredBridgeRegion {
+                        raw_language: info.language.clone(),
+                        region_id: cacheable.region_id.clone(),
+                        content,
+                    }
+                })
+                .collect();
+
             // Store in injection map
             self.injection_map.insert(uri.clone(), cacheable_regions);
 
@@ -306,7 +352,7 @@ impl CacheCoordinator {
             // this parse publishes can rebuild its contexts without
             // re-discovering. `None` when not worth reusing
             // (gate/combined/incomplete).
-            return crate::analysis::semantic::build_document_discovery(
+            let discovery = crate::analysis::semantic::build_document_discovery(
                 &regions,
                 injection_query.as_ref(),
                 text,
@@ -315,9 +361,13 @@ impl CacheCoordinator {
                 tracker,
                 generation,
             );
+            return PopulatedInjections {
+                discovery,
+                bridge_regions,
+            };
         }
 
-        None
+        PopulatedInjections::empty()
     }
 
     /// Get all injection regions for a document (test helper).

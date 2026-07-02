@@ -757,6 +757,7 @@ impl DocumentStore {
             parsed_version: doc.content_version(),
             incarnation: doc.incarnation(),
             injection_regions: None,
+            bridge_regions: None,
         };
         doc.publish_snapshot(Arc::new(snapshot));
     }
@@ -802,6 +803,7 @@ mod tests {
                 parsed_version,
                 incarnation: doc.incarnation(),
                 injection_regions: None,
+                bridge_regions: None,
             }
         }
 

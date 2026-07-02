@@ -31,6 +31,13 @@ def main() -> None:
                                    "generated document (language inferred from the "
                                    "extension, falling back to --lang)")
     ap.add_argument(
+        "--edits", type=int, default=0,
+        help="simulate typing: before each request, send this many incremental "
+             "didChange edits (appending/removing a char at the end of the first "
+             "line), then request tokens. Exercises the edit->reparse->recompute "
+             "cycle instead of the unchanged-document cache hit; token counts "
+             "may reflect a trailing snapshot (serve-stale).")
+    ap.add_argument(
         "--data-dir", default=os.path.join(os.getcwd(), "deps/test/kakehashi"),
         help="parser/query data dir; must already contain installed parsers "
              "(populated by `cargo test --features e2e` or `make deps/tree-sitter`), "
@@ -114,8 +121,28 @@ def main() -> None:
         time.sleep(0.3)  # let the initial parse settle
 
         ok, canceled, tokens = 0, 0, 0
+        version = 1
+        first_line_len = len(text.split("\n", 1)[0])
         t0 = time.time()
-        for _ in range(args.requests):
+        for i in range(args.requests):
+            for j in range(args.edits):
+                # Toggle a trailing char on line 0 so the text genuinely changes
+                # each time (a no-op didChange would be deduped by hashes).
+                grow = (i + j) % 2 == 0
+                version += 1
+                if grow:
+                    change = {"range": {"start": {"line": 0, "character": first_line_len},
+                                        "end": {"line": 0, "character": first_line_len}},
+                              "text": "x"}
+                else:
+                    change = {"range": {"start": {"line": 0, "character": first_line_len},
+                                        "end": {"line": 0, "character": first_line_len + 1}},
+                              "text": ""}
+                notify("textDocument/didChange", {
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [change]})
+                # a beat for the off-ingress reparse to run (the profiled work)
+                time.sleep(0.01)
             resp = request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
             if "error" in resp:
                 # Only -32800 (request cancelled) is expected here; any other

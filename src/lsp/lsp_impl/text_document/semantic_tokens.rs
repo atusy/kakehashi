@@ -926,6 +926,7 @@ mod tests {
                         parsed_version: 0,
                         incarnation,
                         injection_regions: None,
+                        bridge_regions: None,
                     },
                 ))
             })
