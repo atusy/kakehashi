@@ -934,18 +934,38 @@ impl ParseCoordinator {
                     layer_trees: std::sync::OnceLock::new(),
                 },
             );
-            // Serve-stale's heal signal (ADR §3): a fresh publish re-drives the
-            // client with workspace/semanticTokens/refresh so a request served
-            // one edit behind is re-requested against this snapshot. Emitted
-            // HERE — at the parse-loop publish point, after the notification
-            // returned — never from didChange, whose synchronous clients
-            // (vim-lsp) cannot answer a server request mid-notification. Gated
-            // on the publish landing: a rejected publish emits nothing. The
-            // notifier batches and capability-gates the actual request.
+            // Serve-stale's heal signal (ADR §3), narrowed to the cases the
+            // workspace-scoped request is actually FOR. `refresh` is expensive
+            // for the client (Neovim's handler cancels its in-flight token
+            // request and re-tokenizes every attached buffer), and clients
+            // already re-request per didChange — so a publish emits it only
+            // when ALL of:
+            // - the publish landed (a rejected publish emits nothing);
+            // - the document has SETTLED (this parse's version is still the
+            //   live content_version — during a typing burst the scheduler is
+            //   already reparsing newer text, whose own publish re-evaluates);
+            // - some client actually consumes this document's semantic tokens
+            //   (a served-version mark exists) AND its last served tokens
+            //   predate this snapshot (otherwise its own didChange-driven
+            //   request already caught up).
+            // Net: at most one refresh per settle, none mid-burst, none for
+            // documents nobody highlights. Emitted from the parse loop, never
+            // didChange (synchronous clients can't answer a server request
+            // mid-notification).
             if published {
-                events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
-                    language_name.clone(),
-                ));
+                let settled = self
+                    .documents
+                    .get(uri)
+                    .is_some_and(|doc| doc.content_version() == content_version);
+                let client_is_stale = self
+                    .cache
+                    .served_semantic_version(uri)
+                    .is_some_and(|served| served < content_version);
+                if settled && client_is_stale {
+                    events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
+                        language_name.clone(),
+                    ));
+                }
             }
         }
 

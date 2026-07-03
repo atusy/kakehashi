@@ -145,7 +145,11 @@ impl Kakehashi {
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             // No detectable language, or resolved-but-tree-less (no parser
-            // installed / crashed grammar): nothing to tokenize.
+            // installed / crashed grammar): nothing to tokenize. The empty set
+            // IS this snapshot's served state — record it so the parse loop
+            // doesn't keep refreshing a document that has no tokens.
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -223,6 +227,8 @@ impl Kakehashi {
                 .cache
                 .get_current_tokens(&uri, &language_name, cache_key)
             {
+                self.cache
+                    .record_served_semantic_version(&uri, snapshot.parsed_version);
                 self.cache.finish_request(&uri, request_id);
                 return Ok(Some(SemanticTokensResult::Tokens(cached)));
             }
@@ -347,6 +353,8 @@ impl Kakehashi {
             .store_tokens(uri.clone(), stored_tokens, language_name, cache_key);
 
         // Finish tracking this request
+        self.cache
+            .record_served_semantic_version(&uri, snapshot.parsed_version);
         self.cache.finish_request(&uri, request_id);
 
         log::debug!(
@@ -416,6 +424,8 @@ impl Kakehashi {
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -494,6 +504,8 @@ impl Kakehashi {
                 // so the delta is necessarily empty — return it directly and skip
                 // the `previous_tokens` clone + O(N) `calculate_delta` below.
                 if cached.result_id.as_deref() == Some(previous_result_id.as_str()) {
+                    self.cache
+                        .record_served_semantic_version(&uri, snapshot.parsed_version);
                     self.cache.finish_request(&uri, request_id);
                     return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
                         tower_lsp_server::ls_types::SemanticTokensDelta {
@@ -675,6 +687,8 @@ impl Kakehashi {
         };
 
         // Finish tracking this request
+        self.cache
+            .record_served_semantic_version(&uri, snapshot.parsed_version);
         self.cache.finish_request(&uri, request_id);
 
         log::debug!(

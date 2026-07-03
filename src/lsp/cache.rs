@@ -49,6 +49,16 @@ pub(crate) struct CacheCoordinator {
     /// that was already computing (it captured the pre-bump generation), which a
     /// bare clear could not prevent.
     semantic_token_generation: std::sync::atomic::AtomicU64,
+    /// The highest snapshot `parsed_version` whose semantic tokens were
+    /// actually SERVED to the client, per document. The parse loop consults
+    /// this to decide whether a fresh publish needs a
+    /// `workspace/semanticTokens/refresh`: the request is workspace-scoped and
+    /// clients (Neovim) already re-request per `didChange`, so a refresh is
+    /// warranted only when the document has settled and the client's last
+    /// served tokens predate the settled snapshot — one refresh per settle,
+    /// none during a typing burst, none for documents whose tokens no client
+    /// ever asked for.
+    served_semantic_versions: dashmap::DashMap<Url, u64>,
 }
 
 /// Everything one `populate_injections` pass derives from its single
@@ -83,6 +93,7 @@ impl CacheCoordinator {
             injection_token_cache: std::sync::Arc::new(InjectionTokenCache::new()),
             request_tracker: SemanticRequestTracker::new(),
             semantic_token_generation: std::sync::atomic::AtomicU64::new(0),
+            served_semantic_versions: dashmap::DashMap::new(),
         }
     }
 
@@ -108,6 +119,7 @@ impl CacheCoordinator {
         // rest of didClose (see `did_close.rs`), and only leaks a bounded set of
         // entries for a closed doc that no request can read.
         self.request_tracker.cancel_all_for_uri(uri);
+        self.served_semantic_versions.remove(uri);
         self.semantic_cache.remove(uri);
         self.semantic_range_cache.remove(uri);
         self.injection_map.clear(uri);
@@ -450,6 +462,22 @@ impl CacheCoordinator {
     /// post-reload requests (which compute the new-generation key) — so a request
     /// racing a `didChangeConfiguration` can never poison the cache, regardless of
     /// whether it observed the old or new queries.
+    /// Record that a semantic-token response computed from snapshot
+    /// `parsed_version` was served for `uri` (monotonic max — a stale-serve
+    /// racing a fresher one must not regress the mark).
+    pub(crate) fn record_served_semantic_version(&self, uri: &Url, parsed_version: u64) {
+        self.served_semantic_versions
+            .entry(uri.clone())
+            .and_modify(|v| *v = (*v).max(parsed_version))
+            .or_insert(parsed_version);
+    }
+
+    /// The last snapshot version whose tokens were served for `uri`, or `None`
+    /// when no client ever consumed semantic tokens for it.
+    pub(crate) fn served_semantic_version(&self, uri: &Url) -> Option<u64> {
+        self.served_semantic_versions.get(uri).map(|v| *v)
+    }
+
     pub(crate) fn semantic_token_generation(&self) -> u64 {
         self.semantic_token_generation
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -569,6 +597,7 @@ impl CacheCoordinator {
     #[cfg(test)]
     pub(crate) fn cancel_requests(&self, uri: &Url) {
         self.request_tracker.cancel_all_for_uri(uri);
+        self.served_semantic_versions.remove(uri);
     }
 }
 
