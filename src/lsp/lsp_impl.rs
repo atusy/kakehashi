@@ -204,6 +204,25 @@ pub struct Kakehashi {
     /// is live (unambiguous), otherwise `null`.
     #[allow(clippy::type_complexity)]
     captures_cache: dashmap::DashMap<(Url, String), [Option<(String, Vec<serde_json::Value>)>; 2]>,
+    /// Memoized captures walk results per `(uri, kind, injection-mode)`,
+    /// tagged with the exact inputs they were computed from — snapshot
+    /// `(parsed_version, incarnation)` and the settings generation. A typing
+    /// client sends `captures/full` AND `captures/full/delta` per keystroke;
+    /// both walk the same snapshot, so the second (and any repeat on an
+    /// unchanged document) serves the memo instead of re-executing the kind
+    /// query over every layer. One entry per key (insert-overwrites), dropped
+    /// with the lineage cache on `didClose`.
+    #[allow(clippy::type_complexity)]
+    captures_walk_cache: dashmap::DashMap<
+        (Url, String, bool),
+        (
+            u64,
+            u64,
+            u64,
+            Vec<serde_json::Value>,
+            Vec<serde_json::Value>,
+        ),
+    >,
     /// True when the process runs as a one-shot CLI (`kakehashi diagnose`/`format`)
     /// rather than a long-lived LSP server. Set once by `cli_initialize`. No editor
     /// consumes a proactive `publishDiagnostics` in CLI mode (the stub client pump
@@ -286,6 +305,7 @@ impl Kakehashi {
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
+            captures_walk_cache: dashmap::DashMap::new(),
             cli_mode: std::sync::atomic::AtomicBool::new(false),
             parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
         }

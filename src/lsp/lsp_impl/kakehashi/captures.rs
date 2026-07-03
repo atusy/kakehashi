@@ -614,15 +614,38 @@ impl Kakehashi {
         // (parse-snapshot ADR §4). Everything moved in is an owned snapshot
         // piece or a cheap Arc clone; `None` from the pool (work-unit panic)
         // degrades to the protocol's `null`.
+        // Settings generation for the kind-query compile cache — the same
+        // reload discipline the token caches use.
+        let generation = self.cache.semantic_token_generation();
+
+        // Walk-result memo (full mode only — range results depend on the
+        // viewport): a typing client sends captures/full AND full/delta per
+        // keystroke, both walking the SAME snapshot; the second serves this
+        // memo instead of re-executing the kind query over every layer. The
+        // tag must match the exact inputs: snapshot identity
+        // (parsed_version, incarnation) and the settings generation.
+        let walk_key = (uri.clone(), kind.to_string(), injection);
+        if lsp_range.is_none()
+            && let Some(hit) = self.captures_walk_cache.get(&walk_key)
+            && hit.0 == snapshot.parsed_version
+            && hit.1 == incarnation
+            && hit.2 == generation
+        {
+            return Ok(Some(ComputedCaptures {
+                uri,
+                incarnation,
+                entry_content_version,
+                matches: hit.3.clone(),
+                skipped: hit.4.clone(),
+            }));
+        }
+
         let uri_for_walk = uri.clone();
         let kind = kind.to_string();
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
         let documents = std::sync::Arc::clone(&self.documents);
         let parsed_version = snapshot.parsed_version;
-        // Settings generation for the kind-query compile cache — the same
-        // reload discipline the token caches use.
-        let generation = self.cache.semantic_token_generation();
         let snapshot_for_layers = std::sync::Arc::clone(&snapshot);
         let walked = self
             .compute_pool
@@ -667,12 +690,26 @@ impl Kakehashi {
         let Some(walked) = walked else {
             return Ok(None);
         };
-        Ok(walked.map(|(matches, skipped)| ComputedCaptures {
-            uri,
-            incarnation,
-            entry_content_version,
-            matches,
-            skipped,
+        Ok(walked.map(|(matches, skipped)| {
+            if lsp_range.is_none() {
+                self.captures_walk_cache.insert(
+                    walk_key,
+                    (
+                        snapshot.parsed_version,
+                        incarnation,
+                        generation,
+                        matches.clone(),
+                        skipped.clone(),
+                    ),
+                );
+            }
+            ComputedCaptures {
+                uri,
+                incarnation,
+                entry_content_version,
+                matches,
+                skipped,
+            }
         }))
     }
 }

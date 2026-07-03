@@ -36,6 +36,7 @@ impl Kakehashi {
             // degrades to the self-healing "delta answers null → client calls
             // full again", never to stale data.)
             self.captures_cache.retain(|key, _| key.0 != uri);
+            self.captures_walk_cache.retain(|key, _| key.0 != uri);
             self.documents.remove(&uri);
         }
 
