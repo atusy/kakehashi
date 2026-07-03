@@ -46,8 +46,13 @@ impl Kakehashi {
         // former reader on-demand parse: readers never parse inline.
         let deadline = tokio::time::Instant::now() + SELECTION_RANGE_WAIT;
         let snapshot = loop {
-            // Re-resolve per iteration (per-request re-resolution rule): a
-            // close/reopen between wakeups is observed here, never served.
+            // Subscribe BEFORE checking (lost-wakeup guard, see
+            // snapshot_for_tokens), then re-resolve per iteration
+            // (per-request re-resolution rule): a close/reopen between
+            // wakeups is observed here, never served.
+            let Some(mut receiver) = self.documents.subscribe_snapshots(&uri) else {
+                return Ok(None);
+            };
             let Some(view) = self.documents.latest_snapshot(&uri) else {
                 // Unregistered or closed.
                 return Ok(None);
@@ -59,9 +64,6 @@ impl Kakehashi {
                 _ => {
                     // No snapshot yet (first parse in flight) or trailing an
                     // edit: wait for the next publish, bounded by the deadline.
-                    let Some(mut receiver) = self.documents.subscribe_snapshots(&uri) else {
-                        return Ok(None);
-                    };
                     let wait = tokio::time::timeout_at(deadline, receiver.changed()).await;
                     match wait {
                         // A publish (or close) landed — loop and re-resolve.

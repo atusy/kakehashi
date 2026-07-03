@@ -154,10 +154,19 @@ impl ParseCoordinator {
         uri: &Url,
         snapshot: crate::document::snapshot::ParseSnapshot,
     ) -> bool {
-        self.documents
+        let (version, incarnation) = (snapshot.parsed_version, snapshot.incarnation);
+        let landed = self
+            .documents
             .get(uri)
             .map(|doc| doc.publish_snapshot(std::sync::Arc::new(snapshot)))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !landed {
+            log::debug!(
+                target: "kakehashi::snapshot",
+                "publish rejected for {uri}: v{version} inc{incarnation}"
+            );
+        }
+        landed
     }
 
     /// Run `CacheCoordinator::populate_injections` as a compute-pool work-unit

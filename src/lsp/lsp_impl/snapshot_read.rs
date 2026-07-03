@@ -37,8 +37,22 @@ impl Kakehashi {
         uri: &Url,
         wait: std::time::Duration,
     ) -> SnapshotWait {
-        let deadline = tokio::time::Instant::now() + wait;
+        // Two deadlines: the caller's `wait` bounds the SETTLE wait (a
+        // snapshot exists but trails the input — degrading fast there is the
+        // point), while the FIRST-parse wait is generous, because it is
+        // bounded by parse completion rather than time: every open-parse
+        // resolution path publishes (tree, tree-less, or the didClose
+        // sentinel), so the receiver always wakes. A tight first-parse cap
+        // made requests racing didOpen degrade to empty on loaded machines.
+        let stale_deadline = tokio::time::Instant::now() + wait;
+        let first_parse_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
+            // Subscribe BEFORE checking (lost-wakeup guard): `subscribe` marks
+            // the current value as seen, so a publish landing between a check
+            // and a later subscribe would never trigger `changed()`.
+            let Some(mut receiver) = self.documents.subscribe_snapshots(uri) else {
+                return SnapshotWait::Gone;
+            };
             let Some(view) = self.documents.latest_snapshot(uri) else {
                 return SnapshotWait::Gone;
             };
@@ -48,8 +62,10 @@ impl Kakehashi {
                 }
                 trailing => trailing.is_some(),
             };
-            let Some(mut receiver) = self.documents.subscribe_snapshots(uri) else {
-                return SnapshotWait::Gone;
+            let deadline = if had_snapshot {
+                stale_deadline
+            } else {
+                first_parse_deadline
             };
             match tokio::time::timeout_at(deadline, receiver.changed()).await {
                 Ok(Ok(())) => continue,

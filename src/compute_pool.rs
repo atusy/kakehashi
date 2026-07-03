@@ -57,7 +57,22 @@ impl ComputePool {
         T: Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Scheduling-latency instrumentation: a slow response with a fast
+        // compute means the time went to the pool QUEUE (enqueue→start: pool
+        // threads busy with other work-units) or to the RESUME (work end→
+        // awaiter progress: the tokio runtime not scheduling the handler) —
+        // exactly the split a user-supplied debug log needs to attribute a
+        // stall (see the 20s-response investigation).
+        let enqueued = std::time::Instant::now();
         self.pool.spawn(move || {
+            let queued_for = enqueued.elapsed();
+            if queued_for.as_millis() > 100 {
+                log::debug!(
+                    target: "kakehashi::compute_pool",
+                    "work unit waited {}ms in the pool queue",
+                    queued_for.as_millis()
+                );
+            }
             if crate::cancel::is_cancelled(cancel.as_ref()) {
                 return; // dropping tx resolves the awaiter with None
             }
@@ -78,7 +93,15 @@ impl ComputePool {
                 }
             }
         });
-        rx.await.ok()
+        let finished_rx = rx.await.ok();
+        let resume_lag = enqueued.elapsed();
+        // The oneshot resolves the moment the work-unit sends; a large gap
+        // between "work done" and "handler resumed" cannot be measured from
+        // inside this future, but a total far exceeding queue+work shows up in
+        // the caller's own phase logs; the watchdog (see `run_lsp_server`)
+        // covers the runtime-stall half.
+        let _ = resume_lag;
+        finished_rx
     }
 }
 

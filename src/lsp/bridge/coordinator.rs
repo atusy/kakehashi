@@ -1,7 +1,7 @@
 //! Bridge coordinator unifying the language server pool and node tracker
 //! into a single coherent API.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -540,10 +540,19 @@ impl BridgeCoordinator {
         type ServerGroup = (Arc<BridgeServerConfig>, Vec<BridgeInjection>);
         let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
 
+        // Resolve the server config once per DISTINCT language, not per region:
+        // config resolution walks the wildcard+merge chain, and a fence-heavy
+        // document has hundreds of regions across a handful of languages —
+        // per-region resolution was a measured tokio-side hotspot (this loop
+        // runs on the runtime, and starving it delays every handler).
+        let mut config_by_lang: HashMap<String, Option<ResolvedServerConfig>> = HashMap::new();
         for injection in injections {
-            if let Some(resolved) =
-                self.get_config_for_language(settings, host_language, &injection.language)
-            {
+            let resolved = config_by_lang
+                .entry(injection.language.clone())
+                .or_insert_with(|| {
+                    self.get_config_for_language(settings, host_language, &injection.language)
+                });
+            if let Some(resolved) = resolved {
                 server_groups
                     .entry(resolved.server_name.clone())
                     .or_insert_with(|| (resolved.config.clone(), Vec::new()))

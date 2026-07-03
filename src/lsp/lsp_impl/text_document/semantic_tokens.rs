@@ -52,16 +52,34 @@ impl Kakehashi {
         &self,
         uri: &Url,
     ) -> Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>> {
-        const FIRST_PARSE_WAIT: Duration = Duration::from_millis(200);
+        // Generous on purpose: this wait only runs while the document has NO
+        // snapshot for its lifetime, and every open-parse resolution path
+        // publishes one (a tree, a resolved-but-tree-less outcome, or the
+        // didClose sentinel — all of which wake this receiver). The wait is
+        // therefore bounded by parse completion (itself capped by the parse
+        // work-unit timeout), not by this constant; the constant is only a
+        // backstop. A tight cap here made first requests racing didOpen
+        // answer empty whenever the machine was loaded enough to push the
+        // open parse past it (observed under the parallel e2e suite, and the
+        // real-world analog is editor startup on a busy machine).
+        const FIRST_PARSE_WAIT: Duration = Duration::from_secs(15);
         let deadline = tokio::time::Instant::now() + FIRST_PARSE_WAIT;
         loop {
+            // Subscribe BEFORE checking: `watch::Sender::subscribe` marks the
+            // value current at subscription time as already seen, so a publish
+            // landing between a check and a later subscribe would be invisible
+            // to `changed()` — a lost wakeup that burned the whole wait and
+            // served the pre-parse fallback (the e2e-visible symptom: node —
+            // and first-token — requests racing didOpen answered null).
+            // Subscribing first closes the window: a publish before the check
+            // is caught by the check, one after it triggers `changed()`.
+            let mut receiver = self.documents.subscribe_snapshots(uri)?;
             // Re-resolve the cell per iteration (per-request re-resolution +
             // incarnation validation happen inside `latest_snapshot`).
             let view = self.documents.latest_snapshot(uri)?;
             if let Some(snapshot) = view.slot.snapshot {
                 return Some(snapshot);
             }
-            let mut receiver = self.documents.subscribe_snapshots(uri)?;
             match tokio::time::timeout_at(deadline, receiver.changed()).await {
                 Ok(Ok(())) => continue,
                 // Channel closed (document gone) or first-parse wait elapsed.
