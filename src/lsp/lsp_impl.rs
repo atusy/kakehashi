@@ -88,7 +88,7 @@ pub(super) fn bridge_configs_for_injection_language(
     injection_language: &str,
 ) -> Vec<ResolvedServerConfig> {
     let settings = settings_manager.load_settings();
-    bridge.get_all_configs_for_language(&settings, host_language, injection_language)
+    bridge.cached_configs_for_injection_language(&settings, host_language, injection_language)
 }
 
 pub(super) async fn apply_shared_settings(
