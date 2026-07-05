@@ -451,6 +451,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_edit_after_the_snapshot_silences_the_answer() {
+        // A didChange landing between the text/tree snapshot and the answer
+        // makes every computed range stale — worst case a rename edit
+        // applied to newer text. The answer closure runs at publish time,
+        // so mutating the document inside it simulates exactly that window.
+        let text = "fn main() { let target = 1; target; }";
+        let (service, url, uri) = server_with_doc(text);
+        let server = service.inner();
+
+        let edit = server
+            .native_bindings_answer(&uri, Position::new(0, 28), |ctx| {
+                server
+                    .documents
+                    .update_document(url.clone(), "fn main() {}".to_string(), None);
+                native_rename(ctx, &uri, "renamed")
+            })
+            .await
+            .unwrap();
+        assert!(
+            edit.is_none(),
+            "a stale answer must be dropped once the document moved on"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_rename_refuses_non_identifier_names() {
+        // Beyond whitespace: punctuation-carrying names produce
+        // syntactically invalid edits in every shipped asset's language.
+        let text = "fn main() { let target = 1; target; }";
+        let (service, _url, uri) = server_with_doc(text);
+        let server = service.inner();
+
+        for bad in ["a.b", "x;drop", "!", "123abc", "café"] {
+            let edit = server
+                .native_bindings_answer(&uri, Position::new(0, 28), |ctx| {
+                    native_rename(ctx, &uri, bad)
+                })
+                .await
+                .unwrap();
+            assert!(edit.is_none(), "{bad:?} must not produce a WorkspaceEdit");
+        }
+    }
+
+    #[tokio::test]
     async fn native_prepare_rename_stays_silent_on_unresolved_identifier() {
         // `missing` resolves nowhere: the native layer must contribute
         // nothing so the bridge owns the request.
