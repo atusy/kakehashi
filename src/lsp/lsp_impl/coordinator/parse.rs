@@ -14,6 +14,15 @@ use crate::lsp::settings_manager::SettingsManager;
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The awaiter-side backstop for a pooled parse: pool-queue wait (a burst of
+/// opens on a small pool can queue parses for a while) plus the in-parse
+/// budget, with slack. Deliberately generous: the publish happens in the
+/// CALLER after this await, so an awaiter that gives up while its work-unit
+/// is still queued silently drops the parse result — the document then
+/// serves stale (or empty) until the next edit with nothing to heal it. The
+/// pool thread itself is protected by the in-parse abort, not by this.
+const PARSE_AWAIT_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Host-parse with a wall-clock abort — the shared
 /// [`parse_with_deadline`](crate::language::injection::parse_with_deadline)
 /// primitive under the name the parse-loop call sites use.
@@ -100,11 +109,13 @@ impl ParseCoordinator {
     /// Returns `None` if:
     /// - No parser is available for the language
     /// - The parse work-unit panicked
-    /// - The parse timed out after `PARSE_TIMEOUT` — the native parse aborts
-    ///   itself at the same deadline via tree-sitter's progress callback, so a
-    ///   pathological parse cannot pin a bounded-pool thread past the timeout
-    ///   (the pool is sized as low as ONE thread on small hosts, where a pinned
-    ///   thread would stall every document's tree-CPU)
+    /// - The native parse aborted itself at its `PARSE_TIMEOUT` in-parse
+    ///   deadline (anchored at dequeue, via tree-sitter's progress callback),
+    ///   so a pathological parse cannot pin a bounded-pool thread past its
+    ///   budget (the pool is sized as low as ONE thread on small hosts, where
+    ///   a pinned thread would stall every document's tree-CPU)
+    /// - The `PARSE_AWAIT_BACKSTOP` awaiter timeout fired (extreme queue
+    ///   pressure; the work-unit still self-bounds)
     /// - The closure returned `None`
     pub(crate) async fn parse_with_pool<T, F>(
         &self,
@@ -123,17 +134,21 @@ impl ParseCoordinator {
 
         let parser_pool = std::sync::Arc::clone(&self.parser_pool);
         let language_name_owned = language_name.to_string();
-        // One deadline for both halves: the awaiter's timeout below and the
-        // work-unit's in-parse abort. Anchored at submission, so pool-queue
-        // wait counts against it on both sides.
-        let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
         let result = tokio::time::timeout(
-            PARSE_TIMEOUT,
+            PARSE_AWAIT_BACKSTOP,
             self.compute_pool.run(None, move || {
                 let parser = parser_pool
                     .lock()
                     .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
                     .acquire(&language_name_owned)?;
+                // The in-parse abort deadline is anchored at DEQUEUE, not
+                // submission: a parse that sat in the pool queue behind other
+                // documents' work still gets its full budget of actual parse
+                // CPU (a submission-anchored deadline let a burst of opens
+                // expire healthy parses in the queue, leaving those documents
+                // tree-less until the next edit). The awaiter above covers
+                // queue + parse with slack, so the result is not dropped.
+                let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
                 let (parser, value) = parse_fn(parser, deadline);
                 parser_pool
                     .lock()
@@ -152,8 +167,8 @@ impl ParseCoordinator {
             Ok(None) => None,
             Err(_timeout) => {
                 log::warn!(
-                    "Parse timeout after {:?} for language '{}' on document {} ({} bytes)",
-                    PARSE_TIMEOUT,
+                    "Parse await backstop hit after {:?} for language '{}' on document {} ({} bytes)",
+                    PARSE_AWAIT_BACKSTOP,
                     language_name,
                     uri,
                     text_len

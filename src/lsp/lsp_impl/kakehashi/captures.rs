@@ -645,11 +645,16 @@ fn execute_captures_walk(
     // an unregistered id — resolving one via `kakehashi/node/*` yields
     // `null`, the protocol's re-sync signal, and the client's next
     // current-snapshot request mints real ones. Checked here inside the
-    // work-unit so the race window is the walk itself, not the pool-queue
-    // wait.
+    // work-unit so the entry window is the walk itself, not the pool-queue
+    // wait; the walk-duration residual — an edit landing DURING the walk —
+    // is closed by the post-walk reconciliation below, which purges this
+    // walk's own mints when the snapshot is no longer current on exit.
     let mint_into_tracker = documents.latest_snapshot(uri).is_some_and(|view| {
         view.slot.current_incarnation == incarnation && view.content_version == parsed_version
     });
+    // Ids THIS walk created (as opposed to reused) — the purge set for the
+    // post-walk reconciliation.
+    let mut minted_ids: Vec<ulid::Ulid> = Vec::new();
     let mapper = PositionMapper::new(text);
 
     // Range scoping: clamped conversion (like other viewport-shaped
@@ -699,17 +704,28 @@ fn execute_captures_walk(
                     // the tracker handle since this runs off `self`. On a
                     // stale serve the tracker is read-only (see the
                     // currency gate above).
-                    let ulid = if mint_into_tracker {
-                        tracker.get_or_create_in_layer(uri, c.start_byte, c.end_byte, c.kind, depth)
-                    } else {
+                    let ulid =
                         match tracker.lookup_in_layer(uri, c.start_byte, c.end_byte, c.kind, depth)
                         {
                             Some(live) => live,
-                            // NOT Ulid::default() (the nil id): unregistered
-                            // ids must still be unique per capture.
+                            None if mint_into_tracker => {
+                                let created = tracker.get_or_create_in_layer(
+                                    uri,
+                                    c.start_byte,
+                                    c.end_byte,
+                                    c.kind,
+                                    depth,
+                                );
+                                // Recorded for the post-walk purge: if an edit
+                                // lands mid-walk, entries created from this
+                                // (now-stale) snapshot must not persist.
+                                minted_ids.push(created);
+                                created
+                            }
+                            // NOT Ulid::default() (the nil id): unregistered ids
+                            // must still be unique per capture.
                             None => ulid::Ulid::new(),
-                        }
-                    };
+                        };
                     let node = json!({ "id": ulid.to_string(), "kind": c.kind });
                     let mut capture = json!({
                         "name": c.name,
@@ -755,6 +771,24 @@ fn execute_captures_walk(
         );
     } else {
         visit(language_id, tree, 0);
+    }
+
+    // Post-walk reconciliation, the other half of the currency gate: the
+    // entry latch cannot see an edit that lands DURING the walk, and by then
+    // this walk has minted old-snapshot coordinates into a tracker didChange
+    // just shifted. Purge exactly this walk's own creations — the response
+    // still carries the ids, which now resolve `null` (the protocol's
+    // re-sync signal), the same degradation as a stale-at-entry serve. A
+    // concurrent current walk that reused one of these ids re-mints it on
+    // its next request (no tombstone).
+    if !minted_ids.is_empty()
+        && !documents.latest_snapshot(uri).is_some_and(|view| {
+            view.slot.current_incarnation == incarnation && view.content_version == parsed_version
+        })
+    {
+        for id in &minted_ids {
+            tracker.remove_id(uri, id);
+        }
     }
 
     // The kind is "available" when at least one visited language COMPILED

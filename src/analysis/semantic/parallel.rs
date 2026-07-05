@@ -61,6 +61,13 @@ pub(crate) struct InjectionCacheCtx<'a> {
     /// work-unit started: only then may region ids be MINTED into the
     /// live-coordinate tracker. A stale serve reuses existing ids read-only
     /// and skips caching for regions the tracker does not already know.
+    ///
+    /// Accepted residual: an edit landing DURING the fan-out can still let
+    /// this pass mint from a just-staled snapshot. Unlike the captures walk
+    /// (whose ids go out on the wire and get a post-walk purge), region ids
+    /// stay internal cache keys — a phantom entry is orphaned, never
+    /// resolved, and the token cache stays correct via its content-hash
+    /// validity gate — so the purge machinery is not worth its cost here.
     pub mint_regions: bool,
 }
 

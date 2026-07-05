@@ -341,6 +341,22 @@ impl NodeTracker {
         Some((key.start_byte, key.end_byte, key.kind, key.layer))
     }
 
+    /// Remove a single id from `uri`'s index (both directions).
+    ///
+    /// Used by the serve-stale walks' post-walk reconciliation: ids a walk
+    /// minted while its snapshot was still current are purged when an edit
+    /// landed mid-walk, so wrong-coordinate entries never persist as live.
+    /// The removed id then resolves like a never-issued one — the captures
+    /// protocol's re-sync signal (no tombstone, per
+    /// lazy-node-identity-tracking).
+    pub(crate) fn remove_id(&self, uri: &Url, ulid: &Ulid) {
+        if let Some(mut entries) = self.entries.get_mut(uri)
+            && let Some(key) = entries.reverse.remove(ulid)
+        {
+            entries.forward.remove(&key);
+        }
+    }
+
     /// Get the ULID for a position in a layer if it exists, without creating
     /// it — the read-only half of `get_or_create_in_layer`.
     ///
@@ -632,6 +648,28 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
+    }
+
+    /// `remove_id` erases both directions and leaves the id indistinguishable
+    /// from a never-issued one; a later mint at the same position draws a
+    /// FRESH id (no tombstone).
+    #[test]
+    fn remove_id_purges_both_directions_without_tombstone() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("purge");
+        let id = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 1);
+        assert_eq!(tracker.lookup_in_layer(&uri, 0, 4, "word", 1), Some(id));
+
+        tracker.remove_id(&uri, &id);
+        assert!(tracker.lookup_node(&uri, &id).is_none(), "reverse purged");
+        assert_eq!(
+            tracker.lookup_in_layer(&uri, 0, 4, "word", 1),
+            None,
+            "forward purged"
+        );
+
+        let fresh = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 1);
+        assert_ne!(fresh, id, "re-mint draws a fresh id");
     }
 
     /// Produce a `&'static str` kind for a numeric index by intentionally
