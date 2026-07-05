@@ -194,22 +194,22 @@ impl Kakehashi {
                         .documents
                         .current_resolved_regions(&uri, self.cache.semantic_token_generation())
                     {
-                        Some(regions) => regions.as_ref().clone(),
-                        None => InjectionResolver::resolve_all(
+                        Some(regions) => regions,
+                        None => std::sync::Arc::new(InjectionResolver::resolve_all(
                             &self.language,
                             self.bridge.node_tracker(),
                             &uri,
                             snapshot.tree(),
                             snapshot.text(),
                             injection_query.as_ref(),
-                        ),
+                        )),
                     }
                 })
                 .unwrap_or_default(),
             // Virt gated off, or no tree yet (the host layer still pulls). The
             // wait+on-demand above already tried, so a missing tree here is the
             // rare parse-failure case, self-healing on the next pull.
-            _ => Vec::new(),
+            _ => std::sync::Arc::new(Vec::new()),
         };
         // Lightweight per-region metadata `(region_id, injection_language,
         // current offset)` for the pushFallback fold; the live pull below moves
@@ -233,7 +233,7 @@ impl Kakehashi {
         //   Outer: collect across regions
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
-            for resolved in virt_regions {
+            for resolved in virt_regions.iter() {
                 let configs = self.bridge_configs_for_injection_language(
                     &language_name,
                     &resolved.injection_language,
@@ -252,7 +252,7 @@ impl Kakehashi {
                 let strategy = agg.strategy;
                 let region_ctx = DocumentRequestContext {
                     uri: uri.clone(),
-                    resolved,
+                    resolved: resolved.clone(),
                     configs,
                     upstream_request_id: upstream_request_id.clone(),
                     priorities: agg.priorities,

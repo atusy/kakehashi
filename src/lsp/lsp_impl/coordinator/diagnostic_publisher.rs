@@ -630,17 +630,17 @@ impl DiagnosticPublisher {
             .documents
             .current_resolved_regions(host, self.cache.semantic_token_generation())
         {
-            Some(regions) => regions.as_ref().clone(),
-            None => InjectionResolver::resolve_all(
+            Some(regions) => regions,
+            None => std::sync::Arc::new(InjectionResolver::resolve_all(
                 &self.language,
                 self.bridge.node_tracker(),
                 host,
                 snapshot.tree(),
                 snapshot.text(),
                 injection_query.as_ref(),
-            ),
+            )),
         };
-        for resolved in resolved_regions {
+        for resolved in resolved_regions.iter() {
             offsets.insert(
                 resolved.region.region_id.clone(),
                 RegionOffset::with_per_line_offsets(

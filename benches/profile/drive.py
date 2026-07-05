@@ -138,11 +138,12 @@ def main() -> None:
         first_line_len = len(text.split("\n", 1)[0])
         t0 = time.time()
         req_times = []
+        line_has_extra = False
         for i in range(args.requests):
             for j in range(args.edits):
                 # Toggle a trailing char on line 0 so the text genuinely changes
                 # each time (a no-op didChange would be deduped by hashes).
-                grow = (i + j) % 2 == 0
+                grow = not line_has_extra
                 version += 1
                 if grow:
                     change = {"range": {"start": {"line": 0, "character": first_line_len},
@@ -152,6 +153,7 @@ def main() -> None:
                     change = {"range": {"start": {"line": 0, "character": first_line_len},
                                         "end": {"line": 0, "character": first_line_len + 1}},
                               "text": ""}
+                line_has_extra = grow
                 notify("textDocument/didChange", {
                     "textDocument": {"uri": uri, "version": version},
                     "contentChanges": [change]})

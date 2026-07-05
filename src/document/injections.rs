@@ -15,9 +15,11 @@
 //! content slice is stored as a byte range, re-sliced from the current text at
 //! reuse) and no `Arc<Query>` (the highlight query is looked up fresh by
 //! `resolved_lang`, so a settings reload can't serve a stale query — see
-//! `generation`). This is what lets it live on the [`Document`](super::Document)
-//! across requests. Reuse is bound to the exact tree it was discovered on by the
-//! document's `parse_epoch`; see the write-back CAS.
+//! `generation`). This is what lets it ride the
+//! [`ParseSnapshot`](super::snapshot::ParseSnapshot) across requests. Reuse
+//! is bound to the exact tree it was discovered on by snapshot immutability:
+//! text, tree, and regions are one value, so the regions can never be
+//! consumed against a different tree.
 
 /// The injection-token-cache identity of a discovered region (#529 token half),
 /// or absent when the region isn't token-cacheable (combined groups, or below
@@ -110,11 +112,12 @@ pub(crate) struct DiscoveredBridgeRegion {
 
 /// One pre-parsed injection layer of a document, in document-order DFS —
 /// the owned product of the captures/node layer walk
-/// (`walk_document_layers`), built ONCE per parse by `populate_injections`
-/// and carried on the `ParseSnapshot` so the per-keystroke `kakehashi/captures`
-/// requests (full AND delta both walk) iterate these instead of re-running
-/// the injection query, re-resolving every region's language, and re-parsing
-/// every injected region per request.
+/// (`walk_document_layers`), built LAZILY by the first walking request on a
+/// snapshot (never on the parse critical path) and carried on the
+/// `ParseSnapshot` so the per-keystroke `kakehashi/captures` requests (full
+/// AND delta both walk) iterate these instead of re-running the injection
+/// query, re-resolving every region's language, and re-parsing every
+/// injected region per request.
 ///
 /// `tree` is parsed with the exact absolute included ranges the inline walk
 /// computes (same code, run at populate time), so consuming these is

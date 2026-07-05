@@ -139,12 +139,21 @@ pub(crate) struct BridgeCoordinator {
 /// One settings snapshot's worth of resolved-config lookups (see
 /// [`BridgeCoordinator::config_memo`]). Replaced wholesale when a lookup
 /// arrives for a different settings snapshot.
+/// One `(injection_language, configs)` pair in [`ConfigMemo::virt`]'s
+/// per-host list.
+type VirtMemoEntry = (String, Arc<Vec<ResolvedServerConfig>>);
+
 struct ConfigMemo {
     /// Identity anchor: results below are valid only for this snapshot.
     /// `None` for the initial placeholder, which never matches.
     settings: Option<Arc<WorkspaceSettings>>,
-    /// `(host_language, injection_language)` → virt-bridge configs.
-    virt: DashMap<(String, String), Arc<Vec<ResolvedServerConfig>>>,
+    /// `host_language` → `(injection_language, configs)` pairs. A nested Vec
+    /// rather than a `(String, String)` key so the per-region hit path looks
+    /// up with a borrowed `&str` and scans a handful of pairs — zero
+    /// allocations per hit (a tuple key cannot be borrowed field-wise).
+    /// Concurrent same-pair computes may push a duplicate; the linear scan
+    /// returns the first, both hold identical data.
+    virt: DashMap<String, Vec<VirtMemoEntry>>,
     /// `host_language` → `_self` host-bridge configs.
     host: DashMap<String, Arc<Vec<ResolvedServerConfig>>>,
 }
@@ -390,18 +399,20 @@ impl BridgeCoordinator {
         };
         match injection_language {
             Some(injection_language) => {
-                if let Some(hit) = memo
-                    .virt
-                    .get(&(host_language.to_string(), injection_language.to_string()))
+                if let Some(hit) = memo.virt.get(host_language)
+                    && let Some((_, configs)) = hit
+                        .value()
+                        .iter()
+                        .find(|(lang, _)| lang == injection_language)
                 {
-                    return hit.value().as_ref().clone();
+                    return configs.as_ref().clone();
                 }
                 let configs =
                     self.get_all_configs_for_language(settings, host_language, injection_language);
-                memo.virt.insert(
-                    (host_language.to_string(), injection_language.to_string()),
-                    Arc::new(configs.clone()),
-                );
+                memo.virt
+                    .entry(host_language.to_string())
+                    .or_default()
+                    .push((injection_language.to_string(), Arc::new(configs.clone())));
                 configs
             }
             None => {

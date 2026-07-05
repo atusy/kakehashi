@@ -525,6 +525,12 @@ impl CacheCoordinator {
     /// `parsed_version` was served for `uri` (monotonic max — a stale-serve
     /// racing a fresher one must not regress the mark).
     pub(crate) fn record_served_semantic_version(&self, uri: &Url, parsed_version: u64) {
+        // `get_mut` first: the hot path (every token serve) avoids the `Url`
+        // clone `entry()` needs for its owned key.
+        if let Some(mut served) = self.served_semantic_versions.get_mut(uri) {
+            *served = (*served).max(parsed_version);
+            return;
+        }
         self.served_semantic_versions
             .entry(uri.clone())
             .and_modify(|v| *v = (*v).max(parsed_version))

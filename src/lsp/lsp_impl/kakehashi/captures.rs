@@ -185,17 +185,18 @@ struct KindQuery {
     skipped: Vec<crate::language::query_loader::SkippedPattern>,
 }
 
-/// Compiled-kind-query cache keyed by `(language, kind file, settings
-/// generation)`. `load_kind_query` re-read and re-COMPILED every visited
-/// language's kind file on every request — for a per-keystroke highlighter
-/// over an injection-heavy document that meant re-compiling several large
-/// query files per keystroke, dwarfing the walk itself. The generation key
-/// gives the same hot-reload discipline as the highlight-query store: a
-/// settings reload (which also re-resolves search paths) starts a fresh
-/// generation, and the first MISS of a new generation sweeps the previous
-/// generation's entries (see `load_kind_query_cached`), so reload churn
-/// cannot accumulate dead compiled queries.
-type KindQueryCache = dashmap::DashMap<(String, String, u64), std::sync::Arc<KindQueryLoad>>;
+/// Compiled-kind-query cache keyed by `(language, kind file)` with the
+/// settings generation in the VALUE. `load_kind_query` re-read and
+/// re-COMPILED every visited language's kind file on every request — for a
+/// per-keystroke highlighter over an injection-heavy document that meant
+/// re-compiling several large query files per keystroke, dwarfing the walk
+/// itself. A hit requires the stored generation to equal the caller's (the
+/// same hot-reload discipline as the highlight-query store); a miss simply
+/// OVERWRITES the entry, which is also the eviction: the map never holds
+/// more than one generation per (language, kind), no sweep, no
+/// clear-vs-concurrent-store race, and reload churn cannot accumulate dead
+/// compiled queries.
+type KindQueryCache = dashmap::DashMap<(String, String), (std::sync::Arc<KindQueryLoad>, u64)>;
 
 fn kind_query_cache() -> &'static KindQueryCache {
     static CACHE: std::sync::OnceLock<KindQueryCache> = std::sync::OnceLock::new();
@@ -210,23 +211,21 @@ fn load_kind_query_cached(
     file_name: &str,
     generation: u64,
 ) -> std::sync::Arc<KindQueryLoad> {
-    let key = (language_id.to_string(), file_name.to_string(), generation);
-    if let Some(hit) = kind_query_cache().get(&key) {
-        return std::sync::Arc::clone(&hit);
+    let key = (language_id.to_string(), file_name.to_string());
+    if let Some(hit) = kind_query_cache().get(&key)
+        && hit.1 == generation
+    {
+        return std::sync::Arc::clone(&hit.0);
     }
-    // Miss (once per (language, kind) per generation): sweep entries from
-    // other generations so a reload-heavy session doesn't accumulate dead
-    // compiled queries. Off the hit path by construction.
-    kind_query_cache().retain(|(_, _, cached_generation), _| *cached_generation == generation);
     let loaded = std::sync::Arc::new(load_kind_query(
         registry,
         search_paths,
         language_id,
         file_name,
     ));
-    kind_query_cache()
-        .entry(key)
-        .or_insert_with(|| std::sync::Arc::clone(&loaded));
+    // Overwrite-on-miss doubles as eviction (one generation per entry). A
+    // racing same-generation compute overwrites with identical data.
+    kind_query_cache().insert(key, (std::sync::Arc::clone(&loaded), generation));
     loaded
 }
 

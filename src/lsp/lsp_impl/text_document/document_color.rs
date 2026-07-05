@@ -74,15 +74,15 @@ impl Kakehashi {
             .documents
             .current_resolved_regions(&uri, self.cache.semantic_token_generation())
         {
-            Some(regions) => regions.as_ref().clone(),
-            None => InjectionResolver::resolve_all(
+            Some(regions) => regions,
+            None => std::sync::Arc::new(InjectionResolver::resolve_all(
                 &self.language,
                 self.bridge.node_tracker(),
                 &uri,
                 snapshot.tree(),
                 snapshot.text(),
                 injection_query.as_ref(),
-            ),
+            )),
         };
 
         if all_regions.is_empty() {
@@ -101,7 +101,7 @@ impl Kakehashi {
         // Outer JoinSet: one task per injection region, all in parallel
         let mut outer_join_set: JoinSet<Vec<ColorInformation>> = JoinSet::new();
 
-        for resolved in all_regions {
+        for resolved in all_regions.iter() {
             // Get ALL bridge server configs for this injection language
             let configs = self.bridge_configs_for_injection_language(
                 &language_name,
@@ -118,7 +118,7 @@ impl Kakehashi {
             );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
-                resolved,
+                resolved: resolved.clone(),
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
                 priorities: agg.priorities,

@@ -194,15 +194,15 @@ impl DiagnosticScheduler {
                             .documents
                             .current_resolved_regions(uri, self.cache.semantic_token_generation())
                         {
-                            Some(regions) => regions.as_ref().clone(),
-                            None => InjectionResolver::resolve_all(
+                            Some(regions) => regions,
+                            None => std::sync::Arc::new(InjectionResolver::resolve_all(
                                 &self.language,
                                 self.bridge.node_tracker(),
                                 uri,
                                 snapshot.tree(),
                                 snapshot.text(),
                                 injection_query.as_ref(),
-                            ),
+                            )),
                         };
 
                         let mut contexts = Vec::new();
@@ -216,7 +216,7 @@ impl DiagnosticScheduler {
                             Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
                         let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
                             std::collections::HashMap::new();
-                        for resolved in all_regions {
+                        for resolved in all_regions.iter() {
                             // `get` on the common (cache-hit) path is a single lookup;
                             // only the resolving miss touches the map again, cloning
                             // the language key just for that insert.
@@ -273,7 +273,7 @@ impl DiagnosticScheduler {
 
                             contexts.push(DocumentRequestContext {
                                 uri: uri.clone(),
-                                resolved,
+                                resolved: resolved.clone(),
                                 configs: configs.clone(),
                                 upstream_request_id: None,
                                 priorities: agg.priorities.clone(),
