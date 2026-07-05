@@ -45,6 +45,12 @@ pub(crate) struct LanguageCoordinator {
     /// Cleared on every `load_settings` (settings reload / post-install
     /// reload), which is the only event that can make a failed load succeed.
     failed_loads: dashmap::DashSet<String>,
+    /// Bumped by every `load_settings` AFTER the `failed_loads` clear. A load
+    /// attempt captures it BEFORE scanning and inserts its failure only when
+    /// still current — otherwise an attempt that captured the OLD search
+    /// paths could straddle the reload and re-insert a failure for a parser
+    /// the new paths can load, suppressing it until the next reload.
+    load_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Default for LanguageCoordinator {
@@ -64,6 +70,7 @@ impl LanguageCoordinator {
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
             failed_loads: dashmap::DashSet::new(),
+            load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
         }
     }
@@ -81,8 +88,19 @@ impl LanguageCoordinator {
         if self.failed_loads.contains(language_id) {
             return LanguageLoadResult::default();
         }
+        let attempt_generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let result = self.try_load_language_by_id(language_id);
-        if !result.success {
+        if !result.success
+            && attempt_generation
+                == self
+                    .load_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Insert only when no reload happened during the scan: an attempt
+            // that captured the OLD search paths must not negative-cache a
+            // parser the new paths can load (see `load_generation`).
             self.failed_loads.insert(language_id.to_string());
         }
         result
@@ -97,7 +115,12 @@ impl LanguageCoordinator {
         self.clear_derived_languages();
         // A reload (new search paths, or the post-install reload) is the only
         // event that can turn a failed load into a success — retry everything.
+        // Clear BEFORE bumping the generation: an in-flight attempt that
+        // captured the pre-bump generation then fails its insert gate, so it
+        // cannot re-poison the cache it just watched being cleared.
         self.failed_loads.clear();
+        self.load_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
 
         // Build base map from language configs
         self.build_base_map(&settings.languages);

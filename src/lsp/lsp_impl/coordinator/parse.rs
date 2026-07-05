@@ -17,7 +17,10 @@ use crate::lsp::settings_manager::SettingsManager;
 #[derive(Default)]
 struct PopulatedSnapshotRegions {
     discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
-    bridge_regions: Option<std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>>,
+    bridge_regions: Option<(
+        u64,
+        std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>,
+    )>,
     resolved_regions: Option<(
         u64,
         std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>,
@@ -300,7 +303,9 @@ impl ParseCoordinator {
                 );
                 PopulatedSnapshotRegions {
                     discovery: populated.discovery.map(std::sync::Arc::new),
-                    bridge_regions: populated.bridge_regions.map(std::sync::Arc::new),
+                    bridge_regions: populated
+                        .bridge_regions
+                        .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
                     resolved_regions: Some((
                         populated.generation,
                         std::sync::Arc::new(populated.resolved_regions),

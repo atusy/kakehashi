@@ -107,7 +107,12 @@ impl InjectionCoordinator {
         if let Some(view) = self.documents.latest_snapshot(uri)
             && let Some(snapshot) = &view.slot.snapshot
             && snapshot.parsed_version == view.content_version
-            && let Some(bridge_regions) = &snapshot.bridge_regions
+            && let Some((stamped_generation, bridge_regions)) = &snapshot.bridge_regions
+            // Generation gate (like resolved_regions): a reload can change
+            // the injection query without a new snapshot — consuming the old
+            // query's regions would open/update virtual documents the new
+            // query would not discover. Mismatch falls back inline below.
+            && *stamped_generation == self.cache.semantic_token_generation()
         {
             return bridge_regions
                 .iter()
@@ -440,7 +445,10 @@ mod tests {
             .documents
             .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
         let content_version = server.documents.get(&uri).unwrap().content_version();
-        publish(Some(std::sync::Arc::new(bridge_regions)), content_version);
+        publish(
+            Some((populated.generation, std::sync::Arc::new(bridge_regions))),
+            content_version,
+        );
         let fast = injection.resolve_injection_data(&uri, "markdown");
 
         assert_eq!(

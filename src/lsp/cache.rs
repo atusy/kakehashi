@@ -251,6 +251,14 @@ impl CacheCoordinator {
         // re-discovers inline — the "snapshot generation at the top" discipline
         // the token handlers use.
         let generation = self.semantic_token_generation();
+        // Entry half of the mint reconciliation (the captures walk's #554
+        // pattern, applied to the WRITER): populate runs post-CAS but an edit
+        // can land DURING this pass, shift the live-coordinate NodeTracker,
+        // and leave this pass minting the old tree's coordinates into it. The
+        // exit check below purges this pass's own creations and withholds
+        // every region-id-bearing product when the latch no longer matches.
+        let entry_mint_epoch = tracker.mint_epoch(uri);
+        let mut minted_ids: Vec<ulid::Ulid> = Vec::new();
 
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
@@ -288,13 +296,18 @@ impl CacheCoordinator {
             let cacheable_regions: Vec<CacheableInjectionRegion> = regions
                 .iter()
                 .map(|info| {
-                    // Get position-based ULID from tracker
-                    let ulid = tracker.get_or_create(
+                    // Get position-based ULID from tracker, recording
+                    // creations for the exit reconciliation's purge set.
+                    let (ulid, created, _) = tracker.get_or_create_in_layer_tracked(
                         uri,
                         info.content_node.start_byte(),
                         info.content_node.end_byte(),
                         info.content_node.kind(),
+                        0,
                     );
+                    if created {
+                        minted_ids.push(ulid);
+                    }
                     let region_id = ulid.to_string();
                     let new_region =
                         CacheableInjectionRegion::from_region_info(info, &region_id, text);
@@ -387,9 +400,6 @@ impl CacheCoordinator {
                     text,
                 );
 
-            // Store in injection map
-            self.injection_map.insert(uri.clone(), cacheable_regions);
-
             // Producer half of the discovery lever: build the owned discovery
             // from the SAME `regions` just collected — the injection query (`Q`)
             // is not re-run — so a semanticTokens request bound to the snapshot
@@ -405,6 +415,26 @@ impl CacheCoordinator {
                 tracker,
                 generation,
             );
+
+            // Exit half of the mint reconciliation: an edit (or close/reopen)
+            // landed during this pass — its coordinates are superseded. Purge
+            // exactly this pass's tracker creations (the base invariant: a
+            // stale pass never leaves wrong-space entries as live), keep the
+            // injection map's previous entry (the newer text's own populate
+            // replaces it), and withhold the region-id-bearing products; the
+            // snapshot then rides without regions and every reader falls back
+            // inline, byte-identically to the pre-lever path. The token-cache
+            // evictions this pass already performed are conservative
+            // (idempotent removes) and need no rollback.
+            if tracker.mint_epoch(uri) != entry_mint_epoch {
+                for id in &minted_ids {
+                    tracker.remove_id(uri, id);
+                }
+                return PopulatedInjections::empty(generation);
+            }
+            // Commit point: store the region set the token-cache bookkeeping
+            // (reanchor/eviction) keys off.
+            self.injection_map.insert(uri.clone(), cacheable_regions);
             return PopulatedInjections {
                 discovery,
                 bridge_regions,

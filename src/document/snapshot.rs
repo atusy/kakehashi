@@ -54,9 +54,14 @@ pub(crate) struct ParseSnapshot {
     /// never be consumed against a different tree.
     pub(crate) injection_regions: Option<Arc<DiscoveredInjections>>,
     /// The bridge downstream's region list, derived by the same populate pass
-    /// (`None` when populate didn't run for this snapshot — the downstream
-    /// then resolves inline; `Some(empty)` means genuinely no regions).
-    pub(crate) bridge_regions: Option<Arc<Vec<DiscoveredBridgeRegion>>>,
+    /// (`None` when populate didn't run for this snapshot or no bridge server
+    /// was configured — the downstream then resolves inline; `Some(empty)`
+    /// means genuinely no regions). Stamped with the settings generation the
+    /// discovery ran under, like `resolved_regions`: a reload can change the
+    /// injection query without publishing a new snapshot, and the consumer
+    /// must fall back inline rather than open virtual documents for regions
+    /// the new query would not discover.
+    pub(crate) bridge_regions: Option<(u64, Arc<Vec<DiscoveredBridgeRegion>>)>,
     /// Fully resolved injection regions (`InjectionResolver::resolve_all`'s
     /// shape) from the same populate pass, for the whole-document readers —
     /// pull/push diagnostics, documentSymbol/Color, formatting's virt layer —
