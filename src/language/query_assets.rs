@@ -25,6 +25,7 @@ mod tests {
             "java" => tree_sitter_java::LANGUAGE.into(),
             "c_sharp" => tree_sitter_c_sharp::LANGUAGE.into(),
             "php" => tree_sitter_php::LANGUAGE_PHP.into(),
+            "ruby" => tree_sitter_ruby::LANGUAGE.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
             "javascript" => tree_sitter_javascript::LANGUAGE.into(),
             "lua" => tree_sitter_lua::LANGUAGE.into(),
@@ -80,6 +81,7 @@ mod tests {
             "lua",
             "php",
             "python",
+            "ruby",
             "rust",
         ] {
             let source = resolved_source(lang);
@@ -798,6 +800,60 @@ mod tests {
                 None,
                 "the generic must not escape the function"
             );
+        }
+    }
+
+    mod ruby_fixtures {
+        use super::*;
+
+        #[test]
+        fn methods_do_not_capture_outer_locals_but_blocks_do() {
+            let text =
+                "total = 1\ndef bump\n  total\nend\nitems.each do |item|\n  total = item\nend\n";
+            let m = model_for("ruby", text);
+            // The method body cannot see the top-level local...
+            assert_eq!(m.definition_range_at(nth(text, "total", 1)), None);
+            // ...while the block writes the outer binding (outer-or-local).
+            let top = m.binding_at(nth(text, "total", 0)).unwrap();
+            assert_eq!(m.binding_at(nth(text, "total", 2)), Some(top));
+            assert_eq!(m.sites(top).len(), 2, "block assignment merged as a site");
+            assert_resolves(&m, text, "item", 2, 1);
+        }
+
+        #[test]
+        fn bare_calls_resolve_to_methods_receivers_stay_members() {
+            let text = "def helper(x)\n  x\nend\ndef go\n  helper(1)\nend\nobj.helper\n";
+            let m = model_for("ruby", text);
+            assert_resolves(&m, text, "helper", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "helper", 2)),
+                None,
+                "a receiver call names a member, not the lexical method"
+            );
+            assert_resolves(&m, text, "x", 1, 0);
+        }
+
+        #[test]
+        fn parameters_including_splat_keyword_and_block() {
+            let text = "def add(n, key: nil, *rest, &blk)\n  n + key + rest + blk\nend\n";
+            let m = model_for("ruby", text);
+            let n_def = nth(text, "n,", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "n +", 0)),
+                Some(n_def..n_def + 1)
+            );
+            assert_resolves(&m, text, "key", 1, 0);
+            assert_resolves(&m, text, "rest", 1, 0);
+            assert_resolves(&m, text, "blk", 1, 0);
+        }
+
+        #[test]
+        fn instance_variables_span_methods_and_constants_resolve() {
+            let text = "SIZE = 1\nclass Box\n  def set(v)\n    @size = v\n  end\n  def get\n    @size + SIZE\n  end\nend\nBox.new\n";
+            let m = model_for("ruby", text);
+            assert_resolves(&m, text, "@size", 1, 0);
+            assert_resolves(&m, text, "SIZE", 1, 0);
+            assert_resolves(&m, text, "Box", 1, 0);
         }
     }
 
