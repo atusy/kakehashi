@@ -22,14 +22,26 @@
  (#set! definition.namespace "type")
  (#set! definition.visibility "after"))
 
-; Template type parameters live in the templated function, registered by
-; label regardless of containment (the parameter list precedes the
-; function node). Class templates never match: silence over a root leak.
+; Template type parameters live in the templated declaration, registered
+; by label regardless of containment (the parameter list precedes the
+; function / class-body node).
 ((template_declaration
    parameters: (template_parameter_list
      (type_parameter_declaration (type_identifier) @definition.type))
    (function_definition) @scope.function)
  (#set! definition.scope "function")
+ (#set! definition.namespace "type"))
+((template_declaration
+   parameters: (template_parameter_list
+     (type_parameter_declaration (type_identifier) @definition.type))
+   (class_specifier body: (field_declaration_list) @scope.body))
+ (#set! definition.scope "body")
+ (#set! definition.namespace "type"))
+((template_declaration
+   parameters: (template_parameter_list
+     (type_parameter_declaration (type_identifier) @definition.type))
+   (struct_specifier body: (field_declaration_list) @scope.body))
+ (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 
 ; ── Lambdas and range-for ────────────────────────────────────────────────
