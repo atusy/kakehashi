@@ -626,8 +626,10 @@ resolution path and emits `semanticTokens/refresh` at its publish point;
 `semanticTokens` full/delta and `captures/full` serve-stale (the lineage store
 gains the §3 request-entry version guard); `semanticTokens/range` and the
 bridge/formatting/node families staleness-reject (`ContentModified`, or the
-protocol-appropriate `null`); `formatting` and `selectionRange` take the
-explicit-action bounded wait; and **every** reader inline-parse fallback is
+protocol-appropriate `null`); `formatting`, `rangeFormatting`, and
+`selectionRange` take the explicit-action bounded wait (the two formatting
+verbs share the treatment as well as the `textDocument/formatting`
+configuration key); and **every** reader inline-parse fallback is
 removed — `get_tree_with_wait`, `wait_for_epoch`, and the on-demand parse in
 `ensure_document_parsed` are gone, closing the resurrection vector.
 

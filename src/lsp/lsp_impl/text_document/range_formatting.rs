@@ -58,12 +58,22 @@ impl Kakehashi {
 
             log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
 
-            // Tower-LSP runs requests concurrently, and `didChange` now reparses
-            // off-ingress, so a rangeFormatting call can arrive before a tree
-            // exists. Wait for the reparse (and parse on demand if needed) before
-            // snapshotting — the shared post-edit freshness helper — so an
-            // otherwise-valid request doesn't degrade to `Ok(None)` on a parse race.
-            self.ensure_document_parsed(&uri).await;
+            // Explicit-action bounded wait (parse-snapshot ADR §3), the same
+            // treatment as its sibling `formatting` (the two share the
+            // "textDocument/formatting" configuration key and the spec's
+            // explicit-action class): user-triggered and infrequent, so it may
+            // briefly wait for the in-flight parse; a still-stale snapshot
+            // after the wait rejects with ContentModified — the request's
+            // range is authored against the LIVE text, so silently no-opping
+            // (or worse, formatting a trailing region) is the jarring outcome
+            // §3 forbids. Never-parsed/gone falls through to the existing
+            // empty fallbacks below.
+            if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
+                .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(500))
+                .await
+            {
+                return Err(crate::error::content_modified_error());
+            }
 
             let snapshot = match self.documents.get(&uri) {
                 None => {
