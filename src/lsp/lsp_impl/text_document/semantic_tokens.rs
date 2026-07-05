@@ -697,25 +697,33 @@ impl Kakehashi {
         // compute the new-generation key) — so a stale entry can never be served.
         let generation = self.cache.semantic_token_generation();
 
-        // Staleness-reject (parse-snapshot ADR §3): the request's `range` is
-        // authored against the LIVE text, so a trailing snapshot cannot answer
-        // it — unlike full/delta (whole-document, serve-stale). A stale
-        // snapshot → ContentModified; the client's next natural request (this
-        // is a per-redraw viewport read) gets the fresh one. No snapshot at
-        // all (pre-first-parse) keeps the empty-tokens fallback.
+        // First-parse bound (parse-snapshot ADR §3): resolve through the same
+        // bounded first-parse wait as full/delta. Without it, a range request
+        // racing didOpen answered empty tokens with nothing to re-drive the
+        // client — the parse loop's refresh heals full/delta lineages, but an
+        // empty range response has no lineage, so the viewport stayed blank
+        // until an incidental re-request. Steady state (snapshot present)
+        // resolves immediately.
+        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        };
+        // Staleness-reject: the request's `range` is authored against the
+        // LIVE text, so a trailing (or cross-incarnation) snapshot cannot
+        // answer it — unlike full/delta (whole-document, serve-stale). A
+        // stale snapshot → ContentModified; the client's next natural request
+        // (this is a per-redraw viewport read) gets the fresh one.
         let Some(view) = self.documents.latest_snapshot(&uri) else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
             })));
         };
-        let Some(snapshot) = view.slot.snapshot else {
-            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
-        };
-        if snapshot.parsed_version != view.content_version {
+        if snapshot.incarnation != view.slot.current_incarnation
+            || snapshot.parsed_version != view.content_version
+        {
             return Err(crate::error::content_modified_error());
         }
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
