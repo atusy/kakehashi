@@ -569,6 +569,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn injected_rename_edits_both_sites_in_host_coordinates() {
+        // line 3: `local v = 1`; line 4: `print(v)`.
+        let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
+        let (service, uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+
+        let edit = server
+            .native_bindings_answer(&uri, Position::new(4, 6), |ctx| {
+                native_rename(ctx, &uri, "renamed")
+            })
+            .await
+            .unwrap()
+            .expect("injected-layer rename must be offered");
+        let edits = &edit.changes.unwrap()[&uri];
+        let starts: Vec<Position> = edits.iter().map(|e| e.range.start).collect();
+        assert!(
+            starts.contains(&Position::new(3, 6)) && starts.contains(&Position::new(4, 6)),
+            "definition and reference in host coordinates: {starts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn references_without_declaration_exclude_the_definition_site() {
+        let text = "fn main() { let target = 1; target; }";
+        let (service, _url, uri) = server_with_doc(text);
+        let server = service.inner();
+
+        let refs = server
+            .native_bindings_answer(&uri, Position::new(0, 28), |ctx| {
+                native_references(ctx, &uri, false)
+            })
+            .await
+            .unwrap()
+            .expect("the use site is still a reference");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].range.start,
+            Position::new(0, 28),
+            "only the use site; the `let target` declaration is excluded"
+        );
+    }
+
+    #[tokio::test]
     async fn injected_layers_never_cross_regions() {
         // Two lua blocks: the second reads a name only the first defines.
         let text = "```lua\nlocal shared = 1\n```\n\n```lua\nprint(shared)\n```\n";
