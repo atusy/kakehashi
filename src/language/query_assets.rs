@@ -517,6 +517,24 @@ mod tests {
         use super::*;
 
         #[test]
+        fn blank_identifier_never_binds_or_resolves() {
+            // `_` neither introduces nor references a binding in Go: the
+            // discard in `_ = a` must not resolve to the `_` slot of the
+            // short declaration above it.
+            let text = "package m\nfunc f() {\n\ta, _ := g()\n\t_ = a\n}\n";
+            let m = model_for("go", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "_ =", 0)),
+                None,
+                "a discard write must not resolve to a discard 'definition'"
+            );
+            assert!(
+                m.binding_at(nth(text, "_ :=", 0)).is_none(),
+                "the declaration's `_` slot must not create a binding"
+            );
+        }
+
+        #[test]
         fn short_var_declarations_are_sequential() {
             let text = "package m\nfunc f() {\n\ttotal := 1\n\ttotal = total + 1\n\t{ total := 2; _ = total }\n}\n";
             let m = model_for("go", text);
