@@ -369,19 +369,37 @@ impl NodeTracker {
         Some((key.start_byte, key.end_byte, key.kind, key.layer))
     }
 
-    /// Remove a single id from `uri`'s index (both directions).
+    /// Remove `ulid` from `uri`'s index (both directions) — but only if its
+    /// entry still sits at exactly the coordinates it was minted at.
     ///
     /// Used by the serve-stale walks' post-walk reconciliation: ids a walk
-    /// minted while its snapshot was still current are purged when an edit
+    /// created while its snapshot was still current are purged when an edit
     /// landed mid-walk, so wrong-coordinate entries never persist as live.
-    /// The removed id then resolves like a never-issued one — the captures
-    /// protocol's re-sync signal (no tombstone, per
-    /// lazy-node-identity-tracking).
-    pub(crate) fn remove_id(&self, uri: &Url, ulid: &Ulid) {
+    /// The unmoved condition is the discriminator between the two possible
+    /// orderings of that race, because the edit's shift IS the correction:
+    /// - mint happened BEFORE the edit's tracker shift → the shift moved the
+    ///   entry into post-edit coordinates like any live entry → the key no
+    ///   longer matches → kept (the entry is legitimate, and may already be
+    ///   reused by a newer-version walk's response);
+    /// - mint happened AFTER the shift → the entry missed the correction and
+    ///   sits in the wrong space at its minted key → removed. It then
+    ///   resolves like a never-issued one — the captures protocol's re-sync
+    ///   signal (no tombstone, per lazy-node-identity-tracking).
+    pub(crate) fn remove_id_if_unmoved(
+        &self,
+        uri: &Url,
+        ulid: &Ulid,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        layer: usize,
+    ) {
+        let minted_key = PositionKey::new(start, end, kind, layer);
         if let Some(mut entries) = self.entries.get_mut(uri)
-            && let Some(key) = entries.reverse.remove(ulid)
+            && entries.reverse.get(ulid) == Some(&minted_key)
         {
-            entries.forward.remove(&key);
+            entries.reverse.remove(ulid);
+            entries.forward.remove(&minted_key);
         }
     }
 
@@ -678,17 +696,29 @@ mod tests {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
     }
 
-    /// `remove_id` erases both directions and leaves the id indistinguishable
-    /// from a never-issued one; a later mint at the same position draws a
-    /// FRESH id (no tombstone).
+    /// `remove_id_if_unmoved` erases both directions (no tombstone: a later
+    /// mint draws a fresh id) — but ONLY when the entry still sits at its
+    /// minted coordinates; an entry the edit shift already moved is kept
+    /// (it was corrected like any live entry and may be reused).
     #[test]
-    fn remove_id_purges_both_directions_without_tombstone() {
+    fn remove_id_if_unmoved_purges_unmoved_entries_only() {
         let tracker = NodeTracker::new();
         let uri = test_uri("purge");
-        let id = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 1);
-        assert_eq!(tracker.lookup_in_layer(&uri, 0, 4, "word", 1), Some(id));
+        let (id, created) = tracker.get_or_create_in_layer_tracked(&uri, 0, 4, "word", 1);
+        assert!(created, "first mint creates");
+        let (again, created_again) = tracker.get_or_create_in_layer_tracked(&uri, 0, 4, "word", 1);
+        assert_eq!(again, id);
+        assert!(!created_again, "re-mint reuses, atomically attributed");
 
-        tracker.remove_id(&uri, &id);
+        // Coordinates no longer match (the entry "moved"): kept.
+        tracker.remove_id_if_unmoved(&uri, &id, 2, 6, "word", 1);
+        assert!(
+            tracker.lookup_node(&uri, &id).is_some(),
+            "a moved entry must survive the purge"
+        );
+
+        // Unmoved: purged from both directions.
+        tracker.remove_id_if_unmoved(&uri, &id, 0, 4, "word", 1);
         assert!(tracker.lookup_node(&uri, &id).is_none(), "reverse purged");
         assert_eq!(
             tracker.lookup_in_layer(&uri, 0, 4, "word", 1),
