@@ -94,16 +94,18 @@ impl Kakehashi {
 
         // Run the synchronous injection-aware walk as one work-unit on the
         // compute pool against the snapshot's consistent (text, tree). The
-        // parser-pool sync mutex is acquired only on the pool thread.
+        // walk uses a TRANSIENT parser pool: holding the shared parser-pool
+        // mutex across the whole injection walk would block any concurrent
+        // parse work-unit's brief acquire/release on it — pinning a second
+        // compute thread for the walk's duration. Parser construction is
+        // cheap (the grammars are already registered), and selectionRange is
+        // a user-triggered, infrequent read, so per-request parsers beat
+        // cross-request reuse here.
         let language = std::sync::Arc::clone(&self.language);
-        let parser_pool = std::sync::Arc::clone(&self.parser_pool);
         let result = self
             .compute_pool
             .run(None, move || {
-                use crate::error::LockResultExt;
-                let mut pool = parser_pool
-                    .lock()
-                    .recover_poison("Kakehashi::selection_range_impl");
+                let mut pool = language.create_document_parser_pool();
                 handle_selection_range(
                     &snapshot.text,
                     snapshot.tree.as_ref(),
