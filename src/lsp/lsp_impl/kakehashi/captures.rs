@@ -585,6 +585,15 @@ impl Kakehashi {
             return Ok(None);
         };
 
+        // A typing client cancels superseded captures aggressively (one full +
+        // several deltas per keystroke); without a cancel signal each walk ran
+        // to completion on a compute-pool thread. The token doubles as the
+        // pool's dequeue hook (a cancelled work-unit is skipped before it ever
+        // takes a thread) and as the walk's per-layer checkpoint.
+        let upstream_id = crate::lsp::current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let cancel_token = crate::cancel::CancelToken::default();
+
         // Resolve the latest parse snapshot, with only the bounded first-parse
         // wait (parse-snapshot ADR §3). `full` SERVES-STALE — it is a
         // per-keystroke highlighter, and `null`-on-routine-staleness against a
@@ -681,17 +690,22 @@ impl Kakehashi {
         let documents = std::sync::Arc::clone(&self.documents);
         let parsed_version = snapshot.parsed_version;
         let snapshot_for_layers = std::sync::Arc::clone(&snapshot);
-        let walked = self
+        let walk_cancel = cancel_token.clone();
+        let inner_cancel = cancel_token.clone();
+        let walk_future = self
             .compute_pool
-            .run(None, move || {
+            .run(Some(cancel_token.clone()), move || {
                 // Lazily build the snapshot's layer trees on first use (this
                 // is the same walk the inline path would run) and share them
                 // across every subsequent walk on this snapshot — captures
                 // full + delta both walk per keystroke. Concurrent walkers on
                 // one snapshot block on the OnceLock and reuse the winner's.
+                let build_start = std::time::Instant::now();
+                let mut layers_were_cached = true;
                 let fresh_layers;
                 let layers = if injection {
                     let cached = snapshot_for_layers.layer_trees.get_or_init(|| {
+                        layers_were_cached = false;
                         (
                             generation,
                             std::sync::Arc::new(
@@ -725,7 +739,9 @@ impl Kakehashi {
                 } else {
                     None
                 };
-                execute_captures_walk(
+                let build_elapsed = build_start.elapsed();
+                let walk_start = std::time::Instant::now();
+                let walked = execute_captures_walk(
                     &uri_for_walk,
                     &kind,
                     lsp_range,
@@ -740,12 +756,49 @@ impl Kakehashi {
                     parsed_version,
                     incarnation,
                     generation,
-                )
-            })
-            .await;
+                    Some(&inner_cancel),
+                );
+                log::debug!(
+                    target: "kakehashi::captures",
+                    "walk {uri_for_walk} kind={kind} v{parsed_version}: layers {}={}ms walk={}ms matches={}",
+                    if layers_were_cached { "cached" } else { "built" },
+                    build_elapsed.as_millis(),
+                    walk_start.elapsed().as_millis(),
+                    walked.as_ref().map_or(0, |(m, _)| m.len()),
+                );
+                walked
+            });
+        let walked = if let Some(cancel_rx) = cancel_rx {
+            tokio::pin!(cancel_rx);
+            tokio::select! {
+                biased;
+                // $/cancelRequest while queued/walking: flip the token so a
+                // queued unit is skipped at dequeue and a running walk bails
+                // at its next per-layer checkpoint, then answer the protocol
+                // cancellation instead of `null` (which would make the client
+                // immediately re-request).
+                _ = &mut cancel_rx => {
+                    walk_cancel.cancel();
+                    return Err(JsonRpcError::request_cancelled());
+                }
+                walked = walk_future => walked,
+            }
+        } else {
+            walk_future.await
+        };
         let Some(walked) = walked else {
+            // A pool-skip of an already-cancelled unit (or a work-unit panic).
+            if walk_cancel.is_cancelled() {
+                return Err(JsonRpcError::request_cancelled());
+            }
             return Ok(None);
         };
+        // A cancel landing after the walk finished: the result is complete,
+        // but never cache or serve a walk raced by its own cancellation's
+        // supersessor — the client already discarded this request.
+        if walk_cancel.is_cancelled() {
+            return Err(JsonRpcError::request_cancelled());
+        }
         Ok(walked.map(|(matches, skipped)| {
             if let Some(key) = walk_key {
                 self.captures_walk_cache.insert(
@@ -792,6 +845,7 @@ fn execute_captures_walk(
     parsed_version: u64,
     incarnation: u64,
     generation: u64,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<(Vec<Value>, Vec<Value>)> {
     // Tracker minting is currency-gated: the NodeTracker is a LIVE-coordinate
     // index (didChange shifts every entry before the reparse), so a trailing
@@ -848,6 +902,11 @@ fn execute_captures_walk(
     let mut matches: Vec<Value> = Vec::new();
 
     let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
+        // Per-layer cancellation checkpoint: a cancelled walk stops doing
+        // query/mint work; the caller discards the (partial) result.
+        if crate::cancel::is_cancelled(cancel) {
+            return;
+        }
         let entry = kind_queries
             .entry(layer_language.to_string())
             .or_insert_with(|| {
@@ -951,6 +1010,9 @@ fn execute_captures_walk(
             // makes the layer's query yield nothing for the clipped range.
             visit(language_id, tree, 0);
             for layer in layers {
+                if crate::cancel::is_cancelled(cancel) {
+                    break;
+                }
                 if let Some(filter) = &byte_range
                     && (layer.span.end <= filter.start || layer.span.start >= filter.end)
                 {
@@ -965,6 +1027,7 @@ fn execute_captures_walk(
                 text,
                 tree,
                 byte_range.as_ref(),
+                cancel,
                 &mut visit,
             );
         }
@@ -993,6 +1056,15 @@ fn execute_captures_walk(
                 tracker.remove_id(uri, id);
             }
         }
+    }
+
+    // A cancelled walk must not shape a partial result: the caller answers
+    // the protocol cancellation, and nothing may reach the walk memo. The
+    // minted-id reconciliation above still ran, so entries minted before the
+    // bail were purged/kept under the same rules as a completed walk — only
+    // the response is discarded.
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
     }
 
     // The kind is "available" when at least one visited language COMPILED
@@ -1121,6 +1193,7 @@ mod tests {
             0,
             incarnation,
             0,
+            None,
         )
         .expect("kind query should load");
         assert!(!matches.is_empty(), "identifiers should match");
@@ -1149,6 +1222,7 @@ mod tests {
             0,
             incarnation,
             0,
+            None,
         )
         .expect("kind query should load");
         assert!(
@@ -1179,6 +1253,7 @@ mod tests {
             0,
             incarnation,
             0,
+            None,
         )
         .expect("kind query should load");
         let id = first_node_id(&stale_matches);

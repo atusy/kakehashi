@@ -747,6 +747,7 @@ pub(crate) fn collect_document_layer_trees(
         host_text,
         host_tree,
         None,
+        None,
         &mut |language, tree, depth| {
             // The host layer (depth 0) already lives on the snapshot as
             // `ParseSnapshot::tree`; store only the injected layers.
@@ -799,6 +800,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     host_text: &str,
     host_tree: &tree_sitter::Tree,
     byte_filter: Option<&std::ops::Range<usize>>,
+    cancel: Option<&crate::cancel::CancelToken>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
     visit(host_language, host_tree, 0);
@@ -810,6 +812,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
         host_text,
         1,
         byte_filter,
+        cancel,
         visit,
     );
 }
@@ -823,6 +826,7 @@ fn walk_child_layers(
     host_text: &str,
     depth: usize,
     byte_filter: Option<&std::ops::Range<usize>>,
+    cancel: Option<&crate::cancel::CancelToken>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
     // Allows injected depths 1..=MAX_INJECTION_DEPTH — deliberately matching
@@ -832,6 +836,11 @@ fn walk_child_layers(
     // (`depth >= MAX` with a different base); resolution does not depend on
     // it, so the cursor-path stack is the convention that matters here.
     if depth > MAX_INJECTION_DEPTH {
+        return;
+    }
+    // Cancellation checkpoint before the per-depth injection query and the
+    // per-region resolve+parse below — the walk's expensive units.
+    if crate::cancel::is_cancelled(cancel) {
         return;
     }
     for (region, absolute_ranges) in effective_child_regions(
@@ -866,6 +875,7 @@ fn walk_child_layers(
             host_text,
             depth + 1,
             byte_filter,
+            cancel,
             visit,
         );
     }
@@ -912,6 +922,7 @@ mod tests {
             "markdown",
             text,
             &tree,
+            None,
             None,
             &mut |lang, layer_tree, depth| {
                 if depth == 0 {
