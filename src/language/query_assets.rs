@@ -24,6 +24,7 @@ mod tests {
             "cpp" => tree_sitter_cpp::LANGUAGE.into(),
             "java" => tree_sitter_java::LANGUAGE.into(),
             "c_sharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+            "php" => tree_sitter_php::LANGUAGE_PHP.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
             "javascript" => tree_sitter_javascript::LANGUAGE.into(),
             "lua" => tree_sitter_lua::LANGUAGE.into(),
@@ -77,6 +78,7 @@ mod tests {
             "java",
             "javascript",
             "lua",
+            "php",
             "python",
             "rust",
         ] {
@@ -441,6 +443,72 @@ mod tests {
             assert_eq!(
                 m.definition_range_at(nth(text, "=> n", 0) + 3),
                 Some(n_def..n_def + 1)
+            );
+        }
+    }
+
+    mod php_fixtures {
+        use super::*;
+
+        #[test]
+        fn functions_do_not_capture_outer_variables() {
+            let text = "<?php\n$top = 1;\nfunction f($n) { $t = $n; return $t + $top; }\n";
+            let m = model_for("php", text);
+            // Parameters and locals resolve within the function...
+            let n_def = nth(text, "n)", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "n;", 0)),
+                Some(n_def..n_def + 1)
+            );
+            let t_def = nth(text, "t =", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "t +", 0)),
+                Some(t_def..t_def + 1)
+            );
+            // ...but the enclosing $top is invisible without `use`/`global`.
+            assert_eq!(m.definition_range_at(nth(text, "top", 1)), None);
+        }
+
+        #[test]
+        fn function_names_hoist_and_resolve_globally() {
+            let text = "<?php\nhelper();\nfunction helper() {}\nfunction g() { helper(); }\n";
+            let m = model_for("php", text);
+            assert_resolves(&m, text, "helper", 0, 1);
+            assert_resolves(&m, text, "helper", 2, 1);
+        }
+
+        #[test]
+        fn closures_capture_only_via_use() {
+            let text = "<?php\n$acc = 1;\n$f = function ($a) use ($acc) { return $a + $acc; };\n$ar = fn($b) => $b + $acc;\n";
+            let m = model_for("php", text);
+            // The body reads the use-clause import, not the outer variable...
+            assert_resolves(&m, text, "acc", 2, 1);
+            // ...while an arrow function captures the outer scope directly.
+            assert_resolves(&m, text, "acc", 3, 0);
+        }
+
+        #[test]
+        fn classes_resolve_in_type_positions_and_global_redirects() {
+            let text = "<?php\nclass Box {}\nfunction mk(): Box { return new Box(); }\n$count = 0;\nfunction bump() { global $count; $count = 1; }\n";
+            let m = model_for("php", text);
+            assert_resolves(&m, text, "Box", 1, 0);
+            assert_resolves(&m, text, "Box", 2, 0);
+            // `global $count` routes the function's writes to the top level.
+            let top = m.binding_at(nth(text, "count", 0)).unwrap();
+            assert_eq!(m.binding_at(nth(text, "count", 2)), Some(top));
+        }
+
+        #[test]
+        fn foreach_binders_and_member_access() {
+            let text = "<?php\nclass K { public $size; }\nfunction f($xs, $o) { foreach ($xs as $k => $v) { echo $k . $v; } return $o->size; }\n";
+            let m = model_for("php", text);
+            assert_resolves(&m, text, "xs", 1, 0);
+            assert_resolves(&m, text, "k", 1, 0);
+            assert_resolves(&m, text, "v", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "size", 1)),
+                None,
+                "->size is member access, not the property"
             );
         }
     }
