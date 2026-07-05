@@ -46,13 +46,22 @@ struct UriEntries {
 impl UriEntries {
     /// Get or insert a ULID for a position key, keeping both maps in sync.
     fn get_or_insert(&mut self, key: PositionKey) -> Ulid {
+        self.get_or_insert_tracked(key).0
+    }
+
+    /// [`get_or_insert`](Self::get_or_insert) that also reports whether this
+    /// call CREATED the id (`true`) or found an existing one (`false`) — an
+    /// atomic distinction the serve-stale purge needs: a separate
+    /// lookup-then-create races a concurrent creator, mis-attributing (and
+    /// then wrongly purging) an id another, still-current request handed out.
+    fn get_or_insert_tracked(&mut self, key: PositionKey) -> (Ulid, bool) {
         if let Some(existing) = self.forward.get(&key) {
-            return *existing;
+            return (*existing, false);
         }
         let ulid = Ulid::new();
         self.forward.insert(key, ulid);
         self.reverse.insert(ulid, key);
-        ulid
+        (ulid, true)
     }
 
     /// Lookup a position key by ULID.
@@ -304,6 +313,25 @@ impl NodeTracker {
         // NOTE: Explicit two-step pattern to avoid DashMap lifetime ambiguity.
         let mut entry = self.entries.entry(uri.clone()).or_default();
         entry.get_or_insert(key)
+    }
+
+    /// [`get_or_create_in_layer`](Self::get_or_create_in_layer) that also
+    /// reports whether this call CREATED the id — atomically under the same
+    /// entry lock, so a concurrent creator can never be mis-attributed. The
+    /// serve-stale captures walk purges only ids it created itself; purging
+    /// on a lookup-then-create basis would race another, still-current
+    /// request into handing out an id this walk then deletes.
+    pub(crate) fn get_or_create_in_layer_tracked(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        layer: usize,
+    ) -> (Ulid, bool) {
+        let key = PositionKey::new(start, end, kind, layer);
+        let mut entry = self.entries.entry(uri.clone()).or_default();
+        entry.get_or_insert_tracked(key)
     }
 
     /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind)` triple.

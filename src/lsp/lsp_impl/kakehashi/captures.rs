@@ -704,28 +704,34 @@ fn execute_captures_walk(
                     // the tracker handle since this runs off `self`. On a
                     // stale serve the tracker is read-only (see the
                     // currency gate above).
-                    let ulid =
+                    let ulid = if mint_into_tracker {
+                        let (ulid, created) = tracker.get_or_create_in_layer_tracked(
+                            uri,
+                            c.start_byte,
+                            c.end_byte,
+                            c.kind,
+                            depth,
+                        );
+                        // Recorded for the post-walk purge: if an edit lands
+                        // mid-walk, entries created from this (now-stale)
+                        // snapshot must not persist. `created` is determined
+                        // atomically under the tracker's entry lock, so an
+                        // id a concurrent, still-current request created
+                        // (and handed out) is never mis-attributed here and
+                        // wrongly purged.
+                        if created {
+                            minted_ids.push(ulid);
+                        }
+                        ulid
+                    } else {
                         match tracker.lookup_in_layer(uri, c.start_byte, c.end_byte, c.kind, depth)
                         {
                             Some(live) => live,
-                            None if mint_into_tracker => {
-                                let created = tracker.get_or_create_in_layer(
-                                    uri,
-                                    c.start_byte,
-                                    c.end_byte,
-                                    c.kind,
-                                    depth,
-                                );
-                                // Recorded for the post-walk purge: if an edit
-                                // lands mid-walk, entries created from this
-                                // (now-stale) snapshot must not persist.
-                                minted_ids.push(created);
-                                created
-                            }
-                            // NOT Ulid::default() (the nil id): unregistered ids
-                            // must still be unique per capture.
+                            // NOT Ulid::default() (the nil id): unregistered
+                            // ids must still be unique per capture.
                             None => ulid::Ulid::new(),
-                        };
+                        }
+                    };
                     let node = json!({ "id": ulid.to_string(), "kind": c.kind });
                     let mut capture = json!({
                         "name": c.name,
