@@ -27,6 +27,13 @@ pub(crate) struct InjectionCacheParams {
     pub tracker: std::sync::Arc<crate::language::NodeTracker>,
     pub cache: std::sync::Arc<crate::analysis::InjectionTokenCache>,
     pub generation: u64,
+    /// The live-input store plus the snapshot identity this compute serves,
+    /// re-checked INSIDE the work-unit: region-id minting writes into the
+    /// live-coordinate `NodeTracker`, which a stale serve must not do (the
+    /// same "a stale read never mints" invariant the captures walk enforces).
+    pub documents: std::sync::Arc<crate::document::DocumentStore>,
+    pub parsed_version: u64,
+    pub incarnation: u64,
 }
 
 // Internal re-exports for production code
@@ -112,6 +119,14 @@ pub(crate) async fn handle_semantic_tokens_full(
             tracker: p.tracker.as_ref(),
             cache: p.cache.as_ref(),
             generation: p.generation,
+            // Currency latch for region-id minting, taken here inside the
+            // work-unit so the race window is the compute itself, not the
+            // pool-queue wait. A stale serve goes read-only on the tracker
+            // (reuse for unshifted regions, no cache entry for unknown ones).
+            mint_regions: p.documents.latest_snapshot(&p.uri).is_some_and(|view| {
+                view.slot.current_incarnation == p.incarnation
+                    && view.content_version == p.parsed_version
+            }),
         });
 
         // Collect injection tokens in parallel using Rayon.

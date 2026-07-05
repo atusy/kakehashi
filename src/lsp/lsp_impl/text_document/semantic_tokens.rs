@@ -244,6 +244,9 @@ impl Kakehashi {
                 tracker: self.bridge.node_tracker_arc(),
                 cache: self.cache.injection_token_cache_arc(),
                 generation: token_generation,
+                documents: std::sync::Arc::clone(&self.documents),
+                parsed_version: snapshot.parsed_version,
+                incarnation: snapshot.incarnation,
             });
 
             // Compute tokens, racing against cancel notification if provided
@@ -514,6 +517,9 @@ impl Kakehashi {
                     tracker: self.bridge.node_tracker_arc(),
                     cache: self.cache.injection_token_cache_arc(),
                     generation: token_generation,
+                    documents: std::sync::Arc::clone(&self.documents),
+                    parsed_version: snapshot.parsed_version,
+                    incarnation: snapshot.incarnation,
                 });
 
                 // Compute tokens, racing against cancel notification if provided
