@@ -22,8 +22,26 @@
  (#set! definition.namespace "type"))
 (enum_declaration name: (identifier) @definition.enum)
 
-; Generic type parameters live in the declaring function/class scope.
-((type_parameter name: (type_identifier) @definition.type)
+; Generic type parameters resolve only where the declaring construct is
+; already a @scope (the function-likes): the definition registers into
+; that scope by containment. Class / interface / type-alias generics stay
+; uncaptured — those declarations carry no scope, and a root-registered
+; binding would merge every same-named <T> in the file into one
+; rename/reference set (silence over a wrong answer).
+((function_declaration
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
+ (#set! definition.namespace "type"))
+((generator_function_declaration
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
+ (#set! definition.namespace "type"))
+((function_expression
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
+ (#set! definition.namespace "type"))
+((arrow_function
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
+ (#set! definition.namespace "type"))
+((method_definition
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
  (#set! definition.namespace "type"))
 
 ; ── TypeScript parameter shapes ──────────────────────────────────────────
