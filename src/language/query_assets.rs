@@ -86,6 +86,7 @@ mod tests {
             "cpp",
             "dockerfile",
             "go",
+            "haskell",
             "hcl",
             "java",
             "javascript",
@@ -1061,6 +1062,63 @@ mod tests {
                 "variable \"ami\" {\n}\nresource \"aws_instance\" \"web\" {\n  ami = var.ami\n}\n";
             let m = model_for("terraform", text);
             assert_resolves(&m, text, "ami", 2, 0);
+        }
+    }
+
+    mod haskell_fixtures {
+        use super::*;
+
+        #[test]
+        fn signatures_and_equations_merge_and_top_level_is_order_free() {
+            let text = "add :: Int -> Int\nadd n = n + total\ntotal :: Int\ntotal = 1\n";
+            let m = model_for("haskell", text);
+            // The type signature and the equation are one binding...
+            let add_binding = m.binding_at(nth(text, "add", 0)).unwrap();
+            assert_eq!(m.binding_at(nth(text, "add", 1)), Some(add_binding));
+            // ...and a use above the definition still resolves (to the
+            // nearest following site: the signature).
+            let sig = nth(text, "total", 1);
+            assert_eq!(
+                m.definition_range_at(nth(text, "total", 0)),
+                Some(sig..sig + 5)
+            );
+            // Parameters resolve inside the equation.
+            let n_def = nth(text, "n =", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "n +", 0)),
+                Some(n_def..n_def + 1)
+            );
+        }
+
+        #[test]
+        fn where_and_let_bindings_resolve() {
+            let text = "go x =\n  let acc = x + 1\n  in acc + y\n  where\n    y = helper x\n    helper k = k * 2\n";
+            let m = model_for("haskell", text);
+            assert_resolves(&m, text, "acc", 1, 0);
+            // The where-bound y is visible in the equation body above it.
+            assert_resolves(&m, text, "y", 0, 1);
+            assert_resolves(&m, text, "helper", 0, 1);
+            assert_resolves(&m, text, "x", 1, 0);
+            assert_resolves(&m, text, "x", 2, 0);
+            let k_def = nth(text, "k =", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "k *", 0)),
+                Some(k_def..k_def + 1)
+            );
+        }
+
+        #[test]
+        fn lambda_and_case_patterns_bind_locally() {
+            let text = "f = \\lam -> lam + 1\ncase1 v = case v of\n  Just inner -> inner\n  Nothing -> 0\ntop = inner\n";
+            let m = model_for("haskell", text);
+            assert_resolves(&m, text, "lam", 1, 0);
+            assert_resolves(&m, text, "v", 1, 0);
+            assert_resolves(&m, text, "inner", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "inner", 2)),
+                None,
+                "a case binder must not escape its alternative"
+            );
         }
     }
 
