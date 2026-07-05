@@ -169,7 +169,17 @@ impl InstallCoordinator {
             return true;
         }
 
-        result.outcome.should_skip_parse()
+        let skip = result.outcome.should_skip_parse();
+        if skip {
+            // The install produced no parser and no reload-reparse will run
+            // from this call: release a parked first-parse waiter with a
+            // tree-less snapshot (bootstrap-gated inside) instead of letting
+            // every request burn the full first-parse backstop. A later
+            // successful install's same-version tree is re-admitted by the
+            // snapshot cell's tree-upgrade clause.
+            self.documents.publish_giveup_snapshot(&uri);
+        }
+        skip
     }
 
     /// Reload a language after installation and optionally re-parse the document.

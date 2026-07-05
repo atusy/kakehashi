@@ -559,13 +559,16 @@ impl ParseCoordinator {
             )
         };
         let Some(language_name) = language_name else {
+            // Give-up: release a parked first-parse waiter (bootstrap-gated).
+            self.documents.publish_giveup_snapshot(&uri);
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
+            self.documents.publish_giveup_snapshot(&uri);
             return;
         }
         let load_result = self.language.ensure_language_loaded(&language_name);
-        let events = load_result.events;
+        let mut events = load_result.events;
 
         for _ in 0..MAX_REPARSE_ATTEMPTS {
             // Re-read the latest text each attempt. Gone => closed (no resurrect);
@@ -616,7 +619,7 @@ impl ParseCoordinator {
 
             // Snapshot publish first (Stage-2 commit point, ADR §2); the cell
             // guard rejects a stale lifetime or an out-of-order version.
-            self.publish_parse_snapshot(
+            let published = self.publish_parse_snapshot(
                 &uri,
                 crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
@@ -626,6 +629,16 @@ impl ParseCoordinator {
                     incarnation: expected_incarnation,
                 },
             );
+            // Serve-stale's heal signal, mirroring reparse_latest: a token
+            // request answered empty (or 15s-capped) while the install was
+            // still compiling has no lineage to re-drive it — without the
+            // refresh, a slow install leaves the document unhighlighted
+            // until an incidental edit.
+            if published {
+                events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
+                    language_name.clone(),
+                ));
+            }
             // Persist FIRST through the non-inserting, tree-absent CAS: a closed
             // (Vacant) document, one whose text moved (a concurrent `didChange`),
             // or one a concurrent parse already gave a tree all drop this tree —
@@ -655,6 +668,11 @@ impl ParseCoordinator {
             // Loop to re-read the latest text and try again.
         }
 
+        // Covers the give-up exits of the retry loop (parser still
+        // unavailable after the install, exhausted attempts): a no-op after
+        // a successful publish (bootstrap gate), otherwise it releases a
+        // parked first-parse waiter.
+        self.documents.publish_giveup_snapshot(&uri);
         self.notifier().log_language_events(&events).await;
     }
 
@@ -732,10 +750,15 @@ impl ParseCoordinator {
         };
 
         let Some(language_name) = language_name else {
+            // Give-up: release a parked first-parse waiter with a tree-less
+            // snapshot (bootstrap-gated inside) rather than letting every
+            // request burn the full first-parse backstop.
+            self.documents.publish_giveup_snapshot(uri);
             advance_watermark();
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
+            self.documents.publish_giveup_snapshot(uri);
             advance_watermark();
             return;
         }
@@ -826,6 +849,10 @@ impl ParseCoordinator {
             }
         }
 
+        // Covers the parse-produced-no-tree path (timeout / parser
+        // unavailable): a no-op after a successful publish (bootstrap gate),
+        // otherwise it releases a parked first-parse waiter.
+        self.documents.publish_giveup_snapshot(uri);
         advance_watermark();
         self.notifier().log_language_events(&events).await;
     }

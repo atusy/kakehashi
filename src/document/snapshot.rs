@@ -74,19 +74,26 @@ impl SnapshotSlot {
     /// guard (ADR §2). Both clauses must hold; the incarnation clause is never
     /// bypassed:
     /// 1. `snapshot.incarnation == current_incarnation`, and
-    /// 2. no snapshot yet (bootstrap) **or** strictly newer `parsed_version`
+    /// 2. no snapshot yet (bootstrap), **or** strictly newer `parsed_version`
     ///    (an equal-version double-publish must not swap the `Tree` under an
-    ///    already-issued `result_id`).
+    ///    already-issued `result_id`), **or** an equal-version **tree
+    ///    upgrade** (`None → Some`): a give-up publish (tree-less, releases
+    ///    parked first-parse waiters) must not block the real parse of the
+    ///    same version that a later successful install produces. Same
+    ///    version means same input text, so the upgrade only adds
+    ///    information; the equal-version tree *swap* stays rejected.
     pub(crate) fn admits(&self, snapshot: &ParseSnapshot) -> bool {
         // The sentinel is reserved: no snapshot legitimately carries it (the
         // store's counter never draws it), so a closed slot admits nothing —
         // checked explicitly rather than relying on the counter's guarantee.
         snapshot.incarnation != CLOSED_INCARNATION
             && snapshot.incarnation == self.current_incarnation
-            && self
-                .snapshot
-                .as_ref()
-                .is_none_or(|current| snapshot.parsed_version > current.parsed_version)
+            && self.snapshot.as_ref().is_none_or(|current| {
+                snapshot.parsed_version > current.parsed_version
+                    || (snapshot.parsed_version == current.parsed_version
+                        && current.tree.is_none()
+                        && snapshot.tree.is_some())
+            })
     }
 }
 
@@ -131,5 +138,45 @@ mod tests {
         let slot = SnapshotSlot::closed();
         assert!(!slot.admits(&snap(7, 0)));
         assert!(!slot.admits(&snap(CLOSED_INCARNATION, 0)), "reserved value");
+    }
+
+    fn snap_with_tree(incarnation: u64, parsed_version: u64) -> ParseSnapshot {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        ParseSnapshot {
+            text: Arc::from("fn main() {}"),
+            tree: Some(parser.parse("fn main() {}", None).unwrap()),
+            language: Some("rust".to_string()),
+            parsed_version,
+            incarnation,
+        }
+    }
+
+    #[test]
+    fn equal_version_tree_upgrade_is_admitted_but_swap_and_downgrade_are_not() {
+        let mut slot = SnapshotSlot::bootstrap(7);
+        // A give-up publish (tree-less) landed first.
+        slot.snapshot = Some(Arc::new(snap(7, 3)));
+        assert!(
+            slot.admits(&snap_with_tree(7, 3)),
+            "a successful parse of the same version must upgrade a tree-less give-up"
+        );
+        assert!(
+            !slot.admits(&snap_with_tree(6, 3)),
+            "the incarnation clause is never bypassed by the upgrade"
+        );
+
+        // With a tree in place, the equal version is frozen again.
+        slot.snapshot = Some(Arc::new(snap_with_tree(7, 3)));
+        assert!(
+            !slot.admits(&snap_with_tree(7, 3)),
+            "an equal-version tree swap must stay rejected"
+        );
+        assert!(
+            !slot.admits(&snap(7, 3)),
+            "an equal-version tree downgrade must stay rejected"
+        );
     }
 }

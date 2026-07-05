@@ -732,6 +732,34 @@ impl DocumentStore {
         })
     }
 
+    /// Release parked first-parse waiters when a parse pass gives up without
+    /// producing anything to publish — auto-install failed, the parser is
+    /// still missing after an install, or the edit path detected no
+    /// language. Publishes a resolved-but-tree-less snapshot at the CURRENT
+    /// (text, version), which advances the lifetime out of bootstrap so the
+    /// generous first-parse backstop is bounded by the give-up instead of
+    /// burning in full on every request. Gated on the lifetime still being
+    /// at bootstrap: once any snapshot exists no first-parse waiter is
+    /// parked, and a tree-less publish would only downgrade serve-stale
+    /// answers. A later successful parse of the SAME version is re-admitted
+    /// by the cell's tree-upgrade clause (see [`SnapshotSlot::admits`]).
+    pub(crate) fn publish_giveup_snapshot(&self, uri: &Url) {
+        let Some(doc) = self.documents.get(uri) else {
+            return;
+        };
+        if doc.latest_snapshot_slot().snapshot.is_some() {
+            return;
+        }
+        let snapshot = super::snapshot::ParseSnapshot {
+            text: doc.text_arc(),
+            tree: None,
+            language: doc.language_id().map(|s| s.to_string()),
+            parsed_version: doc.content_version(),
+            incarnation: doc.incarnation(),
+        };
+        doc.publish_snapshot(Arc::new(snapshot));
+    }
+
     /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the
     /// first-parse and explicit-action waits, the only two the parse-snapshot
     /// model permits). `None` for an unregistered/closed URI. The `Ref` is
@@ -780,6 +808,33 @@ mod tests {
                 .get(uri)
                 .map(|doc| doc.publish_snapshot(Arc::new(snapshot)))
                 .unwrap_or(false)
+        }
+
+        /// A give-up publish releases parked first-parse waiters at
+        /// bootstrap (tree-less, current version) but is a strict no-op once
+        /// any snapshot exists — it must never downgrade one.
+        #[test]
+        fn giveup_publish_fills_bootstrap_only() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///giveup.rs").unwrap();
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+
+            store.publish_giveup_snapshot(&uri);
+            let view = store.latest_snapshot(&uri).unwrap();
+            let snapshot = view.slot.snapshot.expect("give-up publishes at bootstrap");
+            assert!(snapshot.tree.is_none());
+            assert_eq!(snapshot.parsed_version, view.content_version);
+
+            // A newer input version does NOT re-open the give-up: a snapshot
+            // exists, so no first-parse waiter is parked.
+            store.update_document(uri.clone(), "ab".into(), None);
+            store.publish_giveup_snapshot(&uri);
+            let view = store.latest_snapshot(&uri).unwrap();
+            assert_eq!(
+                view.slot.snapshot.unwrap().parsed_version,
+                0,
+                "give-up is a no-op once any snapshot exists"
+            );
         }
 
         /// A reopen constructs a fresh cell at `snapshot: None`, which clears
