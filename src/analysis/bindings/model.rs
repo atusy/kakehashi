@@ -27,7 +27,9 @@ struct Scope {
     parent: Option<usize>,
     depth: usize,
     /// Bindings registered in this scope, in registration order per name.
-    bindings: HashMap<NameKey, Vec<BindingId>>,
+    /// Nested by name then namespace so the resolution walk looks up with
+    /// borrowed `&str` keys — no per-lookup allocations on the hot path.
+    bindings: HashMap<String, HashMap<String, Vec<BindingId>>>,
     /// `@redirect` directives governing a `(name, namespace)` in this scope.
     redirects: HashMap<NameKey, RedirectTarget>,
 }
@@ -134,7 +136,8 @@ impl BindingsModel {
                     if self.scopes[scope].label.as_deref() == Some(label.as_str())
                         && self.scopes[scope]
                             .bindings
-                            .get(key)
+                            .get(&key.0)
+                            .and_then(|ns_map| ns_map.get(&key.1))
                             .is_some_and(|b| !b.is_empty())
                     {
                         return Some(scope);
@@ -191,7 +194,6 @@ impl BindingsModel {
     }
 
     fn register_into(&mut self, target_scope: usize, def: &DefinitionCapture, rebind: Rebind) {
-        let key = (def.name.clone(), def.namespace.clone());
         let site = Site {
             byte_range: def.byte_range.clone(),
             visibility_start: match def.visibility {
@@ -204,7 +206,7 @@ impl BindingsModel {
 
         let binding_id = match rebind {
             Rebind::Fresh => None,
-            Rebind::Merge => self.select_in_scope(target_scope, &key, p),
+            Rebind::Merge => self.select_in_scope(target_scope, &def.name, &def.namespace, p),
             Rebind::OuterOrLocal => {
                 // A binding visible at the definition's start byte, located
                 // by the resolution walk from the registering scope. The
@@ -213,7 +215,7 @@ impl BindingsModel {
                 // false` (that flag only hides a scope from nested scopes).
                 let namespaces = [def.namespace.clone()];
                 self.walk(target_scope, true, &def.name, &namespaces, p)
-                    .or_else(|| self.select_in_scope(target_scope, &key, p))
+                    .or_else(|| self.select_in_scope(target_scope, &def.name, &def.namespace, p))
             }
         };
 
@@ -222,11 +224,23 @@ impl BindingsModel {
             None => {
                 let id = self.bindings.len();
                 self.bindings.push(Binding { sites: vec![site] });
-                self.scopes[target_scope]
-                    .bindings
-                    .entry(key)
-                    .or_default()
-                    .push(id);
+                // get_mut-then-insert keeps existing keys borrowed; clones
+                // only when a name/namespace first appears in the scope.
+                let by_name = &mut self.scopes[target_scope].bindings;
+                match by_name.get_mut(&def.name) {
+                    Some(ns_map) => match ns_map.get_mut(&def.namespace) {
+                        Some(ids) => ids.push(id),
+                        None => {
+                            ns_map.insert(def.namespace.clone(), vec![id]);
+                        }
+                    },
+                    None => {
+                        by_name.insert(
+                            def.name.clone(),
+                            HashMap::from([(def.namespace.clone(), vec![id])]),
+                        );
+                    }
+                }
             }
         }
     }
@@ -244,11 +258,17 @@ impl BindingsModel {
             .unwrap_or(0)
     }
 
-    /// In-scope selection: among the scope's bindings for `key`, the one with
-    /// the latest visibility start at or before `p`; ties broken by the later
-    /// definition node.
-    fn select_in_scope(&self, scope: usize, key: &NameKey, p: usize) -> Option<BindingId> {
-        let candidates = self.scopes[scope].bindings.get(key)?;
+    /// In-scope selection: among the scope's bindings for `name` in
+    /// `namespace`, the one with the latest visibility start at or before
+    /// `p`; ties broken by the later definition node.
+    fn select_in_scope(
+        &self,
+        scope: usize,
+        name: &str,
+        namespace: &str,
+        p: usize,
+    ) -> Option<BindingId> {
+        let candidates = self.scopes[scope].bindings.get(name)?.get(namespace)?;
         candidates
             .iter()
             .filter_map(|&id| {
@@ -278,18 +298,14 @@ impl BindingsModel {
         namespaces: &[String],
         p: usize,
     ) -> Option<BindingId> {
-        // Lookup keys are allocated once up front — the name/namespaces do
-        // not change during the walk, only the active subset shrinks.
-        let mut active: Vec<NameKey> = namespaces
-            .iter()
-            .map(|ns| (name.to_string(), ns.clone()))
-            .collect();
+        // Borrowed lookups all the way down: the walk allocates nothing.
+        let mut active: Vec<&str> = namespaces.iter().map(String::as_str).collect();
         let mut current = Some(start);
         let mut innermost = start_is_innermost;
         while let Some(scope) = current {
             if innermost || self.scopes[scope].visible_to_nested {
-                for key in &active {
-                    if let Some(id) = self.select_in_scope(scope, key, p) {
+                for &ns in &active {
+                    if let Some(id) = self.select_in_scope(scope, name, ns, p) {
                         return Some(id);
                     }
                 }
@@ -298,7 +314,7 @@ impl BindingsModel {
                 Inherits::All => {}
                 Inherits::None => return None,
                 Inherits::Namespaces(kept) => {
-                    active.retain(|(_, ns)| kept.contains(ns));
+                    active.retain(|ns| kept.iter().any(|k| k == ns));
                     if active.is_empty() {
                         return None;
                     }
