@@ -637,7 +637,7 @@ impl LanguageCoordinator {
         Ok(language)
     }
 
-    /// Load all three query types (highlights, locals, injections) for a language.
+    /// Load all three query types (highlights, bindings, injections) for a language.
     fn load_all_queries(
         &self,
         language: &Language,

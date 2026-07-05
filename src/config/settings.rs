@@ -1973,7 +1973,7 @@ mod tests {
     #[test]
     fn should_parse_query_item_with_path_and_kind() {
         // QueryItem should have path (required) and kind (optional) fields
-        // kind can be "highlights", "locals", or "injections"
+        // kind can be "highlights", "bindings", or "injections"
         let toml_str = r#"
             path = "/path/to/highlights.scm"
             kind = "highlights"

@@ -195,7 +195,7 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 |-------|-------------|
 | `base` | Inherit parser, queries, and bridge configuration from another language |
 | `parser` | Explicit path to the parser library (`.so`, `.dylib`, `.dll`) |
-| `queries` | Array of query configurations with `path` and `kind` (highlights, locals, injections) |
+| `queries` | Array of query configurations with `path` and `kind` (highlights, bindings, injections) |
 | `bridge` | Per-injection-language bridge filter and aggregation settings |
 | `aliases` | Deprecated alternative language IDs. Prefer `base` on the derived language instead. |
 
