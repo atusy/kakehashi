@@ -165,9 +165,16 @@ fn delta_until(
     let mut id = initial_id.to_string();
     loop {
         let d = delta(client, uri, kind, &id);
-        if pred(&d) || std::time::Instant::now() > deadline {
+        if pred(&d) {
             return d;
         }
+        // Fail loudly at the bound: returning the non-matching response would
+        // surface later as a less-informative assertion (e.g. missing edits)
+        // instead of pointing at the eventual-consistency bound itself.
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "delta_until: predicate did not converge within 10s; last response: {d:?}"
+        );
         if let Some(next) = d.get("resultId").and_then(Value::as_str) {
             id = next.to_string();
         }

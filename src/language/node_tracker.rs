@@ -29,6 +29,14 @@ use url::Url;
 /// one (per lazy-node-identity-tracking "no tombstone" rule).
 pub(crate) struct NodeTracker {
     entries: DashMap<Url, UriEntries>,
+    /// Bumped by every [`cleanup`](Self::cleanup) (didClose). Folded into the
+    /// serve-stale walks' generation latch so a close/reopen — which removes
+    /// the per-URI index and would reset its `shift_gen` to 0 (ABA) — can
+    /// never make an old-lifetime latch compare equal. Global (not per-URI)
+    /// so closed documents leave NO retained state; the cost is that a close
+    /// of any document mid-walk purges that walk's own mints — a rare event
+    /// with a one-null-re-sync consequence.
+    cleanup_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// Per-URI bidirectional index between `PositionKey` and `Ulid`.
@@ -280,6 +288,7 @@ impl NodeTracker {
     pub(crate) fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            cleanup_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -319,7 +328,12 @@ impl NodeTracker {
     ) -> Ulid {
         let key = PositionKey::new(start, end, kind, layer);
 
-        // NOTE: Explicit two-step pattern to avoid DashMap lifetime ambiguity.
+        // `get_mut` first: the hot path (index already exists) avoids the
+        // `Url` clone `entry()` needs for its owned key. (Explicit two-step
+        // pattern to avoid DashMap lifetime ambiguity.)
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            return entry.get_or_insert(key);
+        }
         let mut entry = self.entries.entry(uri.clone()).or_default();
         entry.get_or_insert(key)
     }
@@ -344,6 +358,11 @@ impl NodeTracker {
         layer: usize,
     ) -> (Ulid, bool, u64) {
         let key = PositionKey::new(start, end, kind, layer);
+        // `get_mut` first: the hot path (index already exists) avoids the
+        // `Url` clone `entry()` needs for its owned key.
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            return entry.get_or_insert_tracked(key);
+        }
         let mut entry = self.entries.entry(uri.clone()).or_default();
         entry.get_or_insert_tracked(key)
     }
@@ -630,11 +649,16 @@ impl NodeTracker {
         let delta = edit.delta();
         let mut invalidated = Vec::new();
 
-        // `or_default`, not `get_mut`: the shift generation must advance even
-        // for a URI with no entries yet, so a serve-stale walk's latch taken
-        // before its first mint still detects this edit (the mint would land
-        // in this edit's superseded coordinate space).
-        let mut entries = self.entries.entry(uri.clone()).or_default();
+        // The shift generation must advance even for a URI with no entries
+        // yet, so a serve-stale walk's latch taken before its first mint
+        // still detects this edit (the mint would land in this edit's
+        // superseded coordinate space). `get_mut` first so the hot path
+        // (index exists) skips the `Url` clone `entry()` needs.
+        let entries_hit = self.entries.get_mut(uri);
+        let mut entries = match entries_hit {
+            Some(entries) => entries,
+            None => self.entries.entry(uri.clone()).or_default(),
+        };
 
         // Pre-size new index: most edits don't invalidate, so the current count
         // is a good estimate of the surviving entries.
@@ -686,20 +710,29 @@ impl NodeTracker {
 
     /// Remove all tracked regions for a document.
     ///
-    /// Called on didClose to prevent memory leaks. The entries are dropped
-    /// but the URI's shift generation is RETAINED (bumped, in an otherwise
-    /// empty index — two empty maps and a counter, bounded by the distinct
-    /// URIs ever closed): a serve-stale walk's generation latch must never
-    /// compare equal across a close/reopen, or an old-lifetime walk's mints
-    /// into the reopened document's fresh index would masquerade as
-    /// correct-at-birth (ABA). Bumped even for a URI that never tracked a
-    /// node, for the same reason (the latch reads 0 for an absent index).
+    /// Called on didClose to prevent memory leaks. The removal resets the
+    /// URI's `shift_gen`, so the global [`cleanup_epoch`](Self::cleanup_epoch)
+    /// is bumped instead: the serve-stale walks fold it into their latch
+    /// ([`mint_epoch`](Self::mint_epoch)), making an old-lifetime latch
+    /// unequal to any post-close/reopen observation without retaining any
+    /// per-closed-URI state.
     pub(crate) fn cleanup(&self, uri: &Url) {
-        let mut entries = self.entries.entry(uri.clone()).or_default();
-        *entries = UriEntries {
-            shift_gen: entries.shift_gen + 1,
-            ..UriEntries::default()
-        };
+        self.entries.remove(uri);
+        self.cleanup_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The (per-URI shift generation, global cleanup epoch) pair the
+    /// serve-stale walks latch alongside their currency check and compare at
+    /// exit: a mismatch in either half means the mint landed in a superseded
+    /// coordinate space (an edit shifted the index, or a close/reopen
+    /// replaced it) and must be purged.
+    pub(crate) fn mint_epoch(&self, uri: &Url) -> (u64, u64) {
+        (
+            self.shift_generation(uri),
+            self.cleanup_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 }
 
@@ -777,23 +810,18 @@ mod tests {
             "text-diff application advances the generation too"
         );
 
-        // Close/reopen must not ABA the latch: cleanup retains a BUMPED
-        // generation (even for a URI that never tracked a node), so an
-        // old-lifetime walk's latch can never compare equal post-reopen.
-        let before_close = tracker.shift_generation(&uri);
+        // Close/reopen must not ABA the latch: cleanup removes the per-URI
+        // index (its generation restarts at 0) but bumps the GLOBAL cleanup
+        // epoch, so a latch taken before the close can never compare equal
+        // to a post-reopen observation — including for a URI that never
+        // tracked a node.
+        let (_, epoch_before) = tracker.mint_epoch(&uri);
         tracker.cleanup(&uri);
+        let (gen_after, epoch_after) = tracker.mint_epoch(&uri);
+        assert_eq!(gen_after, 0, "the fresh index restarts at generation 0");
         assert!(
-            tracker.shift_generation(&uri) > before_close,
-            "cleanup advances the generation instead of resetting it"
-        );
-
-        let never_tracked = test_uri("never_tracked_then_closed");
-        assert_eq!(tracker.shift_generation(&never_tracked), 0);
-        tracker.cleanup(&never_tracked);
-        assert_eq!(
-            tracker.shift_generation(&never_tracked),
-            1,
-            "cleanup bumps even an absent index"
+            epoch_after > epoch_before,
+            "cleanup bumps the global epoch so the (gen, epoch) latch cannot ABA"
         );
     }
 

@@ -651,8 +651,10 @@ fn execute_captures_walk(
     // walk's own mints when the snapshot is no longer current on exit.
     // Latched BEFORE the currency check: an edit landing between the two
     // bumps the generation (making later mints purge-eligible) or fails the
-    // currency check itself — either way no wrong-space mint survives.
-    let entry_shift_gen = tracker.shift_generation(uri);
+    // currency check itself — either way no wrong-space mint survives. The
+    // epoch half covers close/reopen, which REPLACES the per-URI index (its
+    // generation restarts at 0).
+    let (entry_shift_gen, entry_cleanup_epoch) = tracker.mint_epoch(uri);
     let mint_into_tracker = documents.latest_snapshot(uri).is_some_and(|view| {
         view.slot.current_incarnation == incarnation && view.content_version == parsed_version
     });
@@ -786,18 +788,25 @@ fn execute_captures_walk(
     }
 
     // Post-walk reconciliation, the other half of the currency gate: the
-    // entry latch cannot see an edit that lands DURING the walk. A creation
-    // whose observed shift generation still equals the entry latch is
-    // correct-at-birth — no edit intervened, and later edits shift it like
-    // any live entry. A mismatched one was minted AFTER some edit's shift,
-    // i.e. in a superseded coordinate space, and is purged — coordinate
+    // entry latch cannot see an edit (or close/reopen) that lands DURING the
+    // walk. A creation whose observed shift generation still equals the
+    // entry latch — with the cleanup epoch also unchanged — is
+    // correct-at-birth: no edit intervened, and later edits shift it like
+    // any live entry. A generation mismatch means the mint landed AFTER some
+    // edit's shift, i.e. in a superseded coordinate space — coordinate
     // comparison could not detect this once a second edit moves the
-    // wrong-space entry again. The response still carries purged ids, which
-    // now resolve `null` (the protocol's re-sync signal), the same
-    // degradation as a stale-at-entry serve.
-    for (id, shift_gen) in &minted_ids {
-        if *shift_gen != entry_shift_gen {
-            tracker.remove_id(uri, id);
+    // wrong-space entry again. An epoch mismatch means a close/reopen
+    // replaced some index mid-walk (per-URI generations restart at 0, so
+    // the generation alone could ABA); purging our own mints then is
+    // conservative but bounded — one null re-sync. The response still
+    // carries purged ids, which resolve `null` (the protocol's re-sync
+    // signal), the same degradation as a stale-at-entry serve.
+    if !minted_ids.is_empty() {
+        let (_, exit_cleanup_epoch) = tracker.mint_epoch(uri);
+        for (id, shift_gen) in &minted_ids {
+            if *shift_gen != entry_shift_gen || exit_cleanup_epoch != entry_cleanup_epoch {
+                tracker.remove_id(uri, id);
+            }
         }
     }
 

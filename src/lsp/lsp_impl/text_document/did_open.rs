@@ -832,7 +832,9 @@ print("hello")
     /// reparse scheduled for a cleared tree, it returns within its bounded
     /// wait and the caller degrades to its empty fallback instead of
     /// resurrecting or restoring anything.
-    #[tokio::test]
+    // Paused time: with no snapshot ever published, the bounded wait would
+    // otherwise burn its full first-parse backstop in real time.
+    #[tokio::test(start_paused = true)]
     async fn ensure_document_parsed_never_parses_inline() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
