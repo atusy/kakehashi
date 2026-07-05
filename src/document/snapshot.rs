@@ -62,7 +62,12 @@ pub(crate) struct ParseSnapshot {
     /// pull/push diagnostics, documentSymbol/Color, formatting's virt layer —
     /// which previously each re-ran the injection query per request. Same
     /// `None`/`Some(empty)` semantics as `bridge_regions`.
-    pub(crate) resolved_regions: Option<Arc<Vec<ResolvedInjection>>>,
+    /// Stamped with the settings generation the populate pass ran under: a
+    /// reload (which can change injection resolution) bumps the generation
+    /// WITHOUT publishing a new snapshot, so consumers gate on the stamp and
+    /// fall back to inline resolution on mismatch (same pattern as
+    /// `DiscoveredInjections.generation` and `layer_trees`).
+    pub(crate) resolved_regions: Option<(u64, Arc<Vec<ResolvedInjection>>)>,
     /// Lazily-built, per-snapshot injection layer trees (document-order DFS,
     /// depth ≥ 1) for the captures/node layer walk: the FIRST walking request
     /// on this snapshot builds them (on the compute pool — the same cost the
@@ -72,7 +77,14 @@ pub(crate) struct ParseSnapshot {
     /// query and re-parsing every region. Deliberately lazy rather than
     /// populate-built: non-captures users never pay, and the parse loop's
     /// publish latency is untouched.
-    pub(crate) layer_trees: std::sync::OnceLock<Arc<Vec<SnapshotLayerTree>>>,
+    ///
+    /// The `u64` is the settings generation the trees were built under: an
+    /// injected-grammar auto-install bumps the generation WITHOUT publishing
+    /// a new snapshot, and trees built pre-install would keep serving an
+    /// empty embedded layer for the rest of this snapshot's life. A walker
+    /// seeing a generation mismatch bypasses the cell and walks fresh (the
+    /// pre-cache per-request cost) until the next snapshot rebuilds it.
+    pub(crate) layer_trees: std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>,
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.

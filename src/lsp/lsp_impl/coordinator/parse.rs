@@ -18,7 +18,10 @@ use crate::lsp::settings_manager::SettingsManager;
 struct PopulatedSnapshotRegions {
     discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
     bridge_regions: Option<std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>>,
-    resolved_regions: Option<std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>>,
+    resolved_regions: Option<(
+        u64,
+        std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>,
+    )>,
 }
 
 /// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
@@ -50,6 +53,27 @@ fn parse_text_with_deadline(
     deadline: std::time::Instant,
 ) -> Option<tree_sitter::Tree> {
     crate::language::injection::parse_with_deadline(parser, text, old_tree, deadline)
+}
+
+/// The settled+stale gate for the parse loop's `semanticTokens/refresh`
+/// emission (its full rationale lives at the call site): emit only when the
+/// published parse is still the LIVE content version (settled — mid-burst
+/// publishes skip; the newer text's own publish re-evaluates) AND some
+/// client's last served tokens predate it (a served-version mark exists and
+/// is older — no mark means nobody highlights this document).
+fn should_emit_settle_refresh(
+    documents: &DocumentStore,
+    cache: &CacheCoordinator,
+    uri: &Url,
+    content_version: u64,
+) -> bool {
+    let settled = documents
+        .get(uri)
+        .is_some_and(|doc| doc.content_version() == content_version);
+    let client_is_stale = cache
+        .served_semantic_version(uri)
+        .is_some_and(|served| served < content_version);
+    settled && client_is_stale
 }
 
 pub(super) struct ParseCoordinatorDeps {
@@ -255,6 +279,14 @@ impl ParseCoordinator {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        // Coarse per-parse gate: with no runnable bridge server configured,
+        // the bridge-region build (per-region content copies) is pure waste
+        // on the pre-publish critical path. `None` on the snapshot makes a
+        // bridge configured by a later reload fall back to inline resolution.
+        let build_bridge_regions = self
+            .settings_manager
+            .load_settings()
+            .any_bridge_server_runnable();
         self.compute_pool
             .run(None, move || {
                 let populated = cache.populate_injections(
@@ -264,11 +296,15 @@ impl ParseCoordinator {
                     &language_name,
                     &language,
                     &tracker,
+                    build_bridge_regions,
                 );
                 PopulatedSnapshotRegions {
                     discovery: populated.discovery.map(std::sync::Arc::new),
-                    bridge_regions: Some(std::sync::Arc::new(populated.bridge_regions)),
-                    resolved_regions: Some(std::sync::Arc::new(populated.resolved_regions)),
+                    bridge_regions: populated.bridge_regions.map(std::sync::Arc::new),
+                    resolved_regions: Some((
+                        populated.generation,
+                        std::sync::Arc::new(populated.resolved_regions),
+                    )),
                 }
             })
             .await
@@ -952,20 +988,12 @@ impl ParseCoordinator {
             // documents nobody highlights. Emitted from the parse loop, never
             // didChange (synchronous clients can't answer a server request
             // mid-notification).
-            if published {
-                let settled = self
-                    .documents
-                    .get(uri)
-                    .is_some_and(|doc| doc.content_version() == content_version);
-                let client_is_stale = self
-                    .cache
-                    .served_semantic_version(uri)
-                    .is_some_and(|served| served < content_version);
-                if settled && client_is_stale {
-                    events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
-                        language_name.clone(),
-                    ));
-                }
+            if published
+                && should_emit_settle_refresh(&self.documents, &self.cache, uri, content_version)
+            {
+                events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
+                    language_name.clone(),
+                ));
             }
         }
 
@@ -985,6 +1013,40 @@ impl ParseCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four documented invariants of the settle-refresh gate.
+    #[test]
+    fn settle_refresh_gate_emits_only_for_settled_and_stale() {
+        let documents = DocumentStore::new();
+        let cache = CacheCoordinator::new();
+        let uri = url::Url::parse("file:///settle_gate.rs").unwrap();
+        documents.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+        // content_version == 0 now.
+
+        // No served mark: nobody highlights this document -> no refresh.
+        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 0));
+
+        // Client already served THIS version -> its didChange-driven request
+        // caught up -> no refresh.
+        cache.record_served_semantic_version(&uri, 0);
+        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 0));
+
+        // An edit bumps the live version; the publish for v1 finds the client
+        // stale (served 0 < 1) and the document settled (live == 1) -> emit.
+        documents.update_document(uri.clone(), "ab".into(), None);
+        assert!(should_emit_settle_refresh(&documents, &cache, &uri, 1));
+
+        // Mid-burst: another edit already moved the live version past this
+        // publish (live 2, publish v1) -> not settled -> no refresh (the v2
+        // publish re-evaluates).
+        documents.update_document(uri.clone(), "abc".into(), None);
+        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 1));
+
+        // The mark is monotonic: a stale serve cannot regress it.
+        cache.record_served_semantic_version(&uri, 2);
+        cache.record_served_semantic_version(&uri, 1);
+        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 2));
+    }
 
     /// The deadline must actually abort the native parse (an expired one
     /// yields `None` fast) and must not poison the parser for reuse.

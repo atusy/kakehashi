@@ -38,6 +38,7 @@ pub(crate) struct DiagnosticPublisher {
     documents: Arc<DocumentStore>,
     bridge: Arc<BridgeCoordinator>,
     settings_manager: Arc<SettingsManager>,
+    cache: Arc<crate::lsp::cache::CacheCoordinator>,
     aggregator: Arc<DiagnosticAggregator>,
 }
 
@@ -49,6 +50,7 @@ impl DiagnosticPublisher {
             documents: Arc::clone(&server.documents),
             bridge: Arc::clone(&server.bridge),
             settings_manager: Arc::clone(&server.settings_manager),
+            cache: Arc::clone(&server.cache),
             aggregator: Arc::clone(&server.diagnostics),
         }
     }
@@ -624,7 +626,10 @@ impl DiagnosticPublisher {
             return offsets;
         };
 
-        let resolved_regions = match self.documents.current_resolved_regions(host) {
+        let resolved_regions = match self
+            .documents
+            .current_resolved_regions(host, self.cache.semantic_token_generation())
+        {
             Some(regions) => regions.as_ref().clone(),
             None => InjectionResolver::resolve_all(
                 &self.language,

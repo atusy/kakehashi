@@ -598,6 +598,37 @@ impl InjectionResolver {
             .map(|region| Self::build_resolved_injection(coordinator, tracker, uri, region, text))
             .collect()
     }
+
+    /// [`resolve_from_regions`](Self::resolve_from_regions) fed with the
+    /// `CacheableInjectionRegion`s the caller already built from the SAME
+    /// `regions` (populate's path): skips the duplicate per-region id mint
+    /// and content hash — populate runs on the pre-publish critical path,
+    /// where repeating work the caller just did delays the settle signal.
+    /// `regions` and `cacheable` must be index-aligned (both derive from one
+    /// `collect_all_injections` pass).
+    pub(crate) fn resolve_from_prebuilt(
+        coordinator: &LanguageCoordinator,
+        regions: &[InjectionRegionInfo<'_>],
+        cacheable: &[CacheableInjectionRegion],
+        text: &str,
+    ) -> Vec<ResolvedInjection> {
+        regions
+            .iter()
+            .zip(cacheable.iter())
+            .map(|(region, cacheable_region)| {
+                let (virtual_content, line_column_offsets) =
+                    extract_virtual_content_and_offsets(region, cacheable_region, text);
+                let resolved_language =
+                    Self::resolve_language(coordinator, &region.language, &virtual_content);
+                ResolvedInjection {
+                    region: cacheable_region.clone(),
+                    injection_language: resolved_language,
+                    virtual_content,
+                    line_column_offsets,
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

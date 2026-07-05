@@ -48,6 +48,7 @@ pub(crate) struct DiagnosticScheduler {
     documents: std::sync::Arc<DocumentStore>,
     bridge: std::sync::Arc<BridgeCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
+    cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
     debounced_diagnostics: std::sync::Arc<DebouncedDiagnosticsManager>,
     synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: the host-event pull below feeds its
@@ -64,6 +65,7 @@ impl DiagnosticScheduler {
             documents: std::sync::Arc::clone(&server.documents),
             bridge: std::sync::Arc::clone(&server.bridge),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
+            cache: std::sync::Arc::clone(&server.cache),
             debounced_diagnostics: std::sync::Arc::clone(&server.debounced_diagnostics),
             synthetic_diagnostics: std::sync::Arc::clone(&server.synthetic_diagnostics),
             publisher: std::sync::Arc::new(super::DiagnosticPublisher::new(server)),
@@ -188,7 +190,10 @@ impl DiagnosticScheduler {
                         // Prefer the populate pass's regions riding the current
                         // parse snapshot (never discover twice, ADR §3); fall
                         // back to the inline resolution when absent/stale.
-                        let all_regions = match self.documents.current_resolved_regions(uri) {
+                        let all_regions = match self
+                            .documents
+                            .current_resolved_regions(uri, self.cache.semantic_token_generation())
+                        {
                             Some(regions) => regions.as_ref().clone(),
                             None => InjectionResolver::resolve_all(
                                 &self.language,

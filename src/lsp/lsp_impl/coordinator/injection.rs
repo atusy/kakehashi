@@ -340,3 +340,118 @@ impl InjectionCoordinator {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tower_lsp_server::LspService;
+    use url::Url;
+
+    /// The snapshot fast path of `resolve_injection_data` must produce
+    /// exactly what the inline (live-tree) resolution produces — the fast
+    /// path's output is forwarded verbatim to downstream servers, so a
+    /// divergence would silently mis-forward.
+    #[tokio::test]
+    async fn bridge_fast_path_matches_inline_resolution() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                std::env::var("TREE_SITTER_GRAMMARS")
+                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
+            ],
+            ..Default::default()
+        };
+        let _ = server.language.load_settings(&settings);
+        for lang in ["markdown", "markdown_inline", "lua"] {
+            if !server.language.ensure_language_loaded(lang).success {
+                eprintln!("Skipping: {lang} parser not available");
+                return;
+            }
+        }
+
+        let text = "# T\n\n```lua\nlocal x = 1\n```\n\n```lua\nlocal y = 2\n```\n";
+        let mut pool = server.language.create_document_parser_pool();
+        let Some(mut parser) = pool.acquire("markdown") else {
+            return;
+        };
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+
+        let uri = Url::parse("file:///bridge_fast_path.md").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+
+        let injection = server.injection_coordinator();
+
+        // INLINE: a current snapshot with no bridge_regions falls through to
+        // the live-tree resolution.
+        let incarnation = server
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .current_incarnation;
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let publish = |bridge_regions, parsed_version| {
+            let landed = server
+                .documents
+                .get(&uri)
+                .map(|doc| {
+                    doc.publish_snapshot(std::sync::Arc::new(
+                        crate::document::snapshot::ParseSnapshot {
+                            text: std::sync::Arc::from(text),
+                            tree: Some(tree.clone()),
+                            language: Some("markdown".to_string()),
+                            parsed_version,
+                            incarnation,
+                            injection_regions: None,
+                            bridge_regions,
+                            resolved_regions: None,
+                            layer_trees: std::sync::OnceLock::new(),
+                        },
+                    ))
+                })
+                .unwrap_or(false);
+            assert!(landed, "test publish must land");
+        };
+        publish(None, content_version);
+        let inline = injection.resolve_injection_data(&uri, "markdown");
+        assert!(!inline.is_empty(), "the two fences must resolve");
+
+        // FAST PATH: populate derives the bridge regions from the same tree
+        // (same tracker → same region ids); a newer current snapshot carries
+        // them and the resolver consumes them verbatim.
+        let populated = server.cache.populate_injections(
+            &uri,
+            text,
+            &tree,
+            "markdown",
+            &server.language,
+            &server.bridge.node_tracker_arc(),
+            true,
+        );
+        let bridge_regions = populated.bridge_regions.expect("gate was true");
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        publish(Some(std::sync::Arc::new(bridge_regions)), content_version);
+        let fast = injection.resolve_injection_data(&uri, "markdown");
+
+        assert_eq!(
+            inline.len(),
+            fast.len(),
+            "fast path must resolve the same regions"
+        );
+        for (a, b) in inline.iter().zip(fast.iter()) {
+            assert_eq!(a.language, b.language, "raw language must match");
+            assert_eq!(a.region_id, b.region_id, "region id must match");
+            assert_eq!(a.content, b.content, "clean content must match");
+        }
+    }
+}

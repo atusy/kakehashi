@@ -67,18 +67,26 @@ pub(crate) struct CacheCoordinator {
 /// (ungated). Both ride the `ParseSnapshot` the parse publishes.
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<crate::document::DiscoveredInjections>,
-    pub(crate) bridge_regions: Vec<crate::document::DiscoveredBridgeRegion>,
+    /// `None` when the build was skipped (no bridge server configured) —
+    /// bridge readers then fall back to inline resolution — vs `Some(empty)`
+    /// for "ran, nothing matched" (readers skip their work).
+    pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
     pub(crate) resolved_regions: Vec<crate::language::injection::ResolvedInjection>,
+    /// The settings generation this populate pass ran under — stamped onto
+    /// the snapshot's `resolved_regions` so reload-stale resolution is never
+    /// served (see `ParseSnapshot::resolved_regions`).
+    pub(crate) generation: u64,
 }
 
 impl PopulatedInjections {
     /// No regions (no injection query, or none matched): the downstream skips
     /// its work, exactly as the inline resolution's empty result did.
-    pub(crate) fn empty() -> Self {
+    pub(crate) fn empty(generation: u64) -> Self {
         Self {
             discovery: None,
-            bridge_regions: Vec::new(),
+            bridge_regions: Some(Vec::new()),
             resolved_regions: Vec::new(),
+            generation,
         }
     }
 }
@@ -221,6 +229,7 @@ impl CacheCoordinator {
     /// group, or a not-yet-loaded parser). The discovery query (`Q`) is run
     /// **once** here and shared; the request path never re-runs it.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn populate_injections(
         &self,
         uri: &Url,
@@ -229,6 +238,7 @@ impl CacheCoordinator {
         language_name: &str,
         language: &LanguageCoordinator,
         tracker: &NodeTracker,
+        build_bridge_regions: bool,
     ) -> PopulatedInjections {
         // Snapshot the generation FIRST — before reading the injection query or
         // resolving any language below — so the stamp can never be *newer* than
@@ -250,7 +260,7 @@ impl CacheCoordinator {
                 // Clear any stale injection caches
                 self.injection_map.clear(uri);
                 self.injection_token_cache.clear_document(uri);
-                return PopulatedInjections::empty();
+                return PopulatedInjections::empty(generation);
             }
         };
 
@@ -262,7 +272,7 @@ impl CacheCoordinator {
                 // Clear any existing regions and caches for this document
                 self.injection_map.clear(uri);
                 self.injection_token_cache.clear_document(uri);
-                return PopulatedInjections::empty();
+                return PopulatedInjections::empty(generation);
             }
 
             // Get existing regions for cache cleanup and content comparison
@@ -335,27 +345,47 @@ impl CacheCoordinator {
             // (parse-snapshot ADR §3, never discover twice): the exact
             // (raw language, region_id, clean content) triple
             // `resolve_injection_data` used to re-derive by re-running the
-            // injection query per downstream pass.
-            let bridge_regions: Vec<crate::document::DiscoveredBridgeRegion> = regions
-                .iter()
-                .zip(cacheable_regions.iter())
-                .map(|(info, cacheable)| {
-                    let included_ranges = crate::language::injection::compute_included_ranges(
-                        &info.content_node,
-                        info.include_children,
-                    );
-                    let content = crate::language::injection::extract_clean_content(
-                        text,
-                        info.content_node.byte_range(),
-                        included_ranges.as_deref(),
-                    );
-                    crate::document::DiscoveredBridgeRegion {
-                        raw_language: info.language.clone(),
-                        region_id: cacheable.region_id.clone(),
-                        content,
-                    }
-                })
-                .collect();
+            // injection query per downstream pass. Gated on a bridge server
+            // actually being configured: populate runs on the pre-publish
+            // critical path, and the per-region content copies are pure
+            // waste for the (common) bridge-less deployment — `None` makes
+            // any late-configured bridge fall back to inline resolution.
+            let bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>> =
+                build_bridge_regions.then(|| {
+                    regions
+                        .iter()
+                        .zip(cacheable_regions.iter())
+                        .map(|(info, cacheable)| {
+                            let included_ranges =
+                                crate::language::injection::compute_included_ranges(
+                                    &info.content_node,
+                                    info.include_children,
+                                );
+                            let content = crate::language::injection::extract_clean_content(
+                                text,
+                                info.content_node.byte_range(),
+                                included_ranges.as_deref(),
+                            );
+                            crate::document::DiscoveredBridgeRegion {
+                                raw_language: info.language.clone(),
+                                region_id: cacheable.region_id.clone(),
+                                content,
+                            }
+                        })
+                        .collect()
+                });
+
+            // The whole-document readers' fully resolved regions, from the
+            // same single query run — and from the SAME per-region ids and
+            // content hashes already in `cacheable_regions` (no duplicate
+            // mint/hash on this critical path).
+            let resolved_regions =
+                crate::language::injection::InjectionResolver::resolve_from_prebuilt(
+                    language,
+                    &regions,
+                    &cacheable_regions,
+                    text,
+                );
 
             // Store in injection map
             self.injection_map.insert(uri.clone(), cacheable_regions);
@@ -375,20 +405,15 @@ impl CacheCoordinator {
                 tracker,
                 generation,
             );
-            // The whole-document readers' fully resolved regions, again from
-            // the same single query run.
-            let resolved_regions =
-                crate::language::injection::InjectionResolver::resolve_from_regions(
-                    language, tracker, uri, &regions, text,
-                );
             return PopulatedInjections {
                 discovery,
                 bridge_regions,
                 resolved_regions,
+                generation,
             };
         }
 
-        PopulatedInjections::empty()
+        PopulatedInjections::empty(generation)
     }
 
     /// Get all injection regions for a document (test helper).
@@ -453,15 +478,6 @@ impl CacheCoordinator {
         }
     }
 
-    /// Snapshot the current settings generation. Take this at the TOP of a token
-    /// handler — before reading ANY settings-dependent tokenization input
-    /// (language resolution, `ensure_language_loaded`, highlight query, capture
-    /// mappings) — and pass it to [`cache_key_for`](Self::cache_key_for) once the
-    /// text is available. A reload that bumps the generation after this snapshot
-    /// leaves the request's stored key on the old generation, invisible to
-    /// post-reload requests (which compute the new-generation key) — so a request
-    /// racing a `didChangeConfiguration` can never poison the cache, regardless of
-    /// whether it observed the old or new queries.
     /// Record that a semantic-token response computed from snapshot
     /// `parsed_version` was served for `uri` (monotonic max — a stale-serve
     /// racing a fresher one must not regress the mark).
@@ -478,6 +494,15 @@ impl CacheCoordinator {
         self.served_semantic_versions.get(uri).map(|v| *v)
     }
 
+    /// Snapshot the current settings generation. Take this at the TOP of a token
+    /// handler — before reading ANY settings-dependent tokenization input
+    /// (language resolution, `ensure_language_loaded`, highlight query, capture
+    /// mappings) — and pass it to [`cache_key_for`](Self::cache_key_for) once the
+    /// text is available. A reload that bumps the generation after this snapshot
+    /// leaves the request's stored key on the old generation, invisible to
+    /// post-reload requests (which compute the new-generation key) — so a request
+    /// racing a `didChangeConfiguration` can never poison the cache, regardless of
+    /// whether it observed the old or new queries.
     pub(crate) fn semantic_token_generation(&self) -> u64 {
         self.semantic_token_generation
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -804,6 +829,7 @@ print("hello")
             "markdown",
             &coordinator,
             &tracker,
+            true,
         );
 
         // Verify we have one injection region
@@ -862,6 +888,7 @@ print("hello")
             "markdown",
             &coordinator,
             &tracker,
+            true,
         );
 
         // Verify the region still exists with the same region_id (position-based stability)
@@ -937,6 +964,7 @@ print("hello")
             "markdown",
             &coordinator,
             &tracker,
+            true,
         );
 
         let regions = cache.get_injections(&uri).expect("should have injections");
@@ -982,6 +1010,7 @@ print("goodbye")
             "markdown",
             &coordinator,
             &tracker,
+            true,
         );
 
         let regions_after = cache.get_injections(&uri).expect("should have injections");

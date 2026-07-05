@@ -243,7 +243,10 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let all_regions = match self.documents.current_resolved_regions(uri) {
+        let all_regions = match self
+            .documents
+            .current_resolved_regions(uri, self.cache.semantic_token_generation())
+        {
             Some(regions) => regions.as_ref().clone(),
             None => InjectionResolver::resolve_all(
                 &self.language,

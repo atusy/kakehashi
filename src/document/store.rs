@@ -765,19 +765,23 @@ impl DocumentStore {
     }
 
     /// The CURRENT snapshot's fully resolved injection regions, or `None` when
-    /// there is no current snapshot or its populate pass didn't derive them —
-    /// the caller then resolves inline against the live tree, exactly as
-    /// before (parse-snapshot ADR §3, never discover twice).
+    /// there is no current snapshot, its populate pass didn't derive them, or
+    /// they were derived under a different settings generation (a reload can
+    /// change injection resolution without publishing a new snapshot) — the
+    /// caller then resolves inline against the live tree, exactly as before
+    /// (parse-snapshot ADR §3, never discover twice).
     pub(crate) fn current_resolved_regions(
         &self,
         uri: &Url,
+        current_generation: u64,
     ) -> Option<std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>> {
         let view = self.latest_snapshot(uri)?;
         let snapshot = view.slot.snapshot?;
         if snapshot.parsed_version != view.content_version {
             return None;
         }
-        snapshot.resolved_regions.clone()
+        let (stamped_generation, regions) = snapshot.resolved_regions.as_ref()?;
+        (*stamped_generation == current_generation).then(|| std::sync::Arc::clone(regions))
     }
 
     /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the

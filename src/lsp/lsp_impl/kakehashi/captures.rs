@@ -166,6 +166,18 @@ fn metadata_object(pairs: Vec<(String, Option<String>)>) -> Option<Value> {
     Some(Value::Object(map))
 }
 
+/// A memoized full-mode captures walk result, tagged with the exact inputs
+/// it was computed from: the snapshot identity `(parsed_version,
+/// incarnation)` and the settings `generation`. Named fields (three adjacent
+/// `u64`s as a tuple invited a silent swap).
+pub(in crate::lsp::lsp_impl) struct CachedCapturesWalk {
+    pub(in crate::lsp::lsp_impl) parsed_version: u64,
+    pub(in crate::lsp::lsp_impl) incarnation: u64,
+    pub(in crate::lsp::lsp_impl) generation: u64,
+    pub(in crate::lsp::lsp_impl) matches: Vec<Value>,
+    pub(in crate::lsp::lsp_impl) skipped: Vec<Value>,
+}
+
 /// A kind query compiled for one language, with the patterns tolerant
 /// compilation dropped.
 struct KindQuery {
@@ -180,8 +192,9 @@ struct KindQuery {
 /// query files per keystroke, dwarfing the walk itself. The generation key
 /// gives the same hot-reload discipline as the highlight-query store: a
 /// settings reload (which also re-resolves search paths) starts a fresh
-/// generation and old entries become unreachable garbage (bounded by the
-/// handful of (language, kind) pairs a session touches).
+/// generation, and the first MISS of a new generation sweeps the previous
+/// generation's entries (see `load_kind_query_cached`), so reload churn
+/// cannot accumulate dead compiled queries.
 type KindQueryCache = dashmap::DashMap<(String, String, u64), std::sync::Arc<KindQueryLoad>>;
 
 fn kind_query_cache() -> &'static KindQueryCache {
@@ -201,6 +214,10 @@ fn load_kind_query_cached(
     if let Some(hit) = kind_query_cache().get(&key) {
         return std::sync::Arc::clone(&hit);
     }
+    // Miss (once per (language, kind) per generation): sweep entries from
+    // other generations so a reload-heavy session doesn't accumulate dead
+    // compiled queries. Off the hit path by construction.
+    kind_query_cache().retain(|(_, _, cached_generation), _| *cached_generation == generation);
     let loaded = std::sync::Arc::new(load_kind_query(
         registry,
         search_paths,
@@ -627,16 +644,16 @@ impl Kakehashi {
         let walk_key = (uri.clone(), kind.to_string(), injection);
         if lsp_range.is_none()
             && let Some(hit) = self.captures_walk_cache.get(&walk_key)
-            && hit.0 == snapshot.parsed_version
-            && hit.1 == incarnation
-            && hit.2 == generation
+            && hit.parsed_version == snapshot.parsed_version
+            && hit.incarnation == incarnation
+            && hit.generation == generation
         {
             return Ok(Some(ComputedCaptures {
                 uri,
                 incarnation,
                 entry_content_version,
-                matches: hit.3.clone(),
-                skipped: hit.4.clone(),
+                matches: hit.matches.clone(),
+                skipped: hit.skipped.clone(),
             }));
         }
 
@@ -655,17 +672,39 @@ impl Kakehashi {
                 // across every subsequent walk on this snapshot — captures
                 // full + delta both walk per keystroke. Concurrent walkers on
                 // one snapshot block on the OnceLock and reuse the winner's.
+                let fresh_layers;
                 let layers = if injection {
-                    Some(snapshot_for_layers.layer_trees.get_or_init(|| {
-                        std::sync::Arc::new(
+                    let cached = snapshot_for_layers.layer_trees.get_or_init(|| {
+                        (
+                            generation,
+                            std::sync::Arc::new(
+                                crate::lsp::lsp_impl::kakehashi::node::injection_stack::collect_document_layer_trees(
+                                    &language,
+                                    &language_id,
+                                    &text,
+                                    &tree,
+                                ),
+                            ),
+                        )
+                    });
+                    // Settings-generation gate (the DiscoveredInjections
+                    // pattern): an injected-grammar auto-install bumps the
+                    // generation without a new snapshot, so cached trees
+                    // would keep an embedded layer empty long after its
+                    // parser landed. On mismatch walk fresh, uncached — the
+                    // pre-cache per-request cost — until the next snapshot.
+                    if cached.0 == generation {
+                        Some(cached.1.as_slice())
+                    } else {
+                        fresh_layers =
                             crate::lsp::lsp_impl::kakehashi::node::injection_stack::collect_document_layer_trees(
                                 &language,
                                 &language_id,
                                 &text,
                                 &tree,
-                            ),
-                        )
-                    }))
+                            );
+                        Some(fresh_layers.as_slice())
+                    }
                 } else {
                     None
                 };
@@ -677,7 +716,7 @@ impl Kakehashi {
                     &language_id,
                     &text,
                     &tree,
-                    layers.map(|l| l.as_slice()),
+                    layers,
                     &language,
                     &tracker,
                     &documents,
@@ -694,13 +733,13 @@ impl Kakehashi {
             if lsp_range.is_none() {
                 self.captures_walk_cache.insert(
                     walk_key,
-                    (
-                        snapshot.parsed_version,
+                    CachedCapturesWalk {
+                        parsed_version: snapshot.parsed_version,
                         incarnation,
                         generation,
-                        matches.clone(),
-                        skipped.clone(),
-                    ),
+                        matches: matches.clone(),
+                        skipped: skipped.clone(),
+                    },
                 );
             }
             ComputedCaptures {

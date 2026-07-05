@@ -213,16 +213,8 @@ pub struct Kakehashi {
     /// query over every layer. One entry per key (insert-overwrites), dropped
     /// with the lineage cache on `didClose`.
     #[allow(clippy::type_complexity)]
-    captures_walk_cache: dashmap::DashMap<
-        (Url, String, bool),
-        (
-            u64,
-            u64,
-            u64,
-            Vec<serde_json::Value>,
-            Vec<serde_json::Value>,
-        ),
-    >,
+    captures_walk_cache:
+        dashmap::DashMap<(Url, String, bool), kakehashi::captures::CachedCapturesWalk>,
     /// True when the process runs as a one-shot CLI (`kakehashi diagnose`/`format`)
     /// rather than a long-lived LSP server. Set once by `cli_initialize`. No editor
     /// consumes a proactive `publishDiagnostics` in CLI mode (the stub client pump
