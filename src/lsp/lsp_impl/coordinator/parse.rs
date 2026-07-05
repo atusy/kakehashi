@@ -12,7 +12,9 @@ use crate::lsp::settings_manager::SettingsManager;
 
 /// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
-const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// THE SAME constant bounds the injected-layer re-parses (`parse_with_ranges`),
+/// so host and injected parses cannot silently drift to different budgets.
+const PARSE_TIMEOUT: std::time::Duration = crate::language::injection::NATIVE_PARSE_BUDGET;
 
 /// The awaiter-side backstop for a pooled parse: pool-queue wait (a burst of
 /// opens on a small pool can queue parses for a while) plus the in-parse

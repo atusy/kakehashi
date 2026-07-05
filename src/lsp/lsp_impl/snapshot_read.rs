@@ -26,6 +26,15 @@ pub(crate) enum SnapshotWait {
     Gone,
 }
 
+/// The first-parse backstop shared by every snapshot wait (the token
+/// handlers' `snapshot_for_tokens` and the explicit-action
+/// `wait_for_current_snapshot`): generous on purpose, because it only runs
+/// while the lifetime has NO snapshot and every open-parse resolution path
+/// publishes one (tree, tree-less give-up, or the didClose sentinel) — so it
+/// is bounded by parse completion, not wall time. One constant so the two
+/// reader classes cannot drift apart.
+pub(crate) const FIRST_PARSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl Kakehashi {
     /// Wait (bounded) until `uri`'s latest snapshot is current, re-resolving
     /// the cell per wakeup (per-request re-resolution + incarnation validation
@@ -45,7 +54,7 @@ impl Kakehashi {
         // sentinel), so the receiver always wakes. A tight first-parse cap
         // made requests racing didOpen degrade to empty on loaded machines.
         let stale_deadline = tokio::time::Instant::now() + wait;
-        let first_parse_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let first_parse_deadline = tokio::time::Instant::now() + FIRST_PARSE_BACKSTOP;
         loop {
             // Subscribe BEFORE checking (lost-wakeup guard): `subscribe` marks
             // the current value as seen, so a publish landing between a check

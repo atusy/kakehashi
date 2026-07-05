@@ -93,8 +93,9 @@ pub(super) fn compute_line_column_offsets(
 }
 
 /// Per-parse wall-clock budget for every native parse that runs on the
-/// bounded compute pool (host parses and injected-layer re-parses alike).
-/// Mirrors the parse coordinator's `PARSE_TIMEOUT` awaiter bound.
+/// bounded compute pool — the single source of truth: the parse
+/// coordinator's `PARSE_TIMEOUT` is defined as this constant, so host and
+/// injected-layer parses cannot silently drift to different budgets.
 pub(crate) const NATIVE_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Parse with a wall-clock abort wired into tree-sitter's progress callback.

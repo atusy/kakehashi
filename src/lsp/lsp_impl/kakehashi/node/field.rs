@@ -25,7 +25,7 @@ impl Kakehashi {
         &self,
         params: NodeFieldNameParams,
     ) -> Result<Value> {
-        let name = params.name.clone();
+        let name = params.name;
         Ok(self
             .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
                 n.child_by_field_name(&name)
@@ -41,7 +41,7 @@ impl Kakehashi {
         &self,
         params: NodeFieldNameParams,
     ) -> Result<Value> {
-        let name = params.name.clone();
+        let name = params.name;
         Ok(self
             .navigate_to_nodes(&params.text_document.uri, &params.id, move |n| {
                 let mut cursor = n.walk();

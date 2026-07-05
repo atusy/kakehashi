@@ -17,8 +17,6 @@
 //! This is achieved by subscribing to cancel notifications via `CancelForwarder::subscribe()`
 //! and using biased `tokio::select!` to prioritize cancel handling.
 
-use std::time::Duration;
-
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
@@ -62,8 +60,8 @@ impl Kakehashi {
         // answer empty whenever the machine was loaded enough to push the
         // open parse past it (observed under the parallel e2e suite, and the
         // real-world analog is editor startup on a busy machine).
-        const FIRST_PARSE_WAIT: Duration = Duration::from_secs(15);
-        let deadline = tokio::time::Instant::now() + FIRST_PARSE_WAIT;
+        let deadline =
+            tokio::time::Instant::now() + crate::lsp::lsp_impl::snapshot_read::FIRST_PARSE_BACKSTOP;
         loop {
             // Subscribe BEFORE checking: `watch::Sender::subscribe` marks the
             // value current at subscription time as already seen, so a publish
