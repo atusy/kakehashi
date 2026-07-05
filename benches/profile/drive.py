@@ -135,7 +135,9 @@ def main() -> None:
 
         ok, canceled, tokens = 0, 0, 0
         version = 1
-        first_line_len = len(text.split("\n", 1)[0])
+        # LSP `character` offsets are UTF-16 code units, not Unicode code
+        # points — a non-ASCII first line would make the edit range invalid.
+        first_line_len = len(text.split("\n", 1)[0].encode("utf-16-le")) // 2
         t0 = time.time()
         req_times = []
         line_has_extra = False
