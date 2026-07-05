@@ -23,10 +23,12 @@
  (#set! definition.rebind "fresh"))
 
 ; ── Functions ────────────────────────────────────────────────────────────
-; `local function f` is visible inside its own body (recursion) but not
-; above the statement: neither "scope" nor "after" can express that.
+; `local function f` binds into the enclosing scope (the declaration node
+; is itself a scope, so the name must be lifted out of it), visible from
+; the name onward: recursion works, calls above the statement do not.
 ((function_declaration name: (identifier) @definition.function) @_fd
  (#lua-match? @_fd "^local")
+ (#set! definition.scope "parent")
  (#set! definition.visibility "declaration")
  (#set! definition.rebind "fresh"))
 ; `function f() end` assigns a global.
