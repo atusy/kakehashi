@@ -525,6 +525,8 @@ fn collect_injection_contexts_sync<'a>(
             coordinator,
             parent_included_ranges,
             cache_for_singles,
+            // Inline path: no producer-prebuilt identity to reuse.
+            None,
             // Inline path: early-out a query-missing region (no wasted range work).
             true,
         ) {
@@ -605,6 +607,11 @@ fn discover_single_region(
     coordinator: &LanguageCoordinator,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
     cache_for_singles: Option<(&Url, &NodeTracker, bool)>,
+    // The producer path's already-built cache identity for THIS region
+    // (populate minted the id and hashed the content moments earlier):
+    // reused instead of a second tracker op + content hash on the
+    // pre-publish critical path, the same pattern as `resolve_from_prebuilt`.
+    prebuilt_cacheable: Option<&CacheableInjectionRegion>,
     // On the inline path, skip a region whose highlight query isn't loaded
     // *before* the per-region range/prefix/id work, exactly as the pre-refactor
     // code did (`rebuild_context` would otherwise discard it only after that
@@ -719,29 +726,37 @@ fn discover_single_region(
     // is this request's translation predicate: column-0 start AND no per-row
     // prefixes (singles are never injection.combined).
     let token_cache = cache_for_singles.and_then(|(uri, tracker, mint_regions)| {
-        // Mint only when the served snapshot was current (see
-        // InjectionCacheCtx::mint_regions): a stale serve's coordinates
-        // must not enter the live tracker. Read-only reuse keeps the
-        // cache warm for regions the edits did not shift; an unknown
-        // region simply goes uncached for this stale serve.
-        let region_id = if mint_regions {
-            tracker.get_or_create(
-                uri,
-                injection.content_node.start_byte(),
-                injection.content_node.end_byte(),
-                injection.content_node.kind(),
-            )
-        } else {
-            tracker.lookup_in_layer(
-                uri,
-                injection.content_node.start_byte(),
-                injection.content_node.end_byte(),
-                injection.content_node.kind(),
-                0,
-            )?
-        }
-        .to_string();
-        let cacheable = CacheableInjectionRegion::from_region_info(injection, &region_id, text);
+        let cacheable_owned;
+        let cacheable = match prebuilt_cacheable {
+            Some(prebuilt) => prebuilt,
+            None => {
+                // Mint only when the served snapshot was current (see
+                // InjectionCacheCtx::mint_regions): a stale serve's coordinates
+                // must not enter the live tracker. Read-only reuse keeps the
+                // cache warm for regions the edits did not shift; an unknown
+                // region simply goes uncached for this stale serve.
+                let region_id = if mint_regions {
+                    tracker.get_or_create(
+                        uri,
+                        injection.content_node.start_byte(),
+                        injection.content_node.end_byte(),
+                        injection.content_node.kind(),
+                    )
+                } else {
+                    tracker.lookup_in_layer(
+                        uri,
+                        injection.content_node.start_byte(),
+                        injection.content_node.end_byte(),
+                        injection.content_node.kind(),
+                        0,
+                    )?
+                }
+                .to_string();
+                cacheable_owned =
+                    CacheableInjectionRegion::from_region_info(injection, &region_id, text);
+                &cacheable_owned
+            }
+        };
         let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
         // Fold the resolved language into the validity hash so a position-
         // stable region_id with identical content but a different injected
@@ -752,7 +767,7 @@ fn discover_single_region(
         let validity_hash =
             cacheable.content_hash ^ fnv1a_hash(&resolved_lang).wrapping_mul(0x100000001b3);
         Some(DiscoveredRegionCache {
-            region_id,
+            region_id: cacheable.region_id.clone(),
             validity_hash,
             line_start: cacheable.line_range.start,
             eligible,
@@ -866,8 +881,14 @@ fn rebuild_context<'a>(
 /// for them either, and the failed load is negative-cached until a reload —
 /// which bumps the generation, invalidating this discovery — so the store can
 /// never mask a later-loadable region.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_document_discovery(
     regions: &[InjectionRegionInfo<'_>],
+    // Index-aligned with `regions` (both derive from one
+    // `collect_all_injections` pass): the caller's already-minted ids and
+    // content hashes, reused instead of a second tracker op + hash per
+    // region on the pre-publish critical path.
+    prebuilt_cacheable: &[CacheableInjectionRegion],
     injection_query: &tree_sitter::Query,
     text: &str,
     coordinator: &LanguageCoordinator,
@@ -906,18 +927,20 @@ pub(crate) fn build_document_discovery(
     }
 
     let mut discovered = Vec::with_capacity(singles.len());
-    for injection in singles {
+    for (injection, prebuilt) in singles.iter().zip(prebuilt_cacheable.iter()) {
         // Producer: don't gate on the highlight query — store the region and let
         // reuse re-resolve the query (a load without a generation bump self-heals).
         // Producer path: called from populate_injections right after this
-        // parse's CAS landed, so the coordinates are current — minting is the
-        // same write populate's own region tracking already performs.
+        // parse's CAS landed, so the coordinates are current; the region id +
+        // content hash are REUSED from the caller's just-built identity
+        // (`prebuilt`), not recomputed.
         match discover_single_region(
             injection,
             text,
             coordinator,
             None,
             Some((uri, tracker, true)),
+            Some(prebuilt),
             false,
         ) {
             // Producer path passes `require_highlight_query = false`, so no query
@@ -2583,6 +2606,31 @@ local b = 2
         );
     }
 
+    /// Build the producer's index-aligned cache identities for `regions`,
+    /// the way `populate_injections` does before calling
+    /// `build_document_discovery`.
+    fn cacheable_for(
+        regions: &[crate::language::injection::InjectionRegionInfo<'_>],
+        uri: &Url,
+        tracker: &NodeTracker,
+        text: &str,
+    ) -> Vec<CacheableInjectionRegion> {
+        regions
+            .iter()
+            .map(|info| {
+                let id = tracker
+                    .get_or_create(
+                        uri,
+                        info.content_node.start_byte(),
+                        info.content_node.end_byte(),
+                        info.content_node.kind(),
+                    )
+                    .to_string();
+                CacheableInjectionRegion::from_region_info(info, &id, text)
+            })
+            .collect()
+    }
+
     fn raw_token_at(line: usize, column: usize, length: usize) -> RawToken {
         RawToken {
             line,
@@ -2818,6 +2866,7 @@ local b = 2
         .expect("regions");
         let discovery = build_document_discovery(
             &regions,
+            &cacheable_for(&regions, &uri, &tracker, &text),
             injection_query.as_ref(),
             &text,
             &coordinator,
@@ -2945,6 +2994,7 @@ local b = 2
         assert!(
             build_document_discovery(
                 &regions,
+                &cacheable_for(&regions, &uri, &tracker, COMBINED_LUA_DOC),
                 injection_query.as_ref(),
                 COMBINED_LUA_DOC,
                 &coordinator,
@@ -2996,6 +3046,7 @@ local b = 2
         let tracker = NodeTracker::new();
         let discovery = build_document_discovery(
             &regions,
+            &cacheable_for(&regions, &uri, &tracker, &text),
             injection_query.as_ref(),
             &text,
             &coordinator,

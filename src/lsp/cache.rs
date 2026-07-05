@@ -415,6 +415,7 @@ impl CacheCoordinator {
             // (gate/combined/incomplete).
             let discovery = crate::analysis::semantic::build_document_discovery(
                 &regions,
+                &cacheable_regions,
                 injection_query.as_ref(),
                 text,
                 language,
