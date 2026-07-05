@@ -531,6 +531,33 @@ mod tests {
     }
 
     #[test]
+    fn outer_or_local_sees_its_own_invisible_scope() {
+        // `visible-to-nested false` hides a scope's bindings from NESTED
+        // scopes only — an outer-or-local write registered directly in that
+        // scope must still merge with the scope's own binding, not walk past
+        // it to an outer same-name binding.
+        let text = "fn f() { let x = 1; unsafe { let x = 2; x = 3; } }";
+        let model = model_for(
+            text,
+            r#"
+            (block) @scope
+            ((unsafe_block (block) @scope)
+             (#set! scope.visible-to-nested "false"))
+            (let_declaration pattern: (identifier) @definition)
+            ((assignment_expression left: (identifier) @definition)
+             (#set! definition.visibility "after")
+             (#set! definition.rebind "outer-or-local"))
+            (identifier) @reference
+            "#,
+        );
+        let outer = model.binding_at(nth(text, "x", 0)).unwrap();
+        let inner = model.binding_at(nth(text, "x", 1)).unwrap();
+        let write = model.binding_at(nth(text, "x", 2)).unwrap();
+        assert_ne!(outer, inner);
+        assert_eq!(write, inner, "the write merges with its own scope's x");
+    }
+
+    #[test]
     fn unresolved_is_first_class() {
         let text = "fn main() { let x = 1; y; }";
         let model = model_for(text, BASIC);

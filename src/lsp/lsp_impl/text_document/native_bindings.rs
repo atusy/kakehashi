@@ -480,6 +480,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn out_of_bounds_position_is_silence_not_a_spilled_byte() {
+        // A `character` past the end of its line must not spill onto a
+        // later line's identifier: byte 0 + 39 would land exactly on the
+        // second `target` here under lenient conversion.
+        let text = "//abcdefgh\nfn main() { let target = 1; target; }";
+        let (service, _url, uri) = server_with_doc(text);
+        let server = service.inner();
+
+        let links = server
+            .native_bindings_answer(&uri, Position::new(0, 39), |ctx| {
+                native_definition(ctx, &uri)
+            })
+            .await
+            .unwrap();
+        assert!(
+            links.is_none(),
+            "invalid coordinates must silence: {links:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_edit_after_the_snapshot_silences_the_answer() {
         // A didChange landing between the text/tree snapshot and the answer
         // makes every computed range stale — worst case a rename edit
