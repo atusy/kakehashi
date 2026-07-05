@@ -507,17 +507,13 @@ impl ParseCoordinator {
                 // populate — the snapshot then publishes without discovery and
                 // readers discover inline for that (already-superseded) snapshot.
                 let regions = if stored {
-                    let populated = self
-                        .populate_injections_on_pool(
-                            uri.clone(),
-                            text.clone(),
-                            tree.clone(),
-                            language_name.clone(),
-                        )
-                        .await;
-                    self.documents
-                        .mark_parse_finished(&uri, parse_generation, true);
-                    populated
+                    self.populate_injections_on_pool(
+                        uri.clone(),
+                        text.clone(),
+                        tree.clone(),
+                        language_name.clone(),
+                    )
+                    .await
                 } else {
                     PopulatedSnapshotRegions::default()
                 };
@@ -535,6 +531,15 @@ impl ParseCoordinator {
                         layer_trees: std::sync::OnceLock::new(),
                     },
                 );
+                if stored {
+                    // AFTER the publish: a downstream task woken by this mark
+                    // on another runtime thread must find the snapshot (and
+                    // its fast-path regions) already in the cell — marking
+                    // first let it read the previous snapshot and fall back
+                    // to inline resolution for one cycle.
+                    self.documents
+                        .mark_parse_finished(&uri, parse_generation, true);
+                }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 // `stored` is exactly "this call's CAS landed the tree": false when a

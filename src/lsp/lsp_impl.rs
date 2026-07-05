@@ -111,6 +111,13 @@ pub(super) async fn apply_shared_settings(
     // built MID-swap against a half-updated query set.
     cache.bump_semantic_token_generation();
     let summary = language.load_settings(&settings);
+    // Second bump IMMEDIATELY after the query swap, before any await: a
+    // request that started after the transitional bump above but before the
+    // swap computed against the OLD queries yet stamped the new generation —
+    // without this bump those products would be accepted as current for the
+    // whole awaited propagate below. (The final bump after apply_settings
+    // covers the settings-side inputs the apply swaps.)
+    cache.bump_semantic_token_generation();
     // Path c: push the new per-server settings to live downstream connections
     // at this single reload choke point (initialize, didChangeConfiguration,
     // auto-install reload), before `settings` is consumed by the apply below.
@@ -127,10 +134,13 @@ pub(super) async fn apply_shared_settings(
         Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
         None => settings_manager.apply_settings(settings),
     }
-    // A settings/query reload can change tokenization for unchanged text, so bump
-    // the semantic-token cache generation again — the transitional bump above
-    // covered products built from the OLD queries; this one covers anything a
-    // racing request built DURING the swap against a half-updated query set.
+    // A settings/query reload can change tokenization for unchanged text, so
+    // bump the semantic-token cache generation once more: the ladder is one
+    // bump per mutation boundary — before the query swap (kills old-query
+    // stamps), after it (kills mid-swap stamps), and here after the settings
+    // apply (kills stamps that read the new queries but the OLD
+    // settings-side inputs, e.g. capture mappings, during the awaited
+    // propagate).
     // Done at this single choke point so every reload path (initialize,
     // didChangeConfiguration, and the auto-install reload) is covered, and
     // *before* the refresh below so the editor's re-request recomputes. The
