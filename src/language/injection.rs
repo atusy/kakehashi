@@ -19,7 +19,8 @@ mod ranges;
 pub(crate) const MAX_INJECTION_DEPTH: usize = 10;
 
 pub(crate) use content::{
-    byte_to_point, byte_to_point_anchored, extract_clean_content, parse_with_ranges,
+    NATIVE_PARSE_BUDGET, byte_to_point, byte_to_point_anchored, extract_clean_content,
+    parse_with_deadline, parse_with_ranges,
 };
 pub(crate) use discovery::{
     CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, ResolvedInjection,

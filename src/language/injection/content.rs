@@ -92,12 +92,56 @@ pub(super) fn compute_line_column_offsets(
     }
 }
 
+/// Per-parse wall-clock budget for every native parse that runs on the
+/// bounded compute pool (host parses and injected-layer re-parses alike).
+/// Mirrors the parse coordinator's `PARSE_TIMEOUT` awaiter bound.
+pub(crate) const NATIVE_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Parse with a wall-clock abort wired into tree-sitter's progress callback.
+///
+/// Every native parse in the server runs as (part of) a work-unit on the
+/// bounded compute pool, where an unbounded `ts_parser_parse` call pins a
+/// thread for as long as a pathological parse takes — and the pool is sized
+/// as low as ONE thread on small hosts, where a single pin stalls every
+/// document's tree-CPU server-wide. An async-side `tokio::time::timeout`
+/// cannot help (it only abandons the awaiter); breaking out of the progress
+/// callback makes the parse itself return shortly after the deadline,
+/// reclaiming the thread. An aborted parser is `reset()` so it carries no
+/// half-parse state back into a parser pool or thread-local cache.
+pub(crate) fn parse_with_deadline(
+    parser: &mut tree_sitter::Parser,
+    text: &str,
+    old_tree: Option<&tree_sitter::Tree>,
+    deadline: std::time::Instant,
+) -> Option<tree_sitter::Tree> {
+    let bytes = text.as_bytes();
+    let mut on_progress = |_: &tree_sitter::ParseState| {
+        if std::time::Instant::now() >= deadline {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let result = parser.parse_with_options(
+        &mut |i, _| bytes.get(i..).unwrap_or(&[]),
+        old_tree,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut on_progress)),
+    );
+    if result.is_none() {
+        parser.reset();
+    }
+    result
+}
+
 /// Parse text with optional included ranges, resetting parser state afterward.
 ///
 /// Shared protocol for Tree-sitter's `set_included_ranges` API; both semantic
 /// tokens and selection range paths delegate here to avoid divergence. The reset
 /// to `&[]` is unconditional (even on the failure path) so parsers returned to
-/// pools or caches never carry stale included-range state.
+/// pools or caches never carry stale included-range state. The parse itself is
+/// bounded by [`NATIVE_PARSE_BUDGET`] via [`parse_with_deadline`]: injected
+/// re-parses run on the bounded compute pool too, where an unbounded parse
+/// would pin a thread.
 pub(crate) fn parse_with_ranges(
     parser: &mut tree_sitter::Parser,
     text: &str,
@@ -117,7 +161,16 @@ pub(crate) fn parse_with_ranges(
         return None;
     }
 
-    let tree = parser.parse(text, None);
+    let deadline = std::time::Instant::now() + NATIVE_PARSE_BUDGET;
+    let tree = parse_with_deadline(parser, text, None, deadline);
+    if tree.is_none() {
+        log::warn!(
+            target: log_target,
+            "Injected parse for {} yielded no tree (aborted at the {}s budget or failed)",
+            lang_name,
+            NATIVE_PARSE_BUDGET.as_secs()
+        );
+    }
 
     // Always reset included ranges after parsing to prevent stale state
     let _ = parser.set_included_ranges(&[]);

@@ -14,40 +14,20 @@ use crate::lsp::settings_manager::SettingsManager;
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Host-parse with a wall-clock abort wired into tree-sitter's progress
-/// callback.
+/// Host-parse with a wall-clock abort — the shared
+/// [`parse_with_deadline`](crate::language::injection::parse_with_deadline)
+/// primitive under the name the parse-loop call sites use.
 ///
 /// `parse_with_pool`'s `tokio::time::timeout` only abandons the *awaiter*;
-/// without an in-parse abort the native `ts_parser_parse` call kept running,
-/// pinning a bounded-pool thread for as long as a pathological parse takes —
-/// and the pool is sized as low as ONE thread on small hosts, where that
-/// single pin stalls every document's tree-CPU server-wide. Breaking out of
-/// the progress callback makes the work-unit itself return shortly after the
-/// deadline, reclaiming the thread. An aborted parser is `reset()` so it
-/// carries no half-parse state back into the parser pool.
+/// the in-parse abort is what actually reclaims the bounded-pool thread from
+/// a pathological parse (see the primitive's doc).
 fn parse_text_with_deadline(
     parser: &mut tree_sitter::Parser,
     text: &str,
     old_tree: Option<&tree_sitter::Tree>,
     deadline: std::time::Instant,
 ) -> Option<tree_sitter::Tree> {
-    let bytes = text.as_bytes();
-    let mut on_progress = |_: &tree_sitter::ParseState| {
-        if std::time::Instant::now() >= deadline {
-            std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
-        }
-    };
-    let result = parser.parse_with_options(
-        &mut |i, _| bytes.get(i..).unwrap_or(&[]),
-        old_tree,
-        Some(tree_sitter::ParseOptions::new().progress_callback(&mut on_progress)),
-    );
-    if result.is_none() {
-        parser.reset();
-    }
-    result
+    crate::language::injection::parse_with_deadline(parser, text, old_tree, deadline)
 }
 
 pub(super) struct ParseCoordinatorDeps {

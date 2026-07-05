@@ -500,7 +500,10 @@ fn parse_with_absolute_ranges(
     if parser.set_included_ranges(ranges).is_err() {
         return None;
     }
-    parser.parse(text, None)
+    // Bounded like every other compute-pool parse: this runs inside node/*
+    // work-units, where an unbounded native parse would pin a pool thread.
+    let deadline = std::time::Instant::now() + crate::language::injection::NATIVE_PARSE_BUDGET;
+    crate::language::injection::parse_with_deadline(&mut parser, text, None, deadline)
 }
 
 /// Compute the absolute byte-range list that the injection parser would see
