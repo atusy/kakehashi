@@ -37,15 +37,32 @@ use crate::lsp::current_upstream_id;
 
 use super::super::{Kakehashi, uri_to_url};
 
+/// Outcome of the serve-current snapshot resolution for the whole-document
+/// token handlers (see [`Kakehashi::current_snapshot_for_tokens`]).
+pub(crate) enum TokenSnapshot {
+    /// The snapshot is current (`parsed_version == content_version`) —
+    /// compute against it.
+    Current(std::sync::Arc<crate::document::snapshot::ParseSnapshot>),
+    /// Unregistered/closed URI, or the first parse never landed within its
+    /// backstop — the handlers' empty-tokens fallback applies.
+    Absent,
+    /// The snapshot still trailed the live text when the settle backstop
+    /// expired — reject with `ContentModified`; the parse loop's settle
+    /// refresh re-drives the client once the parse lands.
+    Stale,
+    /// The client cancelled the request while it was parked.
+    Cancelled,
+}
+
 impl Kakehashi {
-    /// Serve-stale snapshot resolution for the semantic-token handlers
-    /// (parse-snapshot ADR §3): returns the **latest completed** snapshot,
-    /// which may trail the input by however many edits the scheduler
-    /// coalesced — the parse loop's `semanticTokens/refresh` re-drives the
-    /// client once a fresher one lands. The only wait is the bounded
-    /// first-parse wait (no snapshot for this lifetime yet); no per-keystroke
-    /// read ever waits on a reparse. `None` for an unregistered/closed URI or
-    /// when no parse resolves within the wait.
+    /// Latest-completed snapshot resolution (parse-snapshot ADR §3): returns
+    /// the newest published snapshot, which may trail the input. The only
+    /// wait is the bounded first-parse wait (no snapshot for this lifetime
+    /// yet); no per-keystroke read ever waits on a reparse. Used by the
+    /// currency-*checking* readers (`semanticTokens/range` via
+    /// [`current_snapshot`](Self::current_snapshot)) that reject stale reads
+    /// themselves. `None` for an unregistered/closed URI or when no parse
+    /// resolves within the wait.
     pub(crate) async fn snapshot_for_tokens(
         &self,
         uri: &Url,
@@ -86,12 +103,54 @@ impl Kakehashi {
         }
     }
 
+    /// Serve-current snapshot resolution for `semanticTokens/full` and
+    /// `full/delta`: park (racing the client's `$/cancelRequest`) until the
+    /// latest snapshot is **current**, then compute against that.
+    ///
+    /// Why not serve the latest completed snapshot and let the parse loop's
+    /// refresh heal the client? Because the editor draws whatever we answer
+    /// against the text it has NOW: Neovim stamps the response with the
+    /// buffer version at request time and renders it as soon as that matches
+    /// the live buffer (`vim.lsp.semantic_tokens`: `process_response` /
+    /// `on_win`, extmarks placed with `strict = false`), so tokens computed
+    /// for older text land visibly misplaced on unchanged lines. While we
+    /// park instead, the editor keeps its previous tokens as extmarks that
+    /// shift with the edit — temporarily unhighlighted new text, never
+    /// corrupted existing text. The wait is bounded by parse completion
+    /// (every edit's parse publishes), not by typing: the settle backstop
+    /// only expires when the pipeline is pathologically behind.
+    pub(crate) async fn current_snapshot_for_tokens(
+        &self,
+        uri: &Url,
+        cancel_rx: Option<&mut crate::lsp::request_id::CancelReceiver>,
+    ) -> TokenSnapshot {
+        use crate::lsp::lsp_impl::snapshot_read::{SnapshotWait, TOKEN_SETTLE_BACKSTOP};
+        let wait = self.wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP);
+        let outcome = match cancel_rx {
+            Some(rx) => {
+                tokio::select! {
+                    biased;
+                    // Fires on $/cancelRequest (and on forwarder teardown,
+                    // which the compute-race arms below treat as cancel too).
+                    _ = rx => return TokenSnapshot::Cancelled,
+                    outcome = wait => outcome,
+                }
+            }
+            None => wait.await,
+        };
+        match outcome {
+            SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
+            SnapshotWait::Stale => TokenSnapshot::Stale,
+            SnapshotWait::Unparsed | SnapshotWait::Gone => TokenSnapshot::Absent,
+        }
+    }
+
     pub(crate) async fn semantic_tokens_full_impl(
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let upstream_id = current_upstream_id();
-        let (cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let lsp_uri = params.text_document.uri;
 
         // Convert ls_types::Uri to url::Url for internal use
@@ -130,17 +189,39 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Serve-stale (ADR §3): resolve the latest completed snapshot up front;
-        // its (text, tree, language) triple is internally consistent, and every
-        // input below (query, mappings) resolves against the snapshot's own
-        // detected language — never a live re-detection that could diverge
-        // from the tree's grammar.
-        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
+        // Serve-current (ADR §3, revised): park until the snapshot matches the
+        // live text — see `current_snapshot_for_tokens` for why answering from
+        // a trailing snapshot corrupts the editor's existing highlights. The
+        // resolved snapshot's (text, tree, language) triple is internally
+        // consistent, and every input below (query, mappings) resolves against
+        // the snapshot's own detected language — never a live re-detection
+        // that could diverge from the tree's grammar.
+        let snapshot = match self
+            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut())
+            .await
+        {
+            TokenSnapshot::Current(snapshot) => snapshot,
+            TokenSnapshot::Absent => {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                    result_id: None,
+                    data: vec![],
+                })));
+            }
+            TokenSnapshot::Stale => {
+                self.cache.finish_request(&uri, request_id);
+                return Err(crate::error::content_modified_error());
+            }
+            TokenSnapshot::Cancelled => {
+                cancel_token.cancel();
+                self.cache.finish_request(&uri, request_id);
+                log::debug!(
+                    target: "kakehashi::semantic",
+                    "[SEMANTIC_TOKENS] CANCELLED via $/cancelRequest uri={} req={} (while parked)",
+                    uri, request_id
+                );
+                return Err(Error::request_cancelled());
+            }
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
@@ -209,15 +290,14 @@ impl Kakehashi {
         // Validity key for the snapshot's text under the generation captured at
         // the top: keys both the unchanged-document cache short-circuit below
         // and the store of the freshly computed tokens. Keying off the
-        // snapshot's own text (not the live text) is what makes serve-stale
-        // cache-safe — a stale compute stores under the stale text's hash,
-        // which a post-edit request never looks up.
+        // snapshot's own text hash means a compute racing a fresh edit stores
+        // under its own text's hash, which a post-edit request never looks up.
         let cache_key = self.cache.cache_key_for(&text, token_generation);
 
-        // Compute tokens against the snapshot (no live-text staleness gate:
-        // Stage 2 deliberately replaced reject-on-stale with serve-stale +
-        // refresh — the parse loop re-drives the client when a fresher
-        // snapshot lands).
+        // Compute tokens against the (current-at-resolution) snapshot. An edit
+        // landing after the resolution supersedes this request via the client's
+        // next didChange-driven request; the CancelToken then reclaims the
+        // compute mid-flight.
         let result = {
             // Snapshot-identical repeat request: tokens already cached for this
             // exact text are still correct, so skip re-tokenizing. Returns the
@@ -304,8 +384,9 @@ impl Kakehashi {
         // compute then bailed at a checkpoint and returned `None` (a partial
         // result), so drop the request rather than storing it over the cache.
         // This is CPU-reclamation, not staleness-rejection: an *un*-superseded
-        // compute over a snapshot the live text has since outrun still serves
-        // (§4's narrowed CancelToken role under serve-stale).
+        // compute over a snapshot the live text has since outrun still serves —
+        // the client's didChange-driven follow-up request supersedes and heals
+        // (§4's narrowed CancelToken role).
         if cancel_token.is_cancelled() {
             self.cache.finish_request(&uri, request_id);
             log::debug!(
@@ -371,7 +452,7 @@ impl Kakehashi {
         params: SemanticTokensDeltaParams,
     ) -> Result<Option<SemanticTokensFullDeltaResult>> {
         let upstream_id = current_upstream_id();
-        let (cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let lsp_uri = params.text_document.uri;
         let previous_result_id = params.previous_result_id;
 
@@ -411,16 +492,38 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Serve-stale (ADR §3): resolve the latest completed snapshot up front
-        // (same rationale as semanticTokens/full).
-        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
-                SemanticTokens {
-                    result_id: None,
-                    data: vec![],
-                },
-            )));
+        // Serve-current (ADR §3, revised): park until the snapshot matches the
+        // live text (same rationale as semanticTokens/full — this is the
+        // steady-state typing path where a stale answer corrupts the editor's
+        // existing highlights AND poisons the client's delta baseline).
+        let snapshot = match self
+            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut())
+            .await
+        {
+            TokenSnapshot::Current(snapshot) => snapshot,
+            TokenSnapshot::Absent => {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
+                    SemanticTokens {
+                        result_id: None,
+                        data: vec![],
+                    },
+                )));
+            }
+            TokenSnapshot::Stale => {
+                self.cache.finish_request(&uri, request_id);
+                return Err(crate::error::content_modified_error());
+            }
+            TokenSnapshot::Cancelled => {
+                cancel_token.cancel();
+                self.cache.finish_request(&uri, request_id);
+                log::debug!(
+                    target: "kakehashi::semantic",
+                    "[SEMANTIC_TOKENS_DELTA] CANCELLED via $/cancelRequest uri={} req={} (while parked)",
+                    uri, request_id
+                );
+                return Err(Error::request_cancelled());
+            }
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
@@ -488,11 +591,11 @@ impl Kakehashi {
 
         // Validity key for the snapshot's text under the generation captured at
         // the top (see semanticTokens/full for why snapshot-text keying makes
-        // serve-stale cache-safe).
+        // a compute racing a fresh edit cache-safe).
         let cache_key = self.cache.cache_key_for(&text, token_generation);
 
-        // Compute tokens against the snapshot (serve-stale; same as
-        // semanticTokens/full)
+        // Compute tokens against the (current-at-resolution) snapshot; same as
+        // semanticTokens/full.
         let result = {
             // Snapshot-identical repeat request: reuse the cached full tokens
             // instead of re-tokenizing.
@@ -587,7 +690,7 @@ impl Kakehashi {
         // compute then bailed at a checkpoint and returned `None` (partial), so
         // drop the request rather than diffing/storing it over the cache. This
         // is CPU-reclamation, not staleness-rejection (§4's narrowed CancelToken
-        // role under serve-stale).
+        // role).
         if cancel_token.is_cancelled() {
             self.cache.finish_request(&uri, request_id);
             log::debug!(
@@ -839,6 +942,198 @@ mod tests {
     use tokio::time::{Duration, sleep, timeout};
     use tower_lsp_server::LspService;
     use url::Url;
+
+    /// Publish a snapshot for `uri` built from `text` at `parsed_version`,
+    /// tree-less (no parser needed): the handlers' snapshot-resolution and
+    /// served-version bookkeeping are observable without tokenizing.
+    fn publish_treeless(server: &Kakehashi, uri: &Url, text: &str, parsed_version: u64) {
+        let incarnation = server
+            .documents
+            .latest_snapshot(uri)
+            .expect("document must be open")
+            .slot
+            .current_incarnation;
+        let landed = server
+            .documents
+            .get(uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: None,
+                        language: Some("rust".to_string()),
+                        parsed_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test snapshot must land");
+    }
+
+    fn full_params(uri: &Url) -> SemanticTokensParams {
+        SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(uri).expect("test URI should convert"),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+
+    /// Serve-current (the Neovim client contract): a full request arriving
+    /// while the latest snapshot trails the live text must NOT serve the
+    /// stale snapshot — it parks until the current one publishes and serves
+    /// that. Pinned via the served-version mark: the old serve-stale model
+    /// recorded the trailing `parsed_version` immediately.
+    #[tokio::test(start_paused = true)]
+    async fn semantic_tokens_full_parks_until_current_snapshot() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///serve_current.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        publish_treeless(service.inner(), &uri, "fn main() {}", 0);
+        // An edit bumps content_version past the published parse: the v0
+        // snapshot is now stale.
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), "fn main() { }".to_string(), None);
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .semantic_tokens_full_impl(full_params(&uri))
+                    .await
+            })
+        };
+        // Let the handler reach its snapshot wait, then publish the current
+        // parse (well inside the settle backstop).
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            service
+                .inner()
+                .cache
+                .served_semantic_version(&uri)
+                .is_none(),
+            "the handler must not have served the stale v0 snapshot"
+        );
+        publish_treeless(service.inner(), &uri, "fn main() { }", 1);
+
+        let result = request.await.expect("handler task must not panic");
+        assert!(result.is_ok(), "current-snapshot serve must succeed");
+        assert_eq!(
+            service.inner().cache.served_semantic_version(&uri),
+            Some(1),
+            "the response must be computed from the CURRENT snapshot"
+        );
+    }
+
+    /// When no parse catches up within the settle backstop, the handler must
+    /// reject with ContentModified (the parse loop's settle refresh re-drives
+    /// the client later) — never answer with tokens for text the client no
+    /// longer has.
+    #[tokio::test(start_paused = true)]
+    async fn semantic_tokens_full_rejects_content_modified_when_parse_never_catches_up() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///serve_current_timeout.rs").expect("valid test uri");
+
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+        server
+            .documents
+            .update_document(uri.clone(), "fn main() { }".to_string(), None);
+
+        let result = server.semantic_tokens_full_impl(full_params(&uri)).await;
+        let err = result.expect_err("a snapshot that never catches up must reject");
+        assert_eq!(
+            err.code,
+            crate::error::content_modified_error().code,
+            "staleness past the settle backstop signals ContentModified"
+        );
+        assert!(
+            server.cache.served_semantic_version(&uri).is_none(),
+            "a rejected request must not record a served version"
+        );
+    }
+
+    /// The delta path shares the serve-current wait: a delta against a
+    /// trailing snapshot parks and answers from the current one.
+    #[tokio::test(start_paused = true)]
+    async fn semantic_tokens_delta_parks_until_current_snapshot() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///serve_current_delta.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        publish_treeless(service.inner(), &uri, "fn main() {}", 0);
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), "fn main() { }".to_string(), None);
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                let params = SemanticTokensDeltaParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: crate::lsp::lsp_impl::url_to_uri(&uri)
+                            .expect("test URI should convert"),
+                    },
+                    previous_result_id: "1".to_string(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                };
+                service
+                    .inner()
+                    .semantic_tokens_full_delta_impl(params)
+                    .await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            service
+                .inner()
+                .cache
+                .served_semantic_version(&uri)
+                .is_none(),
+            "the delta handler must not have served the stale v0 snapshot"
+        );
+        publish_treeless(service.inner(), &uri, "fn main() { }", 1);
+
+        let result = request.await.expect("handler task must not panic");
+        assert!(result.is_ok(), "current-snapshot delta serve must succeed");
+        assert_eq!(
+            service.inner().cache.served_semantic_version(&uri),
+            Some(1),
+            "the delta must be computed from the CURRENT snapshot"
+        );
+    }
 
     #[tokio::test]
     async fn semantic_tokens_delta_does_not_overwrite_newer_text() {

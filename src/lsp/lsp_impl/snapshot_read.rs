@@ -35,6 +35,19 @@ pub(crate) enum SnapshotWait {
 /// reader classes cannot drift apart.
 pub(crate) const FIRST_PARSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Settle backstop for the serve-current token readers (`semanticTokens`
+/// full/delta): how long a token request may park waiting for the snapshot to
+/// catch up with the live text before rejecting with `ContentModified`.
+///
+/// Like the first-parse backstop this is bounded by parse completion, not
+/// wall time — every edit's parse resolution publishes — so it only expires
+/// when the compute pool is pathologically saturated. Generous on purpose:
+/// while the request parks, the client keeps drawing its previous tokens
+/// (shifted by the editor across edits), which is strictly better than
+/// receiving tokens computed for text it no longer has. On expiry the parse
+/// loop's settle refresh re-drives the client once the snapshot lands.
+pub(crate) const TOKEN_SETTLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Kakehashi {
     /// Wait (bounded) until `uri`'s latest snapshot is current, re-resolving
     /// the cell per wakeup (per-request re-resolution + incarnation validation
