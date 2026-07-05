@@ -279,30 +279,6 @@ added, it must align with the concatenated view of
 language-server-bridge-virtual-document-model rather than invent a second
 region-joining model.
 
-### Asset distribution
-
-`bindings.scm` has no upstream corpus: the vocabulary is kakehashi-owned, so
-the auto-install pipeline (which downloads its `QUERY_FILES` set from
-nvim-treesitter) is **not** extended — adding `bindings.scm` there would fetch
-nothing but 404s. Instead the assets are authored and versioned in this
-repository under `assets/queries/<lang>/bindings.scm` and **embedded into the
-binary at build time**.
-
-Per-language resolution order: `searchPaths` first — a user-provided file wins,
-with the same first-hit-wins rule captures-protocol specifies — then the
-embedded corpus as the built-in fallback. Nothing is seeded to the data
-directory: files written at install time would go stale against the running
-binary and reopen the "which copy wins" question, while embedding pins asset
-version to engine version — the spec and the queries written against it
-upgrade atomically with the binary, and languages work out of the box with no
-install step.
-
-`; inherits:` resolves per inherited file with the same order: each parent
-`bindings.scm` is looked up in `searchPaths` first, then the embedded corpus.
-An embedded `typescript` asset can inherit the embedded `ecma` one, and a user
-override of `ecma` in a search path takes effect for every language inheriting
-it.
-
 ### Out of scope, permanently
 
 Member access (`a.b`), type-based method resolution, overload resolution
@@ -439,9 +415,7 @@ the miss policy keeps the resolver silent.
 
 * Every supported language needs a hand-written `bindings.scm`; nothing is
   inherited from the ecosystem. Coverage grows language by language, starting
-  from zero — and because the assets are embedded, growing built-in coverage
-  means a kakehashi release (a user can still drop a `bindings.scm` into a
-  search path to add or override a language immediately).
+  from zero.
 * Authoring requires understanding the property semantics, which are richer
   (and stricter — equality-matched namespaces) than nvim-treesitter's
   forgiving legacy spec. Misannotation *usually* degrades to silence (safe,
@@ -493,6 +467,10 @@ the miss policy keeps the resolver silent.
   (for a future `documentSymbol`) is a separate decision.
 * `reference.write` (for `documentHighlight` Read/Write kinds) is a
   deliberate later phase on the same vocabulary.
+* How `bindings.scm` assets are distributed (auto-install `QUERY_FILES`,
+  bundling, or search-path-only) is an install-source question (there is no
+  upstream corpus to fetch — assets are kakehashi-authored), tracked with
+  the install pipeline, not here.
 * Scope tree and bindings are pure functions of (layer tree, query) —
   computed once per parsed version. `references`/`documentHighlight`
   resolve every reference in the layer per request; whether those results
@@ -507,10 +485,12 @@ Implemented: `QueryKind::Bindings` replaces the removed `Locals` end-to-end
 (`src/analysis/bindings/`) implements the full property vocabulary and
 resolution algorithm; the native layer feeds
 definition/references/documentHighlight/rename/prepareRename through the
-cross-layer walk's `native` slot; the embedded corpus ships
-bash/go/javascript/lua/python/rust/typescript with searchPaths-first
-per-file fallback and embedded `; inherits:` (typescript → javascript),
-validated by fixture tests against the real grammars.
+cross-layer walk's `native` slot. `bindings.scm` files load from
+`searchPaths` like any other query asset, with per-file `; inherits:`
+resolution; experimental queries for
+bash/go/javascript/lua/python/rust/typescript live in-repo under
+`assets/queries/` (not bundled into the binary), validated by fixture
+tests against the real grammars.
 
 Injected layers resolve natively too: the region under the cursor is parsed
 with included ranges and results map back through the region's content
