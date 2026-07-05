@@ -452,6 +452,35 @@ mod tests {
             assert_resolves(&m, text, "Box", 1, 0);
             assert_resolves(&m, text, "Box", 2, 0);
         }
+
+        #[test]
+        fn generic_type_parameters_never_leak_across_declarations() {
+            // Two generic classes: their <T>s must never share a binding
+            // (references/rename on one must not touch the other). Class
+            // declarations carry no scope, so the safe answer is silence.
+            let text = "class Box<T> { value: T }\nclass Bag<T> { item: T }\n";
+            let m = model_for("typescript", text);
+            let box_t = m.binding_at(nth(text, "T>", 0));
+            let bag_t = m.binding_at(nth(text, "T>", 1));
+            if let (Some(a), Some(b)) = (box_t, bag_t) {
+                assert_ne!(a, b, "class type params must not merge at the root");
+            }
+
+            // Function-level generics live in the function scope and resolve.
+            let text = "function id<U>(x: U): U { return x }\nlet u: U;\n";
+            let m = model_for("typescript", text);
+            let def = nth(text, "U>", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "U)", 0)),
+                Some(def..def + 1),
+                "parameter type annotation resolves to the generic"
+            );
+            assert_eq!(
+                m.definition_range_at(nth(text, "U;", 0)),
+                None,
+                "the generic must not escape the function"
+            );
+        }
     }
 
     mod bash_fixtures {
