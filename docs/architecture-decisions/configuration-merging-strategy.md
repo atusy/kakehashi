@@ -246,7 +246,7 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 ### Phase 1: Query Configuration Schema (Completed - Sprint 118, PBI-151)
 - [x] Add `QueryItem` struct with `path` (required) and `kind` (optional) fields
 - [x] Add `queries: Option<Vec<QueryItem>>` field to `LanguageSettings`
-- [x] Implement `QueryKind` enum (`Highlights`, `Locals`, `Injections`) with default `Highlights`
+- [x] Implement `QueryKind` enum (`Highlights`, `Bindings`, `Injections`) with default `Highlights`
 - [x] Implement type inference from exact filename (`highlights.scm`, `bindings.scm`, `injections.scm`)
 
 ### Phase 2: Core Merging (Completed - Sprint 119, PBI-150)
