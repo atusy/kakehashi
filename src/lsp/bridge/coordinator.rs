@@ -130,7 +130,9 @@ pub(crate) struct BridgeCoordinator {
     /// and stall every other response. The memo keys results by the settings
     /// snapshot's `Arc` identity (settings are hot-swapped whole via
     /// `ArcSwap`, so pointer identity IS snapshot identity) and by language
-    /// pair, making repeat resolutions an `Arc` clone.
+    /// pair, making repeat resolutions a shallow `Vec` clone (one `String` +
+    /// one `Arc` bump per configured server — the settings blobs themselves
+    /// stay behind their `Arc`s).
     config_memo: ArcSwap<ConfigMemo>,
 }
 
@@ -371,13 +373,20 @@ impl BridgeCoordinator {
             .as_ref()
             .is_some_and(|s| Arc::ptr_eq(s, settings))
         {
-            memo
+            arc_swap::Guard::into_inner(memo)
         } else {
-            // New settings snapshot: swap in a fresh generation. A racing
-            // swap for the same snapshot just discards one empty memo.
-            self.config_memo
-                .store(Arc::new(ConfigMemo::empty(Some(Arc::clone(settings)))));
-            self.config_memo.load()
+            // New settings snapshot: swap in a fresh generation and keep
+            // USING the locally-built Arc rather than re-loading. A re-load
+            // could return a memo a racing caller anchored to a DIFFERENT
+            // (newer) snapshot — inserting this caller's configs (computed
+            // from ITS settings) there would poison every later hit for that
+            // snapshot until the next reload. Inserting into our own anchor
+            // is always self-consistent: if a newer anchor replaced it in
+            // the cell, our inserts are simply invisible to its callers (one
+            // wasted compute, no wrong serve).
+            let fresh = Arc::new(ConfigMemo::empty(Some(Arc::clone(settings))));
+            self.config_memo.store(Arc::clone(&fresh));
+            fresh
         };
         match injection_language {
             Some(injection_language) => {
