@@ -80,13 +80,15 @@ impl Kakehashi {
         }
 
         // Wait for / trigger the off-ingress parse, then snapshot text and
-        // tree without holding the store Ref across compute.
+        // tree without holding the store Ref across compute. The text Arc
+        // doubles as the staleness witness for the publish-time check below
+        // (every edit and reopen installs a fresh allocation).
         self.ensure_document_parsed(&uri).await;
         let Some((text, tree)) = ({
             let doc = self.documents.get(&uri);
             doc.and_then(|doc| {
                 let tree = doc.tree()?.clone();
-                Some((doc.text().to_string(), tree))
+                Some((doc.text_arc(), tree))
             })
         }) else {
             return Ok(None);
@@ -112,7 +114,7 @@ impl Kakehashi {
                 let Some(query) = self.language.bindings_query(&language) else {
                     return Ok(None);
                 };
-                (query, text.clone(), tree.clone(), 0)
+                (query, text.to_string(), tree.clone(), 0)
             }
         };
 
@@ -133,12 +135,24 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
-        Ok(f(NativeBindingsContext {
+        let answer = f(NativeBindingsContext {
             model: &model,
             byte: byte - layer_offset,
             mapper: &mapper,
             layer_offset,
-        }))
+        });
+
+        // A didChange between the snapshot and here makes every computed
+        // range stale — worst case a rename WorkspaceEdit applied to newer
+        // text. Publish only while the snapshot's text is still current.
+        let unchanged = self
+            .documents
+            .get(&uri)
+            .is_some_and(|doc| std::sync::Arc::ptr_eq(&doc.text_arc(), &text));
+        if !unchanged {
+            return Ok(None);
+        }
+        Ok(answer)
     }
 
     /// The injected layer under the cursor, prepared for resolution.
@@ -290,10 +304,12 @@ pub(crate) fn native_rename(
     lsp_uri: &Uri,
     new_name: &str,
 ) -> Option<WorkspaceEdit> {
-    // The engine carries no per-language identifier grammar, but an empty
-    // or whitespace-carrying name corrupts the buffer in every language:
-    // silence, and the bridge (if any) owns the request.
-    if new_name.is_empty() || new_name.chars().any(char::is_whitespace) {
+    // The engine carries no per-language identifier grammar: accept only
+    // the conservative intersection every shipped asset's language treats
+    // as one identifier ([A-Za-z_][A-Za-z0-9_]*). Anything else — however
+    // valid in some grammar — silences, and the bridge (if any) owns the
+    // request; writing a syntax error would be a wrong answer.
+    if !is_conservative_identifier(new_name) {
         return None;
     }
     let ranges = binding_ranges(&ctx, true)?;
@@ -314,6 +330,14 @@ pub(crate) fn native_rename(
         changes: Some(changes),
         ..WorkspaceEdit::default()
     })
+}
+
+/// The identifier shape every shipped asset's language accepts:
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_conservative_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// `textDocument/prepareRename`: answers only when the cursor's identifier
