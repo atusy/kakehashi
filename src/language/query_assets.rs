@@ -26,6 +26,7 @@ mod tests {
             "c_sharp" => tree_sitter_c_sharp::LANGUAGE.into(),
             "php" => tree_sitter_php::LANGUAGE_PHP.into(),
             "ruby" => tree_sitter_ruby::LANGUAGE.into(),
+            "julia" => tree_sitter_julia::LANGUAGE.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
             "javascript" => tree_sitter_javascript::LANGUAGE.into(),
             "lua" => tree_sitter_lua::LANGUAGE.into(),
@@ -79,6 +80,7 @@ mod tests {
             "go",
             "java",
             "javascript",
+            "julia",
             "lua",
             "php",
             "python",
@@ -879,6 +881,67 @@ mod tests {
                 m.definition_range_at(nth(text, "size", 0)),
                 None,
                 "a JSX attribute names a prop, not a lexical binding"
+            );
+        }
+    }
+
+    mod julia_fixtures {
+        use super::*;
+
+        #[test]
+        fn functions_capture_globals_and_confine_locals() {
+            let text =
+                "total = 1\nfunction add(n, m=2)\n    t = n + m\n    return t + total\nend\nt\n";
+            let m = model_for("julia", text);
+            let n_def = nth(text, "n,", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "n +", 0)),
+                Some(n_def..n_def + 1)
+            );
+            let m_def = nth(text, "m=", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "+ m", 0) + 2),
+                Some(m_def..m_def + 1)
+            );
+            let t_def = nth(text, "t =", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "t +", 0)),
+                Some(t_def..t_def + 1)
+            );
+            // Julia closures capture enclosing globals...
+            assert_resolves(&m, text, "total", 1, 0);
+            // ...but the function's local never escapes.
+            assert_eq!(m.definition_range_at(nth(text, "t\n", 1)), None);
+        }
+
+        #[test]
+        fn for_and_let_bindings_are_confined() {
+            let text = "for item in xs\n    item\nend\nitem\nlet acc = 1\n    acc\nend\nacc\n";
+            let m = model_for("julia", text);
+            assert_resolves(&m, text, "item", 1, 0);
+            assert_eq!(m.definition_range_at(nth(text, "item", 2)), None);
+            assert_resolves(&m, text, "acc", 1, 0);
+            assert_eq!(m.definition_range_at(nth(text, "acc", 2)), None);
+        }
+
+        #[test]
+        fn struct_names_resolve_and_functions_hoist() {
+            let text =
+                "mk()\nstruct Box\n    size::Int\nend\nfunction mk()\n    return Box(1)\nend\n";
+            let m = model_for("julia", text);
+            assert_resolves(&m, text, "Box", 1, 0);
+            assert_resolves(&m, text, "mk", 0, 1);
+        }
+
+        #[test]
+        fn field_access_resolves_the_value_and_silences_the_member() {
+            let text = "size = 1\nobj = g()\nobj.size\n";
+            let m = model_for("julia", text);
+            assert_resolves(&m, text, "obj", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "size", 1)),
+                None,
+                "obj.size is member access, not the global"
             );
         }
     }
