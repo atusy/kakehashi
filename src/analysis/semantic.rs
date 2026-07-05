@@ -70,7 +70,7 @@ use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::Semanti
 /// checkpoints in the handlers).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
-    pool: std::sync::Arc<crate::compute_pool::ComputePool>,
+    pool: &crate::compute_pool::ComputePool,
     text: std::sync::Arc<str>,
     tree: Tree,
     query: std::sync::Arc<Query>,
@@ -629,7 +629,7 @@ local x = 42
 
         // Call the async handler
         let result = handle_semantic_tokens_full(
-            crate::compute_pool::test_pool(),
+            &crate::compute_pool::test_pool(),
             std::sync::Arc::from(text),
             tree,
             query,
@@ -699,7 +699,7 @@ local x = 42
 
         // Call the async handler with empty document
         let result = handle_semantic_tokens_full(
-            crate::compute_pool::test_pool(),
+            &crate::compute_pool::test_pool(),
             std::sync::Arc::from(text),
             tree,
             query,
@@ -773,7 +773,7 @@ local x = 42
 
         // Use the full pipeline — exclusion now happens in finalize_tokens
         let result = handle_semantic_tokens_full(
-            crate::compute_pool::test_pool(),
+            &crate::compute_pool::test_pool(),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -888,7 +888,7 @@ local x = 42
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
 
         let result = handle_semantic_tokens_full(
-            crate::compute_pool::test_pool(),
+            &crate::compute_pool::test_pool(),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1002,7 +1002,7 @@ local x = 42
 
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
-            crate::compute_pool::test_pool(),
+            &crate::compute_pool::test_pool(),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1116,7 +1116,7 @@ local x = 42
 
         // KEY: supports_multiline = true
         let result = handle_semantic_tokens_full(
-            crate::compute_pool::test_pool(),
+            &crate::compute_pool::test_pool(),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1249,7 +1249,7 @@ foo
 
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
-            crate::compute_pool::test_pool(),
+            &crate::compute_pool::test_pool(),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1361,7 +1361,7 @@ foo
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
 
         let result = handle_semantic_tokens_full(
-            crate::compute_pool::test_pool(),
+            &crate::compute_pool::test_pool(),
             std::sync::Arc::from(text),
             tree,
             md_query,

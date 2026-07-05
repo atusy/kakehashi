@@ -115,8 +115,15 @@ pub(crate) fn parse_with_deadline(
     deadline: std::time::Instant,
 ) -> Option<tree_sitter::Tree> {
     let bytes = text.as_bytes();
+    // The callback fires at tree-sitter's internal progress intervals, which
+    // can be very frequent on large inputs; sample the clock every 128
+    // invocations so the steady-state cost is a counter increment, not a
+    // syscall. Worst-case abort delay stays far below the whole-parse
+    // budget's scale.
+    let mut calls: u32 = 0;
     let mut on_progress = |_: &tree_sitter::ParseState| {
-        if std::time::Instant::now() >= deadline {
+        calls = calls.wrapping_add(1);
+        if calls.is_multiple_of(128) && std::time::Instant::now() >= deadline {
             std::ops::ControlFlow::Break(())
         } else {
             std::ops::ControlFlow::Continue(())

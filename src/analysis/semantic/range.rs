@@ -20,7 +20,7 @@ use super::handle_semantic_tokens_full;
 /// and `tree` are moved in; `None` on cancellation/failure.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_range_parallel_async(
-    pool: std::sync::Arc<crate::compute_pool::ComputePool>,
+    pool: &crate::compute_pool::ComputePool,
     text: std::sync::Arc<str>,
     tree: Tree,
     query: std::sync::Arc<Query>,

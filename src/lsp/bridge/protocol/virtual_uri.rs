@@ -203,10 +203,18 @@ impl VirtualDocumentUri {
         // byte-identical to the uncached path.
         static HOST_BASES: std::sync::OnceLock<dashmap::DashMap<String, Option<url::Url>>> =
             std::sync::OnceLock::new();
+        // Values are pure functions of the key, so eviction never risks
+        // staleness — the cap only bounds memory in sessions that touch many
+        // distinct host URIs (generated/untitled churn). Clearing wholesale
+        // is fine: the map refills at one parse per open host document.
+        const HOST_BASES_CAP: usize = 1024;
         let bases = HOST_BASES.get_or_init(dashmap::DashMap::new);
         let base = match bases.get(self.host_uri.as_str()) {
             Some(hit) => hit.clone(),
             None => {
+                if bases.len() >= HOST_BASES_CAP {
+                    bases.clear();
+                }
                 let computed = url::Url::parse(self.host_uri.as_str())
                     .ok()
                     .and_then(|mut url| {

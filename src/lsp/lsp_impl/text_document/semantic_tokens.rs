@@ -251,7 +251,7 @@ impl Kakehashi {
 
             // Compute tokens, racing against cancel notification if provided
             let compute_future = handle_semantic_tokens_full(
-                std::sync::Arc::clone(&self.compute_pool),
+                &self.compute_pool,
                 text.clone(),
                 tree.clone(),
                 query,
@@ -524,7 +524,7 @@ impl Kakehashi {
 
                 // Compute tokens, racing against cancel notification if provided
                 let compute_future = handle_semantic_tokens_full(
-                    std::sync::Arc::clone(&self.compute_pool),
+                    &self.compute_pool,
                     text.clone(),
                     tree.clone(),
                     query,
@@ -769,7 +769,7 @@ impl Kakehashi {
         let coordinator = std::sync::Arc::clone(&self.language);
 
         let result = handle_semantic_tokens_range_parallel_async(
-            std::sync::Arc::clone(&self.compute_pool),
+            &self.compute_pool,
             text,
             tree,
             query,

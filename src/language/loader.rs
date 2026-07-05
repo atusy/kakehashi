@@ -25,13 +25,20 @@ static LOADED_LIBRARIES: OnceLock<Mutex<HashMap<PathBuf, &'static Library>>> = O
 /// Load (or fetch the already-mapped) library at `normalized_path`, leaking it
 /// into the process-global cache so it can never be unmapped.
 fn immortal_library(normalized_path: &Path) -> Result<&'static Library, ParserLoadError> {
+    // Canonicalize so symlinked/relative spellings of the same library file
+    // share one leaked entry (PathClean alone is lexical); fall back to the
+    // cleaned path when the file cannot be resolved — `Library::new` will
+    // then report the real error.
+    let key = normalized_path
+        .canonicalize()
+        .unwrap_or_else(|_| normalized_path.to_path_buf());
     let cache = LOADED_LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = cache.lock().recover_poison("loader::immortal_library");
-    if let Some(library) = map.get(normalized_path) {
+    if let Some(library) = map.get(&key) {
         return Ok(library);
     }
-    let library: &'static Library = Box::leak(Box::new(unsafe { Library::new(normalized_path)? }));
-    map.insert(normalized_path.to_path_buf(), library);
+    let library: &'static Library = Box::leak(Box::new(unsafe { Library::new(&key)? }));
+    map.insert(key, library);
     Ok(library)
 }
 
