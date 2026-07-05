@@ -422,6 +422,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_rename_refuses_names_that_cannot_be_identifiers() {
+        // The engine has no per-language identifier grammar, but an empty
+        // or whitespace-carrying name corrupts the buffer in every
+        // language: silence, and the bridge (if any) owns the request.
+        let text = "fn main() { let target = 1; target; }";
+        let (service, _url, uri) = server_with_doc(text);
+        let server = service.inner();
+
+        for bad in ["", "a b", "x\n", " lead"] {
+            let edit = server
+                .native_bindings_answer(&uri, Position::new(0, 28), |ctx| {
+                    native_rename(ctx, &uri, bad)
+                })
+                .await
+                .unwrap();
+            assert!(edit.is_none(), "{bad:?} must not produce a WorkspaceEdit");
+        }
+    }
+
+    #[tokio::test]
     async fn native_prepare_rename_stays_silent_on_unresolved_identifier() {
         // `missing` resolves nowhere: the native layer must contribute
         // nothing so the bridge owns the request.
