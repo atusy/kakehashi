@@ -269,7 +269,7 @@ mod tests {
             assert_resolves(&m, text, "T", 1, 0);
             assert_resolves(&m, text, "T", 2, 0);
             assert_eq!(
-                m.definition_range_at(nth(text, "T t", 0)),
+                m.definition_range_at(nth(text, "T t;", 0)),
                 None,
                 "the template parameter must not escape the class"
             );
