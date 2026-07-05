@@ -263,6 +263,19 @@ mod tests {
         }
 
         #[test]
+        fn class_template_type_parameters_bind_into_the_class_body() {
+            let text = "template <typename T>\nclass Box { T item; T take(); };\nT t;\n";
+            let m = model_for("cpp", text);
+            assert_resolves(&m, text, "T", 1, 0);
+            assert_resolves(&m, text, "T", 2, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "T t", 0)),
+                None,
+                "the template parameter must not escape the class"
+            );
+        }
+
+        #[test]
         fn class_names_and_aliases_resolve_as_types_members_stay_silent() {
             let text = "class Box { public: int size; };\nusing box_t = Box;\nvoid f(box_t b) { b.size; }\n";
             let m = model_for("cpp", text);
