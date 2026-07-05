@@ -68,9 +68,9 @@ impl InjectionCoordinator {
             return;
         }
 
-        self.cache
-            .remove_injection_tokens_for_ulids(host_uri, invalidated_ulids);
-
+        // No token-cache eviction here: the injection-token cache is
+        // content-addressed (no ULID keys), self-validating on read, and
+        // swept by populate's live-hash retain.
         self.bridge
             .close_invalidated_docs(host_uri, invalidated_ulids)
             .await;

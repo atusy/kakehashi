@@ -27,12 +27,9 @@
 /// `RegionCacheInfo`, kept here so `document` need not depend on `analysis`.
 #[derive(Clone)]
 pub(crate) struct DiscoveredRegionCache {
-    /// Position-stable region id, byte-identical to the one `populate_injections`
-    /// minted for this region in the `InjectionMap` (the discovery build reuses
-    /// that same id — no new off-ingress minting).
-    pub region_id: String,
-    /// Content hash folded with the resolved language (the injection-token
-    /// cache's per-region validity key).
+    /// Content hash folded with the resolved language — the injection-token
+    /// cache's content-addressed key (parse-snapshot ADR §3 companion
+    /// decision), needing no tracker identity at all.
     pub validity_hash: u64,
     /// The region's first host line, added back on token re-anchor.
     pub line_start: u32,

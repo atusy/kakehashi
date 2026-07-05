@@ -473,9 +473,7 @@ impl Kakehashi {
                 _ = term.recv() => SIGTERM_NUM,
                 _ = hup.recv() => SIGHUP_NUM,
             };
-            log::info!(
-                "received signal {signum}: reaping downstream servers before exit"
-            );
+            log::info!("received signal {signum}: reaping downstream servers before exit");
             bridge.shutdown_all().await;
             std::process::exit(128 + signum);
         });

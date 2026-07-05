@@ -27,7 +27,6 @@ use crate::language::injection::{
     compute_included_ranges_clipped, effective_offset_for_pattern, has_combined_for_pattern,
     intersect_included_ranges, parse_with_ranges, sub_select_included_ranges,
 };
-use crate::text::fnv1a_hash;
 use crate::text::position::byte_to_utf16_col;
 
 /// Minimum number of top-level single injection regions before injection-token
@@ -758,16 +757,12 @@ fn discover_single_region(
             }
         };
         let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
-        // Fold the resolved language into the validity hash so a position-
-        // stable region_id with identical content but a different injected
-        // language gets a different key (barring a 64-bit collision) and won't
-        // serve a stale hit — defends the cross-language hazard from a
-        // superseded request's orphaned ULID; same fold style as the
-        // generation fold in cache_key.
+        // Content-addressed cache key: content hash folded with the resolved
+        // language (one shared definition — populate's eviction sweep must
+        // compute the same fold).
         let validity_hash =
-            cacheable.content_hash ^ fnv1a_hash(&resolved_lang).wrapping_mul(0x100000001b3);
+            crate::analysis::semantic_cache::region_validity_hash(cacheable.content_hash, &resolved_lang);
         Some(DiscoveredRegionCache {
-            region_id: cacheable.region_id.clone(),
             validity_hash,
             line_start: cacheable.line_range.start,
             eligible,
@@ -845,7 +840,6 @@ fn rebuild_context<'a>(
     }
 
     let region_cache = region.token_cache.as_ref().map(|tc| RegionCacheInfo {
-        region_id: tc.region_id.clone(),
         validity_hash: tc.validity_hash,
         line_start: tc.line_start,
         eligible: tc.eligible,
@@ -1238,9 +1232,7 @@ pub(crate) fn collect_injection_tokens_parallel(
         for (i, ctx) in contexts.iter().enumerate() {
             if let Some(rc) = &ctx.region_cache
                 && rc.eligible
-                && let Some(local) =
-                    cc.cache
-                        .get(cc.uri, &rc.region_id, rc.validity_hash, cc.generation)
+                && let Some(local) = cc.cache.get(cc.uri, rc.validity_hash, cc.generation)
             {
                 hit_tokens.extend(reanchor_to_host(local, rc.line_start));
             } else {
@@ -1313,13 +1305,8 @@ pub(crate) fn collect_injection_tokens_parallel(
                 && res.fully_loaded
             {
                 let local = to_region_local(&res.tokens, rc.line_start);
-                cc.cache.store(
-                    cc.uri,
-                    &rc.region_id,
-                    rc.validity_hash,
-                    cc.generation,
-                    local,
-                );
+                cc.cache
+                    .store(cc.uri, rc.validity_hash, cc.generation, local);
             }
         }
     }
@@ -3217,7 +3204,7 @@ local b = 2
         );
 
         // Overwrite one region with a region-local sentinel token.
-        let (rid, ch, generation) = cache
+        let (ch, generation) = cache
             .test_keys(&uri)
             .into_iter()
             .next()
@@ -3232,7 +3219,7 @@ local b = 2
             priority: 100,
             node_byte_len: 999,
         };
-        cache.store(&uri, &rid, ch, generation, vec![sentinel]);
+        cache.store(&uri, ch, generation, vec![sentinel]);
 
         let tokens = collect_injection_tokens_parallel(
             &text,

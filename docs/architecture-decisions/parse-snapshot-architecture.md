@@ -266,12 +266,17 @@ The decision therefore **separates three concerns that today all ride the tracke
   settings reload, the #530 discipline — *not* the per-edit parse-run counter), so a
   byte-identical region reuses across edits and is invalidated only on a real config
   change. Two snapshots' byte-identical regions thus reuse tokens without any stable
-  id. That in turn reworks **eviction**:
-  `invalidate_for_edits` currently point-deletes by `region_id` via the interval
-  tree, which has no target once the key drops it, so it must become a content-keyed
-  clear (or a side index) — losing the "typed region preserves reuse on an unrelated
-  edit" optimization measured by the injection-token-cache-reuse work unless that
-  index is added. Reworking the key **and** the eviction surface is a **companion decision to injection-token-cache-reuse**, not silently folded in here.
+  id. That in turn reworks **eviction** — and this companion decision is now
+  **implemented**: the key is `(uri, validity_hash)` (content ⊕ resolved
+  language, one shared fold), spatial `invalidate_for_edits` is deleted
+  (content addressing self-invalidates: an edited region misses under its new
+  hash, and an unrelated edit cannot touch a region's entry at all — the
+  "typed region preserves reuse" property holds *without* the interval
+  index), and the growth bound is a per-populate **live-hash sweep** run
+  inside the mint-epoch commit (a stale pass sweeps nothing). The live set
+  comes from the discovery's own per-region cache identities so the sweep and
+  the store/read path can never disagree on the fold. Free extras: duplicate
+  fences share one entry, and an undo back to previous content is a hit.
 - **Cross-edit bridge / virtual-document identity** — the stable handle a
   downstream language server's virtual document is keyed by — **remains the shared `NodeTracker` ULID**, a live-position (`content_version`) concern. Because regions
   are only *discovered* by a parse, minting still originates from a parse pass, but
