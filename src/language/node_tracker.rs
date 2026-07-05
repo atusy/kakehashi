@@ -686,9 +686,20 @@ impl NodeTracker {
 
     /// Remove all tracked regions for a document.
     ///
-    /// Called on didClose to prevent memory leaks.
+    /// Called on didClose to prevent memory leaks. The entries are dropped
+    /// but the URI's shift generation is RETAINED (bumped, in an otherwise
+    /// empty index — two empty maps and a counter, bounded by the distinct
+    /// URIs ever closed): a serve-stale walk's generation latch must never
+    /// compare equal across a close/reopen, or an old-lifetime walk's mints
+    /// into the reopened document's fresh index would masquerade as
+    /// correct-at-birth (ABA). Bumped even for a URI that never tracked a
+    /// node, for the same reason (the latch reads 0 for an absent index).
     pub(crate) fn cleanup(&self, uri: &Url) {
-        self.entries.remove(uri);
+        let mut entries = self.entries.entry(uri.clone()).or_default();
+        *entries = UriEntries {
+            shift_gen: entries.shift_gen + 1,
+            ..UriEntries::default()
+        };
     }
 }
 
@@ -764,6 +775,25 @@ mod tests {
         assert!(
             tracker.shift_generation(&uri) > 1,
             "text-diff application advances the generation too"
+        );
+
+        // Close/reopen must not ABA the latch: cleanup retains a BUMPED
+        // generation (even for a URI that never tracked a node), so an
+        // old-lifetime walk's latch can never compare equal post-reopen.
+        let before_close = tracker.shift_generation(&uri);
+        tracker.cleanup(&uri);
+        assert!(
+            tracker.shift_generation(&uri) > before_close,
+            "cleanup advances the generation instead of resetting it"
+        );
+
+        let never_tracked = test_uri("never_tracked_then_closed");
+        assert_eq!(tracker.shift_generation(&never_tracked), 0);
+        tracker.cleanup(&never_tracked);
+        assert_eq!(
+            tracker.shift_generation(&never_tracked),
+            1,
+            "cleanup bumps even an absent index"
         );
     }
 
