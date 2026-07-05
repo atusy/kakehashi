@@ -196,10 +196,9 @@ struct WalkFlightGuard<'a> {
 
 impl Drop for WalkFlightGuard<'_> {
     fn drop(&mut self) {
-        self.map
-            .remove_if(&self.key, |_, current| {
-                std::sync::Arc::ptr_eq(current, &self.notify)
-            });
+        self.map.remove_if(&self.key, |_, current| {
+            std::sync::Arc::ptr_eq(current, &self.notify)
+        });
         self.notify.notify_waiters();
     }
 }
@@ -1291,11 +1290,10 @@ mod tests {
         };
         publish("fn main() {}", 0);
         // Edit: content_version moves to 1, the v0 snapshot now trails.
-        service.inner().documents.update_document(
-            uri.clone(),
-            "fn main() { }".to_string(),
-            None,
-        );
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), "fn main() { }".to_string(), None);
 
         let request = {
             let service = std::sync::Arc::clone(&service);

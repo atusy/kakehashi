@@ -428,6 +428,59 @@ impl Kakehashi {
         }
     }
 
+    /// Arm a Unix-signal watcher that reaps the downstream server pool when
+    /// the process is terminated WITHOUT the LSP shutdown handshake.
+    ///
+    /// Editors escalate: Neovim SIGTERMs a server that hasn't exited shortly
+    /// after `shutdown`/`exit`, and a user restart can kill it outright. With
+    /// no handler, kakehashi dies mid-handshake and its downstream children
+    /// are orphaned — observed live as a `with-logging emmylua_ls` wrapper
+    /// re-parented to launchd and running for hours, because not every
+    /// downstream exits on stdin EOF. On SIGTERM/SIGHUP this runs the same
+    /// bounded `shutdown_all` as the graceful path (LSP handshake, then
+    /// SIGTERM→SIGKILL escalation, global timeout) and exits with the
+    /// conventional 128+signal status. A SIGKILL still orphans children —
+    /// nothing can intercept it — but the escalation path an editor actually
+    /// takes starts with SIGTERM, which this converts into a clean reap.
+    ///
+    /// Server mode only (the one-shot CLI has no downstream pool worth a
+    /// watcher); `pub` because the binary arms it before serving.
+    #[cfg(unix)]
+    pub fn spawn_termination_cleanup(&self) {
+        let bridge = std::sync::Arc::clone(&self.bridge);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (mut term, mut hup) = match (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::hangup()),
+            ) {
+                (Ok(term), Ok(hup)) => (term, hup),
+                (term, hup) => {
+                    log::warn!(
+                        "termination cleanup disabled: signal handler install failed \
+                         (SIGTERM: {:?}, SIGHUP: {:?})",
+                        term.err(),
+                        hup.err()
+                    );
+                    return;
+                }
+            };
+            // POSIX signal numbers, avoiding a libc dependency for two
+            // constants that are identical on every Unix Rust supports.
+            const SIGHUP_NUM: i32 = 1;
+            const SIGTERM_NUM: i32 = 15;
+            let signum = tokio::select! {
+                _ = term.recv() => SIGTERM_NUM,
+                _ = hup.recv() => SIGHUP_NUM,
+            };
+            log::info!(
+                "received signal {signum}: reaping downstream servers before exit"
+            );
+            bridge.shutdown_all().await;
+            std::process::exit(128 + signum);
+        });
+    }
+
     pub(crate) async fn shutdown_impl(&self) -> Result<()> {
         // Persist crash detection state before shutdown
         // This enables crash recovery to detect if parsing was in progress

@@ -997,6 +997,13 @@ async fn run_lsp_server() {
     )
     .finish();
 
+    // Reap downstream servers when the editor terminates this process without
+    // completing the shutdown handshake (SIGTERM/SIGHUP) — without this, the
+    // spawned language servers are orphaned to launchd and can outlive the
+    // session indefinitely.
+    #[cfg(unix)]
+    service.inner().spawn_termination_cleanup();
+
     // Wrap service with RequestIdCapture to:
     // 1. Capture upstream request IDs (for ls-bridge-server-pool-coordination bridge requests)
     // 2. Forward $/cancelRequest notifications to downstream servers
