@@ -43,6 +43,7 @@ mod tests {
             "haskell" => tree_sitter_haskell::LANGUAGE.into(),
             "yaml" => tree_sitter_yaml::LANGUAGE.into(),
             "css" => tree_sitter_css::LANGUAGE.into(),
+            "r" => tree_sitter_r::LANGUAGE.into(),
             other => panic!("no grammar for {other}"),
         }
     }
@@ -97,6 +98,7 @@ mod tests {
             "lua",
             "php",
             "python",
+            "r",
             "ruby",
             "rust",
             "terraform",
@@ -1150,6 +1152,49 @@ mod tests {
             let m = model_for("css", text);
             assert_eq!(m.definition_range_at(nth(text, "color", 1)), None);
             assert_eq!(m.definition_range_at(nth(text, "red", 1)), None);
+        }
+    }
+
+    mod r_fixtures {
+        use super::*;
+
+        #[test]
+        fn assignments_bind_and_super_assignment_writes_outward() {
+            let text =
+                "total <- 1\nadd <- function(n, m = 2) {\n  t <- n + m\n  total <<- t\n  t\n}\n";
+            let m = model_for("r", text);
+            let n_def = nth(text, "n,", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "n +", 0)),
+                Some(n_def..n_def + 1)
+            );
+            let m_def = nth(text, "m =", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "+ m", 0) + 2),
+                Some(m_def..m_def + 1)
+            );
+            // `<<-` merges into the enclosing binding instead of shadowing.
+            let top = m.binding_at(nth(text, "total", 0)).unwrap();
+            assert_eq!(m.binding_at(nth(text, "total", 1)), Some(top));
+        }
+
+        #[test]
+        fn function_names_resolve_and_for_variables_leak_by_design() {
+            let text = "helper <- function(x) x\nrun <- function() helper(1)\nfor (item in xs) print(item)\nitem\n";
+            let m = model_for("r", text);
+            assert_resolves(&m, text, "helper", 1, 0);
+            // R has no block scope: the loop variable survives the loop.
+            assert_resolves(&m, text, "item", 1, 0);
+            assert_resolves(&m, text, "item", 2, 0);
+        }
+
+        #[test]
+        fn member_access_and_argument_names_stay_silent() {
+            let text = "size <- 1\nobj$size\nf(size = 2)\nf(size)\n";
+            let m = model_for("r", text);
+            assert_eq!(m.definition_range_at(nth(text, "size", 1)), None);
+            assert_eq!(m.definition_range_at(nth(text, "size", 2)), None);
+            assert_resolves(&m, text, "size", 3, 0);
         }
     }
 
