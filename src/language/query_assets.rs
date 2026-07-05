@@ -32,6 +32,7 @@ mod tests {
             "python" => tree_sitter_python::LANGUAGE.into(),
             "rust" => tree_sitter_rust::LANGUAGE.into(),
             "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
             other => panic!("no grammar for {other}"),
         }
     }
@@ -88,31 +89,32 @@ mod tests {
             tree_sitter::Query::new(&language_of(lang), &source)
                 .unwrap_or_else(|e| panic!("{lang} bindings.scm must compile in full: {e}"));
         }
-        // TypeScript compiles through the tolerant path: the inherited
-        // JavaScript class/parameter patterns are impossible against the TS
-        // grammar and drop out, but every TypeScript-authored pattern (after
-        // the inherited prefix) must survive.
+        // TypeScript and TSX compile through the tolerant path: the
+        // inherited JavaScript class/parameter patterns are impossible
+        // against those grammars and drop out, but every pattern authored
+        // after the JavaScript prefix must survive.
         let js_lines = resolved_source("javascript").lines().count();
-        let source = resolved_source("typescript");
-        let parsed = crate::language::query_loader::QueryLoader::parse_query(
-            &language_of("typescript"),
-            &source,
-            true,
-        );
-        let query = parsed.query.expect("typescript asset must compile");
-        assert!(
-            query.pattern_count() > 10,
-            "typescript corpus is non-trivial"
-        );
-        let dead_ts_patterns: Vec<_> = parsed
-            .skipped
-            .iter()
-            .filter(|s| s.start_line > js_lines)
-            .collect();
-        assert!(
-            dead_ts_patterns.is_empty(),
-            "unexpected dead typescript patterns: {dead_ts_patterns:?}"
-        );
+        for lang in ["typescript", "tsx"] {
+            let source = resolved_source(lang);
+            let parsed = crate::language::query_loader::QueryLoader::parse_query(
+                &language_of(lang),
+                &source,
+                true,
+            );
+            let query = parsed
+                .query
+                .unwrap_or_else(|| panic!("{lang} asset must compile"));
+            assert!(query.pattern_count() > 10, "{lang} corpus is non-trivial");
+            let dead_patterns: Vec<_> = parsed
+                .skipped
+                .iter()
+                .filter(|s| s.start_line > js_lines)
+                .collect();
+            assert!(
+                dead_patterns.is_empty(),
+                "unexpected dead {lang} patterns: {dead_patterns:?}"
+            );
+        }
     }
 
     fn model_for(lang: &str, text: &str) -> BindingsModel {
@@ -854,6 +856,30 @@ mod tests {
             assert_resolves(&m, text, "@size", 1, 0);
             assert_resolves(&m, text, "SIZE", 1, 0);
             assert_resolves(&m, text, "Box", 1, 0);
+        }
+    }
+
+    mod tsx_fixtures {
+        use super::*;
+
+        #[test]
+        fn inherited_typescript_rules_apply() {
+            let text = "interface Shape {}\nlet s: Shape;\n";
+            let m = model_for("tsx", text);
+            assert_resolves(&m, text, "Shape", 1, 0);
+        }
+
+        #[test]
+        fn jsx_element_names_resolve_and_attribute_names_stay_silent() {
+            let text = "import Widget from \"w\";\nconst count = 1;\nfunction App() { return <Widget size={count} />; }\n";
+            let m = model_for("tsx", text);
+            assert_resolves(&m, text, "Widget", 1, 0);
+            assert_resolves(&m, text, "count", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "size", 0)),
+                None,
+                "a JSX attribute names a prop, not a lexical binding"
+            );
         }
     }
 
