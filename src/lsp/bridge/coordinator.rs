@@ -409,10 +409,20 @@ impl BridgeCoordinator {
                 }
                 let configs =
                     self.get_all_configs_for_language(settings, host_language, injection_language);
-                memo.virt
-                    .entry(host_language.to_string())
-                    .or_default()
-                    .push((injection_language.to_string(), Arc::new(configs.clone())));
+                let entry = (injection_language.to_string(), Arc::new(configs.clone()));
+                // `get_mut` first (borrowed key; `entry()` would clone the
+                // host Url-sized String even on a present host), and skip the
+                // push when a racing compute already recorded this pair.
+                if let Some(mut pairs) = memo.virt.get_mut(host_language) {
+                    if !pairs.iter().any(|(lang, _)| lang == injection_language) {
+                        pairs.push(entry);
+                    }
+                } else {
+                    memo.virt
+                        .entry(host_language.to_string())
+                        .or_default()
+                        .push(entry);
+                }
                 configs
             }
             None => {

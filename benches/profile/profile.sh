@@ -69,8 +69,14 @@ echo "==> Generating dSYM for symbolication"
 dsymutil "$BIN"
 
 echo "==> Recording with samply (lang=$LANG_ARG size=$SIZE requests=$REQUESTS)"
+# Build the optional --file argument as an array: ${VAR:+--file "$VAR"} does
+# not apply the inner quoting, so paths with spaces would split.
+FILE_OPTS=()
+if [ -n "${FILE_ARG:-}" ]; then
+  FILE_OPTS=(--file "$FILE_ARG")
+fi
 samply record -s -o "$OUT/profile.json.gz" \
-  -- python3 "$HERE/drive.py" --bin "./$BIN" --lang "$LANG_ARG" --size "$SIZE" --requests "$REQUESTS" --edits "${EDITS:-0}" ${FILE_ARG:+--file "$FILE_ARG"}
+  -- python3 "$HERE/drive.py" --bin "./$BIN" --lang "$LANG_ARG" --size "$SIZE" --requests "$REQUESTS" --edits "${EDITS:-0}" "${FILE_OPTS[@]}"
 
 echo "==> Analyzing + writing collapsed stacks"
 python3 "$HERE/analyze.py" "$OUT/profile.json.gz" --dsym "$DWARF" --arch "$ARCH" \

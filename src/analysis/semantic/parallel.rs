@@ -800,10 +800,14 @@ fn rebuild_context<'a>(
 
     // Guard the re-slice: on the collect path the bounds were just validated; on
     // the reuse path they were validated against the tree this discovery is bound
-    // to, but a defensive check keeps a corrupt entry from panicking.
-    if inj_start_byte > inj_end_byte || inj_end_byte > text.len() {
+    // to, but a defensive check keeps a corrupt entry from panicking. `get`
+    // (below) additionally rejects a mid-codepoint boundary instead of
+    // panicking — impossible for tree-sitter-derived offsets on the bound
+    // text, so failing closed (drop the region) is the right degradation.
+    if inj_start_byte > inj_end_byte {
         return None;
     }
+    let content_text = text.get(inj_start_byte..inj_end_byte)?;
 
     // Highlight query for the resolved language. Missing = transient (loads with
     // the language), so drop the region and let the caller taint discovery.
@@ -835,7 +839,7 @@ fn rebuild_context<'a>(
     Some(InjectionContext {
         resolved_lang: region.resolved_lang.clone(),
         highlight_query,
-        content_text: &text[inj_start_byte..inj_end_byte],
+        content_text,
         host_start_byte: content_start_byte + inj_start_byte,
         included_ranges: region.included_ranges.clone(),
         prefix_byte_widths: region.prefix_byte_widths.clone(),
@@ -1200,7 +1204,9 @@ pub(crate) fn collect_injection_tokens_parallel(
     // to the Rayon workers. Eligibility comes from each context's `region_cache`:
     // computed fresh when contexts were discovered inline, or carried in the owned
     // `DiscoveredRegion` when they were rebuilt from reused discovery — identical
-    // either way, since the discovery is bound to the same tree by `parse_epoch`.
+    // either way, since snapshot immutability binds the discovery to the same
+    // tree (text, tree, and regions are one value) and the generation gate
+    // rejects reload-stale discoveries.
     // Below the region-count gate `region_cache` is `None`, so every context misses
     // and the path matches the uncached behavior exactly.
     let mut hit_tokens: Vec<RawToken> = Vec::new();
