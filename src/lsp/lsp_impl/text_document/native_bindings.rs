@@ -287,6 +287,12 @@ pub(crate) fn native_rename(
     lsp_uri: &Uri,
     new_name: &str,
 ) -> Option<WorkspaceEdit> {
+    // The engine carries no per-language identifier grammar, but an empty
+    // or whitespace-carrying name corrupts the buffer in every language:
+    // silence, and the bridge (if any) owns the request.
+    if new_name.is_empty() || new_name.chars().any(char::is_whitespace) {
+        return None;
+    }
     let ranges = binding_ranges(&ctx, true)?;
     let edits: Vec<TextEdit> = ranges
         .iter()
