@@ -45,6 +45,7 @@ mod tests {
             "css" => tree_sitter_css::LANGUAGE.into(),
             "r" => tree_sitter_r::LANGUAGE.into(),
             "nix" => tree_sitter_nix::LANGUAGE.into(),
+            "vim" => tree_sitter_vim::language(),
             other => panic!("no grammar for {other}"),
         }
     }
@@ -104,6 +105,7 @@ mod tests {
             "ruby",
             "rust",
             "terraform",
+            "vim",
             "yaml",
         ] {
             let source = resolved_source(lang);
@@ -1239,6 +1241,45 @@ mod tests {
             let text = "let size = 1; in rec { inherit size; }\n";
             let m = model_for("nix", text);
             assert_resolves(&m, text, "size", 1, 0);
+        }
+    }
+
+    mod vim_fixtures {
+        use super::*;
+
+        #[test]
+        fn script_scope_spans_functions() {
+            let text = "let s:count = 1\nfunction! s:Helper(arg) abort\n  return s:count + a:arg\nendfunction\ncall s:Helper(2)\n";
+            let m = model_for("vim", text);
+            assert_resolves(&m, text, "count", 1, 0);
+            assert_resolves(&m, text, "Helper", 1, 0);
+            assert_resolves(&m, text, "arg", 1, 0);
+        }
+
+        #[test]
+        fn locals_and_bare_lets_stay_in_their_function() {
+            let text = "function! F()\n  let l:t = 1\n  let total = l:t\n  return total\nendfunction\nlet x = total\n";
+            let m = model_for("vim", text);
+            // l:t and bare t are the same function-local namespace.
+            let t_def = nth(text, "t =", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "l:t\n", 0) + 2),
+                Some(t_def..t_def + 1)
+            );
+            assert_resolves(&m, text, "total", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "total", 2)),
+                None,
+                "a function-local never escapes to the script level"
+            );
+        }
+
+        #[test]
+        fn globals_defined_inside_functions_are_visible_outside() {
+            let text = "function! G()\n  let g:mode = 1\nendfunction\nechom g:mode\nfor item in range(3)\n  echo item\nendfor\n";
+            let m = model_for("vim", text);
+            assert_resolves(&m, text, "mode", 1, 0);
+            assert_resolves(&m, text, "item", 1, 0);
         }
     }
 
