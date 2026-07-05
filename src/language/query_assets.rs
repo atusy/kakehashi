@@ -20,6 +20,7 @@ mod tests {
     fn language_of(name: &str) -> tree_sitter::Language {
         match name {
             "bash" => tree_sitter_bash::LANGUAGE.into(),
+            "c" => tree_sitter_c::LANGUAGE.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
             "javascript" => tree_sitter_javascript::LANGUAGE.into(),
             "lua" => tree_sitter_lua::LANGUAGE.into(),
@@ -64,7 +65,7 @@ mod tests {
     /// the inherited JS class pattern is impossible against the TS grammar.
     #[test]
     fn assets_compile_without_skipped_patterns() {
-        for lang in ["bash", "go", "javascript", "lua", "python", "rust"] {
+        for lang in ["bash", "c", "go", "javascript", "lua", "python", "rust"] {
             let source = resolved_source(lang);
             tree_sitter::Query::new(&language_of(lang), &source)
                 .unwrap_or_else(|e| panic!("{lang} bindings.scm must compile in full: {e}"));
@@ -521,6 +522,91 @@ mod tests {
             let text = "for item in a b; do echo \"$item\"; done\n";
             let m = model_for("bash", text);
             assert_resolves(&m, text, "item", 1, 0);
+        }
+    }
+
+    mod c_fixtures {
+        use super::*;
+
+        #[test]
+        fn block_shadowing_and_sequential_locals() {
+            let text = "int main(void) { int total = 1; { int total = 2; total; } total; }";
+            let m = model_for("c", text);
+            // The block-inner use reads the shadow; the trailing use reads
+            // the outer local.
+            assert_resolves(&m, text, "total", 2, 1);
+            assert_resolves(&m, text, "total", 3, 0);
+        }
+
+        #[test]
+        fn functions_resolve_from_their_declaration_onward() {
+            let text = "int before(void) { return helper(1); } int helper(int x) { return helper(x); } int after(void) { return helper(2); }";
+            let m = model_for("c", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "helper", 0)),
+                None,
+                "a call above the declaration must stay silent"
+            );
+            assert_resolves(&m, text, "helper", 2, 1);
+            assert_resolves(&m, text, "helper", 3, 1);
+        }
+
+        #[test]
+        fn prototype_merges_with_the_definition() {
+            let text = "int helper(int);\nint use1(void) { return helper(1); }\nint helper(int amount) { return amount; }\n";
+            let m = model_for("c", text);
+            let proto = m.binding_at(nth(text, "helper", 0)).unwrap();
+            assert_eq!(m.binding_at(nth(text, "helper", 2)), Some(proto));
+            assert_eq!(m.sites(proto).len(), 2, "prototype and definition merge");
+            // The call resolves to the prototype (the last site before it).
+            assert_resolves(&m, text, "helper", 1, 0);
+            // The prototype's unnamed/named parameter must not leak to file scope.
+            assert_eq!(
+                m.definition_range_at(nth(text, "amount", 1)),
+                Some(nth(text, "amount", 0)..nth(text, "amount", 0) + 6)
+            );
+        }
+
+        #[test]
+        fn parameters_resolve_including_pointers() {
+            let text = "void f(int count, char *name) { count; name; }";
+            let m = model_for("c", text);
+            assert_resolves(&m, text, "count", 1, 0);
+            assert_resolves(&m, text, "name", 1, 0);
+        }
+
+        #[test]
+        fn struct_tags_typedefs_and_member_silence() {
+            let text = "typedef struct list { struct list *next; } list_t;\nvoid f(list_t *item) { item->next; }\n";
+            let m = model_for("c", text);
+            // The tag self-reference inside the body resolves to the tag.
+            let tag = nth(text, "list {", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "list *", 0)),
+                Some(tag..tag + 4)
+            );
+            // The typedef name resolves from the parameter type.
+            assert_resolves(&m, text, "list_t", 1, 0);
+            // Member access is never a lexical reference.
+            assert_eq!(m.definition_range_at(nth(text, "next", 1)), None);
+        }
+
+        #[test]
+        fn goto_labels_resolve_forward_and_stay_in_their_function() {
+            let text = "void f(void) { goto done; done: return; }\nvoid g(void) { goto done; }\n";
+            let m = model_for("c", text);
+            // goto jumps FORWARD to a label declared later.
+            assert_resolves(&m, text, "done", 0, 1);
+            // Another function's goto must not see it.
+            assert_eq!(m.definition_range_at(nth(text, "done", 2)), None);
+        }
+
+        #[test]
+        fn enum_constants_and_macros_are_file_visible() {
+            let text = "#define WIDTH 10\nenum { RED };\nint a = WIDTH;\nint b = RED;\n";
+            let m = model_for("c", text);
+            assert_resolves(&m, text, "WIDTH", 1, 0);
+            assert_resolves(&m, text, "RED", 1, 0);
         }
     }
 
