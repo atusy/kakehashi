@@ -20,7 +20,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::{Kakehashi, uri_to_url};
-use crate::analysis::bindings::collect::collect;
+use crate::analysis::bindings::collect::collect_cancellable;
 use crate::analysis::bindings::model::BindingsModel;
 use crate::text::PositionMapper;
 
@@ -124,13 +124,37 @@ impl Kakehashi {
 
         // The query walk and model build are CPU work proportional to the
         // layer, not the request: keep them off the async worker like every
-        // other tree-CPU site. A failed task degrades to silence.
-        let model = match tokio::task::spawn_blocking(move || {
-            BindingsModel::build(collect(&layer_text, layer_tree.root_node(), &query))
+        // other tree-CPU site. Dropping a spawn_blocking JoinHandle does NOT
+        // stop the task, so when the cross-layer race drops this future (a
+        // higher-priority bridge answer won) the guard flips the cooperative
+        // flag and the collection walk exits at its next match instead of
+        // burning a blocking thread on an answer nobody can use. A failed or
+        // cancelled task degrades to silence.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct CancelOnDrop {
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            armed: bool,
+        }
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let mut guard = CancelOnDrop {
+            flag: std::sync::Arc::clone(&cancel),
+            armed: true,
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            collect_cancellable(&layer_text, layer_tree.root_node(), &query, &cancel)
+                .map(BindingsModel::build)
         })
-        .await
-        {
-            Ok(model) => model,
+        .await;
+        guard.armed = false;
+        let model = match task {
+            Ok(Some(model)) => model,
+            Ok(None) => return Ok(None),
             Err(join_error) => {
                 log::warn!(
                     target: "kakehashi::bindings",

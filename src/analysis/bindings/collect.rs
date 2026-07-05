@@ -250,7 +250,29 @@ fn parse_namespaces(value: Option<&str>) -> Vec<String> {
 /// vocabulary. General predicates gate whole matches; a match with a failing
 /// predicate contributes nothing. Property values outside the spec drop the
 /// carrying capture (silence over a wrong answer), never default.
+/// The production path always carries the race's cancellation flag through
+/// [`collect_cancellable`], so the flagless form stays test-only.
+#[cfg(test)]
 pub(crate) fn collect(text: &str, root: Node, query: &Query) -> Collection {
+    collect_cancellable(
+        text,
+        root,
+        query,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("an unset flag never cancels")
+}
+
+/// [`collect`] with a cooperative cancellation flag, checked once per query
+/// match: a dropped requester (e.g. the cross-layer race returning early)
+/// stops the walk instead of burning a blocking thread to completion.
+/// `None` means cancelled — never a partial collection.
+pub(crate) fn collect_cancellable(
+    text: &str,
+    root: Node,
+    query: &Query,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Collection> {
     let mut collection = Collection {
         root_range: root.byte_range(),
         ..Collection::default()
@@ -262,6 +284,9 @@ pub(crate) fn collect(text: &str, root: Node, query: &Query) -> Collection {
     let mut matches = cursor.matches(query, root, text.as_bytes());
 
     while let Some(m) = matches.next() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
         if m.captures.is_empty() {
             continue;
         }
@@ -428,7 +453,7 @@ pub(crate) fn collect(text: &str, root: Node, query: &Query) -> Collection {
         .references
         .retain(|r| !definition_nodes.contains(&(r.byte_range.start, r.byte_range.end)));
 
-    collection
+    Some(collection)
 }
 
 #[cfg(test)]
@@ -452,6 +477,18 @@ mod tests {
         let tree = parse_rust(text);
         let query = rust_query(query);
         collect(text, tree.root_node(), &query)
+    }
+
+    #[test]
+    fn cancelled_collection_returns_none_not_a_partial_result() {
+        let text = "fn main() { let x = 1; x; }";
+        let tree = parse_rust(text);
+        let query = rust_query("(identifier) @reference");
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(
+            collect_cancellable(text, tree.root_node(), &query, &cancelled).is_none(),
+            "cancellation must yield None, never a partial collection"
+        );
     }
 
     #[test]
