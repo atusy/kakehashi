@@ -206,11 +206,13 @@ impl BindingsModel {
             Rebind::Fresh => None,
             Rebind::Merge => self.select_in_scope(target_scope, &key, p),
             Rebind::OuterOrLocal => {
-                // An enclosing binding visible at the definition's start
-                // byte, located by the resolution walk over scopes outside
-                // the registering one; else merge locally.
+                // A binding visible at the definition's start byte, located
+                // by the resolution walk from the registering scope. The
+                // registering scope IS the definition's innermost scope, so
+                // its own bindings count even under `visible-to-nested
+                // false` (that flag only hides a scope from nested scopes).
                 let namespaces = [def.namespace.clone()];
-                self.walk(target_scope, false, &def.name, &namespaces, p)
+                self.walk(target_scope, true, &def.name, &namespaces, p)
                     .or_else(|| self.select_in_scope(target_scope, &key, p))
             }
         };

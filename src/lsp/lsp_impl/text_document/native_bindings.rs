@@ -96,8 +96,10 @@ impl Kakehashi {
             return Ok(None);
         };
 
+        // Strict conversion: a client-supplied `character` past its line
+        // end must silence, not spill onto a later line's identifier.
         let mapper = PositionMapper::new(&text);
-        let Some(byte) = mapper.position_to_byte(position) else {
+        let Some(byte) = mapper.position_to_byte_strict(position) else {
             return Ok(None);
         };
 
