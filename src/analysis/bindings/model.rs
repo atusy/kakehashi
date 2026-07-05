@@ -276,14 +276,18 @@ impl BindingsModel {
         namespaces: &[String],
         p: usize,
     ) -> Option<BindingId> {
-        let mut active: Vec<&String> = namespaces.iter().collect();
+        // Lookup keys are allocated once up front — the name/namespaces do
+        // not change during the walk, only the active subset shrinks.
+        let mut active: Vec<NameKey> = namespaces
+            .iter()
+            .map(|ns| (name.to_string(), ns.clone()))
+            .collect();
         let mut current = Some(start);
         let mut innermost = start_is_innermost;
         while let Some(scope) = current {
             if innermost || self.scopes[scope].visible_to_nested {
-                for &ns in &active {
-                    let key = (name.to_string(), ns.clone());
-                    if let Some(id) = self.select_in_scope(scope, &key, p) {
+                for key in &active {
+                    if let Some(id) = self.select_in_scope(scope, key, p) {
                         return Some(id);
                     }
                 }
@@ -292,7 +296,7 @@ impl BindingsModel {
                 Inherits::All => {}
                 Inherits::None => return None,
                 Inherits::Namespaces(kept) => {
-                    active.retain(|ns| kept.contains(ns));
+                    active.retain(|(_, ns)| kept.contains(ns));
                     if active.is_empty() {
                         return None;
                     }
