@@ -174,8 +174,12 @@ pub(in crate::lsp::lsp_impl) struct CachedCapturesWalk {
     pub(in crate::lsp::lsp_impl) parsed_version: u64,
     pub(in crate::lsp::lsp_impl) incarnation: u64,
     pub(in crate::lsp::lsp_impl) generation: u64,
-    pub(in crate::lsp::lsp_impl) matches: Vec<Value>,
-    pub(in crate::lsp::lsp_impl) skipped: Vec<Value>,
+    /// `Arc`'d: a memo hit and the lineage store share the array by refcount.
+    /// A deep clone of a large document's matches (19.6k `Value`s on the
+    /// profiling corpus) taxed every repeat request twice — once out of this
+    /// memo, once into the lineage slot.
+    pub(in crate::lsp::lsp_impl) matches: std::sync::Arc<Vec<Value>>,
+    pub(in crate::lsp::lsp_impl) skipped: std::sync::Arc<Vec<Value>>,
 }
 
 /// A kind query compiled for one language, with the patterns tolerant
@@ -321,8 +325,8 @@ struct ComputedCaptures {
     /// *trailed* at entry still serves and stores — that is the deliberate
     /// serve-stale relaxation, healed by the client's per-keystroke re-request.
     entry_content_version: u64,
-    matches: Vec<Value>,
-    skipped: Vec<Value>,
+    matches: std::sync::Arc<Vec<Value>>,
+    skipped: std::sync::Arc<Vec<Value>>,
 }
 
 impl Kakehashi {
@@ -345,8 +349,8 @@ impl Kakehashi {
         // below — exactly one materialization of the matches per request.
         let response = json!({
             "resultId": result_id,
-            "matches": c.matches,
-            "skipped": c.skipped,
+            "matches": &*c.matches,
+            "skipped": &*c.skipped,
         });
         // A full that cannot install lineage (the text moved past the computed
         // snapshot, or a close/reopen raced) answers `null` instead: handing
@@ -510,7 +514,7 @@ impl Kakehashi {
                 let (_, prev_matches) = entry.value()[slot_index]
                     .as_ref()
                     .expect("slot verified Some by the guard above");
-                let edits = match matches_delta_edit(prev_matches, &c.matches) {
+                let edits = match matches_delta_edit(prev_matches, &c.matches[..]) {
                     None => json!([]),
                     Some((start, delete_count, data)) => json!([{
                         "start": start,
@@ -525,8 +529,8 @@ impl Kakehashi {
             // answer a delta with a full).
             _ => json!({
                 "resultId": result_id,
-                "matches": c.matches,
-                "skipped": c.skipped,
+                "matches": &*c.matches,
+                "skipped": &*c.skipped,
             }),
         };
         // Same gate as `full`: a delta whose fresh lineage cannot install
@@ -554,7 +558,7 @@ impl Kakehashi {
             )
             .await?;
         Ok(match computed {
-            Some(c) => json!({ "matches": c.matches, "skipped": c.skipped }),
+            Some(c) => json!({ "matches": &*c.matches, "skipped": &*c.skipped }),
             None => Value::Null,
         })
     }
@@ -800,6 +804,10 @@ impl Kakehashi {
             return Err(JsonRpcError::request_cancelled());
         }
         Ok(walked.map(|(matches, skipped)| {
+            // Arc once; the memo and the returned ComputedCaptures share the
+            // arrays by refcount instead of deep-cloning ~20k `Value`s.
+            let matches = std::sync::Arc::new(matches);
+            let skipped = std::sync::Arc::new(skipped);
             if let Some(key) = walk_key {
                 self.captures_walk_cache.insert(
                     key,
@@ -807,8 +815,8 @@ impl Kakehashi {
                         parsed_version: snapshot.parsed_version,
                         incarnation,
                         generation,
-                        matches: matches.clone(),
-                        skipped: skipped.clone(),
+                        matches: std::sync::Arc::clone(&matches),
+                        skipped: std::sync::Arc::clone(&skipped),
                     },
                 );
             }

@@ -225,7 +225,10 @@ pub struct Kakehashi {
     /// `resultId` falls back to a full response only when a single mode slot
     /// is live (unambiguous), otherwise `null`.
     #[allow(clippy::type_complexity)]
-    captures_cache: dashmap::DashMap<(Url, String), [Option<(String, Vec<serde_json::Value>)>; 2]>,
+    captures_cache: dashmap::DashMap<
+        (Url, String),
+        [Option<(String, std::sync::Arc<Vec<serde_json::Value>>)>; 2],
+    >,
     /// Memoized captures walk results per `(uri, kind, injection-mode)`,
     /// tagged with the exact inputs they were computed from — snapshot
     /// `(parsed_version, incarnation)` and the settings generation. A typing
