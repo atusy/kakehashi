@@ -5,8 +5,8 @@
 //! semantic-token refresh) work safely before `initialize()` — pre-init,
 //! capabilities are absent and the call is skipped instead of panicking.
 
+use crate::error::LockResultExt;
 use std::sync::OnceLock;
-use std::sync::atomic::Ordering;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::notification::Progress;
 use tower_lsp_server::ls_types::{ClientCapabilities, MessageType};
@@ -51,15 +51,24 @@ pub(crate) fn check_diagnostic_refresh_support(caps: &ClientCapabilities) -> boo
 /// unnecessary (a stuck `in_flight` on a never-responding client is the same
 /// accepted trade-off as the pending-map leak documented at the send site,
 /// and the per-keystroke client re-request heals the visible highlight).
-struct RefreshFlight {
-    in_flight: std::sync::atomic::AtomicBool,
-    pending: std::sync::atomic::AtomicBool,
+///
+/// A Mutex over both flags (the #526 diagnostic-refresh pattern), NOT a pair
+/// of atomics: every attempted lock-free version of the release/trailing
+/// handshake had an interleaving that dropped one trailing refresh (a
+/// publisher storing `pending` after the flight's final re-check, or one
+/// flight swallowing a `pending` aimed at another). The critical sections
+/// are two bool ops; the lock is effectively uncontended.
+#[derive(Default)]
+struct RefreshFlightState {
+    in_flight: bool,
+    pending: bool,
 }
 
-static REFRESH_FLIGHT: RefreshFlight = RefreshFlight {
-    in_flight: std::sync::atomic::AtomicBool::new(false),
-    pending: std::sync::atomic::AtomicBool::new(false),
-};
+static REFRESH_FLIGHT: std::sync::Mutex<RefreshFlightState> =
+    std::sync::Mutex::new(RefreshFlightState {
+        in_flight: false,
+        pending: false,
+    });
 
 /// Whether a batch of language events asks for a `workspace/semanticTokens/refresh`.
 ///
@@ -188,36 +197,43 @@ impl<'a> ClientNotifier<'a> {
                 // refresh plus at most one trailing covers any number of
                 // publishes: a publish landing mid-flight sets `pending`, and
                 // the flight loops once more after the answer.
-                if !REFRESH_FLIGHT.in_flight.swap(true, Ordering::AcqRel) {
+                let spawn_flight = {
+                    let mut state = REFRESH_FLIGHT
+                        .lock()
+                        .recover_poison("ClientNotifier::refresh_flight(begin)");
+                    if state.in_flight {
+                        // Coalesce: the in-flight request answers for this
+                        // publish too; at most one trailing refresh follows.
+                        state.pending = true;
+                        false
+                    } else {
+                        state.in_flight = true;
+                        true
+                    }
+                };
+                if spawn_flight {
                     let client = self.client.clone();
                     tokio::spawn(async move {
                         loop {
                             if let Err(err) = client.semantic_tokens_refresh().await {
                                 log::debug!("semantic_tokens_refresh failed: {}", err);
                             }
-                            // Claim the trailing slot; loop while publishes
-                            // kept arriving during the request.
-                            if REFRESH_FLIGHT.pending.swap(false, Ordering::AcqRel) {
+                            // One atomic decision under the lock: either claim
+                            // the trailing slot and loop, or release the
+                            // flight — no interleaving can strand a `pending`
+                            // set by a publisher that saw `in_flight == true`.
+                            let mut state = REFRESH_FLIGHT
+                                .lock()
+                                .recover_poison("ClientNotifier::refresh_flight(release)");
+                            if state.pending {
+                                state.pending = false;
                                 continue;
                             }
-                            REFRESH_FLIGHT.in_flight.store(false, Ordering::Release);
-                            // Narrow re-check: a publish that set `pending`
-                            // between the swap above and the store may have
-                            // found `in_flight` still true and NOT spawned its
-                            // own flight — reclaim it here. A publish that
-                            // instead won the new `swap(true)` runs its own
-                            // flight and this one stops.
-                            if REFRESH_FLIGHT.pending.swap(false, Ordering::AcqRel) {
-                                if REFRESH_FLIGHT.in_flight.swap(true, Ordering::AcqRel) {
-                                    break;
-                                }
-                                continue;
-                            }
+                            state.in_flight = false;
                             break;
                         }
                     });
                 } else {
-                    REFRESH_FLIGHT.pending.store(true, Ordering::Release);
                     log::debug!("semantic_tokens_refresh coalesced into the in-flight request");
                 }
             } else {

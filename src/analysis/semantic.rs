@@ -176,7 +176,14 @@ pub(crate) async fn handle_semantic_tokens_full(
             t_start.elapsed().saturating_sub(host_elapsed).as_millis(),
             injection_cache
                 .as_ref()
-                .and_then(|p| p.discovery.as_ref())
+                // The same generation gate the reuse path applies: a
+                // present-but-reload-stale discovery is NOT reused, and
+                // reporting its count would mislead profiling.
+                .and_then(|p| {
+                    p.discovery
+                        .as_ref()
+                        .filter(|d| d.generation == p.generation)
+                })
                 .map(|d| d.regions.len().to_string())
                 .unwrap_or_else(|| "none".to_string()),
         );

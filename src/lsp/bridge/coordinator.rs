@@ -151,8 +151,8 @@ struct ConfigMemo {
     /// rather than a `(String, String)` key so the per-region hit path looks
     /// up with a borrowed `&str` and scans a handful of pairs — zero
     /// allocations per hit (a tuple key cannot be borrowed field-wise).
-    /// Concurrent same-pair computes may push a duplicate; the linear scan
-    /// returns the first, both hold identical data.
+    /// Inserts re-check under the entry lock, so racing same-pair computes
+    /// cannot append duplicates.
     virt: DashMap<String, Vec<VirtMemoEntry>>,
     /// `host_language` → `_self` host-bridge configs.
     host: DashMap<String, Arc<Vec<ResolvedServerConfig>>>,
@@ -418,10 +418,13 @@ impl BridgeCoordinator {
                         pairs.push(entry);
                     }
                 } else {
-                    memo.virt
-                        .entry(host_language.to_string())
-                        .or_default()
-                        .push(entry);
+                    let mut pairs = memo.virt.entry(host_language.to_string()).or_default();
+                    // Re-check under the entry lock: two racing misses for
+                    // the same host both fall into this branch; the loser
+                    // must not append a duplicate pair.
+                    if !pairs.iter().any(|(lang, _)| lang == injection_language) {
+                        pairs.push(entry);
+                    }
                 }
                 configs
             }

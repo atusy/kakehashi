@@ -115,12 +115,17 @@ impl LanguageCoordinator {
         self.clear_derived_languages();
         // A reload (new search paths, or the post-install reload) is the only
         // event that can turn a failed load into a success — retry everything.
-        // Clear BEFORE bumping the generation: an in-flight attempt that
-        // captured the pre-bump generation then fails its insert gate, so it
-        // cannot re-poison the cache it just watched being cleared.
-        self.failed_loads.clear();
+        // Bump the generation BEFORE clearing: an in-flight attempt that
+        // captured the pre-bump generation fails its insert gate from this
+        // instant, so it cannot re-poison the cache after the clear (with
+        // clear-first, an attempt reading the generation in the clear→bump
+        // window would still pass the gate). An attempt that starts in the
+        // bump→clear window scans with the NEW paths (installed above) and
+        // may have its valid failure wiped by the clear — one wasted rescan,
+        // never a wrong suppression.
         self.load_generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.failed_loads.clear();
 
         // Build base map from language configs
         self.build_base_map(&settings.languages);
