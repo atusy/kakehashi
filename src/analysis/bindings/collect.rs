@@ -358,6 +358,14 @@ pub(crate) fn collect(text: &str, root: Node, query: &Query) -> Collection {
                         );
                         continue;
                     };
+                    // Only label-targeted definitions consult the match's
+                    // labeled scopes; everything else takes an empty
+                    // (allocation-free) map instead of a per-capture clone.
+                    let labeled_scopes = if matches!(scope_target, ScopeTarget::Label(_)) {
+                        labeled_scopes.clone()
+                    } else {
+                        HashMap::new()
+                    };
                     collection.definitions.push(DefinitionCapture {
                         byte_range,
                         name,
@@ -369,7 +377,7 @@ pub(crate) fn collect(text: &str, root: Node, query: &Query) -> Collection {
                         visibility,
                         rebind,
                         match_end,
-                        labeled_scopes: labeled_scopes.clone(),
+                        labeled_scopes,
                     });
                 }
                 "reference" => {
