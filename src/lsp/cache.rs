@@ -11,7 +11,6 @@
 //! `bump_semantic_token_generation`) so post-reload requests recompute; `didChange`
 //! never invalidates.
 
-
 use tower_lsp_server::ls_types::SemanticTokens;
 use tree_sitter::Tree;
 use url::Url;
@@ -818,12 +817,9 @@ print("hello")
         // identifier, deterministically).
         let initial_validity =
             crate::analysis::semantic_cache::region_validity_hash(initial_content_hash, "lua");
-        cache.injection_token_cache.store(
-            &uri,
-            initial_validity,
-            0,
-            injection_raw_tokens(),
-        );
+        cache
+            .injection_token_cache
+            .store(&uri, initial_validity, 0, injection_raw_tokens());
 
         // Verify tokens are stored
         assert!(
@@ -950,12 +946,9 @@ print("hello")
         // Store region-local tokens under the region's LIVE validity hash.
         let initial_validity =
             crate::analysis::semantic_cache::region_validity_hash(initial_content_hash, "lua");
-        cache.injection_token_cache.store(
-            &uri,
-            initial_validity,
-            0,
-            injection_raw_tokens(),
-        );
+        cache
+            .injection_token_cache
+            .store(&uri, initial_validity, 0, injection_raw_tokens());
 
         assert!(
             cache

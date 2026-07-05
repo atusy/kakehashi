@@ -760,8 +760,10 @@ fn discover_single_region(
         // Content-addressed cache key: content hash folded with the resolved
         // language (one shared definition — populate's eviction sweep must
         // compute the same fold).
-        let validity_hash =
-            crate::analysis::semantic_cache::region_validity_hash(cacheable.content_hash, &resolved_lang);
+        let validity_hash = crate::analysis::semantic_cache::region_validity_hash(
+            cacheable.content_hash,
+            &resolved_lang,
+        );
         Some(DiscoveredRegionCache {
             validity_hash,
             line_start: cacheable.line_range.start,
