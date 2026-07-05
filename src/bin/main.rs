@@ -1007,5 +1007,16 @@ async fn run_lsp_server() {
     // observe every edit that preceded them on the wire (#342).
     let service = IngressOrderGate::new(service);
 
-    Server::new(stdin, stdout, socket).serve(service).await;
+    // Lift tower-lsp's default 4-message `buffer_unordered` cap: editors fire
+    // bursts of concurrent requests per keystroke (Neovim: semanticTokens +
+    // captures lineages + diagnostics + …), and handlers park awaiting the
+    // per-URI parse snapshot. With only 4 slots, parked readers exhaust the
+    // buffer and the very didChange/$/cancelRequest notifications that would
+    // release them queue behind — a priority inversion observed as multi-second
+    // handler-start delays. Ordering is IngressOrderGate's job and CPU is the
+    // bounded ComputePool's; admission just needs to never be the bottleneck.
+    Server::new(stdin, stdout, socket)
+        .concurrency_level(64)
+        .serve(service)
+        .await;
 }
