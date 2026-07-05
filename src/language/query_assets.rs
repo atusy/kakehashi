@@ -41,6 +41,7 @@ mod tests {
             // grammar (the terraform asset inherits hcl).
             "hcl" | "terraform" => tree_sitter_hcl::LANGUAGE.into(),
             "haskell" => tree_sitter_haskell::LANGUAGE.into(),
+            "yaml" => tree_sitter_yaml::LANGUAGE.into(),
             other => panic!("no grammar for {other}"),
         }
     }
@@ -97,6 +98,7 @@ mod tests {
             "ruby",
             "rust",
             "terraform",
+            "yaml",
         ] {
             let source = resolved_source(lang);
             tree_sitter::Query::new(&language_of(lang), &source)
@@ -1119,6 +1121,35 @@ mod tests {
                 None,
                 "a case binder must not escape its alternative"
             );
+        }
+    }
+
+    mod yaml_fixtures {
+        use super::*;
+
+        #[test]
+        fn aliases_resolve_to_their_anchor() {
+            let text =
+                "defaults: &base\n  size: 1\nprod:\n  <<: *base\nlist:\n  - &item one\n  - *item\n";
+            let m = model_for("yaml", text);
+            assert_resolves(&m, text, "base", 1, 0);
+            assert_resolves(&m, text, "item", 1, 0);
+        }
+
+        #[test]
+        fn an_alias_above_the_anchor_stays_silent() {
+            // YAML forbids forward aliases; mirror the spec with silence.
+            let text = "prod: *base\ndefaults: &base 1\n";
+            let m = model_for("yaml", text);
+            assert_eq!(m.definition_range_at(nth(text, "base", 0)), None);
+        }
+
+        #[test]
+        fn a_redefined_anchor_shadows_for_later_aliases() {
+            let text = "a: &tag 1\nb: *tag\nc: &tag 2\nd: *tag\n";
+            let m = model_for("yaml", text);
+            assert_resolves(&m, text, "tag", 1, 0);
+            assert_resolves(&m, text, "tag", 3, 2);
         }
     }
 
