@@ -341,14 +341,32 @@ impl NodeTracker {
         Some((key.start_byte, key.end_byte, key.kind, key.layer))
     }
 
-    /// Get the ULID for a position if it exists, without creating it.
+    /// Get the ULID for a position in a layer if it exists, without creating
+    /// it — the read-only half of `get_or_create_in_layer`.
+    ///
+    /// Serve-stale captures use it so a trailing snapshot can reuse the ids
+    /// of positions the intervening edits did not shift (keeping the delta
+    /// lineage minimal) without ever writing its stale coordinates into this
+    /// live-coordinate index.
+    pub(crate) fn lookup_in_layer(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        layer: usize,
+    ) -> Option<Ulid> {
+        let key = PositionKey::new(start, end, kind, layer);
+        self.entries.get(uri)?.forward.get(&key).copied()
+    }
+
+    /// Get the ULID for a host-layer position if it exists, without creating it.
     ///
     /// Returns None if no entry exists for this position.
     /// Used in tests to verify position adjustment without side effects.
     #[cfg(test)]
     fn get(&self, uri: &Url, start: usize, end: usize, kind: &'static str) -> Option<Ulid> {
-        let key = PositionKey::new(start, end, kind, 0);
-        self.entries.get(uri)?.forward.get(&key).copied()
+        self.lookup_in_layer(uri, start, end, kind, 0)
     }
 
     /// Reconstruct character-level edits between `old_text` and `new_text` and

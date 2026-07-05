@@ -532,15 +532,20 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::captures", "no parsed document for {uri}");
             return Ok(None);
         };
-        // The live input version at request entry: `range` staleness-rejects
+        // The live input state at request entry: `range` staleness-rejects
         // against it, and the lineage store re-checks it (see ComputedCaptures).
-        let Some(entry_content_version) = self
-            .documents
-            .latest_snapshot(&uri)
-            .map(|view| view.content_version)
-        else {
+        let Some(view) = self.documents.latest_snapshot(&uri) else {
             return Ok(None);
         };
+        let entry_content_version = view.content_version;
+        // A close+reopen between the snapshot resolve above and this read
+        // leaves `snapshot` on a dead lifetime; per-lifetime versions restart
+        // at 0, so the version equality below could pass by coincidence. A
+        // cross-incarnation snapshot can never answer (or mint) anything —
+        // `null` re-syncs the client against the new lifetime.
+        if snapshot.incarnation != view.slot.current_incarnation {
+            return Ok(None);
+        }
         // `range` is the position/range class: its byte range is authored
         // against the LIVE text, so a trailing snapshot cannot answer it.
         // `null` — the captures protocol's re-sync signal — not ContentModified
@@ -573,6 +578,8 @@ impl Kakehashi {
         let kind = kind.to_string();
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        let documents = std::sync::Arc::clone(&self.documents);
+        let parsed_version = snapshot.parsed_version;
         let walked = self
             .compute_pool
             .run(None, move || {
@@ -586,6 +593,9 @@ impl Kakehashi {
                     &tree,
                     &language,
                     &tracker,
+                    &documents,
+                    parsed_version,
+                    incarnation,
                 )
             })
             .await;
@@ -619,7 +629,27 @@ fn execute_captures_walk(
     tree: &tree_sitter::Tree,
     language: &crate::language::LanguageCoordinator,
     tracker: &crate::language::NodeTracker,
+    documents: &crate::document::DocumentStore,
+    parsed_version: u64,
+    incarnation: u64,
 ) -> Option<(Vec<Value>, Vec<Value>)> {
+    // Tracker minting is currency-gated: the NodeTracker is a LIVE-coordinate
+    // index (didChange shifts every entry before the reparse), so a trailing
+    // snapshot's byte offsets must never be written into it — they would be
+    // wrong-space entries that later edits keep shifting as if they were live
+    // (the "a stale read never mints" invariant, see snapshot_read.rs). A
+    // stale serve still returns matches — serve-stale is the point of the
+    // per-keystroke `full` mode — but goes READ-ONLY on the tracker: a
+    // position the intervening edits did not shift reuses its live id (so
+    // the delta lineage stays a minimal diff), and an unknown position gets
+    // an unregistered id — resolving one via `kakehashi/node/*` yields
+    // `null`, the protocol's re-sync signal, and the client's next
+    // current-snapshot request mints real ones. Checked here inside the
+    // work-unit so the race window is the walk itself, not the pool-queue
+    // wait.
+    let mint_into_tracker = documents.latest_snapshot(uri).is_some_and(|view| {
+        view.slot.current_incarnation == incarnation && view.content_version == parsed_version
+    });
     let mapper = PositionMapper::new(text);
 
     // Range scoping: clamped conversion (like other viewport-shaped
@@ -666,14 +696,20 @@ fn execute_captures_walk(
                     // Minted in the layer's depth, so the id resolves in
                     // its minting layer via kakehashi/node/* (per-layer
                     // Scope rule). Same mint as `mint_node_info`, done via
-                    // the tracker handle since this runs off `self`.
-                    let ulid = tracker.get_or_create_in_layer(
-                        uri,
-                        c.start_byte,
-                        c.end_byte,
-                        c.kind,
-                        depth,
-                    );
+                    // the tracker handle since this runs off `self`. On a
+                    // stale serve the tracker is read-only (see the
+                    // currency gate above).
+                    let ulid = if mint_into_tracker {
+                        tracker.get_or_create_in_layer(uri, c.start_byte, c.end_byte, c.kind, depth)
+                    } else {
+                        match tracker.lookup_in_layer(uri, c.start_byte, c.end_byte, c.kind, depth)
+                        {
+                            Some(live) => live,
+                            // NOT Ulid::default() (the nil id): unregistered
+                            // ids must still be unique per capture.
+                            None => ulid::Ulid::new(),
+                        }
+                    };
                     let node = json!({ "id": ulid.to_string(), "kind": c.kind });
                     let mut capture = json!({
                         "name": c.name,
@@ -773,6 +809,139 @@ mod tests {
 
     fn vals(ns: &[i64]) -> Vec<Value> {
         ns.iter().map(|n| json!(n)).collect()
+    }
+
+    fn first_node_id(matches: &[Value]) -> ulid::Ulid {
+        matches[0]["captures"][0]["node"]["id"]
+            .as_str()
+            .expect("capture carries a node id")
+            .parse()
+            .expect("node id is a ULID")
+    }
+
+    /// The NodeTracker is a live-coordinate index; a walk over a snapshot
+    /// that trails the live document must still serve matches (serve-stale)
+    /// but must NOT register its ids in the tracker — a stale read never
+    /// mints (see the currency gate in `execute_captures_walk`).
+    #[test]
+    fn stale_serve_returns_matches_but_never_mints_into_the_tracker() {
+        use crate::config::WorkspaceSettings;
+        use crate::document::DocumentStore;
+        use crate::language::{LanguageCoordinator, NodeTracker};
+        use std::sync::Arc;
+
+        // Statically-linked grammar + a temp query root: no dylib fixtures.
+        let dir = tempfile::tempdir().unwrap();
+        let query_dir = dir.path().join("queries/rust");
+        std::fs::create_dir_all(&query_dir).unwrap();
+        std::fs::write(
+            query_dir.join("locals.scm"),
+            "(identifier) @local.reference\n",
+        )
+        .unwrap();
+
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let settings = WorkspaceSettings {
+            search_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        coordinator.load_settings(&settings);
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+
+        let text = "fn main() { let x = 1; }\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///stale_mint.rs").unwrap();
+        store.insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+        let incarnation = store
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .current_incarnation;
+
+        // Current (parsed_version == content_version == 0): minting is live.
+        let tracker = NodeTracker::new();
+        let (matches, _) = execute_captures_walk(
+            &uri,
+            "locals",
+            None,
+            false,
+            "rust",
+            text,
+            &tree,
+            &coordinator,
+            &tracker,
+            &store,
+            0,
+            incarnation,
+        )
+        .expect("kind query should load");
+        assert!(!matches.is_empty(), "identifiers should match");
+        let id = first_node_id(&matches);
+        assert!(
+            tracker.lookup_node(&uri, &id).is_some(),
+            "a current serve mints resolvable ids"
+        );
+
+        // Trailing (an edit bumped content_version past parsed_version):
+        // matches still serve, and positions the tracker already knows reuse
+        // their live id read-only (delta lineage stays a minimal diff).
+        store.update_document(uri.clone(), text.to_string(), None);
+        let (stale_matches, _) = execute_captures_walk(
+            &uri,
+            "locals",
+            None,
+            false,
+            "rust",
+            text,
+            &tree,
+            &coordinator,
+            &tracker,
+            &store,
+            0,
+            incarnation,
+        )
+        .expect("kind query should load");
+        assert!(
+            !stale_matches.is_empty(),
+            "serve-stale still returns matches"
+        );
+        assert_eq!(
+            first_node_id(&stale_matches),
+            id,
+            "a stale serve reuses the live id for an unshifted position"
+        );
+
+        // A stale serve against a tracker with no entry for the position must
+        // not create one — the id it hands out stays unregistered.
+        let stale_tracker = NodeTracker::new();
+        let (stale_matches, _) = execute_captures_walk(
+            &uri,
+            "locals",
+            None,
+            false,
+            "rust",
+            text,
+            &tree,
+            &coordinator,
+            &stale_tracker,
+            &store,
+            0,
+            incarnation,
+        )
+        .expect("kind query should load");
+        let id = first_node_id(&stale_matches);
+        assert!(
+            stale_tracker.lookup_node(&uri, &id).is_none(),
+            "a stale serve must not mint into the live tracker"
+        );
     }
 
     #[test]
