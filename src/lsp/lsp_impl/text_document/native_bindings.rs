@@ -49,10 +49,12 @@ impl NativeBindingsContext<'_> {
 }
 
 /// The bindings inputs of the layer under the cursor: the layer's query, its
-/// text, its tree, and its byte offset into the host text.
+/// text (`Arc<str>` so the host layer shares the document text instead of
+/// copying it into the blocking task), its tree, and its byte offset into
+/// the host text.
 type LayerInputs = (
     std::sync::Arc<tree_sitter::Query>,
-    String,
+    std::sync::Arc<str>,
     tree_sitter::Tree,
     usize,
 );
@@ -114,7 +116,7 @@ impl Kakehashi {
                 let Some(query) = self.language.bindings_query(&language) else {
                     return Ok(None);
                 };
-                (query, text.to_string(), tree.clone(), 0)
+                (query, std::sync::Arc::clone(&text), tree.clone(), 0)
             }
         };
 
@@ -232,9 +234,12 @@ impl Kakehashi {
             .await;
 
         match parsed {
-            Some((layer_tree, content_text)) => {
-                Some(Some((query, content_text, layer_tree, content_range.start)))
-            }
+            Some((layer_tree, content_text)) => Some(Some((
+                query,
+                std::sync::Arc::from(content_text),
+                layer_tree,
+                content_range.start,
+            ))),
             None => Some(None),
         }
     }
