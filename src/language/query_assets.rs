@@ -42,6 +42,7 @@ mod tests {
             "hcl" | "terraform" => tree_sitter_hcl::LANGUAGE.into(),
             "haskell" => tree_sitter_haskell::LANGUAGE.into(),
             "yaml" => tree_sitter_yaml::LANGUAGE.into(),
+            "css" => tree_sitter_css::LANGUAGE.into(),
             other => panic!("no grammar for {other}"),
         }
     }
@@ -85,6 +86,7 @@ mod tests {
             "c",
             "c_sharp",
             "cpp",
+            "css",
             "dockerfile",
             "go",
             "haskell",
@@ -1121,6 +1123,33 @@ mod tests {
                 None,
                 "a case binder must not escape its alternative"
             );
+        }
+    }
+
+    mod css_fixtures {
+        use super::*;
+
+        #[test]
+        fn custom_properties_resolve_through_var() {
+            let text = ":root { --main-color: red; }\n.btn { color: var(--main-color); }\n";
+            let m = model_for("css", text);
+            assert_resolves(&m, text, "--main-color", 1, 0);
+        }
+
+        #[test]
+        fn keyframes_names_resolve_from_animation_declarations() {
+            let text = "@keyframes spin { from { opacity: 0; } }\n.s { animation: spin 1s; }\n.t { animation-name: spin; }\n";
+            let m = model_for("css", text);
+            assert_resolves(&m, text, "spin", 1, 0);
+            assert_resolves(&m, text, "spin", 2, 0);
+        }
+
+        #[test]
+        fn ordinary_properties_and_values_stay_silent() {
+            let text = ".a { color: red; }\n.b { color: red; }\n";
+            let m = model_for("css", text);
+            assert_eq!(m.definition_range_at(nth(text, "color", 1)), None);
+            assert_eq!(m.definition_range_at(nth(text, "red", 1)), None);
         }
     }
 
