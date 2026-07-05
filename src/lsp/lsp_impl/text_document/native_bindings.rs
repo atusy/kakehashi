@@ -548,6 +548,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_regions_resolve_in_the_innermost_layer() {
+        // An outer include-children region spans the whole document and the
+        // lua fence nests inside it: the cursor must resolve in the
+        // innermost layer, not the first region in document order.
+        let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
+        let (service, uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+        let nested_query = Query::new(
+            &tree_sitter_md::LANGUAGE.into(),
+            r#"
+            ((document) @injection.content
+             (#set! injection.language "markdown")
+             (#set! injection.include-children))
+            (fenced_code_block
+              (info_string (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(nested_query));
+
+        let links = server
+            .native_bindings_answer(&uri, Position::new(4, 6), |ctx| {
+                native_definition(ctx, &uri)
+            })
+            .await
+            .unwrap()
+            .expect("the innermost (lua) layer must answer, not the outer region");
+        assert_eq!(links[0].target_range.start, Position::new(3, 6));
+    }
+
+    #[tokio::test]
     async fn native_definition_resolves_inside_an_injected_layer() {
         // line 3: `local v = 1`; line 4: `print(v)`.
         let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
