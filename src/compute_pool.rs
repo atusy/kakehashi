@@ -96,15 +96,11 @@ impl ComputePool {
                 }
             }
         });
-        let finished_rx = rx.await.ok();
-        let resume_lag = enqueued.elapsed();
-        // The oneshot resolves the moment the work-unit sends; a large gap
-        // between "work done" and "handler resumed" cannot be measured from
-        // inside this future, but a total far exceeding queue+work shows up in
-        // the caller's own phase logs; the watchdog (see `run_lsp_server`)
-        // covers the runtime-stall half.
-        let _ = resume_lag;
-        finished_rx
+        // The oneshot resolves the moment the work-unit sends. The other
+        // latency half — "work done" to "handler resumed" — cannot be
+        // measured from inside this future; the runtime-stall watchdog (see
+        // `run_lsp_server`) covers it.
+        rx.await.ok()
     }
 }
 
