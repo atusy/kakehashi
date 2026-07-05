@@ -487,10 +487,11 @@ resolution algorithm; the native layer feeds
 definition/references/documentHighlight/rename/prepareRename through the
 cross-layer walk's `native` slot. `bindings.scm` files load from
 `searchPaths` like any other query asset, with per-file `; inherits:`
-resolution; experimental queries for bash, c, cpp, c_sharp, go, java,
-javascript, julia, lua, php, python, ruby, rust, typescript, and tsx
-live in-repo under `assets/queries/` (not bundled into the binary),
-validated by fixture tests against the real grammars.
+resolution; experimental queries for bash, c, cpp, c_sharp, dockerfile,
+go, haskell, hcl, java, javascript, julia, lua, php, python, ruby,
+rust, terraform, tsx, and typescript live in-repo under
+`assets/queries/` (not bundled into the binary), validated by fixture
+tests against the real grammars.
 
 Injected layers resolve natively too: the region under the cursor is parsed
 with included ranges and results map back through the region's content
