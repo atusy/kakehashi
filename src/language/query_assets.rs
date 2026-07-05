@@ -31,20 +31,31 @@ mod tests {
     }
 
     /// The asset source with `; inherits:` parents concatenated from the
-    /// on-disk assets, mirroring the loader's resolution.
+    /// on-disk assets, mirroring the loader's resolution. Fails fast on an
+    /// inheritance cycle (the runtime loader guards likewise) instead of
+    /// recursing until the test suite hangs.
     fn resolved_source(lang: &str) -> String {
-        let source = asset_source(lang);
-        let mut combined = String::new();
-        if let Some(first_line) = source.lines().next()
-            && let Some(parents) = first_line.strip_prefix("; inherits:")
-        {
-            for parent in parents.split(',') {
-                combined.push_str(&resolved_source(parent.trim()));
-                combined.push('\n');
+        fn resolve(lang: &str, chain: &mut Vec<String>) -> String {
+            assert!(
+                !chain.iter().any(|l| l == lang),
+                "inheritance cycle in assets: {chain:?} -> {lang}"
+            );
+            chain.push(lang.to_string());
+            let source = asset_source(lang);
+            let mut combined = String::new();
+            if let Some(first_line) = source.lines().next()
+                && let Some(parents) = first_line.strip_prefix("; inherits:")
+            {
+                for parent in parents.split(',') {
+                    combined.push_str(&resolve(parent.trim(), chain));
+                    combined.push('\n');
+                }
             }
+            chain.pop();
+            combined.push_str(&source);
+            combined
         }
-        combined.push_str(&source);
-        combined
+        resolve(lang, &mut Vec::new())
     }
 
     /// Every asset must compile in full against the grammar it
