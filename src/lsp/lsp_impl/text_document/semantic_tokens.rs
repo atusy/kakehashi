@@ -879,26 +879,47 @@ mod tests {
         );
     }
 
+    /// The serve-stale model never parses on demand: a request against a
+    /// resolved-but-tree-less snapshot (what `parse_document` publishes when
+    /// no parser is available) releases the first-parse wait immediately,
+    /// serves the empty fallback, and leaves the document's tree untouched.
+    /// (Replaces the pre-snapshot `..._times_out_but_parses_on_demand` test,
+    /// whose asserted on-demand parse was removed by the reader migration.)
     #[tokio::test]
-    async fn semantic_tokens_full_times_out_but_parses_on_demand() {
+    async fn semantic_tokens_full_serves_empty_without_parsing_on_demand() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
-        let uri = Url::parse("file:///semantic_timeout.rs").expect("should construct test uri");
+        let uri = Url::parse("file:///semantic_no_inline_parse.rs").expect("valid test uri");
 
+        let text = "fn main() {}";
         server.documents.insert(
             uri.clone(),
-            "fn main() {}".to_string(),
+            text.to_string(),
             Some("rust".to_string()),
             None,
         );
-
-        let load_result = server.language.ensure_language_loaded("rust");
-        if !load_result.success || server.language.highlight_query("rust").is_none() {
-            eprintln!("Skipping: rust highlight query not available");
-            return;
-        }
-
-        server.documents.mark_parse_started(&uri);
+        let incarnation = server
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document just inserted")
+            .slot
+            .current_incarnation;
+        let published = server
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: None,
+                        language: Some("rust".to_string()),
+                        parsed_version: 0,
+                        incarnation,
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(published, "tree-less snapshot must land");
 
         let params = SemanticTokensParams {
             text_document: TextDocumentIdentifier {
@@ -912,25 +933,24 @@ mod tests {
             Duration::from_secs(2),
             server.semantic_tokens_full_impl(params),
         )
-        .await;
+        .await
+        .expect("a present snapshot must not wait out the first-parse bound")
+        .expect("semantic tokens full should return without error");
 
-        assert!(
-            result.is_ok(),
-            "semantic tokens full should complete after waiting timeout"
-        );
-        let result = result.unwrap();
-        assert!(
-            result.is_ok(),
-            "semantic tokens full should return without error"
-        );
+        match result {
+            Some(SemanticTokensResult::Tokens(tokens)) => {
+                assert!(
+                    tokens.data.is_empty(),
+                    "tree-less snapshot serves the empty fallback"
+                );
+            }
+            other => panic!("expected empty tokens fallback, got {other:?}"),
+        }
 
-        let doc = server
-            .documents
-            .get(&uri)
-            .expect("document should exist after on-demand parse");
+        let doc = server.documents.get(&uri).expect("document still open");
         assert!(
-            doc.tree().is_some(),
-            "on-demand parse should populate a syntax tree"
+            doc.tree().is_none(),
+            "serve-stale never parses inline: the tree must stay absent"
         );
     }
 
