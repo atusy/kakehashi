@@ -38,18 +38,20 @@ pub(crate) struct LanguageCoordinator {
     derived_languages: RwLock<HashSet<String>>,
     config_warnings: RwLock<Vec<String>>,
     /// Negative cache for parser-load attempts: a language whose load failed
-    /// (no library found on the search paths) is recorded here so repeated
-    /// resolution attempts — e.g. per injection region, per compute, for a
-    /// not-installed injected language like `latex` inside `markdown_inline` —
-    /// return immediately instead of re-scanning the filesystem every time.
-    /// Cleared on every `load_settings` (settings reload / post-install
-    /// reload), which is the only event that can make a failed load succeed.
-    failed_loads: dashmap::DashSet<String>,
-    /// Bumped by every `load_settings` AFTER the `failed_loads` clear. A load
-    /// attempt captures it BEFORE scanning and inserts its failure only when
-    /// still current — otherwise an attempt that captured the OLD search
-    /// paths could straddle the reload and re-insert a failure for a parser
-    /// the new paths can load, suppressing it until the next reload.
+    /// (no library found on the search paths) is recorded here — tagged with
+    /// the [`load_generation`](Self::load_generation) the attempt captured
+    /// BEFORE scanning — so repeated resolution attempts (per injection
+    /// region, per compute, for a not-installed injected language like
+    /// `latex` inside `markdown_inline`) return immediately instead of
+    /// re-scanning the filesystem. Validity lives in the READ: an entry only
+    /// suppresses when its generation equals the current one, so an insert
+    /// racing a reload (any check-then-insert window) lands inert instead of
+    /// re-poisoning — no clear-vs-store ordering to get right. The clear on
+    /// `load_settings` is memory hygiene, not the correctness mechanism.
+    failed_loads: dashmap::DashMap<String, u64>,
+    /// Bumped by every `load_settings` (the only event that can make a
+    /// failed load succeed) before the hygiene clear. Read-validated against
+    /// `failed_loads` entries; see there.
     load_generation: std::sync::atomic::AtomicU64,
 }
 
@@ -69,7 +71,7 @@ impl LanguageCoordinator {
             parser_loader: RwLock::new(ParserLoader::new()),
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
-            failed_loads: dashmap::DashSet::new(),
+            failed_loads: dashmap::DashMap::new(),
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
         }
@@ -83,25 +85,28 @@ impl LanguageCoordinator {
         if self.language_registry.contains(language_id) {
             return LanguageLoadResult::success_with(Vec::new());
         }
-        // Known-failed load: skip the filesystem scan (and the warning events —
-        // the first attempt already surfaced them). See `failed_loads`.
-        if self.failed_loads.contains(language_id) {
-            return LanguageLoadResult::default();
-        }
-        let attempt_generation = self
+        let current_generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        let result = self.try_load_language_by_id(language_id);
-        if !result.success
-            && attempt_generation
-                == self
-                    .load_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
+        // Known-failed load UNDER THE CURRENT GENERATION: skip the filesystem
+        // scan (and the warning events — the first attempt already surfaced
+        // them). An old-generation entry is inert garbage, not a suppression
+        // (see `failed_loads`).
+        if self
+            .failed_loads
+            .get(language_id)
+            .is_some_and(|generation| *generation == current_generation)
         {
-            // Insert only when no reload happened during the scan: an attempt
-            // that captured the OLD search paths must not negative-cache a
-            // parser the new paths can load (see `load_generation`).
-            self.failed_loads.insert(language_id.to_string());
+            return LanguageLoadResult::default();
+        }
+        let result = self.try_load_language_by_id(language_id);
+        if !result.success {
+            // Tagged with the generation captured BEFORE the scan: if a
+            // reload landed mid-scan, the tag is already stale and this
+            // entry suppresses nothing — the store itself cannot re-poison,
+            // closing the check-then-insert window an insert-time gate had.
+            self.failed_loads
+                .insert(language_id.to_string(), current_generation);
         }
         result
     }
@@ -114,15 +119,12 @@ impl LanguageCoordinator {
         self.config_store.update_from_settings(settings);
         self.clear_derived_languages();
         // A reload (new search paths, or the post-install reload) is the only
-        // event that can turn a failed load into a success — retry everything.
-        // Bump the generation BEFORE clearing: an in-flight attempt that
-        // captured the pre-bump generation fails its insert gate from this
-        // instant, so it cannot re-poison the cache after the clear (with
-        // clear-first, an attempt reading the generation in the clear→bump
-        // window would still pass the gate). An attempt that starts in the
-        // bump→clear window scans with the NEW paths (installed above) and
-        // may have its valid failure wiped by the clear — one wasted rescan,
-        // never a wrong suppression.
+        // event that can turn a failed load into a success — bump the
+        // generation so every existing negative entry stops suppressing
+        // (validity is read-side; see `failed_loads`). The clear is memory
+        // hygiene only: a stale store racing it lands with an old tag and is
+        // inert, so no ordering between bump, clear, and in-flight scans can
+        // produce a wrong suppression.
         self.load_generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.failed_loads.clear();

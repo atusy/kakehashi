@@ -96,12 +96,19 @@ impl Kakehashi {
                 return Ok(None);
             };
 
-            // Collect all injection regions
-            let all_regions = match self
-                .documents
-                .current_resolved_regions(&uri, self.cache.semantic_token_generation())
+            // Collect all injection regions — from THIS snapshot's own
+            // resolved_regions (generation-gated), never a store re-read: a
+            // parse publishing between the wait above and a store lookup
+            // could pair this snapshot's tree/text with a NEWER snapshot's
+            // regions. Snapshot immutability makes tree, text, and regions
+            // one value; absent/reload-stale falls back inline over the same
+            // tree.
+            let all_regions = match snapshot
+                .resolved_regions
+                .as_ref()
+                .filter(|(stamped, _)| *stamped == self.cache.semantic_token_generation())
             {
-                Some(regions) => regions,
+                Some((_, regions)) => std::sync::Arc::clone(regions),
                 None => std::sync::Arc::new(InjectionResolver::resolve_all(
                     &self.language,
                     self.bridge.node_tracker(),

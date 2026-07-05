@@ -651,21 +651,28 @@ impl Kakehashi {
         // memo instead of re-executing the kind query over every layer. The
         // tag must match the exact inputs: snapshot identity
         // (parsed_version, incarnation) and the settings generation.
-        let walk_key = (uri.clone(), kind.to_string(), injection);
-        if lsp_range.is_none()
-            && let Some(hit) = self.captures_walk_cache.get(&walk_key)
-            && hit.parsed_version == snapshot.parsed_version
-            && hit.incarnation == incarnation
-            && hit.generation == generation
-        {
-            return Ok(Some(ComputedCaptures {
-                uri,
-                incarnation,
-                entry_content_version,
-                matches: hit.matches.clone(),
-                skipped: hit.skipped.clone(),
-            }));
-        }
+        // Key built only on the full-mode path (range bypasses the memo), and
+        // carried to the store below so the Url/String allocations happen at
+        // most once per request.
+        let walk_key = if lsp_range.is_none() {
+            let key = (uri.clone(), kind.to_string(), injection);
+            if let Some(hit) = self.captures_walk_cache.get(&key)
+                && hit.parsed_version == snapshot.parsed_version
+                && hit.incarnation == incarnation
+                && hit.generation == generation
+            {
+                return Ok(Some(ComputedCaptures {
+                    uri,
+                    incarnation,
+                    entry_content_version,
+                    matches: hit.matches.clone(),
+                    skipped: hit.skipped.clone(),
+                }));
+            }
+            Some(key)
+        } else {
+            None
+        };
 
         let uri_for_walk = uri.clone();
         let kind = kind.to_string();
@@ -740,9 +747,9 @@ impl Kakehashi {
             return Ok(None);
         };
         Ok(walked.map(|(matches, skipped)| {
-            if lsp_range.is_none() {
+            if let Some(key) = walk_key {
                 self.captures_walk_cache.insert(
-                    walk_key,
+                    key,
                     CachedCapturesWalk {
                         parsed_version: snapshot.parsed_version,
                         incarnation,
