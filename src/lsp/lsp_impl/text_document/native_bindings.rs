@@ -163,9 +163,12 @@ impl Kakehashi {
 
         let injection_query = self.language.injection_query(host_language)?;
         let regions = collect_all_injections(&tree.root_node(), text, Some(&injection_query))?;
+        // Innermost containing region: under nesting (an include-children
+        // outer region wrapping a fence) the smallest layer owns the cursor.
         let region = regions
             .iter()
-            .find(|r| r.content_node.start_byte() <= byte && byte < r.content_node.end_byte())?;
+            .filter(|r| r.content_node.start_byte() <= byte && byte < r.content_node.end_byte())
+            .min_by_key(|r| r.content_node.end_byte() - r.content_node.start_byte())?;
 
         // From here on the cursor IS in a region: every bail is silence.
         if region.offset.is_some() {
