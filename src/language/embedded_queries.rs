@@ -231,6 +231,18 @@ mod tests {
         }
 
         #[test]
+        fn local_function_is_callable_after_its_body() {
+            let text = "local function f()\n  return 1\nend\nf()\n";
+            let m = model_for("lua", text);
+            let def = nth(text, "f(", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "f(", 1)),
+                Some(def..def + 1),
+                "a call after `end` must resolve to the local function"
+            );
+        }
+
+        #[test]
         fn global_function_is_visible_across_scopes() {
             let text = "local function a() helper() end\nfunction helper() end\n";
             let m = model_for("lua", text);
