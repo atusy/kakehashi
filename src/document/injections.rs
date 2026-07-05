@@ -69,11 +69,14 @@ pub(crate) struct DiscoveredRegion {
 /// Stored by the off-ingress write-back with unresolvable regions DROPPED
 /// (their injected language has no parser; the inline path would produce no
 /// tokens for them either, and the failed load is negative-cached until a
-/// reload — which bumps `generation`, invalidating this discovery) and only
-/// when the document had no `injection.combined` group (those keep the inline
-/// path in v1). A resolvable language whose highlight query isn't loaded is
-/// *not* excluded — the query is re-resolved fresh at reuse, so that case
-/// self-heals rather than persisting an incomplete set.
+/// reload — which bumps `generation`, invalidating this discovery). A document
+/// with an `injection.combined` group stores a PARTIAL discovery (singles
+/// only, `complete: false`): the token-cache eviction sweep still needs the
+/// singles' cache identities, but context reuse must fall back inline (those
+/// whole-group contexts aren't part of the owned form in v1). A resolvable
+/// language whose highlight query isn't loaded is *not* excluded — the query
+/// is re-resolved fresh at reuse, so that case self-heals rather than
+/// persisting an incomplete set.
 #[derive(Clone)]
 pub(crate) struct DiscoveredInjections {
     /// Settings generation at discovery time. The reader skips reuse when it no
@@ -84,6 +87,13 @@ pub(crate) struct DiscoveredInjections {
     /// `bump_semantic_token_generation`, which clears the side caches only, so
     /// this gate is what a reload relies on.)
     pub generation: u64,
+    /// `true` when `regions` covers every top-level injection region of the
+    /// parse. `false` when an `injection.combined` group was dropped: the
+    /// singles in `regions` are still authoritative token-cache identities
+    /// (read/store and the eviction sweep key off them), but the semantic
+    /// context-reuse path must not consume a partial region set — it would
+    /// silently drop the combined group's tokens.
+    pub complete: bool,
     pub regions: Vec<DiscoveredRegion>,
 }
 

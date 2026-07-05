@@ -866,11 +866,20 @@ fn rebuild_context<'a>(
 /// discovery cost); only the per-region `from_region_info` / `get_or_create`
 /// recompute, negligible beside `Q`.
 ///
-/// Returns `None` (store nothing → the semantic path re-discovers inline) when:
-/// - the document has any `injection.combined` group — those keep the inline
-///   path in v1 (their whole-group contexts aren't part of the owned form yet);
-/// - fewer single regions than the token-cache gate, so caching wouldn't pay and
-///   the reuse path must stay byte-identical to pre-#529;
+/// Returns `None` (store nothing → the semantic path re-discovers inline) when
+/// there are fewer single regions than the token-cache gate — caching wouldn't
+/// pay, and the reuse path must stay byte-identical to pre-#529. The gate
+/// counts `singles` exactly as the inline path's `cache_for_singles` gate does
+/// (combined-group regions excluded), so "discovery stored" and "token cache
+/// active" are the same predicate — the eviction sweep's live set can never go
+/// empty while the inline path is still storing entries.
+///
+/// A document with an `injection.combined` group (no effective `#offset!`)
+/// stores a PARTIAL discovery: the combined group keeps the inline path in v1
+/// (its whole-group contexts aren't part of the owned form), so the group is
+/// dropped and `complete` is `false` — context reuse falls back inline, while
+/// the singles' token-cache identities stay available to the read/store path
+/// and the eviction sweep.
 ///
 /// Regions whose language/parser isn't loaded are DROPPED from the stored
 /// discovery rather than tainting it: the inline path would produce no tokens
@@ -893,21 +902,25 @@ pub(crate) fn build_document_discovery(
     generation: u64,
 ) -> Option<DiscoveredInjections> {
     // Partition exactly as collect_injection_contexts_sync does: an
-    // injection.combined pattern (with no effective #offset!) → bail, v1 keeps
-    // combined groups on the inline path.
-    let mut singles: Vec<&InjectionRegionInfo> = Vec::with_capacity(regions.len());
-    for injection in regions {
+    // injection.combined pattern (with no effective #offset!) → drop the
+    // region and mark the discovery partial; v1 keeps combined groups on the
+    // inline path. The singles are kept — their token-cache identities feed
+    // the read/store path and the eviction sweep even when reuse can't fire.
+    let mut complete = true;
+    let mut singles: Vec<(usize, &InjectionRegionInfo)> = Vec::with_capacity(regions.len());
+    for (idx, injection) in regions.iter().enumerate() {
         if has_combined_for_pattern(injection_query, injection.pattern_index)
             && effective_offset_for_pattern(injection_query, injection.pattern_index).is_none()
         {
             log::debug!(
                 target: "kakehashi::semantic",
-                "discovery not stored: combined-group region (lang={})",
+                "discovery stored partial: combined-group region dropped (lang={})",
                 injection.language
             );
-            return None;
+            complete = false;
+            continue;
         }
-        singles.push(injection);
+        singles.push((idx, injection));
     }
 
     // Same region-count gate as the token half: below it, caching doesn't pay and
@@ -923,7 +936,13 @@ pub(crate) fn build_document_discovery(
     }
 
     let mut discovered = Vec::with_capacity(singles.len());
-    for (injection, prebuilt) in singles.iter().zip(prebuilt_cacheable.iter()) {
+    // Pair by the ORIGINAL region index, not zip: dropped combined regions
+    // would otherwise shift every later single onto the wrong prebuilt
+    // identity (wrong ULID + content hash).
+    for (injection, prebuilt) in singles
+        .iter()
+        .map(|(idx, injection)| (injection, &prebuilt_cacheable[*idx]))
+    {
         // Producer: don't gate on the highlight query — store the region and let
         // reuse re-resolve the query (a load without a generation bump self-heals).
         // Producer path: called from populate_injections right after this
@@ -960,6 +979,7 @@ pub(crate) fn build_document_discovery(
 
     Some(DiscoveredInjections {
         generation,
+        complete,
         regions: discovered,
     })
 }
@@ -1150,14 +1170,17 @@ pub(crate) fn collect_injection_tokens_parallel(
     // when present and still generation-current (#529 companion lever): rebuild
     // the top-level contexts from the owned data and skip the injection query
     // (`Q`) entirely. Otherwise discover inline exactly as before — the fallback
-    // is byte-identical to the pre-lever path (below the region-count gate, or
-    // with any `injection.combined` group, `populate_injections` stores no
-    // discovery, so this is `None` and we take the inline branch). The reused
+    // is byte-identical to the pre-lever path (below the region-count gate
+    // `populate_injections` stores no discovery, so this is `None`; a document
+    // with an `injection.combined` group stores a PARTIAL discovery whose
+    // `complete: false` fails the filter — either way the inline branch runs,
+    // while the partial discovery's singles still feed the token-cache
+    // read/store path and the eviction sweep). The reused
     // region ids were minted while their snapshot was current (populate runs
     // behind the landed CAS), so rebuilding from them never writes the tracker —
     // the `mint_regions` stale-serve latch only governs the inline branch.
     let reusable_discovery =
-        cache_ctx.and_then(|c| c.discovery.filter(|d| d.generation == c.generation));
+        cache_ctx.and_then(|c| c.discovery.filter(|d| d.generation == c.generation && d.complete));
     let (contexts, exclusion_byte_ranges) = if let Some(discovery) = reusable_discovery {
         #[cfg(test)]
         DISCOVERY_REUSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2952,47 +2975,136 @@ local b = 2
         );
     }
 
-    /// `build_document_discovery` stores nothing when the document has any
-    /// `injection.combined` group: v1 keeps combined groups on the inline path, so
-    /// persisting a singles-only discovery would drop the combined captures on
-    /// reuse (missing/wrong tokens for e.g. HTML-in-markdown).
+    /// A document that mixes an `injection.combined` group with gate-clearing
+    /// single regions stores a PARTIAL discovery: `complete: false` (context
+    /// reuse must fall back inline — a singles-only rebuild would drop the
+    /// combined captures), but the singles keep their token-cache identities so
+    /// the eviction sweep's live set matches what the inline path stores
+    /// (before this, any combined group made the sweep wipe every live entry
+    /// each populate while the inline path kept re-storing them).
     #[test]
-    fn build_document_discovery_bails_on_combined_groups() {
-        let Some(coordinator) = combined_lua_coordinator() else {
+    fn build_document_discovery_partial_on_combined_groups() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
             return;
         };
-        let injection_query = coordinator
-            .injection_query("markdown")
-            .expect("combined injection query");
-        let mut pool = coordinator.create_document_parser_pool();
-        let Some(mut parser) = pool.acquire("markdown") else {
-            return;
-        };
-        let tree = parser
-            .parse(COMBINED_LUA_DOC, None)
-            .expect("parse markdown");
-        pool.release("markdown".to_string(), parser);
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .expect("markdown language must be loaded");
+        // Structurally disjoint patterns (no dedupe ambiguity): indented code
+        // blocks form a combined lua group; fenced blocks stay singles.
+        let query = Query::new(
+            &md_language,
+            r#"
+            ((indented_code_block) @injection.content
+              (#set! injection.language "lua")
+              (#set! injection.combined))
+
+            (fenced_code_block
+              (info_string (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .expect("valid mixed injection query");
+        let injection_query = Arc::new(query);
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::clone(&injection_query));
+
+        // Eight single lua fences (clears the gate) + two indented blocks
+        // (one combined group).
+        let mut text = eight_lua_block_doc();
+        text.push_str("prose\n\n    local y1 = 1\n\nprose\n\n    local y2 = 2\n");
+
+        let tree = parse_markdown(&coordinator, &text);
         let regions = crate::language::injection::collect_all_injections(
             &tree.root_node(),
-            COMBINED_LUA_DOC,
+            &text,
             Some(injection_query.as_ref()),
         )
         .expect("regions");
-        let uri = Url::parse("file:///combined_bail.md").unwrap();
+        assert_eq!(regions.len(), 10, "8 fences + 2 indented blocks");
+
+        let uri = Url::parse("file:///combined_partial.md").unwrap();
         let tracker = NodeTracker::new();
+        let discovery = build_document_discovery(
+            &regions,
+            &cacheable_for(&regions, &uri, &tracker, &text),
+            injection_query.as_ref(),
+            &text,
+            &coordinator,
+            &uri,
+            &tracker,
+            0,
+        )
+        .expect("gate-clearing singles must store a (partial) discovery");
         assert!(
-            build_document_discovery(
-                &regions,
-                &cacheable_for(&regions, &uri, &tracker, COMBINED_LUA_DOC),
-                injection_query.as_ref(),
-                COMBINED_LUA_DOC,
-                &coordinator,
-                &uri,
-                &tracker,
-                0,
-            )
-            .is_none(),
-            "a document with a combined group must not store discovery"
+            !discovery.complete,
+            "a dropped combined group must mark the discovery partial"
+        );
+        assert_eq!(
+            discovery.regions.len(),
+            8,
+            "singles kept, combined group dropped"
+        );
+        assert!(
+            discovery
+                .regions
+                .iter()
+                .all(|r| r.token_cache.is_some()),
+            "singles keep their token-cache identities for the eviction sweep"
+        );
+
+        // The partial discovery must NOT be consumed by the context-reuse
+        // path: if it were, the combined group's tokens would be missing.
+        // Byte-equality against the inline pass is the discriminating check
+        // (the indented blocks are valid lua, so they contribute tokens).
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
+        let inline = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            None,
+            None,
+        )
+        .0;
+        assert!(
+            inline
+                .iter()
+                .any(|t| t.line >= lines.len().saturating_sub(7)),
+            "the combined indented blocks must contribute tokens for the check to discriminate"
+        );
+        let cache = InjectionTokenCache::new();
+        let cc = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+            mint_regions: true,
+            discovery: Some(&discovery),
+        };
+        let with_partial = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&cc),
+            None,
+        )
+        .0;
+        assert_eq!(
+            with_partial, inline,
+            "a partial discovery must fall back to inline discovery (combined tokens intact)"
         );
     }
 

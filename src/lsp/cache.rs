@@ -326,8 +326,11 @@ impl CacheCoordinator {
             // identities — the exact fold and language resolution the
             // store/read path uses (deriving it from any other resolver would
             // silently evict live entries whenever the two resolvers
-            // disagree). `None` discovery (below the gate, combined groups,
-            // incomplete) yields an empty set: the token cache is inactive
+            // disagree). A PARTIAL discovery (combined group present) still
+            // carries every single region's identity, so the sweep keeps the
+            // entries the inline path stores for those docs. `None` discovery
+            // (below the gate — the same singles count that gates the inline
+            // store path) yields an empty set: the token cache is inactive
             // there, so sweeping everything for the document is the correct
             // bound.
             let live_hashes: std::collections::HashSet<u64> = discovery
