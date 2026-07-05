@@ -182,6 +182,28 @@ pub(in crate::lsp::lsp_impl) struct CachedCapturesWalk {
     pub(in crate::lsp::lsp_impl) skipped: std::sync::Arc<Vec<Value>>,
 }
 
+/// Winner-side handle of the single-flight captures walk: holds the
+/// in-flight marker for one `(uri, kind, injection)` and, on drop (every
+/// exit path — success, cancel, panic-unwind), removes it and wakes the
+/// parked losers so they re-check the walk memo or elect a new winner.
+/// `remove_if` with pointer equality so a slow winner can never evict a
+/// successor's marker.
+struct WalkFlightGuard<'a> {
+    map: &'a dashmap::DashMap<(Url, String, bool), std::sync::Arc<tokio::sync::Notify>>,
+    key: (Url, String, bool),
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Drop for WalkFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.map
+            .remove_if(&self.key, |_, current| {
+                std::sync::Arc::ptr_eq(current, &self.notify)
+            });
+        self.notify.notify_waiters();
+    }
+}
+
 /// A kind query compiled for one language, with the patterns tolerant
 /// compilation dropped.
 struct KindQuery {
@@ -318,12 +340,11 @@ fn load_kind_query(
 struct ComputedCaptures {
     uri: Url,
     incarnation: u64,
-    /// The live `content_version` at request entry. The lineage store re-checks
-    /// it so an edit landing DURING the request voids the store: the response
+    /// The live `content_version` at snapshot resolution. The resolved
+    /// snapshot is current at that instant (serve-current park), but an edit
+    /// landing DURING the walk still voids the lineage store: the response
     /// was already outdated at delivery, and lineage must not record matches
-    /// for a text the client no longer has (ADR §3). A snapshot that merely
-    /// *trailed* at entry still serves and stores — that is the deliberate
-    /// serve-stale relaxation, healed by the client's per-keystroke re-request.
+    /// for a text the client no longer has (ADR §3).
     entry_content_version: u64,
     matches: std::sync::Arc<Vec<Value>>,
     skipped: std::sync::Arc<Vec<Value>>,
@@ -385,8 +406,9 @@ impl Kakehashi {
     ///   `content_version` moved past its request-entry value) makes the
     ///   response outdated at delivery; storing it would record lineage for a
     ///   text the client no longer has (parse-snapshot ADR §3), so nothing is
-    ///   stored and the caller answers `null`. A snapshot that merely trailed
-    ///   at entry still stores — the serve-stale relaxation.
+    ///   stored and the caller answers `null`. Under serve-current the
+    ///   snapshot was current at resolution, so this guard covers exactly the
+    ///   resolve→delivery window.
     async fn store_lineage(
         &self,
         computed: ComputedCaptures,
@@ -595,22 +617,52 @@ impl Kakehashi {
         // pool's dequeue hook (a cancelled work-unit is skipped before it ever
         // takes a thread) and as the walk's per-layer checkpoint.
         let upstream_id = crate::lsp::current_upstream_id();
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let (mut cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let cancel_token = crate::cancel::CancelToken::default();
 
-        // Resolve the latest parse snapshot, with only the bounded first-parse
-        // wait (parse-snapshot ADR §3). `full` SERVES-STALE — it is a
-        // per-keystroke highlighter, and `null`-on-routine-staleness against a
-        // client contracted to re-request on `null` would busy-spin; `null` is
-        // reserved for no-snapshot (pre-first-parse) and the lineage gate
-        // below. The injected-grammar install is no longer triggered inline
-        // here: the parse loop's downstream (`process_injections`) detects
-        // missing injected grammars and spawns the install as a detached task;
-        // a layer whose grammar is still installing is skipped by the walk and
+        // Serve-current (parse-snapshot ADR §3, revised like semanticTokens):
+        // park — racing the client's cancel — until the latest snapshot
+        // matches the live text, then walk THAT. The previous serve-stale
+        // policy walked whatever snapshot was latest; during a typing burst
+        // every one of those walks completed its full compute and was then
+        // voided by the lineage still-current gate → `null` → the client
+        // re-requested → another doomed walk. A live capture (01KWSECM…)
+        // shows 41 walks in ~15s, most for snapshots several edits behind,
+        // all nulled — saturating the compute pool and queueing the semantic
+        // delta 10s behind them. Parking costs a watch subscription instead;
+        // walks run once, on the settled snapshot, and install lineage.
+        // `null` stays the protocol's re-sync signal for no-snapshot
+        // (pre-first-parse), the settle backstop, and the lineage gate.
+        // The injected-grammar install is not triggered inline here: the
+        // parse loop's downstream (`process_injections`) detects missing
+        // injected grammars and spawns the install as a detached task; a
+        // layer whose grammar is still installing is skipped by the walk and
         // heals on a later request.
-        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
-            log::debug!(target: "kakehashi::captures", "no parsed document for {uri}");
-            return Ok(None);
+        let snapshot = {
+            use crate::lsp::lsp_impl::snapshot_read::{SnapshotWait, TOKEN_SETTLE_BACKSTOP};
+            let wait = self.wait_for_current_snapshot(&uri, TOKEN_SETTLE_BACKSTOP);
+            let outcome = match cancel_rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        biased;
+                        _ = rx => {
+                            return Err(JsonRpcError::request_cancelled());
+                        }
+                        outcome = wait => outcome,
+                    }
+                }
+                None => wait.await,
+            };
+            match outcome {
+                SnapshotWait::Current(snapshot) => snapshot,
+                SnapshotWait::Stale | SnapshotWait::Unparsed | SnapshotWait::Gone => {
+                    log::debug!(
+                        target: "kakehashi::captures",
+                        "no current snapshot for {uri}: re-sync via null"
+                    );
+                    return Ok(None);
+                }
+            }
         };
         // The live input state at request entry: `range` staleness-rejects
         // against it, and the lineage store re-checks it (see ComputedCaptures).
@@ -667,25 +719,85 @@ impl Kakehashi {
         // Key built only on the full-mode path (range bypasses the memo), and
         // carried to the store below so the Url/String allocations happen at
         // most once per request.
+        //
+        // Single-flight: a typing client sends `full` AND several `delta`s
+        // for the same kind concurrently, and the memo only helps AFTER the
+        // first walk completes — concurrent misses all re-executed the same
+        // walk (the 01KWSECM… capture shows the same (snapshot, kind) walked
+        // up to 4× at once). Losers park on the winner's Notify and re-check
+        // the memo; a winner that stores nothing (cancelled, null) wakes them
+        // to elect a new winner. The 1s re-loop timeout is a lost-wakeup
+        // backstop only — correctness never depends on it.
+        let mut flight_guard = None;
         let walk_key = if lsp_range.is_none() {
             let key = (uri.clone(), kind.to_string(), injection);
-            if let Some(hit) = self.captures_walk_cache.get(&key)
-                && hit.parsed_version == snapshot.parsed_version
-                && hit.incarnation == incarnation
-                && hit.generation == generation
-            {
-                return Ok(Some(ComputedCaptures {
-                    uri,
-                    incarnation,
-                    entry_content_version,
-                    matches: hit.matches.clone(),
-                    skipped: hit.skipped.clone(),
-                }));
+            loop {
+                if let Some(hit) = self.captures_walk_cache.get(&key)
+                    && hit.parsed_version == snapshot.parsed_version
+                    && hit.incarnation == incarnation
+                    && hit.generation == generation
+                {
+                    return Ok(Some(ComputedCaptures {
+                        uri,
+                        incarnation,
+                        entry_content_version,
+                        matches: hit.matches.clone(),
+                        skipped: hit.skipped.clone(),
+                    }));
+                }
+                let notify = match self.captures_walk_inflight.entry(key.clone()) {
+                    dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+                        vacant.insert(std::sync::Arc::clone(&notify));
+                        flight_guard = Some(WalkFlightGuard {
+                            map: &self.captures_walk_inflight,
+                            key: key.clone(),
+                            notify,
+                        });
+                        break;
+                    }
+                    dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                        std::sync::Arc::clone(occupied.get())
+                    }
+                };
+                // Register interest BEFORE re-validating the marker: enable()
+                // makes a notify_waiters() between here and the await visible,
+                // and the marker re-check catches a winner that exited before
+                // we registered (its notify_waiters preceded our enable).
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let winner_live = self
+                    .captures_walk_inflight
+                    .get(&key)
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &notify));
+                if winner_live {
+                    match cancel_rx.as_mut() {
+                        Some(rx) => {
+                            tokio::select! {
+                                biased;
+                                _ = rx => return Err(JsonRpcError::request_cancelled()),
+                                _ = &mut notified => {}
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                        }
+                        None => {
+                            tokio::select! {
+                                _ = &mut notified => {}
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                        }
+                    }
+                }
             }
             Some(key)
         } else {
             None
         };
+        // Holds the in-flight marker for the winner until this function
+        // returns (its Drop removes the marker and wakes the losers, AFTER
+        // the memo store below on the success path).
+        let _flight_guard = flight_guard;
 
         let uri_for_walk = uri.clone();
         let kind = kind.to_string();
@@ -859,9 +971,11 @@ fn execute_captures_walk(
     // index (didChange shifts every entry before the reparse), so a trailing
     // snapshot's byte offsets must never be written into it — they would be
     // wrong-space entries that later edits keep shifting as if they were live
-    // (the "a stale read never mints" invariant, see snapshot_read.rs). A
-    // stale serve still returns matches — serve-stale is the point of the
-    // per-keystroke `full` mode — but goes READ-ONLY on the tracker: a
+    // (the "a stale read never mints" invariant, see snapshot_read.rs). The
+    // handler resolves a CURRENT snapshot (serve-current park), but an edit
+    // can land between that resolution and this work-unit reaching the front
+    // of the pool queue; a walk that starts outrun still returns matches
+    // (voided later by the lineage gate) but goes READ-ONLY on the tracker: a
     // position the intervening edits did not shift reuses its live id (so
     // the delta lineage stays a minimal diff), and an unknown position gets
     // an unregistered id — resolving one via `kakehashi/node/*` yields
@@ -1127,6 +1241,92 @@ mod tests {
 
     fn vals(ns: &[i64]) -> Vec<Value> {
         ns.iter().map(|n| json!(n)).collect()
+    }
+
+    /// Serve-current (ADR §3, revised): a captures request arriving while the
+    /// latest snapshot trails the live text parks until the current snapshot
+    /// publishes instead of walking the trailing one (whose result the
+    /// lineage gate would void into a `null` → re-request busy-loop).
+    #[tokio::test(start_paused = true)]
+    async fn captures_full_parks_until_current_snapshot() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///captures_serve_current.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let incarnation = service
+            .inner()
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document just inserted")
+            .slot
+            .current_incarnation;
+        let publish = |text: &str, parsed_version: u64| {
+            let landed = service
+                .inner()
+                .documents
+                .get(&uri)
+                .map(|doc| {
+                    doc.publish_snapshot(std::sync::Arc::new(
+                        crate::document::snapshot::ParseSnapshot {
+                            text: std::sync::Arc::from(text),
+                            tree: None,
+                            language: Some("rust".to_string()),
+                            parsed_version,
+                            incarnation,
+                            injection_regions: None,
+                            bridge_regions: None,
+                            resolved_regions: None,
+                            layer_trees: std::sync::OnceLock::new(),
+                        },
+                    ))
+                })
+                .unwrap_or(false);
+            assert!(landed, "test snapshot must land");
+        };
+        publish("fn main() {}", 0);
+        // Edit: content_version moves to 1, the v0 snapshot now trails.
+        service.inner().documents.update_document(
+            uri.clone(),
+            "fn main() { }".to_string(),
+            None,
+        );
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .kakehashi_captures_full(CapturesFullParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: crate::lsp::lsp_impl::url_to_uri(&uri)
+                                .expect("test URI should convert"),
+                        },
+                        kind: "highlights".to_string(),
+                        injection: false,
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "the handler must park on the trailing snapshot, not answer from it"
+        );
+        publish("fn main() { }", 1);
+        let result = request
+            .await
+            .expect("handler must not panic")
+            .expect("captures full must not error");
+        // Tree-less snapshot → the walk degrades to the protocol null; what
+        // matters here is WHEN it answered (after currency), not the shape.
+        assert_eq!(result, Value::Null);
     }
 
     fn first_node_id(matches: &[Value]) -> ulid::Ulid {
