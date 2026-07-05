@@ -191,13 +191,13 @@ impl ParseCoordinator {
     /// what serve-stale readers consume, while the legacy tree must stay
     /// current-text-only. No single reader mixes the two sources (cell readers
     /// consume the snapshot's own (text, tree); legacy readers snapshot the
-    /// store under one shard Ref), but the publish deliberately precedes the
-    /// legacy CAS: a legacy-tree reader woken by this publish can observe the
-    /// store a beat before the CAS attaches the tree (or after a racing edit
-    /// makes the CAS reject) and read `None` — main's watermark advanced
-    /// strictly after the store write. That window degrades to the reader's
-    /// empty/None fallback and self-heals on the next request; the legacy
-    /// store and its remaining readers go away in Stage 3.
+    /// store under one shard Ref), and every parse pass runs the legacy CAS
+    /// BEFORE this publish: a legacy-tree reader woken by the publish (the
+    /// explicit-action waiters read `doc.snapshot()` after
+    /// `wait_for_current_snapshot`) therefore finds the store already
+    /// settled — either the tree attached, or a racing edit rejected the CAS,
+    /// in which case the cell is not Current for that reader either. The
+    /// legacy store and its remaining readers go away in Stage 3.
     fn publish_parse_snapshot(
         &self,
         uri: &Url,
@@ -400,9 +400,32 @@ impl ParseCoordinator {
                 .await;
 
             if let Some(tree) = parsed_tree {
-                // Snapshot publish first (the Stage-2 commit point, ADR §2); the
-                // cell guard rejects it if a newer parse already published or
-                // the lifetime moved on.
+                // Legacy tree CAS BEFORE the snapshot publish: a legacy-store
+                // reader woken by the publish (the explicit-action waiters
+                // read `doc.snapshot()` after `wait_for_current_snapshot`)
+                // must find the tree already attached — publish-first opened
+                // a window where the cell said Current while the legacy store
+                // was still tree-less, silently no-opping a user-triggered
+                // formatting. The CAS is non-inserting (text + incarnation
+                // checked), so a tree parsed from open-time text/lifetime is
+                // dropped when a `didChange` moved the text on or a
+                // `didClose`/reopen changed the incarnation — the publish
+                // below still lands in that case (stale-but-consistent is
+                // exactly what serve-stale readers consume; the cell guard
+                // independently rejects out-of-order versions). Only populate
+                // the injection caches when the tree actually landed, so a
+                // `didClose` racing this off-ingress parse can't leave stale
+                // injection entries for a gone document. (`Tree` clone is a
+                // cheap refcount bump.)
+                let stored = self
+                    .documents
+                    .set_parse_result_if_text_and_incarnation_unchanged(
+                        &uri,
+                        &text,
+                        incarnation,
+                        Some(&language_name),
+                        Some(tree.clone()),
+                    );
                 self.publish_parse_snapshot(
                     &uri,
                     crate::document::snapshot::ParseSnapshot {
@@ -413,22 +436,6 @@ impl ParseCoordinator {
                         incarnation,
                     },
                 );
-                // Persist through the text + incarnation CAS (non-inserting), so
-                // a tree parsed from open-time text/lifetime is dropped when a
-                // `didChange` moved the text on or a `didClose`/reopen changed the
-                // incarnation — instead of clobbering the newer state. Only populate
-                // the injection caches when the tree actually landed, so a `didClose`
-                // racing this off-ingress parse can't leave stale injection entries for
-                // a gone document. (`Tree` clone is a cheap refcount bump.)
-                let stored = self
-                    .documents
-                    .set_parse_result_if_text_and_incarnation_unchanged(
-                        &uri,
-                        &text,
-                        incarnation,
-                        Some(&language_name),
-                        Some(tree.clone()),
-                    );
                 if stored {
                     self.populate_injections_on_pool(
                         uri.clone(),
@@ -632,8 +639,26 @@ impl ParseCoordinator {
 
             let Some(tree) = parsed else { break };
 
-            // Snapshot publish first (Stage-2 commit point, ADR §2); the cell
-            // guard rejects a stale lifetime or an out-of-order version.
+            // Persist FIRST through the non-inserting, tree-absent CAS —
+            // before the snapshot publish, so a legacy-store reader the
+            // publish wakes finds the tree already attached (see the
+            // parse_document ordering note). A closed (Vacant) document, one
+            // whose text moved (a concurrent `didChange`), or one a
+            // concurrent parse already gave a tree all drop this tree — the
+            // tree-absent check makes the "don't clobber a concurrent parse"
+            // guard atomic with the write. Only populate the injection caches
+            // when the tree actually landed, so a `didClose` racing this
+            // reparse can't leave stale injection entries for a gone
+            // document. (`Tree` clone is a cheap refcount bump.)
+            let stored = self.documents.attach_tree_if_absent(
+                &uri,
+                &text,
+                expected_language_id.as_deref(),
+                expected_incarnation,
+                tree.clone(),
+            );
+            // The cell guard rejects a stale lifetime or an out-of-order
+            // version on its own.
             let published = self.publish_parse_snapshot(
                 &uri,
                 crate::document::snapshot::ParseSnapshot {
@@ -654,21 +679,6 @@ impl ParseCoordinator {
                     language_name.clone(),
                 ));
             }
-            // Persist FIRST through the non-inserting, tree-absent CAS: a closed
-            // (Vacant) document, one whose text moved (a concurrent `didChange`),
-            // or one a concurrent parse already gave a tree all drop this tree —
-            // the tree-absent check makes the "don't clobber a concurrent parse"
-            // guard atomic with the write. Only populate the injection caches when
-            // the tree actually landed, so a `didClose` racing this reparse can't
-            // leave stale injection entries for a gone document. (`Tree` clone is a
-            // cheap refcount bump.)
-            let stored = self.documents.attach_tree_if_absent(
-                &uri,
-                &text,
-                expected_language_id.as_deref(),
-                expected_incarnation,
-                tree.clone(),
-            );
             if stored {
                 self.populate_injections_on_pool(
                     uri.clone(),
@@ -811,11 +821,27 @@ impl ParseCoordinator {
 
         let mut events = load_result.events;
         if let Some(tree) = parsed {
-            // Snapshot publish first (the Stage-2 commit point, ADR §2). The
-            // cell guard admits this even when the legacy CAS below rejects a
-            // text that moved on — a stale-but-consistent snapshot is exactly
-            // what serve-stale readers consume; the scheduler's dirty loop
-            // reparses the newer text and supersedes it.
+            // Legacy tree CAS BEFORE the snapshot publish (see the
+            // parse_document ordering note): a legacy-store reader woken by
+            // the publish must find the tree already attached. Text +
+            // language + incarnation checked atomically under the tree-write
+            // shard lock: text rejects a within-lifetime stale parse (a
+            // `didChange` landed mid-parse); language rejects a reopen that
+            // relabelled the URI; incarnation rejects a same-language,
+            // identical-text reopen — the tree belongs to the prior lifetime
+            // and must not attach to the reopened document (nor let the
+            // watermark advance below run on the old lifetime's ticket).
+            let stored = self.documents.update_tree_if_text_and_language_unchanged(
+                uri,
+                &text,
+                language_id.as_deref(),
+                incarnation,
+                tree.clone(),
+            );
+            // The cell guard admits this even when the legacy CAS above
+            // rejected a text that moved on — a stale-but-consistent snapshot
+            // is exactly what serve-stale readers consume; the scheduler's
+            // dirty loop reparses the newer text and supersedes it.
             let published = self.publish_parse_snapshot(
                 uri,
                 crate::document::snapshot::ParseSnapshot {
@@ -839,20 +865,6 @@ impl ParseCoordinator {
                     language_name.clone(),
                 ));
             }
-            // Text + language + incarnation CAS (non-inserting), all three checked
-            // atomically under the tree-write shard lock. Text rejects a
-            // within-lifetime stale parse (a `didChange` landed mid-parse);
-            // language rejects a reopen that relabelled the URI; incarnation
-            // rejects a same-language, identical-text reopen — the tree belongs to
-            // the prior lifetime and must not attach to the reopened document (nor
-            // let the watermark advance below run on the old lifetime's ticket).
-            let stored = self.documents.update_tree_if_text_and_language_unchanged(
-                uri,
-                &text,
-                language_id.as_deref(),
-                incarnation,
-                tree.clone(),
-            );
             if stored {
                 self.populate_injections_on_pool(
                     uri.clone(),
