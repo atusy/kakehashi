@@ -169,17 +169,17 @@ impl InstallCoordinator {
             return true;
         }
 
-        let skip = result.outcome.should_skip_parse();
-        if skip {
-            // The install produced no parser and no reload-reparse will run
-            // from this call: release a parked first-parse waiter with a
-            // tree-less snapshot (bootstrap-gated inside) instead of letting
-            // every request burn the full first-parse backstop. A later
-            // successful install's same-version tree is re-admitted by the
-            // snapshot cell's tree-upgrade clause.
-            self.documents.publish_giveup_snapshot(&uri);
-        }
-        skip
+        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir/
+        // ParserFailed (should_skip_parse() == false, but did_open's
+        // auto-install branch never runs parse_document regardless) as well
+        // as AlreadyInstalling. None of them publishes a snapshot anywhere
+        // below, so release a parked first-parse waiter with a tree-less
+        // snapshot (bootstrap-gated inside) instead of letting every request
+        // burn the full first-parse backstop. Harmless for AlreadyInstalling:
+        // its eventual reload-reparse lands the same-version tree through the
+        // snapshot cell's tree-upgrade clause.
+        self.documents.publish_giveup_snapshot(&uri);
+        result.outcome.should_skip_parse()
     }
 
     /// Reload a language after installation and optionally re-parse the document.

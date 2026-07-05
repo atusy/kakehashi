@@ -76,12 +76,17 @@ impl SnapshotSlot {
     /// 1. `snapshot.incarnation == current_incarnation`, and
     /// 2. no snapshot yet (bootstrap), **or** strictly newer `parsed_version`
     ///    (an equal-version double-publish must not swap the `Tree` under an
-    ///    already-issued `result_id`), **or** an equal-version **tree
-    ///    upgrade** (`None → Some`): a give-up publish (tree-less, releases
-    ///    parked first-parse waiters) must not block the real parse of the
-    ///    same version that a later successful install produces. Same
-    ///    version means same input text, so the upgrade only adds
-    ///    information; the equal-version tree *swap* stays rejected.
+    ///    already-issued `result_id`) that does not **tree-downgrade**
+    ///    (`Some → None`: no parse pass legitimately publishes tree-less over
+    ///    a tree at a newer version — the reparse give-up paths are
+    ///    bootstrap-gated, so such a publish can only be a give-up racing a
+    ///    slower successful parse, and admitting it would strip serve-stale
+    ///    readers of a usable tree until the next edit), **or** an
+    ///    equal-version **tree upgrade** (`None → Some`): a give-up publish
+    ///    (tree-less, releases parked first-parse waiters) must not block
+    ///    the real parse of the same version that a later successful install
+    ///    produces. Same version means same input text, so the upgrade only
+    ///    adds information; the equal-version tree *swap* stays rejected.
     pub(crate) fn admits(&self, snapshot: &ParseSnapshot) -> bool {
         // The sentinel is reserved: no snapshot legitimately carries it (the
         // store's counter never draws it), so a closed slot admits nothing —
@@ -89,10 +94,10 @@ impl SnapshotSlot {
         snapshot.incarnation != CLOSED_INCARNATION
             && snapshot.incarnation == self.current_incarnation
             && self.snapshot.as_ref().is_none_or(|current| {
-                snapshot.parsed_version > current.parsed_version
-                    || (snapshot.parsed_version == current.parsed_version
-                        && current.tree.is_none()
-                        && snapshot.tree.is_some())
+                let tree_downgrade = current.tree.is_some() && snapshot.tree.is_none();
+                let tree_upgrade = current.tree.is_none() && snapshot.tree.is_some();
+                (snapshot.parsed_version > current.parsed_version && !tree_downgrade)
+                    || (snapshot.parsed_version == current.parsed_version && tree_upgrade)
             })
     }
 }
@@ -152,6 +157,21 @@ mod tests {
             parsed_version,
             incarnation,
         }
+    }
+
+    #[test]
+    fn newer_version_tree_downgrade_is_rejected() {
+        let mut slot = SnapshotSlot::bootstrap(7);
+        slot.snapshot = Some(Arc::new(snap_with_tree(7, 3)));
+        assert!(
+            !slot.admits(&snap(7, 4)),
+            "a newer tree-less publish must not strip a usable tree (only a \
+             give-up racing a slower parse can produce it)"
+        );
+        assert!(
+            slot.admits(&snap_with_tree(7, 4)),
+            "a newer tree-ful publish advances normally"
+        );
     }
 
     #[test]
