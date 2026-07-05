@@ -437,6 +437,53 @@ mod tests {
     }
 
     #[test]
+    fn invalid_visible_to_nested_drops_the_scope_capture() {
+        // Anything other than "true"/"false" is an authoring error: the
+        // scope must drop (silence), not default to visible and leak its
+        // names into nested scopes.
+        let text = "fn main() { let x = 1; }";
+        let collection = collect_rust(
+            text,
+            r#"
+            ((block) @scope
+             (#set! scope.visible-to-nested "nope"))
+            "#,
+        );
+        assert!(
+            collection.scopes.is_empty(),
+            "invalid scope.visible-to-nested must drop the capture"
+        );
+    }
+
+    #[test]
+    fn definition_dropped_for_invalid_property_stays_out_of_references() {
+        // A node authored as @definition must never fall back to being a
+        // blanket reference when its properties are invalid — resolving a
+        // declaration site to an unrelated outer binding is a wrong answer.
+        let text = "fn main() { let x = 1; x; }";
+        let collection = collect_rust(
+            text,
+            r#"
+            ((let_declaration pattern: (identifier) @definition)
+             (#set! definition.visibility "sometimes"))
+            (identifier) @reference
+            "#,
+        );
+        assert!(
+            collection.definitions.is_empty(),
+            "invalid visibility drops the definition"
+        );
+        let def_x = text.find('x').unwrap();
+        assert!(
+            !collection
+                .references
+                .iter()
+                .any(|r| r.byte_range.start == def_x),
+            "the dropped definition node must not survive as a reference"
+        );
+    }
+
+    #[test]
     fn collects_scopes_definitions_references_with_defaults() {
         let text = "fn main() { let x = 1; x; }";
         let collection = collect_rust(
