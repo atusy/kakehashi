@@ -267,8 +267,16 @@ mod tests {
         fn lambda_parameters_and_range_for_bind() {
             let text = "void f() { auto fn = [](int n) { return n; }; for (int v : vs) { v; } }";
             let m = model_for("cpp", text);
-            assert_resolves(&m, text, "n)", 1, 0);
-            assert_resolves(&m, text, "v", 1, 0);
+            let n_def = nth(text, "n)", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "n;", 0)),
+                Some(n_def..n_def + 1)
+            );
+            let v_def = nth(text, "v :", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "v;", 0)),
+                Some(v_def..v_def + 1)
+            );
         }
 
         #[test]
