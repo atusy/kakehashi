@@ -649,13 +649,17 @@ fn execute_captures_walk(
     // wait; the walk-duration residual — an edit landing DURING the walk —
     // is closed by the post-walk reconciliation below, which purges this
     // walk's own mints when the snapshot is no longer current on exit.
+    // Latched BEFORE the currency check: an edit landing between the two
+    // bumps the generation (making later mints purge-eligible) or fails the
+    // currency check itself — either way no wrong-space mint survives.
+    let entry_shift_gen = tracker.shift_generation(uri);
     let mint_into_tracker = documents.latest_snapshot(uri).is_some_and(|view| {
         view.slot.current_incarnation == incarnation && view.content_version == parsed_version
     });
-    // Ids THIS walk created (as opposed to reused), with their minted
-    // coordinates — the purge set for the post-walk reconciliation.
-    type MintRecord = (ulid::Ulid, usize, usize, &'static str, usize);
-    let mut minted_ids: Vec<MintRecord> = Vec::new();
+    // Ids THIS walk created (as opposed to reused), with the shift
+    // generation each creation observed — the purge set for the post-walk
+    // reconciliation.
+    let mut minted_ids: Vec<(ulid::Ulid, u64)> = Vec::new();
     let mapper = PositionMapper::new(text);
 
     // Range scoping: clamped conversion (like other viewport-shaped
@@ -706,7 +710,7 @@ fn execute_captures_walk(
                     // stale serve the tracker is read-only (see the
                     // currency gate above).
                     let ulid = if mint_into_tracker {
-                        let (ulid, created) = tracker.get_or_create_in_layer_tracked(
+                        let (ulid, created, shift_gen) = tracker.get_or_create_in_layer_tracked(
                             uri,
                             c.start_byte,
                             c.end_byte,
@@ -714,14 +718,15 @@ fn execute_captures_walk(
                             depth,
                         );
                         // Recorded for the post-walk purge: if an edit lands
-                        // mid-walk, entries created from this (now-stale)
-                        // snapshot must not persist. `created` is determined
-                        // atomically under the tracker's entry lock, so an
-                        // id a concurrent, still-current request created
-                        // (and handed out) is never mis-attributed here and
-                        // wrongly purged.
+                        // mid-walk, entries created after its shift were
+                        // minted in a superseded coordinate space and must
+                        // not persist. Both `created` and the observed
+                        // generation are determined atomically under the
+                        // tracker's entry lock, so an id a concurrent,
+                        // still-current request created (and handed out) is
+                        // never mis-attributed here and wrongly purged.
                         if created {
-                            minted_ids.push((ulid, c.start_byte, c.end_byte, c.kind, depth));
+                            minted_ids.push((ulid, shift_gen));
                         }
                         ulid
                     } else {
@@ -781,22 +786,18 @@ fn execute_captures_walk(
     }
 
     // Post-walk reconciliation, the other half of the currency gate: the
-    // entry latch cannot see an edit that lands DURING the walk, and by then
-    // this walk may have minted old-snapshot coordinates into a tracker
-    // didChange just shifted. Purge exactly this walk's own creations that
-    // are STILL AT their minted coordinates — an entry the edit's shift
-    // already moved was corrected like any live entry (and may be reused by
-    // a newer-version walk), so it stays; an unmoved one missed the
-    // correction and is the wrong-space poison. The response still carries
-    // purged ids, which now resolve `null` (the protocol's re-sync signal),
-    // the same degradation as a stale-at-entry serve.
-    if !minted_ids.is_empty()
-        && !documents.latest_snapshot(uri).is_some_and(|view| {
-            view.slot.current_incarnation == incarnation && view.content_version == parsed_version
-        })
-    {
-        for (id, start, end, kind, depth) in &minted_ids {
-            tracker.remove_id_if_unmoved(uri, id, *start, *end, kind, *depth);
+    // entry latch cannot see an edit that lands DURING the walk. A creation
+    // whose observed shift generation still equals the entry latch is
+    // correct-at-birth — no edit intervened, and later edits shift it like
+    // any live entry. A mismatched one was minted AFTER some edit's shift,
+    // i.e. in a superseded coordinate space, and is purged — coordinate
+    // comparison could not detect this once a second edit moves the
+    // wrong-space entry again. The response still carries purged ids, which
+    // now resolve `null` (the protocol's re-sync signal), the same
+    // degradation as a stale-at-entry serve.
+    for (id, shift_gen) in &minted_ids {
+        if *shift_gen != entry_shift_gen {
+            tracker.remove_id(uri, id);
         }
     }
 
