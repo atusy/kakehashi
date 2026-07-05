@@ -779,16 +779,27 @@ mod tests {
 
         #[test]
         fn generic_type_parameters_never_leak_across_declarations() {
-            // Two generic classes: their <T>s must never share a binding
-            // (references/rename on one must not touch the other). Class
-            // declarations carry no scope, so the safe answer is silence.
-            let text = "class Box<T> { value: T }\nclass Bag<T> { item: T }\n";
+            // Two generic classes: each <T> binds into its own class body
+            // (registered by scope label — the parameter list precedes the
+            // body node) and never merges with the neighbor's.
+            let text = "class Box<T> { value: T }\nclass Bag<T> { item: T }\nlet t: T;\n";
             let m = model_for("typescript", text);
-            let box_t = m.binding_at(nth(text, "T>", 0));
-            let bag_t = m.binding_at(nth(text, "T>", 1));
-            if let (Some(a), Some(b)) = (box_t, bag_t) {
-                assert_ne!(a, b, "class type params must not merge at the root");
-            }
+            assert_resolves(&m, text, "T", 1, 0);
+            assert_resolves(&m, text, "T", 3, 2);
+            let box_t = m.binding_at(nth(text, "T", 0)).unwrap();
+            let bag_t = m.binding_at(nth(text, "T", 2)).unwrap();
+            assert_ne!(box_t, bag_t, "class type params must not merge");
+            assert_eq!(
+                m.definition_range_at(nth(text, "T;", 0)),
+                None,
+                "the generic must not escape its class"
+            );
+
+            // Interface generics likewise bind into the interface body.
+            let text = "interface Pair<K> { first: K }\nlet k: K;\n";
+            let m = model_for("typescript", text);
+            assert_resolves(&m, text, "K", 1, 0);
+            assert_eq!(m.definition_range_at(nth(text, "K;", 0)), None);
 
             // Function-level generics live in the function scope and resolve.
             let text = "function id<U>(x: U): U { return x }\nlet u: U;\n";
