@@ -23,6 +23,7 @@ mod tests {
             "c" => tree_sitter_c::LANGUAGE.into(),
             "cpp" => tree_sitter_cpp::LANGUAGE.into(),
             "java" => tree_sitter_java::LANGUAGE.into(),
+            "c_sharp" => tree_sitter_c_sharp::LANGUAGE.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
             "javascript" => tree_sitter_javascript::LANGUAGE.into(),
             "lua" => tree_sitter_lua::LANGUAGE.into(),
@@ -70,6 +71,7 @@ mod tests {
         for lang in [
             "bash",
             "c",
+            "c_sharp",
             "cpp",
             "go",
             "java",
@@ -375,6 +377,71 @@ mod tests {
             let text = "import java.util.List;\nclass K { List l; }\n";
             let m = model_for("java", text);
             assert_resolves(&m, text, "List", 1, 0);
+        }
+    }
+
+    mod c_sharp_fixtures {
+        use super::*;
+
+        #[test]
+        fn members_hoist_and_locals_are_sequential() {
+            let text = "class K { int size; int M(int w) { int t = w; size = t; Run(); return size; } void Run() {} }";
+            let m = model_for("c_sharp", text);
+            assert_resolves(&m, text, "size", 1, 0);
+            assert_resolves(&m, text, "size", 2, 0);
+            let t_def = nth(text, "t =", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "t;", 0)),
+                Some(t_def..t_def + 1)
+            );
+            // The bare call resolves forward to the method.
+            let run_def = nth(text, "Run", 1);
+            assert_eq!(
+                m.definition_range_at(nth(text, "Run", 0)),
+                Some(run_def..run_def + 3)
+            );
+        }
+
+        #[test]
+        fn member_access_resolves_the_object_and_silences_the_member() {
+            let text =
+                "class K { int size; void M(K o) { int x = o.size; o.Run(); } void Run() {} }";
+            let m = model_for("c_sharp", text);
+            let o_def = nth(text, "o)", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "o.", 0)),
+                Some(o_def..o_def + 1)
+            );
+            assert_eq!(m.definition_range_at(nth(text, "size", 1)), None);
+            assert_eq!(m.definition_range_at(nth(text, "Run", 0)), None);
+        }
+
+        #[test]
+        fn class_generics_are_confined_to_their_class() {
+            let text = "class Box<T> { T Id(T x) { return x; } }\nclass Bag<T> { T F() { return default; } }\n";
+            let m = model_for("c_sharp", text);
+            assert_resolves(&m, text, "T", 1, 0);
+            assert_resolves(&m, text, "T", 2, 0);
+            let box_t = m.binding_at(nth(text, "T", 0)).unwrap();
+            let bag_t = m.binding_at(nth(text, "T", 3)).unwrap();
+            assert_ne!(box_t, bag_t, "two classes' <T>s must not merge");
+        }
+
+        #[test]
+        fn foreach_catch_and_lambda_parameters_bind() {
+            let text = "class K { void M() { foreach (var item in K.I()) { item.Use(); } try {} catch (Exception e) { e.Use(); } Func<int,int> f = (n) => n; } }";
+            let m = model_for("c_sharp", text);
+            assert_resolves(&m, text, "item", 1, 0);
+            let e_def = nth(text, "e)", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "e.", 0)),
+                Some(e_def..e_def + 1)
+            );
+            let n_def = nth(text, "n)", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "=> n", 0) + 3),
+                Some(n_def..n_def + 1)
+            );
         }
     }
 
