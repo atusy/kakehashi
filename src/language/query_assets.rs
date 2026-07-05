@@ -34,6 +34,21 @@ mod tests {
             "rust" => tree_sitter_rust::LANGUAGE.into(),
             "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            // tree-sitter-dockerfile 0.2.0 predates the LanguageFn binding
+            // style (its Rust API targets tree-sitter 0.20), so bind the C
+            // symbol its build script links instead of using the crate API.
+            "dockerfile" => {
+                use tree_sitter_dockerfile as _;
+                unsafe extern "C" {
+                    fn tree_sitter_dockerfile() -> *const ();
+                }
+                (unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_dockerfile) })
+                    .into()
+            }
+            // Terraform is HCL syntax: both names validate against the HCL
+            // grammar (the terraform asset inherits hcl).
+            "hcl" | "terraform" => tree_sitter_hcl::LANGUAGE.into(),
+            "haskell" => tree_sitter_haskell::LANGUAGE.into(),
             other => panic!("no grammar for {other}"),
         }
     }
@@ -77,6 +92,7 @@ mod tests {
             "c",
             "c_sharp",
             "cpp",
+            "dockerfile",
             "go",
             "java",
             "javascript",
@@ -966,6 +982,40 @@ mod tests {
                 m.definition_range_at(nth(text, "size", 1)),
                 None,
                 "obj.size is member access, not the global"
+            );
+        }
+    }
+
+    mod dockerfile_fixtures {
+        use super::*;
+
+        #[test]
+        fn stage_names_resolve_and_registry_images_stay_silent() {
+            let text = "FROM ubuntu:22.04 AS builder\nFROM alpine AS runner\nFROM builder\n";
+            let m = model_for("dockerfile", text);
+            // The multi-stage base name resolves to its AS alias...
+            assert_resolves(&m, text, "builder", 1, 0);
+            // ...while real registry images have no stage to bind to.
+            assert_eq!(m.definition_range_at(nth(text, "ubuntu", 0)), None);
+            assert_eq!(m.definition_range_at(nth(text, "alpine", 0)), None);
+        }
+
+        #[test]
+        fn args_and_envs_resolve_in_expansions() {
+            let text = "ARG VERSION=1\nFROM ubuntu:${VERSION}\nENV MODE=fast\nENV COMBO=${MODE}\n";
+            let m = model_for("dockerfile", text);
+            assert_resolves(&m, text, "VERSION", 1, 0);
+            assert_resolves(&m, text, "MODE", 1, 0);
+        }
+
+        #[test]
+        fn an_expansion_before_the_arg_stays_silent() {
+            let text = "FROM ubuntu:${TAG}\nARG TAG=1\n";
+            let m = model_for("dockerfile", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "TAG", 0)),
+                None,
+                "Dockerfiles are sequential: a use above the ARG is undefined"
             );
         }
     }
