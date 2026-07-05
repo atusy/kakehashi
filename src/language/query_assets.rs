@@ -314,8 +314,16 @@ mod tests {
         fn methods_hoist_within_their_class() {
             let text = "class K { int a() { return b(); } int b() { return a(); } }";
             let m = model_for("java", text);
-            assert_resolves(&m, text, "b(", 0, 1);
-            assert_resolves(&m, text, "a(", 1, 0);
+            let b_def = nth(text, "b(", 1);
+            assert_eq!(
+                m.definition_range_at(nth(text, "b(", 0)),
+                Some(b_def..b_def + 1)
+            );
+            let a_def = nth(text, "a(", 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "a(", 1)),
+                Some(a_def..a_def + 1)
+            );
         }
 
         #[test]
