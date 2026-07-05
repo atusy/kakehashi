@@ -22,12 +22,13 @@
  (#set! definition.namespace "type"))
 (enum_declaration name: (identifier) @definition.enum)
 
-; Generic type parameters resolve only where the declaring construct is
-; already a @scope (the function-likes): the definition registers into
-; that scope by containment. Class / interface / type-alias generics stay
-; uncaptured — those declarations carry no scope, and a root-registered
-; binding would merge every same-named <T> in the file into one
-; rename/reference set (silence over a wrong answer).
+; Generic type parameters resolve where the declaring construct is
+; already a @scope (the function-likes, by containment) or where the
+; declaration has a body node the parameter can be registered into by
+; scope label (classes and interfaces — the parameter list precedes the
+; body, so containment alone cannot reach it). Type-alias generics stay
+; uncaptured: an alias has no body node to target (silence over a
+; root-registered binding that would merge every same-named <T>).
 ((function_declaration
    type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
  (#set! definition.namespace "type"))
@@ -42,6 +43,16 @@
  (#set! definition.namespace "type"))
 ((method_definition
    type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
+ (#set! definition.namespace "type"))
+((class_declaration
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type))
+   body: (class_body) @scope.body)
+ (#set! definition.scope "body")
+ (#set! definition.namespace "type"))
+((interface_declaration
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type))
+   body: (interface_body) @scope.body)
+ (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 
 ; ── TypeScript parameter shapes ──────────────────────────────────────────
