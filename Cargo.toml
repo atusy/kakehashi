@@ -135,10 +135,9 @@ tree-sitter-c-sharp = "0.23.5"
 tree-sitter-php = "0.24.2"
 tree-sitter-ruby = "0.23.1"
 tree-sitter-julia = "0.23.1"
-tree-sitter-dockerfile = "0.2.0"
 tree-sitter-hcl = "1.1.0"
 tree-sitter-haskell = "0.23.1"
-tree-sitter-language = "0.1.7"
+tree-sitter-dockerfile = { path = "tests/grammars/tree-sitter-dockerfile" }
 
 # A/B performance comparison of the semantic-tokens hot path across two server
 # binaries (e.g. HEAD vs origin/main). Custom harness (no criterion): it drives

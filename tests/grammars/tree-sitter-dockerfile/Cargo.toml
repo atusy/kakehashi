@@ -1,0 +1,22 @@
+# Vendored from the tree-sitter-dockerfile 0.2.0 crates.io package (MIT,
+# see LICENSE): its published Rust bindings pin tree-sitter 0.20, and
+# linking that crate's bundled runtime next to tree-sitter 0.26 corrupts
+# language-version checks across the whole test binary. This package
+# rebinds the same generated parser through tree-sitter-language, which
+# is runtime-version agnostic. Not part of the kakehashi build — a
+# dev-dependency for validating assets/queries/dockerfile/bindings.scm.
+[package]
+name = "tree-sitter-dockerfile"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"

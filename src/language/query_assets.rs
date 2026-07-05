@@ -34,17 +34,9 @@ mod tests {
             "rust" => tree_sitter_rust::LANGUAGE.into(),
             "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            // tree-sitter-dockerfile 0.2.0 predates the LanguageFn binding
-            // style (its Rust API targets tree-sitter 0.20), so bind the C
-            // symbol its build script links instead of using the crate API.
-            "dockerfile" => {
-                use tree_sitter_dockerfile as _;
-                unsafe extern "C" {
-                    fn tree_sitter_dockerfile() -> *const ();
-                }
-                (unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_dockerfile) })
-                    .into()
-            }
+            // Vendored under tests/grammars/ — the published crate pins an
+            // incompatible tree-sitter runtime (see its Cargo.toml).
+            "dockerfile" => tree_sitter_dockerfile::LANGUAGE.into(),
             // Terraform is HCL syntax: both names validate against the HCL
             // grammar (the terraform asset inherits hcl).
             "hcl" | "terraform" => tree_sitter_hcl::LANGUAGE.into(),
