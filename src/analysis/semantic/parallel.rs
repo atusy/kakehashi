@@ -578,8 +578,11 @@ enum SingleDiscovery {
     /// time), or `None` on the producer path (which stores no query and lets reuse
     /// re-resolve it).
     Region(DiscoveredRegion, Option<std::sync::Arc<tree_sitter::Query>>),
-    /// The injection language/parser isn't loaded yet — a *transient* gap the
-    /// caller taints into `discovery_complete` (never cache such a discovery).
+    /// The injection language/parser isn't loaded yet — a *transient* gap.
+    /// The inline path taints `discovery_complete`; the producer path DROPS
+    /// the region from the stored discovery (sound: the failed load is
+    /// negative-cached until a reload, which bumps the generation and
+    /// invalidates the store).
     Incomplete,
     /// The region is permanently invalid (out-of-bounds byte range) — nothing is
     /// dropped, so discovery stays complete.
@@ -853,9 +856,12 @@ fn rebuild_context<'a>(
 ///   path in v1 (their whole-group contexts aren't part of the owned form yet);
 /// - fewer single regions than the token-cache gate, so caching wouldn't pay and
 ///   the reuse path must stay byte-identical to pre-#529;
-/// - discovery is incomplete (a parser/language isn't loaded yet), matching the
-///   token half's `fully_loaded` gate — never persist a partial region set, or a
-///   later request bound to this tree would see missing tokens until the next edit.
+///
+/// Regions whose language/parser isn't loaded are DROPPED from the stored
+/// discovery rather than tainting it: the inline path would produce no tokens
+/// for them either, and the failed load is negative-cached until a reload —
+/// which bumps the generation, invalidating this discovery — so the store can
+/// never mask a later-loadable region.
 pub(crate) fn build_document_discovery(
     regions: &[InjectionRegionInfo<'_>],
     injection_query: &tree_sitter::Query,
@@ -2954,7 +2960,7 @@ local b = 2
     /// discovery. Here EVERY region is unresolvable, so the stored discovery
     /// is present but empty.
     #[test]
-    fn build_document_discovery_bails_when_injected_language_unresolvable() {
+    fn build_document_discovery_stores_empty_when_every_region_unresolvable() {
         let Some(coordinator) = markdown_lua_coordinator() else {
             return;
         };

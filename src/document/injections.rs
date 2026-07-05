@@ -2,8 +2,10 @@
 //! result (#529 companion lever — "don't discover twice").
 //!
 //! The off-ingress `populate_injections` runs the injection query once over a
-//! freshly parsed tree and, when discovery is complete, records the result here
-//! via [`DocumentStore::set_injections_if_epoch_unchanged`](crate::document::DocumentStore).
+//! freshly parsed tree and records the result here (regions whose injected
+//! language cannot be resolved to a parser are DROPPED from the stored set —
+//! sound because a failed load is negative-cached until a reload, which bumps
+//! the generation and invalidates this discovery).
 //! A later `semanticTokens` request bound to that same tree rebuilds its
 //! injection contexts from this owned data instead of re-running the query — the
 //! query-match loop (`Q`) is the dominant cost of injection discovery, so
@@ -65,13 +67,14 @@ pub(crate) struct DiscoveredRegion {
 /// The complete owned injection discovery for one parse of a document: every
 /// top-level single region plus the settings `generation` it was resolved under.
 ///
-/// Stored on the [`Document`](super::Document) by the off-ingress write-back only
-/// when discovery was *complete* (no region dropped because its injected language
-/// couldn't be resolved to a parser) and the document had no `injection.combined`
-/// group (those keep the inline path in v1), so a present value is always the full
-/// single-region set for the bound tree. A resolvable language whose highlight
-/// query isn't loaded is *not* excluded — the query is re-resolved fresh at reuse,
-/// so that case self-heals rather than persisting an incomplete set.
+/// Stored by the off-ingress write-back with unresolvable regions DROPPED
+/// (their injected language has no parser; the inline path would produce no
+/// tokens for them either, and the failed load is negative-cached until a
+/// reload — which bumps `generation`, invalidating this discovery) and only
+/// when the document had no `injection.combined` group (those keep the inline
+/// path in v1). A resolvable language whose highlight query isn't loaded is
+/// *not* excluded — the query is re-resolved fresh at reuse, so that case
+/// self-heals rather than persisting an incomplete set.
 #[derive(Clone)]
 pub(crate) struct DiscoveredInjections {
     /// Settings generation at discovery time. The reader skips reuse when it no

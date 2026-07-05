@@ -727,37 +727,13 @@ fn ranges_intersect(
         .any(|r| r.start_byte < filter.end && filter.start < r.end_byte)
 }
 
-/// Visit every injection layer of the document in **document-order DFS**: the
-/// host first, then each injection region by ascending start byte, recursing
-/// into nested injections before moving to the next sibling
-/// (captures-protocol §"The `injection` parameter").
-///
-/// `visit` receives the layer's resolved language, its tree (parsed against
-/// the full host text via `set_included_ranges`, so byte coordinates are in
-/// host space), and its depth — the same depth index `injection_stack_at`
-/// assigns, so nodes minted with it resolve through the per-layer Scope rule.
-///
-/// Regions whose grammar is not loaded (or fails to parse) are skipped
-/// silently — discovery and auto-install are the caller's job, via
-/// [`collect_injection_languages_in_document`]. `byte_filter` prunes regions
-/// (and their entire subtrees) that don't intersect the given host-byte range.
-///
-/// Known limitation (#350): when two injection regions at the same depth
-/// **overlap**, the walker visits both, but [`with_resolved_node`] resolves a
-/// minted id by rebuilding the cursor-path stack, which keeps only the
-/// smallest region containing the byte — so an id minted from the larger
-/// sibling may resolve in the **wrong same-depth region** (if that region's
-/// tree happens to hold a node with the identical `(start, end, kind)`) or
-/// return `null` (the protocol's re-acquire signal). Same depth-as-identity
-/// weakness documented in lazy-node-identity-tracking; disjoint same-depth
-/// regions (the norm) are unaffected.
 /// Run the standard layer walk once and collect every injected layer's
 /// parsed tree in document-order DFS (parse-snapshot ADR §3, the layer-tree
-/// half of never-discover-twice): `populate_injections` calls this at parse
-/// time and the result rides the `ParseSnapshot`, so the per-keystroke
-/// captures requests iterate pre-parsed layers instead of re-running the
-/// walk. Byte-identical to the inline walk by construction — it IS the
-/// inline walk, with a collecting visitor.
+/// half of never-discover-twice): the FIRST walking captures request on a
+/// snapshot calls this lazily and the result rides the `ParseSnapshot`, so
+/// subsequent per-keystroke walks iterate pre-parsed layers instead of
+/// re-running the walk. Byte-identical to the inline walk by construction —
+/// it IS the inline walk, with a collecting visitor.
 pub(crate) fn collect_document_layer_trees(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -793,6 +769,30 @@ pub(crate) fn collect_document_layer_trees(
     layers
 }
 
+/// Visit every injection layer of the document in **document-order DFS**: the
+/// host first, then each injection region by ascending start byte, recursing
+/// into nested injections before moving to the next sibling
+/// (captures-protocol §"The `injection` parameter").
+///
+/// `visit` receives the layer's resolved language, its tree (parsed against
+/// the full host text via `set_included_ranges`, so byte coordinates are in
+/// host space), and its depth — the same depth index `injection_stack_at`
+/// assigns, so nodes minted with it resolve through the per-layer Scope rule.
+///
+/// Regions whose grammar is not loaded (or fails to parse) are skipped
+/// silently — discovery and auto-install are the caller's job, via
+/// [`collect_injection_languages_in_document`]. `byte_filter` prunes regions
+/// (and their entire subtrees) that don't intersect the given host-byte range.
+///
+/// Known limitation (#350): when two injection regions at the same depth
+/// **overlap**, the walker visits both, but [`with_resolved_node`] resolves a
+/// minted id by rebuilding the cursor-path stack, which keeps only the
+/// smallest region containing the byte — so an id minted from the larger
+/// sibling may resolve in the **wrong same-depth region** (if that region's
+/// tree happens to hold a node with the identical `(start, end, kind)`) or
+/// return `null` (the protocol's re-acquire signal). Same depth-as-identity
+/// weakness documented in lazy-node-identity-tracking; disjoint same-depth
+/// regions (the norm) are unaffected.
 pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     coordinator: &LanguageCoordinator,
     host_language: &str,

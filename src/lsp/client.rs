@@ -45,19 +45,6 @@ pub(crate) fn check_diagnostic_refresh_support(caps: &ClientCapabilities) -> boo
         .unwrap_or(false)
 }
 
-/// Whether a batch of language events asks for a `workspace/semanticTokens/refresh`.
-///
-/// The refresh request is parameterless and workspace-wide, so every
-/// `SemanticTokensRefresh` event in a single batch is interchangeable: the batch
-/// either wants a refresh or it doesn't. [`ClientNotifier::log_language_events`]
-/// uses this to collapse N refresh events into a single request (#531) — firing N
-/// would only force `(N-1)` redundant workspace re-tokenizations and leak that many
-/// tower-lsp pending entries on a non-responding client.
-///
-/// Extracted as a pure function for unit testing (the notifier cannot be built in
-/// unit tests). Note: this tests the *trigger* (does the batch want a refresh), not
-/// the N→1 *collapse* — the collapse is guaranteed structurally by the single spawn
-/// site in `log_language_events`.
 /// Single-flight state for `workspace/semanticTokens/refresh` (#531): one
 /// in-flight request plus at most one trailing covers any burst of publishes.
 /// Process-global because the server serves exactly one client; reset is
@@ -74,6 +61,19 @@ static REFRESH_FLIGHT: RefreshFlight = RefreshFlight {
     pending: std::sync::atomic::AtomicBool::new(false),
 };
 
+/// Whether a batch of language events asks for a `workspace/semanticTokens/refresh`.
+///
+/// The refresh request is parameterless and workspace-wide, so every
+/// `SemanticTokensRefresh` event in a single batch is interchangeable: the batch
+/// either wants a refresh or it doesn't. [`ClientNotifier::log_language_events`]
+/// uses this to collapse N refresh events into a single request (#531) — firing N
+/// would only force `(N-1)` redundant workspace re-tokenizations and leak that many
+/// tower-lsp pending entries on a non-responding client.
+///
+/// Extracted as a pure function for unit testing (the notifier cannot be built in
+/// unit tests). Note: this tests the *trigger* (does the batch want a refresh), not
+/// the N→1 *collapse* — the collapse is guaranteed structurally by the single spawn
+/// site in `log_language_events`.
 fn batch_requests_semantic_tokens_refresh(events: &[LanguageEvent]) -> bool {
     events
         .iter()
