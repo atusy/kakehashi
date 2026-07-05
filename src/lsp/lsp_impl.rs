@@ -416,8 +416,8 @@ impl Kakehashi {
         let shutdown = self.shutdown_token.clone();
 
         tokio::spawn(async move {
-            // If the loop panics in its glue (the blocking parse is already
-            // panic-isolated by spawn_blocking), this guard clears the stuck
+            // If the loop panics in its glue (the parse work-unit is already
+            // panic-isolated by the compute pool), this guard clears the stuck
             // `parsing` entry on unwind so the next edit re-spawns rather than the
             // document wedging tree-less forever.
             let mut guard = parse_scheduler::ParseLoopGuard::new(

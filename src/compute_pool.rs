@@ -32,11 +32,14 @@ impl ComputePool {
     }
 
     fn with_threads(threads: usize) -> Self {
+        // `build()` fails only when the OS refuses to spawn the worker
+        // threads (resource exhaustion at startup) — the server cannot run
+        // without its compute pool, so aborting is the correct response.
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("kakehashi-compute-{i}"))
             .build()
-            .expect("compute pool construction cannot fail: no stack size or start handler is set");
+            .expect("OS refused to spawn compute-pool threads at startup");
         Self { pool }
     }
 

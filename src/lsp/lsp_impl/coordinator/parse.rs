@@ -194,8 +194,15 @@ impl ParseCoordinator {
     /// may admit a snapshot the legacy CAS rejects — deliberately: a parse of
     /// text an edit has since moved on from is *stale but consistent*, exactly
     /// what serve-stale readers consume, while the legacy tree must stay
-    /// current-text-only. No reader observes the divergence (every reader still
-    /// reads the legacy tree until Stage 2's reader conversion).
+    /// current-text-only. No single reader mixes the two sources (cell readers
+    /// consume the snapshot's own (text, tree); legacy readers snapshot the
+    /// store under one shard Ref), but the publish deliberately precedes the
+    /// legacy CAS: a legacy-tree reader woken by this publish can observe the
+    /// store a beat before the CAS attaches the tree (or after a racing edit
+    /// makes the CAS reject) and read `None` — main's watermark advanced
+    /// strictly after the store write. That window degrades to the reader's
+    /// empty/None fallback and self-heals on the next request; the legacy
+    /// store and its remaining readers go away in Stage 3.
     fn publish_parse_snapshot(
         &self,
         uri: &Url,
@@ -383,13 +390,18 @@ impl ParseCoordinator {
             let language_name_clone = language_name.clone();
 
             let parsed_tree = self
-                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser, deadline| {
-                    let _ = auto_install.begin_parsing(&language_name_clone);
-                    let parse_result =
-                        parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
-                    let _ = auto_install.end_parsing(&language_name_clone);
-                    (parser, parse_result)
-                })
+                .parse_with_pool(
+                    &language_name,
+                    &uri,
+                    text.len(),
+                    move |mut parser, deadline| {
+                        let _ = auto_install.begin_parsing(&language_name_clone);
+                        let parse_result =
+                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
+                        let _ = auto_install.end_parsing(&language_name_clone);
+                        (parser, parse_result)
+                    },
+                )
                 .await;
 
             if let Some(tree) = parsed_tree {
@@ -606,13 +618,18 @@ impl ParseCoordinator {
             // document text is never copied.
             let text_for_parse = text.clone();
             let parsed = self
-                .parse_with_pool(&language_name, &uri, text_len, move |mut parser, deadline| {
-                    let _ = auto_install.begin_parsing(&language_name_clone);
-                    let result =
-                        parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
-                    let _ = auto_install.end_parsing(&language_name_clone);
-                    (parser, result)
-                })
+                .parse_with_pool(
+                    &language_name,
+                    &uri,
+                    text_len,
+                    move |mut parser, deadline| {
+                        let _ = auto_install.begin_parsing(&language_name_clone);
+                        let result =
+                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
+                        let _ = auto_install.end_parsing(&language_name_clone);
+                        (parser, result)
+                    },
+                )
                 .await;
 
             let Some(tree) = parsed else { break };
@@ -756,13 +773,22 @@ impl ParseCoordinator {
         // (`didChange` → `apply_edit_and_seed`), satisfying tree-sitter's contract.
         let text_for_parse = text.clone();
         let parsed = self
-            .parse_with_pool(&language_name, uri, text_len, move |mut parser, deadline| {
-                let _ = auto_install.begin_parsing(&language_name_clone);
-                let result =
-                    parse_text_with_deadline(&mut parser, &text_for_parse, seed.as_ref(), deadline);
-                let _ = auto_install.end_parsing(&language_name_clone);
-                (parser, result)
-            })
+            .parse_with_pool(
+                &language_name,
+                uri,
+                text_len,
+                move |mut parser, deadline| {
+                    let _ = auto_install.begin_parsing(&language_name_clone);
+                    let result = parse_text_with_deadline(
+                        &mut parser,
+                        &text_for_parse,
+                        seed.as_ref(),
+                        deadline,
+                    );
+                    let _ = auto_install.end_parsing(&language_name_clone);
+                    (parser, result)
+                },
+            )
             .await;
 
         let mut events = load_result.events;
