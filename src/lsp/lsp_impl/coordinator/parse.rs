@@ -14,6 +14,42 @@ use crate::lsp::settings_manager::SettingsManager;
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Host-parse with a wall-clock abort wired into tree-sitter's progress
+/// callback.
+///
+/// `parse_with_pool`'s `tokio::time::timeout` only abandons the *awaiter*;
+/// without an in-parse abort the native `ts_parser_parse` call kept running,
+/// pinning a bounded-pool thread for as long as a pathological parse takes —
+/// and the pool is sized as low as ONE thread on small hosts, where that
+/// single pin stalls every document's tree-CPU server-wide. Breaking out of
+/// the progress callback makes the work-unit itself return shortly after the
+/// deadline, reclaiming the thread. An aborted parser is `reset()` so it
+/// carries no half-parse state back into the parser pool.
+fn parse_text_with_deadline(
+    parser: &mut tree_sitter::Parser,
+    text: &str,
+    old_tree: Option<&tree_sitter::Tree>,
+    deadline: std::time::Instant,
+) -> Option<tree_sitter::Tree> {
+    let bytes = text.as_bytes();
+    let mut on_progress = |_: &tree_sitter::ParseState| {
+        if std::time::Instant::now() >= deadline {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let result = parser.parse_with_options(
+        &mut |i, _| bytes.get(i..).unwrap_or(&[]),
+        old_tree,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut on_progress)),
+    );
+    if result.is_none() {
+        parser.reset();
+    }
+    result
+}
+
 pub(super) struct ParseCoordinatorDeps {
     pub(super) client: Client,
     pub(super) language: std::sync::Arc<LanguageCoordinator>,
@@ -71,7 +107,9 @@ impl ParseCoordinator {
     /// work-unit on the bounded compute pool, with timeout.
     ///
     /// The caller provides the actual parse logic via `parse_fn`, which receives a
-    /// `tree_sitter::Parser` and must return it along with an optional result.
+    /// `tree_sitter::Parser` plus the work-unit's wall-clock deadline (feed it to
+    /// [`parse_text_with_deadline`]) and must return the parser along with an
+    /// optional result.
     /// The `parser_pool` sync mutex is acquired **only on the pool thread** (the
     /// parse-snapshot ADR's Stage-1 obligation: a tokio worker must never block on
     /// a mutex a compute thread holds), briefly around acquire and release; the
@@ -82,8 +120,11 @@ impl ParseCoordinator {
     /// Returns `None` if:
     /// - No parser is available for the language
     /// - The parse work-unit panicked
-    /// - The parse timed out after `PARSE_TIMEOUT` (the work-unit keeps running
-    ///   and still releases the parser, but the result is discarded)
+    /// - The parse timed out after `PARSE_TIMEOUT` — the native parse aborts
+    ///   itself at the same deadline via tree-sitter's progress callback, so a
+    ///   pathological parse cannot pin a bounded-pool thread past the timeout
+    ///   (the pool is sized as low as ONE thread on small hosts, where a pinned
+    ///   thread would stall every document's tree-CPU)
     /// - The closure returned `None`
     pub(crate) async fn parse_with_pool<T, F>(
         &self,
@@ -93,13 +134,19 @@ impl ParseCoordinator {
         parse_fn: F,
     ) -> Option<T>
     where
-        F: FnOnce(tree_sitter::Parser) -> (tree_sitter::Parser, Option<T>) + Send + 'static,
+        F: FnOnce(tree_sitter::Parser, std::time::Instant) -> (tree_sitter::Parser, Option<T>)
+            + Send
+            + 'static,
         T: Send + 'static,
     {
         use crate::error::LockResultExt;
 
         let parser_pool = std::sync::Arc::clone(&self.parser_pool);
         let language_name_owned = language_name.to_string();
+        // One deadline for both halves: the awaiter's timeout below and the
+        // work-unit's in-parse abort. Anchored at submission, so pool-queue
+        // wait counts against it on both sides.
+        let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
         let result = tokio::time::timeout(
             PARSE_TIMEOUT,
             self.compute_pool.run(None, move || {
@@ -107,7 +154,7 @@ impl ParseCoordinator {
                     .lock()
                     .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
                     .acquire(&language_name_owned)?;
-                let (parser, value) = parse_fn(parser);
+                let (parser, value) = parse_fn(parser, deadline);
                 parser_pool
                     .lock()
                     .recover_poison("ParseCoordinator::parse_with_pool(release)")
@@ -336,9 +383,10 @@ impl ParseCoordinator {
             let language_name_clone = language_name.clone();
 
             let parsed_tree = self
-                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
+                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser, deadline| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
-                    let parse_result = parser.parse(&*text_for_parse, None);
+                    let parse_result =
+                        parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
                     let _ = auto_install.end_parsing(&language_name_clone);
                     (parser, parse_result)
                 })
@@ -558,9 +606,10 @@ impl ParseCoordinator {
             // document text is never copied.
             let text_for_parse = text.clone();
             let parsed = self
-                .parse_with_pool(&language_name, &uri, text_len, move |mut parser| {
+                .parse_with_pool(&language_name, &uri, text_len, move |mut parser, deadline| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
-                    let result = parser.parse(&*text_for_parse, None);
+                    let result =
+                        parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
                     let _ = auto_install.end_parsing(&language_name_clone);
                     (parser, result)
                 })
@@ -707,9 +756,10 @@ impl ParseCoordinator {
         // (`didChange` → `apply_edit_and_seed`), satisfying tree-sitter's contract.
         let text_for_parse = text.clone();
         let parsed = self
-            .parse_with_pool(&language_name, uri, text_len, move |mut parser| {
+            .parse_with_pool(&language_name, uri, text_len, move |mut parser, deadline| {
                 let _ = auto_install.begin_parsing(&language_name_clone);
-                let result = parser.parse(&*text_for_parse, seed.as_ref());
+                let result =
+                    parse_text_with_deadline(&mut parser, &text_for_parse, seed.as_ref(), deadline);
                 let _ = auto_install.end_parsing(&language_name_clone);
                 (parser, result)
             })
@@ -776,5 +826,37 @@ impl ParseCoordinator {
 
     fn notifier(&self) -> ClientNotifier<'_> {
         build_notifier(&self.client, &self.settings_manager)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The deadline must actually abort the native parse (an expired one
+    /// yields `None` fast) and must not poison the parser for reuse.
+    #[test]
+    fn parse_text_with_deadline_aborts_when_expired_and_parses_within_it() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        // Large enough that tree-sitter fires the progress callback at least
+        // once before completing.
+        let text = "fn f() { let x = 1 + 2 * 3; }\n".repeat(4000);
+
+        let expired = std::time::Instant::now();
+        let started = std::time::Instant::now();
+        let aborted = parse_text_with_deadline(&mut parser, &text, None, expired);
+        assert!(aborted.is_none(), "an expired deadline aborts the parse");
+        assert!(
+            started.elapsed() < PARSE_TIMEOUT,
+            "the abort happens in-parse, not after the full parse"
+        );
+
+        // The reset parser is immediately reusable on the same input.
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let parsed = parse_text_with_deadline(&mut parser, &text, None, future);
+        assert!(parsed.is_some(), "a live deadline parses normally");
     }
 }
