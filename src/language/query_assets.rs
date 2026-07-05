@@ -21,6 +21,7 @@ mod tests {
         match name {
             "bash" => tree_sitter_bash::LANGUAGE.into(),
             "c" => tree_sitter_c::LANGUAGE.into(),
+            "cpp" => tree_sitter_cpp::LANGUAGE.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
             "javascript" => tree_sitter_javascript::LANGUAGE.into(),
             "lua" => tree_sitter_lua::LANGUAGE.into(),
@@ -65,7 +66,16 @@ mod tests {
     /// the inherited JS class pattern is impossible against the TS grammar.
     #[test]
     fn assets_compile_without_skipped_patterns() {
-        for lang in ["bash", "c", "go", "javascript", "lua", "python", "rust"] {
+        for lang in [
+            "bash",
+            "c",
+            "cpp",
+            "go",
+            "javascript",
+            "lua",
+            "python",
+            "rust",
+        ] {
             let source = resolved_source(lang);
             tree_sitter::Query::new(&language_of(lang), &source)
                 .unwrap_or_else(|e| panic!("{lang} bindings.scm must compile in full: {e}"));
@@ -204,6 +214,68 @@ mod tests {
                 m.definition_range_at(type_use),
                 Some(type_def..type_def + 6)
             );
+        }
+    }
+
+    mod cpp_fixtures {
+        use super::*;
+
+        #[test]
+        fn inherited_c_rules_apply() {
+            let text = "int main(void) { int total = 1; { int total = 2; total; } total; }";
+            let m = model_for("cpp", text);
+            assert_resolves(&m, text, "total", 2, 1);
+            assert_resolves(&m, text, "total", 3, 0);
+        }
+
+        #[test]
+        fn template_type_parameters_stay_in_their_function() {
+            let text = "template <typename T>\nT id(T x) { return x; }\nT t;\n";
+            let m = model_for("cpp", text);
+            // The return type and the parameter type read the template param...
+            assert_resolves(&m, text, "T", 1, 0);
+            assert_resolves(&m, text, "T", 2, 0);
+            // ...and it never escapes the function.
+            assert_eq!(m.definition_range_at(nth(text, "T", 3)), None);
+        }
+
+        #[test]
+        fn template_type_parameters_never_leak_across_declarations() {
+            let text = "template <typename T> T f(T a) { return a; }\ntemplate <typename T> T g(T b) { return b; }\n";
+            let m = model_for("cpp", text);
+            let f_t = m.binding_at(nth(text, "T a", 0));
+            let g_t = m.binding_at(nth(text, "T b", 0));
+            if let (Some(a), Some(b)) = (f_t, g_t) {
+                assert_ne!(a, b, "two templates' <T>s must not merge");
+            }
+        }
+
+        #[test]
+        fn class_names_and_aliases_resolve_as_types_members_stay_silent() {
+            let text = "class Box { public: int size; };\nusing box_t = Box;\nvoid f(box_t b) { b.size; }\n";
+            let m = model_for("cpp", text);
+            assert_resolves(&m, text, "Box", 1, 0);
+            assert_resolves(&m, text, "box_t", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "size", 1)),
+                None,
+                "member access is never a lexical reference"
+            );
+        }
+
+        #[test]
+        fn lambda_parameters_and_range_for_bind() {
+            let text = "void f() { auto fn = [](int n) { return n; }; for (int v : vs) { v; } }";
+            let m = model_for("cpp", text);
+            assert_resolves(&m, text, "n)", 1, 0);
+            assert_resolves(&m, text, "v", 1, 0);
+        }
+
+        #[test]
+        fn reference_declarators_bind() {
+            let text = "void f(int a) { int &r = a; r; }";
+            let m = model_for("cpp", text);
+            assert_resolves(&m, text, "r", 1, 0);
         }
     }
 
