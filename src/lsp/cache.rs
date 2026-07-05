@@ -264,10 +264,14 @@ impl CacheCoordinator {
         let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
             None => {
-                // No injection query = no injections to track
-                // Clear any stale injection caches
-                self.injection_map.clear(uri);
-                self.injection_token_cache.clear_document(uri);
+                // No injection query = no injections to track. Clear any
+                // stale injection caches — but only when no edit landed
+                // during this pass (a stale pass must not clobber state the
+                // newer text's own populate maintains).
+                let _ = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                    self.injection_map.clear(uri);
+                    self.injection_token_cache.clear_document(uri);
+                });
                 return PopulatedInjections::empty(generation);
             }
         };
@@ -277,9 +281,12 @@ impl CacheCoordinator {
             collect_all_injections(&tree.root_node(), text, Some(injection_query.as_ref()))
         {
             if regions.is_empty() {
-                // Clear any existing regions and caches for this document
-                self.injection_map.clear(uri);
-                self.injection_token_cache.clear_document(uri);
+                // Clear any existing regions and caches for this document —
+                // epoch-gated like the commit below.
+                let _ = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                    self.injection_map.clear(uri);
+                    self.injection_token_cache.clear_document(uri);
+                });
                 return PopulatedInjections::empty(generation);
             }
 
@@ -416,25 +423,31 @@ impl CacheCoordinator {
                 generation,
             );
 
-            // Exit half of the mint reconciliation: an edit (or close/reopen)
-            // landed during this pass — its coordinates are superseded. Purge
+            // Exit half of the mint reconciliation, atomic with coordinate
+            // shifts: the commit runs under the tracker entry's shared lock
+            // and only while the (shift generation, cleanup epoch) latch
+            // still matches — an edit (or close/reopen) that landed during
+            // this pass fails the check INSIDE the lock, so a shift can
+            // never interleave between check and commit. On mismatch, purge
             // exactly this pass's tracker creations (the base invariant: a
             // stale pass never leaves wrong-space entries as live), keep the
             // injection map's previous entry (the newer text's own populate
             // replaces it), and withhold the region-id-bearing products; the
-            // snapshot then rides without regions and every reader falls back
-            // inline, byte-identically to the pre-lever path. The token-cache
-            // evictions this pass already performed are conservative
-            // (idempotent removes) and need no rollback.
-            if tracker.mint_epoch(uri) != entry_mint_epoch {
+            // snapshot then rides without regions and every reader falls
+            // back inline, byte-identically to the pre-lever path. The
+            // token-cache evictions this pass already performed are
+            // conservative (idempotent removes) and need no rollback.
+            let committed = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                // Commit point: store the region set the token-cache
+                // bookkeeping (reanchor/eviction) keys off.
+                self.injection_map.insert(uri.clone(), cacheable_regions);
+            });
+            if committed.is_none() {
                 for id in &minted_ids {
                     tracker.remove_id(uri, id);
                 }
                 return PopulatedInjections::empty(generation);
             }
-            // Commit point: store the region set the token-cache bookkeeping
-            // (reanchor/eviction) keys off.
-            self.injection_map.insert(uri.clone(), cacheable_regions);
             return PopulatedInjections {
                 discovery,
                 bridge_regions,

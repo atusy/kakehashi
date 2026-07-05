@@ -100,6 +100,16 @@ pub(super) async fn apply_shared_settings(
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
 ) {
+    // TRANSITIONAL generation bump BEFORE any query/config mutation: from
+    // this instant, every generation-stamped product built from the OLD
+    // queries (snapshot-riding discovery/bridge/resolved regions, layer
+    // trees, kind queries, walk memos) stops matching and consumers fall
+    // back inline — without it, `load_settings` swaps the queries first and
+    // the (possibly long: `propagate_settings` awaits the network) window
+    // until the post-reload bump kept serving old-query products as current.
+    // The second bump below then also invalidates anything a racing request
+    // built MID-swap against a half-updated query set.
+    cache.bump_semantic_token_generation();
     let summary = language.load_settings(&settings);
     // Path c: push the new per-server settings to live downstream connections
     // at this single reload choke point (initialize, didChangeConfiguration,
@@ -118,15 +128,17 @@ pub(super) async fn apply_shared_settings(
         None => settings_manager.apply_settings(settings),
     }
     // A settings/query reload can change tokenization for unchanged text, so bump
-    // the semantic-token cache generation — otherwise a repeat request on an
-    // unedited document would serve tokens from the old queries. Done at this single
-    // choke point so every reload path (initialize, didChangeConfiguration, and the
-    // auto-install reload) is covered, and *before* the refresh below so the editor's
-    // re-request recomputes. The generation bump (not a bare clear) also defeats a
-    // request that was mid-tokenization across the reload and stores afterwards: it
-    // captured the old generation, so its entry can't be served post-reload.
-    // `didChange` deliberately does NOT invalidate (delta needs the previous tokens);
-    // only a query/config reload does.
+    // the semantic-token cache generation again — the transitional bump above
+    // covered products built from the OLD queries; this one covers anything a
+    // racing request built DURING the swap against a half-updated query set.
+    // Done at this single choke point so every reload path (initialize,
+    // didChangeConfiguration, and the auto-install reload) is covered, and
+    // *before* the refresh below so the editor's re-request recomputes. The
+    // generation bump (not a bare clear) also defeats a request that was
+    // mid-tokenization across the reload and stores afterwards: it captured
+    // an old generation, so its entry can't be served post-reload.
+    // `didChange` deliberately does NOT invalidate (delta needs the previous
+    // tokens); only a query/config reload does.
     cache.bump_semantic_token_generation();
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)

@@ -722,6 +722,36 @@ impl NodeTracker {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
+    /// Run `commit` only if `uri`'s (shift generation, cleanup epoch) still
+    /// equals `expected` — checked while HOLDING the tracker entry's shared
+    /// lock, which coordinate shifts (`apply_*_edits`) and `cleanup` acquire
+    /// exclusively: a commit that passes the check therefore serializes
+    /// strictly BEFORE any concurrent shift, closing the check-to-commit
+    /// window a bare re-read would leave. Returns `None` without running
+    /// `commit` on a mismatch. (For a URI with no tracker entry yet there is
+    /// no lock to hold; the residual first-ever-edit interleave only affects
+    /// callers committing conservative clears.)
+    ///
+    /// `commit` MUST NOT touch this tracker: it runs while this method holds
+    /// the entry's shared lock, so any re-entrant `get_mut`/`entry` on the
+    /// same URI would self-deadlock.
+    pub(crate) fn commit_if_unshifted<R>(
+        &self,
+        uri: &Url,
+        expected: (u64, u64),
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let entry = self.entries.get(uri);
+        let shift_gen = entry.as_ref().map(|e| e.shift_gen).unwrap_or(0);
+        let epoch = self
+            .cleanup_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if (shift_gen, epoch) != expected {
+            return None;
+        }
+        Some(commit())
+    }
+
     /// The (per-URI shift generation, global cleanup epoch) pair the
     /// serve-stale walks latch alongside their currency check and compare at
     /// exit: a mismatch in either half means the mint landed in a superseded
