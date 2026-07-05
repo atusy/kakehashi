@@ -911,7 +911,7 @@ mod tests {
             // Julia closures capture enclosing globals...
             assert_resolves(&m, text, "total", 1, 0);
             // ...but the function's local never escapes.
-            assert_eq!(m.definition_range_at(nth(text, "t\n", 1)), None);
+            assert_eq!(m.definition_range_at(nth(text, "t\n", 0)), None);
         }
 
         #[test]
