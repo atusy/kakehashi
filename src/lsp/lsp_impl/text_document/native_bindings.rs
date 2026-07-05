@@ -476,11 +476,13 @@ mod tests {
             .language
             .query_store()
             .insert_injection_query("markdown".to_string(), Arc::new(injection_query));
-        let lua_bindings = Query::new(
-            &tree_sitter_lua::LANGUAGE.into(),
-            crate::language::embedded_queries::embedded_bindings_query("lua").unwrap(),
-        )
+        let lua_bindings_source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/queries/lua/bindings.scm"
+        ))
         .unwrap();
+        let lua_bindings =
+            Query::new(&tree_sitter_lua::LANGUAGE.into(), &lua_bindings_source).unwrap();
         server
             .language
             .query_store()

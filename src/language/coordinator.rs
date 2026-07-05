@@ -1164,24 +1164,6 @@ impl LanguageCoordinator {
         // Process unified queries field if present
         if let Some(queries) = &config.queries {
             events.extend(self.load_unified_queries(lang_name, queries, language));
-            // An explicit queries list overrides disk sources, but the
-            // embedded bindings corpus still backstops a list that carries no
-            // bindings entry (lexical-name-resolution ADR: languages work out
-            // of the box). Empty search paths make the loader's disk lookup
-            // miss straight into the embedded fallback.
-            if self.query_store().bindings_query(lang_name).is_none() {
-                self.load_query(
-                    language,
-                    &[] as &[PathBuf],
-                    QueryLoadContext {
-                        language_id: lang_name,
-                        query_kind: QueryKind::Bindings,
-                    },
-                    "Loaded embedded",
-                    &mut events,
-                    |store, q| store.insert_bindings_query(lang_name.to_string(), q),
-                );
-            }
             return events;
         }
 
@@ -1193,20 +1175,6 @@ impl LanguageCoordinator {
                 lang_name,
                 "Loaded from search paths",
                 &mut events,
-            );
-        } else {
-            // No search paths at all: the embedded bindings corpus still
-            // applies (same empty-bases trick as above).
-            self.load_query(
-                language,
-                &[] as &[PathBuf],
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_kind: QueryKind::Bindings,
-                },
-                "Loaded embedded",
-                &mut events,
-                |store, q| store.insert_bindings_query(lang_name.to_string(), q),
             );
         }
 
@@ -1810,25 +1778,25 @@ mod tests {
     }
 
     #[test]
-    fn embedded_bindings_load_when_search_paths_have_none() {
+    fn bindings_query_stays_absent_without_disk_sources() {
         let coordinator = LanguageCoordinator::new();
         coordinator
             .language_registry_for_parallel()
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
         let language = coordinator.language_registry.get("rust").unwrap();
 
-        // Empty search paths, no unified queries: the embedded corpus is the
-        // fallback (lexical-name-resolution ADR, "Asset distribution").
+        // No search paths, no unified queries: nothing is bundled into the
+        // binary, so the native layer stays silent for this language.
         let config = crate::config::settings::LanguageSettings::default();
         let _events = coordinator.load_queries_for_language("rust", &config, &[], &language);
         assert!(
-            coordinator.bindings_query("rust").is_some(),
-            "embedded rust bindings.scm must load with no disk sources"
+            coordinator.bindings_query("rust").is_none(),
+            "no bindings.scm may appear out of thin air"
         );
     }
 
     #[test]
-    fn search_path_bindings_override_embedded() {
+    fn search_path_bindings_load() {
         use std::io::Write;
 
         let coordinator = LanguageCoordinator::new();
@@ -1837,7 +1805,6 @@ mod tests {
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
         let language = coordinator.language_registry.get("rust").unwrap();
 
-        // A user bindings.scm in a search path wins over the embedded asset.
         let temp_dir = tempfile::TempDir::new().unwrap();
         let lang_dir = temp_dir.path().join("queries").join("rust");
         std::fs::create_dir_all(&lang_dir).unwrap();
@@ -1852,40 +1819,7 @@ mod tests {
             &language,
         );
         let query = coordinator.bindings_query("rust").expect("loaded");
-        assert_eq!(
-            query.pattern_count(),
-            1,
-            "the single-pattern user file must win over the embedded corpus"
-        );
-    }
-
-    #[test]
-    fn unified_queries_without_bindings_entry_still_get_embedded_corpus() {
-        use std::io::Write;
-
-        let coordinator = LanguageCoordinator::new();
-        coordinator
-            .language_registry_for_parallel()
-            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
-        let language = coordinator.language_registry.get("rust").unwrap();
-
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let highlights_path = temp_dir.path().join("highlights.scm");
-        let mut highlights = std::fs::File::create(&highlights_path).unwrap();
-        writeln!(highlights, "(identifier) @variable").unwrap();
-
-        let config = crate::config::settings::LanguageSettings {
-            queries: Some(vec![crate::config::settings::QueryItem {
-                path: highlights_path.to_str().unwrap().to_string(),
-                kind: None,
-            }]),
-            ..Default::default()
-        };
-        let _events = coordinator.load_queries_for_language("rust", &config, &[], &language);
-        assert!(
-            coordinator.bindings_query("rust").is_some(),
-            "an explicit queries list without a bindings entry keeps the embedded fallback"
-        );
+        assert_eq!(query.pattern_count(), 1);
     }
 
     // Tests for base resolution

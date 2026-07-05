@@ -1,30 +1,21 @@
-//! Kakehashi-authored query assets embedded at build time.
-//!
-//! The `bindings.scm` corpus has no upstream source (the vocabulary is
-//! kakehashi-owned — lexical-name-resolution ADR, "Asset distribution"), so
-//! the assets live in-repo under `assets/queries/<lang>/bindings.scm` and are
-//! compiled into the binary. They serve as the fallback behind `searchPaths`:
-//! a user-provided file wins, per file, including for `; inherits:` parents.
-
-/// The embedded `bindings.scm` for a language, if kakehashi ships one.
-pub(crate) fn embedded_bindings_query(lang_name: &str) -> Option<&'static str> {
-    match lang_name {
-        "bash" => Some(include_str!("../../assets/queries/bash/bindings.scm")),
-        "go" => Some(include_str!("../../assets/queries/go/bindings.scm")),
-        "javascript" => Some(include_str!("../../assets/queries/javascript/bindings.scm")),
-        "lua" => Some(include_str!("../../assets/queries/lua/bindings.scm")),
-        "python" => Some(include_str!("../../assets/queries/python/bindings.scm")),
-        "rust" => Some(include_str!("../../assets/queries/rust/bindings.scm")),
-        "typescript" => Some(include_str!("../../assets/queries/typescript/bindings.scm")),
-        _ => None,
-    }
-}
+//! Test-only validation of the experimental in-repo query assets
+//! (`assets/queries/<lang>/bindings.scm`). The assets are not part of the
+//! build: at runtime `bindings.scm` loads from `searchPaths` like any other
+//! query file. These tests pin each asset to the grammar it targets.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::analysis::bindings::collect::collect;
     use crate::analysis::bindings::model::BindingsModel;
+
+    /// The on-disk `bindings.scm` asset for a language.
+    fn asset_source(lang_name: &str) -> String {
+        let path = format!(
+            "{}/assets/queries/{lang_name}/bindings.scm",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    }
 
     fn language_of(name: &str) -> tree_sitter::Language {
         match name {
@@ -40,9 +31,9 @@ mod tests {
     }
 
     /// The asset source with `; inherits:` parents concatenated from the
-    /// embedded corpus, mirroring the loader's resolution.
+    /// on-disk assets, mirroring the loader's resolution.
     fn resolved_source(lang: &str) -> String {
-        let source = embedded_bindings_query(lang).expect("asset is embedded");
+        let source = asset_source(lang);
         let mut combined = String::new();
         if let Some(first_line) = source.lines().next()
             && let Some(parents) = first_line.strip_prefix("; inherits:")
@@ -52,21 +43,20 @@ mod tests {
                 combined.push('\n');
             }
         }
-        combined.push_str(source);
+        combined.push_str(&source);
         combined
     }
 
-    /// Every embedded asset must compile in full against the grammar it
+    /// Every asset must compile in full against the grammar it
     /// targets — a pattern silently dropped by tolerant compilation would be
     /// a dead rule nobody notices. TypeScript is the sanctioned exception:
     /// the inherited JS class pattern is impossible against the TS grammar.
     #[test]
-    fn embedded_assets_compile_without_skipped_patterns() {
+    fn assets_compile_without_skipped_patterns() {
         for lang in ["bash", "go", "javascript", "lua", "python", "rust"] {
             let source = resolved_source(lang);
-            tree_sitter::Query::new(&language_of(lang), &source).unwrap_or_else(|e| {
-                panic!("embedded {lang} bindings.scm must compile in full: {e}")
-            });
+            tree_sitter::Query::new(&language_of(lang), &source)
+                .unwrap_or_else(|e| panic!("{lang} bindings.scm must compile in full: {e}"));
         }
         // TypeScript compiles through the tolerant path: the inherited
         // JavaScript class/parameter patterns are impossible against the TS

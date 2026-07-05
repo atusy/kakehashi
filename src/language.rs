@@ -1,6 +1,5 @@
 pub(crate) mod config_store;
 pub(crate) mod coordinator;
-pub(crate) mod embedded_queries;
 pub(crate) mod events;
 pub(crate) mod failed_parsers;
 pub(crate) mod filetypes;
@@ -10,6 +9,8 @@ pub(crate) mod loader;
 pub(crate) mod node_tracker;
 pub(crate) mod parser_pool;
 pub(crate) mod predicate_accessor;
+#[cfg(test)]
+pub(crate) mod query_assets;
 pub(crate) mod query_exec;
 pub(crate) mod query_loader;
 pub(crate) mod query_pattern_splitter;

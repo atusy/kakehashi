@@ -2,7 +2,8 @@
 //! (lexical-name-resolution ADR) over the real LSP protocol.
 //!
 //! No bridge server is configured: definition / references / rename answers
-//! come from the embedded lua `bindings.scm` and the tree-sitter tree alone.
+//! come from the in-repo lua `bindings.scm` (served via `searchPaths` — the
+//! assets are not bundled into the binary) and the tree-sitter tree alone.
 //!
 //! Run with: `cargo test --test e2e_native_definition --features e2e`
 
@@ -16,6 +17,17 @@ use serde_json::json;
 const LUA_SOURCE: &str = "local greeting = \"hi\"\nprint(greeting)\n";
 const URI: &str = "file:///native_bindings_test.lua";
 
+/// `searchPaths` serving the in-repo experimental `bindings.scm` assets,
+/// plus the data dir for parsers and the other query kinds.
+fn init_options() -> serde_json::Value {
+    json!({
+        "searchPaths": [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets"),
+            "${KAKEHASHI_DATA_DIR}"
+        ]
+    })
+}
+
 fn client_with_open_doc() -> LspClient {
     let mut client = LspClient::new();
     client.send_request(
@@ -23,7 +35,8 @@ fn client_with_open_doc() -> LspClient {
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": {}
+            "capabilities": {},
+            "initializationOptions": init_options()
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -89,7 +102,8 @@ fn native_definition_resolves_inside_markdown_lua_block() {
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": {}
+            "capabilities": {},
+            "initializationOptions": init_options()
         }),
     );
     client.send_notification("initialized", json!({}));
