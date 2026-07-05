@@ -48,12 +48,12 @@ The obvious prior art is nvim-treesitter's `locals.scm`
 A compatibility-superset was considered and rejected (see Considered Options);
 this record defines a kakehashi-owned spec instead.
 
-Current code state: `QueryKind::Locals` exists end-to-end (config inference,
-coordinator loading, `QueryStore` storage, auto-install via `QUERY_FILES`)
-but **no feature consumes it** — `QueryStore::locals_query()` has no callers
-outside the store. The slot is dead weight from an earlier intent, and its
-installed content is ecosystem `locals.scm` files written against the
-nvim-treesitter vocabulary.
+Code state before this decision: `QueryKind::Locals` existed end-to-end
+(config inference, coordinator loading, `QueryStore` storage, auto-install
+via `QUERY_FILES`) but **no feature consumed it** —
+`QueryStore::locals_query()` had no callers outside the store. The slot was
+dead weight from an earlier intent, and its installed content was ecosystem
+`locals.scm` files written against the nvim-treesitter vocabulary.
 
 ## Decision
 
