@@ -257,6 +257,7 @@ pub(crate) fn collect(text: &str, root: Node, query: &Query) -> Collection {
     };
 
     let capture_names = query.capture_names();
+    let mut definition_nodes: HashSet<(usize, usize)> = HashSet::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(query, root, text.as_bytes());
 
@@ -301,18 +302,31 @@ pub(crate) fn collect(text: &str, root: Node, query: &Query) -> Collection {
 
             match base {
                 "scope" => {
+                    let visible_to_nested =
+                        match property(props, "scope.visible-to-nested", capture.index) {
+                            None | Some("true") => true,
+                            Some("false") => false,
+                            Some(other) => {
+                                log::debug!(
+                                    target: "kakehashi::bindings",
+                                    "dropping @scope: invalid scope.visible-to-nested '{}'",
+                                    other
+                                );
+                                continue;
+                            }
+                        };
                     collection.scopes.push(ScopeCapture {
                         byte_range,
                         label: label.map(str::to_string),
                         inherits: parse_inherits(property(props, "scope.inherits", capture.index)),
-                        visible_to_nested: property(
-                            props,
-                            "scope.visible-to-nested",
-                            capture.index,
-                        ) != Some("false"),
+                        visible_to_nested,
                     });
                 }
                 "definition" => {
+                    // Every @definition-authored node is barred from the
+                    // reference set, valid or not: a dropped definition must
+                    // silence, not resolve outward as a blanket reference.
+                    definition_nodes.insert((byte_range.start, byte_range.end));
                     let Some(name) = node_text() else { continue };
                     let Some(scope_target) =
                         parse_scope_target(property(props, "definition.scope", capture.index))
@@ -398,17 +412,13 @@ pub(crate) fn collect(text: &str, root: Node, query: &Query) -> Collection {
         }
     }
 
-    // A node registered as a definition site never enters the reference set:
-    // the blanket `(identifier) @reference` form is expected, so definition
-    // nodes are excluded at collection.
-    let definition_ranges: HashSet<(usize, usize)> = collection
-        .definitions
-        .iter()
-        .map(|d| (d.byte_range.start, d.byte_range.end))
-        .collect();
+    // A node captured as @definition never enters the reference set — even
+    // when the definition itself was dropped for an invalid property: the
+    // blanket `(identifier) @reference` form is expected, and a declaration
+    // site resolving outward would be a wrong answer, not silence.
     collection
         .references
-        .retain(|r| !definition_ranges.contains(&(r.byte_range.start, r.byte_range.end)));
+        .retain(|r| !definition_nodes.contains(&(r.byte_range.start, r.byte_range.end)));
 
     collection
 }
