@@ -44,6 +44,7 @@ mod tests {
             "yaml" => tree_sitter_yaml::LANGUAGE.into(),
             "css" => tree_sitter_css::LANGUAGE.into(),
             "r" => tree_sitter_r::LANGUAGE.into(),
+            "nix" => tree_sitter_nix::LANGUAGE.into(),
             other => panic!("no grammar for {other}"),
         }
     }
@@ -96,6 +97,7 @@ mod tests {
             "javascript",
             "julia",
             "lua",
+            "nix",
             "php",
             "python",
             "r",
@@ -1195,6 +1197,48 @@ mod tests {
             assert_eq!(m.definition_range_at(nth(text, "size", 1)), None);
             assert_eq!(m.definition_range_at(nth(text, "size", 2)), None);
             assert_resolves(&m, text, "size", 3, 0);
+        }
+    }
+
+    mod nix_fixtures {
+        use super::*;
+
+        #[test]
+        fn let_bindings_are_mutually_recursive() {
+            let text = "let a = b; b = 1; in a\n";
+            let m = model_for("nix", text);
+            // letrec: the earlier binding's body reads the later one...
+            assert_resolves(&m, text, "b", 0, 1);
+            // ...and the in-expression reads the binding.
+            assert_resolves(&m, text, "a", 1, 0);
+        }
+
+        #[test]
+        fn formals_bind_including_defaults_referencing_siblings() {
+            let text = "{ pkgs, lib ? pkgs, ... }: pkgs + lib\n";
+            let m = model_for("nix", text);
+            assert_resolves(&m, text, "pkgs", 1, 0);
+            assert_resolves(&m, text, "pkgs", 2, 0);
+            assert_resolves(&m, text, "lib", 1, 0);
+        }
+
+        #[test]
+        fn rec_attrsets_bind_and_plain_attrsets_stay_silent() {
+            let text = "let s = rec { a = 1; b = a; }; t = { c = 1; d = c; }; in s\n";
+            let m = model_for("nix", text);
+            assert_resolves(&m, text, "a", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "c", 1)),
+                None,
+                "a plain attrset's keys are not lexical bindings"
+            );
+        }
+
+        #[test]
+        fn inherit_references_the_outer_binding() {
+            let text = "let size = 1; in rec { inherit size; }\n";
+            let m = model_for("nix", text);
+            assert_resolves(&m, text, "size", 1, 0);
         }
     }
 
