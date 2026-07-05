@@ -86,6 +86,7 @@ mod tests {
             "cpp",
             "dockerfile",
             "go",
+            "hcl",
             "java",
             "javascript",
             "julia",
@@ -94,6 +95,7 @@ mod tests {
             "python",
             "ruby",
             "rust",
+            "terraform",
         ] {
             let source = resolved_source(lang);
             tree_sitter::Query::new(&language_of(lang), &source)
@@ -1009,6 +1011,56 @@ mod tests {
                 None,
                 "Dockerfiles are sequential: a use above the ARG is undefined"
             );
+        }
+    }
+
+    mod hcl_fixtures {
+        use super::*;
+
+        #[test]
+        fn variables_and_locals_resolve_from_dotted_references() {
+            let text = "variable \"region\" {\n  default = \"us\"\n}\nlocals {\n  name = \"web\"\n  full = \"${local.name}-${var.region}\"\n}\n";
+            let m = model_for("hcl", text);
+            // Renaming the variable touches the quoted label's content and
+            // the var.region reference — the binding spans both node kinds.
+            assert_resolves(&m, text, "region", 1, 0);
+            assert_resolves(&m, text, "name", 1, 0);
+        }
+
+        #[test]
+        fn resource_and_data_names_resolve_from_their_address() {
+            let text = "resource \"aws_instance\" \"web\" {\n  ami = \"x\"\n}\ndata \"aws_ami\" \"ubuntu\" {\n}\noutput \"ip\" {\n  value = aws_instance.web.id\n}\noutput \"ami\" {\n  value = data.aws_ami.ubuntu.id\n}\n";
+            let m = model_for("hcl", text);
+            assert_resolves(&m, text, "web", 1, 0);
+            assert_resolves(&m, text, "ubuntu", 1, 0);
+            assert_eq!(
+                m.definition_range_at(nth(text, "id", 0)),
+                None,
+                "trailing attribute access is not a lexical reference"
+            );
+        }
+
+        #[test]
+        fn namespaces_do_not_cross() {
+            let text = "locals {\n  size = 1\n}\noutput \"o\" {\n  value = var.size\n}\n";
+            let m = model_for("hcl", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "size", 1)),
+                None,
+                "var.size must not resolve to the local"
+            );
+        }
+    }
+
+    mod terraform_fixtures {
+        use super::*;
+
+        #[test]
+        fn inherits_the_hcl_rules() {
+            let text =
+                "variable \"ami\" {\n}\nresource \"aws_instance\" \"web\" {\n  ami = var.ami\n}\n";
+            let m = model_for("terraform", text);
+            assert_resolves(&m, text, "ami", 2, 0);
         }
     }
 
