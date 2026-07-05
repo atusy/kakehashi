@@ -101,7 +101,7 @@ impl Kakehashi {
         // boundaries: a cursor inside an injected region resolves in that
         // region's layer alone.
         let (query, layer_text, layer_tree, layer_offset) = match self
-            .injected_bindings_layer(&text, &tree, &language, byte)
+            .injected_bindings_layer(&uri, &text, &tree, &language, byte)
             .await
         {
             Some(Some(layer)) => layer,
@@ -116,7 +116,23 @@ impl Kakehashi {
             }
         };
 
-        let model = BindingsModel::build(collect(&layer_text, layer_tree.root_node(), &query));
+        // The query walk and model build are CPU work proportional to the
+        // layer, not the request: keep them off the async worker like every
+        // other tree-CPU site. A failed task degrades to silence.
+        let model = match tokio::task::spawn_blocking(move || {
+            BindingsModel::build(collect(&layer_text, layer_tree.root_node(), &query))
+        })
+        .await
+        {
+            Ok(model) => model,
+            Err(join_error) => {
+                log::warn!(
+                    target: "kakehashi::bindings",
+                    "bindings model task failed for {uri}: {join_error}"
+                );
+                return Ok(None);
+            }
+        };
         Ok(f(NativeBindingsContext {
             model: &model,
             byte: byte - layer_offset,
@@ -135,6 +151,7 @@ impl Kakehashi {
     ///   ranges so node offsets are relative to the region's content start.
     async fn injected_bindings_layer(
         &self,
+        uri: &url::Url,
         text: &str,
         tree: &tree_sitter::Tree,
         host_language: &str,
@@ -175,27 +192,32 @@ impl Kakehashi {
 
         let included_ranges =
             compute_included_ranges(&region.content_node, region.include_children);
-        let mut parser = {
-            let mut pool = self.parser_pool.lock().await;
-            match pool.acquire(&layer_language) {
-                Some(parser) => parser,
-                None => return Some(None),
-            }
-        };
-        let parsed = parse_with_ranges(
-            &mut parser,
-            &content_text,
-            included_ranges.as_deref(),
-            "kakehashi::bindings",
-            &layer_language,
-        );
-        self.parser_pool
-            .lock()
-            .await
-            .release(layer_language.clone(), parser);
+        // The pooled spawn_blocking + timeout protocol every parse site
+        // uses: a pathological region cannot pin an async worker.
+        let lang_for_parse = layer_language.clone();
+        let parsed = self
+            .parse_coordinator()
+            .parse_with_pool(
+                &layer_language,
+                uri,
+                content_text.len(),
+                move |mut parser| {
+                    let tree = parse_with_ranges(
+                        &mut parser,
+                        &content_text,
+                        included_ranges.as_deref(),
+                        "kakehashi::bindings",
+                        &lang_for_parse,
+                    );
+                    (parser, tree.map(|tree| (tree, content_text)))
+                },
+            )
+            .await;
 
         match parsed {
-            Some(layer_tree) => Some(Some((query, content_text, layer_tree, content_range.start))),
+            Some((layer_tree, content_text)) => {
+                Some(Some((query, content_text, layer_tree, content_range.start)))
+            }
             None => Some(None),
         }
     }
