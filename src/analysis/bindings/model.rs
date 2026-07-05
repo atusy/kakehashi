@@ -78,17 +78,15 @@ impl BindingsModel {
         // order within a scope. Outer bindings therefore exist before any
         // inner scope is processed (`outer-or-local` and `nearest-binding`
         // rely on this).
-        let mut by_scope: HashMap<usize, Vec<&DefinitionCapture>> = HashMap::new();
+        let mut by_scope: Vec<Vec<&DefinitionCapture>> = vec![Vec::new(); model.scopes.len()];
         for def in &collection.definitions {
             let scope = model.innermost_scope_at(def.byte_range.start);
-            by_scope.entry(scope).or_default().push(def);
+            by_scope[scope].push(def);
         }
         let mut scope_order: Vec<usize> = (0..model.scopes.len()).collect();
         scope_order.sort_by_key(|&s| (model.scopes[s].depth, model.scopes[s].byte_range.start));
         for scope in scope_order {
-            let Some(mut defs) = by_scope.remove(&scope) else {
-                continue;
-            };
+            let mut defs = std::mem::take(&mut by_scope[scope]);
             defs.sort_by_key(|d| d.byte_range.start);
             for def in defs {
                 model.register(scope, def);
@@ -213,7 +211,7 @@ impl BindingsModel {
                 // registering scope IS the definition's innermost scope, so
                 // its own bindings count even under `visible-to-nested
                 // false` (that flag only hides a scope from nested scopes).
-                let namespaces = [def.namespace.clone()];
+                let namespaces = [def.namespace.as_str()];
                 self.walk(target_scope, true, &def.name, &namespaces, p)
                     .or_else(|| self.select_in_scope(target_scope, &def.name, &def.namespace, p))
             }
@@ -290,16 +288,17 @@ impl BindingsModel {
     /// distinguishes a reference's own scope from registration-time probes,
     /// which always arrive "from a nested scope"); every scope's `inherits`
     /// gate applies on the way out, skipped or not.
-    fn walk(
+    fn walk<S: AsRef<str>>(
         &self,
         start: usize,
         start_is_innermost: bool,
         name: &str,
-        namespaces: &[String],
+        namespaces: &[S],
         p: usize,
     ) -> Option<BindingId> {
-        // Borrowed lookups all the way down: the walk allocates nothing.
-        let mut active: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+        // Borrowed lookups all the way down: the walk allocates nothing
+        // beyond the active-namespace scratch vector.
+        let mut active: Vec<&str> = namespaces.iter().map(AsRef::as_ref).collect();
         let mut current = Some(start);
         let mut innermost = start_is_innermost;
         while let Some(scope) = current {
@@ -389,17 +388,23 @@ impl BindingsModel {
     /// before `p`; when every visible site starts after `p` (hoisting), the
     /// earliest one.
     fn site_for(&self, binding: BindingId, p: usize) -> Option<&Site> {
-        let visible: Vec<&Site> = self.bindings[binding]
-            .sites
-            .iter()
-            .filter(|s| s.visibility_start <= p)
-            .collect();
-        visible
-            .iter()
-            .filter(|s| s.byte_range.start <= p)
-            .max_by_key(|s| s.byte_range.start)
-            .or_else(|| visible.iter().min_by_key(|s| s.byte_range.start))
-            .copied()
+        // Single allocation-free pass: prefer the latest visible site at or
+        // before `p`; else the earliest visible site after it.
+        let mut best_before: Option<&Site> = None;
+        let mut first_after: Option<&Site> = None;
+        for site in &self.bindings[binding].sites {
+            if site.visibility_start > p {
+                continue;
+            }
+            if site.byte_range.start <= p {
+                if best_before.is_none_or(|b| site.byte_range.start > b.byte_range.start) {
+                    best_before = Some(site);
+                }
+            } else if first_after.is_none_or(|a| site.byte_range.start < a.byte_range.start) {
+                first_after = Some(site);
+            }
+        }
+        best_before.or(first_after)
     }
 
     fn site_containing(&self, byte: usize) -> Option<(BindingId, &Site)> {
