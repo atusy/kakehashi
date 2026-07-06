@@ -224,7 +224,11 @@ config that suppresses it.)
    merged result** for the current snapshot; a response identical to the
    layer's already-accepted contribution is absorbed silently. Symmetrically,
    a request does **not** start a new fetch for a layer whose accepted
-   contribution is already current for the snapshot. Both halves are
+   contribution was **computed by its server against the current snapshot** —
+   source freshness, a deliberately stricter test than the display currency a
+   stale-shifted set has. A shifted set is current enough to *serve* (§2's
+   version contract) but never suppresses the re-fetch that repairs its
+   dropped and content-changed tokens. Both halves are
    load-bearing: without them, the refresh-triggered re-request would itself
    spawn fetches whose unchanged responses fire the next refresh — an
    unbounded request → refresh loop on an idle document. Refresh is sent
@@ -311,8 +315,11 @@ place (the new text falls after it). A non-empty replacement drops any token
 whose *interior* it touches and shifts tokens entirely beyond it, under the
 same affinity at the shared endpoints. This ordered fold is the "second
 exactness obligation" the Consequences carry. A shifted set is thereafter **treated as computed against
-the version it was shifted to**: it satisfies the participation check for
-that snapshot, and a later edit re-shifts it from there over the new deltas
+the version it was shifted to** *for sweep participation only*: it satisfies
+the participation check for that snapshot while staying **stale by source**,
+so it never satisfies the no-refetch test in step 2 above — display currency
+and source freshness are distinct states. A later edit re-shifts it from
+there over the new deltas
 only (a shift of the shifted set), never by re-replaying from the original
 version. Tokens dropped by an earlier shift stay dropped until a fresh
 response replaces the layer's whole contribution.
@@ -494,7 +501,9 @@ visible to stage 1 or a type split"; its Neutral bullet now defers here:
 - **Automatic legend widening.** §3's `extraLegend` admits custom types the
   user declares up front; *discovering* a bridged server's legend at runtime
   and widening kakehashi's to match would mean renegotiating an
-  already-initialized legend, which LSP does not allow (Alternative D). The
+  already-initialized legend — impossible under static registration, and
+  reachable only through dynamic re-registration, whose optional client
+  support cannot carry a default behavior (Alternative D). The
   connect-time warning is the designed substitute: it tells the user what to
   declare, it never declares it for them.
 - **Re-fetching/recomputing stale bridged sets** — *the mechanism*, not the
