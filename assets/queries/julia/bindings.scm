@@ -1,12 +1,14 @@
 ; Lexical name bindings for Julia (lexical-name-resolution ADR).
 ;
 ; Functions, loops, let blocks, comprehensions, and modules open scopes;
-; if/begin blocks do not. An assignment writes an enclosing local when one
-; is visible and otherwise introduces a scope-local one (outer-or-local):
-; `x` first-assigned in a loop is loop-local, but re-assigning an `x` that
-; already exists in the enclosing function updates that same binding
-; rather than splitting it. A name is visible across its whole scope
-; (assignments are hoisted within their own scope). Types
+; if/begin blocks do not. An assignment binds into the nearest enclosing
+; function (hard scope), so a name assigned anywhere in a function is
+; local throughout it: reassigning inside a loop updates the function's
+; binding rather than splitting a loop-local one, while assigning a name
+; that only exists as a global creates a function-local instead of
+; writing the global (a top-level assignment falls back to the layer
+; root). Loops/let/comprehensions are soft scopes for their own binders
+; (for/let variables), which stay confined. Types
 ; and values share the default namespace (annotations and constructor
 ; calls are plain identifiers). Field access (obj.size) resolves only
 ; the value — the member stays uncaptured. Short-form definitions
@@ -15,11 +17,12 @@
 ; ── Scopes ──────────────────────────────────────────────────────────────
 (function_definition) @scope.function
 (macro_definition) @scope.function
-(arrow_function_expression) @scope
+; Arrow functions and do-blocks are hard scopes (functions) too.
+(arrow_function_expression) @scope.function
+(do_clause) @scope.function
 (for_statement) @scope
 (while_statement) @scope
 (let_statement) @scope
-(do_clause) @scope
 (comprehension_expression) @scope
 (module_definition) @scope
 
@@ -55,11 +58,11 @@
 
 ; ── Assignments and binders ──────────────────────────────────────────────
 ((assignment . (identifier) @definition)
- (#set! definition.rebind "outer-or-local"))
+ (#set! definition.scope "nearest:function"))
 ((assignment . (tuple_expression (identifier) @definition))
- (#set! definition.rebind "outer-or-local"))
+ (#set! definition.scope "nearest:function"))
 ((assignment . (open_tuple (identifier) @definition))
- (#set! definition.rebind "outer-or-local"))
+ (#set! definition.scope "nearest:function"))
 (for_binding . (identifier) @definition)
 (for_binding . (tuple_expression (identifier) @definition))
 (let_binding . (identifier) @definition)

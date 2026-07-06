@@ -6,6 +6,10 @@
 ; capture automatically, so they inherit everything. `global $x` routes a
 ; function's writes to the top level via @redirect. Member and static
 ; access ($o->x, K::x) is never captured — silence over a wrong answer.
+; Braced `namespace A { … }` blocks scope their function/class names, so a
+; symbol reused across namespaces does not collide; an un-namespaced file
+; (or the file-wide `namespace A;` form, which has no body node) falls
+; back to the layer root, i.e. file-global.
 
 ; ── Scopes ──────────────────────────────────────────────────────────────
 ((function_definition) @scope
@@ -18,19 +22,21 @@
 (arrow_function) @scope
 ; Class bodies confine their members.
 (declaration_list) @scope
+; Braced namespace blocks scope the function/class names declared in them.
+(namespace_definition body: (compound_statement) @scope.namespace)
 
 ; ── Functions and classes: global and hoisted ─────────────────────────────
 ((function_definition name: (name) @definition.function)
- (#set! definition.scope "global")
+ (#set! definition.scope "nearest:namespace")
  (#set! definition.namespace "function"))
 ((class_declaration name: (name) @definition.type)
- (#set! definition.scope "global")
+ (#set! definition.scope "nearest:namespace")
  (#set! definition.namespace "class"))
 ((interface_declaration name: (name) @definition.type)
- (#set! definition.scope "global")
+ (#set! definition.scope "nearest:namespace")
  (#set! definition.namespace "class"))
 ((trait_declaration name: (name) @definition.type)
- (#set! definition.scope "global")
+ (#set! definition.scope "nearest:namespace")
  (#set! definition.namespace "class"))
 
 ; ── Variables ─────────────────────────────────────────────────────────────

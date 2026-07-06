@@ -592,6 +592,30 @@ mod tests {
         }
 
         #[test]
+        fn braced_namespaces_scope_their_symbols() {
+            // The same function name in two braced namespaces is two distinct
+            // bindings; each call resolves within its own namespace.
+            let text = "<?php\nnamespace A { function run() {} run(); }\nnamespace B { function run() {} run(); }\n";
+            let m = model_for("php", text);
+            let a_run = m.binding_at(nth(text, "run", 0)).unwrap();
+            let b_run = m.binding_at(nth(text, "run", 2)).unwrap();
+            assert_ne!(
+                a_run, b_run,
+                "run in namespace A and B are distinct bindings"
+            );
+            assert_eq!(
+                m.binding_at(nth(text, "run", 1)),
+                Some(a_run),
+                "the call in A resolves to A's run"
+            );
+            assert_eq!(
+                m.binding_at(nth(text, "run", 3)),
+                Some(b_run),
+                "the call in B resolves to B's run"
+            );
+        }
+
+        #[test]
         fn closures_capture_only_via_use() {
             let text = "<?php\n$acc = 1;\n$f = function ($a) use ($acc) { return $a + $acc; };\n$ar = fn($b) => $b + $acc;\n";
             let m = model_for("php", text);
@@ -957,6 +981,19 @@ mod tests {
         }
 
         #[test]
+        fn nested_classes_do_not_inherit_enclosing_methods() {
+            // A nested class does not lexically inherit the enclosing class's
+            // instance methods; only constants pass the class boundary.
+            let text = "class Outer\n  def helper\n  end\n  class Inner\n    def go\n      helper\n    end\n  end\nend\n";
+            let m = model_for("ruby", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "helper", 1)),
+                None,
+                "Inner#go cannot see Outer#helper lexically"
+            );
+        }
+
+        #[test]
         fn bare_calls_resolve_to_methods_receivers_stay_members() {
             let text = "def helper(x)\n  x\nend\ndef go\n  helper(1)\nend\nobj.helper\n";
             let m = model_for("ruby", text);
@@ -1078,6 +1115,26 @@ mod tests {
                 "loop assignment merges into the enclosing x, not a new binding"
             );
             assert_eq!(m.binding_at(nth(text, "x", 2)), Some(outer));
+        }
+
+        #[test]
+        fn function_assignments_are_local_not_the_global() {
+            // Assigning `x` inside a function creates a function-local,
+            // distinct from a same-named global (Julia's hard scope), so
+            // rename/references never cross the boundary.
+            let text = "x = 0\nfunction f()\n    x = 1\n    return x\nend\n";
+            let m = model_for("julia", text);
+            let global = m.binding_at(nth(text, "x", 0)).unwrap();
+            let local = m.binding_at(nth(text, "x", 1)).unwrap();
+            assert_ne!(
+                global, local,
+                "the function-local x must not merge with the global"
+            );
+            assert_eq!(
+                m.binding_at(nth(text, "x", 2)),
+                Some(local),
+                "return x reads the function-local"
+            );
         }
 
         #[test]
