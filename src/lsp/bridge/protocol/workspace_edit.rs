@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 
 use tower_lsp_server::ls_types::{
-    DocumentChangeOperation, DocumentChanges, OneOf, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    DocumentChangeOperation, DocumentChanges, OneOf, ResourceOp, TextDocumentEdit, TextEdit, Uri,
+    WorkspaceEdit,
 };
 
 use super::translation::{RegionOffset, translate_virtual_range_to_host};
@@ -77,7 +78,10 @@ fn transform_changes_map(
 ///
 /// Handles both `Edits(Vec<TextDocumentEdit>)` and
 /// `Operations(Vec<DocumentChangeOperation>)` variants.
-/// File operations (CreateFile, RenameFile, DeleteFile) are preserved as-is.
+/// File operations (CreateFile, RenameFile, DeleteFile) on real files are
+/// preserved as-is; ones referencing virtual URIs are dropped — they cannot
+/// be expressed in host coordinates and would leak synthetic resources to
+/// the client.
 fn transform_document_changes(
     doc_changes: &mut DocumentChanges,
     request_virtual_uri: &str,
@@ -95,9 +99,21 @@ fn transform_document_changes(
                 DocumentChangeOperation::Edit(edit) => {
                     transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
                 }
-                DocumentChangeOperation::Op(_) => true, // File operations preserved
+                DocumentChangeOperation::Op(op) => resource_op_targets_real_files_only(op),
             });
         }
+    }
+}
+
+/// Whether a file operation references only real (non-virtual) URIs.
+fn resource_op_targets_real_files_only(op: &ResourceOp) -> bool {
+    match op {
+        ResourceOp::Create(create) => !VirtualDocumentUri::is_virtual_uri(create.uri.as_str()),
+        ResourceOp::Rename(rename) => {
+            !VirtualDocumentUri::is_virtual_uri(rename.old_uri.as_str())
+                && !VirtualDocumentUri::is_virtual_uri(rename.new_uri.as_str())
+        }
+        ResourceOp::Delete(delete) => !VirtualDocumentUri::is_virtual_uri(delete.uri.as_str()),
     }
 }
 
@@ -201,6 +217,46 @@ mod tests {
     }
 
     #[test]
+    fn document_changes_operations_filters_file_ops_on_virtual_uris() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // A file op against a virtual URI would leak the synthetic
+        // kakehashi:// resource to the client; none of create/rename/delete
+        // can be expressed in host coordinates, so each must be dropped.
+        let mut edit = parse_workspace_edit(json!({
+            "documentChanges": [
+                { "kind": "create", "uri": virtual_uri },
+                { "kind": "rename", "oldUri": virtual_uri, "newUri": "file:///renamed.lua" },
+                { "kind": "delete", "uri": "file:///obsolete.lua" }
+            ]
+        }));
+
+        transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        );
+
+        match edit.document_changes.unwrap() {
+            DocumentChanges::Operations(ops) => {
+                assert_eq!(
+                    ops.len(),
+                    1,
+                    "file ops referencing virtual URIs must be dropped"
+                );
+                match &ops[0] {
+                    DocumentChangeOperation::Op(ResourceOp::Delete(delete)) => {
+                        assert_eq!(delete.uri.as_str(), "file:///obsolete.lua");
+                    }
+                    other => panic!("Expected the real-file delete to survive, got {other:?}"),
+                }
+            }
+            DocumentChanges::Edits(_) => panic!("Expected Operations variant"),
+        }
+    }
+
+    #[test]
     fn document_changes_translates_annotated_edits() {
         use tower_lsp_server::ls_types::{
             AnnotatedTextEdit, OptionalVersionedTextDocumentIdentifier, Position, Range,
@@ -209,7 +265,10 @@ mod tests {
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
         // Constructed in code: serde's untagged OneOf parses annotated edits as
-        // plain TextEdits (unknown fields are ignored), so JSON can't reach Right.
+        // plain TextEdits (unknown fields are ignored), so responses
+        // deserialized from JSON never reach Right and silently lose their
+        // annotationId (an upstream ls-types limitation, tracked in #568
+        // checklist item 7). This pins the arm for typed construction.
         let mut edit = WorkspaceEdit {
             document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
                 text_document: OptionalVersionedTextDocumentIdentifier {
