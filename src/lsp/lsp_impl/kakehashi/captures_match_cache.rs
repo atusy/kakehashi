@@ -63,7 +63,16 @@ fn fnv1a(hash: &mut u64, bytes: &[u8]) {
 /// columns can: an indentation-sensitive injected grammar (Python, YAML)
 /// parses differently when the range starts at a different column, and a
 /// gap's internal newline moving changes a later range's column without
-/// touching any hashed byte. See `content.rs`'s column-offset parse tests.
+/// touching any hashed byte (`content.rs` computes real column offsets for
+/// exactly this reason).
+///
+/// Gap BYTES between ranges stay unhashed. The parser never reads them,
+/// but query predicates slice the full host text by node span, so a node
+/// straddling a gap could observe them — the invariant relied on is that
+/// for every shipped gap source (blockquote/list prefixes), a gap byte
+/// cannot change without also changing the discovered ranges (the marker
+/// byte IS the construct; a space→tab change moves tab-stop indentation),
+/// which changes the hashed geometry or columns and misses.
 pub(in crate::lsp::lsp_impl) struct KeyRange {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -433,9 +442,29 @@ mod tests {
 
     #[test]
     fn key_clamps_ranges_to_text_length() {
-        // A host tree parsed without explicit ranges reports ~0..u32::MAX;
-        // the key must behave as "whole document".
+        // A host tree parsed without explicit ranges reports the sentinel
+        // range `0..u32::MAX` with `end_point (u32::MAX, u32::MAX)`. Bytes
+        // clamp to the text, so the hashed CONTENT is the whole document;
+        // columns are folded as-given (store and lookup both key off the
+        // same tree, so the sentinel end column is consistent) — the key
+        // must be deterministic for that real host shape.
         let text = "fn main() {}";
+        let host_sentinel = || KeyRange {
+            start_byte: 0,
+            end_byte: u32::MAX as usize,
+            start_col: 0,
+            end_col: u32::MAX as usize,
+        };
+        let key = layer_cache_key("h", "rust", [host_sentinel()], text);
+        assert_eq!(
+            key,
+            layer_cache_key("h", "rust", [host_sentinel()], text),
+            "the host sentinel shape keys deterministically"
+        );
+        assert_eq!(key.0, 0, "host anchors at 0");
+
+        // Byte clamping: an oversized end with the SAME columns hashes the
+        // same content as the exact span.
         let clamped = layer_cache_key("h", "rust", [kr(0, u32::MAX as usize)], text);
         let whole = layer_cache_key("h", "rust", [kr(0, text.len())], text);
         assert_eq!(clamped, whole);

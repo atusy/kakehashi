@@ -36,7 +36,7 @@
 //! - JSON-RPC `InvalidParams` for a malformed `kind` (fails the character
 //!   whitelist guarding the filesystem lookup).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -1118,7 +1118,7 @@ fn execute_captures_walk(
     let cache_full_walk = byte_range.is_none();
     // Layer-entry hashes this walk read or wrote — the live set for the
     // post-walk sweep (host slots self-replace and need no sweep).
-    let mut touched_layer_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut touched_layer_hashes: HashSet<u64> = HashSet::new();
     // Hit/miss counters for the walk log line (cache-behavior diagnostics).
     let (mut layers_reused, mut layers_executed) = (0usize, 0usize);
 
@@ -1152,9 +1152,9 @@ fn execute_captures_walk(
         // keystroke changes host bytes and misses: its hit case is exact
         // content recurrence (undo/redo, revert), which replays the most
         // expensive single query of the walk for free. The price is one
-        // FNV pass over the layer bytes per visit (~2x document bytes per
-        // full walk, sub-ms on real corpora) against the ~10% walk-time
-        // win measured for the injected layers alone.
+        // FNV pass over the layer bytes per visit — about twice the
+        // document bytes per full walk, sub-ms against the walk times the
+        // per-walk debug line reports (see the reused/executed counters).
         let cache_key = cache_full_walk.then(|| {
             super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text)
         });
