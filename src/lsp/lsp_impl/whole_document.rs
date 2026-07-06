@@ -149,12 +149,25 @@ impl Kakehashi {
             });
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
+            // Drop servers already known (a live, `Ready` connection) NOT to
+            // support this method before the per-region fan-out spawns their
+            // tasks (capability-prefilter-fanout). One pool query for the whole
+            // request; the resulting set is a cheap per-region lookup.
+            let incapable_servers = self
+                .incapable_virt_servers(
+                    &language_name,
+                    all_regions.iter().map(|r| r.injection_language.as_str()),
+                    method_name,
+                )
+                .await;
+
             for resolved in all_regions.iter() {
                 // Get ALL bridge server configs for this injection language
-                let configs = self.bridge_configs_for_injection_language(
+                let mut configs = self.bridge_configs_for_injection_language(
                     &language_name,
                     &resolved.injection_language,
                 );
+                configs.retain(|c| !incapable_servers.contains(&c.server_name));
                 if configs.is_empty() {
                     continue;
                 }
