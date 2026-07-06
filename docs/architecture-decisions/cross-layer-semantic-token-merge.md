@@ -351,6 +351,19 @@ client did not announce is **skipped with a warning** rather than advertised,
 since the client never declared it renderable and tokens carrying it would
 name a type the client has no notion of.
 
+**Downstream capability advertisement.** Today the bridge handshake
+advertises **no** `textDocument.semanticTokens` client capability at all
+(`src/lsp/bridge/protocol/client_capabilities.rs`), so a compliant downstream
+server would not expose `semanticTokensProvider` and the merge would have
+nothing to fetch. Token bridging must extend the baseline: advertise
+`requests` `{full, full.delta, range}`, `formats = ["relative"]`, and
+`tokenTypes`/`tokenModifiers` mirroring kakehashi's own advertised legend —
+while continuing to advertise neither `overlappingTokenSupport` (level 1's
+"non-overlapping by protocol" relies on its absence) nor
+`multilineTokenSupport` (bridged multiline tokens are split during
+normalization regardless). This is part of Strategy 1's plumbing, listed here
+because the legend contract depends on it.
+
 Bridged tokens are decoded with the server's own legend, then re-encoded into
 kakehashi's advertised legend:
 
