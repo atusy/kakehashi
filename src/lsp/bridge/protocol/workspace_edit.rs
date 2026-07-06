@@ -17,9 +17,10 @@ use super::virtual_uri::VirtualDocumentUri;
 
 /// Transform a WorkspaceEdit in place from virtual to host document coordinates.
 ///
-/// For each URI: real files pass through, the request's own virtual URI is
-/// re-keyed to the host URI (ranges translated, stale virtual-doc versions
-/// dropped), and other (cross-region) virtual URIs are filtered out.
+/// For text edits: real-file URIs pass through, the request's own virtual URI
+/// is re-keyed to the host URI (ranges translated, stale virtual-doc versions
+/// dropped), and other (cross-region) virtual URIs are filtered out. File
+/// operations referencing any virtual URI are filtered out entirely.
 pub(crate) fn transform_workspace_edit_to_host(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,
