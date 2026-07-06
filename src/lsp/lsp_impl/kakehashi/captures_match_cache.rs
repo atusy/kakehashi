@@ -23,10 +23,17 @@
 //! Eviction mirrors the injection-token-cache discipline:
 //! - the host slot (depth 0) holds ONE entry per kind and self-replaces on
 //!   store — never more than the latest host content per kind;
-//! - injected-layer entries are swept per completed full-coverage walk
-//!   (`sweep_layers` retains only the hashes that walk touched, scoped to
-//!   its kind so other kinds' entries survive);
+//! - injected-layer entries are swept per completed, current-at-entry
+//!   full-coverage walk (`sweep_layers` retains only the hashes that walk
+//!   touched, scoped to its kind so other kinds' entries survive);
 //! - `clear_document` drops the document on didClose.
+//!
+//! Resident bound while a document is open: for each kind that was ever
+//! full-walked, its LAST live layer set (a kind the client stops requesting
+//! keeps that final set until didClose — kinds are bounded by real `.scm`
+//! files, not by client strings, since only `Loaded` queries store). A
+//! burst of stale-walk stores can transiently exceed the live set until
+//! the next current walk's sweep.
 //!
 //! The 64-bit validity hash accepts the same collision bound as
 //! `region_validity_hash` (semantic token cache): a collision requires two
@@ -137,7 +144,9 @@ pub(in crate::lsp::lsp_impl) fn tree_cache_key(
 /// Shift every capture offset down by `anchor`, in place. Returns `false`
 /// (leaving the matches untouched) if any capture starts below the anchor —
 /// a tree whose root node reaches outside its included ranges must simply
-/// not be cached, never corrupted by a wrapping subtraction.
+/// not be cached, never corrupted by a wrapping subtraction. Ignoring the
+/// verdict would cache un-rebased (absolute) offsets, hence `must_use`.
+#[must_use]
 pub(in crate::lsp::lsp_impl) fn rebase_matches(matches: &mut [MatchData], anchor: usize) -> bool {
     if matches
         .iter()
@@ -148,8 +157,10 @@ pub(in crate::lsp::lsp_impl) fn rebase_matches(matches: &mut [MatchData], anchor
     }
     for m in matches {
         for c in &mut m.captures {
+            // The guard above makes plain `-` safe for both offsets
+            // (end >= start >= anchor by construction).
             c.start_byte -= anchor;
-            c.end_byte = c.end_byte.saturating_sub(anchor);
+            c.end_byte -= anchor;
         }
     }
     true
@@ -256,8 +267,8 @@ impl CapturesMatchCache {
     pub(in crate::lsp::lsp_impl) fn store_layer(
         &self,
         uri: &Url,
-        validity_hash: u64,
         kind: &str,
+        validity_hash: u64,
         generation: u64,
         matches: Arc<Vec<MatchData>>,
         doc_open: impl FnOnce() -> bool,
@@ -477,9 +488,9 @@ mod tests {
         let cache = CapturesMatchCache::new();
         let uri = uri();
         let matches = Arc::new(vec![match_data(&[(0, 3)])]);
-        cache.store_layer(&uri, 1, "highlights", 7, Arc::clone(&matches), || true);
-        cache.store_layer(&uri, 2, "highlights", 7, Arc::clone(&matches), || true);
-        cache.store_layer(&uri, 3, "locals", 7, Arc::clone(&matches), || true);
+        cache.store_layer(&uri, "highlights", 1, 7, Arc::clone(&matches), || true);
+        cache.store_layer(&uri, "highlights", 2, 7, Arc::clone(&matches), || true);
+        cache.store_layer(&uri, "locals", 3, 7, Arc::clone(&matches), || true);
 
         // A completed highlights walk touched only hash 1 (the fence at
         // hash 2 was deleted): 2 goes, 1 stays, the other kind's 3 stays.
@@ -506,7 +517,7 @@ mod tests {
 
         // Closed document (doc_open = false): neither store may resurrect.
         cache.store_host(&uri, "highlights", 1, 7, Arc::clone(&matches), || false);
-        cache.store_layer(&uri, 2, "highlights", 7, Arc::clone(&matches), || false);
+        cache.store_layer(&uri, "highlights", 2, 7, Arc::clone(&matches), || false);
         assert!(cache.get_host(&uri, "highlights", 1, 7).is_none());
         assert!(cache.get_layer(&uri, 2, 7).is_none());
 
@@ -514,7 +525,7 @@ mod tests {
         cache.store_host(&uri, "highlights", 1, 7, Arc::clone(&matches), || true);
         assert!(cache.get_host(&uri, "highlights", 1, 7).is_some());
         // ...and once the slot exists, stores skip the probe entirely.
-        cache.store_layer(&uri, 2, "highlights", 7, matches, || {
+        cache.store_layer(&uri, "highlights", 2, 7, matches, || {
             panic!("existing doc slot must not probe liveness")
         });
         assert!(cache.get_layer(&uri, 2, 7).is_some());
@@ -526,7 +537,7 @@ mod tests {
         let uri = uri();
         let matches = Arc::new(vec![match_data(&[(0, 3)])]);
         cache.store_host(&uri, "highlights", 1, 7, Arc::clone(&matches), || true);
-        cache.store_layer(&uri, 2, "highlights", 7, matches, || true);
+        cache.store_layer(&uri, "highlights", 2, 7, matches, || true);
 
         cache.clear_document(&uri);
         assert!(cache.get_host(&uri, "highlights", 1, 7).is_none());

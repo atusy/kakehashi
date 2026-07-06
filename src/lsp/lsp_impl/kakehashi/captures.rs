@@ -155,13 +155,16 @@ fn matches_delta_edit(previous: &[Value], current: &[Value]) -> Option<(usize, u
 /// A valued key maps to its string; the bare flag form `(#set! key)` maps to
 /// `true` (a flag a client can test for, unlike Neovim's nil no-op). Duplicate
 /// keys are last-write-wins, matching Neovim's in-order directive application.
-fn metadata_object(pairs: Vec<(String, Option<String>)>) -> Option<Value> {
+fn metadata_object(pairs: &[(String, Option<String>)]) -> Option<Value> {
     if pairs.is_empty() {
         return None;
     }
     let mut map = serde_json::Map::new();
     for (key, value) in pairs {
-        map.insert(key, value.map_or(Value::Bool(true), Value::String));
+        map.insert(
+            key.clone(),
+            value.clone().map_or(Value::Bool(true), Value::String),
+        );
     }
     Some(Value::Object(map))
 }
@@ -1144,6 +1147,14 @@ fn execute_captures_walk(
         // translated by edits elsewhere) serves its cached MatchData and
         // skips execute_query. Only the ID-free byte-offset stage is cached;
         // minting/positions/shaping below run identically on hit and miss.
+        //
+        // The host layer (depth 0) is DELIBERATELY included even though any
+        // keystroke changes host bytes and misses: its hit case is exact
+        // content recurrence (undo/redo, revert), which replays the most
+        // expensive single query of the walk for free. The price is one
+        // FNV pass over the layer bytes per visit (~2x document bytes per
+        // full walk, sub-ms on real corpora) against the ~10% walk-time
+        // win measured for the injected layers alone.
         let cache_key = cache_full_walk.then(|| {
             super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text)
         });
@@ -1191,8 +1202,8 @@ fn execute_captures_walk(
                 } else {
                     match_cache.store_layer(
                         uri,
-                        hash,
                         kind,
+                        hash,
                         generation,
                         std::sync::Arc::clone(&arc),
                         doc_open,
@@ -1205,7 +1216,7 @@ fn execute_captures_walk(
             }
         };
         for m in layer_matches.iter() {
-            let match_metadata = metadata_object(m.metadata.clone());
+            let match_metadata = metadata_object(&m.metadata);
             let captures: Vec<Value> = m
                 .captures
                 .iter()
@@ -1254,7 +1265,7 @@ fn execute_captures_walk(
                     });
                     // Capture-scoped `#set! @cap key value` metadata,
                     // only when the capture was annotated.
-                    if let Some(meta) = metadata_object(c.metadata.clone()) {
+                    if let Some(meta) = metadata_object(&c.metadata) {
                         capture["metadata"] = meta;
                     }
                     Some(capture)
@@ -1350,10 +1361,19 @@ fn execute_captures_walk(
     // Match-cache sweep: after a COMPLETED full-coverage walk (all layers
     // visited: injection mode, no viewport clip, no cancel bail), the
     // touched set IS the document's live layer set for this kind — retain
-    // exactly it. Gated on entry-currency (`mint_into_tracker`) so a stale
-    // walk finishing late cannot evict the entries the current content
-    // hits; its own stores are harmless (content-addressed — they only hit
-    // if that content returns, e.g. undo) and the next current walk sweeps.
+    // exactly it. Two things bound eviction of CURRENT entries:
+    // - the `mint_into_tracker` entry-currency gate drops the sweep of a
+    //   walk that was already trailing when it started (a stale-at-entry
+    //   walk never sweeps; its stores are harmless — content-addressed,
+    //   they only hit if that content returns, e.g. undo);
+    // - for a walk outrun DURING the walk (current at entry, edit lands
+    //   mid-flight), it is the single-flight winner guard — held across
+    //   walk AND sweep for this same (uri, kind, injection) key — that
+    //   keeps the successor's stores out until this sweep lands, so the
+    //   stale touched set can only miss entries, never evict a newer
+    //   walk's. Relaxing single-flight would re-open that window (worst
+    //   case: extra misses until the next current walk restores, never
+    //   wrong output).
     if cache_full_walk && injection && mint_into_tracker {
         match_cache.sweep_layers(uri, kind, &touched_layer_hashes);
     }
@@ -2069,8 +2089,8 @@ mod tests {
         );
         rig.match_cache.store_layer(
             &rig.uri,
-            hash_v2,
             "locals",
+            hash_v2,
             0,
             std::sync::Arc::new(vec![crate::language::query_exec::MatchData {
                 pattern_index: 0,
@@ -2233,7 +2253,7 @@ mod tests {
     fn metadata_object_is_none_when_no_directives() {
         // Patterns without #set! must keep their pre-metadata wire shape —
         // an empty object would churn every delta lineage.
-        assert_eq!(metadata_object(vec![]), None);
+        assert_eq!(metadata_object(&[]), None);
     }
 
     #[test]
@@ -2242,7 +2262,7 @@ mod tests {
         // style); JSON true lets clients test for it, where Neovim's nil
         // assignment would make the key undetectable.
         let pairs = vec![("combined".to_string(), None)];
-        assert_eq!(metadata_object(pairs), Some(json!({ "combined": true })));
+        assert_eq!(metadata_object(&pairs), Some(json!({ "combined": true })));
     }
 
     #[test]
@@ -2253,7 +2273,7 @@ mod tests {
             ("kind".to_string(), Some("first".to_string())),
             ("kind".to_string(), Some("second".to_string())),
         ];
-        assert_eq!(metadata_object(pairs), Some(json!({ "kind": "second" })));
+        assert_eq!(metadata_object(&pairs), Some(json!({ "kind": "second" })));
     }
 
     #[test]

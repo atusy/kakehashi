@@ -253,7 +253,8 @@ pub struct Kakehashi {
     /// per-keystroke common case — an edit above a fence) reuses its cached
     /// ID-free match data instead of re-executing the kind query. `Arc`'d
     /// because the compute-pool walk runs off `self`. Swept per completed
-    /// walk, dropped on `didClose`; see `captures_match_cache` module docs.
+    /// current-at-entry full walk, dropped on `didClose`; see the
+    /// `captures_match_cache` module docs.
     captures_match_cache: std::sync::Arc<kakehashi::captures_match_cache::CapturesMatchCache>,
     /// True when the process runs as a one-shot CLI (`kakehashi diagnose`/`format`)
     /// rather than a long-lived LSP server. Set once by `cli_initialize`. No editor
