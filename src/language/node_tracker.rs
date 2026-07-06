@@ -754,6 +754,44 @@ impl NodeTracker {
         Some(commit())
     }
 
+    /// Mint every `(start, end, kind, layer)` key — reusing an existing id
+    /// by position, drawing a fresh ULID for a genuinely new key — under ONE
+    /// acquisition of the URI's entry lock, but only if the (shift
+    /// generation, cleanup epoch) latch still equals `expected`.
+    ///
+    /// This is the mint half of the parse-snapshot ADR §3 **reconciliation
+    /// step**: the latch is checked while HOLDING the entry's exclusive lock
+    /// — the same lock coordinate shifts (`apply_*_edits`) and `cleanup`
+    /// acquire — so a batch that passes serializes strictly before any
+    /// concurrent shift. Every id it mints is therefore *correct-at-birth*
+    /// (its coordinates match the live text at mint time; later edits shift
+    /// it like any live entry), which is why callers need no post-pass purge
+    /// set: a refused batch (`None`) minted **nothing** — the stale pass
+    /// simply defers identity to the next current pass.
+    ///
+    /// Returns the ids aligned with `keys`' iteration order.
+    pub(crate) fn mint_batch_if_unshifted(
+        &self,
+        uri: &Url,
+        expected: (u64, u64),
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
+    ) -> Option<Vec<Ulid>> {
+        let mut entry = self.entries.entry(uri.clone()).or_default();
+        let epoch = self
+            .cleanup_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if (entry.shift_gen, epoch) != expected {
+            return None;
+        }
+        Some(
+            keys.into_iter()
+                .map(|(start, end, kind, layer)| {
+                    entry.get_or_insert(PositionKey::new(start, end, kind, layer))
+                })
+                .collect(),
+        )
+    }
+
     /// The (per-URI shift generation, global cleanup epoch) pair the
     /// serve-stale walks latch alongside their currency check and compare at
     /// exit: a mismatch in either half means the mint landed in a superseded
@@ -780,6 +818,63 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
+    }
+
+    /// The batch reconciliation mint reuses an existing id by position and
+    /// mints fresh ids for genuinely new keys — all under one entry lock,
+    /// gated on the latch (parse-snapshot ADR §3 reconciliation).
+    #[test]
+    fn batch_mint_reuses_by_position_and_mints_new_under_one_latch() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("batch_mint");
+        let existing = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 0);
+        let latch = tracker.mint_epoch(&uri);
+        let ulids = tracker
+            .mint_batch_if_unshifted(&uri, latch, [(0, 4, "word", 0), (10, 14, "word", 1)])
+            .expect("an unshifted latch mints");
+        assert_eq!(ulids[0], existing, "existing position reuses its id");
+        assert_eq!(
+            tracker.lookup_in_layer(&uri, 10, 14, "word", 1),
+            Some(ulids[1]),
+            "new position minted live"
+        );
+    }
+
+    /// A latch an edit has shifted refuses the whole batch — nothing is
+    /// minted (the stale pass defers to the next current pass; there is no
+    /// purge because there is nothing to purge).
+    #[test]
+    fn batch_mint_refuses_shifted_latch_and_mints_nothing() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("batch_mint_shifted");
+        let latch = tracker.mint_epoch(&uri);
+        let _ = tracker.apply_input_edits(&uri, &[EditInfo::new(0, 0, 3)]);
+        assert_eq!(
+            tracker.mint_batch_if_unshifted(&uri, latch, [(0, 4, "word", 0)]),
+            None,
+            "a shifted latch refuses"
+        );
+        assert_eq!(
+            tracker.lookup_in_layer(&uri, 0, 4, "word", 0),
+            None,
+            "the refused batch minted nothing"
+        );
+    }
+
+    /// A close (any document's) bumps the global cleanup epoch, so a latch
+    /// taken before it refuses — the close/reopen ABA guard the per-URI
+    /// generation alone cannot provide.
+    #[test]
+    fn batch_mint_refuses_after_cleanup_epoch_bump() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("batch_mint_cleanup");
+        let other = test_uri("batch_mint_other");
+        let latch = tracker.mint_epoch(&uri);
+        tracker.cleanup(&other);
+        assert_eq!(
+            tracker.mint_batch_if_unshifted(&uri, latch, [(0, 4, "word", 0)]),
+            None
+        );
     }
 
     /// The tracked mint reports created-vs-reused and the observed shift

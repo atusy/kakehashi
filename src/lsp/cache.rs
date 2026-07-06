@@ -197,14 +197,14 @@ impl CacheCoordinator {
         // re-discovers inline — the "snapshot generation at the top" discipline
         // the token handlers use.
         let generation = self.semantic_token_generation();
-        // Entry half of the mint reconciliation (the captures walk's #554
-        // pattern, applied to the WRITER): populate runs post-CAS but an edit
-        // can land DURING this pass, shift the live-coordinate NodeTracker,
-        // and leave this pass minting the old tree's coordinates into it. The
-        // exit check below purges this pass's own creations and withholds
-        // every region-id-bearing product when the latch no longer matches.
+        // Entry half of the mint reconciliation (parse-snapshot ADR §3):
+        // populate runs post-CAS but an edit can land DURING this pass and
+        // shift the live-coordinate NodeTracker, making this pass's tree
+        // coordinates stale. The latch is re-checked inside every
+        // tracker-mutating step below (the batch mint and the commit), so a
+        // stale pass mints nothing and clobbers nothing — identity defers to
+        // the next current pass.
         let entry_mint_epoch = tracker.mint_epoch(uri);
-        let mut minted_ids: Vec<ulid::Ulid> = Vec::new();
 
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
@@ -236,23 +236,41 @@ impl CacheCoordinator {
                 return PopulatedInjections::empty(generation);
             }
 
-            // Convert to CacheableInjectionRegion using position-based ULIDs
-            // NodeTracker provides stable IDs based on (uri, start_byte, end_byte, kind)
-            let cacheable_regions: Vec<CacheableInjectionRegion> = regions
-                .iter()
-                .map(|info| {
-                    // Get position-based ULID from tracker, recording
-                    // creations for the exit reconciliation's purge set.
-                    let (ulid, created, _) = tracker.get_or_create_in_layer_tracked(
-                        uri,
+            // Mint reconciliation step (parse-snapshot ADR §3): map the
+            // pass's region geometry to tracker ULIDs in ONE latch-gated
+            // batch — reusing an existing id by position, minting a fresh
+            // one for a genuinely new region — instead of an inline
+            // per-region mint. The latch check runs under the tracker
+            // entry's exclusive lock (the lock the didChange edit-shift also
+            // takes), so a passing batch is correct-at-birth and needs no
+            // purge set; a refused batch minted NOTHING. Refusal means an
+            // edit outran this pass: withhold every region-id-bearing
+            // product (readers fall back inline, byte-identically to the
+            // pre-lever path) and defer identity to the next current pass —
+            // the tracker is meanwhile kept live by the ordinary didChange
+            // edit-shift.
+            let Some(region_ids) = tracker.mint_batch_if_unshifted(
+                uri,
+                entry_mint_epoch,
+                regions.iter().map(|info| {
+                    (
                         info.content_node.start_byte(),
                         info.content_node.end_byte(),
                         info.content_node.kind(),
                         0,
-                    );
-                    if created {
-                        minted_ids.push(ulid);
-                    }
+                    )
+                }),
+            ) else {
+                return PopulatedInjections::empty(generation);
+            };
+
+            // Convert to CacheableInjectionRegion pairing each region with
+            // its reconciled ULID (index-aligned with `regions` by the batch
+            // contract).
+            let cacheable_regions: Vec<CacheableInjectionRegion> = regions
+                .iter()
+                .zip(&region_ids)
+                .map(|(info, ulid)| {
                     let region_id = ulid.to_string();
                     CacheableInjectionRegion::from_region_info(info, &region_id, text)
                 })
@@ -344,19 +362,20 @@ impl CacheCoordinator {
                 .unwrap_or_default();
 
             // Exit half of the mint reconciliation, atomic with coordinate
-            // shifts: the commit runs under the tracker entry's shared lock
-            // and only while the (shift generation, cleanup epoch) latch
-            // still matches — an edit (or close/reopen) that landed during
-            // this pass fails the check INSIDE the lock, so a shift can
-            // never interleave between check and commit. On mismatch, purge
-            // exactly this pass's tracker creations (the base invariant: a
-            // stale pass never leaves wrong-space entries as live), keep the
-            // injection map's previous entry (the newer text's own populate
-            // replaces it), and withhold the region-id-bearing products; the
-            // snapshot then rides without regions and every reader falls
-            // back inline, byte-identically to the pre-lever path. The
-            // token-cache sweep runs inside the commit closure, so a stale
-            // pass performs no eviction at all.
+            // shifts: the commit runs under the tracker entry's exclusive
+            // lock and only while the (shift generation, cleanup epoch)
+            // latch still matches — an edit (or close/reopen) that landed
+            // during this pass fails the check INSIDE the lock, so a shift
+            // can never interleave between check and commit. On mismatch,
+            // keep the injection map's previous entry (the newer text's own
+            // populate replaces it) and withhold the region-id-bearing
+            // products; the snapshot then rides without regions and every
+            // reader falls back inline, byte-identically to the pre-lever
+            // path. No tracker purge is needed: the batch mint above was
+            // latch-gated too, so every id this pass minted was
+            // correct-at-birth — the intervening edit shifts it like any
+            // live entry. The token-cache sweep runs inside the commit
+            // closure, so a stale pass performs no eviction at all.
             let committed = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
                 // Commit point: record the committed pass's region set (test
                 // observability today; no production reader since token
@@ -370,9 +389,6 @@ impl CacheCoordinator {
                     .retain_document(uri, &live_hashes);
             });
             if committed.is_none() {
-                for id in &minted_ids {
-                    tracker.remove_id(uri, id);
-                }
                 return PopulatedInjections::empty(generation);
             }
             return PopulatedInjections {
