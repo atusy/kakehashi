@@ -74,8 +74,12 @@ That is a distinct third operation, which this decision names `merged`.
   fast; bridged tokens arrive 10s–1000s of ms later. The user must see
   highlighting immediately, so the merge is inherently *temporal*, not a
   request that blocks on all layers (request-strategies Strategy 1).
-- **One advertised legend, fixed at `initialize`.** LSP fixes the
-  `SemanticTokensLegend` at server `initialize`. Bridged servers are spawned
+- **One advertised legend, fixed at `initialize`.** LSP binds the
+  `SemanticTokensLegend` when the capability is registered — for kakehashi's
+  static registration, at `initialize`. (Re-registering with a new legend via
+  `client/registerCapability` exists in the protocol, but only when the client
+  opts into `dynamicRegistration` — optional support the merge cannot stand
+  on; see Alternative D.) Bridged servers are spawned
   **only after** kakehashi has already initialized — on injection detection
   during parsing of an already-open document (language-server-bridge;
   ls-bridge-async-connection handles the async I/O) — so their legends are
@@ -514,10 +518,15 @@ overlap-resolution Phase 4), never as the default.
 Widen kakehashi's legend to union every bridged server's custom types so
 nothing is dropped.
 
-**Rejected because**: LSP fixes the legend at `initialize`, and bridged servers
-are spawned only *afterward* — on injection detection (language-server-bridge) —
-so their legends are unknowable when kakehashi must declare its own. There is no protocol-legal way
-to grow the legend post-initialize. What survives from this alternative is its
+**Rejected because**: kakehashi's legend is bound at `initialize` (static
+registration), and bridged servers are spawned only *afterward* — on injection
+detection (language-server-bridge) — so their legends are unknowable when
+kakehashi must declare its own. The protocol's only post-initialize path is
+re-registering the capability via `client/registerCapability` with a new
+legend, which works only when the client advertises `dynamicRegistration` for
+semantic tokens — optional support that cannot carry a default behavior (and
+each re-registration would invalidate every outstanding `resultId` baseline).
+What survives from this alternative is its
 *static* half, adopted in §3: entries the **user** declares in
 `semanticTokens.extraLegend` are known from config before `initialize`, so
 they extend the legend without renegotiation, and the connect-time warning
