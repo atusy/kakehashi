@@ -167,7 +167,9 @@ impl Kakehashi {
                     &language_name,
                     &resolved.injection_language,
                 );
-                configs.retain(|c| !incapable_servers.contains(&c.server_name));
+                if !incapable_servers.is_empty() {
+                    configs.retain(|c| !incapable_servers.contains(&c.server_name));
+                }
                 if configs.is_empty() {
                     continue;
                 }
