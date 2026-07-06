@@ -693,6 +693,13 @@ impl NodeTracker {
     /// whose insert happens-before any mint that passed the gate, which
     /// happens-before this probe under the same entry lock — so the removal
     /// reclaims only old-lifetime state.
+    ///
+    /// Lock-order contract: `reopened` runs while this method holds `uri`'s
+    /// entry (shard) lock, so it MUST NOT touch this tracker (self-deadlock)
+    /// and may only take locks that never call back into the tracker while
+    /// held — the document-store read the didClose probe performs is fine
+    /// (the store never re-enters the tracker under its own locks); a future
+    /// probe must preserve that one-way ordering.
     pub(crate) fn cleanup(&self, uri: &Url, reopened: impl FnOnce() -> bool) {
         self.cleanup_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);

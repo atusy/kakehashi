@@ -1333,6 +1333,16 @@ fn execute_captures_walk(
             }
             matches.push(Value::Object(envelope));
         }
+        // The alignment contract the unchecked indexing above relies on:
+        // `capture_keys()` and the shaping loop enumerate the same captures
+        // in the same order, so the loop consumes EXACTLY the batch. A
+        // future divergence (a filter on one side but not the other) trips
+        // this in tests instead of panicking on an index in production.
+        debug_assert_eq!(
+            capture_idx,
+            layer_ulids.len(),
+            "capture_keys() and the shaping loop must enumerate the same captures"
+        );
     };
 
     if injection {
