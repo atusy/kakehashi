@@ -228,8 +228,13 @@ fn bridge_code_action(
     };
 
     // A server-side disabled action is only representable with disabledSupport.
-    if action.disabled.is_some() && !client_supports_disabled {
-        return None;
+    if action.disabled.is_some() {
+        if !client_supports_disabled {
+            return None;
+        }
+        // A disabled action must not steer the client's auto-fix keybinding,
+        // whatever path surfaces it.
+        action.is_preferred = None;
     }
 
     // The action's own diagnostics came back in virtual coordinates.
