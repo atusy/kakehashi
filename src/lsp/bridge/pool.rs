@@ -22,7 +22,7 @@ mod message_sender;
 mod shutdown;
 mod shutdown_timeout;
 #[cfg(test)]
-pub(in crate::lsp::bridge) mod test_helpers;
+pub(crate) mod test_helpers;
 
 pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
@@ -567,6 +567,91 @@ impl LanguageServerPool {
         pull_driven
     }
 
+    /// Among `candidates`, the server names **known** not to support `method`:
+    /// the server has at least one live connection past initialization (`Ready`)
+    /// and NONE of its live connections advertises `method` (via static
+    /// initialize caps or a dynamic registration) — checked WITHOUT creating a
+    /// connection (capability-prefilter-fanout).
+    ///
+    /// The inverse of `has_capability`: fan-out builders use this to drop a
+    /// server from a region's candidate set *before* spawning a task, so a
+    /// request never spins up a task + connection lookup only to hit the
+    /// per-handler capability gate and return an empty result.
+    ///
+    /// Deliberately conservative — a candidate is returned ONLY when it has at
+    /// least one `Ready` connection AND none of its connections advertises
+    /// `method`. Concretely:
+    /// - **No live connection at all** → NOT returned. The capability is unknown
+    ///   until the server is spawned + handshaked, so the caller keeps it and
+    ///   lets the request spawn it, exactly as before this filter existed.
+    /// - **Only non-`Ready` connections** (`Initializing`, `Failed`, `Closing`,
+    ///   `Closed`) and no `Ready` one → NOT returned. `server_capabilities` may
+    ///   not be in yet (`has_capability` is a premature `false`), and
+    ///   `get_or_create_connection_wait_ready` waits for `Ready` (or respawns a
+    ///   `Failed` one) before checking, so dropping here would skip a server that
+    ///   will answer.
+    ///
+    /// # Soundness boundary and the across-roots limitation
+    ///
+    /// Classification is **by server name across roots**: a server is capable if
+    /// ANY of its `(server, root)` connections advertises `method`, incapable if
+    /// it has a `Ready` connection and NONE does. This is exactly sound **iff the
+    /// capability is root-invariant** — the near-universal reality, since every
+    /// instance of one binary reports identical *static* `initialize`
+    /// capabilities (this is what makes a statically pull-incapable server like
+    /// basedpyright safe to drop on every root). It is NOT precise about the
+    /// serving root: if a `Ready` connection for `(server, rootA)` lacks `method`
+    /// while `(server, rootB)` would advertise it, a request in rootB is dropped
+    /// even though rootB has no connection yet or only an `Initializing` one — so
+    /// the "non-`Ready` is never dropped" rule above holds only when that is the
+    /// server's SOLE connection.
+    ///
+    /// That over-drop can fire only under genuine per-root capability
+    /// **divergence** (per-root `initializationOptions` that change advertised
+    /// static caps, or a per-instance *dynamic* registration) AND the serving
+    /// root having no `Ready`-capable connection. It is impossible in a
+    /// single-root workspace, and not permanent: any request via an exempt method
+    /// (see `capability_prefilter_applies`) or any other path spawns the
+    /// divergent root's instance and self-corrects the classification. Scoping to
+    /// the request's `(server, root)` would need a per-server marker resolution
+    /// (`resolve_marker_and_key`, filesystem I/O) on this hot path, which would
+    /// erode the win this filter exists for; the per-handler capability gate
+    /// remains authoritative for every server this does keep.
+    pub(crate) async fn servers_known_incapable(
+        &self,
+        candidates: &std::collections::HashSet<&str>,
+        method: &str,
+    ) -> std::collections::HashSet<String> {
+        if candidates.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let connections = self.connections.lock().await;
+        // Accumulate into `candidates`-lifetime references (via `candidates.get`),
+        // NOT borrows of the `connections` map: that lets us drop the lock before
+        // the final owned materialization, so the `connections` mutex — contended
+        // by every bridge request — is held only for the scan, not the
+        // `candidates.iter()/collect()` pass below.
+        let mut capable: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut has_ready: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for handle in connections.values() {
+            let Some(&candidate) = candidates.get(handle.key().server()) else {
+                continue;
+            };
+            if handle.has_capability(method) {
+                capable.insert(candidate);
+            }
+            if handle.state() == ConnectionState::Ready {
+                has_ready.insert(candidate);
+            }
+        }
+        drop(connections);
+        candidates
+            .iter()
+            .filter(|&&name| has_ready.contains(name) && !capable.contains(name))
+            .map(|&name| name.to_string())
+            .collect()
+    }
+
     /// Host-document sync state (host-document-bridge). Used by the host
     /// request path in `text_document/host.rs`.
     pub(super) async fn host_documents(
@@ -580,9 +665,11 @@ impl LanguageServerPool {
     /// This allows tests to set up a pool with a known connection state
     /// without going through the full server spawn + handshake flow. The handle
     /// is keyed by its own `handle.key()` so lookups via the key (didChange,
-    /// cancel) agree with the map.
+    /// cancel) agree with the map. `pub(crate)` (not bridge-private) so the
+    /// capability-prefilter regression test in `lsp_impl` can seed a Ready
+    /// downstream (capability-prefilter-fanout).
     #[cfg(test)]
-    pub(in crate::lsp::bridge) async fn insert_connection(&self, handle: Arc<ConnectionHandle>) {
+    pub(crate) async fn insert_connection(&self, handle: Arc<ConnectionHandle>) {
         let mut connections = self.connections.lock().await;
         connections.insert(handle.key().clone(), handle);
     }
@@ -5158,6 +5245,146 @@ mod tests {
         let pool = LanguageServerPool::new();
         assert!(
             pool.pull_driven_servers(&HashSet::<&str>::new())
+                .await
+                .is_empty()
+        );
+    }
+
+    /// `servers_known_incapable` returns exactly the candidates whose capability
+    /// is *definitively* known-absent: a `Ready` connection lacking `method`.
+    /// A capable server, a still-`Initializing` one, and a name with no live
+    /// connection are all kept out of the result (capability-prefilter-fanout).
+    #[tokio::test]
+    async fn servers_known_incapable_returns_only_ready_and_lacking() {
+        use std::collections::HashSet;
+        use tower_lsp_server::ls_types::{HoverProviderCapability, ServerCapabilities};
+
+        let pool = LanguageServerPool::new();
+
+        // "capable" is Ready and advertises hover → NOT incapable.
+        let capable =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("capable"))
+                .await;
+        capable.set_server_capabilities(ServerCapabilities {
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            ..Default::default()
+        });
+        pool.insert_connection(capable).await;
+
+        // "lacking" is Ready with no hover capability → incapable (the one hit).
+        let lacking =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lacking"))
+                .await;
+        lacking.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(lacking).await;
+
+        // "warming" is still Initializing → capability unknown, must be kept.
+        let warming = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("warming"),
+        )
+        .await;
+        pool.insert_connection(warming).await;
+
+        let candidates = HashSet::from([
+            "capable", "lacking", "warming", "ghost", // no live connection
+        ]);
+        let incapable = pool
+            .servers_known_incapable(&candidates, "textDocument/hover")
+            .await;
+
+        assert_eq!(
+            incapable,
+            HashSet::from(["lacking".to_string()]),
+            "only a Ready connection that lacks the capability is known-incapable"
+        );
+    }
+
+    /// A server counts as capable if ANY of its `(server, root)` connections
+    /// advertises `method`, so a Ready-but-lacking instance alongside a capable
+    /// one does not make the server incapable (across-roots caveat).
+    #[tokio::test]
+    async fn servers_known_incapable_capable_on_any_instance_wins() {
+        use std::collections::HashSet;
+        use tower_lsp_server::ls_types::{HoverProviderCapability, ServerCapabilities};
+
+        let pool = LanguageServerPool::new();
+
+        let root_a = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("srv", Some("/a".to_string())),
+        )
+        .await;
+        root_a.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(root_a).await;
+
+        let root_b = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("srv", Some("/b".to_string())),
+        )
+        .await;
+        root_b.set_server_capabilities(ServerCapabilities {
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            ..Default::default()
+        });
+        pool.insert_connection(root_b).await;
+
+        let candidates = HashSet::from(["srv"]);
+        let incapable = pool
+            .servers_known_incapable(&candidates, "textDocument/hover")
+            .await;
+
+        assert!(
+            incapable.is_empty(),
+            "a capable instance makes the whole server capable across roots"
+        );
+    }
+
+    /// A candidate whose only live connection is `Failed` or `Closing` — not
+    /// past a successful init — is NOT returned: its capability is not
+    /// known-absent (a `Failed` connection is evicted and respawned on the next
+    /// request, which may then advertise the method). Pins the strict
+    /// `state() == Ready` gate against a future widening (e.g. `!= Closed`) that
+    /// would silently over-drop such a server (capability-prefilter-fanout).
+    #[tokio::test]
+    async fn servers_known_incapable_keeps_failed_and_closing_only() {
+        use std::collections::HashSet;
+        use tower_lsp_server::ls_types::ServerCapabilities;
+
+        let pool = LanguageServerPool::new();
+
+        let failed =
+            create_handle_with_key(ConnectionState::Failed, ConnectionKey::for_server("failed"))
+                .await;
+        failed.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(failed).await;
+
+        let closing = create_handle_with_key(
+            ConnectionState::Closing,
+            ConnectionKey::for_server("closing"),
+        )
+        .await;
+        closing.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(closing).await;
+
+        let candidates = HashSet::from(["failed", "closing"]);
+        let incapable = pool
+            .servers_known_incapable(&candidates, "textDocument/hover")
+            .await;
+
+        assert!(
+            incapable.is_empty(),
+            "only a Ready connection is known-incapable; Failed/Closing are kept"
+        );
+    }
+
+    /// An empty candidate set short-circuits to empty without touching the pool.
+    #[tokio::test]
+    async fn servers_known_incapable_empty_candidates_returns_empty() {
+        use std::collections::HashSet;
+        let pool = LanguageServerPool::new();
+        assert!(
+            pool.servers_known_incapable(&HashSet::<&str>::new(), "textDocument/hover")
                 .await
                 .is_empty()
         );

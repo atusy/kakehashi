@@ -228,16 +228,36 @@ impl Kakehashi {
             })
             .collect();
 
+        // Pre-filter servers already known (a live, `Ready` connection) NOT to
+        // answer pull diagnostics, so the per-region fan-out below never spawns a
+        // task + connection lookup only to hit the capability gate and return an
+        // empty layer (capability-prefilter-fanout). A push-only server like
+        // basedpyright, warmed by eager-open, is dropped here for EVERY region
+        // instead of once per (region × pull). One pool query for the whole
+        // request; the resulting set is a cheap lookup inside the region loop.
+        let incapable_servers = self
+            .incapable_virt_servers(
+                &language_name,
+                virt_regions.iter().map(|r| r.injection_language.as_str()),
+                "textDocument/diagnostic",
+            )
+            .await;
+
         // Virt layer: 2-level aggregation —
         //   Inner: dispatch per region (fans out to all servers for that region)
         //   Outer: collect across regions
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
             for resolved in virt_regions.iter() {
-                let configs = self.bridge_configs_for_injection_language(
+                let mut configs = self.bridge_configs_for_injection_language(
                     &language_name,
                     &resolved.injection_language,
                 );
+                // Drop known-incapable servers before building the fan-out
+                // context (capability-prefilter-fanout).
+                if !incapable_servers.is_empty() {
+                    configs.retain(|c| !incapable_servers.contains(&c.server_name));
+                }
                 if configs.is_empty() {
                     continue;
                 }

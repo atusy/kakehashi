@@ -20,6 +20,34 @@ use crate::text::PositionMapper;
 
 use super::{Kakehashi, uri_to_url};
 
+/// Whether the capability prefilter (capability-prefilter-fanout) may drop a
+/// server known to lack `method` before fan-out.
+///
+/// The prefilter relies on `has_capability(method) == false` being observably
+/// equivalent to the handler returning an empty result. That holds for every
+/// routed method EXCEPT the ones whose handler falls back to a *different*
+/// capability when the requested one is absent — dropping a server by the
+/// requested capability alone would then discard a server that would have
+/// answered via the fallback:
+/// - `textDocument/prepareRename` → `send_prepare_rename_request` returns
+///   `DefaultBehavior` (rename stays enabled) when the server advertises
+///   `textDocument/rename` but not `prepareRename`.
+/// - `textDocument/formatting` / `textDocument/rangeFormatting` → the
+///   Concatenated pipeline (`pipeline_step_request_kind` in the
+///   [`formatting`](crate::lsp::lsp_impl::text_document::formatting) module) uses
+///   a server that supports EITHER full OR range formatting, sending whichever
+///   it advertises; filtering by one alone would drop a server capable of the
+///   other.
+///
+/// For exempt methods the per-handler capability gate still runs and handles
+/// the fallback correctly.
+fn capability_prefilter_applies(method: &str) -> bool {
+    !matches!(
+        method,
+        "textDocument/prepareRename" | "textDocument/formatting" | "textDocument/rangeFormatting"
+    )
+}
+
 /// All resolved context needed to send bridge requests to multiple servers.
 ///
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
@@ -596,6 +624,52 @@ impl Kakehashi {
             .allows(LayerSource::Virt)
     }
 
+    /// Shared capability prefilter (capability-prefilter-fanout): the set of
+    /// server names to drop from `method`'s virt fan-out across the given
+    /// `injection_languages` — those with a live `Ready` connection already
+    /// known to lack the capability (so the fan-out never spawns a task +
+    /// connection lookup only to hit the per-handler gate and return empty).
+    ///
+    /// One pool query for the whole request; every virt fan-out entry point
+    /// (per-region diagnostic loop, whole-document helper, documentSymbol /
+    /// documentColor, position/range preamble) routes through here so the drop
+    /// policy is uniform. Returns an empty set — a cheap no-op for callers —
+    /// when `method` is exempt (see [`capability_prefilter_applies`]) or nothing
+    /// is configured. `injection_languages` may repeat; it is deduped here.
+    ///
+    /// The owned `configs_by_lang` exists only so the candidate `&str`s can
+    /// borrow across the `await`; the per-language resolution is a cached lookup
+    /// and callers re-resolve their own per-region configs (same cached call).
+    pub(super) async fn incapable_virt_servers<'a>(
+        &self,
+        host_language: &str,
+        injection_languages: impl IntoIterator<Item = &'a str>,
+        method: &str,
+    ) -> std::collections::HashSet<String> {
+        if !capability_prefilter_applies(method) {
+            return std::collections::HashSet::new();
+        }
+        let mut langs: Vec<&str> = injection_languages.into_iter().collect();
+        langs.sort_unstable();
+        langs.dedup();
+        let configs_by_lang: Vec<_> = langs
+            .into_iter()
+            .map(|lang| self.bridge_configs_for_injection_language(host_language, lang))
+            .collect();
+        let candidates: std::collections::HashSet<&str> = configs_by_lang
+            .iter()
+            .flatten()
+            .map(|c| c.server_name.as_str())
+            .collect();
+        if candidates.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        self.bridge
+            .pool_arc()
+            .servers_known_incapable(&candidates, method)
+            .await
+    }
+
     /// Convert a preamble result into a `DocumentRequestContext` by looking up
     /// bridge server configs for the injection language.
     ///
@@ -603,7 +677,7 @@ impl Kakehashi {
     /// to resolve per-method aggregation priorities from the bridge language config.
     ///
     /// Returns `None` if no configs are found.
-    fn preamble_to_document_context(
+    async fn preamble_to_document_context(
         &self,
         preamble: PreambleResult,
         method_name: &str,
@@ -617,7 +691,7 @@ impl Kakehashi {
             return None;
         }
 
-        let configs = self.bridge_configs_for_injection_language(
+        let mut configs = self.bridge_configs_for_injection_language(
             &preamble.language_name,
             &preamble.resolved.injection_language,
         );
@@ -629,6 +703,29 @@ impl Kakehashi {
                 preamble.language_name
             );
             return None;
+        }
+
+        // Drop servers already known (a live, `Ready` connection) NOT to support
+        // this method, so the fan-out never spawns a task + connection lookup
+        // only to hit the per-handler capability gate and return empty
+        // (capability-prefilter-fanout).
+        let incapable = self
+            .incapable_virt_servers(
+                &preamble.language_name,
+                std::iter::once(preamble.resolved.injection_language.as_str()),
+                method_name,
+            )
+            .await;
+        if !incapable.is_empty() {
+            configs.retain(|c| !incapable.contains(&c.server_name));
+            if configs.is_empty() {
+                log::debug!(
+                    "{}: all configured servers for {} are known-incapable; skipping virt layer",
+                    method_name,
+                    preamble.resolved.injection_language
+                );
+                return None;
+            }
         }
 
         let agg = self.resolve_aggregation_config(
@@ -911,7 +1008,9 @@ impl Kakehashi {
         // would find `snapshot()` empty and return null after every edit.
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let preamble = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
-        let document = self.preamble_to_document_context(preamble, method_name)?;
+        let document = self
+            .preamble_to_document_context(preamble, method_name)
+            .await?;
 
         Some(PositionRequestContext { document, position })
     }
@@ -936,7 +1035,9 @@ impl Kakehashi {
     ) -> Option<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let preamble = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
-        let document = self.preamble_to_document_context(preamble, method_name)?;
+        let document = self
+            .preamble_to_document_context(preamble, method_name)
+            .await?;
 
         Some(RangeRequestContext { document, range })
     }
@@ -1807,5 +1908,42 @@ mod tests {
                 ("rust".to_string(), "python".to_string()),
             ]
         );
+    }
+
+    /// The capability prefilter is exempt for the methods whose capability-absent
+    /// handler branch is NOT empty because it falls back to a different
+    /// capability: `prepareRename` (→ `rename`'s `DefaultBehavior`) and
+    /// `formatting`/`rangeFormatting` (→ the other formatting kind via the
+    /// Concatenated pipeline). Dropping a server by the requested capability
+    /// alone would discard one that would have answered via the fallback. All
+    /// other routed methods are prefiltered.
+    #[test]
+    fn capability_prefilter_exempts_fallback_methods() {
+        for exempt in [
+            "textDocument/prepareRename",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
+        ] {
+            assert!(
+                !capability_prefilter_applies(exempt),
+                "{exempt} must be exempt"
+            );
+        }
+        for method in [
+            "textDocument/hover",
+            "textDocument/definition",
+            "textDocument/completion",
+            "textDocument/references",
+            "textDocument/rename",
+            "textDocument/documentColor",
+            "textDocument/documentSymbol",
+            "textDocument/foldingRange",
+            "textDocument/diagnostic",
+        ] {
+            assert!(
+                capability_prefilter_applies(method),
+                "{method} must be prefiltered"
+            );
+        }
     }
 }

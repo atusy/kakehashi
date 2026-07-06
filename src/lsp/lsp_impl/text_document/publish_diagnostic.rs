@@ -105,11 +105,41 @@ pub(crate) async fn collect_push_diagnostics(
     // async blocks would otherwise rely on disjoint-field captures of
     // `snapshot`, which compiles but reads ambiguously).
     let DiagnosticSnapshot {
-        virt_contexts,
+        mut virt_contexts,
         host,
         host_pull_enabled,
         layer_cfg,
     } = snapshot;
+
+    // Drop servers already known (a live, `Ready` connection) NOT to answer pull
+    // diagnostics before spawning their per-region tasks
+    // (capability-prefilter-fanout). The proactive push path
+    // (didOpen/didSave/debounced didChange) fans out exactly like the editor's
+    // pull, so a push-only server (e.g. basedpyright, warmed by eager-open)
+    // would otherwise be re-dispatched once per region on every change. The
+    // per-region `send_diagnostic_request` already returns an empty layer for
+    // such a server (its capability gate), so with the default (untruncated)
+    // `maxFanOut` pre-dropping only removes the wasted task — the collected set
+    // is unchanged. Under a configured `maxFanOut` this shares the same
+    // priority/truncation aggregation as the pull path, so dropping an incapable
+    // high-priority server can promote the next capable one into a kept slot —
+    // an answer where the region previously collected empty (the improvement
+    // noted in the PR description), never a regression.
+    if !virt_contexts.is_empty() {
+        let candidates: std::collections::HashSet<&str> = virt_contexts
+            .iter()
+            .flat_map(|ctx| ctx.configs.iter().map(|c| c.server_name.as_str()))
+            .collect();
+        let incapable = pool
+            .servers_known_incapable(&candidates, "textDocument/diagnostic")
+            .await;
+        if !incapable.is_empty() {
+            for ctx in &mut virt_contexts {
+                ctx.configs.retain(|c| !incapable.contains(&c.server_name));
+            }
+            virt_contexts.retain(|ctx| !ctx.configs.is_empty());
+        }
+    }
 
     let virt_fut = async {
         let mut join_set = JoinSet::new();
@@ -154,4 +184,87 @@ pub(crate) async fn collect_push_diagnostics(
     PullLayerOutcome::Publish(combine_layer_diagnostics(
         &layer_cfg, virt_items, host_items,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::{AggregationStrategy, BridgeServerConfig};
+    use crate::language::injection::{CacheableInjectionRegion, ResolvedInjection};
+    use crate::lsp::bridge::ConnectionState;
+    use crate::lsp::bridge::ResolvedServerConfig;
+    use crate::lsp::bridge::test_helpers::create_handle_with_state;
+
+    fn virt_ctx_for_server(server: &str) -> DocumentRequestContext {
+        DocumentRequestContext {
+            uri: Url::parse("file:///t.md").unwrap(),
+            resolved: ResolvedInjection {
+                region: CacheableInjectionRegion {
+                    language: "python".to_string(),
+                    byte_range: 0..0,
+                    line_range: 0..0,
+                    start_column: 0,
+                    region_id: "r0".to_string(),
+                    content_hash: 0,
+                },
+                injection_language: "python".to_string(),
+                virtual_content: String::new(),
+                line_column_offsets: vec![],
+            },
+            configs: vec![ResolvedServerConfig {
+                server_name: server.to_string(),
+                config: Arc::new(BridgeServerConfig {
+                    cmd: vec![server.to_string()],
+                    languages: vec![],
+                    initialization_options: None,
+                    workspace_markers: None,
+                    on_type_formatting_triggers: None,
+                    prefer_shared_instance: None,
+                    enabled: None,
+                    settings: None,
+                }),
+            }],
+            upstream_request_id: None,
+            priorities: vec![],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: None,
+        }
+    }
+
+    /// An all-incapable virt snapshot must still publish an (empty) pull layer,
+    /// NOT `Clear`: `has_contributors()` runs BEFORE the capability prefilter, so
+    /// dropping every server leaves the same empty publish the per-region
+    /// capability gate would have produced (capability-prefilter-fanout). Guards
+    /// the ordering against a refactor that filters ahead of that check (which
+    /// would turn a self-healing empty publish into a stale-clearing eviction).
+    #[tokio::test]
+    async fn all_incapable_virt_snapshot_publishes_empty_not_clear() {
+        let pool = Arc::new(LanguageServerPool::new());
+        // A `Ready` connection for server "test" with no advertised capabilities
+        // → known-incapable of `textDocument/diagnostic`, so the prefilter drops
+        // it and the region's config set empties.
+        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        pool.insert_connection(handle).await;
+
+        let snapshot = DiagnosticSnapshot {
+            virt_contexts: vec![virt_ctx_for_server("test")],
+            host: None,
+            host_pull_enabled: false,
+            layer_cfg: ResolvedLayerConfig::with_defaults("textDocument/publishDiagnostics"),
+        };
+
+        let uri = Url::parse("file:///t.md").unwrap();
+        let outcome = collect_push_diagnostics(Some(snapshot), &pool, &uri, "test").await;
+
+        match outcome {
+            PullLayerOutcome::Publish(diags) => {
+                assert!(diags.is_empty(), "expected an empty publish");
+            }
+            PullLayerOutcome::Clear => {
+                panic!("all-incapable virt snapshot must Publish(empty), not Clear")
+            }
+            PullLayerOutcome::Skip => panic!("snapshot was Some, must not Skip"),
+        }
+    }
 }
