@@ -309,7 +309,8 @@ impl ParseCoordinator {
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
             let latch = tracker.mint_epoch(&uri);
-            let valid = self.documents.latest_snapshot(&uri).is_some_and(|view| {
+            let latest = self.documents.latest_snapshot(&uri);
+            let valid = latest.as_ref().is_some_and(|view| {
                 view.slot.current_incarnation == incarnation
                     && view.content_version == content_version
             });
@@ -322,7 +323,7 @@ impl ParseCoordinator {
                 // installed a new one) for the new lifetime's edits, and
                 // removing it from under a queued edit would let the next
                 // edit mint a fresh mutex and run concurrently.
-                if self.documents.latest_snapshot(&uri).is_none() {
+                if latest.is_none() {
                     self.documents
                         .remove_edit_lock_if_unshared(&uri, &edit_lock);
                 }
