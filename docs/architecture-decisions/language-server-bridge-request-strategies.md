@@ -283,7 +283,7 @@ When multiple servers are configured for a language:
 
 | Method | Merging Strategy |
 |--------|------------------|
-| Semantic Tokens | Per-region winner by `priorities` rank; two-level sweep in cross-layer-semantic-token-merge |
+| Semantic Tokens | *(aspirational — token bridging not implemented)* per-region winner by `priorities` rank; two-level sweep in cross-layer-semantic-token-merge |
 | Go-to-Definition | Return first non-empty result (query in order) |
 | Find References | Concatenate all results, dedupe by location |
 | Completion | Merge completion lists from all servers |
