@@ -457,7 +457,7 @@ visible to stage 1 or a type split"; its Neutral bullet now defers here:
   the optional `semanticTokens.extraLegend` table (§3).
 - **Instant highlighting preserved.** Native-first temporal refinement keeps
   the zero-latency tree-sitter experience; bridged richness arrives as a
-  refresh, never blocking the first paint.
+  refresh where the client supports it, never blocking the first paint.
 - **Stable colors while typing.** The stale-tolerant version contract (§2)
   keeps bridged tokens on screen across edits by shifting them, instead of
   reverting the document to native colors on every keystroke and flipping back
