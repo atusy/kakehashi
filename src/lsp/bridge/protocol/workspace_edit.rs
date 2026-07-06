@@ -136,3 +136,166 @@ fn transform_text_document_edit(
     // Case 3: Cross-region → filter out
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_host_uri() -> Uri {
+        crate::lsp::lsp_impl::url_to_uri(&url::Url::parse("file:///test.md").unwrap()).unwrap()
+    }
+
+    fn make_virtual_uri_string() -> String {
+        VirtualDocumentUri::new(&make_host_uri(), "lua", "region-0").to_uri_string()
+    }
+
+    fn parse_workspace_edit(value: serde_json::Value) -> WorkspaceEdit {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn document_changes_operations_preserves_file_ops_and_transforms_edits() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = parse_workspace_edit(json!({
+            "documentChanges": [
+                { "kind": "create", "uri": "file:///new.lua" },
+                {
+                    "textDocument": { "uri": virtual_uri, "version": 3 },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "newName"
+                    }]
+                }
+            ]
+        }));
+
+        transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        );
+
+        match edit.document_changes.unwrap() {
+            DocumentChanges::Operations(ops) => {
+                assert_eq!(ops.len(), 2, "file op and edit must both survive");
+                assert!(
+                    matches!(&ops[0], DocumentChangeOperation::Op(_)),
+                    "file operation must pass through untouched"
+                );
+                match &ops[1] {
+                    DocumentChangeOperation::Edit(edit) => {
+                        assert_eq!(edit.text_document.uri, host_uri);
+                        assert_eq!(edit.text_document.version, None);
+                    }
+                    DocumentChangeOperation::Op(_) => panic!("Expected Edit operation"),
+                }
+            }
+            DocumentChanges::Edits(_) => panic!("Expected Operations variant"),
+        }
+    }
+
+    #[test]
+    fn document_changes_translates_annotated_edits() {
+        use tower_lsp_server::ls_types::{
+            AnnotatedTextEdit, OptionalVersionedTextDocumentIdentifier, Position, Range,
+        };
+
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // Constructed in code: serde's untagged OneOf parses annotated edits as
+        // plain TextEdits (unknown fields are ignored), so JSON can't reach Right.
+        let mut edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: virtual_uri.parse().unwrap(),
+                    version: Some(1),
+                },
+                edits: vec![OneOf::Right(AnnotatedTextEdit {
+                    text_edit: TextEdit {
+                        range: Range {
+                            start: Position {
+                                line: 2,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: 2,
+                                character: 5,
+                            },
+                        },
+                        new_text: "newName".to_string(),
+                    },
+                    annotation_id: "refactor".to_string(),
+                })],
+            }])),
+            ..Default::default()
+        };
+
+        transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        );
+
+        match edit.document_changes.unwrap() {
+            DocumentChanges::Edits(edits) => match &edits[0].edits[0] {
+                OneOf::Right(annotated) => {
+                    assert_eq!(annotated.text_edit.range.start.line, 12); // 2 + 10
+                    assert_eq!(annotated.annotation_id, "refactor");
+                }
+                OneOf::Left(_) => panic!("Expected Right(AnnotatedTextEdit)"),
+            },
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
+        }
+    }
+
+    #[test]
+    fn document_changes_real_file_edit_preserved_untouched() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let real_uri = "file:///usr/local/lib/types.lua";
+        let mut edit = parse_workspace_edit(json!({
+            "documentChanges": [{
+                "textDocument": { "uri": real_uri, "version": 5 },
+                "edits": [{
+                    "range": {
+                        "start": { "line": 50, "character": 0 },
+                        "end": { "line": 50, "character": 5 }
+                    },
+                    "newText": "newName"
+                }]
+            }]
+        }));
+
+        transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        );
+
+        match edit.document_changes.unwrap() {
+            DocumentChanges::Edits(edits) => {
+                assert_eq!(edits[0].text_document.uri.as_str(), real_uri);
+                assert_eq!(
+                    edits[0].text_document.version,
+                    Some(5),
+                    "real-file version must survive untouched"
+                );
+                match &edits[0].edits[0] {
+                    OneOf::Left(text_edit) => {
+                        assert_eq!(text_edit.range.start.line, 50, "real-file range untouched");
+                    }
+                    OneOf::Right(_) => panic!("Expected Left(TextEdit)"),
+                }
+            }
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
+        }
+    }
+}
