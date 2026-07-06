@@ -55,6 +55,13 @@
 ((local_declaration_statement
    (variable_declaration (variable_declarator name: (identifier) @definition))) @_decl
  (#set! definition.visibility "after"))
+; `for (int i = 0; …)` — the initializer holds a bare variable_declaration
+; (no local_declaration_statement wrapper); i is scoped to the for.
+; Anchor `after` to the declaration, not the whole loop, so i is visible
+; in the condition, update, and body.
+((for_statement
+   initializer: (variable_declaration (variable_declarator name: (identifier) @definition)) @_decl)
+ (#set! definition.visibility "after"))
 ; `M(out var x)` declares x from the expression onward.
 ((declaration_expression name: (identifier) @definition) @_decl
  (#set! definition.visibility "after"))

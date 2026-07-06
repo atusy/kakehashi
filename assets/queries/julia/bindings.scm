@@ -8,23 +8,41 @@
 ; that only exists as a global creates a function-local instead of
 ; writing the global (a top-level assignment falls back to the layer
 ; root). Loops/let/comprehensions are soft scopes for their own binders
-; (for/let variables), which stay confined. Types
+; (for/let variables), which stay confined.
+;
+; ACCEPTED APPROXIMATION (see issue #566): Julia's true rule is "assign an
+; existing enclosing *local* if one is visible, else create a local in
+; this hard scope" — so re-assigning inside a `let` or a nested closure a
+; name the enclosing function already binds should update that binding.
+; Binding into the nearest hard scope instead leaves such a reassignment
+; as a *separate* binding (conservative under-linking) rather than the
+; alternative (outer-or-local), which would merge a function-local with a
+; same-named global — a wrong cross-scope rename. Silence over a wrong
+; answer, per the ADR. The proper fix — separate `local`/`global`
+; namespaces selected by `#has-ancestor?`, so outer-or-local finds
+; enclosing locals but never a global while reads search both — is a
+; namespace re-architecture tracked in #566.
+; Types
 ; and values share the default namespace (annotations and constructor
 ; calls are plain identifiers). Field access (obj.size) resolves only
 ; the value — the member stays uncaptured. Short-form definitions
 ; (`f(x) = x`) are deliberately silent for now.
 
 ; ── Scopes ──────────────────────────────────────────────────────────────
-(function_definition) @scope.function
-(macro_definition) @scope.function
-; Arrow functions and do-blocks are hard scopes (functions) too.
-(arrow_function_expression) @scope.function
-(do_clause) @scope.function
+; Hard scopes — an assignment inside one is local to it: functions,
+; macros, arrow functions, do-blocks, let blocks, comprehensions, and
+; modules. `nearest:hard` targets the closest of these.
+(function_definition) @scope.hard
+(macro_definition) @scope.hard
+(arrow_function_expression) @scope.hard
+(do_clause) @scope.hard
+(let_statement) @scope.hard
+(comprehension_expression) @scope.hard
+(module_definition) @scope.hard
+; Loops are soft scopes: an assignment writes an enclosing hard-scope
+; binding when one exists, so they are not `hard`.
 (for_statement) @scope
 (while_statement) @scope
-(let_statement) @scope
-(comprehension_expression) @scope
-(module_definition) @scope
 
 ; ── Functions, macros, structs, modules ──────────────────────────────────
 ; The name is the head of the signature's call expression; it belongs to
@@ -58,11 +76,11 @@
 
 ; ── Assignments and binders ──────────────────────────────────────────────
 ((assignment . (identifier) @definition)
- (#set! definition.scope "nearest:function"))
+ (#set! definition.scope "nearest:hard"))
 ((assignment . (tuple_expression (identifier) @definition))
- (#set! definition.scope "nearest:function"))
+ (#set! definition.scope "nearest:hard"))
 ((assignment . (open_tuple (identifier) @definition))
- (#set! definition.scope "nearest:function"))
+ (#set! definition.scope "nearest:hard"))
 (for_binding . (identifier) @definition)
 (for_binding . (tuple_expression (identifier) @definition))
 (let_binding . (identifier) @definition)

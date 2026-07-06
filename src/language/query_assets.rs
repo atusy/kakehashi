@@ -559,6 +559,17 @@ mod tests {
                 Some(n_def..n_def + 1)
             );
         }
+
+        #[test]
+        fn for_initializer_variable_resolves_in_the_loop() {
+            // `j` (not `i`, which collides with void/int) is the loop variable.
+            let text = "class K { void M() { for (int j = 0; j < 3; j++) { Use(j); } } }";
+            let m = model_for("c_sharp", text);
+            // The `int j` initializer binds and resolves in the condition,
+            // update, and body.
+            assert_resolves(&m, text, "j", 1, 0);
+            assert_resolves(&m, text, "j", 3, 0);
+        }
     }
 
     mod php_fixtures {
@@ -1134,6 +1145,19 @@ mod tests {
                 m.binding_at(nth(text, "x", 2)),
                 Some(local),
                 "return x reads the function-local"
+            );
+        }
+
+        #[test]
+        fn module_level_assignment_stays_in_the_module() {
+            // A module is a hard scope: a name assigned in it does not leak to
+            // the surrounding top level.
+            let text = "module A\n    x = 1\nend\nx\n";
+            let m = model_for("julia", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "x", 1)),
+                None,
+                "the top-level x must not resolve into the module"
             );
         }
 
