@@ -278,10 +278,12 @@ impl ParseCoordinator {
         text: std::sync::Arc<str>,
         tree: tree_sitter::Tree,
         language_name: String,
+        incarnation: u64,
     ) -> PopulatedSnapshotRegions {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        let documents = std::sync::Arc::clone(&self.documents);
         // Coarse per-parse gate: with no runnable bridge server configured,
         // the bridge-region build (per-region content copies) is pure waste
         // on the pre-publish critical path. `None` on the snapshot makes a
@@ -292,6 +294,24 @@ impl ParseCoordinator {
             .any_bridge_server_runnable();
         self.compute_pool
             .run(None, move || {
+                // At-mint liveness gate (the captures walk's
+                // `mint_into_tracker` discipline, applied to the writer): a
+                // didClose that ran to COMPLETION after this parse's CAS
+                // leaves the tracker's post-cleanup state — `(0, epoch+1)` —
+                // indistinguishable from a reopen's legitimate first mint,
+                // so populate's shift latch alone cannot refuse this pass.
+                // Gate on the document still being open in this same
+                // lifetime before minting anything; a close landing AFTER
+                // this check is caught by the latch instead (`cleanup` bumps
+                // the epoch before it removes). Skipping populate here
+                // matches the closed-document outcome everywhere else: the
+                // snapshot (if it still publishes) rides without regions.
+                if documents
+                    .latest_snapshot(&uri)
+                    .is_none_or(|view| view.slot.current_incarnation != incarnation)
+                {
+                    return PopulatedSnapshotRegions::default();
+                }
                 let populated = cache.populate_injections(
                     &uri,
                     &text,
@@ -512,6 +532,7 @@ impl ParseCoordinator {
                         text.clone(),
                         tree.clone(),
                         language_name.clone(),
+                        incarnation,
                     )
                     .await
                 } else {
@@ -768,6 +789,7 @@ impl ParseCoordinator {
                     text.clone(),
                     tree.clone(),
                     language_name.clone(),
+                    expected_incarnation,
                 )
                 .await
             } else {
@@ -961,6 +983,7 @@ impl ParseCoordinator {
                     text.clone(),
                     tree.clone(),
                     language_name.clone(),
+                    incarnation,
                 )
                 .await
             } else {

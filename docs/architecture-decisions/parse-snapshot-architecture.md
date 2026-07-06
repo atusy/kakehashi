@@ -310,8 +310,10 @@ snapshot and touches no shared identity index (the mint-race and the
 undefined-id-on-gate-failure both vanish); token reuse is content-keyed; and the
 one identity that genuinely needs cross-edit stability (the bridge's) keeps the
 tracker that already provides it. This ADR commits only to *not* mutating shared
-identities from a **stale** parse pass or any read path — the current-version
-reconciliation above is the one place a parse still mints them.
+identities from a **stale** parse pass or any **stale** read path — the
+latch-gated reconciliation above is where a parse mints them, and the
+currency-gated inline readers (the Stage-2 remainder below) still mint on
+their current-snapshot path.
 
 Any reader that must resolve against **live** positions is position-critical
 (below).
