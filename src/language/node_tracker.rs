@@ -30,12 +30,13 @@ use url::Url;
 pub(crate) struct NodeTracker {
     entries: DashMap<Url, UriEntries>,
     /// Bumped by every [`cleanup`](Self::cleanup) (didClose). Folded into the
-    /// serve-stale walks' generation latch so a close/reopen — which removes
-    /// the per-URI index and would reset its `shift_gen` to 0 (ABA) — can
-    /// never make an old-lifetime latch compare equal. Global (not per-URI)
-    /// so closed documents leave NO retained state; the cost is that a close
-    /// of any document mid-walk purges that walk's own mints — a rare event
-    /// with a one-null-re-sync consequence.
+    /// mint latch ([`mint_epoch`](Self::mint_epoch)) so a close/reopen —
+    /// which removes the per-URI index and would reset its `shift_gen` to 0
+    /// (ABA) — can never make an old-lifetime latch compare equal. Global
+    /// (not per-URI) so closed documents leave NO retained state; the cost
+    /// is that a close of any document mid-pass refuses that pass's
+    /// remaining mint batches — a rare event with a one-null-re-sync
+    /// consequence.
     cleanup_epoch: std::sync::atomic::AtomicU64,
 }
 
@@ -51,12 +52,11 @@ struct UriEntries {
     reverse: HashMap<Ulid, PositionKey>,
     /// Count of coordinate shifts (edit applications) this index has
     /// received. Read/written under the same DashMap entry lock as the maps,
-    /// so a mint that records the generation it observed can atomically
-    /// prove "no shift intervened between my snapshot's currency check and
-    /// this insert" — the serve-stale purge's correct-at-birth predicate
-    /// (coordinate comparison alone cannot: with two mid-walk edits, an
-    /// entry minted between them is shifted by the second yet still missed
-    /// the first).
+    /// so [`mint_batch_if_unshifted`](NodeTracker::mint_batch_if_unshifted)
+    /// can atomically prove "no shift intervened between the pass's latch
+    /// and this batch" — the correct-at-birth predicate (coordinate
+    /// comparison alone cannot: with two mid-pass edits, an entry minted
+    /// between them is shifted by the second yet still missed the first).
     shift_gen: u64,
 }
 
@@ -736,11 +736,12 @@ impl NodeTracker {
         )
     }
 
-    /// The (per-URI shift generation, global cleanup epoch) pair the
-    /// serve-stale walks latch alongside their currency check and compare at
-    /// exit: a mismatch in either half means the mint landed in a superseded
-    /// coordinate space (an edit shifted the index, or a close/reopen
-    /// replaced it) and must be purged.
+    /// The (per-URI shift generation, global cleanup epoch) pair a pass
+    /// latches at entry, alongside its currency check, and hands to
+    /// [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted): a
+    /// mismatch in either half means the pass's coordinates were superseded
+    /// (an edit shifted the index, or a close/reopen replaced it) and the
+    /// batch refuses to mint.
     pub(crate) fn mint_epoch(&self, uri: &Url) -> (u64, u64) {
         (
             self.shift_generation(uri),
