@@ -1119,41 +1119,51 @@ impl Kakehashi {
         // First intersecting region that resolves to bridge server configs
         // wins: unconfigured injections (e.g. markdown_inline) must not
         // shadow a configured region further down the document.
-        regions
-            .into_iter()
-            .filter(|resolved| {
-                // line_range end is exclusive; intersect on lines only.
-                let lines = &resolved.region.line_range;
-                lines.start <= range.end.line && range.start.line < lines.end
-            })
-            .find_map(|resolved| {
-                // Clamp to the region so the translated range is in-region.
-                let region_start = Position {
-                    line: resolved.region.line_range.start,
-                    character: resolved.region.start_column,
-                };
-                let region_end = Position {
-                    line: resolved.region.line_range.end,
-                    character: 0,
-                };
-                let clamped = Range {
-                    start: range.start.max(region_start),
-                    end: range.end.min(region_end),
-                };
+        regions.into_iter().find_map(|resolved| {
+            let region_start = Position {
+                line: resolved.region.line_range.start,
+                character: resolved.region.start_column,
+            };
+            // line_range end is exclusive.
+            let region_end = Position {
+                line: resolved.region.line_range.end,
+                character: 0,
+            };
+            if !range_intersects_region(&range, region_start, region_end) {
+                return None;
+            }
+            // Clamp to the region so the translated range is in-region.
+            let clamped = Range {
+                start: range.start.max(region_start),
+                end: range.end.min(region_end),
+            };
 
-                let preamble = PreambleResult {
-                    uri: uri.clone(),
-                    resolved,
-                    language_name: language_name.clone(),
-                    upstream_request_id: current_upstream_id(),
-                };
-                let document = self.preamble_to_document_context(preamble, method_name)?;
-                Some(RangeRequestContext {
-                    document,
-                    range: clamped,
-                })
+            let preamble = PreambleResult {
+                uri: uri.clone(),
+                resolved,
+                language_name: language_name.clone(),
+                upstream_request_id: current_upstream_id(),
+            };
+            let document = self.preamble_to_document_context(preamble, method_name)?;
+            Some(RangeRequestContext {
+                document,
+                range: clamped,
             })
+        })
     }
+}
+
+/// Position-precise intersection of an LSP request range with an injection
+/// region `[region_start, region_end)`. Line-only comparison would bridge a
+/// region the range never touches — e.g. a range ending exactly AT the
+/// region start, or a same-line range entirely before an inline region's
+/// start column. A zero-length (cursor) request counts as inside when the
+/// position sits within the region, inclusive of its start.
+fn range_intersects_region(range: &Range, region_start: Position, region_end: Position) -> bool {
+    if range.start == range.end {
+        return region_start <= range.start && range.start < region_end;
+    }
+    range.start < region_end && region_start < range.end
 }
 
 #[cfg(test)]
@@ -1162,6 +1172,67 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    #[test]
+    fn range_intersection_is_position_precise() {
+        // Fenced region: content [(3,0), (4,0)).
+        let (rs, re) = (pos(3, 0), pos(4, 0));
+        let range = |s: Position, e: Position| Range { start: s, end: e };
+
+        // Overlapping and containing ranges intersect.
+        assert!(range_intersects_region(
+            &range(pos(0, 0), pos(5, 0)),
+            rs,
+            re
+        ));
+        assert!(range_intersects_region(
+            &range(pos(3, 1), pos(3, 5)),
+            rs,
+            re
+        ));
+        // Ending exactly AT the region start does not touch it.
+        assert!(!range_intersects_region(
+            &range(pos(0, 0), pos(3, 0)),
+            rs,
+            re
+        ));
+        // Starting at the exclusive region end does not touch it.
+        assert!(!range_intersects_region(
+            &range(pos(4, 0), pos(5, 0)),
+            rs,
+            re
+        ));
+
+        // Cursor (zero-length) requests: inclusive start, exclusive end.
+        assert!(range_intersects_region(
+            &range(pos(3, 0), pos(3, 0)),
+            rs,
+            re
+        ));
+        assert!(!range_intersects_region(
+            &range(pos(4, 0), pos(4, 0)),
+            rs,
+            re
+        ));
+
+        // Inline region starting mid-line: a same-line range entirely
+        // before the start column must not match.
+        let (rs, re) = (pos(3, 5), pos(4, 0));
+        assert!(!range_intersects_region(
+            &range(pos(3, 0), pos(3, 2)),
+            rs,
+            re
+        ));
+        assert!(range_intersects_region(
+            &range(pos(3, 0), pos(3, 6)),
+            rs,
+            re
+        ));
+    }
     use std::collections::HashMap;
 
     fn settings_with(languages: HashMap<String, LanguageSettings>) -> WorkspaceSettings {
