@@ -360,7 +360,14 @@ impl Default for InjectionMap {
 /// (a `OnceLock` set once at `initialize()`), so it is session-constant and
 /// cannot flip mid-session — no entry can outlive a change to it.
 pub(crate) struct InjectionTokenCache {
-    cache: DashMap<(Url, u64), CachedRegionTokens>,
+    /// Outer key: document; inner key: `validity_hash`. Nested (rather than a
+    /// flat `(Url, u64)` key) so the per-populate eviction sweep touches only
+    /// the swept document's entries — a flat `DashMap::retain` scans every
+    /// shard of every document under write locks on each parse commit. Reads
+    /// and stores are single-threaded per request (pre-fan-out resolve loop /
+    /// post-fan-in store loop), so the coarser per-document entry adds no
+    /// contention, and the read path drops its per-lookup `Url` clone.
+    cache: DashMap<Url, std::collections::HashMap<u64, CachedRegionTokens>>,
 }
 
 /// The per-region validity/cache key: the region's content hash folded with
@@ -401,10 +408,10 @@ impl InjectionTokenCache {
         generation: u64,
         tokens: Vec<RawToken>,
     ) {
-        self.cache.insert(
-            (uri.clone(), validity_hash),
-            CachedRegionTokens { generation, tokens },
-        );
+        self.cache
+            .entry(uri.clone())
+            .or_default()
+            .insert(validity_hash, CachedRegionTokens { generation, tokens });
     }
 
     /// Retrieve region-local tokens for this exact content (`validity_hash`
@@ -419,9 +426,12 @@ impl InjectionTokenCache {
     ) -> Option<Vec<RawToken>> {
         let result = self
             .cache
-            .get(&(uri.clone(), validity_hash))
-            .filter(|entry| entry.generation == generation)
-            .map(|entry| entry.tokens.clone());
+            .get(uri)
+            .and_then(|doc| {
+                doc.get(&validity_hash)
+                    .filter(|entry| entry.generation == generation)
+                    .map(|entry| entry.tokens.clone())
+            });
 
         if result.is_some() {
             log::debug!(
@@ -450,13 +460,18 @@ impl InjectionTokenCache {
     /// racing a store of an already-dead hash merely leaks that entry until
     /// the next sweep.
     pub(crate) fn retain_document(&self, uri: &Url, live: &std::collections::HashSet<u64>) {
-        self.cache
-            .retain(|(entry_uri, hash), _| entry_uri != uri || live.contains(hash));
+        if let Some(mut doc) = self.cache.get_mut(uri) {
+            doc.retain(|hash, _| live.contains(hash));
+        }
+        // Reclaim the emptied outer entry; `remove_if` re-checks under the
+        // shard write lock so a concurrent store that repopulated the map
+        // between the sweep above and this call is never dropped.
+        self.cache.remove_if(uri, |_, doc| doc.is_empty());
     }
 
     /// Remove all cached tokens for a document (all its injection regions).
     pub(crate) fn clear_document(&self, uri: &Url) {
-        self.cache.retain(|key, _| &key.0 != uri);
+        self.cache.remove(uri);
     }
 
     /// Drop every cached entry. Used on a settings/query reload (alongside the
@@ -474,10 +489,13 @@ impl InjectionTokenCache {
     #[cfg(test)]
     pub(crate) fn test_keys(&self, uri: &Url) -> Vec<(u64, u64)> {
         self.cache
-            .iter()
-            .filter(|e| &e.key().0 == uri)
-            .map(|e| (e.key().1, e.value().generation))
-            .collect()
+            .get(uri)
+            .map(|doc| {
+                doc.iter()
+                    .map(|(hash, entry)| (*hash, entry.generation))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
