@@ -681,7 +681,6 @@ print("hello")
         let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);
 
         let wait_version = |want: i32| {
-            let server = server;
             let uri = &uri;
             async move {
                 timeout(Duration::from_secs(1), async {
@@ -828,43 +827,31 @@ print("hello")
         );
     }
 
-    /// Regression (parse-actor flip): `ensure_document_parsed` — the shared
-    /// post-edit freshness helper that every snapshot-reading handler (pull
-    /// diagnostics, the position/range bridge preamble, formatting, node/captures)
-    /// now calls — must restore a tree that `did_change` cleared, so those handlers
-    /// don't return empty/null after every edit while the off-ingress reparse is
-    /// still pending. (Without it, a request racing the reparse sees
-    /// `snapshot() == None`.)
-    #[tokio::test]
-    async fn ensure_document_parsed_restores_a_cleared_tree() {
+    /// The shared freshness helper never parses inline (parse-snapshot ADR
+    /// §3: the reader on-demand parse was a resurrection vector). With no
+    /// reparse scheduled for a cleared tree, it returns within its bounded
+    /// wait and the caller degrades to its empty fallback instead of
+    /// resurrecting or restoring anything.
+    // Paused time: with no snapshot ever published, the bounded wait would
+    // otherwise burn its full first-parse backstop in real time.
+    #[tokio::test(start_paused = true)]
+    async fn ensure_document_parsed_never_parses_inline() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
-        configure_rust_self_host(server);
 
-        let uri = Url::parse("file:///test/ensure_fresh.rs").unwrap();
+        let uri = Url::parse("file:///test/cleared.rs").unwrap();
         server.documents.insert(
             uri.clone(),
             "fn main() {}".to_string(),
             Some("rust".to_string()),
             None,
         );
-        server
-            .parse_coordinator()
-            .parse_document(uri.clone(), Some("rust"), None)
-            .await;
 
-        // did_change applies the edit and CLEARS the tree synchronously.
-        server
-            .documents
-            .update_document(uri.clone(), "fn changed() {}".to_string(), None);
-        assert!(server.documents.get(&uri).unwrap().tree().is_none());
-
-        // A reader's freshness call restores the tree (here via on-demand parse,
-        // since no off-ingress reparse is running in this unit test).
         server.ensure_document_parsed(&uri).await;
+
         assert!(
-            server.documents.get(&uri).unwrap().tree().is_some(),
-            "the freshness helper must restore the tree so post-edit readers aren't empty"
+            server.documents.get(&uri).unwrap().tree().is_none(),
+            "no reparse was scheduled, so no tree may appear — readers never parse inline"
         );
     }
 
@@ -1059,16 +1046,9 @@ print("hello")
             server.documents.get(&uri).unwrap().tree().is_some(),
             "the off-ingress reparse attaches a tree to the edited document"
         );
-        // The watermark reached the edit's ticket, so a reader gated behind it is
-        // released (wait_for_epoch returns immediately for target <= 3).
-        timeout(
-            Duration::from_millis(100),
-            server
-                .documents
-                .wait_for_epoch(&uri, 3, Duration::from_secs(5)),
-        )
-        .await
-        .expect("watermark must have advanced to the reparse ticket");
+        // The watermark advance itself is still exercised by the store's own
+        // watermark tests; the reader-side wait (`wait_for_epoch`) was removed
+        // with the snapshot conversion (parse-snapshot ADR Stage 2).
     }
 
     /// If a concurrent `didChange` already parsed the document (a tree is
@@ -1120,6 +1100,10 @@ print("hello")
     /// host doc still attaches while the parse is blocked — proving it does not wait
     /// for the parse. (Before the hoist the attach sat *after* the parse, so with the
     /// pool lock held the host doc would never open and this test would time out.)
+    // Holding the sync parser-pool guard across awaits is this test's blocking
+    // mechanism (the parked parse blocks a compute-pool thread, not this task,
+    // so no deadlock): the lint's advice would defeat the test.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn host_document_attaches_before_parse_completes() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1131,8 +1115,13 @@ print("hello")
         let uri = Url::parse("file:///test/host_attach_no_wait.rs").unwrap();
         let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
 
-        // Hold the parser-pool lock so the spawned parse parks indefinitely (above).
-        let pool_guard = server.parser_pool.lock().await;
+        // Hold the parser-pool lock so the spawned parse parks indefinitely
+        // (above) — its compute-pool work-unit blocks acquiring this sync mutex.
+        use crate::error::LockResultExt;
+        let pool_guard = server
+            .parser_pool
+            .lock()
+            .recover_poison("test:host_document_attaches_before_parse_completes");
 
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {

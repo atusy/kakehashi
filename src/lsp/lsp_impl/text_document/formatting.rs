@@ -93,11 +93,18 @@ impl Kakehashi {
 
         log::debug!("formatting called for {}", uri);
 
-        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
-        // reparses off-ingress, so a format-on-save batched right after an edit
-        // would otherwise snapshot `None` and return no edits. (range_formatting
-        // uses the same helper — keep them from drifting.)
-        self.ensure_document_parsed(&uri).await;
+        // Explicit-action bounded wait (parse-snapshot ADR §3): formatting is
+        // user-triggered and infrequent, so it may briefly wait for the
+        // in-flight parse; a still-stale snapshot after the wait rejects with
+        // ContentModified rather than silently no-opping an action the user
+        // consciously triggered. Never-parsed/gone falls through to the
+        // existing empty fallbacks below.
+        if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
+            .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(500))
+            .await
+        {
+            return Err(crate::error::content_modified_error());
+        }
 
         let snapshot = match self.documents.get(&uri) {
             None => {

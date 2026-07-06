@@ -212,11 +212,6 @@ impl AutoInstallManager {
         self.failed_parsers.persist_state()
     }
 
-    /// Clear a parser from the failed list (e.g., after reinstallation).
-    pub fn clear_failed(&self, language: &str) -> std::io::Result<()> {
-        self.failed_parsers.clear_failed(language)
-    }
-
     /// Attempt to install a language parser.
     ///
     /// Intentionally isolated to enable unit testing without LSP infrastructure:
@@ -517,22 +512,6 @@ mod tests {
             e,
             InstallEvent::Log { level: MessageType::WARNING, message } if message.contains("previously crashed")
         )));
-    }
-
-    #[test]
-    fn test_clear_failed_removes_parser_from_failed_list() {
-        let (manager, _temp) = create_test_manager();
-
-        // Mark as failed
-        manager
-            .failed_parsers
-            .mark_failed("lua")
-            .expect("mark_failed failed");
-        assert!(manager.is_parser_failed("lua"));
-
-        // Clear
-        manager.clear_failed("lua").expect("clear_failed failed");
-        assert!(!manager.is_parser_failed("lua"));
     }
 
     #[test]

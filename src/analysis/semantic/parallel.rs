@@ -57,6 +57,18 @@ pub(crate) struct InjectionCacheCtx<'a> {
     pub tracker: &'a NodeTracker,
     pub cache: &'a InjectionTokenCache,
     pub generation: u64,
+    /// Whether the snapshot this compute serves was current when the
+    /// work-unit started: only then may region ids be MINTED into the
+    /// live-coordinate tracker. A stale serve reuses existing ids read-only
+    /// and skips caching for regions the tracker does not already know.
+    ///
+    /// Accepted residual: an edit landing DURING the fan-out can still let
+    /// this pass mint from a just-staled snapshot. Unlike the captures walk
+    /// (whose ids go out on the wire and get a post-walk purge), region ids
+    /// stay internal cache keys — a phantom entry is orphaned, never
+    /// resolved, and the token cache stays correct via its content-hash
+    /// validity gate — so the purge machinery is not worth its cost here.
+    pub mint_regions: bool,
 }
 
 /// Maximum number of parsers to cache per Rayon worker thread.
@@ -414,7 +426,7 @@ fn collect_injection_contexts_sync<'a>(
     coordinator: &LanguageCoordinator,
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
-    cache_ctx: Option<(&Url, &NodeTracker)>,
+    cache_ctx: Option<(&Url, &NodeTracker, bool)>,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>, bool) {
     use crate::language::injection::collect_all_injections;
@@ -602,15 +614,29 @@ fn collect_injection_contexts_sync<'a>(
         // (cache.rs) — so invalidate_for_edits evicts the same entry. Eligibility
         // is this request's translation predicate: column-0 start AND no per-row
         // prefixes (singles are never injection.combined).
-        let region_cache = cache_for_singles.map(|(uri, tracker)| {
-            let region_id = tracker
-                .get_or_create(
+        let region_cache = cache_for_singles.and_then(|(uri, tracker, mint_regions)| {
+            // Mint only when the served snapshot was current (see
+            // InjectionCacheCtx::mint_regions): a stale serve's coordinates
+            // must not enter the live tracker. Read-only reuse keeps the
+            // cache warm for regions the edits did not shift; an unknown
+            // region simply goes uncached for this stale serve.
+            let region_id = if mint_regions {
+                tracker.get_or_create(
                     uri,
                     injection.content_node.start_byte(),
                     injection.content_node.end_byte(),
                     injection.content_node.kind(),
                 )
-                .to_string();
+            } else {
+                tracker.lookup_in_layer(
+                    uri,
+                    injection.content_node.start_byte(),
+                    injection.content_node.end_byte(),
+                    injection.content_node.kind(),
+                    0,
+                )?
+            }
+            .to_string();
             let cacheable =
                 CacheableInjectionRegion::from_region_info(&injection, &region_id, text);
             let eligible = cacheable.start_column == 0 && prefix_byte_widths.is_empty();
@@ -622,12 +648,12 @@ fn collect_injection_contexts_sync<'a>(
             // generation fold in cache_key.
             let validity_hash =
                 cacheable.content_hash ^ fnv1a_hash(&resolved_lang).wrapping_mul(0x100000001b3);
-            RegionCacheInfo {
+            Some(RegionCacheInfo {
                 region_id,
                 validity_hash,
                 line_start: cacheable.line_range.start,
                 eligible,
-            }
+            })
         });
 
         contexts.push(InjectionContext {
@@ -860,7 +886,7 @@ pub(crate) fn collect_injection_tokens_parallel(
         coordinator,
         0,
         None,
-        cache_ctx.map(|c| (c.uri, c.tracker)),
+        cache_ctx.map(|c| (c.uri, c.tracker, c.mint_regions)),
         cancel,
     );
 
@@ -2271,6 +2297,97 @@ local b = 2
         }
     }
 
+    /// A stale serve (`mint_regions: false`) must not write region ids into
+    /// the live-coordinate tracker: unknown regions go uncached (no phantom
+    /// entries), while tokens still match the uncached output. Once ids exist
+    /// (a current serve minted them), a stale serve reuses them read-only and
+    /// still gets identical tokens.
+    #[test]
+    fn stale_serve_never_mints_region_ids_and_reuses_live_ones() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
+
+        let uri = Url::parse("file:///stale_region_mint.md").unwrap();
+        let cache = InjectionTokenCache::new();
+        let tracker = NodeTracker::new();
+        let stale = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+            mint_regions: false,
+        };
+
+        let tokens = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&stale),
+            None,
+        )
+        .0;
+        assert!(!tokens.is_empty(), "stale serves still tokenize");
+        assert_eq!(
+            cache.test_keys(&uri).len(),
+            0,
+            "a stale serve with no known regions must not cache (no ids minted)"
+        );
+
+        // A current serve mints; a following stale serve reuses those ids.
+        let current = InjectionCacheCtx {
+            uri: &uri,
+            tracker: &tracker,
+            cache: &cache,
+            generation: 0,
+            mint_regions: true,
+        };
+        let _ = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&current),
+            None,
+        );
+        assert_eq!(
+            cache.test_keys(&uri).len(),
+            8,
+            "the current serve mints and caches all regions"
+        );
+
+        let stale_after = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+            Some(&stale),
+            None,
+        )
+        .0;
+        assert_eq!(
+            stale_after, tokens,
+            "read-only reuse must not change the tokens"
+        );
+    }
+
     /// The cached path must produce byte-identical tokens to the uncached path,
     /// on both the first (all-miss, store) and second (all-hit) request.
     #[test]
@@ -2305,6 +2422,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            mint_regions: true,
         };
 
         let first = collect_injection_tokens_parallel(
@@ -2425,6 +2543,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            mint_regions: true,
         };
 
         let cancel = crate::cancel::CancelToken::default();
@@ -2472,6 +2591,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            mint_regions: true,
         };
 
         // Populate.
@@ -2548,6 +2668,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            mint_regions: true,
         };
 
         // Populate against the original document.

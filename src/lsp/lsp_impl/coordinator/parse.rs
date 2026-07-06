@@ -10,14 +10,42 @@ use url::Url;
 use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
-/// Timeout for spawn_blocking parse operations to prevent hangs on pathological inputs.
+/// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
-const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// THE SAME constant bounds the injected-layer re-parses (`parse_with_ranges`),
+/// so host and injected parses cannot silently drift to different budgets.
+const PARSE_TIMEOUT: std::time::Duration = crate::language::injection::NATIVE_PARSE_BUDGET;
+
+/// The awaiter-side backstop for a pooled parse: pool-queue wait (a burst of
+/// opens on a small pool can queue parses for a while) plus the in-parse
+/// budget, with slack. Deliberately generous: the publish happens in the
+/// CALLER after this await, so an awaiter that gives up while its work-unit
+/// is still queued silently drops the parse result — the document then
+/// serves stale (or empty) until the next edit with nothing to heal it. The
+/// pool thread itself is protected by the in-parse abort, not by this.
+const PARSE_AWAIT_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Host-parse with a wall-clock abort — the shared
+/// [`parse_with_deadline`](crate::language::injection::parse_with_deadline)
+/// primitive under the name the parse-loop call sites use.
+///
+/// `parse_with_pool`'s `tokio::time::timeout` only abandons the *awaiter*;
+/// the in-parse abort is what actually reclaims the bounded-pool thread from
+/// a pathological parse (see the primitive's doc).
+fn parse_text_with_deadline(
+    parser: &mut tree_sitter::Parser,
+    text: &str,
+    old_tree: Option<&tree_sitter::Tree>,
+    deadline: std::time::Instant,
+) -> Option<tree_sitter::Tree> {
+    crate::language::injection::parse_with_deadline(parser, text, old_tree, deadline)
+}
 
 pub(super) struct ParseCoordinatorDeps {
     pub(super) client: Client,
     pub(super) language: std::sync::Arc<LanguageCoordinator>,
-    pub(super) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(super) parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
+    pub(super) compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     pub(super) documents: std::sync::Arc<DocumentStore>,
     pub(super) cache: std::sync::Arc<CacheCoordinator>,
     pub(super) settings_manager: std::sync::Arc<SettingsManager>,
@@ -28,7 +56,8 @@ pub(super) struct ParseCoordinatorDeps {
 pub(crate) struct ParseCoordinator {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
-    parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
+    compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     documents: std::sync::Arc<DocumentStore>,
     cache: std::sync::Arc<CacheCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
@@ -42,6 +71,7 @@ impl ParseCoordinator {
             client: server.client.clone(),
             language: std::sync::Arc::clone(&server.language),
             parser_pool: std::sync::Arc::clone(&server.parser_pool),
+            compute_pool: std::sync::Arc::clone(&server.compute_pool),
             documents: std::sync::Arc::clone(&server.documents),
             cache: std::sync::Arc::clone(&server.cache),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
@@ -55,6 +85,7 @@ impl ParseCoordinator {
             client: deps.client,
             language: deps.language,
             parser_pool: deps.parser_pool,
+            compute_pool: deps.compute_pool,
             documents: deps.documents,
             cache: deps.cache,
             settings_manager: deps.settings_manager,
@@ -63,19 +94,30 @@ impl ParseCoordinator {
         }
     }
 
-    /// Shared parsing orchestration: acquire parser from pool, run parse logic in
-    /// `spawn_blocking` with timeout, release parser back to pool.
+    /// Shared parsing orchestration: run parser acquisition + parse logic as one
+    /// work-unit on the bounded compute pool, with timeout.
     ///
     /// The caller provides the actual parse logic via `parse_fn`, which receives a
-    /// `tree_sitter::Parser` and must return it along with an optional result.
-    /// On normal completion, this ensures the parser is returned to the pool.
-    /// The parser is not returned if the blocking task times out (it keeps
-    /// running) or if the task fails or is cancelled and yields a `JoinError`.
+    /// `tree_sitter::Parser` plus the work-unit's wall-clock deadline (feed it to
+    /// [`parse_text_with_deadline`]) and must return the parser along with an
+    /// optional result.
+    /// The `parser_pool` sync mutex is acquired **only on the pool thread** (the
+    /// parse-snapshot ADR's Stage-1 obligation: a tokio worker must never block on
+    /// a mutex a compute thread holds), briefly around acquire and release; the
+    /// parse itself runs unlocked. On normal completion the parser returns to the
+    /// pool — including after this caller timed out, since the release runs inside
+    /// the work-unit. A panicking work-unit loses its parser.
     ///
     /// Returns `None` if:
     /// - No parser is available for the language
-    /// - The parse task panicked or was cancelled (JoinError; parser not returned)
-    /// - The parse timed out after `PARSE_TIMEOUT` (parser not returned)
+    /// - The parse work-unit panicked
+    /// - The native parse aborted itself at its `PARSE_TIMEOUT` in-parse
+    ///   deadline (anchored at dequeue, via tree-sitter's progress callback),
+    ///   so a pathological parse cannot pin a bounded-pool thread past its
+    ///   budget (the pool is sized as low as ONE thread on small hosts, where
+    ///   a pinned thread would stall every document's tree-CPU)
+    /// - The `PARSE_AWAIT_BACKSTOP` awaiter timeout fired (extreme queue
+    ///   pressure; the work-unit still self-bounds)
     /// - The closure returned `None`
     pub(crate) async fn parse_with_pool<T, F>(
         &self,
@@ -85,50 +127,50 @@ impl ParseCoordinator {
         parse_fn: F,
     ) -> Option<T>
     where
-        F: FnOnce(tree_sitter::Parser) -> (tree_sitter::Parser, Option<T>) + Send + 'static,
+        F: FnOnce(tree_sitter::Parser, std::time::Instant) -> (tree_sitter::Parser, Option<T>)
+            + Send
+            + 'static,
         T: Send + 'static,
     {
-        let parser = {
-            let mut pool = self.parser_pool.lock().await;
-            pool.acquire(language_name)
-        };
+        use crate::error::LockResultExt;
 
-        let parser = parser?;
-
+        let parser_pool = std::sync::Arc::clone(&self.parser_pool);
+        let language_name_owned = language_name.to_string();
         let result = tokio::time::timeout(
-            PARSE_TIMEOUT,
-            tokio::task::spawn_blocking(move || parse_fn(parser)),
+            PARSE_AWAIT_BACKSTOP,
+            self.compute_pool.run(None, move || {
+                let parser = parser_pool
+                    .lock()
+                    .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
+                    .acquire(&language_name_owned)?;
+                // The in-parse abort deadline is anchored at DEQUEUE, not
+                // submission: a parse that sat in the pool queue behind other
+                // documents' work still gets its full budget of actual parse
+                // CPU (a submission-anchored deadline let a burst of opens
+                // expire healthy parses in the queue, leaving those documents
+                // tree-less until the next edit). The awaiter above covers
+                // queue + parse with slack, so the result is not dropped.
+                let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
+                let (parser, value) = parse_fn(parser, deadline);
+                parser_pool
+                    .lock()
+                    .recover_poison("ParseCoordinator::parse_with_pool(release)")
+                    .release(language_name_owned, parser);
+                value
+            }),
         )
         .await;
 
         match result {
-            Ok(Ok((parser, value))) => {
-                let mut pool = self.parser_pool.lock().await;
-                pool.release(language_name.to_string(), parser);
-                value
-            }
-            Ok(Err(join_error)) => {
-                if join_error.is_panic() {
-                    log::error!(
-                        "Parse task panicked for language '{}' on document {}: {}",
-                        language_name,
-                        uri,
-                        join_error
-                    );
-                } else {
-                    log::warn!(
-                        "Parse task was cancelled for language '{}' on document {}: {}",
-                        language_name,
-                        uri,
-                        join_error
-                    );
-                }
-                None
-            }
+            // Outer Option: None = the work-unit panicked (logged with its
+            // payload by the pool). Inner Option: None = no parser available
+            // for this language, or the closure itself yielded nothing.
+            Ok(Some(value)) => value,
+            Ok(None) => None,
             Err(_timeout) => {
                 log::warn!(
-                    "Parse timeout after {:?} for language '{}' on document {} ({} bytes)",
-                    PARSE_TIMEOUT,
+                    "Parse await backstop hit after {:?} for language '{}' on document {} ({} bytes)",
+                    PARSE_AWAIT_BACKSTOP,
                     language_name,
                     uri,
                     text_len
@@ -136,6 +178,73 @@ impl ParseCoordinator {
                 None
             }
         }
+    }
+
+    /// Publish a parse pass's [`ParseSnapshot`](crate::document::snapshot::ParseSnapshot)
+    /// into the document's snapshot cell (parse-snapshot ADR §2, Stage-2
+    /// dual-write). The cell's own guard (incarnation + strict version) decides
+    /// admission; a document a `didClose` already removed simply has no cell to
+    /// publish into (its detached cell holds the closed sentinel). Returns
+    /// whether the publish landed.
+    ///
+    /// During the dual-write stage this runs alongside the legacy tree CAS and
+    /// may admit a snapshot the legacy CAS rejects — deliberately: a parse of
+    /// text an edit has since moved on from is *stale but consistent*, exactly
+    /// what serve-stale readers consume, while the legacy tree must stay
+    /// current-text-only. No single reader mixes the two sources (cell readers
+    /// consume the snapshot's own (text, tree); legacy readers snapshot the
+    /// store under one shard Ref), and every parse pass runs the legacy CAS
+    /// BEFORE this publish: a legacy-tree reader woken by the publish (the
+    /// explicit-action waiters read `doc.snapshot()` after
+    /// `wait_for_current_snapshot`) therefore finds the store already
+    /// settled — either the tree attached, or a racing edit rejected the CAS,
+    /// in which case the cell is not Current for that reader either. The
+    /// legacy store and its remaining readers go away in Stage 3.
+    fn publish_parse_snapshot(
+        &self,
+        uri: &Url,
+        snapshot: crate::document::snapshot::ParseSnapshot,
+    ) -> bool {
+        let (version, incarnation) = (snapshot.parsed_version, snapshot.incarnation);
+        let landed = self
+            .documents
+            .get(uri)
+            .map(|doc| doc.publish_snapshot(std::sync::Arc::new(snapshot)))
+            .unwrap_or(false);
+        if !landed {
+            log::debug!(
+                target: "kakehashi::snapshot",
+                "publish rejected for {uri}: v{version} inc{incarnation}"
+            );
+        }
+        landed
+    }
+
+    /// Run `CacheCoordinator::populate_injections` as a compute-pool work-unit
+    /// and await it.
+    ///
+    /// The injection walk (injection-query execution + per-region ULID mint +
+    /// content hash) is O(regions) synchronous tree-CPU — hundreds of ms on an
+    /// injection-heavy document — and previously ran inline on a tokio worker
+    /// right after the parse, starving the runtime (parse-snapshot ADR, Context).
+    /// It is **awaited**, not detached, preserving the `populate → mark finished
+    /// → downstream` ordering the injection-map invalidation depends on (Stage-1
+    /// obligation). All parameters are cheap clones (refcount bumps).
+    async fn populate_injections_on_pool(
+        &self,
+        uri: Url,
+        text: std::sync::Arc<str>,
+        tree: tree_sitter::Tree,
+        language_name: String,
+    ) {
+        let cache = std::sync::Arc::clone(&self.cache);
+        let language = std::sync::Arc::clone(&self.language);
+        let tracker = self.bridge.node_tracker_arc();
+        self.compute_pool
+            .run(None, move || {
+                cache.populate_injections(&uri, &text, &tree, &language_name, &language, &tracker);
+            })
+            .await;
     }
 
     /// Parse the (already-registered) document at `uri` and publish the result.
@@ -190,10 +299,10 @@ impl ParseCoordinator {
         // wakes its readers (they fall back). Unreachable while this parse is inline on
         // the writer ticket (a `didClose` is gated behind the open); the guard is for
         // the off-ingress open flip (#6), where a `didClose`/reopen can race it.
-        let Some((text, incarnation)) = self
+        let Some((text, incarnation, content_version)) = self
             .documents
             .get(&uri)
-            .map(|doc| (doc.text_arc(), doc.incarnation()))
+            .map(|doc| (doc.text_arc(), doc.incarnation(), doc.content_version()))
         else {
             return false;
         };
@@ -243,6 +352,19 @@ impl ParseCoordinator {
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, false);
                 }
+                // Resolved-but-tree-less snapshot (ADR §2): the parse completed
+                // with no usable tree; publishing it advances parsed_version so
+                // a first-parse waiter releases to its empty fallback.
+                self.publish_parse_snapshot(
+                    &uri,
+                    crate::document::snapshot::ParseSnapshot {
+                        text: text.clone(),
+                        tree: None,
+                        language: Some(language_name.clone()),
+                        parsed_version: content_version,
+                        incarnation,
+                    },
+                );
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 // No tree landed (the parser previously crashed): the open caller
@@ -265,22 +387,38 @@ impl ParseCoordinator {
             let language_name_clone = language_name.clone();
 
             let parsed_tree = self
-                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
-                    let _ = auto_install.begin_parsing(&language_name_clone);
-                    let parse_result = parser.parse(&*text_for_parse, None);
-                    let _ = auto_install.end_parsing(&language_name_clone);
-                    (parser, parse_result)
-                })
+                .parse_with_pool(
+                    &language_name,
+                    &uri,
+                    text.len(),
+                    move |mut parser, deadline| {
+                        let _ = auto_install.begin_parsing(&language_name_clone);
+                        let parse_result =
+                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
+                        let _ = auto_install.end_parsing(&language_name_clone);
+                        (parser, parse_result)
+                    },
+                )
                 .await;
 
             if let Some(tree) = parsed_tree {
-                // Persist FIRST through the text + incarnation CAS (non-inserting), so
-                // a tree parsed from open-time text/lifetime is dropped when a
-                // `didChange` moved the text on or a `didClose`/reopen changed the
-                // incarnation — instead of clobbering the newer state. Only populate
-                // the injection caches when the tree actually landed, so a `didClose`
-                // racing this off-ingress parse can't leave stale injection entries for
-                // a gone document. (`Tree` clone is a cheap refcount bump.)
+                // Legacy tree CAS BEFORE the snapshot publish: a legacy-store
+                // reader woken by the publish (the explicit-action waiters
+                // read `doc.snapshot()` after `wait_for_current_snapshot`)
+                // must find the tree already attached — publish-first opened
+                // a window where the cell said Current while the legacy store
+                // was still tree-less, silently no-opping a user-triggered
+                // formatting. The CAS is non-inserting (text + incarnation
+                // checked), so a tree parsed from open-time text/lifetime is
+                // dropped when a `didChange` moved the text on or a
+                // `didClose`/reopen changed the incarnation — the publish
+                // below still lands in that case (stale-but-consistent is
+                // exactly what serve-stale readers consume; the cell guard
+                // independently rejects out-of-order versions). Only populate
+                // the injection caches when the tree actually landed, so a
+                // `didClose` racing this off-ingress parse can't leave stale
+                // injection entries for a gone document. (`Tree` clone is a
+                // cheap refcount bump.)
                 let stored = self
                     .documents
                     .set_parse_result_if_text_and_incarnation_unchanged(
@@ -290,15 +428,24 @@ impl ParseCoordinator {
                         Some(&language_name),
                         Some(tree.clone()),
                     );
+                self.publish_parse_snapshot(
+                    &uri,
+                    crate::document::snapshot::ParseSnapshot {
+                        text: text.clone(),
+                        tree: Some(tree.clone()),
+                        language: Some(language_name.clone()),
+                        parsed_version: content_version,
+                        incarnation,
+                    },
+                );
                 if stored {
-                    self.cache.populate_injections(
-                        &uri,
-                        &text,
-                        &tree,
-                        &language_name,
-                        &self.language,
-                        self.bridge.node_tracker(),
-                    );
+                    self.populate_injections_on_pool(
+                        uri.clone(),
+                        text.clone(),
+                        tree.clone(),
+                        language_name.clone(),
+                    )
+                    .await;
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, true);
                 }
@@ -329,6 +476,16 @@ impl ParseCoordinator {
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, false);
             }
+            self.publish_parse_snapshot(
+                &uri,
+                crate::document::snapshot::ParseSnapshot {
+                    text: text.clone(),
+                    tree: None,
+                    language: Some(language_name.clone()),
+                    parsed_version: content_version,
+                    incarnation,
+                },
+            );
             advance_watermark();
             self.notifier().log_language_events(&events).await;
             return false;
@@ -348,6 +505,16 @@ impl ParseCoordinator {
             self.documents
                 .mark_parse_finished(&uri, parse_generation, false);
         }
+        self.publish_parse_snapshot(
+            &uri,
+            crate::document::snapshot::ParseSnapshot {
+                text: text.clone(),
+                tree: None,
+                language: None,
+                parsed_version: content_version,
+                incarnation,
+            },
+        );
         advance_watermark();
         self.notifier().log_language_events(&events).await;
         false
@@ -416,13 +583,16 @@ impl ParseCoordinator {
             )
         };
         let Some(language_name) = language_name else {
+            // Give-up: release a parked first-parse waiter (bootstrap-gated).
+            self.documents.publish_giveup_snapshot(&uri);
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
+            self.documents.publish_giveup_snapshot(&uri);
             return;
         }
         let load_result = self.language.ensure_language_loaded(&language_name);
-        let events = load_result.events;
+        let mut events = load_result.events;
 
         for _ in 0..MAX_REPARSE_ATTEMPTS {
             // Re-read the latest text each attempt. Gone => closed (no resurrect);
@@ -431,7 +601,7 @@ impl ParseCoordinator {
             // than parse its text with this lifetime's (possibly relabelled-away)
             // grammar (the CAS would reject it anyway; this just avoids the wasted
             // parses).
-            let text = {
+            let (text, content_version) = {
                 let Some(doc) = self.documents.get(&uri) else {
                     break;
                 };
@@ -444,7 +614,7 @@ impl ParseCoordinator {
                 // `text_arc()` is a refcount bump, not a full copy (#498) — the
                 // original stays here for the CAS while a cheap clone goes to the
                 // blocking parse closure.
-                doc.text_arc()
+                (doc.text_arc(), doc.content_version())
             };
 
             let text_len = text.len();
@@ -455,24 +625,33 @@ impl ParseCoordinator {
             // document text is never copied.
             let text_for_parse = text.clone();
             let parsed = self
-                .parse_with_pool(&language_name, &uri, text_len, move |mut parser| {
-                    let _ = auto_install.begin_parsing(&language_name_clone);
-                    let result = parser.parse(&*text_for_parse, None);
-                    let _ = auto_install.end_parsing(&language_name_clone);
-                    (parser, result)
-                })
+                .parse_with_pool(
+                    &language_name,
+                    &uri,
+                    text_len,
+                    move |mut parser, deadline| {
+                        let _ = auto_install.begin_parsing(&language_name_clone);
+                        let result =
+                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
+                        let _ = auto_install.end_parsing(&language_name_clone);
+                        (parser, result)
+                    },
+                )
                 .await;
 
             let Some(tree) = parsed else { break };
 
-            // Persist FIRST through the non-inserting, tree-absent CAS: a closed
-            // (Vacant) document, one whose text moved (a concurrent `didChange`),
-            // or one a concurrent parse already gave a tree all drop this tree —
-            // the tree-absent check makes the "don't clobber a concurrent parse"
-            // guard atomic with the write. Only populate the injection caches when
-            // the tree actually landed, so a `didClose` racing this reparse can't
-            // leave stale injection entries for a gone document. (`Tree` clone is a
-            // cheap refcount bump.)
+            // Persist FIRST through the non-inserting, tree-absent CAS —
+            // before the snapshot publish, so a legacy-store reader the
+            // publish wakes finds the tree already attached (see the
+            // parse_document ordering note). A closed (Vacant) document, one
+            // whose text moved (a concurrent `didChange`), or one a
+            // concurrent parse already gave a tree all drop this tree — the
+            // tree-absent check makes the "don't clobber a concurrent parse"
+            // guard atomic with the write. Only populate the injection caches
+            // when the tree actually landed, so a `didClose` racing this
+            // reparse can't leave stale injection entries for a gone
+            // document. (`Tree` clone is a cheap refcount bump.)
             let stored = self.documents.attach_tree_if_absent(
                 &uri,
                 &text,
@@ -480,21 +659,47 @@ impl ParseCoordinator {
                 expected_incarnation,
                 tree.clone(),
             );
+            // The cell guard rejects a stale lifetime or an out-of-order
+            // version on its own.
+            let published = self.publish_parse_snapshot(
+                &uri,
+                crate::document::snapshot::ParseSnapshot {
+                    text: text.clone(),
+                    tree: Some(tree.clone()),
+                    language: Some(language_name.clone()),
+                    parsed_version: content_version,
+                    incarnation: expected_incarnation,
+                },
+            );
+            // Serve-stale's heal signal, mirroring reparse_latest: a token
+            // request answered empty (or 15s-capped) while the install was
+            // still compiling has no lineage to re-drive it — without the
+            // refresh, a slow install leaves the document unhighlighted
+            // until an incidental edit.
+            if published {
+                events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
+                    language_name.clone(),
+                ));
+            }
             if stored {
-                self.cache.populate_injections(
-                    &uri,
-                    &text,
-                    &tree,
-                    &language_name,
-                    &self.language,
-                    self.bridge.node_tracker(),
-                );
+                self.populate_injections_on_pool(
+                    uri.clone(),
+                    text.clone(),
+                    tree.clone(),
+                    language_name.clone(),
+                )
+                .await;
                 break;
             }
             // CAS rejected: the text moved under us (a concurrent `didChange`).
             // Loop to re-read the latest text and try again.
         }
 
+        // Covers the give-up exits of the retry loop (parser still
+        // unavailable after the install, exhausted attempts): a no-op after
+        // a successful publish (bootstrap gate), otherwise it releases a
+        // parked first-parse waiter.
+        self.documents.publish_giveup_snapshot(&uri);
         self.notifier().log_language_events(&events).await;
     }
 
@@ -533,7 +738,7 @@ impl ParseCoordinator {
         // `pending_seed` (a cheap `Tree` refcount-clone) is the edit's incremental
         // parse seed stashed by `didChange`; `None` for a full-text sync / freshly
         // installed parse, in which case we parse from scratch.
-        let (language_name, language_id, text, seed, incarnation) = {
+        let (language_name, language_id, text, seed, incarnation, content_version) = {
             let Some(doc) = self.documents.get(uri) else {
                 return;
             };
@@ -549,7 +754,14 @@ impl ParseCoordinator {
             let language_name =
                 self.language
                     .detect_language(uri.path(), &text, None, language_id.as_deref());
-            (language_name, language_id, text, seed, incarnation)
+            (
+                language_name,
+                language_id,
+                text,
+                seed,
+                incarnation,
+                doc.content_version(),
+            )
         };
 
         // Post-read resolutions advance the watermark **only if this lifetime is
@@ -565,10 +777,15 @@ impl ParseCoordinator {
         };
 
         let Some(language_name) = language_name else {
+            // Give-up: release a parked first-parse waiter with a tree-less
+            // snapshot (bootstrap-gated inside) rather than letting every
+            // request burn the full first-parse backstop.
+            self.documents.publish_giveup_snapshot(uri);
             advance_watermark();
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
+            self.documents.publish_giveup_snapshot(uri);
             advance_watermark();
             return;
         }
@@ -586,22 +803,36 @@ impl ParseCoordinator {
         // (`didChange` → `apply_edit_and_seed`), satisfying tree-sitter's contract.
         let text_for_parse = text.clone();
         let parsed = self
-            .parse_with_pool(&language_name, uri, text_len, move |mut parser| {
-                let _ = auto_install.begin_parsing(&language_name_clone);
-                let result = parser.parse(&*text_for_parse, seed.as_ref());
-                let _ = auto_install.end_parsing(&language_name_clone);
-                (parser, result)
-            })
+            .parse_with_pool(
+                &language_name,
+                uri,
+                text_len,
+                move |mut parser, deadline| {
+                    let _ = auto_install.begin_parsing(&language_name_clone);
+                    let result = parse_text_with_deadline(
+                        &mut parser,
+                        &text_for_parse,
+                        seed.as_ref(),
+                        deadline,
+                    );
+                    let _ = auto_install.end_parsing(&language_name_clone);
+                    (parser, result)
+                },
+            )
             .await;
 
+        let mut events = load_result.events;
         if let Some(tree) = parsed {
-            // Text + language + incarnation CAS (non-inserting), all three checked
-            // atomically under the tree-write shard lock. Text rejects a
-            // within-lifetime stale parse (a `didChange` landed mid-parse);
-            // language rejects a reopen that relabelled the URI; incarnation
-            // rejects a same-language, identical-text reopen — the tree belongs to
-            // the prior lifetime and must not attach to the reopened document (nor
-            // let the watermark advance below run on the old lifetime's ticket).
+            // Legacy tree CAS BEFORE the snapshot publish (see the
+            // parse_document ordering note): a legacy-store reader woken by
+            // the publish must find the tree already attached. Text +
+            // language + incarnation checked atomically under the tree-write
+            // shard lock: text rejects a within-lifetime stale parse (a
+            // `didChange` landed mid-parse); language rejects a reopen that
+            // relabelled the URI; incarnation rejects a same-language,
+            // identical-text reopen — the tree belongs to the prior lifetime
+            // and must not attach to the reopened document (nor let the
+            // watermark advance below run on the old lifetime's ticket).
             let stored = self.documents.update_tree_if_text_and_language_unchanged(
                 uri,
                 &text,
@@ -609,25 +840,85 @@ impl ParseCoordinator {
                 incarnation,
                 tree.clone(),
             );
+            // The cell guard admits this even when the legacy CAS above
+            // rejected a text that moved on — a stale-but-consistent snapshot
+            // is exactly what serve-stale readers consume; the scheduler's
+            // dirty loop reparses the newer text and supersedes it.
+            let published = self.publish_parse_snapshot(
+                uri,
+                crate::document::snapshot::ParseSnapshot {
+                    text: text.clone(),
+                    tree: Some(tree.clone()),
+                    language: Some(language_name.clone()),
+                    parsed_version: content_version,
+                    incarnation,
+                },
+            );
+            // Serve-stale's heal signal (ADR §3): a fresh publish re-drives the
+            // client with workspace/semanticTokens/refresh so a request served
+            // one edit behind is re-requested against this snapshot. Emitted
+            // HERE — at the parse-loop publish point, after the notification
+            // returned — never from didChange, whose synchronous clients
+            // (vim-lsp) cannot answer a server request mid-notification. Gated
+            // on the publish landing: a rejected publish emits nothing. The
+            // notifier batches and capability-gates the actual request.
+            if published {
+                events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
+                    language_name.clone(),
+                ));
+            }
             if stored {
-                self.cache.populate_injections(
-                    uri,
-                    &text,
-                    &tree,
-                    &language_name,
-                    &self.language,
-                    self.bridge.node_tracker(),
-                );
+                self.populate_injections_on_pool(
+                    uri.clone(),
+                    text.clone(),
+                    tree.clone(),
+                    language_name.clone(),
+                )
+                .await;
             }
         }
 
+        // Covers the parse-produced-no-tree path (timeout / parser
+        // unavailable): a no-op after a successful publish (bootstrap gate),
+        // otherwise it releases a parked first-parse waiter.
+        self.documents.publish_giveup_snapshot(uri);
         advance_watermark();
-        self.notifier()
-            .log_language_events(&load_result.events)
-            .await;
+        self.notifier().log_language_events(&events).await;
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {
         build_notifier(&self.client, &self.settings_manager)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The deadline must actually abort the native parse (an expired one
+    /// yields `None` fast) and must not poison the parser for reuse.
+    #[test]
+    fn parse_text_with_deadline_aborts_when_expired_and_parses_within_it() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        // Large enough that tree-sitter fires the progress callback at least
+        // once before completing.
+        let text = "fn f() { let x = 1 + 2 * 3; }\n".repeat(4000);
+
+        let expired = std::time::Instant::now();
+        let started = std::time::Instant::now();
+        let aborted = parse_text_with_deadline(&mut parser, &text, None, expired);
+        assert!(aborted.is_none(), "an expired deadline aborts the parse");
+        assert!(
+            started.elapsed() < PARSE_TIMEOUT,
+            "the abort happens in-parse, not after the full parse"
+        );
+
+        // The reset parser is immediately reusable on the same input.
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let parsed = parse_text_with_deadline(&mut parser, &text, None, future);
+        assert!(parsed.is_some(), "a live deadline parses normally");
     }
 }

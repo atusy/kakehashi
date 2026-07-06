@@ -42,7 +42,8 @@ fn updated_settings_after_install(
 pub(super) struct InstallCoordinatorDeps {
     pub(super) client: Client,
     pub(super) language: std::sync::Arc<LanguageCoordinator>,
-    pub(super) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(super) parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
+    pub(super) compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     pub(super) documents: std::sync::Arc<DocumentStore>,
     pub(super) cache: std::sync::Arc<CacheCoordinator>,
     pub(super) settings_manager: std::sync::Arc<SettingsManager>,
@@ -53,7 +54,8 @@ pub(super) struct InstallCoordinatorDeps {
 pub(crate) struct InstallCoordinator {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
-    parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
+    compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     documents: std::sync::Arc<DocumentStore>,
     cache: std::sync::Arc<CacheCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
@@ -67,6 +69,7 @@ impl InstallCoordinator {
             client: server.client.clone(),
             language: std::sync::Arc::clone(&server.language),
             parser_pool: std::sync::Arc::clone(&server.parser_pool),
+            compute_pool: std::sync::Arc::clone(&server.compute_pool),
             documents: std::sync::Arc::clone(&server.documents),
             cache: std::sync::Arc::clone(&server.cache),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
@@ -80,6 +83,7 @@ impl InstallCoordinator {
             client: deps.client,
             language: deps.language,
             parser_pool: deps.parser_pool,
+            compute_pool: deps.compute_pool,
             documents: deps.documents,
             cache: deps.cache,
             settings_manager: deps.settings_manager,
@@ -165,6 +169,16 @@ impl InstallCoordinator {
             return true;
         }
 
+        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir/
+        // ParserFailed (should_skip_parse() == false, but did_open's
+        // auto-install branch never runs parse_document regardless) as well
+        // as AlreadyInstalling. None of them publishes a snapshot anywhere
+        // below, so release a parked first-parse waiter with a tree-less
+        // snapshot (bootstrap-gated inside) instead of letting every request
+        // burn the full first-parse backstop. Harmless for AlreadyInstalling:
+        // its eventual reload-reparse lands the same-version tree through the
+        // snapshot cell's tree-upgrade clause.
+        self.documents.publish_giveup_snapshot(&uri);
         result.outcome.should_skip_parse()
     }
 
@@ -238,6 +252,7 @@ impl InstallCoordinator {
             client: self.client.clone(),
             language: std::sync::Arc::clone(&self.language),
             parser_pool: std::sync::Arc::clone(&self.parser_pool),
+            compute_pool: std::sync::Arc::clone(&self.compute_pool),
             documents: std::sync::Arc::clone(&self.documents),
             cache: std::sync::Arc::clone(&self.cache),
             settings_manager: std::sync::Arc::clone(&self.settings_manager),

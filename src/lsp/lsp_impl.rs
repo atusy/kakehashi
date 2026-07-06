@@ -6,6 +6,7 @@ mod kakehashi;
 mod lifecycle;
 mod parse_scheduler;
 mod show_document_translation;
+mod snapshot_read;
 pub(crate) mod text_document;
 mod whole_document;
 mod workspace;
@@ -45,7 +46,6 @@ use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::bridge::ResolvedServerConfig;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::settings_manager::SettingsManager;
-use tokio::sync::Mutex;
 
 use super::auto_install::{AutoInstallManager, InstallingLanguages};
 use super::cache::CacheCoordinator;
@@ -158,7 +158,11 @@ pub(crate) fn url_to_uri(url: &Url) -> std::result::Result<Uri, crate::error::Ls
 pub struct Kakehashi {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
-    parser_pool: std::sync::Arc<Mutex<DocumentParserPool>>,
+    parser_pool: std::sync::Arc<std::sync::Mutex<DocumentParserPool>>,
+    /// Bounded compute pool for all synchronous tree-CPU (parse-snapshot ADR §4):
+    /// keeps tree work off the tokio workers so timers and unrelated documents'
+    /// handlers stay pollable.
+    compute_pool: std::sync::Arc<crate::compute_pool::ComputePool>,
     documents: std::sync::Arc<DocumentStore>,
     /// Unified cache coordinator for semantic tokens, injections, and request tracking
     cache: std::sync::Arc<CacheCoordinator>,
@@ -267,7 +271,8 @@ impl Kakehashi {
         Self {
             client,
             language,
-            parser_pool: std::sync::Arc::new(Mutex::new(parser_pool)),
+            parser_pool: std::sync::Arc::new(std::sync::Mutex::new(parser_pool)),
+            compute_pool: std::sync::Arc::new(crate::compute_pool::ComputePool::new()),
             documents: std::sync::Arc::new(DocumentStore::new()),
             cache: std::sync::Arc::new(CacheCoordinator::new()),
             settings_manager: std::sync::Arc::new(SettingsManager::new()),
@@ -411,8 +416,8 @@ impl Kakehashi {
         let shutdown = self.shutdown_token.clone();
 
         tokio::spawn(async move {
-            // If the loop panics in its glue (the blocking parse is already
-            // panic-isolated by spawn_blocking), this guard clears the stuck
+            // If the loop panics in its glue (the parse work-unit is already
+            // panic-isolated by the compute pool), this guard clears the stuck
             // `parsing` entry on unwind so the next edit re-spawns rather than the
             // document wedging tree-less forever.
             let mut guard = parse_scheduler::ParseLoopGuard::new(

@@ -25,10 +25,10 @@ impl Kakehashi {
         &self,
         params: NodeFieldNameParams,
     ) -> Result<Value> {
-        let name = params.name.as_str();
+        let name = params.name;
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, |n| {
-                n.child_by_field_name(name)
+            .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
+                n.child_by_field_name(&name)
                     .map(|c| (c.start_byte(), c.end_byte(), c.kind()))
             })
             .await)
@@ -41,11 +41,11 @@ impl Kakehashi {
         &self,
         params: NodeFieldNameParams,
     ) -> Result<Value> {
-        let name = params.name.as_str();
+        let name = params.name;
         Ok(self
-            .navigate_to_nodes(&params.text_document.uri, &params.id, |n| {
+            .navigate_to_nodes(&params.text_document.uri, &params.id, move |n| {
                 let mut cursor = n.walk();
-                n.children_by_field_name(name, &mut cursor)
+                n.children_by_field_name(&name, &mut cursor)
                     .map(|c| (c.start_byte(), c.end_byte(), c.kind()))
                     .collect()
             })
@@ -64,7 +64,7 @@ impl Kakehashi {
     ) -> Result<Value> {
         let index = u32::try_from(params.index).ok();
         let value = self
-            .with_node_by_id(&params.text_document.uri, &params.id, |n| {
+            .with_node_by_id(&params.text_document.uri, &params.id, move |n| {
                 index.and_then(|i| n.field_name_for_child(i))
             })
             .await
@@ -82,7 +82,7 @@ impl Kakehashi {
     ) -> Result<Value> {
         let index = u32::try_from(params.index).ok();
         let value = self
-            .with_node_by_id(&params.text_document.uri, &params.id, |n| {
+            .with_node_by_id(&params.text_document.uri, &params.id, move |n| {
                 index.and_then(|i| n.field_name_for_named_child(i))
             })
             .await

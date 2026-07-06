@@ -163,22 +163,20 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Ensure the document is parsed before snapshotting. `didOpen` inserts the
-        // document with `tree: None` and schedules an async parse; a client that
-        // calls `kakehashi/node` quickly afterwards must not race with that parse.
-        self.ensure_document_parsed(&uri).await;
-
-        // Snapshot the document so we hold the read lock for as short as possible.
-        let snapshot = match self.documents.get(&uri).and_then(|doc| doc.snapshot()) {
-            Some(s) => s,
-            None => {
-                log::debug!(target: "kakehashi::node", "no parsed document for {}", uri);
-                return Ok(Value::Null);
-            }
+        // Resolve a CURRENT parse snapshot (parse-snapshot ADR §3): the
+        // request's position is authored against the live text, so a trailing
+        // snapshot rejects immediately with the universal null; only the
+        // bounded first-parse wait applies. Currency keeps the mint below
+        // sound (a stale read never mints).
+        let Some(snapshot) = self.current_snapshot(&uri).await else {
+            log::debug!(target: "kakehashi::node", "no current parse snapshot for {}", uri);
+            return Ok(Value::Null);
         };
 
-        let text = snapshot.text();
-        let tree = snapshot.tree();
+        let text: &str = &snapshot.text;
+        let Some(tree) = snapshot.tree.as_ref() else {
+            return Ok(Value::Null);
+        };
         let mapper = PositionMapper::new(text);
 
         // Empty document: end-of-document exception is gated on `L > 0`,
@@ -205,8 +203,8 @@ impl Kakehashi {
         }
 
         // We need the host language to seed `injection_stack_at` with the
-        // right injection query. Detect it from the document store.
-        let Some(host_language) = self.document_language(&uri) else {
+        // right injection query — the snapshot's own detected language.
+        let Some(host_language) = snapshot.language.clone() else {
             log::debug!(
                 target: "kakehashi::node",
                 "no host language detected for {} — cannot resolve injection layers",
@@ -228,27 +226,24 @@ impl Kakehashi {
         self.ensure_injection_languages_loaded(&uri, &host_language, text, tree, byte)
             .await;
 
-        // Re-ensure freshness before the re-snapshot: a `didChange` processed
-        // during the (awaited) grammar load clears the tree off-ingress, so
-        // without this the re-snapshot below would spuriously return `Null`.
-        self.ensure_document_parsed(&uri).await;
-
-        // Re-snapshot after the await and recompute the position mapping. From
-        // here on we operate strictly on the post-await document state.
-        let snapshot = match self.documents.get(&uri).and_then(|doc| doc.snapshot()) {
-            Some(s) => s,
-            None => {
-                log::debug!(target: "kakehashi::node", "no parsed document for {} after load", uri);
-                return Ok(Value::Null);
-            }
+        // Re-resolve a CURRENT snapshot after the await and recompute the
+        // position mapping: a `didChange` processed during the (awaited)
+        // grammar load moved the version on, and the mint below must run
+        // against the live state only. From here on we operate strictly on the
+        // post-await snapshot.
+        let Some(snapshot) = self.current_snapshot(&uri).await else {
+            log::debug!(target: "kakehashi::node", "no current parse snapshot for {} after load", uri);
+            return Ok(Value::Null);
         };
-        let text = snapshot.text();
-        let tree = snapshot.tree();
+        let text = std::sync::Arc::clone(&snapshot.text);
+        let Some(tree) = snapshot.tree.clone() else {
+            return Ok(Value::Null);
+        };
         let doc_len = text.len();
         if doc_len == 0 {
             return Ok(Value::Null);
         }
-        let mapper = PositionMapper::new(text);
+        let mapper = PositionMapper::new(&text);
         let Some(byte) = mapper.position_to_byte(position) else {
             return Ok(Value::Null);
         };
@@ -256,48 +251,63 @@ impl Kakehashi {
             return Ok(Value::Null);
         }
 
-        let stack = injection_stack_at(&self.language, &host_language, text, tree, byte);
+        // The stack enumeration re-runs the injection query over the host tree
+        // (O(regions)) and re-parses each containing layer — synchronous
+        // tree-CPU, run as a compute-pool work-unit (parse-snapshot ADR §4),
+        // together with the layer selection and the mint over its result.
+        let language = std::sync::Arc::clone(&self.language);
+        let tracker = self.bridge.node_tracker_arc();
+        let result = self
+            .compute_pool
+            .run(None, move || {
+                let stack = injection_stack_at(&language, &host_language, &text, &tree, byte);
 
-        let layer_index = match selector {
-            InjectionSelector::Host => unreachable!("handled above"),
-            InjectionSelector::Invalid => unreachable!("handled above"),
-            InjectionSelector::Saturating => {
-                // `true` saturates to the deepest layer. The stack always
-                // contains at least the host (layer 0), so this never
-                // under-indexes.
-                stack.len() - 1
-            }
-            InjectionSelector::Index(n) => {
-                let Some(idx) = resolve_index(n, stack.len()) else {
-                    return Ok(Value::Null);
+                let layer_index = match selector {
+                    InjectionSelector::Host => unreachable!("handled above"),
+                    InjectionSelector::Invalid => unreachable!("handled above"),
+                    InjectionSelector::Saturating => {
+                        // `true` saturates to the deepest layer. The stack always
+                        // contains at least the host (layer 0), so this never
+                        // under-indexes.
+                        stack.len() - 1
+                    }
+                    InjectionSelector::Index(n) => {
+                        let Some(idx) = resolve_index(n, stack.len()) else {
+                            return Value::Null;
+                        };
+                        idx
+                    }
                 };
-                idx
-            }
-        };
 
-        let Some(layer) = stack.get(layer_index) else {
-            return Ok(Value::Null);
-        };
+                let Some(layer) = stack.get(layer_index) else {
+                    return Value::Null;
+                };
 
-        let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
-            return Ok(Value::Null);
-        };
+                let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
+                    return Value::Null;
+                };
 
-        // Mint with the resolved layer index so a host and injected node sharing
-        // (start, end, kind) get distinct ULIDs and stay navigable in their own
-        // tree (lazy-node-identity-tracking §"Node Uniqueness Key", issue #313).
-        let ulid = self.bridge.node_tracker().get_or_create_in_layer(
-            &uri,
-            node.start_byte(),
-            node.end_byte(),
-            node.kind(),
-            layer_index,
-        );
+                // Mint with the resolved layer index so a host and injected node
+                // sharing (start, end, kind) get distinct ULIDs and stay navigable
+                // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
+                // Key", issue #313).
+                let ulid = tracker.get_or_create_in_layer(
+                    &uri,
+                    node.start_byte(),
+                    node.end_byte(),
+                    node.kind(),
+                    layer_index,
+                );
 
-        Ok(json!({
-            "id": ulid.to_string(),
-            "kind": node.kind(),
-        }))
+                json!({
+                    "id": ulid.to_string(),
+                    "kind": node.kind(),
+                })
+            })
+            .await;
+
+        // None = the work-unit panicked (logged by the pool) → protocol null.
+        Ok(result.unwrap_or(Value::Null))
     }
 
     /// Host-layer lookup, factored out so the no-injection request keeps
@@ -393,90 +403,18 @@ impl Kakehashi {
         }
     }
 
-    /// Ensure the store holds a **fresh** parse tree for `uri`, parsing on demand
-    /// if needed. The shared post-edit freshness helper for every request handler
-    /// that snapshots the document tree.
-    ///
-    /// Since the per-document parse scheduler flip, `didChange` clears the tree and
-    /// reparses **off-ingress**, so a request arriving in the reparse window finds
-    /// `Document::snapshot()` returning `None`. Any tree-reading handler must call
-    /// this first: it waits the bounded `wait_for_parse_completion` for the
-    /// off-ingress reparse to land and, failing that, parses on demand and writes
-    /// the tree through the non-inserting CAS — so the caller's subsequent
-    /// `snapshot()` sees a current `(text, tree)` pair instead of empty/stale.
-    /// Without it the handler degrades to empty results after every edit.
-    ///
-    /// `didOpen` inserts the document immediately with `tree: None` and
-    /// schedules an asynchronous parse. `kakehashi/node` requests issued
-    /// straight after `didOpen` would otherwise race with that parse and
-    /// see `snapshot()` return `None`. This helper mirrors the on-demand
-    /// parsing path used by `selection_range_impl`: load the language,
-    /// parse via the shared pool, and update the document store atomically.
-    ///
-    /// Race protection: an in-flight `didChange` parse sets `has_tree=false`
-    /// via `mark_parse_started` while the old `Document::tree()` may briefly
-    /// remain populated. Waiting on `wait_for_parse_completion` first guarantees
-    /// the snapshot returned by the caller is the *current* (text, tree) pair,
-    /// not a stale combination produced mid-parse. The timeout matches the
-    /// `semantic_tokens` budget so this helper stays responsive even if the
-    /// parser hangs on a pathological input.
+    /// Bounded wait for `uri`'s parse snapshot to become **current** — the
+    /// shared post-edit freshness helper for handlers that still read the
+    /// legacy store tree. It never parses inline (parse-snapshot ADR §3:
+    /// readers never parse; the former on-demand fallback was one of the two
+    /// reader resurrection vectors). If the off-ingress reparse does not land
+    /// within the wait, the caller's subsequent store read simply finds no
+    /// tree and degrades to its empty fallback, self-correcting on the
+    /// client's next request.
     pub(crate) async fn ensure_document_parsed(&self, uri: &Url) {
-        self.documents
-            .wait_for_parse_completion(uri, std::time::Duration::from_millis(200))
+        let _ = self
+            .wait_for_current_snapshot(uri, std::time::Duration::from_millis(200))
             .await;
-
-        // If a tree is now available (either it always was, or didChange's
-        // parse just finished), nothing to do.
-        if let Some(doc) = self.documents.get(uri)
-            && doc.tree().is_some()
-        {
-            return;
-        }
-
-        let Some(language_name) = self.document_language(uri) else {
-            return;
-        };
-
-        let load_result = self.language.ensure_language_loaded(&language_name);
-        if !load_result.success {
-            return;
-        }
-
-        // Take a fresh read to grab the current text (the doc may still be missing a tree).
-        let Some(doc) = self.documents.get(uri) else {
-            return;
-        };
-        let text = doc.text().to_string();
-        drop(doc);
-
-        let text_clone = text.clone();
-        let parsed = self
-            .parse_coordinator()
-            .parse_with_pool(&language_name, uri, text.len(), move |mut parser| {
-                let tree = parser.parse(&text_clone, None);
-                (parser, tree)
-            })
-            .await;
-
-        if let Some(tree) = parsed {
-            // Persist atomically and non-insertingly: store the tree only if the
-            // document still exists with the text we parsed. Between the snapshot
-            // above and now, a didChange may have moved the text (storing our tree
-            // would break the (text, tree) consistency invariant) or a didClose may
-            // have removed the document (re-inserting it would resurrect a closed
-            // doc — #342/#374). The single atomic CAS closes both at the write
-            // itself; the next request re-triggers the parse against newer text.
-            if !self
-                .documents
-                .update_tree_if_text_unchanged(uri, &text, tree)
-            {
-                log::debug!(
-                    target: "kakehashi::node",
-                    "discarding on-demand parse for {} — text changed or document closed during parse",
-                    uri
-                );
-            }
-        }
     }
 }
 

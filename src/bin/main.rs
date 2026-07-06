@@ -813,6 +813,30 @@ async fn run_lsp_server() {
     let stdin = stdin();
     let stdout = stdout();
 
+    // Async-runtime stall watchdog: a detached task ticks every 100ms and
+    // logs whenever its own wakeup was delayed — the definitive signal that
+    // the tokio workers were wedged (a stalled watchdog with a fast compute
+    // pool is what distinguishes "runtime starved" from "pool queued" in a
+    // slow-response report). Debug-level, so it costs nothing unless a user
+    // is already collecting diagnostics.
+    tokio::spawn(async {
+        const TICK: std::time::Duration = std::time::Duration::from_millis(100);
+        let mut last = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(TICK).await;
+            let now = tokio::time::Instant::now();
+            let lag = now.saturating_duration_since(last + TICK);
+            if lag.as_millis() > 250 {
+                log::debug!(
+                    target: "kakehashi::runtime_watchdog",
+                    "async runtime stalled: watchdog tick delayed by {}ms",
+                    lag.as_millis()
+                );
+            }
+            last = now;
+        }
+    });
+
     // Create shared pool and cancel forwarder
     // Both are shared between Kakehashi and the RequestIdCapture middleware:
     // - Pool: for downstream server connections

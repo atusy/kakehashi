@@ -80,7 +80,11 @@ pub(crate) fn current_writer_ticket() -> Option<u64> {
 
 /// The tail writer ticket the currently-running gated reader handler must
 /// observe, or `None` outside a gated reader or when no writer has been issued
-/// for the document (nothing to wait for).
+/// for the document (nothing to wait for). Test-only since the snapshot
+/// conversion removed the reader-side watermark wait; the READER_TAIL scoping
+/// itself is retained (the middleware still stamps it) until Stage 3 prunes
+/// the watermark system.
+#[cfg(test)]
 pub(crate) fn current_reader_tail() -> Option<u64> {
     READER_TAIL.try_with(|ticket| *ticket).ok()
 }

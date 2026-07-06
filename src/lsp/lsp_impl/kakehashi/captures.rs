@@ -49,9 +49,7 @@ use crate::analysis::next_result_id;
 use crate::language::query_exec::execute_query;
 use crate::language::query_loader::QueryLoader;
 use crate::language::registry::LanguageRegistry;
-use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{
-    collect_injection_languages_in_document, walk_document_layers,
-};
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::walk_document_layers;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 use crate::text::PositionMapper;
 
@@ -249,6 +247,13 @@ fn load_kind_query(
 struct ComputedCaptures {
     uri: Url,
     incarnation: u64,
+    /// The live `content_version` at request entry. The lineage store re-checks
+    /// it so an edit landing DURING the request voids the store: the response
+    /// was already outdated at delivery, and lineage must not record matches
+    /// for a text the client no longer has (ADR §3). A snapshot that merely
+    /// *trailed* at entry still serves and stores — that is the deliberate
+    /// serve-stale relaxation, healed by the client's per-keystroke re-request.
+    entry_content_version: u64,
     matches: Vec<Value>,
     skipped: Vec<Value>,
 }
@@ -276,16 +281,27 @@ impl Kakehashi {
             "matches": c.matches,
             "skipped": c.skipped,
         });
-        self.store_lineage(c, params.kind, params.injection, result_id)
-            .await;
+        // A full that cannot install lineage (the text moved past the computed
+        // snapshot, or a close/reopen raced) answers `null` instead: handing
+        // out a `resultId` with no stored lineage would make the client's next
+        // delta lie about its baseline. `null` is the protocol's re-sync
+        // signal; the client re-requests and converges once the reparse lands
+        // (ADR §3).
+        if !self
+            .store_lineage(c, params.kind, params.injection, result_id)
+            .await
+        {
+            return Ok(Value::Null);
+        }
         Ok(response)
     }
 
     /// Store a fresh lineage in this mode's slot, unless the document closed
-    /// (or closed-and-reopened) while the request was in flight.
+    /// (or closed-and-reopened) or its text moved past the computed snapshot
+    /// while the request was in flight. Returns whether the lineage landed.
     ///
-    /// Two guards, both under the same per-URI edit lock `didClose` holds
-    /// around its document removal:
+    /// Three guards, all under the same per-URI edit lock `didClose` and
+    /// `didChange` hold around their mutations:
     /// - liveness: a close that won the lock first leaves the document gone,
     ///   so the check skips the insert; an insert that won first is cleared by
     ///   the close's cache cleanup, which runs after the removal;
@@ -293,31 +309,34 @@ impl Kakehashi {
     ///   alive again, but the reopened document carries a fresh open incarnation,
     ///   so a stale request's snapshot-time incarnation no longer matches and
     ///   the insert is skipped — a reopened document starts its lineage fresh
-    ///   (captures-protocol §"Delta semantics").
+    ///   (captures-protocol §"Delta semantics");
+    /// - version: an edit that landed DURING the request (the live
+    ///   `content_version` moved past its request-entry value) makes the
+    ///   response outdated at delivery; storing it would record lineage for a
+    ///   text the client no longer has (parse-snapshot ADR §3), so nothing is
+    ///   stored and the caller answers `null`. A snapshot that merely trailed
+    ///   at entry still stores — the serve-stale relaxation.
     async fn store_lineage(
         &self,
         computed: ComputedCaptures,
         kind: String,
         injection: bool,
         result_id: String,
-    ) {
+    ) -> bool {
         let uri = computed.uri;
         let edit_lock = self.documents.edit_lock(&uri);
         let _guard = edit_lock.lock().await;
-        // A single `documents` lookup reads both liveness and the current
-        // incarnation atomically: a closed URI is `None` (skip), and a reopened
-        // one carries a fresh incarnation that no longer equals the snapshot's
-        // (skip). The incarnation lives on the document, so this no longer
-        // straddles two maps — the former ABBA-avoidance dance (drop the Ref
-        // before a separate `open_generations` write) is gone.
-        let still_current = self
-            .documents
-            .get(&uri)
-            .is_some_and(|doc| doc.incarnation() == computed.incarnation);
+        // A single `documents` lookup reads liveness, the current incarnation,
+        // and the current content_version atomically under one shard read lock.
+        let still_current = self.documents.get(&uri).is_some_and(|doc| {
+            doc.incarnation() == computed.incarnation
+                && doc.content_version() == computed.entry_content_version
+        });
         if still_current {
             let mut entry = self.captures_cache.entry((uri, kind)).or_default();
             entry[usize::from(injection)] = Some((result_id, computed.matches));
         }
+        still_current
     }
 
     /// Handler for `kakehashi/captures/full/delta`.
@@ -443,7 +462,13 @@ impl Kakehashi {
                 "skipped": c.skipped,
             }),
         };
-        self.store_lineage(c, key.1, injection, result_id).await;
+        // Same gate as `full`: a delta whose fresh lineage cannot install
+        // (text moved past the computed snapshot, or close/reopen) answers
+        // `null` — the client re-acquires via `full` (its baseline slot may
+        // have been superseded by the failed rotation's circumstances anyway).
+        if !self.store_lineage(c, key.1, injection, result_id).await {
+            return Ok(Value::Null);
+        }
         Ok(response)
     }
 
@@ -493,234 +518,342 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        // Same didOpen→async-parse race the node handlers guard against.
-        self.ensure_document_parsed(&uri).await;
-
-        let Some(language_id) = self.document_language(&uri) else {
-            log::debug!(target: "kakehashi::captures", "no host language detected for {uri}");
-            return Ok(None);
-        };
-
-        // Injection layers need their grammars loaded before the walk can
-        // parse them. The pre-await snapshot is only used for *discovery* —
-        // it must NOT feed minting: a didChange processed during the await
-        // would adjust the tracker while our byte ranges stay stale. We
-        // re-snapshot below, after the await (mirroring `kakehashi/node`).
-        if injection && let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot())
-        {
-            self.ensure_injection_languages_loaded_for_document(
-                &uri,
-                &language_id,
-                snapshot.text(),
-                snapshot.tree(),
-            )
-            .await;
-            // A didChange processed during the await above may have scheduled
-            // a reparse; wait for it like the initial prelude does, so the
-            // snapshot below is the settled (text, tree) pair and never a
-            // mid-parse combination.
-            self.ensure_document_parsed(&uri).await;
-        }
-
-        // The snapshot carries the document's open incarnation, captured under
-        // the same shard read lock as its text and tree — so there is no longer
-        // a separate "fetch the generation before snapshotting" ordering to get
-        // right. If a close+reopen races after this, store_lineage sees a fresh
-        // incarnation on the URI and skips the stale insert (conservative).
-        let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
+        // Resolve the latest parse snapshot, with only the bounded first-parse
+        // wait (parse-snapshot ADR §3). `full` SERVES-STALE — it is a
+        // per-keystroke highlighter, and `null`-on-routine-staleness against a
+        // client contracted to re-request on `null` would busy-spin; `null` is
+        // reserved for no-snapshot (pre-first-parse) and the lineage gate
+        // below. The injected-grammar install is no longer triggered inline
+        // here: the parse loop's downstream (`process_injections`) detects
+        // missing injected grammars and spawns the install as a detached task;
+        // a layer whose grammar is still installing is skipped by the walk and
+        // heals on a later request.
+        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
             log::debug!(target: "kakehashi::captures", "no parsed document for {uri}");
             return Ok(None);
         };
-        let incarnation = snapshot.incarnation();
-        let text = snapshot.text();
-        let tree = snapshot.tree();
-
-        let mapper = PositionMapper::new(text);
-
-        // Range scoping: clamped conversion (like other viewport-shaped
-        // requests) — an out-of-bounds position means "to the document edge",
-        // not an error. An inverted range is normalized to [min, max], the
-        // same forgiveness range_formatting applies, rather than collapsing
-        // to null (which the protocol reserves for unresolvable states).
-        let byte_range = lsp_range.map(|r| {
-            let a = mapper.position_to_byte_clamped(r.start);
-            let b = mapper.position_to_byte_clamped(r.end);
-            a.min(b)..a.max(b)
-        });
-
-        let registry = self.language.language_registry_for_parallel();
-        let search_paths = self.language.search_paths();
-        let file_name = format!("{kind}.scm");
-
-        // One kind-query load per language per request: with many regions of
-        // the same language (e.g. dozens of python blocks), the memo keeps
-        // file IO + compilation at one per language, and yields each
-        // language's `skipped` exactly once.
-        let mut kind_queries: HashMap<String, KindQueryLoad> = HashMap::new();
-        let mut matches: Vec<Value> = Vec::new();
-
-        let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
-            let entry = kind_queries
-                .entry(layer_language.to_string())
-                .or_insert_with(|| {
-                    load_kind_query(&registry, &search_paths, layer_language, &file_name)
-                });
-            let KindQueryLoad::Loaded(kind_query) = entry else {
-                return;
-            };
-            for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
-                let match_metadata = metadata_object(m.metadata);
-                let captures: Vec<Value> = m
-                    .captures
-                    .into_iter()
-                    .filter_map(|c| {
-                        // A capture whose bytes don't map to positions (corrupt
-                        // span) is dropped rather than failing the whole request.
-                        let start = mapper.byte_to_position(c.start_byte)?;
-                        let end = mapper.byte_to_position(c.end_byte)?;
-                        // Minted in the layer's depth, so the id resolves in
-                        // its minting layer via kakehashi/node/* (per-layer
-                        // Scope rule).
-                        let node =
-                            self.mint_node_info(&uri, depth, (c.start_byte, c.end_byte, c.kind));
-                        let mut capture = json!({
-                            "name": c.name,
-                            "node": node,
-                            "range": { "start": start, "end": end },
-                        });
-                        // Capture-scoped `#set! @cap key value` metadata,
-                        // only when the capture was annotated.
-                        if let Some(meta) = metadata_object(c.metadata) {
-                            capture["metadata"] = meta;
-                        }
-                        Some(capture)
-                    })
-                    .collect();
-                // Mirror execute_query's invariant: clients never see an empty
-                // match envelope, even when every capture span fails to map.
-                if captures.is_empty() {
-                    continue;
-                }
-                let mut envelope = json!({
-                    "patternIndex": m.pattern_index,
-                    "language": layer_language,
-                    "captures": captures,
-                });
-                // Match-level `#set!` metadata, only when the pattern set any
-                // (treesitter-directive-set!) — absent otherwise, so patterns
-                // without directives keep their pre-metadata wire shape.
-                if let Some(meta) = match_metadata {
-                    envelope["metadata"] = meta;
-                }
-                matches.push(envelope);
-            }
+        // The live input state at request entry: `range` staleness-rejects
+        // against it, and the lineage store re-checks it (see ComputedCaptures).
+        let Some(view) = self.documents.latest_snapshot(&uri) else {
+            return Ok(None);
         };
-
-        if injection {
-            walk_document_layers(
-                &self.language,
-                &language_id,
-                text,
-                tree,
-                byte_range.as_ref(),
-                &mut visit,
-            );
-        } else {
-            visit(&language_id, tree, 0);
-        }
-
-        // The kind is "available" when at least one visited language COMPILED
-        // the file — a host without a context.scm still surfaces the embedded
-        // layers' contexts. A `Broken` file does not make the kind available
-        // (a sole broken asset degrades to null, per the ADR), but its
-        // diagnostics are surfaced below whenever another language yields a
-        // result.
-        if !kind_queries
-            .values()
-            .any(|load| matches!(load, KindQueryLoad::Loaded(_)))
-        {
+        let entry_content_version = view.content_version;
+        // A close+reopen between the snapshot resolve above and this read
+        // leaves `snapshot` on a dead lifetime; per-lifetime versions restart
+        // at 0, so the version equality below could pass by coincidence. A
+        // cross-incarnation snapshot can never answer (or mint) anything —
+        // `null` re-syncs the client against the new lifetime.
+        if snapshot.incarnation != view.slot.current_incarnation {
             return Ok(None);
         }
+        // `range` is the position/range class: its byte range is authored
+        // against the LIVE text, so a trailing snapshot cannot answer it.
+        // `null` — the captures protocol's re-sync signal — not ContentModified
+        // (a JSON-RPC error would violate the captures contract).
+        if lsp_range.is_some() && entry_content_version != snapshot.parsed_version {
+            log::debug!(
+                target: "kakehashi::captures",
+                "stale snapshot for range request on {uri}: re-sync via null"
+            );
+            return Ok(None);
+        }
+        let Some(language_id) = snapshot.language.clone() else {
+            log::debug!(target: "kakehashi::captures", "no host language detected for {uri}");
+            return Ok(None);
+        };
+        let incarnation = snapshot.incarnation;
+        let text = std::sync::Arc::clone(&snapshot.text);
+        let Some(tree) = snapshot.tree.clone() else {
+            // Resolved-but-tree-less (no parser installed / crashed grammar).
+            return Ok(None);
+        };
 
-        // Sort by language so the wire order is deterministic — the memo is a
-        // HashMap, whose iteration order would otherwise vary per process.
-        // Within a language, the loader already reports skipped patterns in
-        // file order. `Broken` languages contribute their diagnostics too:
-        // a wholly-invalid kind file would otherwise be silently invisible
-        // exactly when other layers still produce matches.
-        let mut reportable: Vec<(&String, &[crate::language::query_loader::SkippedPattern])> =
-            kind_queries
-                .iter()
-                .filter_map(|(lang, load)| match load {
-                    KindQueryLoad::Loaded(kq) => Some((lang, kq.skipped.as_slice())),
-                    KindQueryLoad::Broken(skipped) => Some((lang, skipped.as_slice())),
-                    KindQueryLoad::Unavailable => None,
-                })
-                .collect();
-        reportable.sort_by(|a, b| a.0.cmp(b.0));
-        let skipped: Vec<Value> = reportable
-            .into_iter()
-            .flat_map(|(lang, patterns)| {
-                patterns.iter().map(move |s| {
-                    json!({
-                        "language": lang,
-                        "startLine": s.start_line,
-                        "endLine": s.end_line,
-                        "reason": s.error,
-                    })
-                })
+        // The query-execution walk over every layer — including the injected
+        // layers' one-off re-parses — is synchronous tree-CPU; run it as one
+        // compute-pool work-unit instead of inline on this tokio worker
+        // (parse-snapshot ADR §4). Everything moved in is an owned snapshot
+        // piece or a cheap Arc clone; `None` from the pool (work-unit panic)
+        // degrades to the protocol's `null`.
+        let uri_for_walk = uri.clone();
+        let kind = kind.to_string();
+        let language = std::sync::Arc::clone(&self.language);
+        let tracker = self.bridge.node_tracker_arc();
+        let documents = std::sync::Arc::clone(&self.documents);
+        let parsed_version = snapshot.parsed_version;
+        let walked = self
+            .compute_pool
+            .run(None, move || {
+                execute_captures_walk(
+                    &uri_for_walk,
+                    &kind,
+                    lsp_range,
+                    injection,
+                    &language_id,
+                    &text,
+                    &tree,
+                    &language,
+                    &tracker,
+                    &documents,
+                    parsed_version,
+                    incarnation,
+                )
             })
-            .collect();
-
-        Ok(Some(ComputedCaptures {
+            .await;
+        let Some(walked) = walked else {
+            return Ok(None);
+        };
+        Ok(walked.map(|(matches, skipped)| ComputedCaptures {
             uri,
             incarnation,
+            entry_content_version,
             matches,
             skipped,
         }))
     }
+}
 
-    /// Ensure the grammars for every injection language appearing in the
-    /// document are loaded (auto-installing where configured), iterating to a
-    /// fixpoint: each round can only discover one tier deeper than the
-    /// grammars available in the previous round. Document-wide analog of
-    /// `kakehashi/node`'s position-based `ensure_injection_languages_loaded`
-    /// (see entry.rs for the registry re-read and `seen` rationale).
-    async fn ensure_injection_languages_loaded_for_document(
-        &self,
-        uri: &Url,
-        host_language: &str,
-        text: &str,
-        host_tree: &tree_sitter::Tree,
-    ) {
-        use std::collections::HashSet;
+/// Synchronous half of the captures pipeline: load + compile the kind query
+/// per visited layer language, execute it over each layer, and shape the wire
+/// JSON. Runs as a compute-pool work-unit (never on a tokio worker).
+///
+/// Returns `None` when no visited language compiled a kind file (→ `null` on
+/// the wire), `Some((matches, skipped))` otherwise.
+#[allow(clippy::too_many_arguments)]
+fn execute_captures_walk(
+    uri: &Url,
+    kind: &str,
+    lsp_range: Option<Range>,
+    injection: bool,
+    language_id: &str,
+    text: &str,
+    tree: &tree_sitter::Tree,
+    language: &crate::language::LanguageCoordinator,
+    tracker: &crate::language::NodeTracker,
+    documents: &crate::document::DocumentStore,
+    parsed_version: u64,
+    incarnation: u64,
+) -> Option<(Vec<Value>, Vec<Value>)> {
+    // Tracker minting is currency-gated: the NodeTracker is a LIVE-coordinate
+    // index (didChange shifts every entry before the reparse), so a trailing
+    // snapshot's byte offsets must never be written into it — they would be
+    // wrong-space entries that later edits keep shifting as if they were live
+    // (the "a stale read never mints" invariant, see snapshot_read.rs). A
+    // stale serve still returns matches — serve-stale is the point of the
+    // per-keystroke `full` mode — but goes READ-ONLY on the tracker: a
+    // position the intervening edits did not shift reuses its live id (so
+    // the delta lineage stays a minimal diff), and an unknown position gets
+    // an unregistered id — resolving one via `kakehashi/node/*` yields
+    // `null`, the protocol's re-sync signal, and the client's next
+    // current-snapshot request mints real ones. Checked here inside the
+    // work-unit so the entry window is the walk itself, not the pool-queue
+    // wait; the walk-duration residual — an edit landing DURING the walk —
+    // is closed by the post-walk reconciliation below, which purges this
+    // walk's own mints when the snapshot is no longer current on exit.
+    // Latched BEFORE the currency check: an edit landing between the two
+    // bumps the generation (making later mints purge-eligible) or fails the
+    // currency check itself — either way no wrong-space mint survives. The
+    // epoch half covers close/reopen, which REPLACES the per-URI index (its
+    // generation restarts at 0).
+    let (entry_shift_gen, entry_cleanup_epoch) = tracker.mint_epoch(uri);
+    let mint_into_tracker = documents.latest_snapshot(uri).is_some_and(|view| {
+        view.slot.current_incarnation == incarnation && view.content_version == parsed_version
+    });
+    // Ids THIS walk created (as opposed to reused), with the shift
+    // generation each creation observed — the purge set for the post-walk
+    // reconciliation.
+    let mut minted_ids: Vec<(ulid::Ulid, u64)> = Vec::new();
+    let mapper = PositionMapper::new(text);
 
-        let coordinator = self.injection_coordinator();
-        let mut seen: HashSet<String> = HashSet::new();
+    // Range scoping: clamped conversion (like other viewport-shaped
+    // requests) — an out-of-bounds position means "to the document edge",
+    // not an error. An inverted range is normalized to [min, max], the
+    // same forgiveness range_formatting applies, rather than collapsing
+    // to null (which the protocol reserves for unresolvable states).
+    let byte_range = lsp_range.map(|r| {
+        let a = mapper.position_to_byte_clamped(r.start);
+        let b = mapper.position_to_byte_clamped(r.end);
+        a.min(b)..a.max(b)
+    });
 
-        for _round in 0..crate::language::injection::MAX_INJECTION_DEPTH {
-            let discovered = collect_injection_languages_in_document(
-                &self.language,
-                host_language,
-                text,
-                host_tree,
-            );
-            let registry = self.language.language_registry_for_parallel();
-            let fresh: HashSet<String> = discovered
+    let registry = language.language_registry_for_parallel();
+    let search_paths = language.search_paths();
+    let file_name = format!("{kind}.scm");
+
+    // One kind-query load per language per request: with many regions of
+    // the same language (e.g. dozens of python blocks), the memo keeps
+    // file IO + compilation at one per language, and yields each
+    // language's `skipped` exactly once.
+    let mut kind_queries: HashMap<String, KindQueryLoad> = HashMap::new();
+    let mut matches: Vec<Value> = Vec::new();
+
+    let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
+        let entry = kind_queries
+            .entry(layer_language.to_string())
+            .or_insert_with(|| {
+                load_kind_query(&registry, &search_paths, layer_language, &file_name)
+            });
+        let KindQueryLoad::Loaded(kind_query) = entry else {
+            return;
+        };
+        for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
+            let match_metadata = metadata_object(m.metadata);
+            let captures: Vec<Value> = m
+                .captures
                 .into_iter()
-                .filter(|lang| registry.get(lang).is_none())
-                .filter(|lang| !seen.contains(lang))
+                .filter_map(|c| {
+                    // A capture whose bytes don't map to positions (corrupt
+                    // span) is dropped rather than failing the whole request.
+                    let start = mapper.byte_to_position(c.start_byte)?;
+                    let end = mapper.byte_to_position(c.end_byte)?;
+                    // Minted in the layer's depth, so the id resolves in
+                    // its minting layer via kakehashi/node/* (per-layer
+                    // Scope rule). Same mint as `mint_node_info`, done via
+                    // the tracker handle since this runs off `self`. On a
+                    // stale serve the tracker is read-only (see the
+                    // currency gate above).
+                    let ulid = if mint_into_tracker {
+                        let (ulid, created, shift_gen) = tracker.get_or_create_in_layer_tracked(
+                            uri,
+                            c.start_byte,
+                            c.end_byte,
+                            c.kind,
+                            depth,
+                        );
+                        // Recorded for the post-walk purge: if an edit lands
+                        // mid-walk, entries created after its shift were
+                        // minted in a superseded coordinate space and must
+                        // not persist. Both `created` and the observed
+                        // generation are determined atomically under the
+                        // tracker's entry lock, so an id a concurrent,
+                        // still-current request created (and handed out) is
+                        // never mis-attributed here and wrongly purged.
+                        if created {
+                            minted_ids.push((ulid, shift_gen));
+                        }
+                        ulid
+                    } else {
+                        match tracker.lookup_in_layer(uri, c.start_byte, c.end_byte, c.kind, depth)
+                        {
+                            Some(live) => live,
+                            // NOT Ulid::default() (the nil id): unregistered
+                            // ids must still be unique per capture.
+                            None => ulid::Ulid::new(),
+                        }
+                    };
+                    let node = json!({ "id": ulid.to_string(), "kind": c.kind });
+                    let mut capture = json!({
+                        "name": c.name,
+                        "node": node,
+                        "range": { "start": start, "end": end },
+                    });
+                    // Capture-scoped `#set! @cap key value` metadata,
+                    // only when the capture was annotated.
+                    if let Some(meta) = metadata_object(c.metadata) {
+                        capture["metadata"] = meta;
+                    }
+                    Some(capture)
+                })
                 .collect();
-            drop(registry);
-            if fresh.is_empty() {
-                break;
+            // Mirror execute_query's invariant: clients never see an empty
+            // match envelope, even when every capture span fails to map.
+            if captures.is_empty() {
+                continue;
             }
-            coordinator
-                .check_injected_languages_auto_install(uri, &fresh)
-                .await;
-            seen.extend(fresh);
+            let mut envelope = json!({
+                "patternIndex": m.pattern_index,
+                "language": layer_language,
+                "captures": captures,
+            });
+            // Match-level `#set!` metadata, only when the pattern set any
+            // (treesitter-directive-set!) — absent otherwise, so patterns
+            // without directives keep their pre-metadata wire shape.
+            if let Some(meta) = match_metadata {
+                envelope["metadata"] = meta;
+            }
+            matches.push(envelope);
+        }
+    };
+
+    if injection {
+        walk_document_layers(
+            language,
+            language_id,
+            text,
+            tree,
+            byte_range.as_ref(),
+            &mut visit,
+        );
+    } else {
+        visit(language_id, tree, 0);
+    }
+
+    // Post-walk reconciliation, the other half of the currency gate: the
+    // entry latch cannot see an edit (or close/reopen) that lands DURING the
+    // walk. A creation whose observed shift generation still equals the
+    // entry latch — with the cleanup epoch also unchanged — is
+    // correct-at-birth: no edit intervened, and later edits shift it like
+    // any live entry. A generation mismatch means the mint landed AFTER some
+    // edit's shift, i.e. in a superseded coordinate space — coordinate
+    // comparison could not detect this once a second edit moves the
+    // wrong-space entry again. An epoch mismatch means a close/reopen
+    // replaced some index mid-walk (per-URI generations restart at 0, so
+    // the generation alone could ABA); purging our own mints then is
+    // conservative but bounded — one null re-sync. The response still
+    // carries purged ids, which resolve `null` (the protocol's re-sync
+    // signal), the same degradation as a stale-at-entry serve.
+    if !minted_ids.is_empty() {
+        let (_, exit_cleanup_epoch) = tracker.mint_epoch(uri);
+        for (id, shift_gen) in &minted_ids {
+            if *shift_gen != entry_shift_gen || exit_cleanup_epoch != entry_cleanup_epoch {
+                tracker.remove_id(uri, id);
+            }
         }
     }
+
+    // The kind is "available" when at least one visited language COMPILED
+    // the file — a host without a context.scm still surfaces the embedded
+    // layers' contexts. A `Broken` file does not make the kind available
+    // (a sole broken asset degrades to null, per the ADR), but its
+    // diagnostics are surfaced below whenever another language yields a
+    // result.
+    if !kind_queries
+        .values()
+        .any(|load| matches!(load, KindQueryLoad::Loaded(_)))
+    {
+        return None;
+    }
+
+    // Sort by language so the wire order is deterministic — the memo is a
+    // HashMap, whose iteration order would otherwise vary per process.
+    // Within a language, the loader already reports skipped patterns in
+    // file order. `Broken` languages contribute their diagnostics too:
+    // a wholly-invalid kind file would otherwise be silently invisible
+    // exactly when other layers still produce matches.
+    let mut reportable: Vec<(&String, &[crate::language::query_loader::SkippedPattern])> =
+        kind_queries
+            .iter()
+            .filter_map(|(lang, load)| match load {
+                KindQueryLoad::Loaded(kq) => Some((lang, kq.skipped.as_slice())),
+                KindQueryLoad::Broken(skipped) => Some((lang, skipped.as_slice())),
+                KindQueryLoad::Unavailable => None,
+            })
+            .collect();
+    reportable.sort_by(|a, b| a.0.cmp(b.0));
+    let skipped: Vec<Value> = reportable
+        .into_iter()
+        .flat_map(|(lang, patterns)| {
+            patterns.iter().map(move |s| {
+                json!({
+                    "language": lang,
+                    "startLine": s.start_line,
+                    "endLine": s.end_line,
+                    "reason": s.error,
+                })
+            })
+        })
+        .collect();
+
+    Some((matches, skipped))
 }
 
 #[cfg(test)]
@@ -729,6 +862,139 @@ mod tests {
 
     fn vals(ns: &[i64]) -> Vec<Value> {
         ns.iter().map(|n| json!(n)).collect()
+    }
+
+    fn first_node_id(matches: &[Value]) -> ulid::Ulid {
+        matches[0]["captures"][0]["node"]["id"]
+            .as_str()
+            .expect("capture carries a node id")
+            .parse()
+            .expect("node id is a ULID")
+    }
+
+    /// The NodeTracker is a live-coordinate index; a walk over a snapshot
+    /// that trails the live document must still serve matches (serve-stale)
+    /// but must NOT register its ids in the tracker — a stale read never
+    /// mints (see the currency gate in `execute_captures_walk`).
+    #[test]
+    fn stale_serve_returns_matches_but_never_mints_into_the_tracker() {
+        use crate::config::WorkspaceSettings;
+        use crate::document::DocumentStore;
+        use crate::language::{LanguageCoordinator, NodeTracker};
+        use std::sync::Arc;
+
+        // Statically-linked grammar + a temp query root: no dylib fixtures.
+        let dir = tempfile::tempdir().unwrap();
+        let query_dir = dir.path().join("queries/rust");
+        std::fs::create_dir_all(&query_dir).unwrap();
+        std::fs::write(
+            query_dir.join("locals.scm"),
+            "(identifier) @local.reference\n",
+        )
+        .unwrap();
+
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let settings = WorkspaceSettings {
+            search_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        coordinator.load_settings(&settings);
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+
+        let text = "fn main() { let x = 1; }\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///stale_mint.rs").unwrap();
+        store.insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+        let incarnation = store
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .current_incarnation;
+
+        // Current (parsed_version == content_version == 0): minting is live.
+        let tracker = NodeTracker::new();
+        let (matches, _) = execute_captures_walk(
+            &uri,
+            "locals",
+            None,
+            false,
+            "rust",
+            text,
+            &tree,
+            &coordinator,
+            &tracker,
+            &store,
+            0,
+            incarnation,
+        )
+        .expect("kind query should load");
+        assert!(!matches.is_empty(), "identifiers should match");
+        let id = first_node_id(&matches);
+        assert!(
+            tracker.lookup_node(&uri, &id).is_some(),
+            "a current serve mints resolvable ids"
+        );
+
+        // Trailing (an edit bumped content_version past parsed_version):
+        // matches still serve, and positions the tracker already knows reuse
+        // their live id read-only (delta lineage stays a minimal diff).
+        store.update_document(uri.clone(), text.to_string(), None);
+        let (stale_matches, _) = execute_captures_walk(
+            &uri,
+            "locals",
+            None,
+            false,
+            "rust",
+            text,
+            &tree,
+            &coordinator,
+            &tracker,
+            &store,
+            0,
+            incarnation,
+        )
+        .expect("kind query should load");
+        assert!(
+            !stale_matches.is_empty(),
+            "serve-stale still returns matches"
+        );
+        assert_eq!(
+            first_node_id(&stale_matches),
+            id,
+            "a stale serve reuses the live id for an unshifted position"
+        );
+
+        // A stale serve against a tracker with no entry for the position must
+        // not create one — the id it hands out stays unregistered.
+        let stale_tracker = NodeTracker::new();
+        let (stale_matches, _) = execute_captures_walk(
+            &uri,
+            "locals",
+            None,
+            false,
+            "rust",
+            text,
+            &tree,
+            &coordinator,
+            &stale_tracker,
+            &store,
+            0,
+            incarnation,
+        )
+        .expect("kind query should load");
+        let id = first_node_id(&stale_matches);
+        assert!(
+            stale_tracker.lookup_node(&uri, &id).is_none(),
+            "a stale serve must not mint into the live tracker"
+        );
     }
 
     #[test]

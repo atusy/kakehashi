@@ -7,6 +7,13 @@ use crate::analysis::handle_selection_range;
 
 use super::super::{Kakehashi, uri_to_url};
 
+/// The explicit-action bounded wait (parse-snapshot ADR §3): `selectionRange`
+/// is keyboard-triggered expand/shrink — a silent no-op on a consciously
+/// triggered action is jarring, and the request is not per-keystroke, so it
+/// may briefly wait for the in-flight parse to land before falling back to
+/// `ContentModified`.
+const SELECTION_RANGE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl Kakehashi {
     pub(crate) async fn selection_range_impl(
         &self,
@@ -32,67 +39,86 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Take what the on-demand parse needs and drop the Ref at the block's
-        // end: a DashMap Ref held across an .await keeps the shard read-locked
-        // while this task is parked, stalling didOpen/didChange writers.
-        let unparsed_text = {
-            let Some(doc) = self.documents.get(&uri) else {
+        // Resolve the latest parse snapshot, waiting briefly (bounded) for a
+        // *current* one — this reader's coordinates are authored against the
+        // live text, so a trailing snapshot cannot answer it (ADR §3
+        // staleness-reject, with the explicit-action wait). This replaces the
+        // former reader on-demand parse: readers never parse inline.
+        let deadline = tokio::time::Instant::now() + SELECTION_RANGE_WAIT;
+        let snapshot = loop {
+            // Subscribe BEFORE checking (lost-wakeup guard, see
+            // snapshot_for_tokens), then re-resolve per iteration
+            // (per-request re-resolution rule): a close/reopen between
+            // wakeups is observed here, never served.
+            let Some(mut receiver) = self.documents.subscribe_snapshots(&uri) else {
                 return Ok(None);
             };
-            doc.tree().is_none().then(|| doc.text().to_string())
-        };
-
-        // Parse on-demand if the document has no tree yet
-        if let Some(text) = unparsed_text {
-            let text_clone = text.clone();
-
-            let sync_parse_result = self
-                .parse_coordinator()
-                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
-                    let parse_result = parser.parse(&text_clone, None);
-                    (parser, parse_result)
-                })
-                .await;
-
-            let Some(tree) = sync_parse_result else {
+            let Some(view) = self.documents.latest_snapshot(&uri) else {
+                // Unregistered or closed.
                 return Ok(None);
             };
-
-            // Persist under the per-URI edit lock and only if the document is
-            // still alive with the text we parsed: a didClose racing the parse
-            // must not be undone by re-inserting the document, and a didChange
-            // must not be clobbered with the older text/tree. Block-scoped so
-            // the edit lock is released before the pool wait below.
-            {
-                let edit_lock = self.documents.edit_lock(&uri);
-                let _guard = edit_lock.lock().await;
-                let still_current = {
-                    let Some(doc) = self.documents.get(&uri) else {
-                        // edit_lock() get-or-inserts; a didClose that raced the
-                        // parse already removed the entry, so drop the one we
-                        // just recreated rather than leaking it (same miss-path
-                        // cleanup as semantic_tokens).
-                        drop(_guard);
-                        self.documents.remove_edit_lock(&uri);
-                        return Ok(None);
-                    };
-                    doc.text() == text
-                };
-                if still_current {
-                    self.documents
-                        .update_document(uri.clone(), text, Some(tree));
+            match &view.slot.snapshot {
+                Some(snapshot) if snapshot.parsed_version == view.content_version => {
+                    break std::sync::Arc::clone(snapshot);
+                }
+                _ => {
+                    // No snapshot yet (first parse in flight) or trailing an
+                    // edit: wait for the next publish, bounded by the deadline.
+                    let wait = tokio::time::timeout_at(deadline, receiver.changed()).await;
+                    match wait {
+                        // A publish (or close) landed — loop and re-resolve.
+                        Ok(Ok(())) => continue,
+                        // Channel closed: the document is gone.
+                        Ok(Err(_)) => return Ok(None),
+                        // Deadline passed. A stale snapshot exists → the
+                        // coordinates can't be answered: ContentModified. No
+                        // snapshot at all (first parse still running) → the
+                        // pre-snapshot behavior: null.
+                        Err(_elapsed) => {
+                            return if view.slot.snapshot.is_some() {
+                                Err(crate::error::content_modified_error())
+                            } else {
+                                Ok(None)
+                            };
+                        }
+                    }
                 }
             }
+        };
+
+        // A resolved-but-tree-less snapshot (no parser installed / crashed
+        // grammar) cannot produce selection ranges.
+        if snapshot.tree.is_none() {
+            return Ok(None);
         }
 
-        // Lock the pool before re-acquiring the document so the Ref is never
-        // held across an await, then run the full injection parsing handler.
-        let mut pool = self.parser_pool.lock().await;
-        let Some(doc) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        let result = handle_selection_range(&doc, &positions, &self.language, &mut pool);
+        // Run the synchronous injection-aware walk as one work-unit on the
+        // compute pool against the snapshot's consistent (text, tree). The
+        // walk uses a TRANSIENT parser pool: holding the shared parser-pool
+        // mutex across the whole injection walk would block any concurrent
+        // parse work-unit's brief acquire/release on it — pinning a second
+        // compute thread for the walk's duration. Parser construction is
+        // cheap (the grammars are already registered), and selectionRange is
+        // a user-triggered, infrequent read, so per-request parsers beat
+        // cross-request reuse here.
+        let language = std::sync::Arc::clone(&self.language);
+        let result = self
+            .compute_pool
+            .run(None, move || {
+                let mut pool = language.create_document_parser_pool();
+                handle_selection_range(
+                    &snapshot.text,
+                    snapshot.tree.as_ref(),
+                    snapshot.language.as_deref(),
+                    &positions,
+                    &language,
+                    &mut pool,
+                )
+            })
+            .await;
 
-        Ok(Some(result))
+        // None = the work-unit panicked (logged by the pool); serve the
+        // no-result fallback rather than an error.
+        Ok(result)
     }
 }

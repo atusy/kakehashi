@@ -1,6 +1,7 @@
 pub(crate) mod analysis;
 pub(crate) mod cancel;
 pub mod cli;
+pub(crate) mod compute_pool;
 pub mod config;
 pub(crate) mod document;
 pub(crate) mod error;

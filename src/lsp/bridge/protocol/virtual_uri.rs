@@ -29,12 +29,29 @@ const VIRTUAL_URI_PREFIX: &str = "kakehashi-virtual-uri-";
 /// For cannot-be-a-base URIs (untitled:, mailto:, data:):
 /// - Format: `kakehashi:///virtual/{encoded_host}/kakehashi-virtual-uri-{region_id}.{ext}`
 /// - Example: `kakehashi:///virtual/untitled%3AUntitled-1/kakehashi-virtual-uri-REGION.lua`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct VirtualDocumentUri {
     host_uri: tower_lsp_server::ls_types::Uri,
     language: String,
     region_id: String,
+    /// Memoized rendering (see [`to_uri_string`](Self::to_uri_string)): the
+    /// fields are immutable after construction, so the rendered form is fixed
+    /// — and the document tracker keys several maps by it per forwarded
+    /// message, which made re-rendering a measured tokio-side hotspot on
+    /// fence-heavy documents. Excluded from `PartialEq` (identity is the
+    /// three fields; the memo is derived).
+    rendered: std::sync::OnceLock<String>,
 }
+
+impl PartialEq for VirtualDocumentUri {
+    fn eq(&self, other: &Self) -> bool {
+        self.host_uri == other.host_uri
+            && self.language == other.language
+            && self.region_id == other.region_id
+    }
+}
+
+impl Eq for VirtualDocumentUri {}
 
 impl VirtualDocumentUri {
     /// Build a virtual document URI for an injection region.
@@ -54,6 +71,7 @@ impl VirtualDocumentUri {
 
         Self {
             host_uri: host_uri.clone(),
+            rendered: std::sync::OnceLock::new(),
             language: language.to_string(),
             region_id: region_id.to_string(),
         }
@@ -163,23 +181,67 @@ impl VirtualDocumentUri {
     /// like lua-language-server recognize the file type. The url crate
     /// percent-encodes `region_id` (defense-in-depth; ULIDs are alphanumeric).
     pub(crate) fn to_uri_string(&self) -> String {
+        self.rendered
+            .get_or_init(|| self.render_uri_string())
+            .clone()
+    }
+
+    /// Uncached rendering behind [`to_uri_string`](Self::to_uri_string)'s
+    /// per-instance memo.
+    fn render_uri_string(&self) -> String {
         let extension = Self::language_to_extension(&self.language);
         let virtual_filename = format!("{VIRTUAL_URI_PREFIX}{}.{extension}", self.region_id);
 
-        // Try to parse and modify the host URI (works for file://, https://, etc.)
-        if let Ok(mut url) = url::Url::parse(self.host_uri.as_str()) {
-            // path_segments_mut() returns Err for cannot-be-a-base URIs (untitled:, mailto:, data:)
-            let modified = url
+        // The parsed host URL with its filename segment popped is identical
+        // for every region of a host document, but this function runs once per
+        // forwarded message — for a fence-heavy document the repeated full URL
+        // parse was a measured tokio-side hotspot (thousands of parses on the
+        // runtime). Cache the parsed+popped `Url` per host URI (tiny map — one
+        // entry per open host document — and never stale: the value is a pure
+        // function of the key). Per call, clone it and push the virtual
+        // filename, keeping `Url`'s percent-encoding and fragment handling
+        // byte-identical to the uncached path.
+        static HOST_BASES: std::sync::OnceLock<dashmap::DashMap<String, Option<url::Url>>> =
+            std::sync::OnceLock::new();
+        // Values are pure functions of the key, so eviction never risks
+        // staleness — the cap only bounds memory in sessions that touch many
+        // distinct host URIs (generated/untitled churn). Clearing wholesale
+        // is fine: the map refills at one parse per open host document.
+        const HOST_BASES_CAP: usize = 1024;
+        let bases = HOST_BASES.get_or_init(dashmap::DashMap::new);
+        let base = match bases.get(self.host_uri.as_str()) {
+            Some(hit) => hit.clone(),
+            None => {
+                if bases.len() >= HOST_BASES_CAP {
+                    bases.clear();
+                }
+                let computed = url::Url::parse(self.host_uri.as_str())
+                    .ok()
+                    .and_then(|mut url| {
+                        // path_segments_mut() returns Err for cannot-be-a-base URIs
+                        // (untitled:, mailto:, data:)
+                        url.path_segments_mut()
+                            .map(|mut segments| {
+                                segments.pop(); // Remove the host filename
+                            })
+                            .ok()?;
+                        Some(url)
+                    });
+                bases
+                    .entry(self.host_uri.as_str().to_string())
+                    .or_insert_with(|| computed.clone());
+                computed
+            }
+        };
+        if let Some(mut url) = base
+            && url
                 .path_segments_mut()
                 .map(|mut segments| {
-                    segments.pop(); // Remove the host filename
-                    segments.push(&virtual_filename); // Add the virtual filename
+                    segments.push(&virtual_filename);
                 })
-                .is_ok();
-
-            if modified {
-                return url.to_string();
-            }
+                .is_ok()
+        {
+            return url.to_string();
         }
 
         // Fallback for cannot-be-a-base URIs or parse errors

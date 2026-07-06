@@ -628,16 +628,13 @@ fn test_snapshot_heading_inline_decoration_binary() {
     insta::assert_json_snapshot!("heading_inline_decoration_binary", data_u32);
 }
 
-/// Regression: a large paste split into several back-to-back `didChange`
-/// chunks must not leave the later lines unhighlighted (rendered white).
-///
-/// The editor sends the paste as multiple incremental `didChange`s and then a
-/// single `semanticTokens/full` for the final state. Those notifications are
-/// dispatched concurrently with the token request, so without serialization the
-/// request could snapshot a half-applied document and return tokens covering
-/// only the first chunks — the symptom this guards against. The server must
-/// settle all pending edits before computing, so the tokens reach the last
-/// line.
+/// A large paste split into several back-to-back `didChange` chunks must not
+/// leave the later lines unhighlighted (rendered white) — under the
+/// parse-snapshot model (serve-stale + refresh, ADR §3) the guarantee is
+/// **eventual**: the immediate response may serve a consistent snapshot that
+/// trails the paste, and the parse loop then emits
+/// `workspace/semanticTokens/refresh`, whose re-request returns tokens
+/// covering the final state. This asserts that heal loop converges.
 #[test]
 fn test_semantic_tokens_large_paste_covers_last_line() {
     let mut client = LspClient::new();
@@ -647,6 +644,9 @@ fn test_semantic_tokens_large_paste_covers_last_line() {
             "processId": std::process::id(),
             "rootUri": null,
             "capabilities": {
+                "workspace": {
+                    "semanticTokens": { "refreshSupport": true }
+                },
                 "textDocument": {
                     "semanticTokens": {
                         "dynamicRegistration": false,
@@ -714,30 +714,43 @@ fn test_semantic_tokens_large_paste_covers_last_line() {
     let total_lines = CHUNKS * LINES_PER_CHUNK; // lines 0..total_lines-1 carry code
     let last_code_line = (total_lines - 1) as u32; // 8 * 40 - 1 = line 319
 
-    // Immediately request tokens for the final state — the server must settle
-    // the pending edits before answering.
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": uri } }),
-    );
-
-    let result = response
-        .get("result")
-        .unwrap_or_else(|| panic!("semantic tokens response missing result: {response:?}"));
-    let data = result
-        .get("data")
-        .expect("result should have data")
-        .as_array()
-        .expect("data should be array");
-    let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
-    let tokens = decode_semantic_tokens(&data_u32);
-
-    let max_line = tokens.iter().map(|t| t.line).max().unwrap_or(0);
+    // Request immediately — the response may legitimately serve a snapshot
+    // trailing the still-parsing paste (serve-stale). The reparse's publish
+    // emits workspace/semanticTokens/refresh; re-request until the tokens
+    // cover the final state (bounded), which is the model's healed steady
+    // state. The very first response still must be a *consistent* snapshot —
+    // decodable tokens, never a torn read — which decode_semantic_tokens
+    // implicitly checks.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (max_line, tokens) = loop {
+        let response = client.send_request(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        let result = response
+            .get("result")
+            .unwrap_or_else(|| panic!("semantic tokens response missing result: {response:?}"));
+        let data = result
+            .get("data")
+            .expect("result should have data")
+            .as_array()
+            .expect("data should be array");
+        let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let tokens = decode_semantic_tokens(&data_u32);
+        let max_line = tokens.iter().map(|t| t.line).max().unwrap_or(0);
+        if max_line >= last_code_line || std::time::Instant::now() > deadline {
+            break (max_line, tokens);
+        }
+        // Trailing snapshot served: give the off-ingress reparse (and its
+        // refresh) a beat, then re-request — what a refresh-supporting client
+        // does on workspace/semanticTokens/refresh.
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert!(
         max_line >= last_code_line,
-        "tokens must cover the whole pasted document: last code line is {last_code_line} \
-         but tokens stop at line {max_line} ({} tokens) — the later part would render white",
-        tokens.len()
+        "tokens must eventually cover the whole pasted document: last code line is \
+         {last_code_line} but tokens stop at line {max_line} — the later part would \
+         render white even after the refresh heal"
     );
 
     // The last line is `local var_N = N`; its `local` keyword must be tokenized.

@@ -17,16 +17,11 @@
 //! This is achieved by subscribing to cancel notifications via `CancelForwarder::subscribe()`
 //! and using biased `tokio::select!` to prioritize cancel handling.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Duration;
-use tree_sitter::Parser;
-
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
 };
-use tree_sitter::Tree;
 use url::Url;
 
 #[cfg(test)]
@@ -42,192 +37,53 @@ use crate::lsp::current_upstream_id;
 
 use super::super::{Kakehashi, uri_to_url};
 
-/// Reason why a semantic token request was cancelled.
-#[derive(Debug, Clone, Copy)]
-enum CancellationReason {
-    StaleText,
-    DocumentMissing,
-}
-
 impl Kakehashi {
-    /// Check if the document text matches the expected text, returning the cancellation reason if not.
-    fn check_text_staleness(&self, uri: &Url, expected_text: &str) -> Option<CancellationReason> {
-        match self.documents.get(uri) {
-            Some(doc) if doc.text() == expected_text => None,
-            Some(_) => Some(CancellationReason::StaleText),
-            None => Some(CancellationReason::DocumentMissing),
-        }
-    }
-
-    /// Get the syntax tree for a document, waiting for parse completion or parsing on-demand.
-    ///
-    /// This handles the race condition where semantic tokens are requested before
-    /// `didOpen`/`didChange` finishes parsing. Strategy:
-    /// 1. Wait up to 200ms for any in-flight parse to complete
-    /// 2. Try to use the tree from the document store (preferred for incremental tokenization)
-    /// 3. Parse on-demand as fallback if tree is missing or stale
-    ///
-    /// Returns `(tree, text)` tuple where tree was verified to be parsed from text,
-    /// or `None` if the document is missing or parsing failed.
-    async fn get_tree_with_wait(&self, uri: &Url, language_name: &str) -> Option<(Tree, String)> {
-        // If the document isn't open there is nothing to settle or snapshot.
-        // Return before taking the edit lock so we don't create a lock entry for
-        // a never-opened/closed URI (language detection can resolve a language
-        // from the path alone, so this point is reachable without a document).
-        // The handle is dropped immediately; we only need the existence check.
-        self.documents.get(uri)?;
-
-        // Settle in-flight edits before snapshotting. A large paste arrives as
-        // several back-to-back `didChange` chunks; the editor then sends one
-        // semantic-tokens request for the final state. Each `didChange` holds
-        // the document's edit lock across its reparse, so acquiring the same
-        // lock here waits for any edit currently applying/parsing to finish
-        // before snapshotting. Without it the request can snapshot a tree from a
-        // half-applied paste and return tokens for only the first chunks — the
-        // later lines render unhighlighted (white). Acquisition follows first-poll
-        // order (a practical mitigation, not a hard JSON-RPC wire-order
-        // guarantee — see https://github.com/atusy/kakehashi/issues/342), so a
-        // request polled before a still-pending edit may not wait for it; the
-        // common debounced-after-paste case settles correctly. The guard is held
-        // across the tree read (and the on-demand parse fallback) so no edit can
-        // interleave between settling and snapshotting; it is released when this
-        // function returns, before token computation, so edits never wait on the
-        // (slower) tokenization.
-        let edit_lock = self.documents.edit_lock(uri);
-        let _settle_guard = edit_lock.lock().await;
-
-        // Re-check existence now that we hold the lock: the document could have
-        // been closed between the pre-check and here (e.g. `didClose` took the
-        // edit lock first, removed the document — and its lock entry — then
-        // released). In that case `edit_lock()` above re-created a fresh entry,
-        // so drop it and bail rather than leaving an orphan behind for a gone
-        // document.
-        if self.documents.get(uri).is_none() {
-            drop(_settle_guard);
-            self.documents.remove_edit_lock(uri);
-            return None;
-        }
-
-        // Settle the in-flight parse before snapshotting, under a SINGLE 200ms
-        // budget shared across both waits so the `edit_lock` held here is never
-        // pinned longer than the pre-existing has-tree budget (the two waits do
-        // not stack to ~400ms).
-        //
-        // First wait on the parse **watermark** for this reader's tail edit
-        // (per-document-parse-scheduler ADR). In the current inline-parse world this
-        // returns effectively immediately — the parse runs within the writer's
-        // gated critical section, so by the time the gate releases this reader the
-        // watermark already covers the tail ticket — leaving the full budget for
-        // the has-tree wait below (so today this adds no measurable latency). Once
-        // the per-document parse scheduler runs the parse off the ingress ticket this
-        // genuinely waits — that is the point: a bare `has_tree` check would
-        // instead pass while the store still holds the *old* tree (the #342/#374
-        // stale-tree race), and this watermark wait is what closes it.
-        let settle_budget = Duration::from_millis(200);
-        let settle_start = std::time::Instant::now();
-        if let Some(tail) = crate::lsp::current_reader_tail() {
-            self.documents
-                .wait_for_epoch(uri, tail, settle_budget)
-                .await;
-        }
-
-        // Wait for any in-flight parse to complete with whatever budget remains.
-        let remaining = settle_budget.saturating_sub(settle_start.elapsed());
-        self.documents
-            .wait_for_parse_completion(uri, remaining)
-            .await;
-
-        // First, try to use the tree already in the document store, to avoid a
-        // redundant parse here: the store's tree is kept current by didOpen's parse
-        // and the off-ingress edit reparse.
-        if let Some(doc) = self.documents.get(uri) {
-            let text = doc.text().to_string();
-            if let Some(tree) = doc.tree().cloned() {
-                log::debug!(
-                    target: "kakehashi::semantic",
-                    "Using existing tree from document store for {}",
-                    uri.path()
-                );
-                return Some((tree, text));
-            }
-        }
-
-        // Fallback: parse on-demand if no tree is available.
-        // This handles race conditions where semantic tokens are requested before
-        // didOpen/didChange finishes parsing.
-        log::debug!(
-            target: "kakehashi::semantic",
-            "Parsing on-demand for {} (no tree in store)",
-            uri.path()
-        );
-        self.try_parse_and_update_document(uri, language_name).await
-    }
-
-    /// Parse the document on-demand and update the store if successful.
-    ///
-    /// This is a fallback path when the normal parse pipeline hasn't completed.
-    /// Side effects:
-    /// - Updates the document store with the parsed tree (if text unchanged)
-    /// - Clears any failed parser state for recovery
-    ///
-    /// Returns `(tree, text)` tuple where `text` is the exact text the tree was
-    /// parsed from (and verified unchanged). This prevents race conditions where
-    /// the document changes after parsing but before the caller captures text.
-    async fn try_parse_and_update_document(
+    /// Serve-stale snapshot resolution for the semantic-token handlers
+    /// (parse-snapshot ADR §3): returns the **latest completed** snapshot,
+    /// which may trail the input by however many edits the scheduler
+    /// coalesced — the parse loop's `semanticTokens/refresh` re-drives the
+    /// client once a fresher one lands. The only wait is the bounded
+    /// first-parse wait (no snapshot for this lifetime yet); no per-keystroke
+    /// read ever waits on a reparse. `None` for an unregistered/closed URI or
+    /// when no parse resolves within the wait.
+    pub(crate) async fn snapshot_for_tokens(
         &self,
         uri: &Url,
-        language_name: &str,
-    ) -> Option<(Tree, String)> {
-        let doc = self.documents.get(uri)?;
-        let text = doc.text().to_string();
-        drop(doc);
-
-        let text_clone = text.clone();
-
-        // Parse with panic protection via catch_unwind, delegating pool
-        // management to the shared parse_with_pool helper
-        let parse_result: Option<Tree> = self
-            .parse_coordinator()
-            .parse_with_pool(language_name, uri, text.len(), move |mut parser: Parser| {
-                let result = catch_unwind(AssertUnwindSafe(|| parser.parse(&text_clone, None)))
-                    .ok()
-                    .flatten();
-                (parser, result)
-            })
-            .await;
-
-        if let Some(tree) = parse_result {
-            let mut doc_is_current = false;
-            let mut should_update = false;
-            if let Some(current_doc) = self.documents.get(uri)
-                && current_doc.text() == text
-            {
-                doc_is_current = true;
-                should_update = current_doc.tree().is_none();
+    ) -> Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>> {
+        // Generous on purpose: this wait only runs while the document has NO
+        // snapshot for its lifetime, and every open-parse resolution path
+        // publishes one (a tree, a resolved-but-tree-less outcome, or the
+        // didClose sentinel — all of which wake this receiver). The wait is
+        // therefore bounded by parse completion (itself capped by the parse
+        // work-unit timeout), not by this constant; the constant is only a
+        // backstop. A tight cap here made first requests racing didOpen
+        // answer empty whenever the machine was loaded enough to push the
+        // open parse past it (observed under the parallel e2e suite, and the
+        // real-world analog is editor startup on a busy machine).
+        let deadline =
+            tokio::time::Instant::now() + crate::lsp::lsp_impl::snapshot_read::FIRST_PARSE_BACKSTOP;
+        loop {
+            // Subscribe BEFORE checking: `watch::Sender::subscribe` marks the
+            // value current at subscription time as already seen, so a publish
+            // landing between a check and a later subscribe would be invisible
+            // to `changed()` — a lost wakeup that burned the whole wait and
+            // served the pre-parse fallback (the e2e-visible symptom: node —
+            // and first-token — requests racing didOpen answered null).
+            // Subscribing first closes the window: a publish before the check
+            // is caught by the check, one after it triggers `changed()`.
+            let mut receiver = self.documents.subscribe_snapshots(uri)?;
+            // Re-resolve the cell per iteration (per-request re-resolution +
+            // incarnation validation happen inside `latest_snapshot`).
+            let view = self.documents.latest_snapshot(uri)?;
+            if let Some(snapshot) = view.slot.snapshot {
+                return Some(snapshot);
             }
-
-            if should_update {
-                self.documents
-                    .update_document(uri.clone(), text.clone(), Some(tree.clone()));
-            }
-
-            if doc_is_current {
-                if self.auto_install.is_parser_failed(language_name)
-                    && let Err(error) = self.auto_install.clear_failed(language_name)
-                {
-                    log::warn!(
-                        target: "kakehashi::crash_recovery",
-                        "Failed to clear failed parser state for '{}': {}",
-                        language_name,
-                        error
-                    );
-                }
-                // Return both tree and the validated text to prevent TOCTOU race
-                return Some((tree, text));
+            match tokio::time::timeout_at(deadline, receiver.changed()).await {
+                Ok(Ok(())) => continue,
+                // Channel closed (document gone) or first-parse wait elapsed.
+                _ => return None,
             }
         }
-
-        None
     }
 
     pub(crate) async fn semantic_tokens_full_impl(
@@ -274,13 +130,29 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let Some(language_name) = self.document_language(&uri) else {
+        // Serve-stale (ADR §3): resolve the latest completed snapshot up front;
+        // its (text, tree, language) triple is internally consistent, and every
+        // input below (query, mappings) resolves against the snapshot's own
+        // detected language — never a live re-detection that could diverge
+        // from the tree's grammar.
+        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
             })));
         };
+        let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
+        else {
+            // No detectable language, or resolved-but-tree-less (no parser
+            // installed / crashed grammar): nothing to tokenize.
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        };
+        let text = std::sync::Arc::clone(&snapshot.text);
 
         // Ensure language is loaded before trying to get queries.
         // This handles the race condition where semanticTokens/full arrives
@@ -312,10 +184,10 @@ impl Kakehashi {
             })));
         };
 
-        // Read the remaining settings-dependent tokenization inputs HERE — together
-        // with the query above and BEFORE the get_tree_with_wait().await below — so
-        // a settings reload during that await can't split them into an inconsistent
-        // mix (e.g. old query + new capture mappings). All are consistent with the
+        // Read the remaining settings-dependent tokenization inputs HERE —
+        // together with the query above, with no `.await` in between — so a
+        // settings reload can't split them into an inconsistent mix (e.g. old
+        // query + new capture mappings). All are consistent with the
         // `token_generation` snapshotted at the top.
         let capture_mappings = self.language.capture_mappings();
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
@@ -330,56 +202,23 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Get tree and text, waiting for parse completion or parsing on-demand
-        let Some((tree, text)) = self.get_tree_with_wait(&uri, &language_name).await else {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
-        };
-
-        // Validity key for the snapshotted text under the generation captured at
-        // the top (before any query/capture-mapping read): keys both the
-        // unchanged-document cache short-circuit below and the store of the freshly
-        // computed tokens. Pinning to the early generation is what keeps a
-        // concurrent settings reload from making this request poison the cache.
+        // Validity key for the snapshot's text under the generation captured at
+        // the top: keys both the unchanged-document cache short-circuit below
+        // and the store of the freshly computed tokens. Keying off the
+        // snapshot's own text (not the live text) is what makes serve-stale
+        // cache-safe — a stale compute stores under the stale text's hash,
+        // which a post-edit request never looks up.
         let cache_key = self.cache.cache_key_for(&text, token_generation);
 
-        // Get document data and compute tokens
-        let (result, text_used) = {
-            if let Some(reason) = self.check_text_staleness(&uri, &text) {
-                self.cache.finish_request(&uri, request_id);
-                log::debug!(
-                    target: "kakehashi::semantic",
-                    "[SEMANTIC_TOKENS] CANCELLED uri={} req={} ({:?})",
-                    uri, request_id, reason
-                );
-                return Ok(None);
-            }
-
-            // Early exit check after waiting for parse completion
-            if !self.cache.is_request_active(&uri, request_id) {
-                log::debug!(
-                    target: "kakehashi::semantic",
-                    "[SEMANTIC_TOKENS] CANCELLED uri={} req={}",
-                    uri, request_id
-                );
-                return Ok(None);
-            }
-
-            // Unchanged document: tokens already cached for this exact text are
-            // still correct, so skip re-tokenizing (the expensive work). The
-            // `result_id` can't signal "unchanged" — it's a fresh global counter
-            // per response — but the content hash can. Returns the cached tokens
-            // with their original `result_id`, keeping a client's delta baseline
-            // stable across idle re-requests. Dropped wholesale on settings reload.
-            //
-            // No `.await` runs between the staleness check above and this serve, so
-            // no `didChange` can interleave — the cached tokens stay consistent with
-            // that check. (The compute path below DOES await, which is why it
-            // re-checks staleness after the block; this early return needs no such
-            // re-check.)
+        // Compute tokens against the snapshot (no live-text staleness gate:
+        // Stage 2 deliberately replaced reject-on-stale with serve-stale +
+        // refresh — the parse loop re-drives the client when a fresher
+        // snapshot lands).
+        let result = {
+            // Snapshot-identical repeat request: tokens already cached for this
+            // exact text are still correct, so skip re-tokenizing. Returns the
+            // cached tokens with their original `result_id`, keeping a client's
+            // delta baseline stable across idle re-requests.
             if let Some(cached) = self
                 .cache
                 .get_current_tokens(&uri, &language_name, cache_key)
@@ -403,10 +242,14 @@ impl Kakehashi {
                 tracker: self.bridge.node_tracker_arc(),
                 cache: self.cache.injection_token_cache_arc(),
                 generation: token_generation,
+                documents: std::sync::Arc::clone(&self.documents),
+                parsed_version: snapshot.parsed_version,
+                incarnation: snapshot.incarnation,
             });
 
             // Compute tokens, racing against cancel notification if provided
             let compute_future = handle_semantic_tokens_full(
+                &self.compute_pool,
                 text.clone(),
                 tree.clone(),
                 query,
@@ -418,7 +261,7 @@ impl Kakehashi {
                 Some(cancel_token.clone()),
             );
 
-            let result = if let Some(cancel_rx) = cancel_rx {
+            if let Some(cancel_rx) = cancel_rx {
                 // Race between computation and cancel notification
                 tokio::pin!(cancel_rx);
                 tokio::select! {
@@ -444,30 +287,21 @@ impl Kakehashi {
             } else {
                 // No cancel support - just await the computation
                 compute_future.await
-            };
-
-            (result, text)
-        }; // doc reference is dropped here
+            }
+        };
 
         // A supersede/close between compute start and here flips the token; the
-        // compute then bailed at a checkpoint and returned `None`, so drop the
-        // request rather than storing an unwanted result over the cache.
+        // compute then bailed at a checkpoint and returned `None` (a partial
+        // result), so drop the request rather than storing it over the cache.
+        // This is CPU-reclamation, not staleness-rejection: an *un*-superseded
+        // compute over a snapshot the live text has since outrun still serves
+        // (§4's narrowed CancelToken role under serve-stale).
         if cancel_token.is_cancelled() {
             self.cache.finish_request(&uri, request_id);
             log::debug!(
                 target: "kakehashi::semantic",
                 "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (compute superseded)",
                 uri, request_id
-            );
-            return Ok(None);
-        }
-
-        if let Some(reason) = self.check_text_staleness(&uri, &text_used) {
-            self.cache.finish_request(&uri, request_id);
-            log::debug!(
-                target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS] CANCELLED uri={} req={} ({:?})",
-                uri, request_id, reason
             );
             return Ok(None);
         }
@@ -565,7 +399,9 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let Some(language_name) = self.document_language(&uri) else {
+        // Serve-stale (ADR §3): resolve the latest completed snapshot up front
+        // (same rationale as semanticTokens/full).
+        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -574,6 +410,17 @@ impl Kakehashi {
                 },
             )));
         };
+        let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
+        else {
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
+                SemanticTokens {
+                    result_id: None,
+                    data: vec![],
+                },
+            )));
+        };
+        let text = std::sync::Arc::clone(&snapshot.text);
 
         // Ensure language is loaded before trying to get queries.
         // This handles the race condition where semanticTokens/full/delta arrives
@@ -609,10 +456,9 @@ impl Kakehashi {
             )));
         };
 
-        // Read the remaining settings-dependent tokenization inputs HERE — with the
-        // query above and BEFORE the get_tree_with_wait().await below — so a settings
-        // reload during that await can't split them into an inconsistent mix
-        // (same as semanticTokens/full; all consistent with `token_generation`).
+        // Read the remaining settings-dependent tokenization inputs HERE — with
+        // the query above, no `.await` in between — so a settings reload can't
+        // split them into an inconsistent mix (same as semanticTokens/full).
         let capture_mappings = self.language.capture_mappings();
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
 
@@ -626,49 +472,16 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Get tree and text, waiting for parse completion or parsing on-demand
-        let Some((tree, text)) = self.get_tree_with_wait(&uri, &language_name).await else {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
-                SemanticTokens {
-                    result_id: None,
-                    data: vec![],
-                },
-            )));
-        };
-
-        // Validity key for the snapshotted text under the generation captured at
-        // the top (before the tokenization inputs are read, as in
-        // semanticTokens/full): keys the unchanged-document reuse below and the
-        // store of freshly computed tokens.
+        // Validity key for the snapshot's text under the generation captured at
+        // the top (see semanticTokens/full for why snapshot-text keying makes
+        // serve-stale cache-safe).
         let cache_key = self.cache.cache_key_for(&text, token_generation);
 
-        // Get document data and compute tokens (same as semanticTokens/full)
-        let (result, text_used) = {
-            if let Some(reason) = self.check_text_staleness(&uri, &text) {
-                self.cache.finish_request(&uri, request_id);
-                log::debug!(
-                    target: "kakehashi::semantic",
-                    "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} ({:?})",
-                    uri, request_id, reason
-                );
-                return Ok(None);
-            }
-
-            // Early exit check after waiting for parse completion
-            if !self.cache.is_request_active(&uri, request_id) {
-                log::debug!(
-                    target: "kakehashi::semantic",
-                    "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={}",
-                    uri, request_id
-                );
-                return Ok(None);
-            }
-
-            // Unchanged document: reuse the cached full tokens instead of
-            // re-tokenizing. No `.await` runs between the staleness check above and
-            // here, so the cached tokens stay consistent with it. Cleared wholesale
-            // on a settings reload.
+        // Compute tokens against the snapshot (serve-stale; same as
+        // semanticTokens/full)
+        let result = {
+            // Snapshot-identical repeat request: reuse the cached full tokens
+            // instead of re-tokenizing.
             if let Some(cached) = self
                 .cache
                 .get_current_tokens(&uri, &language_name, cache_key)
@@ -687,7 +500,7 @@ impl Kakehashi {
                 }
                 // Baseline differs: fall through to diff the cached tokens against
                 // the client's `previous_result_id` (still skips re-tokenization).
-                (Some(SemanticTokensResult::Tokens(cached)), text)
+                Some(SemanticTokensResult::Tokens(cached))
             } else {
                 // capture_mappings and supports_multiline were read before the await
                 // above (consistent with the query and token_generation). Rayon-based
@@ -702,10 +515,14 @@ impl Kakehashi {
                     tracker: self.bridge.node_tracker_arc(),
                     cache: self.cache.injection_token_cache_arc(),
                     generation: token_generation,
+                    documents: std::sync::Arc::clone(&self.documents),
+                    parsed_version: snapshot.parsed_version,
+                    incarnation: snapshot.incarnation,
                 });
 
                 // Compute tokens, racing against cancel notification if provided
                 let compute_future = handle_semantic_tokens_full(
+                    &self.compute_pool,
                     text.clone(),
                     tree.clone(),
                     query,
@@ -717,7 +534,7 @@ impl Kakehashi {
                     Some(cancel_token.clone()),
                 );
 
-                let result = if let Some(cancel_rx) = cancel_rx {
+                if let Some(cancel_rx) = cancel_rx {
                     // Race between computation and cancel notification
                     tokio::pin!(cancel_rx);
                     tokio::select! {
@@ -744,31 +561,21 @@ impl Kakehashi {
                 } else {
                     // No cancel support - just await the computation
                     compute_future.await
-                };
-
-                (result, text)
+                }
             }
         };
 
         // A supersede/close between compute start and here flips the token; the
-        // compute then bailed at a checkpoint and returned `None`, so drop the
-        // request rather than diffing/storing an unwanted result over the cache.
+        // compute then bailed at a checkpoint and returned `None` (partial), so
+        // drop the request rather than diffing/storing it over the cache. This
+        // is CPU-reclamation, not staleness-rejection (§4's narrowed CancelToken
+        // role under serve-stale).
         if cancel_token.is_cancelled() {
             self.cache.finish_request(&uri, request_id);
             log::debug!(
                 target: "kakehashi::semantic",
                 "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (compute superseded)",
                 uri, request_id
-            );
-            return Ok(None);
-        }
-
-        if let Some(reason) = self.check_text_staleness(&uri, &text_used) {
-            self.cache.finish_request(&uri, request_id);
-            log::debug!(
-                target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} ({:?})",
-                uri, request_id, reason
             );
             return Ok(None);
         }
@@ -894,35 +701,45 @@ impl Kakehashi {
         // compute the new-generation key) — so a stale entry can never be served.
         let generation = self.cache.semantic_token_generation();
 
-        let Some(language_name) = self.document_language(&uri) else {
+        // First-parse bound (parse-snapshot ADR §3): resolve through the same
+        // bounded first-parse wait as full/delta. Without it, a range request
+        // racing didOpen answered empty tokens with nothing to re-drive the
+        // client — the parse loop's refresh heals full/delta lineages, but an
+        // empty range response has no lineage, so the viewport stayed blank
+        // until an incidental re-request. Steady state (snapshot present)
+        // resolves immediately.
+        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
             })));
         };
+        // Staleness-reject: the request's `range` is authored against the
+        // LIVE text, so a trailing (or cross-incarnation) snapshot cannot
+        // answer it — unlike full/delta (whole-document, serve-stale). A
+        // stale snapshot → ContentModified; the client's next natural request
+        // (this is a per-redraw viewport read) gets the fresh one.
+        let Some(view) = self.documents.latest_snapshot(&uri) else {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        };
+        if snapshot.incarnation != view.slot.current_incarnation
+            || snapshot.parsed_version != view.content_version
+        {
+            return Err(crate::error::content_modified_error());
+        }
+        let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
+        else {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        };
+        let text = std::sync::Arc::clone(&snapshot.text);
 
         let Some(query) = self.language.highlight_query(&language_name) else {
-            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
-        };
-
-        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
-        // reparses off-ingress, so without this the visible-range tokens go blank
-        // for the reparse window after every edit. (The full/delta paths get this
-        // via `get_tree_with_wait`; the range path reads the store directly.)
-        self.ensure_document_parsed(&uri).await;
-
-        let Some(doc) = self.documents.get(&uri) else {
-            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
-        };
-
-        let text = doc.text();
-        let Some(tree) = doc.tree() else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -934,7 +751,7 @@ impl Kakehashi {
         // and the entry also pins the viewport `range`, so a hit means re-tokenizing
         // would reproduce these exact tokens. Misses (scroll, edit, or reload) fall
         // through to the recompute below, which restores the entry.
-        let cache_key = self.cache.cache_key_for(text, generation);
+        let cache_key = self.cache.cache_key_for(&text, generation);
         if let Some(tokens) =
             self.cache
                 .get_current_range_tokens(&uri, &domain_range, &language_name, cache_key)
@@ -950,8 +767,9 @@ impl Kakehashi {
         let coordinator = std::sync::Arc::clone(&self.language);
 
         let result = handle_semantic_tokens_range_parallel_async(
-            text.to_string(),
-            tree.clone(),
+            &self.compute_pool,
+            text,
+            tree,
             query,
             domain_range,
             Some(language_name.clone()),
@@ -1065,26 +883,47 @@ mod tests {
         );
     }
 
+    /// The serve-stale model never parses on demand: a request against a
+    /// resolved-but-tree-less snapshot (what `parse_document` publishes when
+    /// no parser is available) releases the first-parse wait immediately,
+    /// serves the empty fallback, and leaves the document's tree untouched.
+    /// (Replaces the pre-snapshot `..._times_out_but_parses_on_demand` test,
+    /// whose asserted on-demand parse was removed by the reader migration.)
     #[tokio::test]
-    async fn semantic_tokens_full_times_out_but_parses_on_demand() {
+    async fn semantic_tokens_full_serves_empty_without_parsing_on_demand() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
-        let uri = Url::parse("file:///semantic_timeout.rs").expect("should construct test uri");
+        let uri = Url::parse("file:///semantic_no_inline_parse.rs").expect("valid test uri");
 
+        let text = "fn main() {}";
         server.documents.insert(
             uri.clone(),
-            "fn main() {}".to_string(),
+            text.to_string(),
             Some("rust".to_string()),
             None,
         );
-
-        let load_result = server.language.ensure_language_loaded("rust");
-        if !load_result.success || server.language.highlight_query("rust").is_none() {
-            eprintln!("Skipping: rust highlight query not available");
-            return;
-        }
-
-        server.documents.mark_parse_started(&uri);
+        let incarnation = server
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document just inserted")
+            .slot
+            .current_incarnation;
+        let published = server
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: None,
+                        language: Some("rust".to_string()),
+                        parsed_version: 0,
+                        incarnation,
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(published, "tree-less snapshot must land");
 
         let params = SemanticTokensParams {
             text_document: TextDocumentIdentifier {
@@ -1098,25 +937,24 @@ mod tests {
             Duration::from_secs(2),
             server.semantic_tokens_full_impl(params),
         )
-        .await;
+        .await
+        .expect("a present snapshot must not wait out the first-parse bound")
+        .expect("semantic tokens full should return without error");
 
-        assert!(
-            result.is_ok(),
-            "semantic tokens full should complete after waiting timeout"
-        );
-        let result = result.unwrap();
-        assert!(
-            result.is_ok(),
-            "semantic tokens full should return without error"
-        );
+        match result {
+            Some(SemanticTokensResult::Tokens(tokens)) => {
+                assert!(
+                    tokens.data.is_empty(),
+                    "tree-less snapshot serves the empty fallback"
+                );
+            }
+            other => panic!("expected empty tokens fallback, got {other:?}"),
+        }
 
-        let doc = server
-            .documents
-            .get(&uri)
-            .expect("document should exist after on-demand parse");
+        let doc = server.documents.get(&uri).expect("document still open");
         assert!(
-            doc.tree().is_some(),
-            "on-demand parse should populate a syntax tree"
+            doc.tree().is_none(),
+            "serve-stale never parses inline: the tree must stay absent"
         );
     }
 
@@ -1271,6 +1109,14 @@ mod tests {
             eprintln!("Skipping: lua language parser or highlight query not available");
             return;
         }
+
+        // Publish a parse snapshot: the handlers serve the latest snapshot and
+        // never parse on demand (parse-snapshot ADR §3), so the open parse must
+        // run before the first request — as didOpen arranges in production.
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("lua"), None)
+            .await;
 
         // First request: semanticTokens/full to get the initial result_id.
         let full_params = SemanticTokensParams {

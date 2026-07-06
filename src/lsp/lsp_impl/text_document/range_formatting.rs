@@ -46,6 +46,26 @@ impl Kakehashi {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri.clone();
         let work_done_token = params.work_done_progress_params.work_done_token.clone();
+
+        // Explicit-action bounded wait (parse-snapshot ADR §3), the same
+        // treatment — and the same placement, BEFORE the layer race — as its
+        // sibling `formatting` (the two share the "textDocument/formatting"
+        // configuration key and the spec's explicit-action class):
+        // user-triggered and infrequent, so it may briefly wait for the
+        // in-flight parse; a still-stale snapshot after the wait rejects with
+        // ContentModified — the request's range is authored against the LIVE
+        // text, so silently no-opping (or worse, formatting a trailing
+        // region) is the jarring outcome §3 forbids. Hoisted above the layer
+        // closures so it applies under every layer-order configuration.
+        // Never-parsed/gone falls through to the layers' empty fallbacks.
+        if let Ok(wait_uri) = uri_to_url(&lsp_uri)
+            && let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
+                .wait_for_current_snapshot(&wait_uri, std::time::Duration::from_millis(500))
+                .await
+        {
+            return Err(crate::error::content_modified_error());
+        }
+
         let virt = async {
             let lsp_uri = params.text_document.uri;
             let options = params.options;
@@ -57,13 +77,6 @@ impl Kakehashi {
             };
 
             log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
-
-            // Tower-LSP runs requests concurrently, and `didChange` now reparses
-            // off-ingress, so a rangeFormatting call can arrive before a tree
-            // exists. Wait for the reparse (and parse on demand if needed) before
-            // snapshotting — the shared post-edit freshness helper — so an
-            // otherwise-valid request doesn't degrade to `Ok(None)` on a parse race.
-            self.ensure_document_parsed(&uri).await;
 
             let snapshot = match self.documents.get(&uri) {
                 None => {

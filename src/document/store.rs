@@ -181,29 +181,6 @@ impl DocumentStore {
         sender.send_replace(state);
     }
 
-    pub async fn wait_for_parse_completion(&self, uri: &Url, timeout: std::time::Duration) {
-        let mut receiver = self.parse_sender(uri).subscribe();
-
-        let wait_future = async {
-            loop {
-                let state = *receiver.borrow();
-
-                // Already have a tree - done waiting
-                if state.has_tree {
-                    return;
-                }
-
-                // No tree yet - wait for state change
-                // (either parse starts, or parse finishes with a tree)
-                if receiver.changed().await.is_err() {
-                    return; // Channel closed
-                }
-            }
-        };
-
-        let _ = tokio::time::timeout(timeout, wait_future).await;
-    }
-
     // Lock safety: Single insert() call - no read lock held before or during write
     pub fn insert(&self, uri: Url, text: String, language_id: Option<String>, tree: Option<Tree>) {
         let has_tree = tree.is_some();
@@ -235,6 +212,10 @@ impl DocumentStore {
 
     // Lock safety: Uses entry() API for atomic check-and-update/insert operations,
     // eliminating race conditions between get_mut and insert.
+    /// Test-only since the snapshot conversion removed the last production
+    /// caller (the semantic-tokens on-demand parse fallback); handler tests
+    /// still use it as an edit fixture.
+    #[cfg(test)]
     pub fn update_document(&self, uri: Url, text: String, new_tree: Option<Tree>) {
         // Use entry API for atomic operations to prevent race conditions
         // between checking if document exists and inserting/updating.
@@ -292,7 +273,7 @@ impl DocumentStore {
         self.update_tree_availability(&uri, has_tree);
         // Keep the "live document ⟺ watermark entry" invariant: `update_document`
         // can insert on its `Vacant` branch, and a present document with no
-        // watermark entry would make `wait_for_epoch` treat it as unregistered.
+        // watermark entry would break the live-document ⟺ watermark invariant.
         // Idempotent on the (common) update-in-place path (same incarnation).
         self.ensure_watermark_entry(&uri, incarnation);
     }
@@ -357,6 +338,10 @@ impl DocumentStore {
     /// than associated with the newer text. The availability update is likewise
     /// non-inserting (see `mark_tree_available_if_tracked`), so the parse-state
     /// isn't resurrected either.
+    /// Test-only since the snapshot conversion removed the last production
+    /// caller (the node handlers' on-demand parse); store tests still exercise
+    /// the CAS semantics its non-test siblings share.
+    #[cfg(test)]
     pub(crate) fn update_tree_if_text_unchanged(
         &self,
         uri: &Url,
@@ -682,54 +667,25 @@ impl DocumentStore {
         });
     }
 
-    /// Wait until the parse watermark for `uri` reaches `target` — the tail
-    /// ingress ticket a virt/native reader must observe — bounded by `timeout`.
-    ///
-    /// Returns early (proceed into the empty/`null` reader fallback) when the
-    /// watermark already covers `target`, when there is no watermark entry — the
-    /// document is not registered (never opened, or a `didClose` removed it), as
-    /// `insert` seeds the entry at 0 for every live document, so there is nothing
-    /// to wait for — or when the entry is dropped while waiting (a concurrent
-    /// `didClose`). Non-inserting on the missing-entry path so it never resurrects
-    /// a watermark for a closed URI.
-    pub(crate) async fn wait_for_epoch(
-        &self,
-        uri: &Url,
-        target: u64,
-        timeout: std::time::Duration,
-    ) {
-        // Subscribe under the shard read lock, then drop the `Ref` *before*
-        // awaiting — never hold a DashMap guard across `.await`.
-        let mut receiver = {
-            let Some(sender) = self.watermarks.get(uri) else {
-                return;
-            };
-            sender.subscribe()
-        };
-
-        let wait_future = async {
-            // Err => the sender was dropped (entry removed after a close): every
-            // parse that will ever run for this lifetime has, so proceed. A reader
-            // waits on its own lifetime's channel ticket; a reopen replaces the
-            // channel (dropping this sender → Err → fallback), so the target (an
-            // intra-lifetime ticket) is only ever compared within one lifetime.
-            let _ = receiver
-                .wait_for(|watermark| watermark.ticket >= target)
-                .await;
-        };
-
-        let _ = tokio::time::timeout(timeout, wait_future).await;
-    }
-
     // Lock safety: Single remove() call - no read lock held before or during write
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
         self.edit_locks.remove(uri);
         // Dropping the watermark sender wakes any reader still blocked on
-        // `wait_for_epoch` for this document, so a reader racing the close
+        // the watermark for this document, so a reader racing the close
         // proceeds into the empty fallback instead of stalling to the timeout.
         self.watermarks.remove(uri);
-        self.documents.remove(uri).map(|(_, doc)| doc)
+        let removed = self.documents.remove(uri).map(|(_, doc)| doc);
+        // Publish the terminal slot AFTER the entry is gone (parse-snapshot ADR
+        // §2): wakes first-parse waiters parked on the removed document's
+        // channel — stale parse-task `Sender` clones can keep it alive past
+        // this drop — and its reserved incarnation rejects any later stale
+        // publish that would otherwise pass the bootstrap branch and resurrect
+        // the closed document for those waiters.
+        if let Some(doc) = &removed {
+            doc.publish_closed();
+        }
+        removed
     }
 
     /// Draw the next process-wide-unique **open incarnation** (see
@@ -737,20 +693,228 @@ impl DocumentStore {
     /// — including a close-then-reopen of the same URI — always get distinct
     /// values, which is what lets a consumer detect a reopen by comparing a
     /// captured incarnation against the document's current one. Starts at 1, so
-    /// `0` is reserved for a document built outside any store.
+    /// `0` is reserved for a document built outside any store, and
+    /// [`CLOSED_INCARNATION`](super::snapshot::CLOSED_INCARNATION) (`u64::MAX`,
+    /// the closed-slot sentinel) is reserved and never drawn — the redraw loop
+    /// guards the (practically unreachable) wrap-around.
     pub(crate) fn next_incarnation(&self) -> u64 {
-        self.open_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        loop {
+            let drawn = self
+                .open_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if drawn != 0 && drawn != super::snapshot::CLOSED_INCARNATION {
+                return drawn;
+            }
+        }
     }
+
+    /// Resolve the current per-URI cell and read its latest snapshot slot,
+    /// wait-free, in a **single** `DashMap` lookup (parse-snapshot ADR §2's
+    /// isolation rule: per-request re-resolution + incarnation validation, not
+    /// cell identity). A snapshot from a prior lifetime — a wait-free borrow
+    /// racing close+reopen — is discarded here, so a cross-lifetime snapshot
+    /// degrades to the empty/`null` path rather than being served. `None` for
+    /// an unregistered/closed URI.
+    pub(crate) fn latest_snapshot(&self, uri: &Url) -> Option<SnapshotView> {
+        let doc = self.documents.get(uri)?;
+        let live_incarnation = doc.incarnation();
+        let mut slot = doc.latest_snapshot_slot();
+        if slot
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.incarnation != live_incarnation)
+        {
+            slot.snapshot = None;
+        }
+        Some(SnapshotView {
+            slot,
+            content_version: doc.content_version(),
+        })
+    }
+
+    /// Release parked first-parse waiters when a parse pass gives up without
+    /// producing anything to publish — auto-install failed, the parser is
+    /// still missing after an install, or the edit path detected no
+    /// language. Publishes a resolved-but-tree-less snapshot at the CURRENT
+    /// (text, version), which advances the lifetime out of bootstrap so the
+    /// generous first-parse backstop is bounded by the give-up instead of
+    /// burning in full on every request. Gated on the lifetime still being
+    /// at bootstrap: once any snapshot exists no first-parse waiter is
+    /// parked, and a tree-less publish would only downgrade serve-stale
+    /// answers. A later successful parse of the SAME version is re-admitted
+    /// by the cell's tree-upgrade clause (see [`SnapshotSlot::admits`]).
+    pub(crate) fn publish_giveup_snapshot(&self, uri: &Url) {
+        let Some(doc) = self.documents.get(uri) else {
+            return;
+        };
+        if doc.latest_snapshot_slot().snapshot.is_some() {
+            return;
+        }
+        let snapshot = super::snapshot::ParseSnapshot {
+            text: doc.text_arc(),
+            tree: None,
+            language: doc.language_id().map(|s| s.to_string()),
+            parsed_version: doc.content_version(),
+            incarnation: doc.incarnation(),
+        };
+        doc.publish_snapshot(Arc::new(snapshot));
+    }
+
+    /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the
+    /// first-parse and explicit-action waits, the only two the parse-snapshot
+    /// model permits). `None` for an unregistered/closed URI. The `Ref` is
+    /// dropped before the caller awaits.
+    pub(crate) fn subscribe_snapshots(
+        &self,
+        uri: &Url,
+    ) -> Option<tokio::sync::watch::Receiver<super::snapshot::SnapshotSlot>> {
+        Some(self.documents.get(uri)?.subscribe_snapshots())
+    }
+}
+
+/// One consistent read of a document's inputs + latest snapshot, resolved by
+/// [`DocumentStore::latest_snapshot`]: the live input version is captured under
+/// the same shard read lock as the slot borrow, so a reader can classify
+/// staleness (`snapshot.parsed_version < content_version`) without further
+/// lookups; the slot's snapshot is already validated against the live
+/// incarnation.
+pub(crate) struct SnapshotView {
+    pub(crate) slot: super::snapshot::SnapshotSlot,
+    pub(crate) content_version: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod snapshot_cell {
+        use super::super::*;
+        use crate::document::snapshot::{CLOSED_INCARNATION, ParseSnapshot};
+        use std::sync::Arc;
+
+        fn snap_for(store: &DocumentStore, uri: &Url, parsed_version: u64) -> ParseSnapshot {
+            let doc = store.get(uri).expect("registered");
+            ParseSnapshot {
+                text: doc.text_arc(),
+                tree: None,
+                language: Some("rust".to_string()),
+                parsed_version,
+                incarnation: doc.incarnation(),
+            }
+        }
+
+        fn publish(store: &DocumentStore, uri: &Url, snapshot: ParseSnapshot) -> bool {
+            store
+                .get(uri)
+                .map(|doc| doc.publish_snapshot(Arc::new(snapshot)))
+                .unwrap_or(false)
+        }
+
+        /// A give-up publish releases parked first-parse waiters at
+        /// bootstrap (tree-less, current version) but is a strict no-op once
+        /// any snapshot exists — it must never downgrade one.
+        #[test]
+        fn giveup_publish_fills_bootstrap_only() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///giveup.rs").unwrap();
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+
+            store.publish_giveup_snapshot(&uri);
+            let view = store.latest_snapshot(&uri).unwrap();
+            let snapshot = view.slot.snapshot.expect("give-up publishes at bootstrap");
+            assert!(snapshot.tree.is_none());
+            assert_eq!(snapshot.parsed_version, view.content_version);
+
+            // A newer input version does NOT re-open the give-up: a snapshot
+            // exists, so no first-parse waiter is parked.
+            store.update_document(uri.clone(), "ab".into(), None);
+            store.publish_giveup_snapshot(&uri);
+            let view = store.latest_snapshot(&uri).unwrap();
+            assert_eq!(
+                view.slot.snapshot.unwrap().parsed_version,
+                0,
+                "give-up is a no-op once any snapshot exists"
+            );
+        }
+
+        /// A reopen constructs a fresh cell at `snapshot: None`, which clears
+        /// the prior lifetime's version floor: the first post-reopen publish
+        /// (version 0) must land even though the prior lifetime reached 5.
+        #[test]
+        fn reopen_resets_the_version_floor() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///floor.rs").unwrap();
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            assert!(publish(&store, &uri, snap_for(&store, &uri, 5)));
+
+            let stale = snap_for(&store, &uri, 6); // prior-lifetime straggler
+            store.remove(&uri);
+            store.insert(uri.clone(), "b".into(), Some("rust".into()), None);
+
+            assert!(
+                !publish(&store, &uri, stale),
+                "a prior-lifetime publish must fail the incarnation clause"
+            );
+            assert!(
+                publish(&store, &uri, snap_for(&store, &uri, 0)),
+                "the new lifetime's bootstrap publish must land at version 0"
+            );
+        }
+
+        /// `remove` installs the closed sentinel on the detached cell: a
+        /// parked first-parse waiter wakes and unambiguously observes the
+        /// closed state instead of stalling or being resurrected.
+        #[tokio::test]
+        async fn remove_wakes_waiters_with_the_closed_sentinel() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///close.rs").unwrap();
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+
+            let mut receiver = store.subscribe_snapshots(&uri).expect("live");
+            store.remove(&uri);
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.changed())
+                .await
+                .expect("close must wake the waiter")
+                .expect("sender alive via the removed document");
+            let slot = receiver.borrow().clone();
+            assert_eq!(slot.current_incarnation, CLOSED_INCARNATION);
+            assert!(slot.snapshot.is_none());
+        }
+
+        /// The single-lookup read validates the snapshot against the live
+        /// incarnation: after close+reopen, a reader must not be handed the
+        /// prior lifetime's snapshot.
+        #[test]
+        fn latest_snapshot_discards_cross_lifetime_leftovers() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///xlife.rs").unwrap();
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            assert!(publish(&store, &uri, snap_for(&store, &uri, 0)));
+            assert!(
+                store
+                    .latest_snapshot(&uri)
+                    .expect("registered")
+                    .slot
+                    .snapshot
+                    .is_some()
+            );
+
+            store.remove(&uri);
+            assert!(store.latest_snapshot(&uri).is_none(), "closed → None");
+
+            store.insert(uri.clone(), "b".into(), Some("rust".into()), None);
+            let view = store.latest_snapshot(&uri).expect("reopened");
+            assert!(
+                view.slot.snapshot.is_none(),
+                "the reopened lifetime has no snapshot yet"
+            );
+            assert_eq!(view.content_version, 0);
+        }
+    }
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use tokio::time::timeout;
 
     #[test]
     fn insert_stamps_a_fresh_nonzero_incarnation() {
@@ -1411,115 +1575,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn wait_for_epoch_returns_immediately_when_already_reached() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///wm.rs").unwrap();
-        seed_document(&store, &uri);
-        store.advance_watermark(&uri, 5);
-
-        // target below the watermark resolves without blocking.
-        timeout(
-            Duration::from_millis(100),
-            store.wait_for_epoch(&uri, 3, Duration::from_secs(10)),
-        )
-        .await
-        .expect("a watermark already past the target must not block");
-    }
-
-    #[tokio::test]
-    async fn wait_for_epoch_returns_immediately_when_no_entry() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///absent.rs").unwrap();
-        // No publish has happened: nothing is pending, so the reader proceeds.
-        timeout(
-            Duration::from_millis(100),
-            store.wait_for_epoch(&uri, 1, Duration::from_secs(10)),
-        )
-        .await
-        .expect("a missing watermark entry means nothing to wait for");
-    }
-
-    #[tokio::test]
-    async fn wait_for_epoch_blocks_until_watermark_reaches_target() {
-        let store = Arc::new(DocumentStore::new());
-        let uri = Url::parse("file:///wm.rs").unwrap();
-        // Entry seeded at 0, advanced to ticket 1, below the reader's target of 3.
-        seed_document(&store, &uri);
-        store.advance_watermark(&uri, 1);
-
-        let waiter = {
-            let store = Arc::clone(&store);
-            let uri = uri.clone();
-            tokio::spawn(async move {
-                store.wait_for_epoch(&uri, 3, Duration::from_secs(10)).await;
-            })
-        };
-
-        // The intermediate ticket 2 must not release a reader waiting for 3.
-        store.advance_watermark(&uri, 2);
-        // Let the spawned waiter run to its park point (deterministic on the
-        // current-thread test runtime — no wall-clock dependency).
-        tokio::task::yield_now().await;
-        assert!(
-            !waiter.is_finished(),
-            "reader must keep waiting until the watermark covers its target ticket"
-        );
-
-        store.advance_watermark(&uri, 3);
-        timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("reaching the target must wake the reader")
-            .expect("waiter task panicked");
-    }
-
-    #[tokio::test]
-    async fn wait_for_epoch_proceeds_when_entry_removed_mid_wait() {
-        let store = Arc::new(DocumentStore::new());
-        let uri = Url::parse("file:///wm.rs").unwrap();
-        seed_document(&store, &uri);
-        store.advance_watermark(&uri, 1);
-
-        let waiter = {
-            let store = Arc::clone(&store);
-            let uri = uri.clone();
-            tokio::spawn(async move {
-                store.wait_for_epoch(&uri, 9, Duration::from_secs(10)).await;
-            })
-        };
-
-        tokio::task::yield_now().await;
-        assert!(
-            !waiter.is_finished(),
-            "reader is waiting for an unreached target"
-        );
-
-        // A didClose drops the watermark entry: the blocked reader must proceed
-        // (into the empty fallback) rather than stall to the timeout.
-        store.remove(&uri);
-        timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("dropping the watermark sender must wake the reader")
-            .expect("waiter task panicked");
-    }
-
-    #[tokio::test]
-    async fn wait_for_epoch_times_out_when_target_unreached() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///wm.rs").unwrap();
-        seed_document(&store, &uri);
-        store.advance_watermark(&uri, 1);
-
-        // The watermark never reaches 9; the bounded wait returns after the
-        // timeout rather than hanging.
-        timeout(
-            Duration::from_secs(5),
-            store.wait_for_epoch(&uri, 9, Duration::from_millis(80)),
-        )
-        .await
-        .expect("wait_for_epoch must return after its own timeout even if unreached");
-    }
-
     #[test]
     fn test_concurrent_update_and_get_no_deadlock() {
         // This test verifies that concurrent update_document and get operations
@@ -1721,54 +1776,5 @@ mod tests {
         let doc = store.get(&uri).unwrap();
         assert_eq!(doc.text(), new_text);
         assert!(doc.tree().is_some());
-    }
-
-    #[tokio::test]
-    async fn wait_for_parse_completion_blocks_until_finished() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///parse-wait.lua").unwrap();
-
-        let generation = store.mark_parse_started(&uri);
-        let wait_future = store.wait_for_parse_completion(&uri, Duration::from_secs(1));
-        let mut wait_future = Box::pin(wait_future);
-
-        assert!(
-            timeout(Duration::from_millis(10), &mut wait_future)
-                .await
-                .is_err(),
-            "wait should block while parse is in progress"
-        );
-
-        store.mark_parse_finished(&uri, generation, true);
-
-        assert!(
-            timeout(Duration::from_millis(200), wait_future)
-                .await
-                .is_ok(),
-            "wait should complete after parse finishes"
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_for_parse_completion_returns_when_tree_available() {
-        let store = DocumentStore::new();
-        let uri = Url::parse("file:///parse-ready.rs").unwrap();
-
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let text = "fn main() {}".to_string();
-        let tree = parser.parse(&text, None).unwrap();
-
-        store.insert(uri.clone(), text, Some("rust".to_string()), Some(tree));
-
-        let wait_future = store.wait_for_parse_completion(&uri, Duration::from_secs(1));
-        assert!(
-            timeout(Duration::from_millis(10), wait_future)
-                .await
-                .is_ok(),
-            "wait should return immediately when a tree is already available"
-        );
     }
 }

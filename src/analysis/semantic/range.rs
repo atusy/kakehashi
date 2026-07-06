@@ -15,12 +15,13 @@ use tree_sitter::{Query, Tree};
 
 use super::handle_semantic_tokens_full;
 
-/// Async variant of `handle_semantic_tokens_range`: runs the Rayon work via
-/// `spawn_blocking` so the CPU-bound path doesn't block the runtime. `text`
+/// Async variant of `handle_semantic_tokens_range`: runs the CPU-bound path as
+/// a bounded compute-pool work-unit so it doesn't block the runtime. `text`
 /// and `tree` are moved in; `None` on cancellation/failure.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_range_parallel_async(
-    text: String,
+    pool: &crate::compute_pool::ComputePool,
+    text: std::sync::Arc<str>,
     tree: Tree,
     query: std::sync::Arc<Query>,
     range: Range,
@@ -33,6 +34,7 @@ pub(crate) async fn handle_semantic_tokens_range_parallel_async(
     // populate the injection-token cache (v1 targets the full/delta typing path),
     // so no cache handle is threaded in.
     let full_result = handle_semantic_tokens_full(
+        pool,
         text,
         tree,
         query,
