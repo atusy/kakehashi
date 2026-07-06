@@ -525,6 +525,24 @@ mod tests {
             assert_resolves(&m, text, "x", 2, 0); // make(x) -> field
             assert_resolves(&m, text, "x", 3, 1); // use(x)  -> binder
         }
+
+        #[test]
+        fn a_field_and_a_method_may_share_a_name() {
+            // Java has separate variable and method namespaces: a bare read
+            // resolves to the field, a call to the method — they never merge.
+            let text = "class K { int run; void run() {} void m() { int y = run; run(); } }";
+            let m = model_for("java", text);
+            assert_resolves(&m, text, "run", 2, 0); // `= run` -> field
+            assert_resolves(&m, text, "run", 3, 1); // `run()` -> method
+        }
+
+        #[test]
+        fn class_generic_covers_the_base_clause() {
+            let text = "class C<T> extends Base<T> { T field; }\n";
+            let m = model_for("java", text);
+            assert_resolves(&m, text, "T", 1, 0); // extends Base<T>
+            assert_resolves(&m, text, "T", 2, 0); // T field
+        }
     }
 
     mod c_sharp_fixtures {
@@ -605,11 +623,20 @@ mod tests {
         #[test]
         fn foreach_binder_reads_the_outer_in_its_iterable() {
             // `Make(x)` (the iterable) is evaluated before the binding, so its
-            // x is the outer local; the body x is the binder.
-            let text = "class K { void M() { int x = 0; foreach (var x in Make(x)) { Use(x); } } }";
+            // x is the outer field; the body x is the binder. (A field, not a
+            // local — C# rejects a foreach var shadowing an enclosing local.)
+            let text = "class K { int x; void M() { foreach (var x in Make(x)) { Use(x); } } }";
             let m = model_for("c_sharp", text);
-            assert_resolves(&m, text, "x", 2, 0); // Make(x) -> outer
+            assert_resolves(&m, text, "x", 2, 0); // Make(x) -> field
             assert_resolves(&m, text, "x", 3, 1); // Use(x)  -> binder
+        }
+
+        #[test]
+        fn local_functions_are_visible_before_their_declaration() {
+            // C# local functions may be called before they are defined.
+            let text = "class K { void M() { F(); void F() {} } }";
+            let m = model_for("c_sharp", text);
+            assert_resolves(&m, text, "F", 0, 1);
         }
     }
 
@@ -1222,6 +1249,16 @@ mod tests {
                 "obj.size is member access, not the global"
             );
         }
+
+        #[test]
+        fn for_binder_reads_the_outer_in_its_iterable() {
+            // `make(x)` (the iterable) is evaluated before the binding, so its
+            // x is the outer binding; the body x is the loop binder.
+            let text = "x = arr\nfor x in make(x)\n    x\nend\n";
+            let m = model_for("julia", text);
+            assert_resolves(&m, text, "x", 2, 0); // make(x) -> outer
+            assert_resolves(&m, text, "x", 3, 1); // body    -> binder
+        }
     }
 
     mod dockerfile_fixtures {
@@ -1659,6 +1696,15 @@ mod tests {
             // the outer local.
             assert_resolves(&m, text, "total", 2, 1);
             assert_resolves(&m, text, "total", 3, 0);
+        }
+
+        #[test]
+        fn a_later_declarator_sees_an_earlier_one_in_the_same_statement() {
+            // `int a = 1, b = a;` — the second declarator's initializer reads
+            // the first declarator, so visibility anchors per declarator.
+            let text = "void f(void) { int a = 1, b = a; }";
+            let m = model_for("c", text);
+            assert_resolves(&m, text, "a", 1, 0);
         }
 
         #[test]

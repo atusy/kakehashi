@@ -35,13 +35,13 @@
 ((template_declaration
    parameters: (template_parameter_list
      (type_parameter_declaration (type_identifier) @definition.type))
-   (class_specifier body: (field_declaration_list) @scope.body))
+   (class_specifier) @scope.body)
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((template_declaration
    parameters: (template_parameter_list
      (type_parameter_declaration (type_identifier) @definition.type))
-   (struct_specifier body: (field_declaration_list) @scope.body))
+   (struct_specifier) @scope.body)
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 

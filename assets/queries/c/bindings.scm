@@ -51,6 +51,9 @@
         ]))))
 
 ; ── Variables: visible after their declaration ───────────────────────────
+; Anchor `after` to each declarator, not the whole statement, so
+; `int a = 1, b = a;` sees the first declarator from the second's
+; initializer (and `int a = a;` still reads outward).
 ((declaration
    declarator: [
      (identifier) @definition
@@ -62,7 +65,7 @@
          (pointer_declarator declarator: (identifier) @definition)
          (array_declarator declarator: (identifier) @definition)
        ])
-   ]) @_decl
+   ] @_decl)
  (#set! definition.visibility "after"))
 
 ; ── Types ────────────────────────────────────────────────────────────────

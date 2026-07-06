@@ -28,19 +28,18 @@
 ((enum_declaration name: (identifier) @definition.type)
  (#set! definition.namespace "type"))
 
-; Class/interface-level generics bind into the body by label (the
-; parameter list precedes the body node); method-level generics land in
-; the method scope by containment. A generic used in the `extends`/base
-; clause (which sits outside the body node) stays unresolved — silence, an
-; accepted under-resolution rather than a wrong answer.
+; Class/interface-level generics bind by labelling the whole declaration
+; as the target scope, so the parameter covers the `extends`/`implements`
+; base clause (which precedes the body) as well as the body itself;
+; method-level generics land in the method scope by containment.
 ((class_declaration
-   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type))
-   body: (class_body) @scope.body)
+   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type)))
+   @scope.body
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((interface_declaration
-   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type))
-   body: (interface_body) @scope.body)
+   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type)))
+   @scope.body
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((method_declaration
@@ -48,15 +47,21 @@
  (#set! definition.namespace "type"))
 
 ; ── Members: methods and fields hoist within the class body ─────────────
-; A method's name belongs to the class body, not to the method's own scope.
+; A method's name belongs to the class body, not to the method's own
+; scope. Methods live in the `method` namespace, distinct from fields and
+; variables (Java lets a field and a method share a name).
 ((method_declaration name: (identifier) @definition.method)
- (#set! definition.scope "parent"))
+ (#set! definition.scope "parent")
+ (#set! definition.namespace "method"))
 (field_declaration
   declarator: (variable_declarator name: (identifier) @definition.field))
 
 ; ── Locals: sequential ───────────────────────────────────────────────────
+; Anchor `after` to the individual declarator, not the whole statement, so
+; `int a = 1, b = a;` sees the first declarator from the second's
+; initializer (and a self-initializer `int a = a;` still reads outward).
 ((local_variable_declaration
-   declarator: (variable_declarator name: (identifier) @definition)) @_decl
+   declarator: (variable_declarator name: (identifier) @definition) @_decl)
  (#set! definition.visibility "after"))
 
 ; ── Parameters ───────────────────────────────────────────────────────────
@@ -80,9 +85,10 @@
  (#not-has-parent? @reference "field_access" "method_invocation" "scoped_identifier"))
 (field_access object: (identifier) @reference)
 (method_invocation object: (identifier) @reference)
-; A bare call (no object) resolves to a method in scope.
-(method_invocation
+; A bare call (no object) resolves to a method in scope (method namespace).
+((method_invocation
   !object
   name: (identifier) @reference)
+ (#set! reference.namespace "method"))
 ((type_identifier) @reference
  (#set! reference.namespace "type"))

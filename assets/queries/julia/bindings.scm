@@ -81,8 +81,12 @@
  (#set! definition.scope "nearest:hard"))
 ((assignment . (open_tuple (identifier) @definition))
  (#set! definition.scope "nearest:hard"))
-(for_binding . (identifier) @definition)
-(for_binding . (tuple_expression (identifier) @definition))
+; The for binder is visible after the whole `x in make(x)` binding, so the
+; iterable's own references read outward, not the new binder.
+((for_binding . (identifier) @definition) @_it
+ (#set! definition.visibility "after"))
+((for_binding . (tuple_expression (identifier) @definition)) @_it
+ (#set! definition.visibility "after"))
 (let_binding . (identifier) @definition)
 
 ; ── References ───────────────────────────────────────────────────────────

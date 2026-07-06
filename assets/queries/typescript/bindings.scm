@@ -45,13 +45,13 @@
    type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
  (#set! definition.namespace "type"))
 ((class_declaration
-   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type))
-   body: (class_body) @scope.body)
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
+   @scope.body
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((interface_declaration
-   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type))
-   body: (interface_body) @scope.body)
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
+   @scope.body
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 

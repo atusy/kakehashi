@@ -27,33 +27,37 @@
 (delegate_declaration name: (identifier) @definition.type)
 
 ; A method's name belongs to the declaration list, not its own scope; a
-; local function's name likewise belongs to the enclosing block.
+; local function's name likewise belongs to the enclosing block and is
+; visible across it (C# local functions may be called before their
+; declaration), so it keeps whole-scope visibility.
 ((method_declaration name: (identifier) @definition.method)
  (#set! definition.scope "parent"))
 ((local_function_statement name: (identifier) @definition.function)
- (#set! definition.scope "parent")
- (#set! definition.visibility "declaration"))
+ (#set! definition.scope "parent"))
 
 (field_declaration
   (variable_declaration (variable_declarator name: (identifier) @definition.field)))
 (property_declaration name: (identifier) @definition.field)
 
-; Class-level generics bind into the body by label (the parameter list
-; precedes the body node); method generics land in the method scope.
+; Class-level generics bind by labelling the whole declaration, so the
+; parameter covers the base list (`: Base<T>`) as well as the body; method
+; generics land in the method scope by containment.
 ((class_declaration
-   (type_parameter_list (type_parameter name: (identifier) @definition.type))
-   body: (declaration_list) @scope.body)
+   (type_parameter_list (type_parameter name: (identifier) @definition.type)))
+   @scope.body
  (#set! definition.scope "body"))
 ((interface_declaration
-   (type_parameter_list (type_parameter name: (identifier) @definition.type))
-   body: (declaration_list) @scope.body)
+   (type_parameter_list (type_parameter name: (identifier) @definition.type)))
+   @scope.body
  (#set! definition.scope "body"))
 (method_declaration
   (type_parameter_list (type_parameter name: (identifier) @definition.type)))
 
 ; ── Locals: sequential ───────────────────────────────────────────────────
+; Anchor `after` to the declarator, not the whole statement, so
+; `int a = 1, b = a;` sees the first declarator from the second.
 ((local_declaration_statement
-   (variable_declaration (variable_declarator name: (identifier) @definition))) @_decl
+   (variable_declaration (variable_declarator name: (identifier) @definition) @_decl))
  (#set! definition.visibility "after"))
 ; `for (int i = 0; …)` — the initializer holds a bare variable_declaration
 ; (no local_declaration_statement wrapper); i is scoped to the for.
