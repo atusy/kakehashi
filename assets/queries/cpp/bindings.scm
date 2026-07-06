@@ -2,11 +2,12 @@
 ; Lexical name bindings for C++ (lexical-name-resolution ADR).
 ;
 ; On top of the C rules: classes and aliases define type names, template
-; type parameters bind into the templated function via scope-label
-; targeting (a class template's parameters stay silent — class
-; declarations carry no scope, mirroring the TypeScript posture), lambdas
-; and range-for open scopes. Qualified names (ns::x, Box::area) and
-; member accesses are never captured — silence over a wrong answer.
+; type parameters bind via scope-label targeting into the body they
+; precede — the templated function, the class body, or the struct body
+; (the parameter list sits outside every one of those nodes, so
+; containment alone can never confine it), lambdas and range-for open
+; scopes. Qualified names (ns::x, Box::area) and member accesses are
+; never captured — silence over a wrong answer.
 
 ; ── Scopes ──────────────────────────────────────────────────────────────
 (lambda_expression) @scope
