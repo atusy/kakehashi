@@ -228,15 +228,22 @@ re-requests after `didChange`, when every bridged set is necessarily stale)
 and flip them back when the servers catch up: a per-edit color oscillation
 across the whole document, precisely the stale handling editors themselves
 avoid by shifting tokens locally. Instead the merge is **stale-tolerant**: the
-edit deltas between the set's version and the current snapshot — already
-tracked to sync virtual documents on host change (virtual-document-model) —
-are replayed over the token positions, shifting each token to its post-edit
-location. A token overlapping an edited range cannot be shifted soundly and is
-dropped, falling through to the next layer for that region only. The shifted
-set participates in the sweep until a fresh set arrives and fires another
-refresh. When the edit trail is unavailable — full-text-only sync, a version
-gap after reopen — the set is excluded as the conservative fallback, so
-unshifted stale coordinates never reach the sweep. Native is recomputed
+edit deltas between the set's version and the current snapshot are replayed
+over the token positions, shifting each token to its post-edit location. The
+trail those deltas come from is **new bookkeeping this decision requires**:
+today nothing retains per-version edits — both bridge sync paths send full
+text (virt `did_change.rs`, host `host.rs`), and the incremental `InputEdit`s
+from the client are applied to the tree seed and discarded
+(`src/document/model.rs`) — so the implementation must retain the client's
+incremental `contentChanges` keyed by host version, bounded to the window
+between the oldest in-flight bridged request and now. This cost is carried
+under Consequences, not hidden. A token overlapping an edited range cannot be
+shifted soundly and is dropped, falling through to the next layer for that
+region only. The shifted set participates in the sweep until a fresh set
+arrives and fires another refresh. When the trail cannot cover the gap — the
+client itself syncs full-text only, the retained window was exceeded, a
+version gap after reopen — the set is excluded as the conservative fallback,
+so unshifted stale coordinates never reach the sweep. Native is recomputed
 synchronously per request and is always current by construction.
 
 This temporal ordering — native now, refined later — is precisely what
@@ -416,7 +423,9 @@ Resolving the open cost cross-layer-aggregation flagged ("a stage-2-only
 - **Stable colors while typing.** The stale-tolerant version contract (§2)
   keeps bridged tokens on screen across edits by shifting them, instead of
   reverting the document to native colors on every keystroke and flipping back
-  after each bridged response.
+  after each bridged response. Contingent on the edit-delta trail §2 requires:
+  clients syncing full-text only fall back to exclusion and keep the
+  oscillation.
 - **The legend ceiling is user-liftable.** `semanticTokens.extraLegend` plus
   the connect-time warning turn dropped custom types from a silent hard bound
   into a discoverable, opt-in extension — without fuzzy matching or protocol
@@ -424,8 +433,11 @@ Resolving the open cost cross-layer-aggregation flagged ("a stage-2-only
 - **Thin new surface.** The genuinely new code is the level-2 sweep (a
   re-parameterization of the existing one), the pre-level-2 virt collapse
   (another application of the same deepest-first sweep, over per-injection virt
-  streams), and the legend re-encode table. Native's intra-layer finalize,
-  coordinate remap, and layer-priority resolution are all reused.
+  streams), the legend re-encode table, and the version-keyed edit-delta trail
+  §2's stale shift requires (a bounded per-document log of incremental
+  `contentChanges` plus the replay over token positions — the one piece with
+  no existing counterpart). Native's intra-layer finalize, coordinate remap,
+  and layer-priority resolution are all reused.
 - **Stage 1 and `AggregationStrategy` untouched.** Keeping `merged` off the
   enum means no typo-surface or namespace growth for the 30+ other methods.
 - **Allowlist suppression for free.** `["native"]` (today's behavior) and
