@@ -5,10 +5,15 @@
 //!
 //! ## Module Structure
 //!
+//! - `client_capabilities` - Baseline client capabilities advertised downstream
+//! - `jsonrpc` - JSON-RPC message types and error inspection
+//! - `lifecycle` - Initialize/shutdown message builders
 //! - `request_id` - RequestId type for type-safe request ID handling
 //! - `virtual_uri` - VirtualDocumentUri type for encoding injection region references
 //! - `request` - Request builders for downstream language servers
 //! - `response` - Response transformers for coordinate translation
+//! - `translation` - Position/range translation between host and virtual coordinates
+//! - `workspace_edit` - WorkspaceEdit virtual→host transformation
 
 mod client_capabilities;
 mod jsonrpc;
