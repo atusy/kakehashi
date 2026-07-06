@@ -132,7 +132,9 @@ fn transform_workspace_edit_response_to_host(
     // Parse into typed WorkspaceEdit
     let mut edit: WorkspaceEdit = serde_json::from_value(result).ok()?;
 
-    transform_workspace_edit_to_host(&mut edit, request_virtual_uri, host_uri, offset);
+    if !transform_workspace_edit_to_host(&mut edit, request_virtual_uri, host_uri, offset) {
+        return None;
+    }
 
     Some(edit)
 }

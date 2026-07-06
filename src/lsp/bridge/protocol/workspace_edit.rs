@@ -19,14 +19,29 @@ use super::virtual_uri::VirtualDocumentUri;
 ///
 /// For text edits: real-file URIs pass through, the request's own virtual URI
 /// is re-keyed to the host URI (ranges translated, stale virtual-doc versions
-/// dropped), and other (cross-region) virtual URIs are filtered out. File
-/// operations referencing any virtual URI are filtered out entirely.
+/// dropped), and other (cross-region) virtual URIs are filtered out.
+///
+/// Returns `false` when the edit cannot be represented in host coordinates:
+/// a file operation (create/rename/delete) references a virtual URI. The
+/// spec applies `documentChanges` in order, so dropping just the op (e.g. a
+/// virtual→real rename) would misdirect later edits at an unrelated existing
+/// file — the caller must discard the whole edit instead.
 pub(crate) fn transform_workspace_edit_to_host(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
-) {
+) -> bool {
+    if let Some(DocumentChanges::Operations(ops)) = &edit.document_changes {
+        let has_virtual_file_op = ops.iter().any(|op| match op {
+            DocumentChangeOperation::Op(op) => !resource_op_targets_real_files_only(op),
+            DocumentChangeOperation::Edit(_) => false,
+        });
+        if has_virtual_file_op {
+            return false;
+        }
+    }
+
     // Transform changes map: { [uri: string]: TextEdit[] }
     if let Some(changes) = &mut edit.changes {
         transform_changes_map(changes, request_virtual_uri, host_uri, offset);
@@ -36,6 +51,8 @@ pub(crate) fn transform_workspace_edit_to_host(
     if let Some(doc_changes) = &mut edit.document_changes {
         transform_document_changes(doc_changes, request_virtual_uri, host_uri, offset);
     }
+
+    true
 }
 
 /// Transform the `changes` map in a WorkspaceEdit.
@@ -79,10 +96,9 @@ fn transform_changes_map(
 ///
 /// Handles both `Edits(Vec<TextDocumentEdit>)` and
 /// `Operations(Vec<DocumentChangeOperation>)` variants.
-/// File operations (CreateFile, RenameFile, DeleteFile) on real files are
-/// preserved as-is; ones referencing virtual URIs are dropped — they cannot
-/// be expressed in host coordinates and would leak synthetic resources to
-/// the client.
+/// File operations (CreateFile, RenameFile, DeleteFile) are preserved as-is;
+/// the caller has already rejected edits whose file ops reference virtual
+/// URIs.
 fn transform_document_changes(
     doc_changes: &mut DocumentChanges,
     request_virtual_uri: &str,
@@ -100,7 +116,7 @@ fn transform_document_changes(
                 DocumentChangeOperation::Edit(edit) => {
                     transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
                 }
-                DocumentChangeOperation::Op(op) => resource_op_targets_real_files_only(op),
+                DocumentChangeOperation::Op(_) => true, // Pre-validated real-file ops
             });
         }
     }
@@ -218,43 +234,67 @@ mod tests {
     }
 
     #[test]
-    fn document_changes_operations_filters_file_ops_on_virtual_uris() {
+    fn document_changes_rejects_whole_edit_on_virtual_uri_file_ops() {
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
-        // A file op against a virtual URI would leak the synthetic
-        // kakehashi:// resource to the client; none of create/rename/delete
-        // can be expressed in host coordinates, so each must be dropped.
+        // A file op against a virtual URI would leak the synthetic resource
+        // to the client, and documentChanges apply IN ORDER — dropping just
+        // the op (e.g. a virtual→real rename) would misdirect later edits at
+        // an unrelated existing file. The whole edit must be rejected.
         let mut edit = parse_workspace_edit(json!({
             "documentChanges": [
-                { "kind": "create", "uri": virtual_uri },
                 { "kind": "rename", "oldUri": virtual_uri, "newUri": "file:///renamed.lua" },
-                { "kind": "delete", "uri": "file:///obsolete.lua" }
+                {
+                    "textDocument": { "uri": "file:///renamed.lua", "version": null },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "dependsOnRename"
+                    }]
+                }
             ]
         }));
 
-        transform_workspace_edit_to_host(
+        let representable = transform_workspace_edit_to_host(
             &mut edit,
             &virtual_uri,
             &host_uri,
             &RegionOffset::new(10, 0),
         );
 
-        match edit.document_changes.unwrap() {
-            DocumentChanges::Operations(ops) => {
-                assert_eq!(
-                    ops.len(),
-                    1,
-                    "file ops referencing virtual URIs must be dropped"
-                );
-                match &ops[0] {
-                    DocumentChangeOperation::Op(ResourceOp::Delete(delete)) => {
-                        assert_eq!(delete.uri.as_str(), "file:///obsolete.lua");
-                    }
-                    other => panic!("Expected the real-file delete to survive, got {other:?}"),
-                }
+        assert!(
+            !representable,
+            "a virtual-URI file op must reject the whole WorkspaceEdit"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::create(json!({ "kind": "create", "uri": "kakehashi://virtual" }))]
+    #[case::rename_new(
+        json!({ "kind": "rename", "oldUri": "file:///a.lua", "newUri": "kakehashi://virtual" })
+    )]
+    #[case::delete(json!({ "kind": "delete", "uri": "kakehashi://virtual" }))]
+    fn document_changes_rejects_each_virtual_file_op_kind(#[case] mut op: serde_json::Value) {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // Substitute a well-formed virtual URI for the placeholder
+        for key in ["uri", "oldUri", "newUri"] {
+            if op.get(key).is_some_and(|v| v == "kakehashi://virtual") {
+                op[key] = json!(virtual_uri.clone());
             }
-            DocumentChanges::Edits(_) => panic!("Expected Operations variant"),
         }
+        let mut edit = parse_workspace_edit(json!({ "documentChanges": [op] }));
+
+        let representable = transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        );
+
+        assert!(!representable);
     }
 
     #[test]
