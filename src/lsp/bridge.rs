@@ -53,8 +53,14 @@ pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
 pub(crate) use inbound_request_registry::InboundRequestRegistry;
 pub(crate) use pool::ConnectionKey;
+#[cfg(test)]
+pub(crate) use pool::ConnectionState;
 pub use pool::LanguageServerPool;
 pub(crate) use pool::UpstreamId;
+/// Re-exported for the capability-prefilter regression test in `lsp_impl`, which
+/// seeds a `Ready` downstream to exercise `collect_push_diagnostics`' filter.
+#[cfg(test)]
+pub(crate) use pool::test_helpers;
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;

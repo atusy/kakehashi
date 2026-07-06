@@ -22,7 +22,7 @@ mod message_sender;
 mod shutdown;
 mod shutdown_timeout;
 #[cfg(test)]
-pub(in crate::lsp::bridge) mod test_helpers;
+pub(crate) mod test_helpers;
 
 pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
@@ -643,9 +643,11 @@ impl LanguageServerPool {
     /// This allows tests to set up a pool with a known connection state
     /// without going through the full server spawn + handshake flow. The handle
     /// is keyed by its own `handle.key()` so lookups via the key (didChange,
-    /// cancel) agree with the map.
+    /// cancel) agree with the map. `pub(crate)` (not bridge-private) so the
+    /// capability-prefilter regression test in `lsp_impl` can seed a Ready
+    /// downstream (capability-prefilter-fanout).
     #[cfg(test)]
-    pub(in crate::lsp::bridge) async fn insert_connection(&self, handle: Arc<ConnectionHandle>) {
+    pub(crate) async fn insert_connection(&self, handle: Arc<ConnectionHandle>) {
         let mut connections = self.connections.lock().await;
         connections.insert(handle.key().clone(), handle);
     }
