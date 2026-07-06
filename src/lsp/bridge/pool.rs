@@ -626,23 +626,25 @@ impl LanguageServerPool {
             return std::collections::HashSet::new();
         }
         let connections = self.connections.lock().await;
-        // `capable` / `has_ready` borrow server names from the connections map;
-        // the owned result is materialized below while the guard is still held,
-        // so they need not outlive it.
+        // Accumulate into `candidates`-lifetime references (via `candidates.get`),
+        // NOT borrows of the `connections` map: that lets us drop the lock before
+        // the final owned materialization, so the `connections` mutex — contended
+        // by every bridge request — is held only for the scan, not the
+        // `candidates.iter()/collect()` pass below.
         let mut capable: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut has_ready: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for handle in connections.values() {
-            let server = handle.key().server();
-            if !candidates.contains(server) {
+            let Some(&candidate) = candidates.get(handle.key().server()) else {
                 continue;
-            }
+            };
             if handle.has_capability(method) {
-                capable.insert(server);
+                capable.insert(candidate);
             }
             if handle.state() == ConnectionState::Ready {
-                has_ready.insert(server);
+                has_ready.insert(candidate);
             }
         }
+        drop(connections);
         candidates
             .iter()
             .filter(|&&name| has_ready.contains(name) && !capable.contains(name))
