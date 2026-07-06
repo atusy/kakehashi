@@ -182,6 +182,17 @@ impl CacheCoordinator {
     /// would let a close+reopen completing between the two `mint_epoch`
     /// reads produce a `(0, new_epoch)` latch that matches the reopened
     /// index and mints this pass's old-lifetime coordinates into it.
+    ///
+    /// Returns `None` when the latch REFUSED the pass (at the batch mint or
+    /// the final commit) — the pass was outrun and produced nothing, so the
+    /// snapshot must ride with `None` region fields and every reader falls
+    /// back to inline resolution. This is distinct from
+    /// `Some(PopulatedInjections::empty(..))`, which means the pass RAN and
+    /// found no injections — consumers then skip injection work outright.
+    /// Conflating the two would let a refused pass (e.g. any document's
+    /// close bumping the global cleanup epoch mid-populate) publish "no
+    /// injections" and blank the document's injections until the next
+    /// parse.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn populate_injections(
@@ -194,7 +205,7 @@ impl CacheCoordinator {
         tracker: &NodeTracker,
         entry_mint_epoch: (u64, u64),
         build_bridge_regions: bool,
-    ) -> PopulatedInjections {
+    ) -> Option<PopulatedInjections> {
         // Snapshot the generation FIRST — before reading the injection query or
         // resolving any language below — so the stamp can never be *newer* than
         // the queries the discovery was built with. A reload swaps queries and
@@ -227,7 +238,7 @@ impl CacheCoordinator {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
                 });
-                return PopulatedInjections::empty(generation);
+                return Some(PopulatedInjections::empty(generation));
             }
         };
 
@@ -242,7 +253,7 @@ impl CacheCoordinator {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
                 });
-                return PopulatedInjections::empty(generation);
+                return Some(PopulatedInjections::empty(generation));
             }
 
             // Mint reconciliation step (parse-snapshot ADR §3): map the
@@ -258,7 +269,7 @@ impl CacheCoordinator {
             // pre-lever path) and defer identity to the next current pass —
             // the tracker is meanwhile kept live by the ordinary didChange
             // edit-shift.
-            let Some(region_ids) = tracker.mint_batch_if_unshifted(
+            let region_ids = tracker.mint_batch_if_unshifted(
                 uri,
                 entry_mint_epoch,
                 regions.iter().map(|info| {
@@ -269,9 +280,7 @@ impl CacheCoordinator {
                         0,
                     )
                 }),
-            ) else {
-                return PopulatedInjections::empty(generation);
-            };
+            )?;
 
             // Convert to CacheableInjectionRegion pairing each region with
             // its reconciled ULID (index-aligned with `regions` by the batch
@@ -397,18 +406,16 @@ impl CacheCoordinator {
                 self.injection_token_cache
                     .retain_document(uri, &live_hashes);
             });
-            if committed.is_none() {
-                return PopulatedInjections::empty(generation);
-            }
-            return PopulatedInjections {
+            committed?;
+            return Some(PopulatedInjections {
                 discovery,
                 bridge_regions,
                 resolved_regions,
                 generation,
-            };
+            });
         }
 
-        PopulatedInjections::empty(generation)
+        Some(PopulatedInjections::empty(generation))
     }
 
     /// Get all injection regions for a document (test helper).

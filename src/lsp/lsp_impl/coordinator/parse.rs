@@ -340,7 +340,13 @@ impl ParseCoordinator {
             .any_bridge_server_runnable();
         self.compute_pool
             .run(None, move || {
-                let populated = cache.populate_injections(
+                // A refused pass (`None`) maps to all-`None` region fields —
+                // the snapshot then rides WITHOUT regions and readers fall
+                // back to inline resolution. Mapping it to the ran-and-empty
+                // shape instead would publish "no injections" for a pass
+                // that never derived anything, blanking the document's
+                // injections until the next parse.
+                let Some(populated) = cache.populate_injections(
                     &uri,
                     &text,
                     &tree,
@@ -349,7 +355,9 @@ impl ParseCoordinator {
                     &tracker,
                     entry_mint_epoch,
                     build_bridge_regions,
-                );
+                ) else {
+                    return PopulatedSnapshotRegions::default();
+                };
                 PopulatedSnapshotRegions {
                     discovery: populated.discovery.map(std::sync::Arc::new),
                     bridge_regions: populated

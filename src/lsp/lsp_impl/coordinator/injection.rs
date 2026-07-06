@@ -442,6 +442,7 @@ mod tests {
             server.bridge.node_tracker_arc().mint_epoch(&uri),
             true,
         );
+        let populated = populated.expect("current pass populates");
         let bridge_regions = populated.bridge_regions.expect("gate was true");
         server
             .documents
