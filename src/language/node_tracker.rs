@@ -656,14 +656,24 @@ impl NodeTracker {
     ///
     /// Called on didClose to prevent memory leaks. The removal resets the
     /// URI's `shift_gen`, so the global [`cleanup_epoch`](Self::cleanup_epoch)
-    /// is bumped instead: the serve-stale walks fold it into their latch
+    /// is bumped instead: the latch-gated passes fold it into their latch
     /// ([`mint_epoch`](Self::mint_epoch)), making an old-lifetime latch
     /// unequal to any post-close/reopen observation without retaining any
     /// per-closed-URI state.
+    ///
+    /// The bump runs BEFORE the removal, and the order is load-bearing: a
+    /// latch check that passes reads the pre-bump epoch, so it strictly
+    /// precedes this close in epoch order, and whatever it minted is wiped
+    /// by the removal that follows — a closed document still leaves no
+    /// state. Removing FIRST would open a gap where a pre-close latch
+    /// `(0, E)` re-materializes the just-removed entry (`or_default`,
+    /// `shift_gen` back at 0) and passes against the not-yet-bumped epoch,
+    /// leaving stale-lifetime coordinates alive in a reopened document's
+    /// index with nothing left to reclaim them.
     pub(crate) fn cleanup(&self, uri: &Url) {
-        self.entries.remove(uri);
         self.cleanup_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.entries.remove(uri);
     }
 
     /// Run `commit` only if `uri`'s (shift generation, cleanup epoch) still
