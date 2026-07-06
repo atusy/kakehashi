@@ -394,6 +394,13 @@ impl InjectionTokenCache {
         generation: u64,
         tokens: Vec<RawToken>,
     ) {
+        // `get_mut` first: the steady-state store (document entry exists)
+        // avoids the `Url` clone the `entry` API needs for its owned key —
+        // the same discipline as `record_served_semantic_version`.
+        if let Some(mut doc) = self.cache.get_mut(uri) {
+            doc.insert(validity_hash, CachedRegionTokens { generation, tokens });
+            return;
+        }
         self.cache
             .entry(uri.clone())
             .or_default()

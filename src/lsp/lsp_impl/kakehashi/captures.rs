@@ -957,9 +957,13 @@ impl Kakehashi {
             }
             return Ok(None);
         };
-        // A cancel landing after the walk finished: the result is complete,
-        // but never cache or serve a walk raced by its own cancellation's
-        // supersessor — the client already discarded this request.
+        // Forward-looking guard, unreachable today: the only current writer of
+        // this token is the `cancel_rx` select arm above, which returns
+        // instead of falling through. It stays because the token is designed
+        // to gain writers (captures supersession would flip it the way
+        // `SemanticRequestTracker` flips the token handlers'), and a completed
+        // walk raced by its own cancellation must never be cached or served —
+        // the client already discarded this request.
         if walk_cancel.is_cancelled() {
             return Err(JsonRpcError::request_cancelled());
         }
