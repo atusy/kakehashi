@@ -326,11 +326,12 @@ mod tests {
         fn template_type_parameters_never_leak_across_declarations() {
             let text = "template <typename T> T f(T a) { return a; }\ntemplate <typename T> T g(T b) { return b; }\n";
             let m = model_for("cpp", text);
-            let f_t = m.binding_at(nth(text, "T a", 0));
-            let g_t = m.binding_at(nth(text, "T b", 0));
-            if let (Some(a), Some(b)) = (f_t, g_t) {
-                assert_ne!(a, b, "two templates' <T>s must not merge");
-            }
+            // unwrap (not `if let`): both must bind, else the test is vacuous
+            // — a broken asset that stopped binding template params would make
+            // both `None` and silently pass.
+            let f_t = m.binding_at(nth(text, "T a", 0)).unwrap();
+            let g_t = m.binding_at(nth(text, "T b", 0)).unwrap();
+            assert_ne!(f_t, g_t, "two templates' <T>s must not merge");
         }
 
         #[test]
@@ -348,12 +349,21 @@ mod tests {
 
         #[test]
         fn class_names_and_aliases_resolve_as_types_members_stay_silent() {
-            let text = "class Box { public: int size; };\nusing box_t = Box;\nvoid f(box_t b) { b.size; }\n";
+            // A file-scope `size` binding makes the member-access silence
+            // discriminating: cpp never binds class fields, so without an
+            // in-scope same-named binding the `b.size` assertion would pass
+            // even if the asset wrongly captured the member access (it would
+            // resolve to nothing either way). With the global present, a
+            // wrongful capture resolves to it and the assertion fails.
+            let text = "class Box { public: int size; };\nusing box_t = Box;\nint size = 9;\nvoid f(box_t b) { size; b.size; }\n";
             let m = model_for("cpp", text);
             assert_resolves(&m, text, "Box", 1, 0);
             assert_resolves(&m, text, "box_t", 1, 0);
+            // The bare `size;` resolves to the file-scope global (live binding)...
+            assert_resolves(&m, text, "size", 2, 1);
+            // ...but member access of the same name stays silent.
             assert_eq!(
-                m.definition_range_at(nth(text, "size", 1)),
+                m.definition_range_at(nth(text, "size", 3)),
                 None,
                 "member access is never a lexical reference"
             );
@@ -968,12 +978,19 @@ mod tests {
 
         #[test]
         fn jsx_element_names_resolve_and_attribute_names_stay_silent() {
-            let text = "import Widget from \"w\";\nconst count = 1;\nfunction App() { return <Widget size={count} />; }\n";
+            // A same-named `size` binding sits in scope so the silence
+            // assertion discriminates: were the JSX attribute wrongly captured
+            // as a reference, it would resolve to this const rather than to
+            // nothing, and the assertion below would fail.
+            let text = "import Widget from \"w\";\nconst count = 1;\nconst size = 9;\nfunction App() { size; return <Widget size={count} />; }\n";
             let m = model_for("tsx", text);
             assert_resolves(&m, text, "Widget", 1, 0);
             assert_resolves(&m, text, "count", 1, 0);
+            // The bare `size;` use resolves to the const (the binding is live)...
+            assert_resolves(&m, text, "size", 1, 0);
+            // ...but the JSX attribute of the same name stays silent.
             assert_eq!(
-                m.definition_range_at(nth(text, "size", 0)),
+                m.definition_range_at(nth(text, "size", 2)),
                 None,
                 "a JSX attribute names a prop, not a lexical binding"
             );
@@ -1098,6 +1115,43 @@ mod tests {
                 m.definition_range_at(nth(text, "id", 0)),
                 None,
                 "trailing attribute access is not a lexical reference"
+            );
+        }
+
+        #[test]
+        fn resource_addresses_collide_across_type_known_lossy() {
+            // KNOWN LIMITATION (see hcl/bindings.scm and the ADR): a namespace
+            // is a static literal, so a resource's *type* cannot enter the
+            // binding key. Two resources of different types sharing a name
+            // therefore collapse into one binding. This pins the accepted-lossy
+            // behavior so it stays a documented limitation, not a silent bug:
+            // aws_instance.this and aws_eip.this resolve to the *same* site
+            // (ideally they would not). The proper fix is tracked in #563;
+            // revisit this pin and the ADR note when it lands.
+            let text = "resource \"aws_instance\" \"this\" {\n  ami = \"x\"\n}\nresource \"aws_eip\" \"this\" {\n}\noutput \"a\" {\n  value = aws_instance.this.id\n}\noutput \"b\" {\n  value = aws_eip.this.id\n}\n";
+            let m = model_for("hcl", text);
+            let via_instance = m.definition_range_at(nth(text, "this", 2));
+            let via_eip = m.definition_range_at(nth(text, "this", 3));
+            assert!(via_instance.is_some(), "a resource address still resolves");
+            assert_eq!(
+                via_instance, via_eip,
+                "known-lossy: distinct resource types sharing a name collide into one binding"
+            );
+        }
+
+        #[test]
+        fn reserved_address_roots_stay_silent() {
+            // count/each/self/path are meta roots, not resource addresses. A
+            // resource literally named `index` sits in scope so this test
+            // discriminates: dropping the reserved-root guards would capture
+            // `count.index` as a resource reference and wrongly resolve it to
+            // that resource instead of leaving it silent.
+            let text = "resource \"aws_x\" \"index\" {\n}\nresource \"aws_y\" \"n\" {\n  count = 2\n  tags = count.index\n}\n";
+            let m = model_for("hcl", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "index", 1)),
+                None,
+                "count.index is a meta root, not the resource named index"
             );
         }
 

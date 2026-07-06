@@ -8,6 +8,17 @@
 ; every dotted reference together. Attribute traversal past the name
 ; (aws_instance.web.id → id) is never captured, and unknown roots
 ; (each, count, self, path, terraform) stay silent.
+;
+; KNOWN LIMITATION (resource/data): the address is <type>.<name>, but a
+; namespace is a static literal (#set! cannot read the captured type), so
+; the binding key is (name, "resource"/"data") with the type dropped. Two
+; blocks of different types that share a name — resource "aws_instance"
+; "this" and resource "aws_eip" "this", idiomatic with this/main/default —
+; therefore collide into one binding: goto-definition may pick the wrong
+; block and rename rewrites both. variable/local/module are single-segment
+; and unaffected. Accepted as lossy rather than dropping resource/data
+; resolution entirely; the proper fix (a capture-valued namespace) is
+; tracked in issue #563. See the lexical-name-resolution ADR.
 
 ; ── Definitions ──────────────────────────────────────────────────────────
 ((block . (identifier) @_b (body (attribute . (identifier) @definition)))
