@@ -260,7 +260,12 @@ moves same-line positions after it by a character delta, later lines by a
 line delta, and combines both for a token on the boundary line of a line
 merge or split; a token whose range intersects any edited range is the drop
 bucket above. This ordered fold is the "second exactness obligation" the
-Consequences carry.
+Consequences carry. A shifted set is thereafter **treated as computed against
+the version it was shifted to**: it satisfies the participation check for
+that snapshot, and a later edit re-shifts it from there over the new deltas
+only (a shift of the shifted set), never by re-replaying from the original
+version. Tokens dropped by an earlier shift stay dropped until a fresh
+response replaces the layer's whole contribution.
 
 This temporal ordering — native now, refined later — is precisely what
 `preferred`/`concatenated` (synchronous, one-shot) cannot represent, and why
