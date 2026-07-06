@@ -499,7 +499,11 @@ visible to stage 1 or a type split"; its Neutral bullet now defers here:
   infrastructure is *how* a stale virt set is recomputed and *when* the
   re-fetch happens after an edit — the same edit-invalidation every bridged
   response already relies on (virtual-document-model syncs virtual docs on
-  host change; old in-flight requests are cancelled). The sweep never sees
+  host change). The bridge does **not** cancel its own in-flight downstream
+  requests on edit — it only forwards an upstream `$/cancelRequest` when one
+  arrives — so late responses from superseded requests are expected, and are
+  handled by §2's monotonic acceptance rather than assumed away by
+  cancellation. The sweep never sees
   unshifted stale coordinates: a set is either shifted to the current snapshot
   or excluded.
 - **Per-injection-language rank relative to host.** Inherited verbatim from
