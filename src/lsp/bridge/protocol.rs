@@ -18,6 +18,7 @@ mod request_id;
 mod response;
 mod translation;
 mod virtual_uri;
+mod workspace_edit;
 
 // Re-export all public items for external use
 pub(crate) use jsonrpc::{
@@ -29,3 +30,4 @@ pub(crate) use request_id::RequestId;
 pub(crate) use response::*;
 pub(crate) use translation::*;
 pub(crate) use virtual_uri::VirtualDocumentUri;
+pub(crate) use workspace_edit::transform_workspace_edit_to_host;
