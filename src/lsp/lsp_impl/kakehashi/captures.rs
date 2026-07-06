@@ -904,6 +904,39 @@ impl Kakehashi {
         let snapshot_for_layers = std::sync::Arc::clone(&snapshot);
         let walk_cancel = cancel_token.clone();
         let inner_cancel = cancel_token.clone();
+        // Mint latch + currency gate, taken atomically UNDER the document's
+        // edit lock (populate's discipline, see
+        // `populate_injections_on_pool`): `did_change` shifts the tracker
+        // BEFORE it bumps `content_version` under this same lock, so a
+        // lock-free latch + version check could observe the intermediate
+        // state — latch matching the already-shifted tracker, version not
+        // yet bumped — and let the walk's per-layer batches mint
+        // old-snapshot coordinates as correct-at-birth. Under the lock the
+        // pair is atomic; an edit (or close) landing after the lock drops
+        // fails the per-layer batch latch instead, degrading that layer to
+        // the read-only fallback. Taken before the pool dispatch: an edit
+        // during the queue wait now refuses the batches rather than
+        // flipping the gate, the same read-only outcome; the sweep it
+        // permits stays bounded by the single-flight winner guard (see the
+        // sweep note in `execute_captures_walk`).
+        let (entry_mint_epoch, mint_into_tracker) = {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let latch = tracker.mint_epoch(&uri);
+            let latest = self.documents.latest_snapshot(&uri);
+            let current = latest.as_ref().is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == parsed_version
+            });
+            if latest.is_none() {
+                // Reclaim the lock entry edit_lock() materialized for a
+                // closed document (identity+share-checked — see
+                // `remove_edit_lock_if_unshared`).
+                self.documents
+                    .remove_edit_lock_if_unshared(&uri, &edit_lock);
+            }
+            (latch, current)
+        };
         let walk_future = self
             .compute_pool
             .run(Some(cancel_token.clone()), move || {
@@ -965,8 +998,8 @@ impl Kakehashi {
                     &language,
                     &tracker,
                     &documents,
-                    parsed_version,
-                    incarnation,
+                    entry_mint_epoch,
+                    mint_into_tracker,
                     generation,
                     &match_cache,
                     Some(&inner_cancel),
@@ -1062,8 +1095,8 @@ fn execute_captures_walk(
     language: &crate::language::LanguageCoordinator,
     tracker: &crate::language::NodeTracker,
     documents: &crate::document::DocumentStore,
-    parsed_version: u64,
-    incarnation: u64,
+    entry_mint_epoch: (u64, u64),
+    mint_into_tracker: bool,
     generation: u64,
     match_cache: &super::captures_match_cache::CapturesMatchCache,
     cancel: Option<&crate::cancel::CancelToken>,
@@ -1072,32 +1105,24 @@ fn execute_captures_walk(
     // index (didChange shifts every entry before the reparse), so a trailing
     // snapshot's byte offsets must never be written into it — they would be
     // wrong-space entries that later edits keep shifting as if they were live
-    // (the "a stale read never mints" invariant, see snapshot_read.rs). The
-    // handler resolves a CURRENT snapshot (serve-current park), but an edit
-    // can land between that resolution and this work-unit reaching the front
-    // of the pool queue; a walk that starts outrun still returns matches
-    // (voided later by the lineage gate) but goes READ-ONLY on the tracker: a
-    // position the intervening edits did not shift reuses its live id (so
-    // the delta lineage stays a minimal diff), and an unknown position gets
-    // an unregistered id — resolving one via `kakehashi/node/*` yields
-    // `null`, the protocol's re-sync signal, and the client's next
-    // current-snapshot request mints real ones. Checked here inside the
-    // work-unit so the entry window is the walk itself, not the pool-queue
-    // wait; the walk-duration residual — an edit landing DURING the walk —
-    // is closed by the mint itself: each layer's ids are reconciled in ONE
-    // latch-gated batch (`mint_batch_if_unshifted`), whose latch check runs
-    // under the tracker entry's exclusive lock, so every id it mints is
-    // correct-at-birth and no purge set is needed — a batch the mid-walk
-    // edit outran refuses wholesale (minting nothing) and the layer falls
-    // back to the same read-only resolution as a stale-at-entry serve.
-    // Latched BEFORE the currency check: an edit landing between the two
-    // fails the batch latch or the currency check itself — either way no
-    // wrong-space mint EXISTS, ever. The epoch half covers close/reopen,
-    // which REPLACES the per-URI index (its generation restarts at 0).
-    let entry_mint_epoch = tracker.mint_epoch(uri);
-    let mint_into_tracker = documents.latest_snapshot(uri).is_some_and(|view| {
-        view.slot.current_incarnation == incarnation && view.content_version == parsed_version
-    });
+    // (the "a stale read never mints" invariant, see snapshot_read.rs).
+    // `entry_mint_epoch` + `mint_into_tracker` are captured by the CALLER,
+    // atomically under the document's edit lock (see `compute_captures`) —
+    // `did_change` shifts the tracker BEFORE it bumps `content_version`
+    // under that lock, so computing the pair lock-free here could observe
+    // the intermediate state and mint old-snapshot coordinates as
+    // correct-at-birth. A stale-at-entry serve (`mint_into_tracker` false)
+    // goes READ-ONLY on the tracker: a position the intervening edits did
+    // not shift reuses its live id (so the delta lineage stays a minimal
+    // diff), and an unknown position gets an unregistered id — resolving
+    // one via `kakehashi/node/*` yields `null`, the protocol's re-sync
+    // signal, and the client's next current-snapshot request mints real
+    // ones. An edit landing AFTER the caller's gate — during the pool-queue
+    // wait or the walk itself — fails the per-layer batch latch instead
+    // (`mint_batch_if_unshifted` re-checks it under the tracker entry's
+    // exclusive lock; the epoch half covers close/reopen, whose per-URI
+    // generation restarts at 0), degrading those layers to the same
+    // read-only resolution. Either way no wrong-space mint EXISTS, ever.
     let mapper = PositionMapper::new(text);
 
     // Range scoping: clamped conversion (like other viewport-shaped
@@ -1865,13 +1890,7 @@ mod tests {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///stale_mint.rs").unwrap();
         store.insert(uri.clone(), text.to_string(), Some("rust".into()), None);
-        let incarnation = store
-            .latest_snapshot(&uri)
-            .unwrap()
-            .slot
-            .current_incarnation;
-
-        // Current (parsed_version == content_version == 0): minting is live.
+        // Current serve: the caller-computed gate is true (minting live).
         let tracker = NodeTracker::new();
         let match_cache = super::super::captures_match_cache::CapturesMatchCache::new();
         let (matches, _) = execute_captures_walk(
@@ -1886,8 +1905,8 @@ mod tests {
             &coordinator,
             &tracker,
             &store,
-            0,
-            incarnation,
+            tracker.mint_epoch(&uri),
+            true,
             0,
             &match_cache,
             None,
@@ -1916,8 +1935,8 @@ mod tests {
             &coordinator,
             &tracker,
             &store,
-            0,
-            incarnation,
+            tracker.mint_epoch(&uri),
+            false,
             0,
             &match_cache,
             None,
@@ -1948,8 +1967,8 @@ mod tests {
             &coordinator,
             &stale_tracker,
             &store,
-            0,
-            incarnation,
+            stale_tracker.mint_epoch(&uri),
+            false,
             0,
             &match_cache,
             None,
@@ -2083,6 +2102,13 @@ mod tests {
                 .unwrap()
                 .slot
                 .current_incarnation;
+            // Latch-then-validate, mirroring the production caller
+            // (`compute_captures` takes both under the edit lock).
+            let entry_mint_epoch = self.tracker.mint_epoch(&self.uri);
+            let mint_into_tracker = self.store.latest_snapshot(&self.uri).is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == parsed_version
+            });
             execute_captures_walk(
                 &self.uri,
                 "locals",
@@ -2095,8 +2121,8 @@ mod tests {
                 &self.coordinator,
                 &self.tracker,
                 &self.store,
-                parsed_version,
-                incarnation,
+                entry_mint_epoch,
+                mint_into_tracker,
                 generation,
                 &self.match_cache,
                 cancel,
