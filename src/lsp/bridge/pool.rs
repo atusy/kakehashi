@@ -626,19 +626,21 @@ impl LanguageServerPool {
             return std::collections::HashSet::new();
         }
         let connections = self.connections.lock().await;
-        // Tie the accumulated names to `candidates`' lifetime (not the lock
-        // guard) so the returned `String`s outlive the guard drop.
+        // `capable` / `has_ready` borrow server names from the connections map;
+        // the owned result is materialized below while the guard is still held,
+        // so they need not outlive it.
         let mut capable: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut has_ready: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for handle in connections.values() {
-            let Some(&candidate) = candidates.get(handle.key().server()) else {
+            let server = handle.key().server();
+            if !candidates.contains(server) {
                 continue;
-            };
+            }
             if handle.has_capability(method) {
-                capable.insert(candidate);
+                capable.insert(server);
             }
             if handle.state() == ConnectionState::Ready {
-                has_ready.insert(candidate);
+                has_ready.insert(server);
             }
         }
         candidates
