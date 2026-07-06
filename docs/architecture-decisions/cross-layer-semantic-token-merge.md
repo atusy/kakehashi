@@ -141,8 +141,12 @@ native finalize          host server          virt server(s)
   `priorities` ordering as the key — the first-listed server that tokenized a
   region wins it. A `"*"` entry ranks every unlisted server at its own
   position as one group (aggregation-priorities-wildcard's first-win rest
-  group); the sweep needs a total order, so ties inside the group break
-  deterministically by the target's server registration order. For semantic
+  group); the sweep needs a total order, so ties inside the group break by
+  **server name**, matching the by-name sort the bridge coordinator already
+  imposes on candidate lists for determinism (`coordinator.rs`) — not
+  registration order, which is a `HashMap` iteration artifact and unstable.
+  Users wanting a specific intra-group ranking list those servers explicitly
+  before `"*"`. For semantic
   tokens this **supersedes** request-strategies' provisional "Later server
   wins for overlapping ranges" rule, which predates this decision. The same
   per-target collapse applies within each injection's
