@@ -741,7 +741,27 @@ impl NodeTracker {
         expected: (u64, u64),
         keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
     ) -> Option<Vec<Ulid>> {
+        // `get_mut` first: the hot path (index already exists — every batch
+        // after a document's first) avoids the `Url` clone `entry()` needs
+        // for its owned key. The absent-entry `entry().or_default()`
+        // fallback stays load-bearing: it serializes the latch check with a
+        // concurrent FIRST edit on a never-minted URI.
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            return self.mint_batch_in_entry(&mut entry, expected, keys);
+        }
         let mut entry = self.entries.entry(uri.clone()).or_default();
+        self.mint_batch_in_entry(&mut entry, expected, keys)
+    }
+
+    /// The latch check + mint body of
+    /// [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted), run while
+    /// the caller holds `entry`'s exclusive lock.
+    fn mint_batch_in_entry(
+        &self,
+        entry: &mut UriEntries,
+        expected: (u64, u64),
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
+    ) -> Option<Vec<Ulid>> {
         let epoch = self
             .cleanup_epoch
             .load(std::sync::atomic::Ordering::Acquire);

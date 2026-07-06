@@ -1268,7 +1268,6 @@ fn execute_captures_walk(
         });
         let mut capture_idx = 0usize;
         for m in layer_matches.iter() {
-            let match_metadata = metadata_object(&m.metadata);
             let captures: Vec<Value> = m
                 .captures
                 .iter()
@@ -1315,6 +1314,9 @@ fn execute_captures_walk(
             if captures.is_empty() {
                 continue;
             }
+            // Shaped after the empty-captures bail so a skipped envelope
+            // allocates nothing.
+            let match_metadata = metadata_object(&m.metadata);
             let mut envelope =
                 serde_json::Map::with_capacity(3 + usize::from(match_metadata.is_some()));
             envelope.insert("patternIndex".to_owned(), Value::from(m.pattern_index));
