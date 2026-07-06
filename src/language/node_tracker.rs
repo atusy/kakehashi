@@ -700,6 +700,18 @@ impl NodeTracker {
     /// held — the document-store read the didClose probe performs is fine
     /// (the store never re-enters the tracker under its own locks); a future
     /// probe must preserve that one-way ordering.
+    ///
+    /// Memory-ordering note (why `Release` on the bump suffices, no
+    /// `SeqCst` needed): the only way another thread can OBSERVE the
+    /// removal is through the entry's shard lock (`get_mut` /
+    /// `entry().or_default()`), and that lock's release/acquire pair makes
+    /// every write sequenced before the removal — including this bump —
+    /// visible to the observer, so a check that finds the entry gone always
+    /// reads the bumped epoch and refuses. A check that instead wins the
+    /// shard lock BEFORE the removal may still read the pre-bump epoch and
+    /// pass, but it then minted into the still-present entry, which the
+    /// removal (queued behind that same lock) wipes — a closed document
+    /// leaves no state on either interleaving.
     pub(crate) fn cleanup(&self, uri: &Url, reopened: impl FnOnce() -> bool) {
         self.cleanup_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
