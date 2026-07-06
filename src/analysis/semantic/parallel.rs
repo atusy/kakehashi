@@ -1179,8 +1179,10 @@ pub(crate) fn collect_injection_tokens_parallel(
     // region ids were minted while their snapshot was current (populate runs
     // behind the landed CAS), so rebuilding from them never writes the tracker —
     // the `mint_regions` stale-serve latch only governs the inline branch.
-    let reusable_discovery =
-        cache_ctx.and_then(|c| c.discovery.filter(|d| d.generation == c.generation && d.complete));
+    let reusable_discovery = cache_ctx.and_then(|c| {
+        c.discovery
+            .filter(|d| d.generation == c.generation && d.complete)
+    });
     let (contexts, exclusion_byte_ranges) = if let Some(discovery) = reusable_discovery {
         #[cfg(test)]
         DISCOVERY_REUSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3048,10 +3050,7 @@ local b = 2
             "singles kept, combined group dropped"
         );
         assert!(
-            discovery
-                .regions
-                .iter()
-                .all(|r| r.token_cache.is_some()),
+            discovery.regions.iter().all(|r| r.token_cache.is_some()),
             "singles keep their token-cache identities for the eviction sweep"
         );
 
