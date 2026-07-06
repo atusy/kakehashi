@@ -232,6 +232,15 @@ mod tests {
                     DocumentChangeOperation::Edit(edit) => {
                         assert_eq!(edit.text_document.uri, host_uri);
                         assert_eq!(edit.text_document.version, None);
+                        match &edit.edits[0] {
+                            OneOf::Left(text_edit) => {
+                                assert_eq!(
+                                    text_edit.range.start.line, 10,
+                                    "range must be translated by the region offset (0 + 10)"
+                                );
+                            }
+                            OneOf::Right(_) => panic!("Expected Left(TextEdit)"),
+                        }
                     }
                     DocumentChangeOperation::Op(_) => panic!("Expected Edit operation"),
                 }
