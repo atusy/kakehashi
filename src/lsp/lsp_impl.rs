@@ -1,3 +1,4 @@
+mod apply_edit_translation;
 pub(crate) mod bridge_context;
 mod cli;
 mod coordinator;

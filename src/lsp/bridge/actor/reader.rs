@@ -174,6 +174,16 @@ pub(crate) enum UpstreamRequest {
         reply: oneshot::Sender<bool>,
         cancel: ForwardedRequestCancel,
     },
+    /// Forward a `workspace/applyEdit`; the editor's full response (`applied`,
+    /// `failureReason`, `failedChange`) is relayed back — the downstream acts
+    /// on the outcome. The forwarding loop translates virtual-document edits
+    /// back to host coordinates before the editor sees them, and answers
+    /// untranslatable edits `applied: false` locally (#568).
+    ApplyEdit {
+        params: tower_lsp_server::ls_types::ApplyWorkspaceEditParams,
+        reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
+        cancel: ForwardedRequestCancel,
+    },
 }
 
 /// Cancellation context for a forwarded request: the originating connection and
@@ -232,9 +242,9 @@ pub(crate) struct ServerRequestDeps {
     /// dropped when full.
     pub(crate) window_tx: mpsc::Sender<UpstreamNotification>,
     /// Downstream-initiated requests forwarded to the editor with a response
-    /// relayed back (`window/showMessageRequest`, `window/showDocument`).
-    /// Unbounded: a dropped request would hang the downstream. See
-    /// [`UpstreamRequest`].
+    /// relayed back (`window/showMessageRequest`, `window/showDocument`,
+    /// `workspace/applyEdit`). Unbounded: a dropped request would hang the
+    /// downstream. See [`UpstreamRequest`].
     pub(crate) upstream_request_tx: mpsc::UnboundedSender<UpstreamRequest>,
     /// Tracks in-flight forwarded requests so a downstream `$/cancelRequest`
     /// (or connection death) can cancel the editor-bound request (#404).
@@ -908,6 +918,10 @@ async fn handle_server_request(
         }
         "window/showDocument" => {
             window::show_document::handle(&message, id, server_prefix, deps);
+            return;
+        }
+        "workspace/applyEdit" => {
+            workspace::apply_edit::handle(&message, id, server_prefix, deps);
             return;
         }
         _ => {}
@@ -3341,5 +3355,101 @@ mod tests {
         let response = recv_untracked(&mut response_rx).await;
         assert_eq!(response["id"], 12);
         assert_eq!(response["result"]["success"], false);
+    }
+
+    #[tokio::test]
+    async fn handle_message_apply_edit_relays_full_editor_response() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "workspace/applyEdit",
+            "params": {
+                "label": "organize imports",
+                "edit": { "changes": { "file:///p/main.rs": [] } }
+            }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        let UpstreamRequest::ApplyEdit { params, reply, .. } = request_rx
+            .recv()
+            .await
+            .expect("should forward an UpstreamRequest")
+        else {
+            panic!("expected ApplyEdit");
+        };
+        assert_eq!(params.label.as_deref(), Some("organize imports"));
+
+        // The editor rejected the edit: `applied`, `failureReason`, and
+        // `failedChange` must all reach the downstream — it acts on them.
+        reply
+            .send(
+                serde_json::from_value(json!({
+                    "applied": false,
+                    "failureReason": "user rejected",
+                    "failedChange": 1
+                }))
+                .unwrap(),
+            )
+            .expect("reply channel open");
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 20);
+        assert_eq!(response["result"]["applied"], false);
+        assert_eq!(response["result"]["failureReason"], "user rejected");
+        assert_eq!(response["result"]["failedChange"], 1);
+    }
+
+    #[tokio::test]
+    async fn handle_message_apply_edit_editor_drop_responds_applied_false() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "workspace/applyEdit",
+            "params": { "edit": {} }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        // Dropping the request (and its reply sender) simulates the editor
+        // failing to answer; the downstream must still get `applied: false`.
+        let request = request_rx.recv().await.expect("forwarded");
+        drop(request);
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 21);
+        assert_eq!(response["result"]["applied"], false);
+        assert!(
+            response["result"]["failureReason"].is_string(),
+            "a fabricated failure must carry a reason: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_apply_edit_invalid_params_responds_error() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        // Missing the required `edit` field.
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "workspace/applyEdit",
+            "params": { "label": "no edit" }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 22);
+        assert!(
+            response["error"].is_object(),
+            "invalid params should produce an error response: {response}"
+        );
+        // No request should have been forwarded to the editor.
+        assert!(request_rx.try_recv().is_err());
     }
 }
