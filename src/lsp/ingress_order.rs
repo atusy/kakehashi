@@ -287,8 +287,9 @@ enum Role {
 /// its current text, so edits computed against a stale snapshot corrupt the
 /// document), pull diagnostics, and `didSave` (its synthetic-diagnostic task
 /// snapshots the document, which must reflect every edit before the save).
-/// `textDocument/codeAction` belongs in the same class once it is
-/// implemented (#352). `codeLens/resolve` is a reader too (#355): its
+/// `textDocument/codeAction` is in the same class: its
+/// `context.diagnostics` and returned edits are computed against the
+/// document snapshot (#568). `codeLens/resolve` is a reader too (#355): its
 /// freshness gate reads tracker/document state, so it must observe every
 /// `didChange` that preceded it on the wire — but its params carry no
 /// `textDocument`, so the URI comes from the routing envelope in
@@ -315,6 +316,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/rangeFormatting"
         | "textDocument/rename"
         | "textDocument/prepareRename"
+        | "textDocument/codeAction"
         | "textDocument/diagnostic"
         | "textDocument/didSave"
         | "kakehashi/captures/full"
@@ -643,6 +645,7 @@ mod tests {
             "textDocument/rangeFormatting",
             "textDocument/rename",
             "textDocument/prepareRename",
+            "textDocument/codeAction",
             "textDocument/diagnostic",
             "textDocument/didSave",
             "kakehashi/captures/full",

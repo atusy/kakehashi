@@ -6,18 +6,18 @@ use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
-    CodeLensOptions, CompletionOptions, DeclarationCapability, DeclarationOptions,
-    DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentFormattingOptions,
-    DocumentLinkOptions, DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions,
-    DocumentSymbolOptions, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHintOptions, InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf,
-    ReferenceOptions, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri,
-    WorkDoneProgressOptions,
+    CodeActionProviderCapability, CodeLensOptions, CompletionOptions, DeclarationCapability,
+    DeclarationOptions, DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
+    DocumentFormattingOptions, DocumentLinkOptions, DocumentOnTypeFormattingOptions,
+    DocumentRangeFormattingOptions, DocumentSymbolOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InlayHintOptions, InlayHintServerCapabilities,
+    LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions, RenameOptions, SaveOptions,
+    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
 };
 use url::Url;
 
@@ -320,6 +320,11 @@ impl Kakehashi {
                 // codeLens/resolve is routed to the origin downstream server
                 // via the envelope in lens.data (#355, see
                 // bridge/text_document/code_lens.rs).
+                // No resolveProvider or codeActionKinds yet: downstream
+                // servers are asked for complete (edit-carrying) actions, and
+                // narrowing kinds would stop clients from asking at all
+                // (#568).
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
                 }),
