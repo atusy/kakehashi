@@ -132,9 +132,16 @@ native finalize          host server          virt server(s)
 ```
 
 - **Level 1 (intra-layer) collapses each layer to exactly one non-overlapping
-  stream.** Native is the existing `finalize_tokens` output. Host is one
-  server's response, non-overlapping by protocol (kakehashi does not advertise
-  `overlappingTokenSupport` to downstream servers). **Virt is not a single
+  stream.** Native is the existing `finalize_tokens` output. Host is
+  `bridge._self`'s contribution: a single server's response is non-overlapping
+  by protocol (kakehashi does not advertise `overlappingTokenSupport` to
+  downstream servers); when a bridge target dispatches to **multiple
+  servers**, their per-server streams are collapsed by the same breakpoint
+  sweep with the server's rank in the stage-1 `bridge.<key>.aggregation`
+  `priorities` ordering as the key — the first-listed server that tokenized a
+  region wins it. The same per-target collapse applies within each injection's
+  `bridge.<inj>` before the cross-injection nesting collapse below, so every
+  downstream stream enters that step already single. **Virt is not a single
   response** — nested injections (markdown → python → sql) yield one stream
   *per injection*, and a deeper injection's host range sits inside its
   parent's, so the virt streams overlap each other. Level 1 therefore collapses
@@ -247,7 +254,12 @@ the host document version it was computed against. Acceptance is **monotonic
 per layer**: in-flight requests can complete out of order, and a response
 computed against an older host version than the layer's currently accepted
 contribution is discarded — a late straggler never replaces newer tokens with
-older, edit-shifted ones. A bridged set whose version
+older, edit-shifted ones. The unit all of these contracts operate on is the
+**per-server contribution** — tracked as (layer, server, version) — and a
+layer's level-1 stream is derived from its accepted per-server contributions,
+so acceptance monotonicity and the material-change refresh test stay
+well-defined when a bridge target dispatches to multiple servers (§1). A
+bridged set whose version
 equals the current host snapshot participates as-is. A **stale** set (version
 older than the snapshot) is **not excluded wholesale** — hard exclusion would
 downgrade every bridged region to native colors on each keystroke (the client
@@ -398,14 +410,18 @@ pre-revision wording, "a stage-2-only `merged` would force either enum growth
 visible to stage 1 or a type split"; its Neutral bullet now defers here:
 
 - `merged` is **not** added to `AggregationStrategy`. It is not a value any
-  user writes anywhere. Stage 1 (`bridge.<key>.aggregation`) and other stage-2
-  methods are untouched; no enum grows, no type splits.
+  user writes anywhere. Other stage-2 methods are untouched, and stage 1
+  (`bridge.<key>.aggregation`) keeps its enum unchanged — for semantic-tokens
+  methods its `priorities` is reused as the intra-layer server rank (§1) and a
+  written `strategy` is rejected the same way as at stage 2; no enum grows, no
+  type splits.
 - Semantic-tokens methods dispatch to the merge path **internally**, the way
   formatting already gets a per-method default strategy
   (`default_layer_strategy_for_method`). The user still controls *which* layers
   participate and their *rank* via
   `layers.aggregation."textDocument/semanticTokens/full".priorities`.
-- A `strategy` written on a semantic-tokens method (e.g.
+- A `strategy` written on a semantic-tokens method — at stage 2
+  (`layers.aggregation`) or stage 1 (`bridge.<key>.aggregation`) — (e.g.
   `strategy = "preferred"`) **must be rejected at config validation** with a
   message pointing here — rather than silently ignored — because honoring it
   would reintroduce the gap-leaving wholesale-winner behavior this decision
