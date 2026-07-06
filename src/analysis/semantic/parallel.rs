@@ -3014,10 +3014,19 @@ local b = 2
             .query_store()
             .insert_injection_query("markdown".to_string(), Arc::clone(&injection_query));
 
-        // Eight single lua fences (clears the gate) + two indented blocks
-        // (one combined group).
-        let mut text = eight_lua_block_doc();
-        text.push_str("prose\n\n    local y1 = 1\n\nprose\n\n    local y2 = 2\n");
+        // Eight single lua fences (clears the gate) with the two combined
+        // indented blocks INTERLEAVED — one before the singles, one mid-list —
+        // so a zip-style pairing of the filtered singles against the
+        // index-aligned prebuilt identities would shift every later single
+        // onto the wrong identity (the off-by-one this test discriminates).
+        let mut text = String::from("prose\n\n    local y1 = 1\n\n");
+        for i in 0..4 {
+            text.push_str(&format!("```lua\nlocal x{i} = {i}\n```\n\n"));
+        }
+        text.push_str("prose\n\n    local y2 = 2\n\n");
+        for i in 4..8 {
+            text.push_str(&format!("```lua\nlocal x{i} = {i}\n```\n\n"));
+        }
 
         let tree = parse_markdown(&coordinator, &text);
         let regions = crate::language::injection::collect_all_injections(
@@ -3030,9 +3039,10 @@ local b = 2
 
         let uri = Url::parse("file:///combined_partial.md").unwrap();
         let tracker = NodeTracker::new();
+        let prebuilt = cacheable_for(&regions, &uri, &tracker, &text);
         let discovery = build_document_discovery(
             &regions,
-            &cacheable_for(&regions, &uri, &tracker, &text),
+            &prebuilt,
             injection_query.as_ref(),
             &text,
             &coordinator,
@@ -3050,9 +3060,31 @@ local b = 2
             8,
             "singles kept, combined group dropped"
         );
-        assert!(
-            discovery.regions.iter().all(|r| r.token_cache.is_some()),
-            "singles keep their token-cache identities for the eviction sweep"
+        // Identity alignment: each stored single must carry the validity hash
+        // of ITS OWN prebuilt identity (by original region index). A zip over
+        // the filtered singles would pair post-combined singles with the
+        // dropped combined regions' hashes and fail this set equality.
+        let expected_hashes: std::collections::HashSet<u64> = regions
+            .iter()
+            .zip(prebuilt.iter())
+            .filter(|(r, _)| !has_combined_for_pattern(injection_query.as_ref(), r.pattern_index))
+            .map(|(_, c)| {
+                crate::analysis::semantic_cache::region_validity_hash(c.content_hash, "lua")
+            })
+            .collect();
+        let stored_hashes: std::collections::HashSet<u64> = discovery
+            .regions
+            .iter()
+            .map(|r| {
+                r.token_cache
+                    .as_ref()
+                    .expect("singles keep their token-cache identities for the eviction sweep")
+                    .validity_hash
+            })
+            .collect();
+        assert_eq!(
+            stored_hashes, expected_hashes,
+            "stored singles must keep their own (index-aligned) cache identities"
         );
 
         // The partial discovery must NOT be consumed by the context-reuse
@@ -3074,10 +3106,14 @@ local b = 2
             None,
         )
         .0;
+        let indented_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("local y"))
+            .map(|(i, _)| i)
+            .collect();
         assert!(
-            inline
-                .iter()
-                .any(|t| t.line >= lines.len().saturating_sub(7)),
+            inline.iter().any(|t| indented_lines.contains(&t.line)),
             "the combined indented blocks must contribute tokens for the check to discriminate"
         );
         let cache = InjectionTokenCache::new();
