@@ -20,6 +20,22 @@ use crate::text::PositionMapper;
 
 use super::{Kakehashi, uri_to_url};
 
+/// Whether the capability prefilter (capability-prefilter-fanout) may drop a
+/// server known to lack `method` before fan-out.
+///
+/// The prefilter relies on `has_capability(method) == false` being observably
+/// equivalent to the handler returning an empty result. That holds for every
+/// routed method EXCEPT `textDocument/prepareRename`: its handler
+/// ([`send_prepare_rename_request`]) falls back to `DefaultBehavior` (rename
+/// stays enabled) when the server advertises `textDocument/rename` but not
+/// `prepareRename`, so dropping such a server here would silently disable
+/// rename in injected regions. Exempt it — the per-handler gate still runs.
+///
+/// [`send_prepare_rename_request`]: crate::lsp::bridge::LanguageServerPool::send_prepare_rename_request
+fn capability_prefilter_applies(method: &str) -> bool {
+    method != "textDocument/prepareRename"
+}
+
 /// All resolved context needed to send bridge requests to multiple servers.
 ///
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
@@ -637,23 +653,26 @@ impl Kakehashi {
         // (capability-prefilter-fanout). Uses the same `has_capability(method)`
         // predicate as that gate, so a dropped server is observably equivalent
         // to it having answered empty. Unknown / still-initializing servers are
-        // kept (spawned/awaited as before).
-        let candidates: std::collections::HashSet<&str> =
-            configs.iter().map(|c| c.server_name.as_str()).collect();
-        let incapable = self
-            .bridge
-            .pool_arc()
-            .servers_known_incapable(&candidates, method_name)
-            .await;
-        if !incapable.is_empty() {
-            configs.retain(|c| !incapable.contains(&c.server_name));
-            if configs.is_empty() {
-                log::debug!(
-                    "{}: all configured servers for {} are known-incapable; skipping virt layer",
-                    method_name,
-                    preamble.resolved.injection_language
-                );
-                return None;
+        // kept (spawned/awaited as before). Exempt methods whose capability-absent
+        // handler branch is NOT empty (see `capability_prefilter_applies`).
+        if capability_prefilter_applies(method_name) {
+            let candidates: std::collections::HashSet<&str> =
+                configs.iter().map(|c| c.server_name.as_str()).collect();
+            let incapable = self
+                .bridge
+                .pool_arc()
+                .servers_known_incapable(&candidates, method_name)
+                .await;
+            if !incapable.is_empty() {
+                configs.retain(|c| !incapable.contains(&c.server_name));
+                if configs.is_empty() {
+                    log::debug!(
+                        "{}: all configured servers for {} are known-incapable; skipping virt layer",
+                        method_name,
+                        preamble.resolved.injection_language
+                    );
+                    return None;
+                }
             }
         }
 
@@ -1837,5 +1856,28 @@ mod tests {
                 ("rust".to_string(), "python".to_string()),
             ]
         );
+    }
+
+    /// The capability prefilter applies to ordinary position/range methods but
+    /// is exempt for `textDocument/prepareRename`, whose capability-absent
+    /// handler branch is NOT empty (it falls back to `DefaultBehavior` when the
+    /// server advertises `textDocument/rename`). Dropping a rename-only server
+    /// here would silently disable rename in injected regions.
+    #[test]
+    fn capability_prefilter_exempts_prepare_rename_only() {
+        assert!(!capability_prefilter_applies("textDocument/prepareRename"));
+        for method in [
+            "textDocument/hover",
+            "textDocument/definition",
+            "textDocument/completion",
+            "textDocument/references",
+            "textDocument/rename",
+            "textDocument/documentColor",
+        ] {
+            assert!(
+                capability_prefilter_applies(method),
+                "{method} must be prefiltered"
+            );
+        }
     }
 }
