@@ -1074,21 +1074,20 @@ fn execute_captures_walk(
     // current-snapshot request mints real ones. Checked here inside the
     // work-unit so the entry window is the walk itself, not the pool-queue
     // wait; the walk-duration residual — an edit landing DURING the walk —
-    // is closed by the post-walk reconciliation below, which purges this
-    // walk's own mints when the snapshot is no longer current on exit.
+    // is closed by the mint itself: each layer's ids are reconciled in ONE
+    // latch-gated batch (`mint_batch_if_unshifted`), whose latch check runs
+    // under the tracker entry's exclusive lock, so every id it mints is
+    // correct-at-birth and no purge set is needed — a batch the mid-walk
+    // edit outran refuses wholesale (minting nothing) and the layer falls
+    // back to the same read-only resolution as a stale-at-entry serve.
     // Latched BEFORE the currency check: an edit landing between the two
-    // bumps the generation (making later mints purge-eligible) or fails the
-    // currency check itself — either way no wrong-space mint survives. The
-    // epoch half covers close/reopen, which REPLACES the per-URI index (its
-    // generation restarts at 0).
-    let (entry_shift_gen, entry_cleanup_epoch) = tracker.mint_epoch(uri);
+    // fails the batch latch or the currency check itself — either way no
+    // wrong-space mint EXISTS, ever. The epoch half covers close/reopen,
+    // which REPLACES the per-URI index (its generation restarts at 0).
+    let entry_mint_epoch = tracker.mint_epoch(uri);
     let mint_into_tracker = documents.latest_snapshot(uri).is_some_and(|view| {
         view.slot.current_incarnation == incarnation && view.content_version == parsed_version
     });
-    // Ids THIS walk created (as opposed to reused), with the shift
-    // generation each creation observed — the purge set for the post-walk
-    // reconciliation.
-    let mut minted_ids: Vec<(ulid::Ulid, u64)> = Vec::new();
     let mapper = PositionMapper::new(text);
 
     // Range scoping: clamped conversion (like other viewport-shaped
@@ -1217,48 +1216,64 @@ fn execute_captures_walk(
                 (arc, 0)
             }
         };
+        // Per-layer id reconciliation (the §3 walk lever): resolve every
+        // capture's ULID in ONE tracker entry-lock acquisition instead of
+        // one per capture (~20k on an injection-heavy document). Minted in
+        // the layer's depth, so the id resolves in its minting layer via
+        // kakehashi/node/* (per-layer Scope rule). The batch is keyed on the
+        // walk's entry latch: a mid-walk edit refuses it wholesale (nothing
+        // minted — no wrong-space entries, no purge), and the layer degrades
+        // to the stale serve's read-only resolution below. Ids are minted
+        // for every capture, including one whose span later fails position
+        // mapping and is dropped from the response — under a current
+        // snapshot every span maps by construction, so the difference is
+        // theoretical; the alignment (one id per capture, match order) is
+        // what the shaping loop indexes by.
+        let capture_keys = || {
+            layer_matches.iter().flat_map(|m| {
+                m.captures
+                    .iter()
+                    .map(|c| (c.start_byte + anchor, c.end_byte + anchor, c.kind, depth))
+            })
+        };
+        let layer_ulids: Vec<ulid::Ulid> = if mint_into_tracker {
+            tracker.mint_batch_if_unshifted(uri, entry_mint_epoch, capture_keys())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            // Read-only resolution (stale-at-entry serve, or a mid-walk edit
+            // refusing the batch): a position the intervening edits did not
+            // shift reuses its live id; an unknown position gets a fresh
+            // UNREGISTERED id — NOT Ulid::default() (the nil id), since
+            // unregistered ids must still be unique per capture.
+            capture_keys()
+                .map(|(start, end, kind, layer)| {
+                    match tracker.lookup_in_layer(uri, start, end, kind, layer) {
+                        Some(live) => live,
+                        None => ulid::Ulid::new(),
+                    }
+                })
+                .collect()
+        });
+        let mut capture_idx = 0usize;
         for m in layer_matches.iter() {
             let match_metadata = metadata_object(&m.metadata);
             let captures: Vec<Value> = m
                 .captures
                 .iter()
                 .filter_map(|c| {
+                    // Consume this capture's reconciled id FIRST (the batch
+                    // is aligned one-id-per-capture in match order), so a
+                    // dropped capture cannot shift later captures' ids.
+                    let ulid = layer_ulids[capture_idx];
+                    capture_idx += 1;
                     // A capture whose bytes don't map to positions (corrupt
                     // span) is dropped rather than failing the whole request.
                     let start_byte = c.start_byte + anchor;
                     let end_byte = c.end_byte + anchor;
                     let start = mapper.byte_to_position(start_byte)?;
                     let end = mapper.byte_to_position(end_byte)?;
-                    // Minted in the layer's depth, so the id resolves in
-                    // its minting layer via kakehashi/node/* (per-layer
-                    // Scope rule). Same mint as `mint_node_info`, done via
-                    // the tracker handle since this runs off `self`. On a
-                    // stale serve the tracker is read-only (see the
-                    // currency gate above).
-                    let ulid = if mint_into_tracker {
-                        let (ulid, created, shift_gen) = tracker.get_or_create_in_layer_tracked(
-                            uri, start_byte, end_byte, c.kind, depth,
-                        );
-                        // Recorded for the post-walk purge: if an edit lands
-                        // mid-walk, entries created after its shift were
-                        // minted in a superseded coordinate space and must
-                        // not persist. Both `created` and the observed
-                        // generation are determined atomically under the
-                        // tracker's entry lock, so an id a concurrent,
-                        // still-current request created (and handed out) is
-                        // never mis-attributed here and wrongly purged.
-                        if created {
-                            minted_ids.push((ulid, shift_gen));
-                        }
-                        ulid
-                    } else {
-                        match tracker.lookup_in_layer(uri, start_byte, end_byte, c.kind, depth) {
-                            Some(live) => live,
-                            // NOT Ulid::default() (the nil id): unregistered
-                            // ids must still be unique per capture.
-                            None => ulid::Ulid::new(),
-                        }
-                    };
                     let node = json!({ "id": ulid.to_string(), "kind": c.kind });
                     let mut capture = json!({
                         "name": c.name,
@@ -1328,33 +1343,10 @@ fn execute_captures_walk(
         visit(language_id, tree, 0);
     }
 
-    // Post-walk reconciliation, the other half of the currency gate: the
-    // entry latch cannot see an edit (or close/reopen) that lands DURING the
-    // walk. A creation whose observed shift generation still equals the
-    // entry latch — with the cleanup epoch also unchanged — is
-    // correct-at-birth: no edit intervened, and later edits shift it like
-    // any live entry. A generation mismatch means the mint landed AFTER some
-    // edit's shift, i.e. in a superseded coordinate space — coordinate
-    // comparison could not detect this once a second edit moves the
-    // wrong-space entry again. An epoch mismatch means a close/reopen
-    // replaced some index mid-walk (per-URI generations restart at 0, so
-    // the generation alone could ABA); purging our own mints then is
-    // conservative but bounded — one null re-sync. The response still
-    // carries purged ids, which resolve `null` (the protocol's re-sync
-    // signal), the same degradation as a stale-at-entry serve.
-    if !minted_ids.is_empty() {
-        let (_, exit_cleanup_epoch) = tracker.mint_epoch(uri);
-        for (id, shift_gen) in &minted_ids {
-            if *shift_gen != entry_shift_gen || exit_cleanup_epoch != entry_cleanup_epoch {
-                tracker.remove_id(uri, id);
-            }
-        }
-    }
-
     // A cancelled walk must not shape a partial result: the caller answers
     // the protocol cancellation, and nothing may reach the walk memo. The
-    // minted-id reconciliation above still ran, so entries minted before the
-    // bail were purged/kept under the same rules as a completed walk — only
+    // per-layer batch mints that ran before the bail were latch-gated
+    // (correct-at-birth), so no post-walk reconciliation is needed — only
     // the response is discarded.
     if crate::cancel::is_cancelled(cancel) {
         return None;
@@ -2068,6 +2060,57 @@ mod tests {
                 cancel,
             )
         }
+    }
+
+    /// Batch id reconciliation alignment: every capture in a current serve
+    /// carries the id of ITS OWN span — resolvable via `lookup_node` to
+    /// exactly the byte range and kind the response reports for it. An
+    /// off-by-one in the one-id-per-capture alignment (e.g. a dropped
+    /// capture shifting later ids) would pair some capture with a
+    /// neighbor's id and fail the span equality.
+    #[test]
+    fn current_serve_ids_align_one_per_capture_with_their_own_spans() {
+        let code = "let alpha = beta + gamma;\n";
+        let text = format!("AAAA\n{code}");
+        let start = text.find(code).unwrap();
+        let rig = MatchCacheRig::new("file:///batch_align.rs", &text);
+        let layer = rust_layer(&text, start, text.len());
+        let (matches, _) = rig
+            .walk(&text, &[layer], 0, None)
+            .expect("kind query should load");
+        let mapper = PositionMapper::new(&text);
+        let to_pos = |p: &Value| {
+            tower_lsp_server::ls_types::Position::new(
+                u32::try_from(p["line"].as_u64().unwrap()).unwrap(),
+                u32::try_from(p["character"].as_u64().unwrap()).unwrap(),
+            )
+        };
+        let mut seen = 0;
+        for m in &matches {
+            for c in m["captures"].as_array().unwrap() {
+                let id: ulid::Ulid = c["node"]["id"].as_str().unwrap().parse().unwrap();
+                let (s, e, kind, _layer) = rig
+                    .tracker
+                    .lookup_node(&rig.uri, &id)
+                    .expect("a current serve mints resolvable ids");
+                assert_eq!(
+                    mapper.position_to_byte_clamped(to_pos(&c["range"]["start"])),
+                    s,
+                    "capture start must be the id's own tracked start"
+                );
+                assert_eq!(
+                    mapper.position_to_byte_clamped(to_pos(&c["range"]["end"])),
+                    e,
+                    "capture end must be the id's own tracked end"
+                );
+                assert_eq!(c["node"]["kind"].as_str().unwrap(), kind);
+                seen += 1;
+            }
+        }
+        assert!(
+            seen >= 4,
+            "host and layer captures should both contribute (got {seen})"
+        );
     }
 
     fn capture_names(matches: &[Value]) -> Vec<String> {

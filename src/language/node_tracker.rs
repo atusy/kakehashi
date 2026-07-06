@@ -63,22 +63,13 @@ struct UriEntries {
 impl UriEntries {
     /// Get or insert a ULID for a position key, keeping both maps in sync.
     fn get_or_insert(&mut self, key: PositionKey) -> Ulid {
-        self.get_or_insert_tracked(key).0
-    }
-
-    /// [`get_or_insert`](Self::get_or_insert) that also reports whether this
-    /// call CREATED the id (`true`) or found an existing one (`false`) — an
-    /// atomic distinction the serve-stale purge needs: a separate
-    /// lookup-then-create races a concurrent creator, mis-attributing (and
-    /// then wrongly purging) an id another, still-current request handed out.
-    fn get_or_insert_tracked(&mut self, key: PositionKey) -> (Ulid, bool, u64) {
         if let Some(existing) = self.forward.get(&key) {
-            return (*existing, false, self.shift_gen);
+            return *existing;
         }
         let ulid = Ulid::new();
         self.forward.insert(key, ulid);
         self.reverse.insert(ulid, key);
-        (ulid, true, self.shift_gen)
+        ulid
     }
 
     /// Lookup a position key by ULID.
@@ -338,40 +329,11 @@ impl NodeTracker {
         entry.get_or_insert(key)
     }
 
-    /// [`get_or_create_in_layer`](Self::get_or_create_in_layer) that also
-    /// reports whether this call CREATED the id — atomically under the same
-    /// entry lock, so a concurrent creator can never be mis-attributed. The
-    /// serve-stale captures walk purges only ids it created itself; purging
-    /// on a lookup-then-create basis would race another, still-current
-    /// request into handing out an id this walk then deletes. The third
-    /// element is the [`shift generation`](Self::shift_generation) observed
-    /// atomically with the insert: a creation whose generation equals the
-    /// one latched alongside the walk's currency check is correct-at-birth
-    /// (no edit shift intervened); a mismatch marks the entry as minted in a
-    /// superseded coordinate space.
-    pub(crate) fn get_or_create_in_layer_tracked(
-        &self,
-        uri: &Url,
-        start: usize,
-        end: usize,
-        kind: &'static str,
-        layer: usize,
-    ) -> (Ulid, bool, u64) {
-        let key = PositionKey::new(start, end, kind, layer);
-        // `get_mut` first: the hot path (index already exists) avoids the
-        // `Url` clone `entry()` needs for its owned key.
-        if let Some(mut entry) = self.entries.get_mut(uri) {
-            return entry.get_or_insert_tracked(key);
-        }
-        let mut entry = self.entries.entry(uri.clone()).or_default();
-        entry.get_or_insert_tracked(key)
-    }
-
     /// The count of coordinate shifts (edit applications) `uri`'s index has
-    /// received — see `get_or_create_in_layer_tracked` for the atomicity
-    /// contract. `0` for an index no edit has touched yet (edits bump the
-    /// generation even for a URI with no entries, so a latch taken before
-    /// the first mint still detects an intervening shift).
+    /// received — see [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted)
+    /// for the atomicity contract. `0` for an index no edit has touched yet
+    /// (edits bump the generation even for a URI with no entries, so a latch
+    /// taken before the first mint still detects an intervening shift).
     pub(crate) fn shift_generation(&self, uri: &Url) -> u64 {
         self.entries.get(uri).map(|e| e.shift_gen).unwrap_or(0)
     }
@@ -409,24 +371,6 @@ impl NodeTracker {
         let entries = self.entries.get(uri)?;
         let key = entries.lookup(ulid)?;
         Some((key.start_byte, key.end_byte, key.kind, key.layer))
-    }
-
-    /// Remove `ulid` from `uri`'s index (both directions).
-    ///
-    /// Used by the serve-stale walks' post-walk reconciliation: an id whose
-    /// creation observed a shift generation different from the one latched
-    /// with the walk's currency check was minted in a superseded coordinate
-    /// space (it missed at least one edit's correction — coordinate
-    /// comparison cannot detect this once a LATER edit moves the entry
-    /// again) and must not persist as live. The removed id then resolves
-    /// like a never-issued one — the captures protocol's re-sync signal (no
-    /// tombstone, per lazy-node-identity-tracking).
-    pub(crate) fn remove_id(&self, uri: &Url, ulid: &Ulid) {
-        if let Some(mut entries) = self.entries.get_mut(uri)
-            && let Some(key) = entries.reverse.remove(ulid)
-        {
-            entries.forward.remove(&key);
-        }
     }
 
     /// Get the ULID for a position in a layer if it exists, without creating
@@ -877,38 +821,9 @@ mod tests {
         );
     }
 
-    /// The tracked mint reports created-vs-reused and the observed shift
-    /// generation atomically; `remove_id` erases both directions with no
-    /// tombstone (a later mint draws a fresh id).
-    #[test]
-    fn tracked_mint_reports_creation_and_shift_generation_atomically() {
-        let tracker = NodeTracker::new();
-        let uri = test_uri("purge");
-        let (id, created, observed_gen) =
-            tracker.get_or_create_in_layer_tracked(&uri, 0, 4, "word", 1);
-        assert!(created, "first mint creates");
-        assert_eq!(observed_gen, 0, "no edit has shifted this index yet");
-        let (again, created_again, _) =
-            tracker.get_or_create_in_layer_tracked(&uri, 0, 4, "word", 1);
-        assert_eq!(again, id);
-        assert!(!created_again, "re-mint reuses, atomically attributed");
-
-        tracker.remove_id(&uri, &id);
-        assert!(tracker.lookup_node(&uri, &id).is_none(), "reverse purged");
-        assert_eq!(
-            tracker.lookup_in_layer(&uri, 0, 4, "word", 1),
-            None,
-            "forward purged"
-        );
-
-        let fresh = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 1);
-        assert_ne!(fresh, id, "re-mint draws a fresh id");
-    }
-
     /// Every edit application advances the shift generation — including on a
-    /// URI with no entries yet — and a post-edit mint observes the advanced
-    /// generation, marking it as minted in a superseded coordinate space
-    /// relative to a pre-edit latch.
+    /// URI with no entries yet — so a latch taken before the edit refuses a
+    /// later batch, while a latch taken AFTER it mints.
     #[test]
     fn shift_generation_advances_on_every_edit_even_without_entries() {
         let tracker = NodeTracker::new();
@@ -923,12 +838,12 @@ mod tests {
             "the latch-before-first-mint case must detect this edit"
         );
 
-        let (_, created, observed_gen) =
-            tracker.get_or_create_in_layer_tracked(&uri, 10, 14, "word", 0);
-        assert!(created);
-        assert_eq!(
-            observed_gen, 1,
-            "a post-edit mint observes the advanced generation"
+        let post_edit_latch = tracker.mint_epoch(&uri);
+        assert!(
+            tracker
+                .mint_batch_if_unshifted(&uri, post_edit_latch, [(10, 14, "word", 0)])
+                .is_some(),
+            "a latch taken after the edit mints"
         );
 
         let _ = tracker.apply_text_diff(&uri, "aaaa aaaa aaaa", "aaaa aaaa bbbb aaaa");
