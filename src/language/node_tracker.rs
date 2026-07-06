@@ -680,7 +680,15 @@ impl NodeTracker {
     /// reopened document's live index, keep it (the epoch bump above still
     /// refuses any old-lifetime latch; old-lifetime entries it may carry
     /// are position-keyed and bounded, invalidated by the new lifetime's
-    /// edits like any other). Probe-sees-closed ⇒ no new-lifetime mint can
+    /// edits like any other). ACCEPTED residual of that keep: a pre-close
+    /// id can stay resolvable against the reopened document instead of
+    /// degrading to `null` — this is the didOpen-racing-didClose lifecycle
+    /// class the close path deliberately defers to a per-document
+    /// lifecycle-epoch gate (see the residual notes in `did_close.rs`);
+    /// separating the lifetimes here would need incarnation-tagged
+    /// entries, while the alternative (unconditional wipe) nulls the
+    /// reopened snapshot's ENTIRE id set — strictly worse.
+    /// Probe-sees-closed ⇒ no new-lifetime mint can
     /// have happened — mints are liveness-gated on the reopened snapshot,
     /// whose insert happens-before any mint that passed the gate, which
     /// happens-before this probe under the same entry lock — so the removal
