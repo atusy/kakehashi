@@ -581,24 +581,42 @@ impl LanguageServerPool {
     /// Deliberately conservative — a candidate is returned ONLY when it has at
     /// least one `Ready` connection AND none of its connections advertises
     /// `method`. Concretely:
-    /// - **No live connection** → NOT returned. The capability is unknown until
-    ///   the server is spawned + handshaked, so the caller must keep it and let
-    ///   the request spawn it, exactly as before this filter existed.
+    /// - **No live connection at all** → NOT returned. The capability is unknown
+    ///   until the server is spawned + handshaked, so the caller keeps it and
+    ///   lets the request spawn it, exactly as before this filter existed.
     /// - **Only non-`Ready` connections** (`Initializing`, `Failed`, `Closing`,
-    ///   `Closed`) → NOT returned. Their `server_capabilities` may not be in yet
-    ///   (`has_capability` is a premature `false`), and today's
-    ///   `get_or_create_connection_wait_ready` waits for `Ready` before checking
-    ///   (or respawns a `Failed` one), so dropping here would change behavior
-    ///   (skip a server that will answer). A server with BOTH a `Ready`-lacking
-    ///   connection and a separate still-`Initializing` one IS returned — the
-    ///   `Ready` one already answers the capability; the same-binary static caps
-    ///   make the `Initializing` one redundant (see the across-roots note below).
+    ///   `Closed`) and no `Ready` one → NOT returned. `server_capabilities` may
+    ///   not be in yet (`has_capability` is a premature `false`), and
+    ///   `get_or_create_connection_wait_ready` waits for `Ready` (or respawns a
+    ///   `Failed` one) before checking, so dropping here would skip a server that
+    ///   will answer.
     ///
-    /// Classification is **by server name across roots**, reusing
-    /// `pull_driven_servers`' caveat verbatim: capability is a binary-level
-    /// property, so a server counts as capable if ANY of its `(server, root)`
-    /// connections advertises `method`; the only divergence is the exotic
-    /// per-instance *dynamic* registration, accepted there and here.
+    /// # Soundness boundary and the across-roots limitation
+    ///
+    /// Classification is **by server name across roots**: a server is capable if
+    /// ANY of its `(server, root)` connections advertises `method`, incapable if
+    /// it has a `Ready` connection and NONE does. This is exactly sound **iff the
+    /// capability is root-invariant** — the near-universal reality, since every
+    /// instance of one binary reports identical *static* `initialize`
+    /// capabilities (this is what makes a statically pull-incapable server like
+    /// basedpyright safe to drop on every root). It is NOT precise about the
+    /// serving root: if a `Ready` connection for `(server, rootA)` lacks `method`
+    /// while `(server, rootB)` would advertise it, a request in rootB is dropped
+    /// even though rootB has no connection yet or only an `Initializing` one — so
+    /// the "non-`Ready` is never dropped" rule above holds only when that is the
+    /// server's SOLE connection.
+    ///
+    /// That over-drop can fire only under genuine per-root capability
+    /// **divergence** (per-root `initializationOptions` that change advertised
+    /// static caps, or a per-instance *dynamic* registration) AND the serving
+    /// root having no `Ready`-capable connection. It is impossible in a
+    /// single-root workspace, and not permanent: any request via an exempt method
+    /// (see `capability_prefilter_applies`) or any other path spawns the
+    /// divergent root's instance and self-corrects the classification. Scoping to
+    /// the request's `(server, root)` would need a per-server marker resolution
+    /// (`resolve_marker_and_key`, filesystem I/O) on this hot path, which would
+    /// erode the win this filter exists for; the per-handler capability gate
+    /// remains authoritative for every server this does keep.
     pub(crate) async fn servers_known_incapable(
         &self,
         candidates: &std::collections::HashSet<&str>,
