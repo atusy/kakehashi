@@ -174,13 +174,24 @@ pub(in crate::lsp::lsp_impl) struct CachedCapturesWalk {
     pub(in crate::lsp::lsp_impl) parsed_version: u64,
     pub(in crate::lsp::lsp_impl) incarnation: u64,
     pub(in crate::lsp::lsp_impl) generation: u64,
-    /// `Arc`'d: a memo hit and the lineage store share the array by refcount.
-    /// A deep clone of a large document's matches (19.6k `Value`s on the
-    /// profiling corpus) taxed every repeat request twice — once out of this
-    /// memo, once into the lineage slot.
-    pub(in crate::lsp::lsp_impl) matches: std::sync::Arc<Vec<Value>>,
-    pub(in crate::lsp::lsp_impl) skipped: std::sync::Arc<Vec<Value>>,
+    /// `Some((matches, skipped))` — `Arc`'d: a memo hit and the lineage store
+    /// share the array by refcount. A deep clone of a large document's
+    /// matches (19.6k `Value`s on the profiling corpus) taxed every repeat
+    /// request twice — once out of this memo, once into the lineage slot.
+    ///
+    /// `None` is a NEGATIVE memo: the walk completed and no visited language
+    /// had a kind file (protocol `null`). That outcome is deterministic for
+    /// the tag (same snapshot, same generation — a kind file can only appear
+    /// via a settings reload or post-install, both of which bump the
+    /// generation), so without it every parked single-flight loser re-elected
+    /// itself winner and re-ran the identical doomed walk SEQUENTIALLY, and
+    /// each client `null`-retry re-walked from scratch.
+    pub(in crate::lsp::lsp_impl) result: Option<WalkArrays>,
 }
+
+/// The shared `(matches, skipped)` arrays of one completed walk.
+pub(in crate::lsp::lsp_impl) type WalkArrays =
+    (std::sync::Arc<Vec<Value>>, std::sync::Arc<Vec<Value>>);
 
 /// Winner-side handle of the single-flight captures walk: holds the
 /// in-flight marker for one `(uri, kind, injection)` and, on drop (every
@@ -724,9 +735,12 @@ impl Kakehashi {
         // first walk completes — concurrent misses all re-executed the same
         // walk (the 01KWSECM… capture shows the same (snapshot, kind) walked
         // up to 4× at once). Losers park on the winner's Notify and re-check
-        // the memo; a winner that stores nothing (cancelled, null) wakes them
-        // to elect a new winner. The 1s re-loop timeout is a lost-wakeup
-        // backstop only — correctness never depends on it.
+        // the memo; a winner that stores nothing (cancelled, pool panic)
+        // wakes them to elect a new winner. A COMPLETED walk always stores —
+        // a `null` outcome as a negative entry — so the no-kind-file case
+        // can't convoy the losers into sequential identical walks. The 1s
+        // re-loop timeout is a lost-wakeup backstop only — correctness never
+        // depends on it.
         let mut flight_guard = None;
         let walk_key = if lsp_range.is_none() {
             let key = (uri.clone(), kind.to_string(), injection);
@@ -736,12 +750,17 @@ impl Kakehashi {
                     && hit.incarnation == incarnation
                     && hit.generation == generation
                 {
-                    return Ok(Some(ComputedCaptures {
-                        uri,
-                        incarnation,
-                        entry_content_version,
-                        matches: hit.matches.clone(),
-                        skipped: hit.skipped.clone(),
+                    // A negative entry (`None`) serves the protocol `null`
+                    // without a walk — no kind file for this snapshot +
+                    // generation, see `CachedCapturesWalk::result`.
+                    return Ok(hit.result.clone().map(|(matches, skipped)| {
+                        ComputedCaptures {
+                            uri,
+                            incarnation,
+                            entry_content_version,
+                            matches,
+                            skipped,
+                        }
                     }));
                 }
                 let notify = match self.captures_walk_inflight.entry(key.clone()) {
@@ -914,30 +933,29 @@ impl Kakehashi {
         if walk_cancel.is_cancelled() {
             return Err(JsonRpcError::request_cancelled());
         }
-        Ok(walked.map(|(matches, skipped)| {
-            // Arc once; the memo and the returned ComputedCaptures share the
-            // arrays by refcount instead of deep-cloning ~20k `Value`s.
-            let matches = std::sync::Arc::new(matches);
-            let skipped = std::sync::Arc::new(skipped);
-            if let Some(key) = walk_key {
-                self.captures_walk_cache.insert(
-                    key,
-                    CachedCapturesWalk {
-                        parsed_version: snapshot.parsed_version,
-                        incarnation,
-                        generation,
-                        matches: std::sync::Arc::clone(&matches),
-                        skipped: std::sync::Arc::clone(&skipped),
-                    },
-                );
-            }
-            ComputedCaptures {
-                uri,
-                incarnation,
-                entry_content_version,
-                matches,
-                skipped,
-            }
+        // Arc once; the memo and the returned ComputedCaptures share the
+        // arrays by refcount instead of deep-cloning ~20k `Value`s. A `None`
+        // walk (no kind file) is memoized too — the negative entry, see
+        // `CachedCapturesWalk::result`.
+        let result = walked
+            .map(|(matches, skipped)| (std::sync::Arc::new(matches), std::sync::Arc::new(skipped)));
+        if let Some(key) = walk_key {
+            self.captures_walk_cache.insert(
+                key,
+                CachedCapturesWalk {
+                    parsed_version: snapshot.parsed_version,
+                    incarnation,
+                    generation,
+                    result: result.clone(),
+                },
+            );
+        }
+        Ok(result.map(|(matches, skipped)| ComputedCaptures {
+            uri,
+            incarnation,
+            entry_content_version,
+            matches,
+            skipped,
         }))
     }
 }
