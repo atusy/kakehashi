@@ -37,6 +37,7 @@ impl Kakehashi {
             // full again", never to stale data.)
             self.captures_cache.retain(|key, _| key.0 != uri);
             self.captures_walk_cache.retain(|key, _| key.0 != uri);
+            self.captures_match_cache.clear_document(&uri);
             self.documents.remove(&uri);
         }
 
