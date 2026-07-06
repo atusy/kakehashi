@@ -1042,6 +1042,67 @@ mod tests {
         );
     }
 
+    /// A `$/cancelRequest` arriving while the handler is parked on a trailing
+    /// snapshot must answer RequestCancelled promptly (the
+    /// `TokenSnapshot::Cancelled` arm) — not sit out the settle backstop.
+    #[tokio::test(start_paused = true)]
+    async fn semantic_tokens_full_cancel_while_parked_answers_request_cancelled() {
+        use tower_lsp_server::jsonrpc::Id;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///serve_current_cancel.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        // No snapshot for the live content version → the handler parks.
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), "fn main() { }".to_string(), None);
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            // The upstream request id rides task-local storage (installed by
+            // the RequestIdCapture middleware in production).
+            tokio::spawn(crate::lsp::request_id::CURRENT_REQUEST_ID.scope(
+                Some(Id::Number(42)),
+                async move {
+                    service
+                        .inner()
+                        .semantic_tokens_full_impl(full_params(&uri))
+                        .await
+                },
+            ))
+        };
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "the handler must be parked awaiting the current snapshot"
+        );
+
+        service
+            .inner()
+            .bridge
+            .cancel_forwarder()
+            .forward_cancel(crate::lsp::bridge::UpstreamId::Number(42))
+            .await
+            .expect("cancel forward must not error");
+
+        let result = request.await.expect("handler task must not panic");
+        let err = result.expect_err("a cancelled parked request must error, not answer");
+        assert_eq!(
+            err.code,
+            Error::request_cancelled().code,
+            "the parked handler must answer RequestCancelled on $/cancelRequest"
+        );
+    }
+
     /// When no parse catches up within the settle backstop, the handler must
     /// reject with ContentModified (the parse loop's settle refresh re-drives
     /// the client later) — never answer with tokens for text the client no

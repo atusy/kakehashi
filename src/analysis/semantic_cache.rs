@@ -847,6 +847,28 @@ mod tests {
         );
     }
 
+    /// The validity fold must separate resolved languages for identical bytes
+    /// (the #530 wrong-language discipline) and be deterministic — the store/
+    /// read path and populate's eviction sweep both compute it and must agree.
+    #[test]
+    fn region_validity_hash_separates_languages_and_is_deterministic() {
+        let content_hash = 0xDEAD_BEEF_u64;
+        assert_eq!(
+            region_validity_hash(content_hash, "lua"),
+            region_validity_hash(content_hash, "lua"),
+        );
+        assert_ne!(
+            region_validity_hash(content_hash, "lua"),
+            region_validity_hash(content_hash, "python"),
+            "identical bytes injecting a different language must key differently"
+        );
+        assert_ne!(
+            region_validity_hash(0x1111, "lua"),
+            region_validity_hash(0x2222, "lua"),
+            "different content must key differently for the same language"
+        );
+    }
+
     #[test]
     fn test_injection_map_get_tokens_via_region_id() {
         use crate::language::injection::CacheableInjectionRegion;

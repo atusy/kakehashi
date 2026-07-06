@@ -753,15 +753,16 @@ impl Kakehashi {
                     // A negative entry (`None`) serves the protocol `null`
                     // without a walk — no kind file for this snapshot +
                     // generation, see `CachedCapturesWalk::result`.
-                    return Ok(hit.result.clone().map(|(matches, skipped)| {
-                        ComputedCaptures {
+                    return Ok(hit
+                        .result
+                        .clone()
+                        .map(|(matches, skipped)| ComputedCaptures {
                             uri,
                             incarnation,
                             entry_content_version,
                             matches,
                             skipped,
-                        }
-                    }));
+                        }));
                 }
                 let notify = match self.captures_walk_inflight.entry(key.clone()) {
                     dashmap::mapref::entry::Entry::Vacant(vacant) => {
@@ -1343,6 +1344,189 @@ mod tests {
         // Tree-less snapshot → the walk degrades to the protocol null; what
         // matters here is WHEN it answered (after currency), not the shape.
         assert_eq!(result, Value::Null);
+    }
+
+    /// Single-flight: a request that finds another walk in flight for the
+    /// same `(uri, kind, injection)` parks on the winner's `Notify`, and on
+    /// wake serves the winner's memo instead of re-executing the walk. Pinned
+    /// with a sentinel memo no real walk could produce.
+    #[tokio::test(start_paused = true)]
+    async fn captures_full_single_flight_loser_serves_winner_memo() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///captures_single_flight.rs").expect("valid test uri");
+        let text = "fn main() {}";
+
+        service.inner().documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let incarnation = service
+            .inner()
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document just inserted")
+            .slot
+            .current_incarnation;
+        // A real tree so the handler passes the tree check and reaches the
+        // single-flight loop (a tree-less snapshot short-circuits to null).
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust grammar loads");
+        let tree = parser.parse(text, None).expect("parse rust");
+        let landed = service
+            .inner()
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some("rust".to_string()),
+                        parsed_version: 0,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test snapshot must land");
+        let generation = service.inner().cache.semantic_token_generation();
+
+        // Simulate a winner already walking this key.
+        let key = (uri.clone(), "highlights".to_string(), false);
+        let winner_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        service
+            .inner()
+            .captures_walk_inflight
+            .insert(key.clone(), std::sync::Arc::clone(&winner_notify));
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .kakehashi_captures_full(CapturesFullParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: crate::lsp::lsp_impl::url_to_uri(&uri)
+                                .expect("test URI should convert"),
+                        },
+                        kind: "highlights".to_string(),
+                        injection: false,
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "the loser must park on the winner's in-flight marker"
+        );
+
+        // Winner completes: memo BEFORE marker removal + wake — the same
+        // ordering the handler's `_flight_guard` drop guarantees.
+        let sentinel = json!({"sentinel": "from-winner-memo"});
+        service.inner().captures_walk_cache.insert(
+            key.clone(),
+            CachedCapturesWalk {
+                parsed_version: 0,
+                incarnation,
+                generation,
+                result: Some((
+                    std::sync::Arc::new(vec![sentinel.clone()]),
+                    std::sync::Arc::new(Vec::new()),
+                )),
+            },
+        );
+        service.inner().captures_walk_inflight.remove(&key);
+        winner_notify.notify_waiters();
+
+        let result = request
+            .await
+            .expect("handler task must not panic")
+            .expect("captures full must not error");
+        assert_eq!(
+            result["matches"][0], sentinel,
+            "the loser must serve the winner's memo, not run its own walk"
+        );
+    }
+
+    /// A `$/cancelRequest` arriving while the handler is parked on a trailing
+    /// snapshot must answer RequestCancelled promptly — not sit out the
+    /// settle backstop.
+    #[tokio::test(start_paused = true)]
+    async fn captures_full_cancel_while_parked_answers_request_cancelled() {
+        use tower_lsp_server::jsonrpc::Id;
+
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///captures_cancel_parked.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        // No snapshot published for the live content version: with an edit
+        // past the (absent) parse, the handler parks in the serve-current
+        // wait.
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), "fn main() { }".to_string(), None);
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            // The upstream request id rides task-local storage (installed by
+            // the RequestIdCapture middleware in production).
+            tokio::spawn(crate::lsp::request_id::CURRENT_REQUEST_ID.scope(
+                Some(Id::Number(77)),
+                async move {
+                    service
+                        .inner()
+                        .kakehashi_captures_full(CapturesFullParams {
+                            text_document: TextDocumentIdentifier {
+                                uri: crate::lsp::lsp_impl::url_to_uri(&uri)
+                                    .expect("test URI should convert"),
+                            },
+                            kind: "highlights".to_string(),
+                            injection: false,
+                        })
+                        .await
+                },
+            ))
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "the handler must be parked awaiting the current snapshot"
+        );
+
+        service
+            .inner()
+            .bridge
+            .cancel_forwarder()
+            .forward_cancel(crate::lsp::bridge::UpstreamId::Number(77))
+            .await
+            .expect("cancel forward must not error");
+
+        let result = request.await.expect("handler task must not panic");
+        let err = result.expect_err("a cancelled parked request must error, not answer");
+        assert_eq!(
+            err.code,
+            JsonRpcError::request_cancelled().code,
+            "the parked handler must answer RequestCancelled on $/cancelRequest"
+        );
     }
 
     fn first_node_id(matches: &[Value]) -> ulid::Ulid {
