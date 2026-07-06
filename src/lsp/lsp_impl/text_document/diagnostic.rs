@@ -235,33 +235,13 @@ impl Kakehashi {
         // basedpyright, warmed by eager-open, is dropped here for EVERY region
         // instead of once per (region × pull). One pool query for the whole
         // request; the resulting set is a cheap lookup inside the region loop.
-        //
-        // Candidates: the distinct injection languages' configured servers. The
-        // per-language config resolution is a cached lookup
-        // (`cached_configs_for_injection_language`); the owned `configs_by_lang`
-        // exists only so the candidate `&str`s can borrow from it across the
-        // `await`, and the region loop re-resolves (same cheap cached call).
-        let incapable_servers = {
-            let mut langs: Vec<&str> = virt_regions
-                .iter()
-                .map(|r| r.injection_language.as_str())
-                .collect();
-            langs.sort_unstable();
-            langs.dedup();
-            let configs_by_lang: Vec<_> = langs
-                .iter()
-                .map(|lang| self.bridge_configs_for_injection_language(&language_name, lang))
-                .collect();
-            let candidates: std::collections::HashSet<&str> = configs_by_lang
-                .iter()
-                .flatten()
-                .map(|c| c.server_name.as_str())
-                .collect();
-            self.bridge
-                .pool_arc()
-                .servers_known_incapable(&candidates, "textDocument/diagnostic")
-                .await
-        };
+        let incapable_servers = self
+            .incapable_virt_servers(
+                &language_name,
+                virt_regions.iter().map(|r| r.injection_language.as_str()),
+                "textDocument/diagnostic",
+            )
+            .await;
 
         // Virt layer: 2-level aggregation —
         //   Inner: dispatch per region (fans out to all servers for that region)

@@ -25,15 +25,27 @@ use super::{Kakehashi, uri_to_url};
 ///
 /// The prefilter relies on `has_capability(method) == false` being observably
 /// equivalent to the handler returning an empty result. That holds for every
-/// routed method EXCEPT `textDocument/prepareRename`: its handler
-/// ([`send_prepare_rename_request`]) falls back to `DefaultBehavior` (rename
-/// stays enabled) when the server advertises `textDocument/rename` but not
-/// `prepareRename`, so dropping such a server here would silently disable
-/// rename in injected regions. Exempt it — the per-handler gate still runs.
+/// routed method EXCEPT the ones whose handler falls back to a *different*
+/// capability when the requested one is absent — dropping a server by the
+/// requested capability alone would then discard a server that would have
+/// answered via the fallback:
+/// - `textDocument/prepareRename` → `send_prepare_rename_request` returns
+///   `DefaultBehavior` (rename stays enabled) when the server advertises
+///   `textDocument/rename` but not `prepareRename`.
+/// - `textDocument/formatting` / `textDocument/rangeFormatting` → the
+///   Concatenated pipeline ([`pipeline_step_request_kind`]) uses a server that
+///   supports EITHER full OR range formatting, sending whichever it advertises;
+///   filtering by one alone would drop a server capable of the other.
 ///
-/// [`send_prepare_rename_request`]: crate::lsp::bridge::LanguageServerPool::send_prepare_rename_request
+/// For exempt methods the per-handler capability gate still runs and handles
+/// the fallback correctly.
+///
+/// [`pipeline_step_request_kind`]: crate::lsp::lsp_impl::text_document::formatting
 fn capability_prefilter_applies(method: &str) -> bool {
-    method != "textDocument/prepareRename"
+    !matches!(
+        method,
+        "textDocument/prepareRename" | "textDocument/formatting" | "textDocument/rangeFormatting"
+    )
 }
 
 /// All resolved context needed to send bridge requests to multiple servers.
@@ -612,6 +624,52 @@ impl Kakehashi {
             .allows(LayerSource::Virt)
     }
 
+    /// Shared capability prefilter (capability-prefilter-fanout): the set of
+    /// server names to drop from `method`'s virt fan-out across the given
+    /// `injection_languages` — those with a live `Ready` connection already
+    /// known to lack the capability (so the fan-out never spawns a task +
+    /// connection lookup only to hit the per-handler gate and return empty).
+    ///
+    /// One pool query for the whole request; every virt fan-out entry point
+    /// (per-region diagnostic loop, whole-document helper, documentSymbol /
+    /// documentColor, position/range preamble) routes through here so the drop
+    /// policy is uniform. Returns an empty set — a cheap no-op for callers —
+    /// when `method` is exempt (see [`capability_prefilter_applies`]) or nothing
+    /// is configured. `injection_languages` may repeat; it is deduped here.
+    ///
+    /// The owned `configs_by_lang` exists only so the candidate `&str`s can
+    /// borrow across the `await`; the per-language resolution is a cached lookup
+    /// and callers re-resolve their own per-region configs (same cached call).
+    pub(super) async fn incapable_virt_servers<'a>(
+        &self,
+        host_language: &str,
+        injection_languages: impl IntoIterator<Item = &'a str>,
+        method: &str,
+    ) -> std::collections::HashSet<String> {
+        if !capability_prefilter_applies(method) {
+            return std::collections::HashSet::new();
+        }
+        let mut langs: Vec<&str> = injection_languages.into_iter().collect();
+        langs.sort_unstable();
+        langs.dedup();
+        let configs_by_lang: Vec<_> = langs
+            .iter()
+            .map(|lang| self.bridge_configs_for_injection_language(host_language, lang))
+            .collect();
+        let candidates: std::collections::HashSet<&str> = configs_by_lang
+            .iter()
+            .flatten()
+            .map(|c| c.server_name.as_str())
+            .collect();
+        if candidates.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        self.bridge
+            .pool_arc()
+            .servers_known_incapable(&candidates, method)
+            .await
+    }
+
     /// Convert a preamble result into a `DocumentRequestContext` by looking up
     /// bridge server configs for the injection language.
     ///
@@ -650,29 +708,23 @@ impl Kakehashi {
         // Drop servers already known (a live, `Ready` connection) NOT to support
         // this method, so the fan-out never spawns a task + connection lookup
         // only to hit the per-handler capability gate and return empty
-        // (capability-prefilter-fanout). Uses the same `has_capability(method)`
-        // predicate as that gate, so a dropped server is observably equivalent
-        // to it having answered empty. Unknown / still-initializing servers are
-        // kept (spawned/awaited as before). Exempt methods whose capability-absent
-        // handler branch is NOT empty (see `capability_prefilter_applies`).
-        if capability_prefilter_applies(method_name) {
-            let candidates: std::collections::HashSet<&str> =
-                configs.iter().map(|c| c.server_name.as_str()).collect();
-            let incapable = self
-                .bridge
-                .pool_arc()
-                .servers_known_incapable(&candidates, method_name)
-                .await;
-            if !incapable.is_empty() {
-                configs.retain(|c| !incapable.contains(&c.server_name));
-                if configs.is_empty() {
-                    log::debug!(
-                        "{}: all configured servers for {} are known-incapable; skipping virt layer",
-                        method_name,
-                        preamble.resolved.injection_language
-                    );
-                    return None;
-                }
+        // (capability-prefilter-fanout).
+        let incapable = self
+            .incapable_virt_servers(
+                &preamble.language_name,
+                std::iter::once(preamble.resolved.injection_language.as_str()),
+                method_name,
+            )
+            .await;
+        if !incapable.is_empty() {
+            configs.retain(|c| !incapable.contains(&c.server_name));
+            if configs.is_empty() {
+                log::debug!(
+                    "{}: all configured servers for {} are known-incapable; skipping virt layer",
+                    method_name,
+                    preamble.resolved.injection_language
+                );
+                return None;
             }
         }
 
