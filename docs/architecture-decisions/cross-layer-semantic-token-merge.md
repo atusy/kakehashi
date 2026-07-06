@@ -196,8 +196,9 @@ config that suppresses it.)
    bridged layers still in flight are not awaited even if one could return
    first. If `priorities` **omits** `native`
    (e.g. `["host"]`), there is no instant local layer: the first response is
-   whatever bridged set is already cached for the current version, or an empty
-   result if none is — and the bridged layers still refine via step 2. Omitting
+   whatever bridged sets are already on hand (current, or stale-shifted per
+   the version contract below), or an empty result if none are — and the
+   bridged layers still refine via step 2. Omitting
    native therefore trades instant highlighting for bridged-only output; the
    default keeps the instant-paint guarantee. Config validation **warns** when
    `priorities` omits `native`, so the trade is explicit, not accidental.
@@ -215,9 +216,9 @@ window length is an implementation concern; the policy — batch within a
 window, never block a refresh on the slowest layer — is decided here, because
 it fixes how many intermediate paints the user sees.
 
-**Delta baseline contract.** Every array kakehashi returns — the first response
-(native-only by default, or a cached/empty bridged set when `native` is
-omitted) *and* every subsequent merged response — is a valid `full/delta`
+**Delta baseline contract.** Every array kakehashi returns — the first
+response (step 1's synchronously-available set) *and* every subsequent merged
+response — is a valid `full/delta`
 baseline, tagged with a `resultId`. A `full/delta` request diffs against the
 array named by its `previousResultId`, not against an internal "last merged"
 cache; if that baseline is no longer retained, kakehashi falls back to a full
