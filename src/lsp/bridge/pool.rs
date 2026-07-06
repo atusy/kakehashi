@@ -567,6 +567,64 @@ impl LanguageServerPool {
         pull_driven
     }
 
+    /// Among `candidates`, the server names **known** not to support `method`:
+    /// the server has at least one live connection past initialization (`Ready`)
+    /// and NONE of its live connections advertises `method` (via static
+    /// initialize caps or a dynamic registration) — checked WITHOUT creating a
+    /// connection (capability-prefilter-fanout).
+    ///
+    /// The inverse of `has_capability`: fan-out builders use this to drop a
+    /// server from a region's candidate set *before* spawning a task, so a
+    /// request never spins up a task + connection lookup only to hit the
+    /// per-handler capability gate and return an empty result.
+    ///
+    /// Deliberately conservative — a candidate is returned ONLY when its
+    /// capability is *definitively* known-absent:
+    /// - **No live connection** → NOT returned. The capability is unknown until
+    ///   the server is spawned + handshaked, so the caller must keep it and let
+    ///   the request spawn it, exactly as before this filter existed.
+    /// - **A still-`Initializing` connection** → NOT returned. Its
+    ///   `server_capabilities` are not in yet (`has_capability` is a premature
+    ///   `false`); today's `get_or_create_connection_wait_ready` waits for it to
+    ///   become `Ready` before checking, so dropping it here would change
+    ///   behavior (skip a server that will answer).
+    ///
+    /// Classification is **by server name across roots**, reusing
+    /// `pull_driven_servers`' caveat verbatim: capability is a binary-level
+    /// property, so a server counts as capable if ANY of its `(server, root)`
+    /// connections advertises `method`; the only divergence is the exotic
+    /// per-instance *dynamic* registration, accepted there and here.
+    pub(crate) async fn servers_known_incapable(
+        &self,
+        candidates: &std::collections::HashSet<&str>,
+        method: &str,
+    ) -> std::collections::HashSet<String> {
+        if candidates.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let connections = self.connections.lock().await;
+        // Tie the accumulated names to `candidates`' lifetime (not the lock
+        // guard) so the returned `String`s outlive the guard drop.
+        let mut capable: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut has_ready: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for handle in connections.values() {
+            let Some(&candidate) = candidates.get(handle.key().server()) else {
+                continue;
+            };
+            if handle.has_capability(method) {
+                capable.insert(candidate);
+            }
+            if handle.state() == ConnectionState::Ready {
+                has_ready.insert(candidate);
+            }
+        }
+        candidates
+            .iter()
+            .filter(|&&name| has_ready.contains(name) && !capable.contains(name))
+            .map(|&name| name.to_string())
+            .collect()
+    }
+
     /// Host-document sync state (host-document-bridge). Used by the host
     /// request path in `text_document/host.rs`.
     pub(super) async fn host_documents(
@@ -5158,6 +5216,108 @@ mod tests {
         let pool = LanguageServerPool::new();
         assert!(
             pool.pull_driven_servers(&HashSet::<&str>::new())
+                .await
+                .is_empty()
+        );
+    }
+
+    /// `servers_known_incapable` returns exactly the candidates whose capability
+    /// is *definitively* known-absent: a `Ready` connection lacking `method`.
+    /// A capable server, a still-`Initializing` one, and a name with no live
+    /// connection are all kept out of the result (capability-prefilter-fanout).
+    #[tokio::test]
+    async fn servers_known_incapable_returns_only_ready_and_lacking() {
+        use std::collections::HashSet;
+        use tower_lsp_server::ls_types::{HoverProviderCapability, ServerCapabilities};
+
+        let pool = LanguageServerPool::new();
+
+        // "capable" is Ready and advertises hover → NOT incapable.
+        let capable =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("capable"))
+                .await;
+        capable.set_server_capabilities(ServerCapabilities {
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            ..Default::default()
+        });
+        pool.insert_connection(capable).await;
+
+        // "lacking" is Ready with no hover capability → incapable (the one hit).
+        let lacking =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lacking"))
+                .await;
+        lacking.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(lacking).await;
+
+        // "warming" is still Initializing → capability unknown, must be kept.
+        let warming = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("warming"),
+        )
+        .await;
+        pool.insert_connection(warming).await;
+
+        let candidates = HashSet::from([
+            "capable", "lacking", "warming", "ghost", // no live connection
+        ]);
+        let incapable = pool
+            .servers_known_incapable(&candidates, "textDocument/hover")
+            .await;
+
+        assert_eq!(
+            incapable,
+            HashSet::from(["lacking".to_string()]),
+            "only a Ready connection that lacks the capability is known-incapable"
+        );
+    }
+
+    /// A server counts as capable if ANY of its `(server, root)` connections
+    /// advertises `method`, so a Ready-but-lacking instance alongside a capable
+    /// one does not make the server incapable (across-roots caveat).
+    #[tokio::test]
+    async fn servers_known_incapable_capable_on_any_instance_wins() {
+        use std::collections::HashSet;
+        use tower_lsp_server::ls_types::{HoverProviderCapability, ServerCapabilities};
+
+        let pool = LanguageServerPool::new();
+
+        let root_a = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("srv", Some("/a".to_string())),
+        )
+        .await;
+        root_a.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(root_a).await;
+
+        let root_b = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("srv", Some("/b".to_string())),
+        )
+        .await;
+        root_b.set_server_capabilities(ServerCapabilities {
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            ..Default::default()
+        });
+        pool.insert_connection(root_b).await;
+
+        let candidates = HashSet::from(["srv"]);
+        let incapable = pool
+            .servers_known_incapable(&candidates, "textDocument/hover")
+            .await;
+
+        assert!(
+            incapable.is_empty(),
+            "a capable instance makes the whole server capable across roots"
+        );
+    }
+
+    /// An empty candidate set short-circuits to empty without touching the pool.
+    #[tokio::test]
+    async fn servers_known_incapable_empty_candidates_returns_empty() {
+        use std::collections::HashSet;
+        let pool = LanguageServerPool::new();
+        assert!(
+            pool.servers_known_incapable(&HashSet::<&str>::new(), "textDocument/hover")
                 .await
                 .is_empty()
         );
