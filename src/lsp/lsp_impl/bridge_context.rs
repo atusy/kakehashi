@@ -1074,11 +1074,14 @@ impl Kakehashi {
     }
 
     /// Range-overlap variant of [`Self::resolve_bridge_contexts_for_range`]:
-    /// when `range.start` is not inside an injection — save-time flows
-    /// (`editor.codeActionsOnSave`) request with a whole-document range
-    /// starting at (0,0) — fall back to the FIRST region intersecting the
-    /// range and clamp the request range to it, so coordinate translation
-    /// stays in-region. Only the first intersecting region is bridged
+    /// bridge the FIRST region (document order) that intersects the range
+    /// and resolves to bridge server configs, clamping the request range to
+    /// that region so coordinate translation stays in-region — a range that
+    /// merely starts inside a region can still overshoot its end, and
+    /// save-time flows (`editor.codeActionsOnSave`) request with a
+    /// whole-document range starting at (0,0), outside any injection.
+    /// Unconfigured injections (e.g. `markdown_inline`) never shadow a
+    /// configured region further down. Only one region is bridged
     /// (preferred semantics; multi-region merging is #568 stage 7).
     pub(crate) async fn resolve_bridge_contexts_for_range_overlap(
         &self,
@@ -1086,17 +1089,13 @@ impl Kakehashi {
         range: Range,
         method_name: &str,
     ) -> Option<RangeRequestContext> {
-        if let Some(ctx) = self
-            .resolve_bridge_contexts_for_range(lsp_uri, range, method_name)
-            .await
-        {
-            return Some(ctx);
-        }
+        self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         self.resolve_first_region_overlapping_range(lsp_uri, range, method_name)
     }
 
-    /// Whole-document region scan behind the overlap fallback: the tree is
-    /// already fresh (the primary resolver awaited it).
+    /// Whole-document region scan behind
+    /// [`Self::resolve_bridge_contexts_for_range_overlap`]; the tree is
+    /// already fresh (the caller awaited it).
     fn resolve_first_region_overlapping_range(
         &self,
         lsp_uri: &Uri,
