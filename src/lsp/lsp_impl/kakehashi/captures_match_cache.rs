@@ -50,31 +50,50 @@ fn fnv1a(hash: &mut u64, bytes: &[u8]) {
     }
 }
 
+/// One included range as the cache key consumes it: byte span plus the
+/// COLUMNS tree-sitter was given for its endpoints. Rows are deliberately
+/// absent — a vertical shift changes rows but cannot change the parse — but
+/// columns can: an indentation-sensitive injected grammar (Python, YAML)
+/// parses differently when the range starts at a different column, and a
+/// gap's internal newline moving changes a later range's column without
+/// touching any hashed byte. See `content.rs`'s column-offset parse tests.
+pub(in crate::lsp::lsp_impl) struct KeyRange {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
 /// The cache key of one layer's walk: `(anchor, validity_hash)`.
 ///
 /// `anchor` is the layer's first included-range start — the offset cached
 /// matches are stored relative to, and the offset a hit re-adds. The hash
 /// folds the kind file name, the layer language, and each included range's
-/// anchor-relative geometry plus its text, so it is translation-invariant
-/// (an edit above the layer shifts the anchor, not the hash) but changes
-/// whenever the layer's visible bytes or its internal gap structure change.
+/// anchor-relative byte geometry, endpoint columns, and text, so it is
+/// invariant under VERTICAL translation (an edit on earlier lines shifts
+/// the anchor and rows, neither of which the parse can see) but changes
+/// whenever the layer's visible bytes, its internal gap structure, or its
+/// column placement change.
 ///
 /// Ranges are clamped to `text.len()` before hashing: a host tree parsed
 /// without explicit included ranges reports one `0..u32::MAX`-ish range.
 pub(in crate::lsp::lsp_impl) fn layer_cache_key(
     kind: &str,
     language: &str,
-    ranges: impl IntoIterator<Item = (usize, usize)>,
+    ranges: impl IntoIterator<Item = KeyRange>,
     text: &str,
 ) -> (usize, u64) {
     let mut hash = FNV_OFFSET;
     fnv1a(&mut hash, kind.as_bytes());
+    // Domain separator between the two variable-length prefix fields (kind
+    // is charset-validated and cannot contain 0xFF; language names cannot
+    // either, both being path components).
     fnv1a(&mut hash, &[0xFF]);
     fnv1a(&mut hash, language.as_bytes());
     let mut anchor = None;
-    for (start, end) in ranges {
-        let start = start.min(text.len());
-        let end = end.min(text.len());
+    for range in ranges {
+        let start = range.start_byte.min(text.len());
+        let end = range.end_byte.min(text.len());
         let anchor = *anchor.get_or_insert(start);
         // Separator + relative geometry: two range lists with the same
         // concatenated content but different gaps must not collide.
@@ -84,14 +103,18 @@ pub(in crate::lsp::lsp_impl) fn layer_cache_key(
             &(start.wrapping_sub(anchor) as u64).to_le_bytes(),
         );
         fnv1a(&mut hash, &(end.wrapping_sub(anchor) as u64).to_le_bytes());
+        fnv1a(&mut hash, &(range.start_col as u64).to_le_bytes());
+        fnv1a(&mut hash, &(range.end_col as u64).to_le_bytes());
+        // `start.min(end)` tolerates a (never observed) inverted range the
+        // same way the clamping above tolerates the host sentinel span.
         fnv1a(&mut hash, &text.as_bytes()[start.min(end)..end]);
     }
     (anchor.unwrap_or(0), hash)
 }
 
 /// [`layer_cache_key`] over a parsed layer tree — `Tree::included_ranges`
-/// recovers the exact absolute ranges the layer was parsed with (for a host
-/// tree, the whole document).
+/// recovers the exact absolute ranges (bytes AND points) the layer was
+/// parsed with (for a host tree, the whole document).
 pub(in crate::lsp::lsp_impl) fn tree_cache_key(
     kind: &str,
     language: &str,
@@ -101,9 +124,12 @@ pub(in crate::lsp::lsp_impl) fn tree_cache_key(
     layer_cache_key(
         kind,
         language,
-        tree.included_ranges()
-            .iter()
-            .map(|r| (r.start_byte, r.end_byte)),
+        tree.included_ranges().iter().map(|r| KeyRange {
+            start_byte: r.start_byte,
+            end_byte: r.end_byte,
+            start_col: r.start_point.column,
+            end_col: r.end_point.column,
+        }),
         text,
     )
 }
@@ -303,23 +329,33 @@ mod tests {
         Url::parse("file:///match_cache.md").unwrap()
     }
 
+    /// A `KeyRange` with column-0 endpoints — the common fence shape.
+    fn kr(start_byte: usize, end_byte: usize) -> KeyRange {
+        KeyRange {
+            start_byte,
+            end_byte,
+            start_col: 0,
+            end_col: 0,
+        }
+    }
+
     #[test]
     fn key_is_deterministic_and_separates_kind_and_language() {
         let text = "abcdefghij";
-        let base = layer_cache_key("highlights", "lua", [(2, 8)], text);
+        let base = layer_cache_key("highlights", "lua", [kr(2, 8)], text);
         assert_eq!(
             base,
-            layer_cache_key("highlights", "lua", [(2, 8)], text),
+            layer_cache_key("highlights", "lua", [kr(2, 8)], text),
             "same inputs -> same key"
         );
         assert_ne!(
             base.1,
-            layer_cache_key("locals", "lua", [(2, 8)], text).1,
+            layer_cache_key("locals", "lua", [kr(2, 8)], text).1,
             "kind separates"
         );
         assert_ne!(
             base.1,
-            layer_cache_key("highlights", "vim", [(2, 8)], text).1,
+            layer_cache_key("highlights", "vim", [kr(2, 8)], text).1,
             "language separates"
         );
     }
@@ -328,19 +364,60 @@ mod tests {
     fn key_is_translation_invariant_but_geometry_sensitive() {
         // Same content, shifted: the anchor moves, the hash does not — this
         // IS the cross-snapshot hit ("edit above the fence").
-        let (anchor_a, hash_a) = layer_cache_key("h", "lua", [(2, 5), (7, 9)], "..abc..de.");
-        let (anchor_b, hash_b) = layer_cache_key("h", "lua", [(5, 8), (10, 12)], ".....abc..de..");
+        let (anchor_a, hash_a) = layer_cache_key("h", "lua", [kr(2, 5), kr(7, 9)], "..abc..de.");
+        let (anchor_b, hash_b) =
+            layer_cache_key("h", "lua", [kr(5, 8), kr(10, 12)], ".....abc..de..");
         assert_eq!(hash_a, hash_b, "translated identical layer must hit");
         assert_eq!((anchor_a, anchor_b), (2, 5));
 
         // Same concatenated content ("abcde"), different gap: the layer tree
         // was parsed over different geometry, so the hash must differ.
-        let (_, gap_moved) = layer_cache_key("h", "lua", [(2, 6), (8, 9)], "..abcd..e.");
+        let (_, gap_moved) = layer_cache_key("h", "lua", [kr(2, 6), kr(8, 9)], "..abcd..e.");
         assert_ne!(hash_a, gap_moved, "gap geometry must separate");
 
         // Different content, same geometry.
-        let (_, content_changed) = layer_cache_key("h", "lua", [(2, 5), (7, 9)], "..abX..de.");
+        let (_, content_changed) = layer_cache_key("h", "lua", [kr(2, 5), kr(7, 9)], "..abX..de.");
         assert_ne!(hash_a, content_changed, "content must separate");
+    }
+
+    /// Endpoint columns are parse inputs for indentation-sensitive grammars
+    /// (and a gap's internal newline can move a later range's column without
+    /// touching any hashed byte) — same bytes at a different column must not
+    /// alias.
+    #[test]
+    fn key_separates_endpoint_columns() {
+        let text = "..abc..de.";
+        let base = layer_cache_key("h", "python", [kr(2, 5), kr(7, 9)], text);
+        let indented = layer_cache_key(
+            "h",
+            "python",
+            [
+                KeyRange {
+                    start_byte: 2,
+                    end_byte: 5,
+                    start_col: 4,
+                    end_col: 0,
+                },
+                kr(7, 9),
+            ],
+            text,
+        );
+        assert_ne!(base.1, indented.1, "first-range start column separates");
+        let gap_newline_moved = layer_cache_key(
+            "h",
+            "python",
+            [
+                kr(2, 5),
+                KeyRange {
+                    start_byte: 7,
+                    end_byte: 9,
+                    start_col: 2,
+                    end_col: 0,
+                },
+            ],
+            text,
+        );
+        assert_ne!(base.1, gap_newline_moved.1, "later-range column separates");
     }
 
     #[test]
@@ -348,8 +425,8 @@ mod tests {
         // A host tree parsed without explicit ranges reports ~0..u32::MAX;
         // the key must behave as "whole document".
         let text = "fn main() {}";
-        let clamped = layer_cache_key("h", "rust", [(0, u32::MAX as usize)], text);
-        let whole = layer_cache_key("h", "rust", [(0, text.len())], text);
+        let clamped = layer_cache_key("h", "rust", [kr(0, u32::MAX as usize)], text);
+        let whole = layer_cache_key("h", "rust", [kr(0, text.len())], text);
         assert_eq!(clamped, whole);
     }
 
