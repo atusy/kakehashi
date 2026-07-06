@@ -44,14 +44,18 @@
 ((method_definition
    type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
  (#set! definition.namespace "type"))
+; Base-clause use of a generic (`extends Base<T>`, outside the body) is not
+; covered — silence, or a rare wrong answer only if an outer type shares
+; the parameter name; scoping the whole declaration would swallow the
+; class/interface name, so the body is the target.
 ((class_declaration
-   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
-   @scope.body
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type))
+   body: (class_body) @scope.body)
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((interface_declaration
-   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type)))
-   @scope.body
+   type_parameters: (type_parameters (type_parameter name: (type_identifier) @definition.type))
+   body: (interface_body) @scope.body)
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 

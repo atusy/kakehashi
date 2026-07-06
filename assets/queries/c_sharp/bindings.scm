@@ -39,33 +39,34 @@
   (variable_declaration (variable_declarator name: (identifier) @definition.field)))
 (property_declaration name: (identifier) @definition.field)
 
-; Class-level generics bind by labelling the whole declaration, so the
-; parameter covers the base list (`: Base<T>`) as well as the body; method
-; generics land in the method scope by containment.
+; Class-level generics bind into the body by label; method generics land
+; in the method scope. ACCEPTED LIMITATION: a generic in the base list
+; (`: Base<T>`, outside the body) is not covered — silence, or a rare wrong
+; answer only if an outer type shares the parameter name. Scoping the whole
+; declaration would swallow the class's own name, so body-only is kept.
 ((class_declaration
-   (type_parameter_list (type_parameter name: (identifier) @definition.type)))
-   @scope.body
+   (type_parameter_list (type_parameter name: (identifier) @definition.type))
+   body: (declaration_list) @scope.body)
  (#set! definition.scope "body"))
 ((interface_declaration
-   (type_parameter_list (type_parameter name: (identifier) @definition.type)))
-   @scope.body
+   (type_parameter_list (type_parameter name: (identifier) @definition.type))
+   body: (declaration_list) @scope.body)
  (#set! definition.scope "body"))
 (method_declaration
   (type_parameter_list (type_parameter name: (identifier) @definition.type)))
 
-; ── Locals: sequential ───────────────────────────────────────────────────
-; Anchor `after` to the declarator, not the whole statement, so
-; `int a = 1, b = a;` sees the first declarator from the second.
+; ── Locals: point of declaration ─────────────────────────────────────────
+; Visible from the declarator onward, so `int a = 1, b = a;` sees the first
+; declarator from the second and `int a = a;` binds the new local.
 ((local_declaration_statement
-   (variable_declaration (variable_declarator name: (identifier) @definition) @_decl))
- (#set! definition.visibility "after"))
+   (variable_declaration (variable_declarator name: (identifier) @definition)))
+ (#set! definition.visibility "declaration"))
 ; `for (int i = 0; …)` — the initializer holds a bare variable_declaration
-; (no local_declaration_statement wrapper); i is scoped to the for.
-; Anchor `after` to the declaration, not the whole loop, so i is visible
-; in the condition, update, and body.
+; (no local_declaration_statement wrapper); i is scoped to the for and
+; visible from its declarator (condition, update, body).
 ((for_statement
-   initializer: (variable_declaration (variable_declarator name: (identifier) @definition)) @_decl)
- (#set! definition.visibility "after"))
+   initializer: (variable_declaration (variable_declarator name: (identifier) @definition)))
+ (#set! definition.visibility "declaration"))
 ; `M(out var x)` declares x from the expression onward.
 ((declaration_expression name: (identifier) @definition) @_decl
  (#set! definition.visibility "after"))

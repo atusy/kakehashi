@@ -537,11 +537,14 @@ mod tests {
         }
 
         #[test]
-        fn class_generic_covers_the_base_clause() {
-            let text = "class C<T> extends Base<T> { T field; }\n";
+        fn generic_param_resolves_in_body_and_the_class_name_resolves_externally() {
+            // The generic resolves inside the body; crucially the generic
+            // class's own name still resolves from outside (the generic must
+            // not turn the whole declaration into a scope that swallows it).
+            let text = "class Box<T> { T item; }\nclass K { Box b; }\n";
             let m = model_for("java", text);
-            assert_resolves(&m, text, "T", 1, 0); // extends Base<T>
-            assert_resolves(&m, text, "T", 2, 0); // T field
+            assert_resolves(&m, text, "T", 1, 0); // T item -> <T>
+            assert_resolves(&m, text, "Box", 1, 0); // external Box -> class Box
         }
     }
 
@@ -1701,10 +1704,19 @@ mod tests {
         #[test]
         fn a_later_declarator_sees_an_earlier_one_in_the_same_statement() {
             // `int a = 1, b = a;` — the second declarator's initializer reads
-            // the first declarator, so visibility anchors per declarator.
+            // the first declarator (point-of-declaration visibility).
             let text = "void f(void) { int a = 1, b = a; }";
             let m = model_for("c", text);
             assert_resolves(&m, text, "a", 1, 0);
+        }
+
+        #[test]
+        fn a_self_initializer_binds_the_new_local() {
+            // C's point-of-declaration: `int a = a;` reads the new
+            // (uninitialized) local, not the file-scope a.
+            let text = "int a = 1;\nvoid f(void) { int a = a; }";
+            let m = model_for("c", text);
+            assert_resolves(&m, text, "a", 2, 1);
         }
 
         #[test]

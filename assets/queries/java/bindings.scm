@@ -28,18 +28,22 @@
 ((enum_declaration name: (identifier) @definition.type)
  (#set! definition.namespace "type"))
 
-; Class/interface-level generics bind by labelling the whole declaration
-; as the target scope, so the parameter covers the `extends`/`implements`
-; base clause (which precedes the body) as well as the body itself;
-; method-level generics land in the method scope by containment.
+; Class/interface-level generics bind into the body by label (the
+; parameter list precedes the body node); method-level generics land in
+; the method scope by containment. ACCEPTED LIMITATION: a generic used in
+; the `extends`/`implements` base clause (outside the body node) is not
+; covered — normally silence, or a wrong answer only if an outer type
+; shares the single-letter parameter name (rare). Scoping the whole
+; declaration would fix it but would swallow the class's own name, so the
+; body-only target is kept.
 ((class_declaration
-   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type)))
-   @scope.body
+   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type))
+   body: (class_body) @scope.body)
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((interface_declaration
-   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type)))
-   @scope.body
+   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type))
+   body: (interface_body) @scope.body)
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((method_declaration
@@ -56,13 +60,13 @@
 (field_declaration
   declarator: (variable_declarator name: (identifier) @definition.field))
 
-; ── Locals: sequential ───────────────────────────────────────────────────
-; Anchor `after` to the individual declarator, not the whole statement, so
-; `int a = 1, b = a;` sees the first declarator from the second's
-; initializer (and a self-initializer `int a = a;` still reads outward).
+; ── Locals: point of declaration ─────────────────────────────────────────
+; Visible from the declarator onward (Java's point-of-declaration rule), so
+; `int a = 1, b = a;` sees the first declarator from the second, and a
+; self-initializer `int a = a;` binds the new local (not an outer a).
 ((local_variable_declaration
-   declarator: (variable_declarator name: (identifier) @definition) @_decl)
- (#set! definition.visibility "after"))
+   declarator: (variable_declarator name: (identifier) @definition))
+ (#set! definition.visibility "declaration"))
 
 ; ── Parameters ───────────────────────────────────────────────────────────
 (formal_parameter name: (identifier) @definition.parameter)

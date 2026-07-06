@@ -51,9 +51,9 @@
         ]))))
 
 ; ── Variables: visible after their declaration ───────────────────────────
-; Anchor `after` to each declarator, not the whole statement, so
-; `int a = 1, b = a;` sees the first declarator from the second's
-; initializer (and `int a = a;` still reads outward).
+; Visible from the declarator onward (C's point-of-declaration rule: the
+; scope begins just after the declarator, so `int a = 1, b = a;` sees the
+; first declarator from the second, and `int a = a;` binds the new local).
 ((declaration
    declarator: [
      (identifier) @definition
@@ -65,8 +65,8 @@
          (pointer_declarator declarator: (identifier) @definition)
          (array_declarator declarator: (identifier) @definition)
        ])
-   ] @_decl)
- (#set! definition.visibility "after"))
+   ])
+ (#set! definition.visibility "declaration"))
 
 ; ── Types ────────────────────────────────────────────────────────────────
 ; Tags with a body are definitions (self-references inside the body work);

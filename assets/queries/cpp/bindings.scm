@@ -32,16 +32,20 @@
    (function_definition) @scope.function)
  (#set! definition.scope "function")
  (#set! definition.namespace "type"))
+; Base-class-clause use of a template parameter (outside the body) is not
+; covered — silence, or a rare wrong answer only if an outer type shares
+; the parameter name; scoping the whole specifier would swallow the class
+; name, so the body is the target.
 ((template_declaration
    parameters: (template_parameter_list
      (type_parameter_declaration (type_identifier) @definition.type))
-   (class_specifier) @scope.body)
+   (class_specifier body: (field_declaration_list) @scope.body))
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((template_declaration
    parameters: (template_parameter_list
      (type_parameter_declaration (type_identifier) @definition.type))
-   (struct_specifier) @scope.body)
+   (struct_specifier body: (field_declaration_list) @scope.body))
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 
