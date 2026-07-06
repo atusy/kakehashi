@@ -281,20 +281,29 @@ The decision therefore **separates three concerns that today all ride the tracke
 - **Cross-edit bridge / virtual-document identity** — the stable handle a
   downstream language server's virtual document is keyed by — **remains the shared `NodeTracker` ULID**, a live-position (`content_version`) concern. Because regions
   are only *discovered* by a parse, minting still originates from a parse pass, but
-  as a distinct **current-version reconciliation step**, not off the stale-read
-  path: the tracker ULID mint that `populate_injections` performs inline today
-  **moves out of `populate` into a distinct reconciliation step**. When a pass
-  completes and (under `edit_lock`) its `parsed_version` still equals
-  `content_version`, that step maps the snapshot's region geometry to tracker ULIDs
-  — reusing an existing id by position, minting a fresh one for a genuinely new
-  region — exactly what the mint discovery does today, just gated and relocated. If the
-  pass is stale (`content_version` moved on), reconciliation is skipped and deferred
-  to the next current pass; the tracker is meanwhile kept live by the ordinary
-  `didChange` edit-shift (`apply_input_edits`), so the bridge always resolves
-  against a `content_version`-consistent index. A *stale-tree read* still never
-  mints or mutates it — only the current-version reconciliation does. So `populate`
-  splits into two: derive the snapshot-owned ordinals + geometry (always), and (only
-  at current version) reconcile tracker ULIDs.
+  as a distinct **reconciliation step**, not an inline per-region mint off the
+  stale-read path. **Implemented** (`NodeTracker::mint_batch_if_unshifted`):
+  the pass latches the tracker's (shift generation, cleanup epoch) at entry,
+  derives its region geometry, then maps that geometry to tracker ULIDs in one
+  batch — reusing an existing id by position, minting a fresh one for a
+  genuinely new region — with the latch re-checked under the tracker entry's
+  exclusive lock, the same lock the `didChange` edit-shift takes. (The check is
+  the tracker's own shift-latch rather than a `parsed_version == content_version`
+  comparison under `edit_lock`: the latch detects exactly the events that would
+  make the pass's coordinates stale — an edit-shift or a close/reopen — and
+  holding the mint inside the shifting lock is what makes the currency check and
+  the mint atomic.) A batch that passes is *correct-at-birth* — a later edit
+  shifts its ids like any live entry — so there is no purge machinery; a batch
+  the latch refuses minted **nothing**: the stale pass withholds every
+  region-id-bearing product and defers identity to the next current pass, the
+  tracker meanwhile kept live by the ordinary `didChange` edit-shift
+  (`apply_input_edits`), so the bridge always resolves against a
+  `content_version`-consistent index. A *stale-tree read* still never mints or
+  mutates it — only the latch-gated reconciliation does. So `populate` splits in
+  two: derive the snapshot-owned geometry (always), and (only while unshifted)
+  reconcile tracker ULIDs. The captures walk applies the same primitive
+  per layer — one latch-gated batch per visited layer instead of one tracker
+  lock acquisition per capture.
 
 So a stale-tree reader reads self-consistent ordinals + geometry from its own
 snapshot and touches no shared identity index (the mint-race and the
@@ -492,8 +501,8 @@ inside the existing safety contracts at each step:
   `latest_snapshot` retains a servable tree across an edit's `tree.take()`; the two
   stores may transiently sit at different versions (a lost legacy CAS just reseeds
   next pass), but no **reader** sees the difference because every reader reads the
-  snapshot, not the legacy tree. Split `populate` into ordinal/geometry derivation
-  (snapshot-owned) and the current-version tracker reconciliation (§3). Take the
+  snapshot, not the legacy tree. `populate`'s split into geometry derivation and
+  the latch-gated tracker reconciliation (§3) is **already in**. Take the
   grammar auto-install off the read handlers (`compute_captures` no longer triggers
   `ensure_injection_languages_loaded_for_document` inline): the parse loop
   *detects* a missing injected grammar and spawns the install as a **detached
@@ -501,7 +510,7 @@ inside the existing safety contracts at each step:
   **never on the ingress path and never under `edit_lock`** — only the O(1)
   detect-and-spawn is near the lock, and even that need not hold it. The region is
   re-minted on a later reconciliation once the grammar lands. Only the fast
-  tracker-mint itself runs under `edit_lock`. Convert
+  latch-gated tracker-mint itself runs inside the tracker's shifting lock. Convert
   `semanticTokens` full/delta and `captures/full` to the serve-current parked
   wait (the latter reserving
   `null` for no-snapshot / no-lineage / the settle backstop); the whole-document
