@@ -603,7 +603,7 @@ impl Kakehashi {
     /// to resolve per-method aggregation priorities from the bridge language config.
     ///
     /// Returns `None` if no configs are found.
-    fn preamble_to_document_context(
+    async fn preamble_to_document_context(
         &self,
         preamble: PreambleResult,
         method_name: &str,
@@ -617,7 +617,7 @@ impl Kakehashi {
             return None;
         }
 
-        let configs = self.bridge_configs_for_injection_language(
+        let mut configs = self.bridge_configs_for_injection_language(
             &preamble.language_name,
             &preamble.resolved.injection_language,
         );
@@ -629,6 +629,32 @@ impl Kakehashi {
                 preamble.language_name
             );
             return None;
+        }
+
+        // Drop servers already known (a live, `Ready` connection) NOT to support
+        // this method, so the fan-out never spawns a task + connection lookup
+        // only to hit the per-handler capability gate and return empty
+        // (capability-prefilter-fanout). Uses the same `has_capability(method)`
+        // predicate as that gate, so a dropped server is observably equivalent
+        // to it having answered empty. Unknown / still-initializing servers are
+        // kept (spawned/awaited as before).
+        let candidates: std::collections::HashSet<&str> =
+            configs.iter().map(|c| c.server_name.as_str()).collect();
+        let incapable = self
+            .bridge
+            .pool_arc()
+            .servers_known_incapable(&candidates, method_name)
+            .await;
+        if !incapable.is_empty() {
+            configs.retain(|c| !incapable.contains(&c.server_name));
+            if configs.is_empty() {
+                log::debug!(
+                    "{}: all configured servers for {} are known-incapable; skipping virt layer",
+                    method_name,
+                    preamble.resolved.injection_language
+                );
+                return None;
+            }
         }
 
         let agg = self.resolve_aggregation_config(
@@ -911,7 +937,9 @@ impl Kakehashi {
         // would find `snapshot()` empty and return null after every edit.
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let preamble = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
-        let document = self.preamble_to_document_context(preamble, method_name)?;
+        let document = self
+            .preamble_to_document_context(preamble, method_name)
+            .await?;
 
         Some(PositionRequestContext { document, position })
     }
@@ -936,7 +964,9 @@ impl Kakehashi {
     ) -> Option<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let preamble = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
-        let document = self.preamble_to_document_context(preamble, method_name)?;
+        let document = self
+            .preamble_to_document_context(preamble, method_name)
+            .await?;
 
         Some(RangeRequestContext { document, range })
     }
