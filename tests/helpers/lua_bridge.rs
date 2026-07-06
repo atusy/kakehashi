@@ -116,7 +116,8 @@ fn init_lua_client_with(
     let mut client = if experimental {
         builder.env("KAKEHASHI_EXPERIMENTAL", "true")
     } else {
-        builder
+        // Hermetic even when the developer's shell exports the opt-in.
+        builder.env_remove("KAKEHASHI_EXPERIMENTAL")
     }
     .build();
 

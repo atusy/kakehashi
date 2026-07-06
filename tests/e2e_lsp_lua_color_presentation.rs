@@ -17,7 +17,9 @@
 
 mod helpers;
 
-use helpers::lua_bridge::{create_lua_configured_client_experimental, shutdown_client};
+use helpers::lua_bridge::{
+    create_lua_configured_client_experimental, shutdown_client, skip_if_lua_ls_unavailable,
+};
 use serde_json::json;
 
 /// E2E test: colorPresentation request is handled without error
@@ -27,6 +29,9 @@ use serde_json::json;
 /// that the bridge infrastructure correctly handles the request.
 #[test]
 fn e2e_color_presentation_request_handled() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
     let (mut client, _config_dir) = create_lua_configured_client_experimental();
 
     // Open markdown document with Lua code block

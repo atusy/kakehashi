@@ -17,12 +17,17 @@
 
 mod helpers;
 
-use helpers::lua_bridge::{create_lua_configured_client_experimental, shutdown_client};
+use helpers::lua_bridge::{
+    create_lua_configured_client_experimental, shutdown_client, skip_if_lua_ls_unavailable,
+};
 use serde_json::json;
 
 /// E2E test: documentColor request is handled without error
 #[test]
 fn e2e_document_color_request_handled() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
     let (mut client, _config_dir) = create_lua_configured_client_experimental();
 
     // Open markdown document with Lua code block
@@ -126,6 +131,9 @@ More text.
 /// E2E test: documentColor for markdown without code blocks returns empty or null
 #[test]
 fn e2e_document_color_no_injections_returns_empty() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
     let (mut client, _config_dir) = create_lua_configured_client_experimental();
 
     // Open markdown document WITHOUT code blocks
