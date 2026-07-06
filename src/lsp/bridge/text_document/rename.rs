@@ -234,6 +234,9 @@ fn transform_text_document_edit(
     // Case 2: Same virtual URI → transform
     if uri_str == request_virtual_uri {
         edit.text_document.uri = host_uri.clone();
+        // The version counted the virtual document; against the host URI it
+        // would make clients reject the edit as stale.
+        edit.text_document.version = None;
         for one_of in &mut edit.edits {
             let text_edit = match one_of {
                 OneOf::Left(text_edit) => text_edit,
@@ -590,6 +593,55 @@ mod tests {
                     }
                     OneOf::Right(_) => panic!("Expected Left(TextEdit)"),
                 }
+            }
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
+        }
+    }
+
+    #[test]
+    fn workspace_edit_document_changes_drops_virtual_doc_version() {
+        // The downstream's version counts the VIRTUAL document, not the host
+        // document. Re-keying the URI to the host while keeping that version
+        // makes clients reject the whole WorkspaceEdit as stale whenever the
+        // two counters disagree. The version must be dropped with the URI.
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "documentChanges": [
+                    {
+                        "textDocument": { "uri": virtual_uri, "version": 7 },
+                        "edits": [{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 5 }
+                            },
+                            "newText": "newName"
+                        }]
+                    }
+                ]
+            }
+        });
+
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        )
+        .unwrap();
+
+        match edit.document_changes.unwrap() {
+            DocumentChanges::Edits(edits) => {
+                assert_eq!(edits.len(), 1);
+                assert_eq!(edits[0].text_document.uri, host_uri);
+                assert_eq!(
+                    edits[0].text_document.version, None,
+                    "virtual doc version must not survive re-keying to the host URI"
+                );
             }
             DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
         }
