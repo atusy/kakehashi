@@ -207,6 +207,12 @@ config that suppresses it.)
 2. When a bridged layer responds, kakehashi recomputes the level-2 sweep and
    emits `workspace/semanticTokens/refresh`; the client re-requests and
    receives the merged set (as a `full/delta` where the client supports it).
+   Refresh is sent **only when the client advertised
+   `workspace.semanticTokens.refreshSupport`** — LSP makes the request an
+   optional client capability. Without it kakehashi cannot prompt a re-pull:
+   bridged refinement then surfaces only on the client's own next request
+   (typically after an edit), and a passive document stays on its first-paint
+   set. This degradation is carried under Consequences.
 
 **Refresh coalescing.** Bridged layers respond independently; firing
 `workspace/semanticTokens/refresh` per response would make the client repaint
@@ -480,6 +486,12 @@ visible to stage 1 or a type split"; its Neutral bullet now defers here:
   (rust-analyzer) loses ~30 custom types to the drop, with the per-character
   patchwork §3 describes. Lifting the bound is manual: the user maintains the
   `extraLegend` list, and their editor theme must style the extra types.
+- **Bridged richness rides on `refreshSupport`.** Refresh is the only path
+  that delivers bridged tokens to an idle document; a client that does not
+  advertise `workspace.semanticTokens.refreshSupport` re-requests only on its
+  own schedule (typically the next edit), so between requests it effectively
+  sees native-only output. Instant paint and correctness are unaffected —
+  only the arrival of bridged refinement is.
 - **Refresh coalescing is load-bearing.** §2's quiescence-window policy bounds
   how many intermediate paints the user sees, but the window length is a
   tuning knob: too short re-admits per-layer thrash, too long delays bridged
