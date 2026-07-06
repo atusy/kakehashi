@@ -252,6 +252,16 @@ version gap after reopen — the set is excluded as the conservative fallback,
 so unshifted stale coordinates never reach the sweep. Native is recomputed
 synchronously per request and is always current by construction.
 
+**Shift definition.** The shift is an absolute-position mapping obtained by
+folding the retained `contentChanges` **in order** through their intermediate
+document states — never as independent shifts against the original text,
+which mis-places tokens as soon as one batch contains two edits. Each edit
+moves same-line positions after it by a character delta, later lines by a
+line delta, and combines both for a token on the boundary line of a line
+merge or split; a token whose range intersects any edited range is the drop
+bucket above. This ordered fold is the "second exactness obligation" the
+Consequences carry.
+
 This temporal ordering — native now, refined later — is precisely what
 `preferred`/`concatenated` (synchronous, one-shot) cannot represent, and why
 `merged` is a separate operation rather than a strategy value.
