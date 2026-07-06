@@ -105,11 +105,36 @@ pub(crate) async fn collect_push_diagnostics(
     // async blocks would otherwise rely on disjoint-field captures of
     // `snapshot`, which compiles but reads ambiguously).
     let DiagnosticSnapshot {
-        virt_contexts,
+        mut virt_contexts,
         host,
         host_pull_enabled,
         layer_cfg,
     } = snapshot;
+
+    // Drop servers already known (a live, `Ready` connection) NOT to answer pull
+    // diagnostics before spawning their per-region tasks
+    // (capability-prefilter-fanout). The proactive push path
+    // (didOpen/didSave/debounced didChange) fans out exactly like the editor's
+    // pull, so a push-only server (e.g. basedpyright, warmed by eager-open)
+    // would otherwise be re-dispatched once per region on every change. This is
+    // equivalence-preserving: the per-region `send_diagnostic_request` already
+    // returns an empty layer for such a server (its capability gate), so
+    // pre-dropping only removes the wasted task — the collected set is unchanged.
+    if !virt_contexts.is_empty() {
+        let candidates: std::collections::HashSet<&str> = virt_contexts
+            .iter()
+            .flat_map(|ctx| ctx.configs.iter().map(|c| c.server_name.as_str()))
+            .collect();
+        let incapable = pool
+            .servers_known_incapable(&candidates, "textDocument/diagnostic")
+            .await;
+        if !incapable.is_empty() {
+            for ctx in &mut virt_contexts {
+                ctx.configs.retain(|c| !incapable.contains(&c.server_name));
+            }
+            virt_contexts.retain(|ctx| !ctx.configs.is_empty());
+        }
+    }
 
     let virt_fut = async {
         let mut join_set = JoinSet::new();
