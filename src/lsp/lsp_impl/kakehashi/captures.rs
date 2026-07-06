@@ -159,11 +159,13 @@ fn metadata_object(pairs: &[(String, Option<String>)]) -> Option<Value> {
     if pairs.is_empty() {
         return None;
     }
-    let mut map = serde_json::Map::new();
+    let mut map = serde_json::Map::with_capacity(pairs.len());
     for (key, value) in pairs {
         map.insert(
             key.clone(),
-            value.clone().map_or(Value::Bool(true), Value::String),
+            value
+                .as_ref()
+                .map_or(Value::Bool(true), |v| Value::String(v.clone())),
         );
     }
     Some(Value::Object(map))

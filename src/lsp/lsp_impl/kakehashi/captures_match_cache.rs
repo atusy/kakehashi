@@ -110,17 +110,14 @@ pub(in crate::lsp::lsp_impl) fn layer_cache_key(
     for range in ranges {
         let start = range.start_byte.min(text.len());
         let end = range.end_byte.min(text.len());
-        let anchor = *anchor.get_or_insert(start);
+        let base = *anchor.get_or_insert(start);
         span_start = span_start.min(start.min(end));
         span_end = span_end.max(end);
         // Separator + relative geometry: two range lists with the same
         // span content but different range boundaries must not collide.
         fnv1a(&mut hash, &[0xFE]);
-        fnv1a(
-            &mut hash,
-            &(start.wrapping_sub(anchor) as u64).to_le_bytes(),
-        );
-        fnv1a(&mut hash, &(end.wrapping_sub(anchor) as u64).to_le_bytes());
+        fnv1a(&mut hash, &(start.wrapping_sub(base) as u64).to_le_bytes());
+        fnv1a(&mut hash, &(end.wrapping_sub(base) as u64).to_le_bytes());
         fnv1a(&mut hash, &(range.start_col as u64).to_le_bytes());
         fnv1a(&mut hash, &(range.end_col as u64).to_le_bytes());
     }
@@ -243,9 +240,14 @@ impl CapturesMatchCache {
             matches,
         };
         // get_mut before entry: the steady-state store hits an existing doc
-        // and skips the owned-key clone the entry API requires.
+        // and skips the owned-key clones the entry APIs require (the `Url`
+        // here, the kind `String` below).
         if let Some(mut doc) = self.cache.get_mut(uri) {
-            doc.host.insert(kind.to_string(), entry);
+            if let Some(slot) = doc.host.get_mut(kind) {
+                *slot = entry;
+            } else {
+                doc.host.insert(kind.to_string(), entry);
+            }
             return;
         }
         // Creating the doc slot needs a liveness handshake: an airborne walk
@@ -292,15 +294,30 @@ impl CapturesMatchCache {
         matches: Arc<Vec<MatchData>>,
         doc_open: impl FnOnce() -> bool,
     ) {
+        if let Some(mut doc) = self.cache.get_mut(uri) {
+            // In-place refresh keeps the existing kind `String`: kind is
+            // folded into the validity hash, so a same-hash entry already
+            // carries this kind (modulo the accepted 64-bit bound).
+            if let Some(slot) = doc.layers.get_mut(&validity_hash) {
+                slot.generation = generation;
+                slot.matches = matches;
+            } else {
+                doc.layers.insert(
+                    validity_hash,
+                    CachedLayerMatches {
+                        kind: kind.to_string(),
+                        generation,
+                        matches,
+                    },
+                );
+            }
+            return;
+        }
         let entry = CachedLayerMatches {
             kind: kind.to_string(),
             generation,
             matches,
         };
-        if let Some(mut doc) = self.cache.get_mut(uri) {
-            doc.layers.insert(validity_hash, entry);
-            return;
-        }
         // See `store_host`: create-path insert-then-verify handshake
         // against the close-during-walk resurrection leak.
         self.cache
