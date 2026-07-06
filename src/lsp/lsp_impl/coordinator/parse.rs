@@ -294,6 +294,14 @@ impl ParseCoordinator {
             .any_bridge_server_runnable();
         self.compute_pool
             .run(None, move || {
+                // Latch FIRST, validate liveness SECOND — the captures
+                // walk's ordering, and it is load-bearing: `mint_epoch` is
+                // two unsynchronized reads, so a close+reopen completing
+                // between them yields `(old_gen, new_epoch)`; only a
+                // liveness check taken AFTER the latch is guaranteed to see
+                // that reopen's new incarnation and bail before anything
+                // mints under the mixed latch.
+                let entry_mint_epoch = tracker.mint_epoch(&uri);
                 // At-mint liveness gate (the captures walk's
                 // `mint_into_tracker` discipline, applied to the writer): a
                 // didClose that ran to COMPLETION after this parse's CAS
@@ -319,6 +327,7 @@ impl ParseCoordinator {
                     &language_name,
                     &language,
                     &tracker,
+                    entry_mint_epoch,
                     build_bridge_regions,
                 );
                 PopulatedSnapshotRegions {

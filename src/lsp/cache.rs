@@ -174,6 +174,14 @@ impl CacheCoordinator {
     /// no/empty regions, below the region-count gate, an `injection.combined`
     /// group, or a not-yet-loaded parser). The discovery query (`Q`) is run
     /// **once** here and shared; the request path never re-runs it.
+    ///
+    /// `entry_mint_epoch` is the tracker latch ([`NodeTracker::mint_epoch`])
+    /// the CALLER captured **before** validating the pass's
+    /// liveness/lifetime, and every tracker-mutating step below re-checks it
+    /// (latch-then-validate): capturing it here, after the caller's check,
+    /// would let a close+reopen completing between the two `mint_epoch`
+    /// reads produce a `(0, new_epoch)` latch that matches the reopened
+    /// index and mints this pass's old-lifetime coordinates into it.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn populate_injections(
@@ -184,6 +192,7 @@ impl CacheCoordinator {
         language_name: &str,
         language: &LanguageCoordinator,
         tracker: &NodeTracker,
+        entry_mint_epoch: (u64, u64),
         build_bridge_regions: bool,
     ) -> PopulatedInjections {
         // Snapshot the generation FIRST — before reading the injection query or
@@ -200,11 +209,11 @@ impl CacheCoordinator {
         // Entry half of the mint reconciliation (parse-snapshot ADR §3):
         // populate runs post-CAS but an edit can land DURING this pass and
         // shift the live-coordinate NodeTracker, making this pass's tree
-        // coordinates stale. The latch is re-checked inside every
-        // tracker-mutating step below (the batch mint and the commit), so a
-        // stale pass mints nothing and clobbers nothing — identity defers to
-        // the next current pass.
-        let entry_mint_epoch = tracker.mint_epoch(uri);
+        // coordinates stale. `entry_mint_epoch` (latched by the caller,
+        // BEFORE its liveness validation — see the doc comment) is
+        // re-checked inside every tracker-mutating step below (the batch
+        // mint and the commit), so a stale pass mints nothing and clobbers
+        // nothing — identity defers to the next current pass.
 
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
@@ -821,6 +830,7 @@ print("hello")
             "markdown",
             &coordinator,
             &tracker,
+            tracker.mint_epoch(&uri),
             true,
         );
 
@@ -881,6 +891,7 @@ print("hello")
             "markdown",
             &coordinator,
             &tracker,
+            tracker.mint_epoch(&uri),
             true,
         );
 
@@ -955,6 +966,7 @@ print("hello")
             "markdown",
             &coordinator,
             &tracker,
+            tracker.mint_epoch(&uri),
             true,
         );
 
@@ -999,6 +1011,7 @@ print("goodbye")
             "markdown",
             &coordinator,
             &tracker,
+            tracker.mint_epoch(&uri),
             true,
         );
 

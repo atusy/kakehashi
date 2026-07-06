@@ -778,11 +778,19 @@ impl NodeTracker {
     }
 
     /// The (per-URI shift generation, global cleanup epoch) pair a pass
-    /// latches at entry, alongside its currency check, and hands to
+    /// latches at entry and hands to
     /// [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted): a
     /// mismatch in either half means the pass's coordinates were superseded
     /// (an edit shifted the index, or a close/reopen replaced it) and the
     /// batch refuses to mint.
+    ///
+    /// The two halves are read WITHOUT mutual synchronization, so a
+    /// close+reopen completing between them yields a mixed
+    /// `(old_gen, new_epoch)` latch that can match the reopened index.
+    /// Callers therefore must latch FIRST and validate the pass's
+    /// liveness/currency (incarnation, snapshot version) AFTER — only a
+    /// post-latch check is guaranteed to observe the lifetime change that
+    /// produced the mixed latch and bail before minting under it.
     pub(crate) fn mint_epoch(&self, uri: &Url) -> (u64, u64) {
         (
             self.shift_generation(uri),
