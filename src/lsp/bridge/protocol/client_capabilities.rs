@@ -17,6 +17,7 @@ fn build_baseline_capabilities(
     experimental: bool,
 ) -> ClientCapabilities {
     use tower_lsp_server::ls_types::{
+        CodeActionClientCapabilities, CodeActionKindLiteralSupport, CodeActionLiteralSupport,
         CompletionClientCapabilities, CompletionItemCapability, DiagnosticClientCapabilities,
         DiagnosticWorkspaceClientCapabilities, DocumentLinkClientCapabilities,
         DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities,
@@ -68,6 +69,34 @@ fn build_baseline_capabilities(
         }),
         inlay_hint: Some(InlayHintClientCapabilities {
             dynamic_registration: Some(false),
+            ..Default::default()
+        }),
+        // Without codeActionLiteralSupport, older servers fall back to
+        // returning bare Commands only (issue #568). No dataSupport /
+        // resolveSupport yet: servers must return complete (edit-carrying)
+        // actions until codeAction/resolve is bridged.
+        code_action: Some(CodeActionClientCapabilities {
+            dynamic_registration: Some(false),
+            code_action_literal_support: Some(CodeActionLiteralSupport {
+                code_action_kind: CodeActionKindLiteralSupport {
+                    value_set: [
+                        "",
+                        "quickfix",
+                        "refactor",
+                        "refactor.extract",
+                        "refactor.inline",
+                        "refactor.rewrite",
+                        "source",
+                        "source.organizeImports",
+                        "source.fixAll",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                },
+            }),
+            is_preferred_support: Some(true),
+            disabled_support: Some(true),
             ..Default::default()
         }),
         diagnostic: Some(DiagnosticClientCapabilities {

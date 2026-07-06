@@ -68,7 +68,7 @@ pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
-pub(crate) use text_document::{CodeLensEnvelope, extract_code_lens_envelope};
+pub(crate) use text_document::{CodeLensEnvelope, bridge_code_actions, extract_code_lens_envelope};
 pub(crate) use workspace::WorkspaceFolderSet;
 
 /// Integration tests for the bridge module.

@@ -65,6 +65,26 @@ expression: request
           "dynamicRegistration": false,
           "linkSupport": true
         },
+        "codeAction": {
+          "dynamicRegistration": false,
+          "codeActionLiteralSupport": {
+            "codeActionKind": {
+              "valueSet": [
+                "",
+                "quickfix",
+                "refactor",
+                "refactor.extract",
+                "refactor.inline",
+                "refactor.rewrite",
+                "source",
+                "source.organizeImports",
+                "source.fixAll"
+              ]
+            }
+          },
+          "isPreferredSupport": true,
+          "disabledSupport": true
+        },
         "documentLink": {
           "dynamicRegistration": false,
           "tooltipSupport": true

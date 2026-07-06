@@ -1,5 +1,6 @@
 //! Text document related LSP methods.
 
+mod code_action;
 mod code_lens;
 mod color_presentation;
 mod completion;

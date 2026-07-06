@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
-    ColorProviderCapability, DeclarationCapability, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability,
+    CodeActionProviderCapability, ColorProviderCapability, DeclarationCapability,
+    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
     LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
     TypeDefinitionProviderCapability,
@@ -564,6 +564,13 @@ impl ConnectionHandle {
                     LinkedEditingRangeServerCapabilities::Simple(true)
                         | LinkedEditingRangeServerCapabilities::Options(_)
                         | LinkedEditingRangeServerCapabilities::RegistrationOptions(_)
+                )
+            ),
+            "textDocument/codeAction" => matches!(
+                caps.code_action_provider,
+                Some(
+                    CodeActionProviderCapability::Simple(true)
+                        | CodeActionProviderCapability::Options(_)
                 )
             ),
             "textDocument/codeLens" => caps.code_lens_provider.is_some(),
@@ -1907,6 +1914,12 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/codeAction",
+                Box::new(|c| {
+                    c.code_action_provider = Some(CodeActionProviderCapability::Simple(true));
+                }),
+            ),
+            (
                 "textDocument/completion",
                 Box::new(|c| {
                     c.completion_provider = Some(CompletionOptions::default());
@@ -2134,6 +2147,12 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/codeAction",
+                Box::new(|c| {
+                    c.code_action_provider = Some(CodeActionProviderCapability::Simple(false));
+                }),
+            ),
+            (
                 "textDocument/definition",
                 Box::new(|c| {
                     c.definition_provider = Some(OneOf::Left(false));
@@ -2246,6 +2265,7 @@ mod tests {
             "textDocument/inlayHint",
             "textDocument/documentColor",
             "textDocument/colorPresentation",
+            "textDocument/codeAction",
             "textDocument/codeLens",
             "codeLens/resolve",
             "textDocument/onTypeFormatting",
