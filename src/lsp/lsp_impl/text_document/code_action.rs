@@ -15,7 +15,7 @@ use tower_lsp_server::ls_types::{
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::{FanInResult, dispatch_host_preferred, dispatch_preferred};
-use crate::lsp::bridge::{HostDocument, bridge_code_actions};
+use crate::lsp::bridge::{HostDocument, bridge_code_actions, parse_code_actions_leniently};
 
 const METHOD: &str = "textDocument/codeAction";
 
@@ -156,7 +156,7 @@ impl Kakehashi {
                         )
                         .await?;
                     Ok(raw.and_then(|value| {
-                        let actions: CodeActionResponse = serde_json::from_value(value).ok()?;
+                        let actions = parse_code_actions_leniently(value)?;
                         Some(bridge_code_actions(
                             actions,
                             &t.server_name,

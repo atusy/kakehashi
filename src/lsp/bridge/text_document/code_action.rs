@@ -3,7 +3,7 @@
 //! Edit-carrying actions only: `codeAction/resolve` and `Command` execution
 //! are not bridged yet. Actions that would need them surface as
 //! `disabled: { reason }` when the upstream client supports it and are
-//! dropped otherwise (LSP 3.18 `disabledSupport`).
+//! dropped otherwise (LSP 3.16 `disabledSupport`).
 //!
 //! Every bridged action title gets the `"{title} — {server}"` suffix so
 //! users can see which downstream server each action comes from.
@@ -139,10 +139,7 @@ fn transform_code_action_response_to_host(
         return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
-    if result.is_null() {
-        return None;
-    }
-    let actions: CodeActionResponse = serde_json::from_value(result).ok()?;
+    let actions = parse_code_actions_leniently(result)?;
 
     Some(bridge_code_actions(
         actions,
@@ -156,12 +153,39 @@ fn transform_code_action_response_to_host(
     ))
 }
 
+/// Parse a code action result value item by item: one malformed action must
+/// not nuke the whole server response (a whole-`Vec` parse would return
+/// `None` with zero valid actions and no log).
+pub(crate) fn parse_code_actions_leniently(
+    result: serde_json::Value,
+) -> Option<CodeActionResponse> {
+    if result.is_null() {
+        return None;
+    }
+    let Ok(items) = serde_json::from_value::<Vec<serde_json::Value>>(result) else {
+        log::warn!("textDocument/codeAction: response result is not an array");
+        return None;
+    };
+    Some(
+        items
+            .into_iter()
+            .filter_map(|item| match serde_json::from_value(item) {
+                Ok(action) => Some(action),
+                Err(error) => {
+                    log::warn!("textDocument/codeAction: skipping malformed action: {error}");
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
 /// Virtual-layer coordinate context for [`bridge_code_actions`]; `None`
 /// means the host layer (real URIs and coordinates, nothing to translate).
 pub(crate) struct VirtLayerContext<'a> {
-    pub(crate) request_virtual_uri: &'a str,
-    pub(crate) host_uri: &'a Uri,
-    pub(crate) offset: &'a RegionOffset,
+    request_virtual_uri: &'a str,
+    host_uri: &'a Uri,
+    offset: &'a RegionOffset,
 }
 
 /// Apply the bridge policy to a downstream server's actions: title suffix,
@@ -262,6 +286,10 @@ fn bridge_code_action(
         }
     }
 
+    // The bridge can't answer codeAction/resolve yet, and untranslated
+    // `data` can embed virtual URIs/coordinates — strip it on the kept path
+    // too (PR 4's envelope replaces this).
+    action.data = None;
     action.title = suffix_title(action.title, server_name);
     Some(CodeActionOrCommand::CodeAction(action))
 }
@@ -287,9 +315,14 @@ fn disable_action(
     action.edit = None;
     action.command = None;
     action.data = None;
-    action.disabled = Some(CodeActionDisabled {
-        reason: reason.to_string(),
-    });
+    // A disabled action must not steer the client's auto-fix keybinding.
+    action.is_preferred = None;
+    // Keep the server's own reason when it already disabled the action.
+    if action.disabled.is_none() {
+        action.disabled = Some(CodeActionDisabled {
+            reason: reason.to_string(),
+        });
+    }
     Some(CodeActionOrCommand::CodeAction(action))
 }
 
@@ -479,6 +512,25 @@ mod tests {
     }
 
     #[test]
+    fn malformed_action_is_skipped_not_fatal() {
+        // One malformed item (no title) must not nuke the whole server
+        // response — the valid action survives.
+        let actions = transform(
+            json!([
+                { "kind": "quickfix" },
+                edit_carrying_action("Remove unused import")
+            ]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1, "valid action must survive: {actions:?}");
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(action.title, "Remove unused import — ruff");
+    }
+
+    #[test]
     fn edit_carrying_action_is_translated_and_suffixed() {
         let actions =
             transform(json!([edit_carrying_action("Remove unused import")]), true).unwrap();
@@ -569,6 +621,47 @@ mod tests {
         };
         assert_eq!(action.disabled.as_ref().unwrap().reason, REASON_RESOLVE);
         assert!(action.data.is_none());
+    }
+
+    #[test]
+    fn kept_action_strips_untranslated_data() {
+        let mut action = edit_carrying_action("Fix");
+        action["data"] = json!({ "virtualUri": make_virtual_uri_string() });
+        let actions = transform(json!([action]), true).unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert!(action.edit.is_some(), "edit must survive");
+        assert!(
+            action.data.is_none(),
+            "untranslated data must not leak until the PR 4 envelope exists"
+        );
+    }
+
+    #[test]
+    fn server_disabled_command_action_keeps_server_reason() {
+        let actions = transform(
+            json!([{
+                "title": "Not here",
+                "command": { "title": "x", "command": "mock.x" },
+                "disabled": { "reason": "wrong scope" },
+                "isPreferred": true
+            }]),
+            true,
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            action.disabled.as_ref().unwrap().reason,
+            "wrong scope",
+            "the server's own disabled reason must not be overwritten"
+        );
+        assert_eq!(
+            action.is_preferred, None,
+            "a disabled action must not steer auto-fix"
+        );
     }
 
     #[test]
