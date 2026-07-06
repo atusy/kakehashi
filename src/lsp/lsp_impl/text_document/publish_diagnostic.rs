@@ -116,10 +116,15 @@ pub(crate) async fn collect_push_diagnostics(
     // (capability-prefilter-fanout). The proactive push path
     // (didOpen/didSave/debounced didChange) fans out exactly like the editor's
     // pull, so a push-only server (e.g. basedpyright, warmed by eager-open)
-    // would otherwise be re-dispatched once per region on every change. This is
-    // equivalence-preserving: the per-region `send_diagnostic_request` already
-    // returns an empty layer for such a server (its capability gate), so
-    // pre-dropping only removes the wasted task — the collected set is unchanged.
+    // would otherwise be re-dispatched once per region on every change. The
+    // per-region `send_diagnostic_request` already returns an empty layer for
+    // such a server (its capability gate), so with the default (untruncated)
+    // `maxFanOut` pre-dropping only removes the wasted task — the collected set
+    // is unchanged. Under a configured `maxFanOut` this shares the same
+    // priority/truncation aggregation as the pull path, so dropping an incapable
+    // high-priority server can promote the next capable one into a kept slot —
+    // an answer where the region previously collected empty (the improvement
+    // noted in the PR description), never a regression.
     if !virt_contexts.is_empty() {
         let candidates: std::collections::HashSet<&str> = virt_contexts
             .iter()
