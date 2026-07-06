@@ -34,9 +34,12 @@ mod tests {
             "rust" => tree_sitter_rust::LANGUAGE.into(),
             "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            // Vendored under tests/grammars/ — the published crate pins an
-            // incompatible tree-sitter runtime (see its Cargo.toml).
-            "dockerfile" => tree_sitter_dockerfile::LANGUAGE.into(),
+            // No tree-sitter-0.26-compatible dockerfile crate exists (the only
+            // one pins tree-sitter ^0.20), so this fixture keeps no grammar
+            // source in-repo: it auto-installs the grammar the same way
+            // `kakehashi language install` does and loads the compiled .so
+            // through the version-independent C ABI. See dockerfile_language.
+            "dockerfile" => dockerfile_language(),
             // Terraform is HCL syntax: both names validate against the HCL
             // grammar (the terraform asset inherits hcl).
             "hcl" | "terraform" => tree_sitter_hcl::LANGUAGE.into(),
@@ -48,6 +51,53 @@ mod tests {
             "vim" => tree_sitter_vim::language(),
             other => panic!("no grammar for {other}"),
         }
+    }
+
+    /// Grammar for the dockerfile fixture, without vendoring any parser source.
+    ///
+    /// Every other language links a `tree-sitter-*` crate at compile time, but
+    /// dockerfile has no crate compatible with this workspace's tree-sitter (the
+    /// sole published crate hard-pins the 0.20 runtime). So this mirrors what
+    /// `kakehashi language install` does at runtime: fetch + compile the grammar
+    /// once into a shared library, then load it through the C ABI (which is
+    /// version-independent — the whole reason the runtime never hit the pin).
+    ///
+    /// The compiled `.so` is cached under the OS temp dir and reused, so
+    /// repeated `cargo test` runs never re-fetch or re-compile; only a cold
+    /// cache (first run, or after the temp dir is cleared) needs the network.
+    /// Concurrent fixture threads are safe: `install_parser` compiles to a
+    /// per-process temp file and atomically renames into place, so a lost race
+    /// surfaces as `AlreadyExists` over an already-good library.
+    fn dockerfile_language() -> tree_sitter::Language {
+        use crate::install::parser::{
+            InstallOptions, ParserCompile, ParserInstallError, install_parser, parser_file_exists,
+        };
+        use crate::language::loader::ParserLoader;
+
+        let cache_dir = std::env::temp_dir().join("kakehashi-test-grammars");
+        let library = parser_file_exists("dockerfile", &cache_dir).unwrap_or_else(|| {
+            let options = InstallOptions {
+                data_dir: cache_dir.clone(),
+                force: false,
+                verbose: false,
+                no_cache: false,
+                // The test harness binary has no `__compile-parser` subcommand to
+                // re-exec, so compile in-process (see ParserCompile docs).
+                compile: ParserCompile::InProcess,
+            };
+            match install_parser("dockerfile", &options) {
+                Ok(result) => result.install_path,
+                Err(ParserInstallError::AlreadyExists(path)) => path,
+                Err(e) => panic!(
+                    "auto-install dockerfile grammar into {}: {e}",
+                    cache_dir.display()
+                ),
+            }
+        });
+
+        ParserLoader::new()
+            .load_language(&library, "dockerfile")
+            .unwrap_or_else(|e| panic!("load dockerfile grammar {}: {e}", library.display()))
     }
 
     /// The asset source with `; inherits:` parents concatenated from the
