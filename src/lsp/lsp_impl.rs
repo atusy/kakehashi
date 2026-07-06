@@ -32,7 +32,6 @@ use tower_lsp_server::ls_types::{
     SignatureHelpParams, TextDocumentPositionParams, TextEdit, Uri, WillSaveTextDocumentParams,
     WorkspaceEdit,
 };
-#[cfg(feature = "experimental")]
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
 };
@@ -764,12 +763,10 @@ impl LanguageServer for Kakehashi {
         self.linked_editing_range_impl(params).await
     }
 
-    #[cfg(feature = "experimental")]
     async fn document_color(&self, params: DocumentColorParams) -> Result<Vec<ColorInformation>> {
         self.document_color_impl(params).await
     }
 
-    #[cfg(feature = "experimental")]
     async fn color_presentation(
         &self,
         params: ColorPresentationParams,

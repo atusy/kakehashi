@@ -46,6 +46,7 @@ pub(super) async fn perform_lsp_handshake(
         workspace_folders,
         client_capabilities.as_ref(),
         advertise_configuration,
+        crate::experimental::enabled(),
     );
     handle
         .send_request(init_request, init_request_id)

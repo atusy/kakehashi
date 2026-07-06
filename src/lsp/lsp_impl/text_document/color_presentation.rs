@@ -11,6 +11,12 @@ impl Kakehashi {
         &self,
         params: ColorPresentationParams,
     ) -> Result<Vec<ColorPresentation>> {
+        // Experimental (KAKEHASHI_EXPERIMENTAL=true): without the opt-in the
+        // capability is not advertised, so answer a compliant empty result to
+        // any client that calls regardless.
+        if !self.experimental_enabled() {
+            return Ok(Vec::new());
+        }
         let lsp_uri = params.text_document.uri;
         let range = params.range;
         let color = params.color;

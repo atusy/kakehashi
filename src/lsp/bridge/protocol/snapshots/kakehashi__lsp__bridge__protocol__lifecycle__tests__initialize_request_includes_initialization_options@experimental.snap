@@ -22,6 +22,8 @@ expression: request
     },
     "capabilities": {
       "workspace": {
+        "workspaceFolders": true,
+        "configuration": true,
         "diagnostics": {
           "refreshSupport": true
         }

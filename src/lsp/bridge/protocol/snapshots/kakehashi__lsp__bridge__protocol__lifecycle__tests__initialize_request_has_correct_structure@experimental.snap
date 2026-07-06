@@ -11,6 +11,8 @@ expression: request
     "rootUri": null,
     "capabilities": {
       "workspace": {
+        "workspaceFolders": true,
+        "configuration": true,
         "diagnostics": {
           "refreshSupport": true
         }

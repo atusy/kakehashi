@@ -18,6 +18,12 @@ impl Kakehashi {
         &self,
         params: DocumentColorParams,
     ) -> Result<Vec<ColorInformation>> {
+        // Experimental (KAKEHASHI_EXPERIMENTAL=true): without the opt-in the
+        // capability is not advertised, so answer a compliant empty result to
+        // any client that calls regardless.
+        if !self.experimental_enabled() {
+            return Ok(Vec::new());
+        }
         let lsp_uri = params.text_document.uri;
 
         // Convert ls_types::Uri to url::Url for internal use

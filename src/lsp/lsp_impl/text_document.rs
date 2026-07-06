@@ -1,7 +1,6 @@
 //! Text document related LSP methods.
 
 mod code_lens;
-#[cfg(feature = "experimental")]
 mod color_presentation;
 mod completion;
 mod completion_item;
@@ -12,7 +11,6 @@ mod did_change;
 mod did_close;
 mod did_open;
 mod did_save;
-#[cfg(feature = "experimental")]
 mod document_color;
 mod document_highlight;
 mod document_link;

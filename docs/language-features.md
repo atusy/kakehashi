@@ -225,8 +225,8 @@ differently.
 and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
 Shows color swatches and color picker presentations for embedded blocks.
-**Only available in experimental builds** — standard builds do not advertise color
-support.
+**Only available with the `KAKEHASHI_EXPERIMENTAL=true` environment variable** —
+without the opt-in the server does not advertise color support.
 
 ---
 
