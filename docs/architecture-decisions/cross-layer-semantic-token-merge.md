@@ -276,8 +276,10 @@ stable. Because config is read before kakehashi answers `initialize`, this
 extension is protocol-legal: the legend is still declared exactly once and
 never changes afterward — what Alternative D rejects is widening it
 *dynamically* per bridged server. Two bounds follow: `tokenModifiers` are
-encoded as bit flags in an integer, so standard + extra modifiers must fit the
-client's integer width (practically 32); and the client's theme must actually
+encoded as bit flags in an LSP `uinteger` (0..2^31−1), so the standard 10 plus
+extra modifiers must fit 31 bits — config validation **rejects** an
+`extraLegend` that would push the total past 31, rather than silently
+truncating; and the client's theme must actually
 style the extra types — kakehashi passes them through, it cannot make an
 editor color a type it has no rule for (Neovim exposes them as
 `@lsp.type.<name>` groups; VS Code needs a theme rule or
