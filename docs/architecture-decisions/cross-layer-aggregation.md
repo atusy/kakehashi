@@ -4,6 +4,7 @@
 - [host-document-bridge](host-document-bridge.md) — Host bridging schema (`bridge._self`); declared cross-layer combine logic out of scope, which this decision now covers
 - [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — The unified ordered-allowlist semantics that the layer `priorities` follows
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method strategies and multi-server merging *within* a bridge target
+- [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md) — The dedicated `merged` composition for semantic-tokens methods, closing the question this decision's Out of Scope deferred
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model (virt bridges)
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — Wildcard merge machinery reused for the method-keyed map
 

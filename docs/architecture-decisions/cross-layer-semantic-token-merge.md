@@ -12,7 +12,8 @@
 
 **Aspirational — deferred with a specified design and trigger.** Semantic
 tokens are **native-only today**: `textDocument/semanticTokens/{full,range}` is
-not bridged (request-strategies Strategy 1 is marked ❌ Not implemented), and
+not bridged (request-strategies marks the semanticTokens row ❌ Not
+implemented), and
 cross-layer-aggregation deliberately scoped semantic tokens out of its
 `preferred`/`concatenated` mechanism. This decision does **not** schedule
 implementation. It records *how* the merge will work when token bridging is
@@ -132,7 +133,8 @@ native finalize          host server          virt server(s)
 
 - **Level 1 (intra-layer) collapses each layer to exactly one non-overlapping
   stream.** Native is the existing `finalize_tokens` output. Host is one
-  server's response, non-overlapping by protocol. **Virt is not a single
+  server's response, non-overlapping by protocol (kakehashi does not advertise
+  `overlappingTokenSupport` to downstream servers). **Virt is not a single
   response** — nested injections (markdown → python → sql) yield one stream
   *per injection*, and a deeper injection's host range sits inside its
   parent's, so the virt streams overlap each other. Level 1 therefore collapses
@@ -172,8 +174,8 @@ tokenizes wherever higher-priority layers are silent. (Semantic tokens are
 sparse, so the merged set covers only characters *some* layer tokenized —
 "gap-free" means the merge adds no *new* gaps via wholesale layer selection,
 not that every character is tokenized.) Dropping a layer from `priorities`
-suppresses it for the
-method (allowlist semantics, identical to cross-layer-aggregation) — e.g.
+suppresses it for the method (allowlist semantics, identical to
+cross-layer-aggregation) — e.g.
 `["host", "native"]` ignores injection servers; `["native"]` is exactly
 today's behavior.
 
@@ -318,8 +320,10 @@ kakehashi's advertised legend:
   `extraLegend` route above, applied *before* the freeze.
 - **Modifiers** are handled independently of the type: a token whose base type
   *is* standard is emitted even if it carries non-standard modifiers; the
-  unknown modifiers are simply dropped (mirroring `resolve_capture`'s existing
-  "unknown modifiers are silently ignored" behavior in `legend.rs`). Only an
+  unknown modifiers are simply dropped (mirroring the existing "unknown
+  modifiers are silently ignored" behavior of
+  `map_capture_to_token_type_and_modifiers`, `resolve_capture`'s delegate in
+  `legend.rs`). Only an
   unmappable *base type* drops the whole token.
 - **Dropping is loud, not silent.** When a bridged server's `initialize`
   result arrives, its legend is diffed against kakehashi's advertised one:
