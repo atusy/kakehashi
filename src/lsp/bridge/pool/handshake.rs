@@ -46,6 +46,11 @@ pub(super) async fn perform_lsp_handshake(
         workspace_folders,
         client_capabilities.as_ref(),
         advertise_configuration,
+        // Process-global opt-in, not Kakehashi's per-instance copy: the pool
+        // has no Kakehashi in scope, and both derive from the same one-shot
+        // env read (the per-instance AtomicBool exists only so unit tests can
+        // toggle Kakehashi-level gates; none of them reach this handshake).
+        crate::experimental::enabled(),
     );
     handle
         .send_request(init_request, init_request_id)

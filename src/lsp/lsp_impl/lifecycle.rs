@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::Result;
-#[cfg(feature = "experimental")]
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
     CodeLensOptions, CompletionOptions, DeclarationCapability, DeclarationOptions,
@@ -365,10 +364,9 @@ impl Kakehashi {
                 linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
                     true,
                 )),
-                #[cfg(feature = "experimental")]
-                color_provider: Some(ColorProviderCapability::Simple(true)),
-                #[cfg(not(feature = "experimental"))]
-                color_provider: None,
+                color_provider: self
+                    .experimental_enabled()
+                    .then_some(ColorProviderCapability::Simple(true)),
                 moniker_provider: Some(OneOf::Left(true)),
                 // pull-first-diagnostic-forwarding: Pull-first diagnostic forwarding
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(

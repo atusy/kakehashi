@@ -28,8 +28,21 @@ fn init_options() -> serde_json::Value {
     })
 }
 
-fn client_with_open_doc() -> LspClient {
-    let mut client = LspClient::new();
+/// Spawn a client with the native layer enabled (`KAKEHASHI_EXPERIMENTAL=true`)
+/// or hermetically disabled (the variable removed even if the developer's
+/// shell exports it).
+fn experimental_client(enabled: bool) -> LspClient {
+    let builder = LspClient::builder();
+    if enabled {
+        builder.env("KAKEHASHI_EXPERIMENTAL", "true")
+    } else {
+        builder.env_remove("KAKEHASHI_EXPERIMENTAL")
+    }
+    .build()
+}
+
+fn client_with_open_doc(experimental: bool) -> LspClient {
+    let mut client = experimental_client(experimental);
     client.send_request(
         "initialize",
         json!({
@@ -61,7 +74,7 @@ fn use_position() -> serde_json::Value {
 
 #[test]
 fn native_definition_resolves_without_a_bridge_server() {
-    let mut client = client_with_open_doc();
+    let mut client = client_with_open_doc(true);
 
     let response = client.send_request(
         "textDocument/definition",
@@ -96,7 +109,7 @@ fn native_definition_resolves_without_a_bridge_server() {
 
 #[test]
 fn native_definition_resolves_inside_markdown_lua_block() {
-    let mut client = LspClient::new();
+    let mut client = experimental_client(true);
     client.send_request(
         "initialize",
         json!({
@@ -149,9 +162,34 @@ fn native_definition_resolves_inside_markdown_lua_block() {
     assert_eq!(range["start"]["character"], 6);
 }
 
+/// The native lexical-resolution layer is experimental: without
+/// `KAKEHASHI_EXPERIMENTAL=true` in the server's environment it must stay
+/// silent, even when a `bindings.scm` is served — with no bridge server
+/// configured, definition then answers `null`.
+#[test]
+fn native_definition_stays_silent_without_kakehashi_experimental() {
+    let mut client = client_with_open_doc(false);
+
+    let response = client.send_request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": URI },
+            "position": use_position()
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "definition must not error: {response:?}"
+    );
+    assert!(
+        response["result"].is_null(),
+        "native layer must stay silent without KAKEHASHI_EXPERIMENTAL=true: {response:?}"
+    );
+}
+
 #[test]
 fn native_references_and_rename_span_definition_and_use() {
-    let mut client = client_with_open_doc();
+    let mut client = client_with_open_doc(true);
 
     let response = client.send_request(
         "textDocument/references",

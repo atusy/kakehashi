@@ -6,7 +6,6 @@
 //! The structure mirrors `lsp_impl/text_document/` for consistency.
 
 mod code_lens;
-#[cfg(feature = "experimental")]
 mod color_presentation;
 
 pub(crate) use code_lens::{CodeLensEnvelope, extract_code_lens_envelope};
@@ -18,7 +17,6 @@ mod diagnostic;
 mod did_change;
 mod did_close;
 mod did_open;
-#[cfg(feature = "experimental")]
 mod document_color;
 mod document_highlight;
 mod document_link;

@@ -62,7 +62,15 @@ pub fn skip_if_lua_ls_unavailable() -> bool {
 /// Callers must keep the `TempDir` alive (e.g., `let (_client, _config_dir) = ...`)
 /// so the temp directory is not deleted while the server is running.
 pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
-    let (client, config_dir) = init_lua_client(None);
+    let (client, config_dir) = init_lua_client_with(None, false);
+    (client, config_dir)
+}
+
+/// [`create_lua_configured_client`] with `KAKEHASHI_EXPERIMENTAL=true` set on
+/// the spawned server — for tests exercising experimental features
+/// (documentColor / colorPresentation bridging).
+pub fn create_lua_configured_client_experimental() -> (LspClient, tempfile::TempDir) {
+    let (client, config_dir) = init_lua_client_with(None, true);
     (client, config_dir)
 }
 
@@ -82,7 +90,7 @@ pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
 pub fn create_lua_configured_client_with_workspace()
 -> (LspClient, tempfile::TempDir, tempfile::TempDir) {
     let workspace_dir = tempfile::TempDir::new().expect("Failed to create workspace temp dir");
-    let (client, config_dir) = init_lua_client(Some(&workspace_dir));
+    let (client, config_dir) = init_lua_client_with(Some(&workspace_dir), false);
     (client, workspace_dir, config_dir)
 }
 
@@ -90,7 +98,10 @@ pub fn create_lua_configured_client_with_workspace()
 ///
 /// When `workspace_dir` is `Some`, sets `rootUri` and `workspaceFolders` so lua-ls
 /// can index virtual documents. When `None`, uses `rootUri: null`.
-fn init_lua_client(workspace_dir: Option<&tempfile::TempDir>) -> (LspClient, tempfile::TempDir) {
+fn init_lua_client_with(
+    workspace_dir: Option<&tempfile::TempDir>,
+    experimental: bool,
+) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("empty.toml");
     std::fs::write(&config_path, "").expect("Failed to write empty config");
@@ -99,10 +110,16 @@ fn init_lua_client(workspace_dir: Option<&tempfile::TempDir>) -> (LspClient, tem
         .expect("temp path should be valid UTF-8")
         .to_string();
 
-    let mut client = LspClient::builder()
+    let builder = LspClient::builder()
         .arg("--config-file")
-        .arg(&config_path_str)
-        .build();
+        .arg(&config_path_str);
+    let mut client = if experimental {
+        builder.env("KAKEHASHI_EXPERIMENTAL", "true")
+    } else {
+        // Hermetic even when the developer's shell exports the opt-in.
+        builder.env_remove("KAKEHASHI_EXPERIMENTAL")
+    }
+    .build();
 
     let (root_uri, workspace_folders) = match workspace_dir {
         Some(dir) => {

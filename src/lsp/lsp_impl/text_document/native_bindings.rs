@@ -71,6 +71,12 @@ impl Kakehashi {
         position: Position,
         f: impl FnOnce(NativeBindingsContext<'_>) -> Option<R>,
     ) -> Result<Option<R>> {
+        // Experimental gate (KAKEHASHI_EXPERIMENTAL=true): without the
+        // opt-in the native layer contributes nothing and the layer walk
+        // falls through to the bridge layers.
+        if !self.experimental_enabled() {
+            return Ok(None);
+        }
         let Ok(uri) = uri_to_url(lsp_uri) else {
             return Ok(None);
         };
@@ -428,6 +434,7 @@ mod tests {
     fn server_with_doc(text: &str) -> (LspService<Kakehashi>, Url, Uri) {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
+        server.set_experimental(true);
         server
             .language
             .language_registry_for_parallel()
@@ -472,6 +479,25 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].target_range.start, Position::new(0, 16));
         assert_eq!(links[0].target_range.end, Position::new(0, 22));
+    }
+
+    #[tokio::test]
+    async fn native_layer_stays_silent_without_the_experimental_opt_in() {
+        let text = "fn main() { let target = 1; target; }";
+        let (service, _url, uri) = server_with_doc(text);
+        let server = service.inner();
+        server.set_experimental(false);
+
+        let links = server
+            .native_bindings_answer(&uri, Position::new(0, 28), |ctx| {
+                native_definition(ctx, &uri)
+            })
+            .await
+            .unwrap();
+        assert!(
+            links.is_none(),
+            "the native layer must contribute nothing without the opt-in"
+        );
     }
 
     #[tokio::test]
@@ -633,6 +659,7 @@ mod tests {
     fn server_with_markdown_doc(text: &str) -> (LspService<Kakehashi>, Uri) {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
+        server.set_experimental(true);
         server
             .language
             .language_registry_for_parallel()
