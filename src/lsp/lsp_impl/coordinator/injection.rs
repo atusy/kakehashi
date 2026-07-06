@@ -56,9 +56,10 @@ impl InjectionCoordinator {
     /// Send didClose for invalidated virtual documents.
     ///
     /// Region IDs invalidated by edits touching their START orphan their virtual
-    /// documents downstream; this clears their token cache and delegates didClose to
-    /// the BridgeCoordinator. Never-opened documents are skipped automatically (no
-    /// didOpen was sent).
+    /// documents downstream; this delegates their didClose to the
+    /// BridgeCoordinator and evicts their diagnostic slots (the injection-token
+    /// cache is content-addressed and needs no per-ULID eviction — see below).
+    /// Never-opened documents are skipped automatically (no didOpen was sent).
     pub(crate) async fn close_invalidated_virtual_docs(
         &self,
         host_uri: &Url,

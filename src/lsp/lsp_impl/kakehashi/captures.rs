@@ -625,7 +625,15 @@ impl Kakehashi {
         // several deltas per keystroke); without a cancel signal each walk ran
         // to completion on a compute-pool thread. The token doubles as the
         // pool's dequeue hook (a cancelled work-unit is skipped before it ever
-        // takes a thread) and as the walk's per-layer checkpoint.
+        // takes a thread) and as the walk's per-layer checkpoint. Two accepted
+        // bounds on that granularity: (a) the layer-tree BUILD phase
+        // (`layer_trees.get_or_init`) deliberately ignores cancel — its result
+        // is shared by every subsequent walk on the snapshot via OnceLock, and
+        // a cancelled partial build must never be cached, so it runs at most
+        // once per snapshot to completion; (b) the token's only cancel source
+        // is the select arm below — if this handler future is dropped wholesale
+        // (client disconnect / service teardown) a walk already dequeued runs
+        // to completion once, bounded by the walk itself.
         let upstream_id = crate::lsp::current_upstream_id();
         let (mut cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let cancel_token = crate::cancel::CancelToken::default();
@@ -643,6 +651,11 @@ impl Kakehashi {
         // walks run once, on the settled snapshot, and install lineage.
         // `null` stays the protocol's re-sync signal for no-snapshot
         // (pre-first-parse), the settle backstop, and the lineage gate.
+        // Deliberate asymmetry with semanticTokens: tokens get the parse
+        // loop's settle refresh (server re-drive) and so may reject silently;
+        // captures rely entirely on the client's null-retry — past the
+        // backstop that cycles at one park per retry (~0.1 req/s per kind),
+        // churn but never dark, and no server-side re-drive is needed.
         // The injected-grammar install is not triggered inline here: the
         // parse loop's downstream (`process_injections`) detects missing
         // injected grammars and spawns the install as a detached task; a
@@ -740,7 +753,11 @@ impl Kakehashi {
         // a `null` outcome as a negative entry — so the no-kind-file case
         // can't convoy the losers into sequential identical walks. The 1s
         // re-loop timeout is a lost-wakeup backstop only — correctness never
-        // depends on it.
+        // depends on it. Accepted dedup gap: each request resolves its
+        // snapshot BEFORE this loop, so a loser whose wake finds the memo
+        // tagged one publish newer than its own snapshot misses and re-walks
+        // — correct (the lineage gate voids nothing), just less deduped
+        // exactly under burst load.
         let mut flight_guard = None;
         let walk_key = if lsp_range.is_none() {
             let key = (uri.clone(), kind.to_string(), injection);
@@ -1337,6 +1354,7 @@ mod tests {
             "the handler must park on the trailing snapshot, not answer from it"
         );
         publish("fn main() { }", 1);
+        let woke_at = tokio::time::Instant::now();
         let result = request
             .await
             .expect("handler must not panic")
@@ -1344,6 +1362,13 @@ mod tests {
         // Tree-less snapshot → the walk degrades to the protocol null; what
         // matters here is WHEN it answered (after currency), not the shape.
         assert_eq!(result, Value::Null);
+        // Discriminate woke-on-publish from backstop-timeout: under the
+        // paused clock a handler that missed the publish would only answer
+        // after auto-advancing through the settle backstop.
+        assert!(
+            woke_at.elapsed() < crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP,
+            "the handler must wake on the publish, not ride out the backstop"
+        );
     }
 
     /// Single-flight: a request that finds another walk in flight for the
@@ -1537,10 +1562,13 @@ mod tests {
             .expect("node id is a ULID")
     }
 
-    /// The NodeTracker is a live-coordinate index; a walk over a snapshot
-    /// that trails the live document must still serve matches (serve-stale)
-    /// but must NOT register its ids in the tracker — a stale read never
-    /// mints (see the currency gate in `execute_captures_walk`).
+    /// The NodeTracker is a live-coordinate index; the walk CORE, run
+    /// directly against a snapshot that trails the live document, must still
+    /// serve matches but must NOT register its ids in the tracker — a stale
+    /// read never mints (see the currency gate in `execute_captures_walk`).
+    /// The handler above it parks for the current snapshot (serve-current),
+    /// so this is defense in depth for the close/reopen races the handler's
+    /// own incarnation checks bound but cannot eliminate.
     #[test]
     fn stale_serve_returns_matches_but_never_mints_into_the_tracker() {
         use crate::config::WorkspaceSettings;
@@ -1635,7 +1663,7 @@ mod tests {
         .expect("kind query should load");
         assert!(
             !stale_matches.is_empty(),
-            "serve-stale still returns matches"
+            "a stale walk still returns matches"
         );
         assert_eq!(
             first_node_id(&stale_matches),

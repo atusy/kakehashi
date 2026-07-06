@@ -258,9 +258,10 @@ The decision therefore **separates three concerns that today all ride the tracke
 - **Cross-edit token reuse** (the injection-token-cache-reuse benefit): the cache
   is already content-validated at read (its entry carries `validity_hash` = content
   ⊕ language, and the settings `generation`), but its *key* is today the tracker
-  ULID. The change is to **drop `region_id` from the key** — key on
-  `(uri, content_hash)`, keeping `validity_hash` and the settings `generation` as
-  entry metadata checked at read, not as key components. The key **must stay stable
+  ULID. The change is to **drop `region_id` from the key** — key on the content
+  identity (implemented as `(uri, validity_hash)`, the content ⊕ resolved-language
+  fold), keeping the settings `generation` as entry metadata checked at read, not
+  as a key component. The key **must stay stable
   across edits** for reuse to work, so it must not include anything that turns over
   per edit; the `generation` here is the **config/settings epoch** (bumped only on a
   settings reload, the #530 discipline — *not* the per-edit parse-run counter), so a
@@ -398,8 +399,10 @@ Any reader that must resolve against **live** positions is position-critical
     this guards the resolve→delivery window).
 
 Three bounded waits remain, all deliberate: the **first parse after `didOpen`**
-(the snapshot is `None`; it waits briefly on `watch::changed()` then serves `null` —
-the same decoupling parse-decoupled-document-lifecycle applies to its host tier),
+(the snapshot is `None`; it waits briefly on `watch::changed()` then serves each
+reader's empty fallback — protocol `null` for captures/node, an empty
+`SemanticTokens` for the token handlers — the same decoupling
+parse-decoupled-document-lifecycle applies to its host tier),
 the **explicit-action wait** above (`formatting`/`rename`), and the
 **serve-current token wait** (`semanticTokens` full/delta — parked, not
 polling; bounded by parse completion and released early by supersede/cancel).
@@ -600,9 +603,11 @@ inside the existing safety contracts at each step:
   `semanticTokens` full/delta **parks** for the current snapshot (silence keeps
   the editor's shifted extmarks intact — see §3) and falls back to
   `ContentModified` + the settle refresh only past its backstop; `captures/full`
-  serves stale (usually one edit behind, healed by its per-keystroke
-  re-request); `documentSymbol`/`documentColor` self-correct only on the
-  client's next natural request (no active refresh added).
+  and `full/delta` take the same parked wait (§3 — revised from the original
+  serve-stale on live-editor evidence), answering `null` (their protocol
+  re-sync signal) past the backstop; `documentSymbol`/`documentColor`
+  self-correct only on the client's next natural request (no active refresh
+  added).
 - Staleness-reject requests (`kakehashi/node/*`, range requests, formatting) return
   `ContentModified` during the reparse window (`captures/range` returns `null`, its
   protocol re-sync signal). The LSP spec does not mandate retry on `ContentModified`,

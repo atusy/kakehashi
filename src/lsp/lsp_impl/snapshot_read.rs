@@ -46,6 +46,12 @@ pub(crate) const FIRST_PARSE_BACKSTOP: std::time::Duration = std::time::Duration
 /// (shifted by the editor across edits), which is strictly better than
 /// receiving tokens computed for text it no longer has. On expiry the parse
 /// loop's settle refresh re-drives the client once the snapshot lands.
+///
+/// This constant governs the *stale* park only (a snapshot exists but
+/// trails). A document with NO snapshot for its lifetime parks on
+/// [`FIRST_PARSE_BACKSTOP`] instead, regardless of the caller's `wait` — a
+/// token reader's worst-case park is therefore the first-parse bound (15s),
+/// not this.
 pub(crate) const TOKEN_SETTLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Kakehashi {

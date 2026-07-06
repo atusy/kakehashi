@@ -355,6 +355,12 @@ pub(crate) struct InjectionTokenCache {
 /// different language (or a language re-resolution after install) get a
 /// different key barring a 64-bit collision. One definition shared by the
 /// store/read path and populate's eviction sweep — the two must never drift.
+///
+/// Accepted bound: the 64-bit FNV-1a fold is not collision-resistant, and a
+/// collision has no secondary gate — but an accidental one is ~2⁻⁶⁴ and a
+/// *crafted* one only mis-highlights the crafting user's own buffer (tokens
+/// never cross documents: the outer key is the URI), so a cryptographic hash
+/// isn't worth its per-keystroke cost here.
 pub(crate) fn region_validity_hash(content_hash: u64, resolved_lang: &str) -> u64 {
     content_hash ^ crate::text::fnv1a_hash(resolved_lang).wrapping_mul(0x100000001b3)
 }

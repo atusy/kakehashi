@@ -1018,12 +1018,22 @@ async fn run_lsp_server() {
     // bursts of concurrent requests per keystroke (Neovim: semanticTokens +
     // captures lineages + diagnostics + …), and handlers park awaiting the
     // per-URI parse snapshot. With only 4 slots, parked readers exhaust the
-    // buffer and the very didChange/$/cancelRequest notifications that would
-    // release them queue behind — a priority inversion observed as multi-second
-    // handler-start delays. Ordering is IngressOrderGate's job and CPU is the
-    // bounded ComputePool's; admission just needs to never be the bottleneck.
+    // buffer and the very didChange notifications that would release them
+    // queue behind — a priority inversion observed as multi-second
+    // handler-start delays. Ordering is IngressOrderGate's job (tickets are
+    // assigned synchronously in wire order, independent of this value) and
+    // CPU is the bounded ComputePool's, so a wider admission costs only
+    // parked futures. This NARROWS the inversion rather than removing it:
+    // the wedge threshold becomes INGRESS_CONCURRENCY + tower-lsp's 100-slot
+    // channel queue of outstanding messages, and a wedge self-heals within
+    // the parked readers' settle backstop. `$/cancelRequest` is immune either
+    // way — its forwarding runs synchronously inside `RequestIdCapture::call`
+    // and needs no admission slot. Sized for the worst observed per-keystroke
+    // burst (≈10 concurrent reader parks per document) across several
+    // documents, with headroom.
+    const INGRESS_CONCURRENCY: usize = 64;
     Server::new(stdin, stdout, socket)
-        .concurrency_level(64)
+        .concurrency_level(INGRESS_CONCURRENCY)
         .serve(service)
         .await;
 }

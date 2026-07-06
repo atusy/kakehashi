@@ -59,9 +59,9 @@ impl Kakehashi {
     /// the newest published snapshot, which may trail the input. The only
     /// wait is the bounded first-parse wait (no snapshot for this lifetime
     /// yet); no per-keystroke read ever waits on a reparse. Used by the
-    /// currency-*checking* readers (`semanticTokens/range` via
-    /// [`current_snapshot`](Self::current_snapshot)) that reject stale reads
-    /// themselves. `None` for an unregistered/closed URI or when no parse
+    /// currency-*checking* readers (`semanticTokens/range`, which resolves
+    /// through this and then staleness-rejects inline against the live
+    /// version). `None` for an unregistered/closed URI or when no parse
     /// resolves within the wait.
     pub(crate) async fn snapshot_for_tokens(
         &self,
@@ -209,6 +209,13 @@ impl Kakehashi {
                 })));
             }
             TokenSnapshot::Stale => {
+                // Register token interest (version 0, monotonic max — a real
+                // serve overwrites) so the settle-refresh gate re-drives this
+                // client even when EVERY request so far rejected: without a
+                // served mark the gate reads "nobody highlights this
+                // document" and the client would stay dark until its next
+                // didChange-driven request.
+                self.cache.record_served_semantic_version(&uri, 0);
                 self.cache.finish_request(&uri, request_id);
                 return Err(crate::error::content_modified_error());
             }
@@ -511,6 +518,13 @@ impl Kakehashi {
                 )));
             }
             TokenSnapshot::Stale => {
+                // Register token interest (version 0, monotonic max — a real
+                // serve overwrites) so the settle-refresh gate re-drives this
+                // client even when EVERY request so far rejected: without a
+                // served mark the gate reads "nobody highlights this
+                // document" and the client would stay dark until its next
+                // didChange-driven request.
+                self.cache.record_served_semantic_version(&uri, 0);
                 self.cache.finish_request(&uri, request_id);
                 return Err(crate::error::content_modified_error());
             }
@@ -839,9 +853,10 @@ impl Kakehashi {
         };
         // Staleness-reject: the request's `range` is authored against the
         // LIVE text, so a trailing (or cross-incarnation) snapshot cannot
-        // answer it — unlike full/delta (whole-document, serve-stale). A
-        // stale snapshot → ContentModified; the client's next natural request
-        // (this is a per-redraw viewport read) gets the fresh one.
+        // answer it — unlike full/delta (whole-document, which PARK for the
+        // current snapshot instead). A stale snapshot → ContentModified; the
+        // client's next natural request (this is a per-redraw viewport read)
+        // gets the fresh one.
         let Some(view) = self.documents.latest_snapshot(&uri) else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -1131,9 +1146,12 @@ mod tests {
             crate::error::content_modified_error().code,
             "staleness past the settle backstop signals ContentModified"
         );
-        assert!(
-            server.cache.served_semantic_version(&uri).is_none(),
-            "a rejected request must not record a served version"
+        assert_eq!(
+            server.cache.served_semantic_version(&uri),
+            Some(0),
+            "a rejected request must register token interest (version 0, \
+             never the stale snapshot's version) so the settle-refresh gate \
+             re-drives a client whose every request rejected"
         );
     }
 
@@ -1259,7 +1277,8 @@ mod tests {
         );
     }
 
-    /// The serve-stale model never parses on demand: a request against a
+    /// Snapshot readers never parse on demand (ADR §3 — the property survived
+    /// the serve-stale → serve-current revision): a request against a
     /// resolved-but-tree-less snapshot (what `parse_document` publishes when
     /// no parser is available) releases the first-parse wait immediately,
     /// serves the empty fallback, and leaves the document's tree untouched.
@@ -1334,7 +1353,7 @@ mod tests {
         let doc = server.documents.get(&uri).expect("document still open");
         assert!(
             doc.tree().is_none(),
-            "serve-stale never parses inline: the tree must stay absent"
+            "snapshot readers never parse inline: the tree must stay absent"
         );
     }
 

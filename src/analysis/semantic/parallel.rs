@@ -721,7 +721,8 @@ fn discover_single_region(
 
     // Resolve this single region's cache identity (#529). region_id is minted
     // from the RAW content node — byte-identical to populate_injections
-    // (cache.rs) — so invalidate_for_edits evicts the same entry. Eligibility
+    // (cache.rs), which keeps the bridge/tracker identities in sync (token
+    // eviction itself is content-addressed and needs no id). Eligibility
     // is this request's translation predicate: column-0 start AND no per-row
     // prefixes (singles are never injection.combined).
     let token_cache = cache_for_singles.and_then(|(uri, tracker, mint_regions)| {
