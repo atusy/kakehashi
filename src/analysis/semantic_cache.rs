@@ -450,13 +450,14 @@ impl InjectionTokenCache {
     /// racing a store of an already-dead hash merely leaks that entry until
     /// the next sweep.
     pub(crate) fn retain_document(&self, uri: &Url, live: &std::collections::HashSet<u64>) {
-        if let Some(mut doc) = self.cache.get_mut(uri) {
+        // One shard write lock for both the sweep and the empty-entry
+        // reclaim: `remove_if_mut` mutates in place and removes only when
+        // the closure returns true, so a concurrent store can never land
+        // between the sweep and the reclaim.
+        self.cache.remove_if_mut(uri, |_, doc| {
             doc.retain(|hash, _| live.contains(hash));
-        }
-        // Reclaim the emptied outer entry; `remove_if` re-checks under the
-        // shard write lock so a concurrent store that repopulated the map
-        // between the sweep above and this call is never dropped.
-        self.cache.remove_if(uri, |_, doc| doc.is_empty());
+            doc.is_empty()
+        });
     }
 
     /// Remove all cached tokens for a document (all its injection regions).
