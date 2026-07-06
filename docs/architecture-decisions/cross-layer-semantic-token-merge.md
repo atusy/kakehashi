@@ -295,7 +295,9 @@ tokenModifiers = ["mutable", "consuming"]
 ```
 
 Extra entries are appended after the standard ones, so standard indices stay
-stable. Because config is read before kakehashi answers `initialize`, this
+stable. (The camelCase key names deliberately mirror LSP's
+`SemanticTokensLegend` fields, and the table is top-level rather than
+per-language because the legend is advertised once per server.) Because config is read before kakehashi answers `initialize`, this
 extension is protocol-legal: the legend is still declared exactly once and
 never changes afterward — what Alternative D rejects is widening it
 *dynamically* per bridged server. Two bounds follow: `tokenModifiers` are
@@ -504,8 +506,9 @@ visible to stage 1 or a type split"; its Neutral bullet now defers here:
 - **Two-coordinate bookkeeping, plus edit replay.** virt→host remap must be
   exact, or merged tokens land on the wrong characters — a sharper failure
   mode than for position requests, where one wrong location is visible in
-  isolation. The stale-shift contract adds a second exactness obligation:
-  replaying edit deltas over token positions. Injection-fence boundaries —
+  isolation. The stale-shift contract adds a second exactness obligation: the
+  **ordered** replay of edit deltas over token positions (§2's fold — never
+  independent shifts against the original text). Injection-fence boundaries —
   where clipped/split bridged fragments meet native tokens — are the most
   visible artifact zone and the natural focus for merge tests.
 

@@ -249,7 +249,7 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   (language-server-bridge-request-strategies Strategy 1) is a *temporal*
   merge — native immediately, bridged tokens replacing them later — not an
   ordering. Semantic tokens stay outside this mechanism (native-only today);
-  the `merged`-style strategy that brings them in is specified by
+  the `merged` composition that brings them in is specified by
   cross-layer-semantic-token-merge, which reuses this decision's `priorities`
   ordering as its sweep-line layer rank.
 
@@ -292,7 +292,7 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 ### Neutral
 
 - **`strategy` type shared across stages**: one `AggregationStrategy` enum
-  serves both. The anticipated stage-2-only `merged` strategy avoids the
+  serves both. The stage-2-only `merged` composition avoids the
   enum-growth-vs-type-split cost entirely: cross-layer-semantic-token-merge
   keeps `merged` off the enum, dispatching semantic-tokens methods to the
   merge path internally rather than exposing a new strategy value.
