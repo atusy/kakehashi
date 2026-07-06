@@ -248,23 +248,28 @@ impl CapturesMatchCache {
             doc.host.insert(kind.to_string(), entry);
             return;
         }
-        // Creating the doc slot needs a liveness check: an airborne walk
+        // Creating the doc slot needs a liveness handshake: an airborne walk
         // whose document was closed mid-flight must not resurrect the entry
         // `clear_document` just dropped — nothing would ever reclaim it (the
         // pre-existing walk memo shares this race; its entries are small,
-        // these hold full match sets). `doc_open` is consulted only on this
-        // create path, so the steady state pays nothing. A close landing
-        // between the check and the insert still resurrects — the same
-        // accepted micro-window as every deferred-epoch-class lifecycle
-        // race; it heals on reopen-close and costs memory, never staleness.
-        if !doc_open() {
-            return;
-        }
+        // these hold full match sets). INSERT-THEN-VERIFY, paired with
+        // didClose's `documents.remove` → `clear_document` ordering, closes
+        // the leak entirely (codex review): if the post-insert probe sees
+        // the document open, the remove has not run yet, so the close's
+        // later `clear_document` reclaims this insert; if it sees it
+        // closed, we drop the slot ourselves. (A probe-BEFORE-insert had a
+        // TOCTOU hole: close landing between check and insert leaked.) The
+        // self-remove can transiently drop a reopen-race walk's fresh
+        // entries — a recomputable miss, never staleness. `doc_open` runs
+        // only on this create path; the steady state never probes.
         self.cache
             .entry(uri.clone())
             .or_default()
             .host
             .insert(kind.to_string(), entry);
+        if !doc_open() {
+            self.cache.remove(uri);
+        }
     }
 
     pub(in crate::lsp::lsp_impl) fn get_layer(
@@ -296,16 +301,16 @@ impl CapturesMatchCache {
             doc.layers.insert(validity_hash, entry);
             return;
         }
-        // See `store_host`: create-path liveness check against the
-        // close-during-walk resurrection leak.
-        if !doc_open() {
-            return;
-        }
+        // See `store_host`: create-path insert-then-verify handshake
+        // against the close-during-walk resurrection leak.
         self.cache
             .entry(uri.clone())
             .or_default()
             .layers
             .insert(validity_hash, entry);
+        if !doc_open() {
+            self.cache.remove(uri);
+        }
     }
 
     /// Retain, for `kind`, only the layer entries a completed full-coverage
@@ -551,10 +556,11 @@ mod tests {
         );
     }
 
-    /// The close-during-walk resurrection guard: a store that would CREATE
-    /// the per-document slot consults `doc_open` and drops the store for a
-    /// closed document; a store into an EXISTING slot never probes (the
-    /// steady-state path stays closure-free).
+    /// The close-during-walk resurrection guard: a store that CREATES the
+    /// per-document slot verifies `doc_open` AFTER the insert and drops the
+    /// slot for a closed document (insert-then-verify — see `store_host`);
+    /// a store into an EXISTING slot never probes (the steady-state path
+    /// stays closure-free).
     #[test]
     fn store_into_missing_doc_slot_requires_liveness() {
         let cache = CapturesMatchCache::new();
