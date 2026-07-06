@@ -317,9 +317,14 @@ impl ParseCoordinator {
                 // The edit_lock() accessor above materializes a lock entry
                 // even for a document a didClose already removed — drop it
                 // so raced closes can't grow the map (the did_change stray
-                // rule).
+                // rule). Identity- AND share-checked: a reopen racing this
+                // probe may already be reusing this very entry (or have
+                // installed a new one) for the new lifetime's edits, and
+                // removing it from under a queued edit would let the next
+                // edit mint a fresh mutex and run concurrently.
                 if self.documents.latest_snapshot(&uri).is_none() {
-                    self.documents.remove_edit_lock(&uri);
+                    self.documents
+                        .remove_edit_lock_if_unshared(&uri, &edit_lock);
                 }
                 return PopulatedSnapshotRegions::default();
             }

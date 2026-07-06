@@ -542,6 +542,25 @@ impl DocumentStore {
         self.edit_locks.remove(uri);
     }
 
+    /// [`remove_edit_lock`](Self::remove_edit_lock), but only while the map
+    /// still holds the exact `Arc` the caller acquired AND nobody else
+    /// holds a clone — for miss paths that probe liveness some time after
+    /// their `edit_lock()` call. A close+reopen in that gap can hand the
+    /// SAME entry to the new lifetime's first edit (`edit_lock`
+    /// get-or-inserts), and removing it from under that queued edit would
+    /// let the lifetime's next edit mint a fresh mutex and run
+    /// concurrently. The strong count identifies the safe case: exactly 2
+    /// means the caller's clone plus the map's copy and no queued waiter
+    /// (every waiter cloned via `edit_lock`, whose or-insert serializes
+    /// with this predicate on the entry's shard lock, so a pre-predicate
+    /// clone is always visible in the count). On a waiter, the entry stays
+    /// — it is in live use, not a leak.
+    pub(crate) fn remove_edit_lock_if_unshared(&self, uri: &Url, held: &Arc<Mutex<()>>) {
+        self.edit_locks.remove_if(uri, |_, current| {
+            Arc::ptr_eq(current, held) && Arc::strong_count(current) == 2
+        });
+    }
+
     /// Ensure a watermark channel exists for `uri` carrying the current lifetime's
     /// `incarnation`, created at ticket 0. Called when a document is registered or
     /// edited so the watermark's lifetime tracks the document's — it exists exactly
