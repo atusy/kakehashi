@@ -139,7 +139,13 @@ native finalize          host server          virt server(s)
   servers**, their per-server streams are collapsed by the same breakpoint
   sweep with the server's rank in the stage-1 `bridge.<key>.aggregation`
   `priorities` ordering as the key — the first-listed server that tokenized a
-  region wins it. The same per-target collapse applies within each injection's
+  region wins it. A `"*"` entry ranks every unlisted server at its own
+  position as one group (aggregation-priorities-wildcard's first-win rest
+  group); the sweep needs a total order, so ties inside the group break
+  deterministically by the target's server registration order. For semantic
+  tokens this **supersedes** request-strategies' provisional "Later server
+  wins for overlapping ranges" rule, which predates this decision. The same
+  per-target collapse applies within each injection's
   `bridge.<inj>` before the cross-injection nesting collapse below, so every
   downstream stream enters that step already single. **Virt is not a single
   response** — nested injections (markdown → python → sql) yield one stream
