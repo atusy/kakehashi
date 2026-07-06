@@ -248,6 +248,14 @@ pub struct Kakehashi {
     #[allow(clippy::type_complexity)]
     captures_walk_inflight:
         dashmap::DashMap<(Url, String, bool), std::sync::Arc<tokio::sync::Notify>>,
+    /// Cross-snapshot, content-addressed cache of per-layer captures query
+    /// matches: a layer whose content merely SHIFTED between snapshots (the
+    /// per-keystroke common case — an edit above a fence) reuses its cached
+    /// ID-free match data instead of re-executing the kind query. `Arc`'d
+    /// because the compute-pool walk runs off `self`. Swept per completed
+    /// current-at-entry full walk, dropped on `didClose`; see the
+    /// `captures_match_cache` module docs.
+    captures_match_cache: std::sync::Arc<kakehashi::captures_match_cache::CapturesMatchCache>,
     /// True when the process runs as a one-shot CLI (`kakehashi diagnose`/`format`)
     /// rather than a long-lived LSP server. Set once by `cli_initialize`. No editor
     /// consumes a proactive `publishDiagnostics` in CLI mode (the stub client pump
@@ -332,6 +340,9 @@ impl Kakehashi {
             captures_cache: dashmap::DashMap::new(),
             captures_walk_cache: dashmap::DashMap::new(),
             captures_walk_inflight: dashmap::DashMap::new(),
+            captures_match_cache: std::sync::Arc::new(
+                kakehashi::captures_match_cache::CapturesMatchCache::new(),
+            ),
             cli_mode: std::sync::atomic::AtomicBool::new(false),
             parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
         }

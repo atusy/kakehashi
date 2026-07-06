@@ -36,7 +36,7 @@
 //! - JSON-RPC `InvalidParams` for a malformed `kind` (fails the character
 //!   whitelist guarding the filesystem lookup).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -155,13 +155,18 @@ fn matches_delta_edit(previous: &[Value], current: &[Value]) -> Option<(usize, u
 /// A valued key maps to its string; the bare flag form `(#set! key)` maps to
 /// `true` (a flag a client can test for, unlike Neovim's nil no-op). Duplicate
 /// keys are last-write-wins, matching Neovim's in-order directive application.
-fn metadata_object(pairs: Vec<(String, Option<String>)>) -> Option<Value> {
+fn metadata_object(pairs: &[(String, Option<String>)]) -> Option<Value> {
     if pairs.is_empty() {
         return None;
     }
-    let mut map = serde_json::Map::new();
+    let mut map = serde_json::Map::with_capacity(pairs.len());
     for (key, value) in pairs {
-        map.insert(key, value.map_or(Value::Bool(true), Value::String));
+        map.insert(
+            key.clone(),
+            value
+                .as_ref()
+                .map_or(Value::Bool(true), |v| Value::String(v.clone())),
+        );
     }
     Some(Value::Object(map))
 }
@@ -884,6 +889,7 @@ impl Kakehashi {
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
         let documents = std::sync::Arc::clone(&self.documents);
+        let match_cache = std::sync::Arc::clone(&self.captures_match_cache);
         let parsed_version = snapshot.parsed_version;
         let snapshot_for_layers = std::sync::Arc::clone(&snapshot);
         let walk_cancel = cancel_token.clone();
@@ -952,6 +958,7 @@ impl Kakehashi {
                     parsed_version,
                     incarnation,
                     generation,
+                    &match_cache,
                     Some(&inner_cancel),
                 );
                 log::debug!(
@@ -1048,6 +1055,7 @@ fn execute_captures_walk(
     parsed_version: u64,
     incarnation: u64,
     generation: u64,
+    match_cache: &super::captures_match_cache::CapturesMatchCache,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<(Vec<Value>, Vec<Value>)> {
     // Tracker minting is currency-gated: the NodeTracker is a LIVE-coordinate
@@ -1106,6 +1114,16 @@ fn execute_captures_walk(
     let mut kind_queries: HashMap<String, std::sync::Arc<KindQueryLoad>> = HashMap::new();
     let mut matches: Vec<Value> = Vec::new();
 
+    // Cross-snapshot match reuse is a full-walk concern only: a range walk
+    // produces results clipped to the viewport, which must neither be
+    // served as a layer's full matches nor stored as them.
+    let cache_full_walk = byte_range.is_none();
+    // Layer-entry hashes this walk read or wrote — the live set for the
+    // post-walk sweep (host slots self-replace and need no sweep).
+    let mut touched_layer_hashes: HashSet<u64> = HashSet::new();
+    // Hit/miss counters for the walk log line (cache-behavior diagnostics).
+    let (mut layers_reused, mut layers_executed) = (0usize, 0usize);
+
     let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
         // Per-layer cancellation checkpoint: a cancelled walk stops doing
         // query/mint work; the caller discards the (partial) result.
@@ -1126,16 +1144,91 @@ fn execute_captures_walk(
         let KindQueryLoad::Loaded(kind_query) = entry.as_ref() else {
             return;
         };
-        for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
-            let match_metadata = metadata_object(m.metadata);
+        // Content-addressed cross-snapshot reuse: a layer whose included
+        // ranges carry the same bytes in the same relative geometry (merely
+        // translated by edits elsewhere) serves its cached MatchData and
+        // skips execute_query. Only the ID-free byte-offset stage is cached;
+        // minting/positions/shaping below run identically on hit and miss.
+        //
+        // The host layer (depth 0) is DELIBERATELY included even though any
+        // keystroke changes host bytes and misses: its hit case is exact
+        // content recurrence (undo/redo, revert), which replays the most
+        // expensive single query of the walk for free. The price is one
+        // FNV pass over the layer bytes per visit — about twice the
+        // document bytes per full walk, sub-ms against the walk times the
+        // per-walk debug line reports (see the reused/executed counters).
+        let cache_key = cache_full_walk.then(|| {
+            super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text)
+        });
+        let reused = cache_key.and_then(|(_, hash)| {
+            if depth == 0 {
+                match_cache.get_host(uri, kind, hash, generation)
+            } else {
+                match_cache.get_layer(uri, hash, generation)
+            }
+        });
+        let (layer_matches, anchor): (
+            std::sync::Arc<Vec<crate::language::query_exec::MatchData>>,
+            usize,
+        ) = if let (Some(cached), Some((anchor, hash))) = (reused, cache_key) {
+            if depth > 0 {
+                touched_layer_hashes.insert(hash);
+            }
+            layers_reused += 1;
+            (cached, anchor)
+        } else {
+            layers_executed += 1;
+            let mut fresh = execute_query(&kind_query.query, layer_tree, text, byte_range.clone());
+            // Rebase to anchor-relative before storing; a refusal (a capture
+            // below the layer anchor, e.g. a root node reaching outside its
+            // included ranges) leaves the matches absolute and uncached.
+            let rebased_key = cache_key.filter(|&(anchor, _)| {
+                super::captures_match_cache::rebase_matches(&mut fresh, anchor)
+            });
+            let arc = std::sync::Arc::new(fresh);
+            if let Some((anchor, hash)) = rebased_key {
+                // The doc-open probe only runs when the store must CREATE the
+                // per-document slot (first store after open, or a walk racing
+                // its own didClose) — see the resurrection-leak note on
+                // `store_host`.
+                let doc_open = || documents.latest_snapshot(uri).is_some();
+                if depth == 0 {
+                    match_cache.store_host(
+                        uri,
+                        kind,
+                        hash,
+                        generation,
+                        std::sync::Arc::clone(&arc),
+                        doc_open,
+                    );
+                } else {
+                    match_cache.store_layer(
+                        uri,
+                        kind,
+                        hash,
+                        generation,
+                        std::sync::Arc::clone(&arc),
+                        doc_open,
+                    );
+                    touched_layer_hashes.insert(hash);
+                }
+                (arc, anchor)
+            } else {
+                (arc, 0)
+            }
+        };
+        for m in layer_matches.iter() {
+            let match_metadata = metadata_object(&m.metadata);
             let captures: Vec<Value> = m
                 .captures
-                .into_iter()
+                .iter()
                 .filter_map(|c| {
                     // A capture whose bytes don't map to positions (corrupt
                     // span) is dropped rather than failing the whole request.
-                    let start = mapper.byte_to_position(c.start_byte)?;
-                    let end = mapper.byte_to_position(c.end_byte)?;
+                    let start_byte = c.start_byte + anchor;
+                    let end_byte = c.end_byte + anchor;
+                    let start = mapper.byte_to_position(start_byte)?;
+                    let end = mapper.byte_to_position(end_byte)?;
                     // Minted in the layer's depth, so the id resolves in
                     // its minting layer via kakehashi/node/* (per-layer
                     // Scope rule). Same mint as `mint_node_info`, done via
@@ -1144,11 +1237,7 @@ fn execute_captures_walk(
                     // currency gate above).
                     let ulid = if mint_into_tracker {
                         let (ulid, created, shift_gen) = tracker.get_or_create_in_layer_tracked(
-                            uri,
-                            c.start_byte,
-                            c.end_byte,
-                            c.kind,
-                            depth,
+                            uri, start_byte, end_byte, c.kind, depth,
                         );
                         // Recorded for the post-walk purge: if an edit lands
                         // mid-walk, entries created after its shift were
@@ -1163,8 +1252,7 @@ fn execute_captures_walk(
                         }
                         ulid
                     } else {
-                        match tracker.lookup_in_layer(uri, c.start_byte, c.end_byte, c.kind, depth)
-                        {
+                        match tracker.lookup_in_layer(uri, start_byte, end_byte, c.kind, depth) {
                             Some(live) => live,
                             // NOT Ulid::default() (the nil id): unregistered
                             // ids must still be unique per capture.
@@ -1179,7 +1267,7 @@ fn execute_captures_walk(
                     });
                     // Capture-scoped `#set! @cap key value` metadata,
                     // only when the capture was annotated.
-                    if let Some(meta) = metadata_object(c.metadata) {
+                    if let Some(meta) = metadata_object(&c.metadata) {
                         capture["metadata"] = meta;
                     }
                     Some(capture)
@@ -1271,6 +1359,30 @@ fn execute_captures_walk(
     if crate::cancel::is_cancelled(cancel) {
         return None;
     }
+
+    // Match-cache sweep: after a COMPLETED full-coverage walk (all layers
+    // visited: injection mode, no viewport clip, no cancel bail), the
+    // touched set IS the document's live layer set for this kind — retain
+    // exactly it. Two things bound eviction of CURRENT entries:
+    // - the `mint_into_tracker` entry-currency gate drops the sweep of a
+    //   walk that was already trailing when it started (a stale-at-entry
+    //   walk never sweeps; its stores are harmless — content-addressed,
+    //   they only hit if that content returns, e.g. undo);
+    // - for a walk outrun DURING the walk (current at entry, edit lands
+    //   mid-flight), it is the single-flight winner guard — held across
+    //   walk AND sweep for this same (uri, kind, injection) key — that
+    //   keeps the successor's stores out until this sweep lands, so the
+    //   stale touched set can only miss entries, never evict a newer
+    //   walk's. Relaxing single-flight would re-open that window (worst
+    //   case: extra misses until the next current walk restores, never
+    //   wrong output).
+    if cache_full_walk && injection && mint_into_tracker {
+        match_cache.sweep_layers(uri, kind, &touched_layer_hashes);
+    }
+    log::debug!(
+        target: "kakehashi::captures",
+        "walk {uri} kind={kind}: match-cache reused={layers_reused} executed={layers_executed}",
+    );
 
     // The kind is "available" when at least one visited language COMPILED
     // the file — a host without a context.scm still surfaces the embedded
@@ -1732,6 +1844,7 @@ mod tests {
 
         // Current (parsed_version == content_version == 0): minting is live.
         let tracker = NodeTracker::new();
+        let match_cache = super::super::captures_match_cache::CapturesMatchCache::new();
         let (matches, _) = execute_captures_walk(
             &uri,
             "locals",
@@ -1747,6 +1860,7 @@ mod tests {
             0,
             incarnation,
             0,
+            &match_cache,
             None,
         )
         .expect("kind query should load");
@@ -1776,6 +1890,7 @@ mod tests {
             0,
             incarnation,
             0,
+            &match_cache,
             None,
         )
         .expect("kind query should load");
@@ -1807,6 +1922,7 @@ mod tests {
             0,
             incarnation,
             0,
+            &match_cache,
             None,
         )
         .expect("kind query should load");
@@ -1814,6 +1930,520 @@ mod tests {
         assert!(
             stale_tracker.lookup_node(&uri, &id).is_none(),
             "a stale serve must not mint into the live tracker"
+        );
+    }
+
+    /// Build a rust "injection layer": the full text parsed with included
+    /// ranges restricted to `[start, end)` — the shape `SnapshotLayerTree`
+    /// carries for a real fence.
+    fn rust_layer(text: &str, start: usize, end: usize) -> crate::document::SnapshotLayerTree {
+        rust_layer_ranges(text, &[(start, end)])
+    }
+
+    /// Multi-range variant of [`rust_layer`] — the blockquote-gap shape,
+    /// where a layer's included ranges are disjoint spans of the host text.
+    fn rust_layer_ranges(
+        text: &str,
+        ranges: &[(usize, usize)],
+    ) -> crate::document::SnapshotLayerTree {
+        let point_at = |byte: usize| {
+            let line = text[..byte].matches('\n').count();
+            let col = byte - text[..byte].rfind('\n').map_or(0, |i| i + 1);
+            tree_sitter::Point::new(line, col)
+        };
+        let ts_ranges: Vec<tree_sitter::Range> = ranges
+            .iter()
+            .map(|&(start, end)| tree_sitter::Range {
+                start_byte: start,
+                end_byte: end,
+                start_point: point_at(start),
+                end_point: point_at(end),
+            })
+            .collect();
+        let (start, end) = (ranges[0].0, ranges[ranges.len() - 1].1);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.set_included_ranges(&ts_ranges).unwrap();
+        crate::document::SnapshotLayerTree {
+            language: "rust".to_string(),
+            tree: parser.parse(text, None).unwrap(),
+            depth: 1,
+            span: start..end,
+        }
+    }
+
+    /// Test rig for the cross-snapshot match cache: a statically-linked rust
+    /// grammar with a locals.scm, so both the host layer and a synthetic
+    /// injected layer produce captures.
+    struct MatchCacheRig {
+        _dir: tempfile::TempDir,
+        coordinator: std::sync::Arc<crate::language::LanguageCoordinator>,
+        store: crate::document::DocumentStore,
+        tracker: crate::language::NodeTracker,
+        match_cache: super::super::captures_match_cache::CapturesMatchCache,
+        uri: Url,
+    }
+
+    impl MatchCacheRig {
+        fn new(uri: &str, text: &str) -> Self {
+            use crate::config::WorkspaceSettings;
+            let dir = tempfile::tempdir().unwrap();
+            let query_dir = dir.path().join("queries/rust");
+            std::fs::create_dir_all(&query_dir).unwrap();
+            std::fs::write(
+                query_dir.join("locals.scm"),
+                "(identifier) @local.reference\n",
+            )
+            .unwrap();
+            let coordinator = std::sync::Arc::new(crate::language::LanguageCoordinator::new());
+            coordinator.load_settings(&WorkspaceSettings {
+                search_paths: vec![dir.path().to_string_lossy().into_owned()],
+                ..Default::default()
+            });
+            coordinator
+                .language_registry_for_parallel()
+                .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+            let store = crate::document::DocumentStore::new();
+            let uri = Url::parse(uri).unwrap();
+            store.insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+            Self {
+                _dir: dir,
+                coordinator,
+                store,
+                tracker: crate::language::NodeTracker::new(),
+                match_cache: super::super::captures_match_cache::CapturesMatchCache::new(),
+                uri,
+            }
+        }
+
+        fn walk(
+            &self,
+            text: &str,
+            layers: &[crate::document::SnapshotLayerTree],
+            parsed_version: u64,
+            lsp_range: Option<Range>,
+        ) -> Option<(Vec<Value>, Vec<Value>)> {
+            self.walk_with(text, layers, parsed_version, lsp_range, true, None)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn walk_with(
+            &self,
+            text: &str,
+            layers: &[crate::document::SnapshotLayerTree],
+            parsed_version: u64,
+            lsp_range: Option<Range>,
+            injection: bool,
+            cancel: Option<&crate::cancel::CancelToken>,
+        ) -> Option<(Vec<Value>, Vec<Value>)> {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(text, None).unwrap();
+            let incarnation = self
+                .store
+                .latest_snapshot(&self.uri)
+                .unwrap()
+                .slot
+                .current_incarnation;
+            execute_captures_walk(
+                &self.uri,
+                "locals",
+                lsp_range,
+                injection,
+                "rust",
+                text,
+                &tree,
+                injection.then_some(layers),
+                &self.coordinator,
+                &self.tracker,
+                &self.store,
+                parsed_version,
+                incarnation,
+                0,
+                &self.match_cache,
+                cancel,
+            )
+        }
+    }
+
+    fn capture_names(matches: &[Value]) -> Vec<String> {
+        matches
+            .iter()
+            .flat_map(|m| m["captures"].as_array().unwrap())
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The read path of the cross-snapshot match cache: after an edit ABOVE
+    /// the layer (content translated, not changed), the walk must serve the
+    /// layer's cached matches instead of re-executing the query. Pinned with
+    /// a sentinel entry, pre-stored under the shifted layer's key, that no
+    /// real query execution could produce.
+    #[test]
+    fn translated_layer_serves_cached_matches_without_reexecuting() {
+        let code = "let a = 1;\n";
+        let text_v1 = format!("AAAA\n{code}");
+        let start_v1 = text_v1.find(code).unwrap();
+        let rig = MatchCacheRig::new("file:///match_cache_translated.rs", &text_v1);
+
+        let layer_v1 = rust_layer(&text_v1, start_v1, text_v1.len());
+        rig.walk(&text_v1, &[layer_v1], 0, None)
+            .expect("kind query should load");
+
+        // Edit above the layer: same layer content, shifted by 4 bytes.
+        let text_v2 = format!("AAAABBBB\n{code}");
+        let start_v2 = text_v2.find(code).unwrap();
+        let layer_v2 = rust_layer(&text_v2, start_v2, text_v2.len());
+        rig.store
+            .update_document(rig.uri.clone(), text_v2.clone(), None);
+
+        // The shifted layer must key IDENTICALLY to what v1 stored
+        // (translation invariance); plant a sentinel there to discriminate
+        // "served from cache" from "silently re-executed".
+        let (anchor_v2, hash_v2) = super::super::captures_match_cache::tree_cache_key(
+            "locals",
+            "rust",
+            &layer_v2.tree,
+            &text_v2,
+        );
+        assert_eq!(anchor_v2, start_v2);
+        assert!(
+            rig.match_cache.get_layer(&rig.uri, hash_v2, 0).is_some(),
+            "the translated layer's key must hit what the v1 walk stored"
+        );
+        rig.match_cache.store_layer(
+            &rig.uri,
+            "locals",
+            hash_v2,
+            0,
+            std::sync::Arc::new(vec![crate::language::query_exec::MatchData {
+                pattern_index: 0,
+                captures: vec![crate::language::query_exec::CapturedNode {
+                    name: "sentinel-from-cache".to_string(),
+                    start_byte: 4,
+                    end_byte: 5,
+                    kind: "identifier",
+                    metadata: Vec::new(),
+                }],
+                metadata: Vec::new(),
+            }]),
+            || true,
+        );
+
+        let (matches, _) = rig
+            .walk(&text_v2, &[layer_v2], 1, None)
+            .expect("kind query should load");
+        let names = capture_names(&matches);
+        assert!(
+            names.iter().any(|n| n == "sentinel-from-cache"),
+            "the layer walk must serve the cached entry, not re-execute: {names:?}"
+        );
+        // And the cached (anchor-relative) offsets must be re-anchored to the
+        // layer's CURRENT position: rel 4..5 inside the layer is `a`.
+        let sentinel = matches
+            .iter()
+            .flat_map(|m| m["captures"].as_array().unwrap())
+            .find(|c| c["name"] == "sentinel-from-cache")
+            .unwrap();
+        assert_eq!(
+            sentinel["range"]["start"]["line"], 1,
+            "anchor must be the v2 layer start, not the v1 one"
+        );
+        assert_eq!(sentinel["range"]["start"]["character"], 4);
+    }
+
+    /// Correctness of the reuse: a walk served from the (translated) cache
+    /// must be byte-identical on the wire to a walk computed fresh — same
+    /// positions, same node ids (`get_or_create` on the same tracker), same
+    /// metadata. On the caching axis this test alone would pass vacuously
+    /// (no hit → cached == fresh trivially); the sentinel test above proves
+    /// hits actually occur for this exact fixture shape.
+    #[test]
+    fn cached_and_fresh_walks_agree_on_the_wire() {
+        let code = "let a = 1;\n";
+        let text_v1 = format!("AAAA\n{code}");
+        let start_v1 = text_v1.find(code).unwrap();
+        let rig = MatchCacheRig::new("file:///match_cache_equality.rs", &text_v1);
+        rig.walk(
+            &text_v1,
+            &[rust_layer(&text_v1, start_v1, text_v1.len())],
+            0,
+            None,
+        )
+        .expect("kind query should load");
+
+        let text_v2 = format!("AAAABBBB\n{code}");
+        let start_v2 = text_v2.find(code).unwrap();
+        rig.store
+            .update_document(rig.uri.clone(), text_v2.clone(), None);
+
+        let (cached, _) = rig
+            .walk(
+                &text_v2,
+                &[rust_layer(&text_v2, start_v2, text_v2.len())],
+                1,
+                None,
+            )
+            .expect("kind query should load");
+        // Fresh compute of the same walk, cache emptied: must agree exactly.
+        rig.match_cache.clear_document(&rig.uri);
+        let (fresh, _) = rig
+            .walk(
+                &text_v2,
+                &[rust_layer(&text_v2, start_v2, text_v2.len())],
+                1,
+                None,
+            )
+            .expect("kind query should load");
+        assert_eq!(cached, fresh, "cache-served wire output must be identical");
+    }
+
+    /// Range walks produce viewport-clipped results: they must neither store
+    /// into nor serve from the cross-snapshot match cache.
+    #[test]
+    fn range_walks_bypass_the_match_cache() {
+        let text = "let a = 1;\n";
+        let rig = MatchCacheRig::new("file:///match_cache_range.rs", text);
+        let layer = rust_layer(text, 0, text.len());
+        let (_, host_hash) =
+            super::super::captures_match_cache::tree_cache_key("locals", "rust", &layer.tree, text);
+
+        rig.walk(
+            text,
+            &[layer],
+            0,
+            Some(Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(0, 5),
+            )),
+        )
+        .expect("kind query should load");
+        assert!(
+            rig.match_cache.get_layer(&rig.uri, host_hash, 0).is_none()
+                && rig
+                    .match_cache
+                    .get_host(&rig.uri, "locals", host_hash, 0)
+                    .is_none(),
+            "a range walk must not populate the match cache"
+        );
+    }
+
+    /// The read half of the range-walk gate: even when full-key entries
+    /// exist, a range walk must not serve them (its results are clipped to
+    /// the viewport, and a full-layer cache entry is not).
+    #[test]
+    fn range_walks_do_not_serve_cached_entries() {
+        let text = "let a = 1;\n";
+        let rig = MatchCacheRig::new("file:///match_cache_range_read.rs", text);
+        let layer = rust_layer(text, 0, text.len());
+        let (_, layer_hash) =
+            super::super::captures_match_cache::tree_cache_key("locals", "rust", &layer.tree, text);
+        rig.match_cache.store_layer(
+            &rig.uri,
+            "locals",
+            layer_hash,
+            0,
+            std::sync::Arc::new(vec![crate::language::query_exec::MatchData {
+                pattern_index: 0,
+                captures: vec![crate::language::query_exec::CapturedNode {
+                    name: "sentinel-must-not-serve".to_string(),
+                    start_byte: 0,
+                    end_byte: 3,
+                    kind: "identifier",
+                    metadata: Vec::new(),
+                }],
+                metadata: Vec::new(),
+            }]),
+            || true,
+        );
+
+        let (matches, _) = rig
+            .walk(
+                text,
+                &[layer],
+                0,
+                Some(Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(0, 11),
+                )),
+            )
+            .expect("kind query should load");
+        assert!(
+            !capture_names(&matches)
+                .iter()
+                .any(|n| n == "sentinel-must-not-serve"),
+            "a range walk must compute fresh, not serve full-walk entries"
+        );
+    }
+
+    /// A capture in a LATER included range of a multi-range (blockquote-gap
+    /// shaped) layer: rebase is relative to the FIRST range's start, so this
+    /// is where an anchor off-by-one would hide. After a vertical shift the
+    /// hit must place the later-range capture at its exact new position,
+    /// byte-identical to a fresh compute.
+    #[test]
+    fn multi_range_layer_hit_reanchors_later_range_captures_exactly() {
+        let (part_a, gap, part_b) = ("let a = 1;\n", "// gap\n", "let b = 2;\n");
+        let make = |pad: &str| {
+            let text = format!("{pad}{part_a}{gap}{part_b}");
+            let a_start = text.find(part_a).unwrap();
+            let b_start = text.find(part_b).unwrap();
+            let ranges = [
+                (a_start, a_start + part_a.len()),
+                (b_start, b_start + part_b.len()),
+            ];
+            let layer = rust_layer_ranges(&text, &ranges);
+            (text, layer)
+        };
+
+        let (text_v1, layer_v1) = make("AAAA\n");
+        let rig = MatchCacheRig::new("file:///match_cache_multirange.rs", &text_v1);
+        rig.walk(&text_v1, &[layer_v1], 0, None)
+            .expect("kind query should load");
+
+        // Shift down by one line: both ranges translate, geometry unchanged.
+        let (text_v2, layer_v2) = make("AAAA\nBBBB\n");
+        rig.store
+            .update_document(rig.uri.clone(), text_v2.clone(), None);
+        let (_, hash_v2) = super::super::captures_match_cache::tree_cache_key(
+            "locals",
+            "rust",
+            &layer_v2.tree,
+            &text_v2,
+        );
+        assert!(
+            rig.match_cache.get_layer(&rig.uri, hash_v2, 0).is_some(),
+            "the translated multi-range layer must hit the v1 store"
+        );
+
+        let (cached, _) = rig
+            .walk(&text_v2, &[layer_v2], 1, None)
+            .expect("kind query should load");
+        // The later-range capture (`b`) must sit at its exact v2 position.
+        let b_line = text_v2[..text_v2.find(part_b).unwrap()]
+            .matches('\n')
+            .count() as u64;
+        let b = cached
+            .iter()
+            .flat_map(|m| m["captures"].as_array().unwrap())
+            .find(|c| {
+                c["range"]["start"]["line"] == b_line && c["range"]["start"]["character"] == 4
+            });
+        assert!(
+            b.is_some(),
+            "later-range capture must reanchor to line {b_line} col 4: {cached:?}"
+        );
+        // And the whole wire output must equal a fresh compute.
+        rig.match_cache.clear_document(&rig.uri);
+        let (fresh, _) = rig
+            .walk(
+                &text_v2,
+                &[{
+                    let (_, layer) = make("AAAA\nBBBB\n");
+                    layer
+                }],
+                1,
+                None,
+            )
+            .expect("kind query should load");
+        assert_eq!(cached, fresh, "multi-range hit must match fresh compute");
+    }
+
+    /// A cancelled walk bails before the sweep: its (empty) touched set must
+    /// not evict the live entries a completed walk stored. Guards the
+    /// ordering of the cancel bail vs the sweep in `execute_captures_walk`.
+    #[test]
+    fn cancelled_walk_does_not_sweep_live_entries() {
+        let code = "let a = 1;\n";
+        let text = format!("AAAA\n{code}");
+        let start = text.find(code).unwrap();
+        let rig = MatchCacheRig::new("file:///match_cache_cancel_sweep.rs", &text);
+        rig.walk(&text, &[rust_layer(&text, start, text.len())], 0, None)
+            .expect("kind query should load");
+        let (_, hash) = super::super::captures_match_cache::tree_cache_key(
+            "locals",
+            "rust",
+            &rust_layer(&text, start, text.len()).tree,
+            &text,
+        );
+        assert!(rig.match_cache.get_layer(&rig.uri, hash, 0).is_some());
+
+        // A pre-cancelled walk visits nothing (touched set empty) and must
+        // return None WITHOUT sweeping the entry away.
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+        let cancelled = rig.walk_with(
+            &text,
+            &[rust_layer(&text, start, text.len())],
+            0,
+            None,
+            true,
+            Some(&cancel),
+        );
+        assert!(cancelled.is_none(), "a cancelled walk serves nothing");
+        assert!(
+            rig.match_cache.get_layer(&rig.uri, hash, 0).is_some(),
+            "a cancelled walk must not sweep live entries"
+        );
+    }
+
+    /// `injection = false` walks visit only the host layer (depth 0): the
+    /// host slot must serve on exact content recurrence (undo/redo), pinned
+    /// with a sentinel like the layer test above.
+    #[test]
+    fn host_slot_serves_on_content_recurrence() {
+        let text = "let a = 1;\n";
+        let rig = MatchCacheRig::new("file:///match_cache_host.rs", text);
+        rig.walk_with(text, &[], 0, None, false, None)
+            .expect("kind query should load");
+
+        // Host key for the same content: parse without included ranges.
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let host_tree = parser.parse(text, None).unwrap();
+        let (anchor, host_hash) =
+            super::super::captures_match_cache::tree_cache_key("locals", "rust", &host_tree, text);
+        assert_eq!(anchor, 0, "host layer anchors at 0");
+        assert!(
+            rig.match_cache
+                .get_host(&rig.uri, "locals", host_hash, 0)
+                .is_some(),
+            "the host walk must store under the host slot"
+        );
+        rig.match_cache.store_host(
+            &rig.uri,
+            "locals",
+            host_hash,
+            0,
+            std::sync::Arc::new(vec![crate::language::query_exec::MatchData {
+                pattern_index: 0,
+                captures: vec![crate::language::query_exec::CapturedNode {
+                    name: "sentinel-host-slot".to_string(),
+                    start_byte: 4,
+                    end_byte: 5,
+                    kind: "identifier",
+                    metadata: Vec::new(),
+                }],
+                metadata: Vec::new(),
+            }]),
+            || true,
+        );
+
+        // Same content again (undo/redo shape): must serve the host slot.
+        let (matches, _) = rig
+            .walk_with(text, &[], 0, None, false, None)
+            .expect("kind query should load");
+        assert!(
+            capture_names(&matches)
+                .iter()
+                .any(|n| n == "sentinel-host-slot"),
+            "an unchanged host must serve the host slot, not re-execute"
         );
     }
 
@@ -1868,7 +2498,7 @@ mod tests {
     fn metadata_object_is_none_when_no_directives() {
         // Patterns without #set! must keep their pre-metadata wire shape —
         // an empty object would churn every delta lineage.
-        assert_eq!(metadata_object(vec![]), None);
+        assert_eq!(metadata_object(&[]), None);
     }
 
     #[test]
@@ -1877,7 +2507,7 @@ mod tests {
         // style); JSON true lets clients test for it, where Neovim's nil
         // assignment would make the key undetectable.
         let pairs = vec![("combined".to_string(), None)];
-        assert_eq!(metadata_object(pairs), Some(json!({ "combined": true })));
+        assert_eq!(metadata_object(&pairs), Some(json!({ "combined": true })));
     }
 
     #[test]
@@ -1888,7 +2518,7 @@ mod tests {
             ("kind".to_string(), Some("first".to_string())),
             ("kind".to_string(), Some("second".to_string())),
         ];
-        assert_eq!(metadata_object(pairs), Some(json!({ "kind": "second" })));
+        assert_eq!(metadata_object(&pairs), Some(json!({ "kind": "second" })));
     }
 
     #[test]
