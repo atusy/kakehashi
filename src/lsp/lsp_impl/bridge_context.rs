@@ -696,7 +696,7 @@ impl Kakehashi {
 
         let configs = self
             .bridge
-            .get_host_configs_for_language(&settings, &language_name);
+            .cached_host_configs_for_language(&settings, &language_name);
         if configs.is_empty() {
             log::debug!(
                 "{}: no host-capable server configured for {}",

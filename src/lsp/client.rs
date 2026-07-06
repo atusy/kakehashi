@@ -5,6 +5,7 @@
 //! semantic-token refresh) work safely before `initialize()` — pre-init,
 //! capabilities are absent and the call is skipped instead of panicking.
 
+use crate::error::LockResultExt;
 use std::sync::OnceLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::notification::Progress;
@@ -43,6 +44,31 @@ pub(crate) fn check_diagnostic_refresh_support(caps: &ClientCapabilities) -> boo
         .and_then(|d| d.refresh_support)
         .unwrap_or(false)
 }
+
+/// Single-flight state for `workspace/semanticTokens/refresh` (#531): one
+/// in-flight request plus at most one trailing covers any burst of publishes.
+/// Process-global because the server serves exactly one client; reset is
+/// unnecessary (a stuck `in_flight` on a never-responding client is the same
+/// accepted trade-off as the pending-map leak documented at the send site,
+/// and the per-keystroke client re-request heals the visible highlight).
+///
+/// A Mutex over both flags (the #526 diagnostic-refresh pattern), NOT a pair
+/// of atomics: every attempted lock-free version of the release/trailing
+/// handshake had an interleaving that dropped one trailing refresh (a
+/// publisher storing `pending` after the flight's final re-check, or one
+/// flight swallowing a `pending` aimed at another). The critical sections
+/// are two bool ops; the lock is effectively uncontended.
+#[derive(Default)]
+struct RefreshFlightState {
+    in_flight: bool,
+    pending: bool,
+}
+
+static REFRESH_FLIGHT: std::sync::Mutex<RefreshFlightState> =
+    std::sync::Mutex::new(RefreshFlightState {
+        in_flight: false,
+        pending: false,
+    });
 
 /// Whether a batch of language events asks for a `workspace/semanticTokens/refresh`.
 ///
@@ -161,12 +187,55 @@ impl<'a> ClientNotifier<'a> {
                 // Trade-off: If a client never responds (e.g., vim-lsp), this causes:
                 // - A small memory leak in tower-lsp's pending requests map
                 // - A spawned task waiting indefinitely
-                let client = self.client.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = client.semantic_tokens_refresh().await {
-                        log::debug!("semantic_tokens_refresh failed: {}", err);
+                //
+                // Workspace-wide single-flight (#531, the twin of the #497
+                // diagnostic-refresh guard): during a typing burst every
+                // parse-loop publish requests a refresh, and each un-answered
+                // duplicate both forces a redundant client re-tokenization
+                // pass and (on a non-responding client) leaks another pending
+                // entry. The request is parameterless, so one in-flight
+                // refresh plus at most one trailing covers any number of
+                // publishes: a publish landing mid-flight sets `pending`, and
+                // the flight loops once more after the answer.
+                let spawn_flight = {
+                    let mut state = REFRESH_FLIGHT
+                        .lock()
+                        .recover_poison("ClientNotifier::refresh_flight(begin)");
+                    if state.in_flight {
+                        // Coalesce: the in-flight request answers for this
+                        // publish too; at most one trailing refresh follows.
+                        state.pending = true;
+                        false
+                    } else {
+                        state.in_flight = true;
+                        true
                     }
-                });
+                };
+                if spawn_flight {
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            if let Err(err) = client.semantic_tokens_refresh().await {
+                                log::debug!("semantic_tokens_refresh failed: {}", err);
+                            }
+                            // One atomic decision under the lock: either claim
+                            // the trailing slot and loop, or release the
+                            // flight — no interleaving can strand a `pending`
+                            // set by a publisher that saw `in_flight == true`.
+                            let mut state = REFRESH_FLIGHT
+                                .lock()
+                                .recover_poison("ClientNotifier::refresh_flight(release)");
+                            if state.pending {
+                                state.pending = false;
+                                continue;
+                            }
+                            state.in_flight = false;
+                            break;
+                        }
+                    });
+                } else {
+                    log::debug!("semantic_tokens_refresh coalesced into the in-flight request");
+                }
             } else {
                 // Only send refresh if client supports it (LSP @since 3.16.0 compliance).
                 log::debug!(

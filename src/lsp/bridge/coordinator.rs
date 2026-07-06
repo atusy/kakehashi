@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -118,6 +119,53 @@ pub(crate) struct BridgeCoordinator {
     /// `CancellationToken` is in the map before any task spawns, each task `select!`s
     /// on it before its first side effect, and cancel/supersede/abort cancel it.
     host_eager_open_tasks: DashMap<Url, EagerOpenBatch>,
+    /// Resolved-config memo for the current settings snapshot.
+    ///
+    /// `get_all_configs_for_language` / `get_host_configs_for_language`
+    /// re-merge every configured server (deep-cloning each server's
+    /// `settings` JSON blob) on every call. Whole-document handlers call
+    /// them once **per injection region**, so on a fence-heavy document with
+    /// a large user config that is seconds of clone/drop CPU inside a single
+    /// handler poll — enough to wedge the transport's shared dispatch task
+    /// and stall every other response. The memo keys results by the settings
+    /// snapshot's `Arc` identity (settings are hot-swapped whole via
+    /// `ArcSwap`, so pointer identity IS snapshot identity) and by language
+    /// pair, making repeat resolutions a shallow `Vec` clone (one `String` +
+    /// one `Arc` bump per configured server — the settings blobs themselves
+    /// stay behind their `Arc`s).
+    config_memo: ArcSwap<ConfigMemo>,
+}
+
+/// One settings snapshot's worth of resolved-config lookups (see
+/// [`BridgeCoordinator::config_memo`]). Replaced wholesale when a lookup
+/// arrives for a different settings snapshot.
+/// One `(injection_language, configs)` pair in [`ConfigMemo::virt`]'s
+/// per-host list.
+type VirtMemoEntry = (String, Arc<Vec<ResolvedServerConfig>>);
+
+struct ConfigMemo {
+    /// Identity anchor: results below are valid only for this snapshot.
+    /// `None` for the initial placeholder, which never matches.
+    settings: Option<Arc<WorkspaceSettings>>,
+    /// `host_language` → `(injection_language, configs)` pairs. A nested Vec
+    /// rather than a `(String, String)` key so the per-region hit path looks
+    /// up with a borrowed `&str` and scans a handful of pairs — zero
+    /// allocations per hit (a tuple key cannot be borrowed field-wise).
+    /// Inserts re-check under the entry lock, so racing same-pair computes
+    /// cannot append duplicates.
+    virt: DashMap<String, Vec<VirtMemoEntry>>,
+    /// `host_language` → `_self` host-bridge configs.
+    host: DashMap<String, Arc<Vec<ResolvedServerConfig>>>,
+}
+
+impl ConfigMemo {
+    fn empty(settings: Option<Arc<WorkspaceSettings>>) -> Self {
+        Self {
+            settings,
+            virt: DashMap::new(),
+            host: DashMap::new(),
+        }
+    }
 }
 
 impl BridgeCoordinator {
@@ -133,6 +181,7 @@ impl BridgeCoordinator {
             eager_open_tasks: DashMap::new(),
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
+            config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
         }
     }
 
@@ -155,6 +204,7 @@ impl BridgeCoordinator {
             eager_open_tasks: DashMap::new(),
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
+            config_memo: ArcSwap::new(Arc::new(ConfigMemo::empty(None))),
         }
     }
 
@@ -313,6 +363,102 @@ impl BridgeCoordinator {
         }
 
         None
+    }
+
+    /// Memo-resolving front for [`Self::get_all_configs_for_language`] /
+    /// [`Self::get_host_configs_for_language`]: returns the memoized result
+    /// for the current settings snapshot, computing (and caching) it on
+    /// first use. Callers on request paths — especially per-region loops —
+    /// must use this instead of the raw resolvers (see `config_memo`).
+    fn cached_configs(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injection_language: Option<&str>,
+    ) -> Vec<ResolvedServerConfig> {
+        let memo = self.config_memo.load();
+        let memo = if memo
+            .settings
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(s, settings))
+        {
+            arc_swap::Guard::into_inner(memo)
+        } else {
+            // New settings snapshot: swap in a fresh generation and keep
+            // USING the locally-built Arc rather than re-loading. A re-load
+            // could return a memo a racing caller anchored to a DIFFERENT
+            // (newer) snapshot — inserting this caller's configs (computed
+            // from ITS settings) there would poison every later hit for that
+            // snapshot until the next reload. Inserting into our own anchor
+            // is always self-consistent: if a newer anchor replaced it in
+            // the cell, our inserts are simply invisible to its callers (one
+            // wasted compute, no wrong serve).
+            let fresh = Arc::new(ConfigMemo::empty(Some(Arc::clone(settings))));
+            self.config_memo.store(Arc::clone(&fresh));
+            fresh
+        };
+        match injection_language {
+            Some(injection_language) => {
+                if let Some(hit) = memo.virt.get(host_language)
+                    && let Some((_, configs)) = hit
+                        .value()
+                        .iter()
+                        .find(|(lang, _)| lang == injection_language)
+                {
+                    return configs.as_ref().clone();
+                }
+                let configs =
+                    self.get_all_configs_for_language(settings, host_language, injection_language);
+                let entry = (injection_language.to_string(), Arc::new(configs.clone()));
+                // `get_mut` first (borrowed key; `entry()` would clone the
+                // host Url-sized String even on a present host), and skip the
+                // push when a racing compute already recorded this pair.
+                if let Some(mut pairs) = memo.virt.get_mut(host_language) {
+                    if !pairs.iter().any(|(lang, _)| lang == injection_language) {
+                        pairs.push(entry);
+                    }
+                } else {
+                    let mut pairs = memo.virt.entry(host_language.to_string()).or_default();
+                    // Re-check under the entry lock: two racing misses for
+                    // the same host both fall into this branch; the loser
+                    // must not append a duplicate pair.
+                    if !pairs.iter().any(|(lang, _)| lang == injection_language) {
+                        pairs.push(entry);
+                    }
+                }
+                configs
+            }
+            None => {
+                if let Some(hit) = memo.host.get(host_language) {
+                    return hit.value().as_ref().clone();
+                }
+                let configs = self.get_host_configs_for_language(settings, host_language);
+                memo.host
+                    .insert(host_language.to_string(), Arc::new(configs.clone()));
+                configs
+            }
+        }
+    }
+
+    /// Memoized [`Self::get_all_configs_for_language`] for the current
+    /// settings snapshot.
+    pub(crate) fn cached_configs_for_injection_language(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injection_language: &str,
+    ) -> Vec<ResolvedServerConfig> {
+        self.cached_configs(settings, host_language, Some(injection_language))
+    }
+
+    /// Memoized [`Self::get_host_configs_for_language`] for the current
+    /// settings snapshot.
+    pub(crate) fn cached_host_configs_for_language(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+    ) -> Vec<ResolvedServerConfig> {
+        self.cached_configs(settings, host_language, None)
     }
 
     /// Get all bridge server configs for a given injection language from settings.

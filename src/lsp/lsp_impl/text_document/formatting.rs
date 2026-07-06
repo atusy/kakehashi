@@ -243,14 +243,20 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let all_regions = InjectionResolver::resolve_all(
-            &self.language,
-            self.bridge.node_tracker(),
-            uri,
-            snapshot.tree(),
-            snapshot.text(),
-            injection_query.as_ref(),
-        );
+        let all_regions = match self
+            .documents
+            .current_resolved_regions(uri, self.cache.semantic_token_generation())
+        {
+            Some(regions) => regions,
+            None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                &self.language,
+                self.bridge.node_tracker(),
+                uri,
+                snapshot.tree(),
+                snapshot.text(),
+                injection_query.as_ref(),
+            )),
+        };
 
         if all_regions.is_empty() {
             return Ok(None);
@@ -282,7 +288,7 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-        for resolved in all_regions {
+        for resolved in all_regions.iter() {
             let configs = self
                 .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
             if configs.is_empty() {
@@ -296,7 +302,7 @@ impl Kakehashi {
             );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
-                resolved,
+                resolved: resolved.clone(),
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
                 priorities: agg.priorities,

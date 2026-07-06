@@ -727,6 +727,48 @@ fn ranges_intersect(
         .any(|r| r.start_byte < filter.end && filter.start < r.end_byte)
 }
 
+/// Run the standard layer walk once and collect every injected layer's
+/// parsed tree in document-order DFS (parse-snapshot ADR §3, the layer-tree
+/// half of never-discover-twice): the FIRST walking captures request on a
+/// snapshot calls this lazily and the result rides the `ParseSnapshot`, so
+/// subsequent per-keystroke walks iterate pre-parsed layers instead of
+/// re-running the walk. Byte-identical to the inline walk by construction —
+/// it IS the inline walk, with a collecting visitor.
+pub(crate) fn collect_document_layer_trees(
+    coordinator: &LanguageCoordinator,
+    host_language: &str,
+    host_text: &str,
+    host_tree: &tree_sitter::Tree,
+) -> Vec<crate::document::SnapshotLayerTree> {
+    let mut layers = Vec::new();
+    walk_document_layers(
+        coordinator,
+        host_language,
+        host_text,
+        host_tree,
+        None,
+        &mut |language, tree, depth| {
+            // The host layer (depth 0) already lives on the snapshot as
+            // `ParseSnapshot::tree`; store only the injected layers.
+            if depth == 0 {
+                return;
+            }
+            let ranges = tree.included_ranges();
+            let span = match (ranges.first(), ranges.last()) {
+                (Some(first), Some(last)) => first.start_byte..last.end_byte,
+                _ => 0..host_text.len(),
+            };
+            layers.push(crate::document::SnapshotLayerTree {
+                language: language.to_string(),
+                tree: tree.clone(),
+                depth,
+                span,
+            });
+        },
+    );
+    layers
+}
+
 /// Visit every injection layer of the document in **document-order DFS**: the
 /// host first, then each injection region by ascending start byte, recursing
 /// into nested injections before moving to the next sibling
@@ -832,6 +874,82 @@ fn walk_child_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stored layer trees must be exactly what the inline walk would
+    /// visit over the same (text, tree): same (language, depth) sequence and
+    /// same included ranges per layer — the equivalence the captures fast
+    /// path relies on.
+    #[test]
+    fn collect_document_layer_trees_matches_the_inline_walk() {
+        let coordinator = crate::language::LanguageCoordinator::new();
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                std::env::var("TREE_SITTER_GRAMMARS")
+                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
+            ],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        for lang in ["markdown", "markdown_inline", "lua"] {
+            if !coordinator.ensure_language_loaded(lang).success {
+                eprintln!("Skipping: {lang} parser not available");
+                return;
+            }
+        }
+
+        let text = "# T\n\nsome *inline* text\n\n```lua\nlocal x = 1\n```\n";
+        let mut pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = pool.acquire("markdown") else {
+            return;
+        };
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+
+        type LayerShape = (String, usize, Vec<(usize, usize)>);
+        let mut inline: Vec<LayerShape> = Vec::new();
+        walk_document_layers(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            None,
+            &mut |lang, layer_tree, depth| {
+                if depth == 0 {
+                    return;
+                }
+                inline.push((
+                    lang.to_string(),
+                    depth,
+                    layer_tree
+                        .included_ranges()
+                        .iter()
+                        .map(|r| (r.start_byte, r.end_byte))
+                        .collect(),
+                ));
+            },
+        );
+        assert!(
+            !inline.is_empty(),
+            "sanity: the document has injected layers"
+        );
+
+        let stored = collect_document_layer_trees(&coordinator, "markdown", text, &tree);
+        let stored_shape: Vec<LayerShape> = stored
+            .iter()
+            .map(|l| {
+                (
+                    l.language.clone(),
+                    l.depth,
+                    l.tree
+                        .included_ranges()
+                        .iter()
+                        .map(|r| (r.start_byte, r.end_byte))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(stored_shape, inline, "stored layers == inline walk");
+    }
 
     #[test]
     fn build_effective_ranges_combines_offset_with_child_exclusion() {

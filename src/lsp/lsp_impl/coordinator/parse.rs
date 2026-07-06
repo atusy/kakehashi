@@ -10,6 +10,23 @@ use url::Url;
 use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
+/// Everything one populate pass derives for the snapshot it rides on
+/// (parse-snapshot ADR §3): all `None` when populate was skipped (raced CAS)
+/// or the pool work-unit panicked — readers then fall back to inline
+/// resolution for that snapshot.
+#[derive(Default)]
+struct PopulatedSnapshotRegions {
+    discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
+    bridge_regions: Option<(
+        u64,
+        std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>,
+    )>,
+    resolved_regions: Option<(
+        u64,
+        std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>,
+    )>,
+}
+
 /// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 /// THE SAME constant bounds the injected-layer re-parses (`parse_with_ranges`),
@@ -39,6 +56,27 @@ fn parse_text_with_deadline(
     deadline: std::time::Instant,
 ) -> Option<tree_sitter::Tree> {
     crate::language::injection::parse_with_deadline(parser, text, old_tree, deadline)
+}
+
+/// The settled+stale gate for the parse loop's `semanticTokens/refresh`
+/// emission (its full rationale lives at the call site): emit only when the
+/// published parse is still the LIVE content version (settled — mid-burst
+/// publishes skip; the newer text's own publish re-evaluates) AND some
+/// client's last served tokens predate it (a served-version mark exists and
+/// is older — no mark means nobody highlights this document).
+fn should_emit_settle_refresh(
+    documents: &DocumentStore,
+    cache: &CacheCoordinator,
+    uri: &Url,
+    content_version: u64,
+) -> bool {
+    let settled = documents
+        .get(uri)
+        .is_some_and(|doc| doc.content_version() == content_version);
+    let client_is_stale = cache
+        .served_semantic_version(uri)
+        .is_some_and(|served| served < content_version);
+    settled && client_is_stale
 }
 
 pub(super) struct ParseCoordinatorDeps {
@@ -230,21 +268,52 @@ impl ParseCoordinator {
     /// It is **awaited**, not detached, preserving the `populate → mark finished
     /// → downstream` ordering the injection-map invalidation depends on (Stage-1
     /// obligation). All parameters are cheap clones (refcount bumps).
+    /// Returns everything the populate pass derived from its single injection
+    /// query — the semantic discovery and the bridge-downstream regions — both
+    /// destined for the snapshot this pass publishes (ADR §3,
+    /// don't-discover-twice). `(None, None)` when the work-unit panicked.
     async fn populate_injections_on_pool(
         &self,
         uri: Url,
         text: std::sync::Arc<str>,
         tree: tree_sitter::Tree,
         language_name: String,
-    ) {
+    ) -> PopulatedSnapshotRegions {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        // Coarse per-parse gate: with no runnable bridge server configured,
+        // the bridge-region build (per-region content copies) is pure waste
+        // on the pre-publish critical path. `None` on the snapshot makes a
+        // bridge configured by a later reload fall back to inline resolution.
+        let build_bridge_regions = self
+            .settings_manager
+            .load_settings()
+            .any_bridge_server_runnable();
         self.compute_pool
             .run(None, move || {
-                cache.populate_injections(&uri, &text, &tree, &language_name, &language, &tracker);
+                let populated = cache.populate_injections(
+                    &uri,
+                    &text,
+                    &tree,
+                    &language_name,
+                    &language,
+                    &tracker,
+                    build_bridge_regions,
+                );
+                PopulatedSnapshotRegions {
+                    discovery: populated.discovery.map(std::sync::Arc::new),
+                    bridge_regions: populated
+                        .bridge_regions
+                        .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+                    resolved_regions: Some((
+                        populated.generation,
+                        std::sync::Arc::new(populated.resolved_regions),
+                    )),
+                }
             })
-            .await;
+            .await
+            .unwrap_or_default()
     }
 
     /// Parse the (already-registered) document at `uri` and publish the result.
@@ -363,6 +432,10 @@ impl ParseCoordinator {
                         language: Some(language_name.clone()),
                         parsed_version: content_version,
                         incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
                     },
                 );
                 advance_watermark();
@@ -428,6 +501,22 @@ impl ParseCoordinator {
                         Some(&language_name),
                         Some(tree.clone()),
                     );
+                // Populate BEFORE the publish so the derived discovery rides the
+                // snapshot (ADR §3 don't-discover-twice); readers keep serving
+                // the previous snapshot meanwhile. A rejected CAS (raced) skips
+                // populate — the snapshot then publishes without discovery and
+                // readers discover inline for that (already-superseded) snapshot.
+                let regions = if stored {
+                    self.populate_injections_on_pool(
+                        uri.clone(),
+                        text.clone(),
+                        tree.clone(),
+                        language_name.clone(),
+                    )
+                    .await
+                } else {
+                    PopulatedSnapshotRegions::default()
+                };
                 self.publish_parse_snapshot(
                     &uri,
                     crate::document::snapshot::ParseSnapshot {
@@ -436,16 +525,18 @@ impl ParseCoordinator {
                         language: Some(language_name.clone()),
                         parsed_version: content_version,
                         incarnation,
+                        injection_regions: regions.discovery,
+                        bridge_regions: regions.bridge_regions,
+                        resolved_regions: regions.resolved_regions,
+                        layer_trees: std::sync::OnceLock::new(),
                     },
                 );
                 if stored {
-                    self.populate_injections_on_pool(
-                        uri.clone(),
-                        text.clone(),
-                        tree.clone(),
-                        language_name.clone(),
-                    )
-                    .await;
+                    // AFTER the publish: a downstream task woken by this mark
+                    // on another runtime thread must find the snapshot (and
+                    // its fast-path regions) already in the cell — marking
+                    // first let it read the previous snapshot and fall back
+                    // to inline resolution for one cycle.
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, true);
                 }
@@ -484,6 +575,10 @@ impl ParseCoordinator {
                     language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation,
+                    injection_regions: None,
+                    bridge_regions: None,
+                    resolved_regions: None,
+                    layer_trees: std::sync::OnceLock::new(),
                 },
             );
             advance_watermark();
@@ -513,6 +608,10 @@ impl ParseCoordinator {
                 language: None,
                 parsed_version: content_version,
                 incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
             },
         );
         advance_watermark();
@@ -659,8 +758,21 @@ impl ParseCoordinator {
                 expected_incarnation,
                 tree.clone(),
             );
-            // The cell guard rejects a stale lifetime or an out-of-order
-            // version on its own.
+            // Populate BEFORE the publish so the discovery rides the snapshot
+            // (ADR §3); the cell guard still rejects a stale lifetime or an
+            // out-of-order version at publish. A rejected CAS skips populate —
+            // the snapshot still publishes as stale-but-consistent.
+            let regions = if stored {
+                self.populate_injections_on_pool(
+                    uri.clone(),
+                    text.clone(),
+                    tree.clone(),
+                    language_name.clone(),
+                )
+                .await
+            } else {
+                PopulatedSnapshotRegions::default()
+            };
             let published = self.publish_parse_snapshot(
                 &uri,
                 crate::document::snapshot::ParseSnapshot {
@@ -669,6 +781,10 @@ impl ParseCoordinator {
                     language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation: expected_incarnation,
+                    injection_regions: regions.discovery,
+                    bridge_regions: regions.bridge_regions,
+                    resolved_regions: regions.resolved_regions,
+                    layer_trees: std::sync::OnceLock::new(),
                 },
             );
             // Serve-stale's heal signal, mirroring reparse_latest: a token
@@ -682,13 +798,6 @@ impl ParseCoordinator {
                 ));
             }
             if stored {
-                self.populate_injections_on_pool(
-                    uri.clone(),
-                    text.clone(),
-                    tree.clone(),
-                    language_name.clone(),
-                )
-                .await;
                 break;
             }
             // CAS rejected: the text moved under us (a concurrent `didChange`).
@@ -840,10 +949,23 @@ impl ParseCoordinator {
                 incarnation,
                 tree.clone(),
             );
-            // The cell guard admits this even when the legacy CAS above
-            // rejected a text that moved on — a stale-but-consistent snapshot
-            // is exactly what serve-stale readers consume; the scheduler's
-            // dirty loop reparses the newer text and supersedes it.
+            // Populate BEFORE the publish so the derived discovery rides the
+            // snapshot (ADR §3, don't-discover-twice); readers keep serving the
+            // previous snapshot for populate's duration. A rejected legacy CAS
+            // (the text moved on mid-parse) skips populate — the snapshot still
+            // publishes as stale-but-consistent (its readers discover inline;
+            // the scheduler's dirty loop is already reparsing the newer text).
+            let regions = if stored {
+                self.populate_injections_on_pool(
+                    uri.clone(),
+                    text.clone(),
+                    tree.clone(),
+                    language_name.clone(),
+                )
+                .await
+            } else {
+                PopulatedSnapshotRegions::default()
+            };
             let published = self.publish_parse_snapshot(
                 uri,
                 crate::document::snapshot::ParseSnapshot {
@@ -852,29 +974,36 @@ impl ParseCoordinator {
                     language: Some(language_name.clone()),
                     parsed_version: content_version,
                     incarnation,
+                    injection_regions: regions.discovery,
+                    bridge_regions: regions.bridge_regions,
+                    resolved_regions: regions.resolved_regions,
+                    layer_trees: std::sync::OnceLock::new(),
                 },
             );
-            // Serve-stale's heal signal (ADR §3): a fresh publish re-drives the
-            // client with workspace/semanticTokens/refresh so a request served
-            // one edit behind is re-requested against this snapshot. Emitted
-            // HERE — at the parse-loop publish point, after the notification
-            // returned — never from didChange, whose synchronous clients
-            // (vim-lsp) cannot answer a server request mid-notification. Gated
-            // on the publish landing: a rejected publish emits nothing. The
-            // notifier batches and capability-gates the actual request.
-            if published {
+            // Serve-stale's heal signal (ADR §3), narrowed to the cases the
+            // workspace-scoped request is actually FOR. `refresh` is expensive
+            // for the client (Neovim's handler cancels its in-flight token
+            // request and re-tokenizes every attached buffer), and clients
+            // already re-request per didChange — so a publish emits it only
+            // when ALL of:
+            // - the publish landed (a rejected publish emits nothing);
+            // - the document has SETTLED (this parse's version is still the
+            //   live content_version — during a typing burst the scheduler is
+            //   already reparsing newer text, whose own publish re-evaluates);
+            // - some client actually consumes this document's semantic tokens
+            //   (a served-version mark exists) AND its last served tokens
+            //   predate this snapshot (otherwise its own didChange-driven
+            //   request already caught up).
+            // Net: at most one refresh per settle, none mid-burst, none for
+            // documents nobody highlights. Emitted from the parse loop, never
+            // didChange (synchronous clients can't answer a server request
+            // mid-notification).
+            if published
+                && should_emit_settle_refresh(&self.documents, &self.cache, uri, content_version)
+            {
                 events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
                     language_name.clone(),
                 ));
-            }
-            if stored {
-                self.populate_injections_on_pool(
-                    uri.clone(),
-                    text.clone(),
-                    tree.clone(),
-                    language_name.clone(),
-                )
-                .await;
             }
         }
 
@@ -894,6 +1023,40 @@ impl ParseCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four documented invariants of the settle-refresh gate.
+    #[test]
+    fn settle_refresh_gate_emits_only_for_settled_and_stale() {
+        let documents = DocumentStore::new();
+        let cache = CacheCoordinator::new();
+        let uri = url::Url::parse("file:///settle_gate.rs").unwrap();
+        documents.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+        // content_version == 0 now.
+
+        // No served mark: nobody highlights this document -> no refresh.
+        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 0));
+
+        // Client already served THIS version -> its didChange-driven request
+        // caught up -> no refresh.
+        cache.record_served_semantic_version(&uri, 0);
+        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 0));
+
+        // An edit bumps the live version; the publish for v1 finds the client
+        // stale (served 0 < 1) and the document settled (live == 1) -> emit.
+        documents.update_document(uri.clone(), "ab".into(), None);
+        assert!(should_emit_settle_refresh(&documents, &cache, &uri, 1));
+
+        // Mid-burst: another edit already moved the live version past this
+        // publish (live 2, publish v1) -> not settled -> no refresh (the v2
+        // publish re-evaluates).
+        documents.update_document(uri.clone(), "abc".into(), None);
+        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 1));
+
+        // The mark is monotonic: a stale serve cannot regress it.
+        cache.record_served_semantic_version(&uri, 2);
+        cache.record_served_semantic_version(&uri, 1);
+        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 2));
+    }
 
     /// The deadline must actually abort the native parse (an expired one
     /// yields `None` fast) and must not poison the parser for reuse.

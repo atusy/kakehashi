@@ -48,6 +48,7 @@ pub(crate) struct DiagnosticScheduler {
     documents: std::sync::Arc<DocumentStore>,
     bridge: std::sync::Arc<BridgeCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
+    cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
     debounced_diagnostics: std::sync::Arc<DebouncedDiagnosticsManager>,
     synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: the host-event pull below feeds its
@@ -64,6 +65,7 @@ impl DiagnosticScheduler {
             documents: std::sync::Arc::clone(&server.documents),
             bridge: std::sync::Arc::clone(&server.bridge),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
+            cache: std::sync::Arc::clone(&server.cache),
             debounced_diagnostics: std::sync::Arc::clone(&server.debounced_diagnostics),
             synthetic_diagnostics: std::sync::Arc::clone(&server.synthetic_diagnostics),
             publisher: std::sync::Arc::new(super::DiagnosticPublisher::new(server)),
@@ -185,14 +187,23 @@ impl DiagnosticScheduler {
                 self.language
                     .injection_query(&language_name)
                     .map(|injection_query| {
-                        let all_regions = InjectionResolver::resolve_all(
-                            &self.language,
-                            self.bridge.node_tracker(),
-                            uri,
-                            snapshot.tree(),
-                            snapshot.text(),
-                            injection_query.as_ref(),
-                        );
+                        // Prefer the populate pass's regions riding the current
+                        // parse snapshot (never discover twice, ADR §3); fall
+                        // back to the inline resolution when absent/stale.
+                        let all_regions = match self
+                            .documents
+                            .current_resolved_regions(uri, self.cache.semantic_token_generation())
+                        {
+                            Some(regions) => regions,
+                            None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                                &self.language,
+                                self.bridge.node_tracker(),
+                                uri,
+                                snapshot.tree(),
+                                snapshot.text(),
+                                injection_query.as_ref(),
+                            )),
+                        };
 
                         let mut contexts = Vec::new();
                         // Configs + aggregation are keyed by injection language, so
@@ -205,7 +216,7 @@ impl DiagnosticScheduler {
                             Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
                         let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
                             std::collections::HashMap::new();
-                        for resolved in all_regions {
+                        for resolved in all_regions.iter() {
                             // `get` on the common (cache-hit) path is a single lookup;
                             // only the resolving miss touches the map again, cloning
                             // the language key just for that insert.
@@ -262,7 +273,7 @@ impl DiagnosticScheduler {
 
                             contexts.push(DocumentRequestContext {
                                 uri: uri.clone(),
-                                resolved,
+                                resolved: resolved.clone(),
                                 configs: configs.clone(),
                                 upstream_request_id: None,
                                 priorities: agg.priorities.clone(),

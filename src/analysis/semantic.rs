@@ -13,6 +13,9 @@ use tree_sitter::{Query, Tree};
 // Re-export crate-internal API from submodules
 pub(crate) use delta::calculate_delta_or_full;
 pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
+#[cfg(test)]
+pub(crate) use parallel::DISCOVERY_REUSE_HITS;
+pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::handle_semantic_tokens_range_parallel_async;
 
 // Re-export for parallel processing
@@ -34,6 +37,13 @@ pub(crate) struct InjectionCacheParams {
     pub documents: std::sync::Arc<crate::document::DocumentStore>,
     pub parsed_version: u64,
     pub incarnation: u64,
+    /// Owned injection discovery from the snapshot being tokenized
+    /// (parse-snapshot ADR §3, the don't-discover-twice lever): rebuilt into
+    /// contexts instead of re-running the injection query, when its
+    /// `generation` still matches `generation` above. `None` re-discovers
+    /// inline (below the region gate, combined groups, or discovery
+    /// incomplete at parse time).
+    pub discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
 }
 
 // Internal re-exports for production code
@@ -83,6 +93,7 @@ pub(crate) async fn handle_semantic_tokens_full(
 ) -> Option<SemanticTokensResult> {
     pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
+        let t_start = std::time::Instant::now();
 
         let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
@@ -106,6 +117,8 @@ pub(crate) async fn handle_semantic_tokens_full(
             &mut all_tokens,
         );
 
+        let host_elapsed = t_start.elapsed();
+
         // Bail before the injection pass — the dominant cost on a large document
         // — if this request has already been superseded.
         if is_cancelled() {
@@ -127,6 +140,7 @@ pub(crate) async fn handle_semantic_tokens_full(
                 view.slot.current_incarnation == p.incarnation
                     && view.content_version == p.parsed_version
             }),
+            discovery: p.discovery.as_deref(),
         });
 
         // Collect injection tokens in parallel using Rayon.
@@ -151,6 +165,28 @@ pub(crate) async fn handle_semantic_tokens_full(
         if is_cancelled() {
             return None;
         }
+
+        // Phase timing at debug level: pinpoints where a slow compute spends
+        // its time (host query pass vs injection fan-out) without a profiler
+        // attached — the numbers a user-supplied log needs.
+        log::debug!(
+            target: "kakehashi::semantic",
+            "[SEMANTIC_TOKENS] compute phases: host={}ms injections={}ms regions_reused={}",
+            host_elapsed.as_millis(),
+            t_start.elapsed().saturating_sub(host_elapsed).as_millis(),
+            injection_cache
+                .as_ref()
+                // The same generation gate the reuse path applies: a
+                // present-but-reload-stale discovery is NOT reused, and
+                // reporting its count would mislead profiling.
+                .and_then(|p| {
+                    p.discovery
+                        .as_ref()
+                        .filter(|d| d.generation == p.generation)
+                })
+                .map(|d| d.regions.len().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        );
 
         // Merge injection tokens with host tokens
         all_tokens.extend(injection_tokens);

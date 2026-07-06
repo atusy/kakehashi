@@ -15,7 +15,7 @@ mod field;
 // Widened beyond `node/`: the captures handlers reuse the injection-layer
 // machinery (document-wide layer walk, language discovery) for
 // captures-protocol's `injection: true` mode.
-pub(in crate::lsp::lsp_impl::kakehashi) mod injection_stack;
+pub(crate) mod injection_stack;
 mod lookup;
 mod metadata;
 mod navigation;

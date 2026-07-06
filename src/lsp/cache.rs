@@ -49,6 +49,46 @@ pub(crate) struct CacheCoordinator {
     /// that was already computing (it captured the pre-bump generation), which a
     /// bare clear could not prevent.
     semantic_token_generation: std::sync::atomic::AtomicU64,
+    /// The highest snapshot `parsed_version` whose semantic tokens were
+    /// actually SERVED to the client, per document. The parse loop consults
+    /// this to decide whether a fresh publish needs a
+    /// `workspace/semanticTokens/refresh`: the request is workspace-scoped and
+    /// clients (Neovim) already re-request per `didChange`, so a refresh is
+    /// warranted only when the document has settled and the client's last
+    /// served tokens predate the settled snapshot — one refresh per settle,
+    /// none during a typing burst, none for documents whose tokens no client
+    /// ever asked for.
+    served_semantic_versions: dashmap::DashMap<Url, u64>,
+}
+
+/// Everything one `populate_injections` pass derives from its single
+/// injection-query run (parse-snapshot ADR §3, never discover twice): the
+/// semantic-path discovery (gated) and the bridge-downstream region list
+/// (ungated). Both ride the `ParseSnapshot` the parse publishes.
+pub(crate) struct PopulatedInjections {
+    pub(crate) discovery: Option<crate::document::DiscoveredInjections>,
+    /// `None` when the build was skipped (no bridge server configured) —
+    /// bridge readers then fall back to inline resolution — vs `Some(empty)`
+    /// for "ran, nothing matched" (readers skip their work).
+    pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
+    pub(crate) resolved_regions: Vec<crate::language::injection::ResolvedInjection>,
+    /// The settings generation this populate pass ran under — stamped onto
+    /// the snapshot's `resolved_regions` so reload-stale resolution is never
+    /// served (see `ParseSnapshot::resolved_regions`).
+    pub(crate) generation: u64,
+}
+
+impl PopulatedInjections {
+    /// No regions (no injection query, or none matched): the downstream skips
+    /// its work, exactly as the inline resolution's empty result did.
+    pub(crate) fn empty(generation: u64) -> Self {
+        Self {
+            discovery: None,
+            bridge_regions: Some(Vec::new()),
+            resolved_regions: Vec::new(),
+            generation,
+        }
+    }
 }
 
 impl CacheCoordinator {
@@ -61,6 +101,7 @@ impl CacheCoordinator {
             injection_token_cache: std::sync::Arc::new(InjectionTokenCache::new()),
             request_tracker: SemanticRequestTracker::new(),
             semantic_token_generation: std::sync::atomic::AtomicU64::new(0),
+            served_semantic_versions: dashmap::DashMap::new(),
         }
     }
 
@@ -86,6 +127,7 @@ impl CacheCoordinator {
         // rest of didClose (see `did_close.rs`), and only leaks a bounded set of
         // entries for a closed doc that no request can read.
         self.request_tracker.cancel_all_for_uri(uri);
+        self.served_semantic_versions.remove(uri);
         self.semantic_cache.remove(uri);
         self.semantic_range_cache.remove(uri);
         self.injection_map.clear(uri);
@@ -178,6 +220,16 @@ impl CacheCoordinator {
     /// enabling stable IDs across document edits when position adjustments are applied.
     ///
     /// Also clears stale InjectionTokenCache entries for removed regions.
+    ///
+    /// Returns the owned injection **discovery** for this parse (parse-snapshot
+    /// ADR §3, the don't-discover-twice lever) when it should ride the
+    /// [`ParseSnapshot`](crate::document::snapshot::ParseSnapshot) for readers
+    /// to reuse — `None` when there is nothing worth reusing (no query,
+    /// no/empty regions, below the region-count gate, an `injection.combined`
+    /// group, or a not-yet-loaded parser). The discovery query (`Q`) is run
+    /// **once** here and shared; the request path never re-runs it.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn populate_injections(
         &self,
         uri: &Url,
@@ -186,16 +238,41 @@ impl CacheCoordinator {
         language_name: &str,
         language: &LanguageCoordinator,
         tracker: &NodeTracker,
-    ) {
+        build_bridge_regions: bool,
+    ) -> PopulatedInjections {
+        // Snapshot the generation FIRST — before reading the injection query or
+        // resolving any language below — so the stamp can never be *newer* than
+        // the queries the discovery was built with. A reload swaps queries and
+        // then bumps the generation (`lsp_impl::apply_shared_settings`); reading
+        // the generation last would let a reload landing mid-`populate` stamp a
+        // stale-query region set with the *new* generation, which the consumer's
+        // generation gate would then wrongly accept. Read first, a raced
+        // discovery carries the *old* generation and the post-reload consumer
+        // re-discovers inline — the "snapshot generation at the top" discipline
+        // the token handlers use.
+        let generation = self.semantic_token_generation();
+        // Entry half of the mint reconciliation (the captures walk's #554
+        // pattern, applied to the WRITER): populate runs post-CAS but an edit
+        // can land DURING this pass, shift the live-coordinate NodeTracker,
+        // and leave this pass minting the old tree's coordinates into it. The
+        // exit check below purges this pass's own creations and withholds
+        // every region-id-bearing product when the latch no longer matches.
+        let entry_mint_epoch = tracker.mint_epoch(uri);
+        let mut minted_ids: Vec<ulid::Ulid> = Vec::new();
+
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
             None => {
-                // No injection query = no injections to track
-                // Clear any stale injection caches
-                self.injection_map.clear(uri);
-                self.injection_token_cache.clear_document(uri);
-                return;
+                // No injection query = no injections to track. Clear any
+                // stale injection caches — but only when no edit landed
+                // during this pass (a stale pass must not clobber state the
+                // newer text's own populate maintains).
+                let _ = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                    self.injection_map.clear(uri);
+                    self.injection_token_cache.clear_document(uri);
+                });
+                return PopulatedInjections::empty(generation);
             }
         };
 
@@ -204,10 +281,13 @@ impl CacheCoordinator {
             collect_all_injections(&tree.root_node(), text, Some(injection_query.as_ref()))
         {
             if regions.is_empty() {
-                // Clear any existing regions and caches for this document
-                self.injection_map.clear(uri);
-                self.injection_token_cache.clear_document(uri);
-                return;
+                // Clear any existing regions and caches for this document —
+                // epoch-gated like the commit below.
+                let _ = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                    self.injection_map.clear(uri);
+                    self.injection_token_cache.clear_document(uri);
+                });
+                return PopulatedInjections::empty(generation);
             }
 
             // Get existing regions for cache cleanup and content comparison
@@ -223,13 +303,18 @@ impl CacheCoordinator {
             let cacheable_regions: Vec<CacheableInjectionRegion> = regions
                 .iter()
                 .map(|info| {
-                    // Get position-based ULID from tracker
-                    let ulid = tracker.get_or_create(
+                    // Get position-based ULID from tracker, recording
+                    // creations for the exit reconciliation's purge set.
+                    let (ulid, created, _) = tracker.get_or_create_in_layer_tracked(
                         uri,
                         info.content_node.start_byte(),
                         info.content_node.end_byte(),
                         info.content_node.kind(),
+                        0,
                     );
+                    if created {
+                        minted_ids.push(ulid);
+                    }
                     let region_id = ulid.to_string();
                     let new_region =
                         CacheableInjectionRegion::from_region_info(info, &region_id, text);
@@ -276,9 +361,103 @@ impl CacheCoordinator {
                 }
             }
 
-            // Store in injection map
-            self.injection_map.insert(uri.clone(), cacheable_regions);
+            // Bridge-downstream regions from the SAME collected `regions`
+            // (parse-snapshot ADR §3, never discover twice): the exact
+            // (raw language, region_id, clean content) triple
+            // `resolve_injection_data` used to re-derive by re-running the
+            // injection query per downstream pass. Gated on a bridge server
+            // actually being configured: populate runs on the pre-publish
+            // critical path, and the per-region content copies are pure
+            // waste for the (common) bridge-less deployment — `None` makes
+            // any late-configured bridge fall back to inline resolution.
+            let bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>> =
+                build_bridge_regions.then(|| {
+                    regions
+                        .iter()
+                        .zip(cacheable_regions.iter())
+                        .map(|(info, cacheable)| {
+                            let included_ranges =
+                                crate::language::injection::compute_included_ranges(
+                                    &info.content_node,
+                                    info.include_children,
+                                );
+                            let content = crate::language::injection::extract_clean_content(
+                                text,
+                                info.content_node.byte_range(),
+                                included_ranges.as_deref(),
+                            );
+                            crate::document::DiscoveredBridgeRegion {
+                                raw_language: info.language.clone(),
+                                region_id: cacheable.region_id.clone(),
+                                content,
+                            }
+                        })
+                        .collect()
+                });
+
+            // The whole-document readers' fully resolved regions, from the
+            // same single query run — and from the SAME per-region ids and
+            // content hashes already in `cacheable_regions` (no duplicate
+            // mint/hash on this critical path).
+            let resolved_regions =
+                crate::language::injection::InjectionResolver::resolve_from_prebuilt(
+                    language,
+                    &regions,
+                    &cacheable_regions,
+                    text,
+                );
+
+            // Producer half of the discovery lever: build the owned discovery
+            // from the SAME `regions` just collected — the injection query (`Q`)
+            // is not re-run — so a semanticTokens request bound to the snapshot
+            // this parse publishes can rebuild its contexts without
+            // re-discovering. `None` when not worth reusing
+            // (gate/combined/incomplete).
+            let discovery = crate::analysis::semantic::build_document_discovery(
+                &regions,
+                &cacheable_regions,
+                injection_query.as_ref(),
+                text,
+                language,
+                uri,
+                tracker,
+                generation,
+            );
+
+            // Exit half of the mint reconciliation, atomic with coordinate
+            // shifts: the commit runs under the tracker entry's shared lock
+            // and only while the (shift generation, cleanup epoch) latch
+            // still matches — an edit (or close/reopen) that landed during
+            // this pass fails the check INSIDE the lock, so a shift can
+            // never interleave between check and commit. On mismatch, purge
+            // exactly this pass's tracker creations (the base invariant: a
+            // stale pass never leaves wrong-space entries as live), keep the
+            // injection map's previous entry (the newer text's own populate
+            // replaces it), and withhold the region-id-bearing products; the
+            // snapshot then rides without regions and every reader falls
+            // back inline, byte-identically to the pre-lever path. The
+            // token-cache evictions this pass already performed are
+            // conservative (idempotent removes) and need no rollback.
+            let committed = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                // Commit point: store the region set the token-cache
+                // bookkeeping (reanchor/eviction) keys off.
+                self.injection_map.insert(uri.clone(), cacheable_regions);
+            });
+            if committed.is_none() {
+                for id in &minted_ids {
+                    tracker.remove_id(uri, id);
+                }
+                return PopulatedInjections::empty(generation);
+            }
+            return PopulatedInjections {
+                discovery,
+                bridge_regions,
+                resolved_regions,
+                generation,
+            };
         }
+
+        PopulatedInjections::empty(generation)
     }
 
     /// Get all injection regions for a document (test helper).
@@ -341,6 +520,28 @@ impl CacheCoordinator {
                 expected_result_id
             );
         }
+    }
+
+    /// Record that a semantic-token response computed from snapshot
+    /// `parsed_version` was served for `uri` (monotonic max — a stale-serve
+    /// racing a fresher one must not regress the mark).
+    pub(crate) fn record_served_semantic_version(&self, uri: &Url, parsed_version: u64) {
+        // `get_mut` first: the hot path (every token serve) avoids the `Url`
+        // clone `entry()` needs for its owned key.
+        if let Some(mut served) = self.served_semantic_versions.get_mut(uri) {
+            *served = (*served).max(parsed_version);
+            return;
+        }
+        self.served_semantic_versions
+            .entry(uri.clone())
+            .and_modify(|v| *v = (*v).max(parsed_version))
+            .or_insert(parsed_version);
+    }
+
+    /// The last snapshot version whose tokens were served for `uri`, or `None`
+    /// when no client ever consumed semantic tokens for it.
+    pub(crate) fn served_semantic_version(&self, uri: &Url) -> Option<u64> {
+        self.served_semantic_versions.get(uri).map(|v| *v)
     }
 
     /// Snapshot the current settings generation. Take this at the TOP of a token
@@ -471,6 +672,7 @@ impl CacheCoordinator {
     #[cfg(test)]
     pub(crate) fn cancel_requests(&self, uri: &Url) {
         self.request_tracker.cancel_all_for_uri(uri);
+        self.served_semantic_versions.remove(uri);
     }
 }
 
@@ -670,13 +872,14 @@ print("hello")
         let tree = parser.parse(initial_text, None).expect("parse");
 
         // Populate injections - this should create a region with position-based ULID
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             initial_text,
             &tree,
             "markdown",
             &coordinator,
             &tracker,
+            true,
         );
 
         // Verify we have one injection region
@@ -728,13 +931,14 @@ print("hello")
         // Key insight: After apply_text_diff, the tracker's positions are adjusted,
         // so get_or_create returns the SAME ULID. The invalidation check in
         // populate_injections should detect language_changed and remove cached tokens.
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             edited_text,
             &edited_tree,
             "markdown",
             &coordinator,
             &tracker,
+            true,
         );
 
         // Verify the region still exists with the same region_id (position-based stability)
@@ -803,13 +1007,14 @@ print("hello")
         let tree = parser.parse(initial_text, None).expect("parse");
 
         // Populate injections
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             initial_text,
             &tree,
             "markdown",
             &coordinator,
             &tracker,
+            true,
         );
 
         let regions = cache.get_injections(&uri).expect("should have injections");
@@ -848,13 +1053,14 @@ print("goodbye")
         let edited_tree = parser.parse(edited_text, None).expect("parse edited");
 
         // Re-populate injections
-        cache.populate_injections(
+        let _ = cache.populate_injections(
             &uri,
             edited_text,
             &edited_tree,
             "markdown",
             &coordinator,
             &tracker,
+            true,
         );
 
         let regions_after = cache.get_injections(&uri).expect("should have injections");

@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use tree_sitter::Tree;
 
+use super::injections::{DiscoveredBridgeRegion, DiscoveredInjections, SnapshotLayerTree};
+use crate::language::injection::ResolvedInjection;
+
 /// The reserved terminal incarnation `didClose` installs in a slot
 /// (`u64::MAX`). Keeping the closed slot at its old incarnation would let a
 /// stale same-lifetime publish pass both the incarnation check and the
@@ -40,6 +43,53 @@ pub(crate) struct ParseSnapshot {
     pub(crate) parsed_version: u64,
     /// The document lifetime the parse belongs to.
     pub(crate) incarnation: u64,
+    /// Owned injection discovery derived from THIS snapshot's tree by the
+    /// parse pass (ADR §3, don't-discover-twice): readers rebuild injection
+    /// contexts from it instead of re-running the injection query per request.
+    /// `None` when discovery didn't run or didn't qualify (tree-less snapshot,
+    /// below the region gate, combined groups, or a not-yet-loaded injected
+    /// parser tainted it) — readers then discover inline, byte-identically to
+    /// the pre-lever path. Immutability of the snapshot is the tree-identity
+    /// binding: text, tree, and regions are one value, so the regions can
+    /// never be consumed against a different tree.
+    pub(crate) injection_regions: Option<Arc<DiscoveredInjections>>,
+    /// The bridge downstream's region list, derived by the same populate pass
+    /// (`None` when populate didn't run for this snapshot or no bridge server
+    /// was configured — the downstream then resolves inline; `Some(empty)`
+    /// means genuinely no regions). Stamped with the settings generation the
+    /// discovery ran under, like `resolved_regions`: a reload can change the
+    /// injection query without publishing a new snapshot, and the consumer
+    /// must fall back inline rather than open virtual documents for regions
+    /// the new query would not discover.
+    pub(crate) bridge_regions: Option<(u64, Arc<Vec<DiscoveredBridgeRegion>>)>,
+    /// Fully resolved injection regions (`InjectionResolver::resolve_all`'s
+    /// shape) from the same populate pass, for the whole-document readers —
+    /// pull/push diagnostics, documentSymbol/Color, formatting's virt layer —
+    /// which previously each re-ran the injection query per request. Same
+    /// `None`/`Some(empty)` semantics as `bridge_regions`.
+    /// Stamped with the settings generation the populate pass ran under: a
+    /// reload (which can change injection resolution) bumps the generation
+    /// WITHOUT publishing a new snapshot, so consumers gate on the stamp and
+    /// fall back to inline resolution on mismatch (same pattern as
+    /// `DiscoveredInjections.generation` and `layer_trees`).
+    pub(crate) resolved_regions: Option<(u64, Arc<Vec<ResolvedInjection>>)>,
+    /// Lazily-built, per-snapshot injection layer trees (document-order DFS,
+    /// depth ≥ 1) for the captures/node layer walk: the FIRST walking request
+    /// on this snapshot builds them (on the compute pool — the same cost the
+    /// inline walk paid), and every subsequent walk on the same snapshot —
+    /// captures full + delta both walk per keystroke, plus range and node
+    /// lookups — reuses the parsed trees instead of re-running the injection
+    /// query and re-parsing every region. Deliberately lazy rather than
+    /// populate-built: non-captures users never pay, and the parse loop's
+    /// publish latency is untouched.
+    ///
+    /// The `u64` is the settings generation the trees were built under: an
+    /// injected-grammar auto-install bumps the generation WITHOUT publishing
+    /// a new snapshot, and trees built pre-install would keep serving an
+    /// empty embedded layer for the rest of this snapshot's life. A walker
+    /// seeing a generation mismatch bypasses the cell and walks fresh (the
+    /// pre-cache per-request cost) until the next snapshot rebuilds it.
+    pub(crate) layer_trees: std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>,
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -113,6 +163,10 @@ mod tests {
             language: None,
             parsed_version,
             incarnation,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
         }
     }
 
@@ -156,6 +210,10 @@ mod tests {
             language: Some("rust".to_string()),
             parsed_version,
             incarnation,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
         }
     }
 

@@ -145,7 +145,11 @@ impl Kakehashi {
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             // No detectable language, or resolved-but-tree-less (no parser
-            // installed / crashed grammar): nothing to tokenize.
+            // installed / crashed grammar): nothing to tokenize. The empty set
+            // IS this snapshot's served state — record it so the parse loop
+            // doesn't keep refreshing a document that has no tokens.
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -223,6 +227,8 @@ impl Kakehashi {
                 .cache
                 .get_current_tokens(&uri, &language_name, cache_key)
             {
+                self.cache
+                    .record_served_semantic_version(&uri, snapshot.parsed_version);
                 self.cache.finish_request(&uri, request_id);
                 return Ok(Some(SemanticTokensResult::Tokens(cached)));
             }
@@ -245,6 +251,10 @@ impl Kakehashi {
                 documents: std::sync::Arc::clone(&self.documents),
                 parsed_version: snapshot.parsed_version,
                 incarnation: snapshot.incarnation,
+                // The snapshot's own discovery (ADR §3, don't-discover-twice):
+                // rebuilt into contexts instead of re-running the injection
+                // query, when its generation still matches.
+                discovery: snapshot.injection_regions.clone(),
             });
 
             // Compute tokens, racing against cancel notification if provided
@@ -343,6 +353,8 @@ impl Kakehashi {
             .store_tokens(uri.clone(), stored_tokens, language_name, cache_key);
 
         // Finish tracking this request
+        self.cache
+            .record_served_semantic_version(&uri, snapshot.parsed_version);
         self.cache.finish_request(&uri, request_id);
 
         log::debug!(
@@ -412,6 +424,8 @@ impl Kakehashi {
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -490,6 +504,8 @@ impl Kakehashi {
                 // so the delta is necessarily empty — return it directly and skip
                 // the `previous_tokens` clone + O(N) `calculate_delta` below.
                 if cached.result_id.as_deref() == Some(previous_result_id.as_str()) {
+                    self.cache
+                        .record_served_semantic_version(&uri, snapshot.parsed_version);
                     self.cache.finish_request(&uri, request_id);
                     return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
                         tower_lsp_server::ls_types::SemanticTokensDelta {
@@ -518,6 +534,8 @@ impl Kakehashi {
                     documents: std::sync::Arc::clone(&self.documents),
                     parsed_version: snapshot.parsed_version,
                     incarnation: snapshot.incarnation,
+                    // The snapshot's own discovery (ADR §3, don't-discover-twice).
+                    discovery: snapshot.injection_regions.clone(),
                 });
 
                 // Compute tokens, racing against cancel notification if provided
@@ -669,6 +687,8 @@ impl Kakehashi {
         };
 
         // Finish tracking this request
+        self.cache
+            .record_served_semantic_version(&uri, snapshot.parsed_version);
         self.cache.finish_request(&uri, request_id);
 
         log::debug!(
@@ -919,6 +939,10 @@ mod tests {
                         language: Some("rust".to_string()),
                         parsed_version: 0,
                         incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
                     },
                 ))
             })
@@ -1069,6 +1093,85 @@ mod tests {
         assert!(
             follow_up_result.is_ok(),
             "follow-up delta request should succeed"
+        );
+    }
+
+    /// End-to-end for the don't-discover-twice lever (parse-snapshot ADR §3):
+    /// the parse loop's `populate_injections` derives the injection discovery
+    /// once, the published snapshot carries it, and the semantic handler
+    /// consumes it — so the request-path compute never re-runs the injection
+    /// query. Pinned via the reuse-hit counter around a real
+    /// `semanticTokens/full` request.
+    #[tokio::test]
+    async fn semantic_full_reuses_snapshot_discovery() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///discovery_reuse.md").expect("test uri");
+
+        // Eight lua blocks: clears INJECTION_CACHE_MIN_REGIONS so populate
+        // stores a discovery.
+        let mut text = String::new();
+        for i in 0..8 {
+            text.push_str(&format!("# h{i}\n\n```lua\nlocal x{i} = {i}\n```\n\n"));
+        }
+        server
+            .documents
+            .insert(uri.clone(), text, Some("markdown".to_string()), None);
+
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                std::env::var("TREE_SITTER_GRAMMARS")
+                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
+            ],
+            ..Default::default()
+        };
+        let _ = server.language.load_settings(&settings);
+        for lang in ["markdown", "markdown_inline", "lua"] {
+            if !server.language.ensure_language_loaded(lang).success {
+                eprintln!("Skipping: {lang} parser not available");
+                return;
+            }
+        }
+        if server.language.highlight_query("markdown").is_none() {
+            eprintln!("Skipping: markdown highlight query not available");
+            return;
+        }
+
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("markdown"), None)
+            .await;
+
+        // The published snapshot must carry the derived discovery.
+        let view = server
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document registered");
+        let snapshot = view.slot.snapshot.expect("open parse published");
+        assert!(
+            snapshot.injection_regions.is_some(),
+            "populate must derive a discovery onto the snapshot for an 8-region document"
+        );
+
+        // A real full request must take the reuse path (no injection-query re-run).
+        use crate::analysis::semantic::DISCOVERY_REUSE_HITS;
+        DISCOVERY_REUSE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let params = SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let result = server
+            .semantic_tokens_full_impl(params)
+            .await
+            .expect("full request should succeed")
+            .expect("should return tokens");
+        assert!(matches!(result, SemanticTokensResult::Tokens(t) if !t.data.is_empty()));
+        assert!(
+            DISCOVERY_REUSE_HITS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the request must rebuild contexts from the snapshot's discovery"
         );
     }
 

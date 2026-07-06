@@ -2,7 +2,7 @@ pub(crate) mod bridge_context;
 mod cli;
 mod coordinator;
 pub(crate) use coordinator::DiagnosticPublisher;
-mod kakehashi;
+pub(crate) mod kakehashi;
 mod lifecycle;
 mod parse_scheduler;
 mod show_document_translation;
@@ -88,7 +88,7 @@ pub(super) fn bridge_configs_for_injection_language(
     injection_language: &str,
 ) -> Vec<ResolvedServerConfig> {
     let settings = settings_manager.load_settings();
-    bridge.get_all_configs_for_language(&settings, host_language, injection_language)
+    bridge.cached_configs_for_injection_language(&settings, host_language, injection_language)
 }
 
 pub(super) async fn apply_shared_settings(
@@ -100,7 +100,24 @@ pub(super) async fn apply_shared_settings(
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
 ) {
+    // TRANSITIONAL generation bump BEFORE any query/config mutation: from
+    // this instant, every generation-stamped product built from the OLD
+    // queries (snapshot-riding discovery/bridge/resolved regions, layer
+    // trees, kind queries, walk memos) stops matching and consumers fall
+    // back inline — without it, `load_settings` swaps the queries first and
+    // the (possibly long: `propagate_settings` awaits the network) window
+    // until the post-reload bump kept serving old-query products as current.
+    // The second bump below then also invalidates anything a racing request
+    // built MID-swap against a half-updated query set.
+    cache.bump_semantic_token_generation();
     let summary = language.load_settings(&settings);
+    // Second bump IMMEDIATELY after the query swap, before any await: a
+    // request that started after the transitional bump above but before the
+    // swap computed against the OLD queries yet stamped the new generation —
+    // without this bump those products would be accepted as current for the
+    // whole awaited propagate below. (The final bump after apply_settings
+    // covers the settings-side inputs the apply swaps.)
+    cache.bump_semantic_token_generation();
     // Path c: push the new per-server settings to live downstream connections
     // at this single reload choke point (initialize, didChangeConfiguration,
     // auto-install reload), before `settings` is consumed by the apply below.
@@ -117,16 +134,21 @@ pub(super) async fn apply_shared_settings(
         Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
         None => settings_manager.apply_settings(settings),
     }
-    // A settings/query reload can change tokenization for unchanged text, so bump
-    // the semantic-token cache generation — otherwise a repeat request on an
-    // unedited document would serve tokens from the old queries. Done at this single
-    // choke point so every reload path (initialize, didChangeConfiguration, and the
-    // auto-install reload) is covered, and *before* the refresh below so the editor's
-    // re-request recomputes. The generation bump (not a bare clear) also defeats a
-    // request that was mid-tokenization across the reload and stores afterwards: it
-    // captured the old generation, so its entry can't be served post-reload.
-    // `didChange` deliberately does NOT invalidate (delta needs the previous tokens);
-    // only a query/config reload does.
+    // A settings/query reload can change tokenization for unchanged text, so
+    // bump the semantic-token cache generation once more: the ladder is one
+    // bump per mutation boundary — before the query swap (kills old-query
+    // stamps), after it (kills mid-swap stamps), and here after the settings
+    // apply (kills stamps that read the new queries but the OLD
+    // settings-side inputs, e.g. capture mappings, during the awaited
+    // propagate).
+    // Done at this single choke point so every reload path (initialize,
+    // didChangeConfiguration, and the auto-install reload) is covered, and
+    // *before* the refresh below so the editor's re-request recomputes. The
+    // generation bump (not a bare clear) also defeats a request that was
+    // mid-tokenization across the reload and stores afterwards: it captured
+    // an old generation, so its entry can't be served post-reload.
+    // `didChange` deliberately does NOT invalidate (delta needs the previous
+    // tokens); only a query/config reload does.
     cache.bump_semantic_token_generation();
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
@@ -204,6 +226,17 @@ pub struct Kakehashi {
     /// is live (unambiguous), otherwise `null`.
     #[allow(clippy::type_complexity)]
     captures_cache: dashmap::DashMap<(Url, String), [Option<(String, Vec<serde_json::Value>)>; 2]>,
+    /// Memoized captures walk results per `(uri, kind, injection-mode)`,
+    /// tagged with the exact inputs they were computed from — snapshot
+    /// `(parsed_version, incarnation)` and the settings generation. A typing
+    /// client sends `captures/full` AND `captures/full/delta` per keystroke;
+    /// both walk the same snapshot, so the second (and any repeat on an
+    /// unchanged document) serves the memo instead of re-executing the kind
+    /// query over every layer. One entry per key (insert-overwrites), dropped
+    /// with the lineage cache on `didClose`.
+    #[allow(clippy::type_complexity)]
+    captures_walk_cache:
+        dashmap::DashMap<(Url, String, bool), kakehashi::captures::CachedCapturesWalk>,
     /// True when the process runs as a one-shot CLI (`kakehashi diagnose`/`format`)
     /// rather than a long-lived LSP server. Set once by `cli_initialize`. No editor
     /// consumes a proactive `publishDiagnostics` in CLI mode (the stub client pump
@@ -286,6 +319,7 @@ impl Kakehashi {
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
+            captures_walk_cache: dashmap::DashMap::new(),
             cli_mode: std::sync::atomic::AtomicBool::new(false),
             parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
         }

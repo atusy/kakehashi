@@ -96,15 +96,28 @@ impl Kakehashi {
                 return Ok(None);
             };
 
-            // Collect all injection regions
-            let all_regions = InjectionResolver::resolve_all(
-                &self.language,
-                self.bridge.node_tracker(),
-                &uri,
-                snapshot_tree,
-                &snapshot.text,
-                injection_query.as_ref(),
-            );
+            // Collect all injection regions — from THIS snapshot's own
+            // resolved_regions (generation-gated), never a store re-read: a
+            // parse publishing between the wait above and a store lookup
+            // could pair this snapshot's tree/text with a NEWER snapshot's
+            // regions. Snapshot immutability makes tree, text, and regions
+            // one value; absent/reload-stale falls back inline over the same
+            // tree.
+            let all_regions = match snapshot
+                .resolved_regions
+                .as_ref()
+                .filter(|(stamped, _)| *stamped == self.cache.semantic_token_generation())
+            {
+                Some((_, regions)) => std::sync::Arc::clone(regions),
+                None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                    &self.language,
+                    self.bridge.node_tracker(),
+                    &uri,
+                    snapshot_tree,
+                    &snapshot.text,
+                    injection_query.as_ref(),
+                )),
+            };
 
             if all_regions.is_empty() {
                 return Ok(None);
@@ -136,7 +149,7 @@ impl Kakehashi {
             });
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-            for resolved in all_regions {
+            for resolved in all_regions.iter() {
                 // Get ALL bridge server configs for this injection language
                 let configs = self.bridge_configs_for_injection_language(
                     &language_name,
@@ -153,7 +166,7 @@ impl Kakehashi {
                 );
                 let region_ctx = DocumentRequestContext {
                     uri: uri.clone(),
-                    resolved,
+                    resolved: resolved.clone(),
                     configs,
                     upstream_request_id: upstream_request_id.clone(),
                     priorities: agg.priorities,
