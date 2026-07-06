@@ -51,7 +51,6 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
                 lang.clone(),
                 QueryTypeMappings {
                     highlights: mappings.highlights.clone(),
-                    locals: mappings.locals.clone(),
                     folds: mappings.folds.clone(),
                 },
             )
@@ -354,7 +353,6 @@ impl From<&WorkspaceSettings> for RawWorkspaceSettings {
                     lang.clone(),
                     QueryTypeMappings {
                         highlights: mappings.highlights.clone(),
-                        locals: mappings.locals.clone(),
                         folds: mappings.folds.clone(),
                     },
                 )
@@ -538,7 +536,6 @@ mod tests {
 
         let query_type_mappings = QueryTypeMappings {
             highlights,
-            locals: HashMap::new(),
             folds: HashMap::new(),
         };
 

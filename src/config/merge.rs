@@ -460,7 +460,6 @@ fn merge_capture_mappings(mut base: CaptureMappings, overlay: CaptureMappings) -
     for (lang, overlay_mappings) in overlay {
         let base_mappings = base.entry(lang).or_default();
         base_mappings.highlights.extend(overlay_mappings.highlights);
-        base_mappings.locals.extend(overlay_mappings.locals);
         base_mappings.folds.extend(overlay_mappings.folds);
     }
     base
@@ -584,10 +583,6 @@ mod tests {
                             ("variable.builtin".to_string(), "base.variable".to_string()),
                             ("function.builtin".to_string(), "base.function".to_string()),
                         ]),
-                        locals: HashMap::from([(
-                            "definition.var".to_string(),
-                            "base.definition".to_string(),
-                        )]),
                         folds: HashMap::from([(
                             "fold.comment".to_string(),
                             "base.comment".to_string(),
@@ -666,7 +661,7 @@ mod tests {
             capture_mappings: HashMap::from([
                 (
                     // shared key: _ — overlay overrides variable.builtin, adds type.builtin;
-                    //   overrides locals definition.var; adds folds fold.function
+                    //   adds folds fold.function
                     "_".to_string(),
                     QueryTypeMappings {
                         highlights: HashMap::from([
@@ -676,10 +671,6 @@ mod tests {
                             ),
                             ("type.builtin".to_string(), "overlay.type".to_string()),
                         ]),
-                        locals: HashMap::from([(
-                            "definition.var".to_string(),
-                            "overlay.definition".to_string(),
-                        )]),
                         folds: HashMap::from([(
                             "fold.function".to_string(),
                             "overlay.function".to_string(),

@@ -29,13 +29,17 @@ impl Kakehashi {
         let work_done_token = params.work_done_progress_params.work_done_token;
 
         let virt = self.definition_virt_layer(&lsp_uri, position, work_done_token);
+        let native = self.native_bindings_answer(&lsp_uri, position, |ctx| {
+            super::native_bindings::native_definition(ctx, &lsp_uri)
+        });
         let links = self
-            .walk_layers(
+            .walk_layers_with_native(
                 &lsp_uri,
                 METHOD,
                 METHOD,
                 raw_params,
                 virt,
+                native,
                 normalize_host_goto_result,
                 |links: &Vec<LocationLink>| !links.is_empty(),
             )

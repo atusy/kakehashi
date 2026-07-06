@@ -48,12 +48,12 @@ The obvious prior art is nvim-treesitter's `locals.scm`
 A compatibility-superset was considered and rejected (see Considered Options);
 this record defines a kakehashi-owned spec instead.
 
-Current code state: `QueryKind::Locals` exists end-to-end (config inference,
-coordinator loading, `QueryStore` storage, auto-install via `QUERY_FILES`)
-but **no feature consumes it** — `QueryStore::locals_query()` has no callers
-outside the store. The slot is dead weight from an earlier intent, and its
-installed content is ecosystem `locals.scm` files written against the
-nvim-treesitter vocabulary.
+Code state before this decision: `QueryKind::Locals` existed end-to-end
+(config inference, coordinator loading, `QueryStore` storage, auto-install
+via `QUERY_FILES`) but **no feature consumed it** —
+`QueryStore::locals_query()` had no callers outside the store. The slot was
+dead weight from an earlier intent, and its installed content was ecosystem
+`locals.scm` files written against the nvim-treesitter vocabulary.
 
 ## Decision
 
@@ -467,9 +467,10 @@ the miss policy keeps the resolver silent.
   (for a future `documentSymbol`) is a separate decision.
 * `reference.write` (for `documentHighlight` Read/Write kinds) is a
   deliberate later phase on the same vocabulary.
-* Whether `bindings.scm` is added to the auto-install `QUERY_FILES` set is
-  an install-source question (there is no upstream corpus to fetch — assets
-  are kakehashi-authored), tracked with the install pipeline, not here.
+* How `bindings.scm` assets are distributed (auto-install `QUERY_FILES`,
+  bundling, or search-path-only) is an install-source question (there is no
+  upstream corpus to fetch — assets are kakehashi-authored), tracked with
+  the install pipeline, not here.
 * Scope tree and bindings are pure functions of (layer tree, query) —
   computed once per parsed version. `references`/`documentHighlight`
   resolve every reference in the layer per request; whether those results
@@ -479,6 +480,21 @@ the miss policy keeps the resolver silent.
 
 ## Decision–Implementation Gap
 
-Nothing is implemented: no `bindings.scm` kind, no engine, and
-`QueryKind::Locals` (slated for removal above) still loads and installs
-`locals.scm` today. This record precedes implementation.
+Implemented: `QueryKind::Bindings` replaces the removed `Locals` end-to-end
+(config, store, coordinator, auto-install set); the engine
+(`src/analysis/bindings/`) implements the full property vocabulary and
+resolution algorithm; the native layer feeds
+definition/references/documentHighlight/rename/prepareRename through the
+cross-layer walk's `native` slot. `bindings.scm` files load from
+`searchPaths` like any other query asset, with per-file `; inherits:`
+resolution; experimental queries for
+bash/go/javascript/lua/python/rust/typescript live in-repo under
+`assets/queries/` (not bundled into the binary), validated by fixture
+tests against the real grammars.
+
+Injected layers resolve natively too: the region under the cursor is parsed
+with included ranges and results map back through the region's content
+offset, per-layer and never crossing regions. Remaining gap:
+`#offset!`-shifted regions stay bridge-only (the native path does not clip
+effective windows yet). Cross-region resolution stays out of scope for v1 as
+decided above.

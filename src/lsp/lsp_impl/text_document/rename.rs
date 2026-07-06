@@ -24,12 +24,16 @@ impl Kakehashi {
         let new_name = params.new_name;
 
         let virt = self.rename_virt_layer(&lsp_uri, position, &new_name, work_done_token);
-        self.walk_layers(
+        let native = self.native_bindings_answer(&lsp_uri, position, |ctx| {
+            super::native_bindings::native_rename(ctx, &lsp_uri, &new_name)
+        });
+        self.walk_layers_with_native(
             &lsp_uri,
             METHOD,
             METHOD,
             raw_params,
             virt,
+            native,
             parse_host_verbatim::<WorkspaceEdit>,
             |_| true,
         )

@@ -24,6 +24,7 @@ mod implementation;
 mod inlay_hint;
 mod linked_editing_range;
 mod moniker;
+mod native_bindings;
 mod on_type_formatting;
 mod prepare_rename;
 pub(crate) mod publish_diagnostic;

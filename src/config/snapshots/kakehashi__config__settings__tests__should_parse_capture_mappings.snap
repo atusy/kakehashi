@@ -8,15 +8,11 @@ expression: settings.capture_mappings
       "function.builtin": "function.defaultLibrary",
       "variable.builtin": "variable.defaultLibrary"
     },
-    "locals": {},
     "folds": {}
   },
   "rust": {
     "highlights": {
       "type.builtin": "type.defaultLibrary"
-    },
-    "locals": {
-      "definition.var": "definition.variable"
     },
     "folds": {}
   }

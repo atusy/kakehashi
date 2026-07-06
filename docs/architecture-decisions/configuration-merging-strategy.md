@@ -29,7 +29,7 @@ kakehashi introduces a unified `queries` field to simplify query file configurat
 [languages.python]
 queries = [
     { path = "/usr/share/python/highlights.scm" },
-    { path = "/usr/share/python-locals.scm", kind = "locals" },
+    { path = "/usr/share/python-bindings.scm", kind = "bindings" },
     { path = "./custom-injections.scm", kind = "injections" }
 ]
 ```
@@ -39,11 +39,11 @@ queries = [
 | Field  | Type   | Required | Description                                      |
 |--------|--------|----------|--------------------------------------------------|
 | `path` | string | Yes      | Path to the `.scm` query file                    |
-| `kind` | string | No       | Query type: `"highlights"`, `"locals"`, `"injections"` |
+| `kind` | string | No       | Query type: `"highlights"`, `"bindings"`, `"injections"` |
 
 **Type inference rules (when `kind` is omitted):**
 
-1. If the filename is exactly `highlights.scm`, `locals.scm`, or `injections.scm`, use the corresponding type
+1. If the filename is exactly `highlights.scm`, `bindings.scm`, or `injections.scm`, use the corresponding type
 2. Otherwise, return `None` and the query item is skipped
 
 **Examples of type inference:**
@@ -52,7 +52,7 @@ queries = [
 |-----------------------------------|-----------------|
 | `/usr/share/python/highlights.scm` | `highlights`    |
 | `./queries/highlights.scm`         | `highlights`    |
-| `/usr/share/python/locals.scm`     | `locals`        |
+| `/usr/share/python/bindings.scm`     | `bindings`        |
 | `./my-custom/injections.scm`       | `injections`    |
 | `./python-highlights.scm`          | (skipped)       |
 | `./custom-queries.scm`             | (skipped)       |
@@ -110,7 +110,7 @@ final_config = [defaults, user_config, project_config, InitializationOptions]
   parser = "/usr/lib/python.so"
   queries = [
       { path = "/usr/share/python/highlights.scm" },
-      { path = "/usr/share/python-locals.scm", kind = "locals" }
+      { path = "/usr/share/python-bindings.scm", kind = "bindings" }
   ]
   bridge = { rust = { enabled = true }, javascript = { enabled = true } }
 
@@ -124,17 +124,17 @@ final_config = [defaults, user_config, project_config, InitializationOptions]
   # final (deep merge)
   [languages.python]
   parser = "/usr/lib/python.so"                           # inherited from user
-  queries = [{ path = "./queries/python-highlights.scm" }] # replaced by project (user's locals lost!)
+  queries = [{ path = "./queries/python-highlights.scm" }] # replaced by project (user's bindings lost!)
   bridge = { rust = { enabled = true }, javascript = { enabled = true } }  # inherited from user
   ```
 
-  **Note**: If the project only wants to override highlights while keeping the user's locals, it must include both:
+  **Note**: If the project only wants to override highlights while keeping the user's bindings, it must include both:
   ```toml
-  # project config (preserving user's locals)
+  # project config (preserving user's bindings)
   [languages.python]
   queries = [
       { path = "./queries/python-highlights.scm" },
-      { path = "/usr/share/python-locals.scm", kind = "locals" }  # must repeat user's locals
+      { path = "/usr/share/python-bindings.scm", kind = "bindings" }  # must repeat user's bindings
   ]
   ```
 
@@ -246,8 +246,8 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 ### Phase 1: Query Configuration Schema (Completed - Sprint 118, PBI-151)
 - [x] Add `QueryItem` struct with `path` (required) and `kind` (optional) fields
 - [x] Add `queries: Option<Vec<QueryItem>>` field to `LanguageSettings`
-- [x] Implement `QueryKind` enum (`Highlights`, `Locals`, `Injections`) with default `Highlights`
-- [x] Implement type inference from exact filename (`highlights.scm`, `locals.scm`, `injections.scm`)
+- [x] Implement `QueryKind` enum (`Highlights`, `Bindings`, `Injections`) with default `Highlights`
+- [x] Implement type inference from exact filename (`highlights.scm`, `bindings.scm`, `injections.scm`)
 
 ### Phase 2: Core Merging (Completed - Sprint 119, PBI-150)
 - [x] Implement `merge_workspace_settings()` function for layered config merging

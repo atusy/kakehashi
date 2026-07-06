@@ -218,7 +218,8 @@ impl QueryLoader {
         None
     }
 
-    /// Load a query file from search paths
+    /// Load a query file from search paths; `; inherits:` parents resolve
+    /// through this same lookup.
     fn load_query_file<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,

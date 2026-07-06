@@ -637,7 +637,7 @@ impl LanguageCoordinator {
         Ok(language)
     }
 
-    /// Load all three query types (highlights, locals, injections) for a language.
+    /// Load all three query types (highlights, bindings, injections) for a language.
     fn load_all_queries(
         &self,
         language: &Language,
@@ -1110,6 +1110,14 @@ impl LanguageCoordinator {
         self.query_store().injection_query(lang_name)
     }
 
+    /// Get bindings query for a language (lexical name resolution).
+    ///
+    /// Visibility: pub(crate) - called by the LSP layer's native
+    /// definition/references/documentHighlight/rename contributors.
+    pub(crate) fn bindings_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
+        self.query_store().bindings_query(lang_name)
+    }
+
     /// Get capture mappings.
     ///
     /// Visibility: pub(crate) - called by LSP layer (semantic_tokens) and analysis
@@ -1187,14 +1195,14 @@ impl LanguageCoordinator {
 
         // Group query paths by their effective kind
         let mut highlights: Vec<String> = Vec::new();
-        let mut locals: Vec<String> = Vec::new();
+        let mut bindings: Vec<String> = Vec::new();
         let mut injections: Vec<String> = Vec::new();
 
         for query in queries {
             let effective_kind = query.kind.or_else(|| infer_query_kind(&query.path));
             match effective_kind {
                 Some(QueryKind::Highlights) => highlights.push(query.path.clone()),
-                Some(QueryKind::Locals) => locals.push(query.path.clone()),
+                Some(QueryKind::Bindings) => bindings.push(query.path.clone()),
                 Some(QueryKind::Injections) => injections.push(query.path.clone()),
                 None => {
                     // Skip unrecognized patterns silently
@@ -1204,7 +1212,7 @@ impl LanguageCoordinator {
 
         for (query_kind, paths) in [
             (QueryKind::Highlights, &highlights),
-            (QueryKind::Locals, &locals),
+            (QueryKind::Bindings, &bindings),
             (QueryKind::Injections, &injections),
         ] {
             if !paths.is_empty() {
@@ -1712,10 +1720,10 @@ mod tests {
         let mut highlights_file = fs::File::create(&highlights_path).unwrap();
         writeln!(highlights_file, "(identifier) @variable").unwrap();
 
-        // Locals query
-        let locals_path = temp_dir.path().join("locals.scm");
-        let mut locals_file = fs::File::create(&locals_path).unwrap();
-        writeln!(locals_file, "(identifier) @local.definition").unwrap();
+        // Bindings query
+        let bindings_path = temp_dir.path().join("bindings.scm");
+        let mut bindings_file = fs::File::create(&bindings_path).unwrap();
+        writeln!(bindings_file, "(identifier) @reference").unwrap();
 
         // Injections query
         let injections_path = temp_dir.path().join("injections.scm");
@@ -1729,8 +1737,8 @@ mod tests {
                 kind: None, // Will be inferred as Highlights
             },
             QueryItem {
-                path: locals_path.to_str().unwrap().to_string(),
-                kind: Some(QueryKind::Locals), // Explicit kind
+                path: bindings_path.to_str().unwrap().to_string(),
+                kind: Some(QueryKind::Bindings), // Explicit kind
             },
             QueryItem {
                 path: injections_path.to_str().unwrap().to_string(),
@@ -1762,11 +1770,56 @@ mod tests {
             );
         }
 
-        // Verify highlight query was loaded (locals and injections confirmed by events)
+        // Verify highlight query was loaded (bindings and injections confirmed by events)
         assert!(
             coordinator.highlight_query("rust").is_some(),
             "Highlight query should be loaded"
         );
+    }
+
+    #[test]
+    fn bindings_query_stays_absent_without_disk_sources() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let language = coordinator.language_registry.get("rust").unwrap();
+
+        // No search paths, no unified queries: nothing is bundled into the
+        // binary, so the native layer stays silent for this language.
+        let config = crate::config::settings::LanguageSettings::default();
+        let _events = coordinator.load_queries_for_language("rust", &config, &[], &language);
+        assert!(
+            coordinator.bindings_query("rust").is_none(),
+            "no bindings.scm may appear out of thin air"
+        );
+    }
+
+    #[test]
+    fn search_path_bindings_load() {
+        use std::io::Write;
+
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let language = coordinator.language_registry.get("rust").unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let lang_dir = temp_dir.path().join("queries").join("rust");
+        std::fs::create_dir_all(&lang_dir).unwrap();
+        let mut file = std::fs::File::create(lang_dir.join("bindings.scm")).unwrap();
+        writeln!(file, "(identifier) @reference").unwrap();
+
+        let config = crate::config::settings::LanguageSettings::default();
+        let _events = coordinator.load_queries_for_language(
+            "rust",
+            &config,
+            &[temp_dir.path().to_path_buf()],
+            &language,
+        );
+        let query = coordinator.bindings_query("rust").expect("loaded");
+        assert_eq!(query.pattern_count(), 1);
     }
 
     // Tests for base resolution

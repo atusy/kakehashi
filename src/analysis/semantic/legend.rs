@@ -194,7 +194,6 @@ mod tests {
             WILDCARD_KEY.to_string(),
             QueryTypeMappings {
                 highlights: wildcard_highlights,
-                locals: HashMap::new(),
                 folds: HashMap::new(),
             },
         );
@@ -210,7 +209,6 @@ mod tests {
             "rust".to_string(),
             QueryTypeMappings {
                 highlights: rust_highlights,
-                locals: HashMap::new(),
                 folds: HashMap::new(),
             },
         );
@@ -250,7 +248,6 @@ mod tests {
             "rust".to_string(),
             QueryTypeMappings {
                 highlights,
-                locals: HashMap::new(),
                 folds: HashMap::new(),
             },
         );
