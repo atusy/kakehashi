@@ -253,9 +253,11 @@ This temporal ordering — native now, refined later — is precisely what
 ### 3. Legend translation — the advertised slice, user-extensible
 
 kakehashi advertises a legend that is **fixed at `initialize` but composed
-from two sources**: the standard LSP set — `LEGEND_TYPES` / `LEGEND_MODIFIERS`
-(`src/analysis/semantic/legend.rs`), exactly the standard 23 types and 10
-modifiers — plus **user-declared extra entries** read from config at startup:
+from two sources**: the built-in set — `LEGEND_TYPES` / `LEGEND_MODIFIERS`
+(`src/analysis/semantic/legend.rs`), exactly the 23 token types and 10
+modifiers of the LSP 3.17 standard set (3.18 adds `label` as a 24th standard
+type; adopting it is a `legend.rs` change orthogonal to this merge) — plus
+**user-declared extra entries** read from config at startup:
 
 ```toml
 [semanticTokens.extraLegend]
