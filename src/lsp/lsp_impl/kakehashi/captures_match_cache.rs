@@ -59,20 +59,11 @@ fn fnv1a(hash: &mut u64, bytes: &[u8]) {
 
 /// One included range as the cache key consumes it: byte span plus the
 /// COLUMNS tree-sitter was given for its endpoints. Rows are deliberately
-/// absent — a vertical shift changes rows but cannot change the parse — but
-/// columns can: an indentation-sensitive injected grammar (Python, YAML)
-/// parses differently when the range starts at a different column, and a
-/// gap's internal newline moving changes a later range's column without
-/// touching any hashed byte (`content.rs` computes real column offsets for
-/// exactly this reason).
-///
-/// Gap BYTES between ranges stay unhashed. The parser never reads them,
-/// but query predicates slice the full host text by node span, so a node
-/// straddling a gap could observe them — the invariant relied on is that
-/// for every shipped gap source (blockquote/list prefixes), a gap byte
-/// cannot change without also changing the discovered ranges (the marker
-/// byte IS the construct; a space→tab change moves tab-stop indentation),
-/// which changes the hashed geometry or columns and misses.
+/// absent — a vertical shift changes rows but cannot change the parse or
+/// what predicates read — but columns can: an indentation-sensitive
+/// injected grammar (Python, YAML) parses differently when the range
+/// starts at a different column (`content.rs` computes real column
+/// offsets for exactly this reason).
 pub(in crate::lsp::lsp_impl) struct KeyRange {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -84,12 +75,20 @@ pub(in crate::lsp::lsp_impl) struct KeyRange {
 ///
 /// `anchor` is the layer's first included-range start — the offset cached
 /// matches are stored relative to, and the offset a hit re-adds. The hash
-/// folds the kind file name, the layer language, and each included range's
-/// anchor-relative byte geometry, endpoint columns, and text, so it is
-/// invariant under VERTICAL translation (an edit on earlier lines shifts
-/// the anchor and rows, neither of which the parse can see) but changes
-/// whenever the layer's visible bytes, its internal gap structure, or its
-/// column placement change.
+/// folds the kind file name, the layer language, each included range's
+/// anchor-relative byte geometry and endpoint columns, and the layer's
+/// ENTIRE outer span text (first range start to last range end, gaps
+/// included, one contiguous pass). It is invariant under translation (an
+/// edit outside the span shifts the anchor and rows, neither of which the
+/// parse or the queries can see) but changes whenever any byte the walk
+/// could observe changes.
+///
+/// Gap bytes between ranges must be hashed even though the PARSER never
+/// reads them: query predicates (`#match?`, `#eq?`, `#lua-match?`, …)
+/// slice the full host text by node span, and a captured node straddling
+/// a gap observes the gap bytes — kind queries come from user-configurable
+/// search paths, so no grammar-level invariant can rule that out. One
+/// contiguous pass over the span is also cheaper than per-range slicing.
 ///
 /// Ranges are clamped to `text.len()` before hashing: a host tree parsed
 /// without explicit included ranges reports one `0..u32::MAX`-ish range.
@@ -107,12 +106,15 @@ pub(in crate::lsp::lsp_impl) fn layer_cache_key(
     fnv1a(&mut hash, &[0xFF]);
     fnv1a(&mut hash, language.as_bytes());
     let mut anchor = None;
+    let (mut span_start, mut span_end) = (usize::MAX, 0usize);
     for range in ranges {
         let start = range.start_byte.min(text.len());
         let end = range.end_byte.min(text.len());
         let anchor = *anchor.get_or_insert(start);
+        span_start = span_start.min(start.min(end));
+        span_end = span_end.max(end);
         // Separator + relative geometry: two range lists with the same
-        // concatenated content but different gaps must not collide.
+        // span content but different range boundaries must not collide.
         fnv1a(&mut hash, &[0xFE]);
         fnv1a(
             &mut hash,
@@ -121,9 +123,12 @@ pub(in crate::lsp::lsp_impl) fn layer_cache_key(
         fnv1a(&mut hash, &(end.wrapping_sub(anchor) as u64).to_le_bytes());
         fnv1a(&mut hash, &(range.start_col as u64).to_le_bytes());
         fnv1a(&mut hash, &(range.end_col as u64).to_le_bytes());
-        // `start.min(end)` tolerates a (never observed) inverted range the
-        // same way the clamping above tolerates the host sentinel span.
-        fnv1a(&mut hash, &text.as_bytes()[start.min(end)..end]);
+    }
+    // The whole outer span in ONE contiguous pass — gaps included, see the
+    // predicate note above. (`span_start` guards the degenerate empty-range
+    // iterator, where it stays at usize::MAX.)
+    if span_start < span_end {
+        fnv1a(&mut hash, &text.as_bytes()[span_start..span_end]);
     }
     (anchor.unwrap_or(0), hash)
 }
@@ -438,6 +443,18 @@ mod tests {
             text,
         );
         assert_ne!(base.1, gap_newline_moved.1, "later-range column separates");
+    }
+
+    /// Gap bytes are predicate-observable (a captured node straddling a gap
+    /// is sliced from the FULL host text), so a gap-only mutation that
+    /// leaves every included range's text, geometry, and columns identical
+    /// must still miss (codex review).
+    #[test]
+    fn key_separates_gap_bytes() {
+        let ranges = || [kr(2, 5), kr(7, 9)];
+        let (_, base) = layer_cache_key("h", "lua", ranges(), "..abc..de.");
+        let (_, gap_mutated) = layer_cache_key("h", "lua", ranges(), "..abcX.de.");
+        assert_ne!(base, gap_mutated, "gap-only mutation must separate");
     }
 
     #[test]
