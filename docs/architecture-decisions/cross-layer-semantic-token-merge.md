@@ -262,9 +262,13 @@ today nothing retains per-version edits — both bridge sync paths send full
 text (virt `did_change.rs`, host `host.rs`), and the incremental `InputEdit`s
 from the client are applied to the tree seed and discarded
 (`src/document/model.rs`) — so the implementation must retain the client's
-incremental `contentChanges` keyed by host version, bounded to the window
-between the oldest in-flight bridged request and now. This cost is carried
-under Consequences, not hidden. A token overlapping an edited range cannot be
+incremental `contentChanges` keyed by host version. The trail stays bounded
+because accepted contributions are re-shifted **eagerly on each edit**
+(adopting the new version per the identity below), so cached sets never need
+history — retention must span back only to the oldest base version among
+**in-flight** bridged requests, and truncates to the current version once the
+last such request lands or is cancelled. This cost is carried under
+Consequences, not hidden. A token overlapping an edited range cannot be
 shifted soundly and is dropped, falling through to the next layer for that
 region only. The shifted set participates in the sweep until a fresh set
 arrives and fires another refresh. When the trail cannot cover the gap — the
