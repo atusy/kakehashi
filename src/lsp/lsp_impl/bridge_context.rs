@@ -33,14 +33,14 @@ use super::{Kakehashi, uri_to_url};
 ///   `DefaultBehavior` (rename stays enabled) when the server advertises
 ///   `textDocument/rename` but not `prepareRename`.
 /// - `textDocument/formatting` / `textDocument/rangeFormatting` → the
-///   Concatenated pipeline ([`pipeline_step_request_kind`]) uses a server that
-///   supports EITHER full OR range formatting, sending whichever it advertises;
-///   filtering by one alone would drop a server capable of the other.
+///   Concatenated pipeline (`pipeline_step_request_kind` in the
+///   [`formatting`](crate::lsp::lsp_impl::text_document::formatting) module) uses
+///   a server that supports EITHER full OR range formatting, sending whichever
+///   it advertises; filtering by one alone would drop a server capable of the
+///   other.
 ///
 /// For exempt methods the per-handler capability gate still runs and handles
 /// the fallback correctly.
-///
-/// [`pipeline_step_request_kind`]: crate::lsp::lsp_impl::text_document::formatting
 fn capability_prefilter_applies(method: &str) -> bool {
     !matches!(
         method,
@@ -653,7 +653,7 @@ impl Kakehashi {
         langs.sort_unstable();
         langs.dedup();
         let configs_by_lang: Vec<_> = langs
-            .iter()
+            .into_iter()
             .map(|lang| self.bridge_configs_for_injection_language(host_language, lang))
             .collect();
         let candidates: std::collections::HashSet<&str> = configs_by_lang
