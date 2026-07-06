@@ -578,16 +578,21 @@ impl LanguageServerPool {
     /// request never spins up a task + connection lookup only to hit the
     /// per-handler capability gate and return an empty result.
     ///
-    /// Deliberately conservative — a candidate is returned ONLY when its
-    /// capability is *definitively* known-absent:
+    /// Deliberately conservative — a candidate is returned ONLY when it has at
+    /// least one `Ready` connection AND none of its connections advertises
+    /// `method`. Concretely:
     /// - **No live connection** → NOT returned. The capability is unknown until
     ///   the server is spawned + handshaked, so the caller must keep it and let
     ///   the request spawn it, exactly as before this filter existed.
-    /// - **A still-`Initializing` connection** → NOT returned. Its
-    ///   `server_capabilities` are not in yet (`has_capability` is a premature
-    ///   `false`); today's `get_or_create_connection_wait_ready` waits for it to
-    ///   become `Ready` before checking, so dropping it here would change
-    ///   behavior (skip a server that will answer).
+    /// - **Only non-`Ready` connections** (`Initializing`, `Failed`, `Closing`,
+    ///   `Closed`) → NOT returned. Their `server_capabilities` may not be in yet
+    ///   (`has_capability` is a premature `false`), and today's
+    ///   `get_or_create_connection_wait_ready` waits for `Ready` before checking
+    ///   (or respawns a `Failed` one), so dropping here would change behavior
+    ///   (skip a server that will answer). A server with BOTH a `Ready`-lacking
+    ///   connection and a separate still-`Initializing` one IS returned — the
+    ///   `Ready` one already answers the capability; the same-binary static caps
+    ///   make the `Initializing` one redundant (see the across-roots note below).
     ///
     /// Classification is **by server name across roots**, reusing
     /// `pull_driven_servers`' caveat verbatim: capability is a binary-level
@@ -5308,6 +5313,44 @@ mod tests {
         assert!(
             incapable.is_empty(),
             "a capable instance makes the whole server capable across roots"
+        );
+    }
+
+    /// A candidate whose only live connection is `Failed` or `Closing` — not
+    /// past a successful init — is NOT returned: its capability is not
+    /// known-absent (a `Failed` connection is evicted and respawned on the next
+    /// request, which may then advertise the method). Pins the strict
+    /// `state() == Ready` gate against a future widening (e.g. `!= Closed`) that
+    /// would silently over-drop such a server (capability-prefilter-fanout).
+    #[tokio::test]
+    async fn servers_known_incapable_keeps_failed_and_closing_only() {
+        use std::collections::HashSet;
+        use tower_lsp_server::ls_types::ServerCapabilities;
+
+        let pool = LanguageServerPool::new();
+
+        let failed =
+            create_handle_with_key(ConnectionState::Failed, ConnectionKey::for_server("failed"))
+                .await;
+        failed.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(failed).await;
+
+        let closing = create_handle_with_key(
+            ConnectionState::Closing,
+            ConnectionKey::for_server("closing"),
+        )
+        .await;
+        closing.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(closing).await;
+
+        let candidates = HashSet::from(["failed", "closing"]);
+        let incapable = pool
+            .servers_known_incapable(&candidates, "textDocument/hover")
+            .await;
+
+        assert!(
+            incapable.is_empty(),
+            "only a Ready connection is known-incapable; Failed/Closing are kept"
         );
     }
 
