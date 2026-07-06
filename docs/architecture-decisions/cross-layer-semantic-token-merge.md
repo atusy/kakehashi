@@ -655,8 +655,9 @@ per-method internal default (formatting's precedent) gives users the real knob
 
 ### F. Layer rank as the least-significant sweep key
 
-Keep native's `(depth, node_depth, pattern_index)` dominant and use layer rank
-only to break remaining ties.
+Keep native's `(priority, depth, inverse node_byte_len, pattern_index)` key
+(`token_priority` in `src/analysis/semantic/finalize.rs`) dominant and use
+layer rank only to break remaining ties.
 
 **Rejected because**: it inverts the intent. A native tree-sitter token on a
 deeply-nested node would outrank a richer bridged token covering the same
