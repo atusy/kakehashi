@@ -940,10 +940,8 @@ pub(crate) fn build_document_discovery(
     // Pair by the ORIGINAL region index, not zip: dropped combined regions
     // would otherwise shift every later single onto the wrong prebuilt
     // identity (wrong ULID + content hash).
-    for (injection, prebuilt) in singles
-        .iter()
-        .map(|(idx, injection)| (injection, &prebuilt_cacheable[*idx]))
-    {
+    for (idx, injection) in singles {
+        let prebuilt = &prebuilt_cacheable[idx];
         // Producer: don't gate on the highlight query — store the region and let
         // reuse re-resolve the query (a load without a generation bump self-heals).
         // Producer path: called from populate_injections right after this

@@ -828,7 +828,7 @@ impl Kakehashi {
                 let winner_live = self
                     .captures_walk_inflight
                     .get(&key)
-                    .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &notify));
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(&*current, &notify));
                 if winner_live {
                     match cancel_rx.as_mut() {
                         Some(rx) => {
