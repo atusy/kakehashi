@@ -474,13 +474,13 @@ impl Kakehashi {
                     return;
                 }
             };
-            // POSIX signal numbers, avoiding a libc dependency for two
-            // constants that are identical on every Unix Rust supports.
-            const SIGHUP_NUM: i32 = 1;
-            const SIGTERM_NUM: i32 = 15;
+            // Platform signal numbers straight from the SignalKind
+            // constructors (tokio exposes the libc constants via
+            // `as_raw_value`), so the 128+signum exit status is correct even
+            // on a Unix that renumbers them — no hard-coded 1/15.
             let signum = tokio::select! {
-                _ = term.recv() => SIGTERM_NUM,
-                _ = hup.recv() => SIGHUP_NUM,
+                _ = term.recv() => SignalKind::terminate().as_raw_value(),
+                _ = hup.recv() => SignalKind::hangup().as_raw_value(),
             };
             log::info!("received signal {signum}: reaping downstream servers before exit");
             // Crash-detection parity with `shutdown_impl`: a kill mid-parse is
