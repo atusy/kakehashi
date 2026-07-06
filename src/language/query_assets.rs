@@ -1526,6 +1526,17 @@ mod tests {
         }
 
         #[test]
+        fn self_recursion_stays_unresolved_accepted_limitation() {
+            // The name is visible only after the assignment (correct for a
+            // value self-reference); the recursive call inside the body is
+            // therefore unresolved — an accepted limitation (see the asset
+            // header) rather than a rename-splitting second binding.
+            let text = "fact <- function(n) if (n <= 1) 1 else n * fact(n - 1)\n";
+            let m = model_for("r", text);
+            assert_eq!(m.definition_range_at(nth(text, "fact", 1)), None);
+        }
+
+        #[test]
         fn member_access_and_argument_names_stay_silent() {
             let text = "size <- 1\nobj$size\nf(size = 2)\nf(size)\n";
             let m = model_for("r", text);

@@ -17,6 +17,15 @@
  (#set! definition.visibility "after"))
 ((binary_operator lhs: (identifier) @definition operator: "=") @_a
  (#set! definition.visibility "after"))
+; ACCEPTED LIMITATION: self-recursion (`fact <- function(n) … fact(n-1)`)
+; leaves the recursive call unresolved. The name is visible only after the
+; assignment (correct for a value self-reference like `x <- x + 1`, which
+; reads the outer x). A recursive call needs the name visible inside its
+; own body; a second `declaration`-visibility rule for function RHSs would
+; register a *separate* binding (merge can't find the not-yet-visible
+; `after` binding at the definition position), splitting rename/highlight —
+; worse than the silence. A one-binding fix needs engine-level dedup of
+; same-name definitions across visibilities.
 ((binary_operator rhs: (identifier) @definition operator: "->") @_a
  (#set! definition.visibility "after"))
 ((binary_operator lhs: (identifier) @definition operator: "<<-") @_a
