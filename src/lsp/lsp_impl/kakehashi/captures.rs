@@ -2007,15 +2007,15 @@ mod tests {
 
     impl MatchCacheRig {
         fn new(uri: &str, text: &str) -> Self {
+            Self::new_with_query(uri, text, "(identifier) @local.reference\n")
+        }
+
+        fn new_with_query(uri: &str, text: &str, locals_scm: &str) -> Self {
             use crate::config::WorkspaceSettings;
             let dir = tempfile::tempdir().unwrap();
             let query_dir = dir.path().join("queries/rust");
             std::fs::create_dir_all(&query_dir).unwrap();
-            std::fs::write(
-                query_dir.join("locals.scm"),
-                "(identifier) @local.reference\n",
-            )
-            .unwrap();
+            std::fs::write(query_dir.join("locals.scm"), locals_scm).unwrap();
             let coordinator = std::sync::Arc::new(crate::language::LanguageCoordinator::new());
             coordinator.load_settings(&WorkspaceSettings {
                 search_paths: vec![dir.path().to_string_lossy().into_owned()],
@@ -2044,7 +2044,7 @@ mod tests {
             parsed_version: u64,
             lsp_range: Option<Range>,
         ) -> Option<(Vec<Value>, Vec<Value>)> {
-            self.walk_with(text, layers, parsed_version, lsp_range, true, None)
+            self.walk_with(text, layers, parsed_version, lsp_range, true, None, 0)
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -2056,6 +2056,11 @@ mod tests {
             lsp_range: Option<Range>,
             injection: bool,
             cancel: Option<&crate::cancel::CancelToken>,
+            // The kind-query compile cache is PROCESS-WIDE, keyed
+            // (language, kind file, generation) — a rig with a custom
+            // locals.scm must walk under a generation no other test uses,
+            // or it silently serves another rig's compiled query.
+            generation: u64,
         ) -> Option<(Vec<Value>, Vec<Value>)> {
             let mut parser = tree_sitter::Parser::new();
             parser
@@ -2082,7 +2087,7 @@ mod tests {
                 &self.store,
                 parsed_version,
                 incarnation,
-                0,
+                generation,
                 &self.match_cache,
                 cancel,
             )
@@ -2161,6 +2166,101 @@ mod tests {
              \"node\":{{\"id\":\"{id}\",\"kind\":\"identifier\"}},\
              \"range\":{{\"start\":{{\"line\":0,\"character\":3}},\
              \"end\":{{\"line\":0,\"character\":4}}}}}}]}}"
+        );
+        assert_eq!(serde_json::to_string(m).unwrap(), expected);
+    }
+
+    /// The dropped-capture half of the alignment invariant: a capture whose
+    /// span fails position mapping is dropped from the response, and the
+    /// SURVIVING captures must keep their own ids — consuming the batch
+    /// index after the drop (instead of before) would hand the survivor the
+    /// dropped capture's id. Unmappable spans cannot come from a real tree,
+    /// so one is planted as a cached-matches sentinel (the walk trusts the
+    /// content-addressed cache).
+    #[test]
+    fn dropped_capture_does_not_shift_surviving_capture_ids() {
+        let text = "fn x() {}\n";
+        let rig = MatchCacheRig::new("file:///drop_align.rs", text);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let (anchor, hash) =
+            super::super::captures_match_cache::tree_cache_key("locals", "rust", &tree, text);
+        assert_eq!(anchor, 0, "host layer anchors at 0");
+        rig.match_cache.store_host(
+            &rig.uri,
+            "locals",
+            hash,
+            0,
+            std::sync::Arc::new(vec![crate::language::query_exec::MatchData {
+                pattern_index: 0,
+                captures: vec![
+                    // Unmappable span (beyond EOF): dropped by the position
+                    // filter AFTER its id was consumed from the batch.
+                    crate::language::query_exec::CapturedNode {
+                        name: "dropped".to_string(),
+                        start_byte: text.len() + 10,
+                        end_byte: text.len() + 12,
+                        kind: "identifier",
+                        metadata: Vec::new(),
+                    },
+                    crate::language::query_exec::CapturedNode {
+                        name: "survivor".to_string(),
+                        start_byte: 3,
+                        end_byte: 4,
+                        kind: "identifier",
+                        metadata: Vec::new(),
+                    },
+                ],
+                metadata: Vec::new(),
+            }]),
+            || true,
+        );
+
+        let (matches, _) = rig
+            .walk(text, &[], 0, None)
+            .expect("kind query should load");
+        let envelope = &matches[0];
+        let captures = envelope["captures"].as_array().unwrap();
+        assert_eq!(captures.len(), 1, "the unmappable capture is dropped");
+        assert_eq!(captures[0]["name"], "survivor");
+        let id: ulid::Ulid = captures[0]["node"]["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            rig.tracker.lookup_node(&rig.uri, &id),
+            Some((3, 4, "identifier", 0)),
+            "the survivor must keep ITS OWN id, not inherit the dropped capture's"
+        );
+    }
+
+    /// Wire position of the optional `metadata` field, pinned byte-for-byte
+    /// at both levels: last key of the capture object and last key of the
+    /// match envelope (the `#set!` directives' documented shape).
+    #[test]
+    fn metadata_wire_position_is_stable() {
+        let text = "fn x() {}\n";
+        let rig = MatchCacheRig::new_with_query(
+            "file:///wire_shape_meta.rs",
+            text,
+            "((identifier) @local.reference\n  (#set! @local.reference ck \"cv\")\n  (#set! mk \"mv\"))\n",
+        );
+        // Unique generation: the process-wide kind-query compile cache would
+        // otherwise serve another rig's plain locals.scm (see walk_with).
+        let (matches, _) = rig
+            .walk_with(text, &[], 0, None, true, None, 7777)
+            .expect("kind query should load");
+        assert_eq!(matches.len(), 1, "one identifier expected");
+        let m = &matches[0];
+        let id = m["captures"][0]["node"]["id"].as_str().unwrap().to_owned();
+        let expected = format!(
+            "{{\"patternIndex\":0,\"language\":\"rust\",\"captures\":[\
+             {{\"name\":\"local.reference\",\
+             \"node\":{{\"id\":\"{id}\",\"kind\":\"identifier\"}},\
+             \"range\":{{\"start\":{{\"line\":0,\"character\":3}},\
+             \"end\":{{\"line\":0,\"character\":4}}}},\
+             \"metadata\":{{\"ck\":\"cv\"}}}}],\
+             \"metadata\":{{\"mk\":\"mv\"}}}}"
         );
         assert_eq!(serde_json::to_string(m).unwrap(), expected);
     }
@@ -2478,6 +2578,7 @@ mod tests {
             None,
             true,
             Some(&cancel),
+            0,
         );
         assert!(cancelled.is_none(), "a cancelled walk serves nothing");
         assert!(
@@ -2493,7 +2594,7 @@ mod tests {
     fn host_slot_serves_on_content_recurrence() {
         let text = "let a = 1;\n";
         let rig = MatchCacheRig::new("file:///match_cache_host.rs", text);
-        rig.walk_with(text, &[], 0, None, false, None)
+        rig.walk_with(text, &[], 0, None, false, None, 0)
             .expect("kind query should load");
 
         // Host key for the same content: parse without included ranges.
@@ -2532,7 +2633,7 @@ mod tests {
 
         // Same content again (undo/redo shape): must serve the host slot.
         let (matches, _) = rig
-            .walk_with(text, &[], 0, None, false, None)
+            .walk_with(text, &[], 0, None, false, None, 0)
             .expect("kind query should load");
         assert!(
             capture_names(&matches)
