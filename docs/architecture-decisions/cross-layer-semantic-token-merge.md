@@ -248,7 +248,15 @@ therefore **coalesced**: responses landing within a short quiescence window
 single refresh; a layer that responds after the window fires its own. The
 window length is an implementation concern; the policy — batch within a
 window, never block a refresh on the slowest layer — is decided here, because
-it fixes how many intermediate paints the user sees.
+it fixes how many intermediate paints the user sees. One more property shapes
+the policy: `workspace/semanticTokens/refresh` is **parameterless and
+workspace-global** — the client re-requests tokens for *every* visible
+document, not just the one whose layer responded. Coalescing is therefore
+workspace-wide single-flight (concurrent per-document triggers collapse into
+one refresh), and one document's bridged refinement does cost re-requests for
+unrelated visible documents; those are answered from their current merged
+state, so they are cheap, but the fan-out is why the window must not be
+per-document.
 
 **Delta baseline contract.** Every array kakehashi returns — the first
 response (step 1's synchronously-available set) *and* every subsequent merged
@@ -349,11 +357,14 @@ stable. (The camelCase key names deliberately mirror LSP's
 per-language because the legend is advertised once per server.) Because config is read before kakehashi answers `initialize`, this
 extension is protocol-legal: the legend is still declared exactly once and
 never changes afterward — what Alternative D rejects is widening it
-*dynamically* per bridged server. Two bounds follow: `tokenModifiers` are
+*dynamically* per bridged server. Three bounds follow: `tokenModifiers` are
 encoded as bit flags in an LSP `uinteger` (0..2^31−1), so the standard 10 plus
 extra modifiers must fit 31 bits — config validation **rejects** an
 `extraLegend` that would push the total past 31, rather than silently
-truncating; and the client's theme must actually
+truncating; the spec asks that a `tokenType` index stay below 65536, so
+validation likewise rejects a combined `tokenTypes` list that would exceed
+it (a bound stated for completeness — no plausible config approaches it); and
+the client's theme must actually
 style the extra types — kakehashi passes them through, it cannot make an
 editor color a type it has no rule for (Neovim exposes them as
 `@lsp.type.<name>` groups; VS Code needs a theme rule or
@@ -366,9 +377,11 @@ name a type the client has no notion of.
 
 **Downstream capability advertisement.** Today the bridge handshake
 advertises **no** `textDocument.semanticTokens` client capability at all
-(`src/lsp/bridge/protocol/client_capabilities.rs`), so a compliant downstream
-server would not expose `semanticTokensProvider` and the merge would have
-nothing to fetch. Token bridging must extend the baseline: advertise
+(`src/lsp/bridge/protocol/client_capabilities.rs`): kakehashi has not
+announced token support as a client, so it must not issue semantic-token
+requests yet — and servers commonly gate `semanticTokensProvider` on the
+announced client capability, leaving the merge nothing to fetch. Token
+bridging must extend the baseline: advertise
 `requests` `{full, full.delta, range}`, `formats = ["relative"]`, and
 `tokenTypes`/`tokenModifiers` mirroring kakehashi's own advertised legend —
 while continuing to advertise neither `overlappingTokenSupport` (level 1's
@@ -484,8 +497,8 @@ visible to stage 1 or a type split"; its Neutral bullet now defers here:
   is also native-first: a range request returns the requested slice of the
   current document-versioned merged state (native-only at first), starts the
   same bridged fetches, and surfaces bridged refinement through the same
-  document-level `workspace/semanticTokens/refresh` — there is no range-local
-  refresh and no `range/delta` (the LSP protocol defines no delta for range),
+  workspace-global `workspace/semanticTokens/refresh` — there is no
+  range-local refresh and no `range/delta` (the LSP protocol defines no delta for range),
   so range responses are always full slices, never deltas.
 
 ### Out of Scope
