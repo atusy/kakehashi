@@ -233,11 +233,14 @@ impl CacheCoordinator {
                 // No injection query = no injections to track. Clear any
                 // stale injection caches — but only when no edit landed
                 // during this pass (a stale pass must not clobber state the
-                // newer text's own populate maintains).
-                let _ = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                // newer text's own populate maintains). A refused clear
+                // aborts the pass (`None`): reporting ran-and-empty while
+                // the old entries survive would leave them unreclaimed
+                // until another parse.
+                tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
-                });
+                })?;
                 return Some(PopulatedInjections::empty(generation));
             }
         };
@@ -248,11 +251,13 @@ impl CacheCoordinator {
         {
             if regions.is_empty() {
                 // Clear any existing regions and caches for this document —
-                // epoch-gated like the commit below.
-                let _ = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                // epoch-gated like the commit below, and aborting (`None`)
+                // on refusal like it too: ran-and-empty must only be
+                // reported after the clear actually landed.
+                tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
-                });
+                })?;
                 return Some(PopulatedInjections::empty(generation));
             }
 
