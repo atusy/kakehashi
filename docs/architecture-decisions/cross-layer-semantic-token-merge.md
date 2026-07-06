@@ -243,7 +243,11 @@ response. This keeps the first-response → merged transition expressible as an
 ordinary delta, with no special baseline bookkeeping.
 
 **Version contract (owned by the merge).** Each layer's contribution carries
-the host document version it was computed against. A bridged set whose version
+the host document version it was computed against. Acceptance is **monotonic
+per layer**: in-flight requests can complete out of order, and a response
+computed against an older host version than the layer's currently accepted
+contribution is discarded — a late straggler never replaces newer tokens with
+older, edit-shifted ones. A bridged set whose version
 equals the current host snapshot participates as-is. A **stale** set (version
 older than the snapshot) is **not excluded wholesale** — hard exclusion would
 downgrade every bridged region to native colors on each keystroke (the client
