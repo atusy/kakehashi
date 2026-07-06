@@ -1174,6 +1174,11 @@ fn execute_captures_walk(
             });
             let arc = std::sync::Arc::new(fresh);
             if let Some((anchor, hash)) = rebased_key {
+                // The doc-open probe only runs when the store must CREATE the
+                // per-document slot (first store after open, or a walk racing
+                // its own didClose) — see the resurrection-leak note on
+                // `store_host`.
+                let doc_open = || documents.latest_snapshot(uri).is_some();
                 if depth == 0 {
                     match_cache.store_host(
                         uri,
@@ -1181,6 +1186,7 @@ fn execute_captures_walk(
                         hash,
                         generation,
                         std::sync::Arc::clone(&arc),
+                        doc_open,
                     );
                 } else {
                     match_cache.store_layer(
@@ -1189,6 +1195,7 @@ fn execute_captures_walk(
                         kind,
                         generation,
                         std::sync::Arc::clone(&arc),
+                        doc_open,
                     );
                     touched_layer_hashes.insert(hash);
                 }
@@ -2076,6 +2083,7 @@ mod tests {
                 }],
                 metadata: Vec::new(),
             }]),
+            || true,
         );
 
         let (matches, _) = rig

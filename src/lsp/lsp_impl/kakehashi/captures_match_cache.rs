@@ -184,6 +184,7 @@ impl CapturesMatchCache {
         validity_hash: u64,
         generation: u64,
         matches: Arc<Vec<MatchData>>,
+        doc_open: impl FnOnce() -> bool,
     ) {
         let entry = CachedHostMatches {
             validity_hash,
@@ -194,6 +195,18 @@ impl CapturesMatchCache {
         // and skips the owned-key clone the entry API requires.
         if let Some(mut doc) = self.cache.get_mut(uri) {
             doc.host.insert(kind.to_string(), entry);
+            return;
+        }
+        // Creating the doc slot needs a liveness check: an airborne walk
+        // whose document was closed mid-flight must not resurrect the entry
+        // `clear_document` just dropped — nothing would ever reclaim it (the
+        // pre-existing walk memo shares this race; its entries are small,
+        // these hold full match sets). `doc_open` is consulted only on this
+        // create path, so the steady state pays nothing. A close landing
+        // between the check and the insert still resurrects — the same
+        // accepted micro-window as every deferred-epoch-class lifecycle
+        // race; it heals on reopen-close and costs memory, never staleness.
+        if !doc_open() {
             return;
         }
         self.cache
@@ -221,6 +234,7 @@ impl CapturesMatchCache {
         kind: &str,
         generation: u64,
         matches: Arc<Vec<MatchData>>,
+        doc_open: impl FnOnce() -> bool,
     ) {
         let entry = CachedLayerMatches {
             kind: kind.to_string(),
@@ -229,6 +243,11 @@ impl CapturesMatchCache {
         };
         if let Some(mut doc) = self.cache.get_mut(uri) {
             doc.layers.insert(validity_hash, entry);
+            return;
+        }
+        // See `store_host`: create-path liveness check against the
+        // close-during-walk resurrection leak.
+        if !doc_open() {
             return;
         }
         self.cache
@@ -354,7 +373,7 @@ mod tests {
         let cache = CapturesMatchCache::new();
         let uri = uri();
         let matches = Arc::new(vec![match_data(&[(0, 3)])]);
-        cache.store_host(&uri, "highlights", 111, 7, Arc::clone(&matches));
+        cache.store_host(&uri, "highlights", 111, 7, Arc::clone(&matches), || true);
 
         assert!(cache.get_host(&uri, "highlights", 111, 7).is_some());
         assert!(
@@ -371,7 +390,7 @@ mod tests {
         );
 
         // Self-replacement: the new content evicts the old, per kind.
-        cache.store_host(&uri, "highlights", 333, 7, matches);
+        cache.store_host(&uri, "highlights", 333, 7, matches, || true);
         assert!(cache.get_host(&uri, "highlights", 111, 7).is_none());
         assert!(cache.get_host(&uri, "highlights", 333, 7).is_some());
     }
@@ -381,9 +400,9 @@ mod tests {
         let cache = CapturesMatchCache::new();
         let uri = uri();
         let matches = Arc::new(vec![match_data(&[(0, 3)])]);
-        cache.store_layer(&uri, 1, "highlights", 7, Arc::clone(&matches));
-        cache.store_layer(&uri, 2, "highlights", 7, Arc::clone(&matches));
-        cache.store_layer(&uri, 3, "locals", 7, Arc::clone(&matches));
+        cache.store_layer(&uri, 1, "highlights", 7, Arc::clone(&matches), || true);
+        cache.store_layer(&uri, 2, "highlights", 7, Arc::clone(&matches), || true);
+        cache.store_layer(&uri, 3, "locals", 7, Arc::clone(&matches), || true);
 
         // A completed highlights walk touched only hash 1 (the fence at
         // hash 2 was deleted): 2 goes, 1 stays, the other kind's 3 stays.
@@ -398,13 +417,39 @@ mod tests {
         );
     }
 
+    /// The close-during-walk resurrection guard: a store that would CREATE
+    /// the per-document slot consults `doc_open` and drops the store for a
+    /// closed document; a store into an EXISTING slot never probes (the
+    /// steady-state path stays closure-free).
+    #[test]
+    fn store_into_missing_doc_slot_requires_liveness() {
+        let cache = CapturesMatchCache::new();
+        let uri = uri();
+        let matches = Arc::new(vec![match_data(&[(0, 3)])]);
+
+        // Closed document (doc_open = false): neither store may resurrect.
+        cache.store_host(&uri, "highlights", 1, 7, Arc::clone(&matches), || false);
+        cache.store_layer(&uri, 2, "highlights", 7, Arc::clone(&matches), || false);
+        assert!(cache.get_host(&uri, "highlights", 1, 7).is_none());
+        assert!(cache.get_layer(&uri, 2, 7).is_none());
+
+        // Open document: the create path proceeds...
+        cache.store_host(&uri, "highlights", 1, 7, Arc::clone(&matches), || true);
+        assert!(cache.get_host(&uri, "highlights", 1, 7).is_some());
+        // ...and once the slot exists, stores skip the probe entirely.
+        cache.store_layer(&uri, 2, "highlights", 7, matches, || {
+            panic!("existing doc slot must not probe liveness")
+        });
+        assert!(cache.get_layer(&uri, 2, 7).is_some());
+    }
+
     #[test]
     fn clear_document_drops_everything_for_the_uri() {
         let cache = CapturesMatchCache::new();
         let uri = uri();
         let matches = Arc::new(vec![match_data(&[(0, 3)])]);
-        cache.store_host(&uri, "highlights", 1, 7, Arc::clone(&matches));
-        cache.store_layer(&uri, 2, "highlights", 7, matches);
+        cache.store_host(&uri, "highlights", 1, 7, Arc::clone(&matches), || true);
+        cache.store_layer(&uri, 2, "highlights", 7, matches, || true);
 
         cache.clear_document(&uri);
         assert!(cache.get_host(&uri, "highlights", 1, 7).is_none());
