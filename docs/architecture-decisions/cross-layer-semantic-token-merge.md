@@ -284,8 +284,15 @@ which mis-places tokens as soon as one batch contains two edits. Each edit
 moves same-line positions after it by a character delta, later lines by a
 line delta, and combines both for a token on the boundary line of a line
 merge or split; a token whose range intersects any edited range is the drop
-bucket above. This ordered fold is the "second exactness obligation" the
-Consequences carry. A shifted set is thereafter **treated as computed against
+bucket above. "Intersects" is defined with explicit boundary affinity,
+because an insertion has an **empty** replaced range that overlaps nothing
+under a naive interval test: an insertion strictly *inside* a token changes
+the token's contents and **drops** it; an insertion at the token's start
+shifts the whole token right; an insertion at its end leaves the token in
+place (the new text falls after it). A non-empty replacement drops any token
+whose *interior* it touches and shifts tokens entirely beyond it, under the
+same affinity at the shared endpoints. This ordered fold is the "second
+exactness obligation" the Consequences carry. A shifted set is thereafter **treated as computed against
 the version it was shifted to**: it satisfies the participation check for
 that snapshot, and a later edit re-shifts it from there over the new deltas
 only (a shift of the shifted set), never by re-replaying from the original
