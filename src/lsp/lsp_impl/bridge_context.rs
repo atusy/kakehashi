@@ -1910,14 +1910,25 @@ mod tests {
         );
     }
 
-    /// The capability prefilter applies to ordinary position/range methods but
-    /// is exempt for `textDocument/prepareRename`, whose capability-absent
-    /// handler branch is NOT empty (it falls back to `DefaultBehavior` when the
-    /// server advertises `textDocument/rename`). Dropping a rename-only server
-    /// here would silently disable rename in injected regions.
+    /// The capability prefilter is exempt for the methods whose capability-absent
+    /// handler branch is NOT empty because it falls back to a different
+    /// capability: `prepareRename` (→ `rename`'s `DefaultBehavior`) and
+    /// `formatting`/`rangeFormatting` (→ the other formatting kind via the
+    /// Concatenated pipeline). Dropping a server by the requested capability
+    /// alone would discard one that would have answered via the fallback. All
+    /// other routed methods are prefiltered.
     #[test]
-    fn capability_prefilter_exempts_prepare_rename_only() {
-        assert!(!capability_prefilter_applies("textDocument/prepareRename"));
+    fn capability_prefilter_exempts_fallback_methods() {
+        for exempt in [
+            "textDocument/prepareRename",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
+        ] {
+            assert!(
+                !capability_prefilter_applies(exempt),
+                "{exempt} must be exempt"
+            );
+        }
         for method in [
             "textDocument/hover",
             "textDocument/definition",
@@ -1925,6 +1936,9 @@ mod tests {
             "textDocument/references",
             "textDocument/rename",
             "textDocument/documentColor",
+            "textDocument/documentSymbol",
+            "textDocument/foldingRange",
+            "textDocument/diagnostic",
         ] {
             assert!(
                 capability_prefilter_applies(method),
