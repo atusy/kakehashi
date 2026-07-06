@@ -3,6 +3,7 @@
 **Related Decisions**:
 - [node-reference-protocol](node-reference-protocol.md) — Node identity, `NodeInfo`, and the `kakehashi/node/*` accessor family the capture results compose with
 - [lazy-node-identity-tracking](lazy-node-identity-tracking.md) — ULID identity tracking reused to make captured nodes addressable across edits
+- [packed-captures-protocol](packed-captures-protocol.md) — a separate machine-readable method family emitting a packed (columnar + legend) encoding of the same compute, for dense kinds (e.g. `highlights`) where this verbose shape reaches ~600 KB
 
 ## Context and Problem Statement
 
