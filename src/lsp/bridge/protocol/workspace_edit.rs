@@ -65,30 +65,37 @@ fn transform_changes_map(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) {
-    // Collect keys to process (can't modify HashMap keys in-place)
-    let keys: Vec<Uri> = changes.keys().cloned().collect();
-
-    for key in keys {
+    // Filter and translate in one allocation-free pass, extracting the
+    // request's own edits for re-keying afterwards (keys can't change in place).
+    let mut rekeyed_edits: Option<Vec<TextEdit>> = None;
+    changes.retain(|key, edits| {
         let uri_str = key.as_str();
 
         // Case 1: Real file URI → keep as-is
         if !VirtualDocumentUri::is_virtual_uri(uri_str) {
-            continue;
+            return true;
         }
 
         // Case 2: Same virtual URI → transform ranges, re-key to host URI
         if uri_str == request_virtual_uri {
-            if let Some(mut edits) = changes.remove(&key) {
-                for edit in &mut edits {
-                    translate_virtual_range_to_host(&mut edit.range, offset);
-                }
-                changes.entry(host_uri.clone()).or_default().extend(edits);
+            for edit in edits.iter_mut() {
+                translate_virtual_range_to_host(&mut edit.range, offset);
             }
-            continue;
+            rekeyed_edits = Some(std::mem::take(edits));
+            return false;
         }
 
         // Case 3: Different virtual URI (cross-region) → filter out
-        changes.remove(&key);
+        false
+    });
+
+    if let Some(edits) = rekeyed_edits {
+        // get_mut before insert: clone the host key only on the miss path.
+        if let Some(existing) = changes.get_mut(host_uri) {
+            existing.extend(edits);
+        } else {
+            changes.insert(host_uri.clone(), edits);
+        }
     }
 }
 
