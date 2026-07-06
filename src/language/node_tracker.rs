@@ -721,7 +721,18 @@ impl NodeTracker {
     /// (its coordinates match the live text at mint time; later edits shift
     /// it like any live entry), which is why callers need no post-pass purge
     /// set: a refused batch (`None`) minted **nothing** — the stale pass
-    /// simply defers identity to the next current pass.
+    /// simply defers identity to the next current pass. Correct-at-birth is
+    /// **relative to the latch**: the batch only proves no shift happened
+    /// since `expected` was read, so callers must take it (via
+    /// [`mint_epoch`](Self::mint_epoch)) at or before validating that the
+    /// coordinates they are about to mint belong to the live text.
+    ///
+    /// `keys` is consumed while this method holds the entry's exclusive
+    /// lock — like `commit_if_unshifted`'s closure, it MUST NOT touch this
+    /// tracker (a re-entrant access to the same URI or shard would
+    /// self-deadlock). An entry materialized only to fail the check stays
+    /// behind as an empty index — the same bounded residue
+    /// [`commit_if_unshifted`](Self::commit_if_unshifted) documents.
     ///
     /// Returns the ids aligned with `keys`' iteration order.
     pub(crate) fn mint_batch_if_unshifted(
@@ -832,9 +843,10 @@ mod tests {
         );
     }
 
-    /// Every edit application advances the shift generation — including on a
-    /// URI with no entries yet — so a latch taken before the edit refuses a
-    /// later batch, while a latch taken AFTER it mints.
+    /// Edit application advances the shift generation — including on a URI
+    /// with no entries yet — and a latch taken AFTER the edit still mints.
+    /// (That a latch taken BEFORE the edit refuses is pinned separately by
+    /// `batch_mint_refuses_shifted_latch_and_mints_nothing`.)
     #[test]
     fn shift_generation_advances_on_every_edit_even_without_entries() {
         let tracker = NodeTracker::new();
