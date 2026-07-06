@@ -133,6 +133,47 @@ fn code_action_edit_is_host_translated_and_suffixed() {
 }
 
 #[test]
+fn whole_document_range_reaches_the_injection_region() {
+    // Save-time flows (editor.codeActionsOnSave) request with a range that
+    // starts at (0,0), OUTSIDE any injection — the bridge must still find
+    // the overlapped region instead of skipping the virt layer.
+    let (mut client, _config_dir) = init_client(json!({}));
+    open_markdown(&mut client);
+
+    let actions = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": { "uri": MARKDOWN_URI },
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 5, "character": 0 }
+                    },
+                    "context": { "diagnostics": [] }
+                }),
+            );
+            match response["result"].as_array() {
+                Some(actions) if !actions.is_empty() => Some(actions.clone()),
+                _ => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    None
+                }
+            }
+        })
+        .expect("whole-document codeAction never returned actions");
+
+    assert_eq!(actions[0]["title"], "Replace with fixed — mock-codeaction");
+    // The edit still lands on the fence content line in host coordinates.
+    assert_eq!(
+        actions[0]["edit"]["changes"][MARKDOWN_URI][0]["range"]["start"]["line"],
+        3
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn command_action_surfaces_as_disabled_with_disabled_support() {
     let (mut client, _config_dir) = init_client(json!({
         "textDocument": { "codeAction": { "disabledSupport": true } }

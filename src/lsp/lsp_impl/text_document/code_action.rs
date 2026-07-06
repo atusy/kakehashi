@@ -74,7 +74,7 @@ impl Kakehashi {
         client_supports_disabled: bool,
     ) -> Result<Option<CodeActionResponse>> {
         let Some(mut ctx) = self
-            .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
+            .resolve_bridge_contexts_for_range_overlap(lsp_uri, range, METHOD)
             .await
         else {
             return Ok(None);

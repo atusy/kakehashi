@@ -1072,6 +1072,89 @@ impl Kakehashi {
 
         Some(RangeRequestContext { document, range })
     }
+
+    /// Range-overlap variant of [`Self::resolve_bridge_contexts_for_range`]:
+    /// when `range.start` is not inside an injection — save-time flows
+    /// (`editor.codeActionsOnSave`) request with a whole-document range
+    /// starting at (0,0) — fall back to the FIRST region intersecting the
+    /// range and clamp the request range to it, so coordinate translation
+    /// stays in-region. Only the first intersecting region is bridged
+    /// (preferred semantics; multi-region merging is #568 stage 7).
+    pub(crate) async fn resolve_bridge_contexts_for_range_overlap(
+        &self,
+        lsp_uri: &Uri,
+        range: Range,
+        method_name: &str,
+    ) -> Option<RangeRequestContext> {
+        if let Some(ctx) = self
+            .resolve_bridge_contexts_for_range(lsp_uri, range, method_name)
+            .await
+        {
+            return Some(ctx);
+        }
+        self.resolve_first_region_overlapping_range(lsp_uri, range, method_name)
+    }
+
+    /// Whole-document region scan behind the overlap fallback: the tree is
+    /// already fresh (the primary resolver awaited it).
+    fn resolve_first_region_overlapping_range(
+        &self,
+        lsp_uri: &Uri,
+        range: Range,
+        method_name: &str,
+    ) -> Option<RangeRequestContext> {
+        let uri = uri_to_url(lsp_uri).ok()?;
+        let snapshot = self.documents.get(&uri)?.snapshot()?;
+        let language_name = self.document_language(&uri)?;
+        let injection_query = self.language.injection_query(&language_name)?;
+
+        let regions = crate::language::InjectionResolver::resolve_all(
+            &self.language,
+            self.bridge.node_tracker(),
+            &uri,
+            snapshot.tree(),
+            snapshot.text(),
+            injection_query.as_ref(),
+        );
+
+        // First intersecting region that resolves to bridge server configs
+        // wins: unconfigured injections (e.g. markdown_inline) must not
+        // shadow a configured region further down the document.
+        regions
+            .into_iter()
+            .filter(|resolved| {
+                // line_range end is exclusive; intersect on lines only.
+                let lines = &resolved.region.line_range;
+                lines.start <= range.end.line && range.start.line < lines.end
+            })
+            .find_map(|resolved| {
+                // Clamp to the region so the translated range is in-region.
+                let region_start = Position {
+                    line: resolved.region.line_range.start,
+                    character: resolved.region.start_column,
+                };
+                let region_end = Position {
+                    line: resolved.region.line_range.end,
+                    character: 0,
+                };
+                let clamped = Range {
+                    start: range.start.max(region_start),
+                    end: range.end.min(region_end),
+                };
+
+                let preamble = PreambleResult {
+                    uri: uri.clone(),
+                    resolved,
+                    language_name: language_name.clone(),
+                    upstream_request_id: current_upstream_id(),
+                };
+                let document = self.preamble_to_document_context(preamble, method_name)?;
+                Some(RangeRequestContext {
+                    document,
+                    range: clamped,
+                })
+            })
+    }
 }
 
 #[cfg(test)]
