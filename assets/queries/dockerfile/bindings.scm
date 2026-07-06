@@ -13,7 +13,9 @@
 ((from_instruction as: (image_alias) @definition.stage) @_from
  (#set! definition.namespace "stage")
  (#set! definition.visibility "after"))
-((from_instruction (image_spec name: (image_name) @reference))
+; Only a bare `FROM name` can name a stage; `FROM name:tag` / `name@digest`
+; is always a registry image, so exclude tagged/digested specs.
+((from_instruction (image_spec name: (image_name) @reference !tag !digest))
  (#set! reference.namespace "stage"))
 
 ; ── ARG / ENV variables ──────────────────────────────────────────────────

@@ -68,7 +68,11 @@
 
 ; ── Parameters and binders ───────────────────────────────────────────────
 (parameter name: (identifier) @definition.parameter)
-(foreach_statement left: (identifier) @definition)
+; The foreach binder is visible in the body but not while evaluating the
+; iterable (which is evaluated before the binding): anchor `after` to the
+; iterable so `foreach (var x in make(x))` reads the outer x.
+((foreach_statement left: (identifier) @definition right: (_) @_it)
+ (#set! definition.visibility "after"))
 (catch_declaration name: (identifier) @definition.parameter)
 
 ; ── References ───────────────────────────────────────────────────────────

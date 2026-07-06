@@ -72,6 +72,12 @@
 (destructured_parameter (identifier) @definition.parameter)
 
 ; ── Instance variables: object-wide, registered on the class ────────────
+; ACCEPTED APPROXIMATION: every @x registers on the nearest class, so a
+; class-body / `def self.` @x (class-object state) and an instance-method
+; @x (instance state) merge into one binding though they are different
+; object state. Separating them would need a has-ancestor split on
+; singleton vs instance context; class-level ivars are uncommon, so this
+; is left as-is.
 ((assignment left: (instance_variable) @definition.ivar)
  (#set! definition.scope "nearest:class")
  (#set! definition.namespace "ivar"))

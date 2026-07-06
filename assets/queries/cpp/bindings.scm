@@ -56,12 +56,16 @@
           (reference_declarator (identifier) @definition.parameter)
         ]))))
 
-(for_range_loop
+; Visible in the body, not while evaluating the range (`for (auto x : make(x))`
+; reads the outer x): anchor `after` to the range expression.
+((for_range_loop
   declarator: [
     (identifier) @definition
     (pointer_declarator declarator: (identifier) @definition)
     (reference_declarator (identifier) @definition)
-  ])
+  ]
+  right: (_) @_it)
+ (#set! definition.visibility "after"))
 
 ; ── Reference variables: `int &r = a;` ───────────────────────────────────
 ((declaration

@@ -28,12 +28,19 @@
 ((enum_declaration name: (identifier) @definition.type)
  (#set! definition.namespace "type"))
 
-; Class-level generics bind into the class body by label (the parameter
-; list precedes the body node); method-level generics land in the method
-; scope by containment.
+; Class/interface-level generics bind into the body by label (the
+; parameter list precedes the body node); method-level generics land in
+; the method scope by containment. A generic used in the `extends`/base
+; clause (which sits outside the body node) stays unresolved — silence, an
+; accepted under-resolution rather than a wrong answer.
 ((class_declaration
    type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type))
    body: (class_body) @scope.body)
+ (#set! definition.scope "body")
+ (#set! definition.namespace "type"))
+((interface_declaration
+   type_parameters: (type_parameters (type_parameter (type_identifier) @definition.type))
+   body: (interface_body) @scope.body)
  (#set! definition.scope "body")
  (#set! definition.namespace "type"))
 ((method_declaration
@@ -56,7 +63,10 @@
 (formal_parameter name: (identifier) @definition.parameter)
 (spread_parameter (variable_declarator name: (identifier) @definition.parameter))
 (catch_formal_parameter name: (identifier) @definition.parameter)
-(enhanced_for_statement name: (identifier) @definition)
+; Visible in the body, not while evaluating the iterable (`for (T x : make(x))`
+; reads the outer x): anchor `after` to the iterable.
+((enhanced_for_statement name: (identifier) @definition value: (_) @_it)
+ (#set! definition.visibility "after"))
 (inferred_parameters (identifier) @definition.parameter)
 (lambda_expression parameters: (identifier) @definition.parameter)
 

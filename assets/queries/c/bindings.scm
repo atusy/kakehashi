@@ -5,6 +5,13 @@
 ; binding), variables after their declaration statement. Member access
 ; (s.field, p->field) uses field_identifier nodes and is never captured —
 ; silence over a wrong answer.
+;
+; Tags (struct/union/enum) and typedefs share one `type` namespace by
+; design, so the ubiquitous `typedef struct S { … } S;` idiom links the
+; tag and the alias as one navigable type. C technically keeps tags in a
+; separate namespace from ordinary identifiers; the accepted cost is that
+; an unrelated reuse (`struct S {}; typedef int S;`) merges — rare in
+; practice, and the alternative would break the common idiom's linkage.
 
 ; ── Scopes ──────────────────────────────────────────────────────────────
 (compound_statement) @scope

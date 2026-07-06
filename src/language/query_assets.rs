@@ -65,8 +65,11 @@ mod tests {
     /// The compiled `.so` is cached under the OS temp dir and reused, so
     /// repeated `cargo test` runs never re-fetch or re-compile; only a cold
     /// cache (first run, or after the temp dir is cleared) needs the network.
-    /// The grammar revision tracks nvim-treesitter (via `install_parser`'s
-    /// metadata), matching how the rest of the tool sources parsers.
+    /// The revision is whatever nvim-treesitter's metadata pointed to when the
+    /// cache was first populated; a warm cache is then frozen until the temp
+    /// dir is cleared (it does not follow later upstream grammar updates). The
+    /// dockerfile asset targets stable node types, so this is acceptable for a
+    /// fixture; a stricter revision pin would need a pinned-fetch API.
     ///
     /// A process-wide `OnceLock` memoizes the loaded grammar so the install +
     /// load runs exactly once no matter how many fixture threads race here —
@@ -405,6 +408,16 @@ mod tests {
             let m = model_for("cpp", text);
             assert_resolves(&m, text, "r", 1, 0);
         }
+
+        #[test]
+        fn range_for_binder_reads_the_outer_in_its_range() {
+            // `make(x)` (the range) is evaluated before the binding, so its x
+            // is the outer local; the body x is the binder.
+            let text = "void f() { int x = 0; for (auto x : make(x)) { use(x); } }";
+            let m = model_for("cpp", text);
+            assert_resolves(&m, text, "x", 2, 0); // make(x) -> outer
+            assert_resolves(&m, text, "x", 3, 1); // use(x)  -> binder
+        }
     }
 
     mod java_fixtures {
@@ -494,6 +507,24 @@ mod tests {
             let m = model_for("java", text);
             assert_resolves(&m, text, "List", 1, 0);
         }
+
+        #[test]
+        fn interface_generics_resolve_in_the_body() {
+            let text = "interface I<T> { T get(); }\n";
+            let m = model_for("java", text);
+            assert_resolves(&m, text, "T", 1, 0);
+        }
+
+        #[test]
+        fn enhanced_for_binder_reads_the_outer_field_in_its_iterable() {
+            // Java forbids a loop variable shadowing an enclosing *local*, so
+            // the binder shadows a *field* here. `make(x)` is evaluated before
+            // the binding, so its x is the field; the body x is the binder.
+            let text = "class K { int x; void m() { for (int x : make(x)) { use(x); } } }";
+            let m = model_for("java", text);
+            assert_resolves(&m, text, "x", 2, 0); // make(x) -> field
+            assert_resolves(&m, text, "x", 3, 1); // use(x)  -> binder
+        }
     }
 
     mod c_sharp_fixtures {
@@ -569,6 +600,16 @@ mod tests {
             // update, and body.
             assert_resolves(&m, text, "j", 1, 0);
             assert_resolves(&m, text, "j", 3, 0);
+        }
+
+        #[test]
+        fn foreach_binder_reads_the_outer_in_its_iterable() {
+            // `Make(x)` (the iterable) is evaluated before the binding, so its
+            // x is the outer local; the body x is the binder.
+            let text = "class K { void M() { int x = 0; foreach (var x in Make(x)) { Use(x); } } }";
+            let m = model_for("c_sharp", text);
+            assert_resolves(&m, text, "x", 2, 0); // Make(x) -> outer
+            assert_resolves(&m, text, "x", 3, 1); // Use(x)  -> binder
         }
     }
 
@@ -1224,6 +1265,19 @@ mod tests {
             let text = "ENV A=old\nENV A=new B=${A}\n";
             let m = model_for("dockerfile", text);
             assert_resolves(&m, text, "A", 2, 0);
+        }
+
+        #[test]
+        fn a_tagged_image_is_not_a_stage_even_if_the_name_matches() {
+            // `FROM ubuntu:22.04` is a registry image (it carries a tag), so it
+            // must not resolve to a same-named stage.
+            let text = "FROM scratch AS ubuntu\nFROM ubuntu:22.04\n";
+            let m = model_for("dockerfile", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "ubuntu", 1)),
+                None,
+                "a tagged image is a registry ref, not the stage alias"
+            );
         }
     }
 
