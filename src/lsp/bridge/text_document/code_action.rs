@@ -20,8 +20,8 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    transform_workspace_edit_to_host, translate_host_range_to_virtual,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region,
+    response_has_jsonrpc_error, transform_workspace_edit_to_host, translate_host_range_to_virtual,
     translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
@@ -102,6 +102,12 @@ fn build_code_action_request(
 ) -> JsonRpcRequest<CodeActionParams> {
     let mut virtual_range = host_range;
     translate_host_range_to_virtual(&mut virtual_range, offset);
+    // Out-of-region diagnostics would saturate to virtual (0,0) and could
+    // false-match a different diagnostic the server published at the top of
+    // the virtual document — drop them instead of clamping.
+    context
+        .diagnostics
+        .retain(|diagnostic| host_position_within_region(diagnostic.range.start, offset));
     for diagnostic in &mut context.diagnostics {
         translate_host_range_to_virtual(&mut diagnostic.range, offset);
     }
@@ -381,6 +387,35 @@ mod tests {
             "source.organizeImports"
         );
         assert_eq!(json["params"]["context"]["triggerKind"], 1);
+    }
+
+    #[test]
+    fn code_action_request_drops_out_of_region_diagnostics() {
+        // A diagnostic above the region would clamp to virtual (0,0) and
+        // could false-match a different diagnostic the server published at
+        // the top of the virtual document — it must be dropped, not clamped.
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let context = CodeActionContext {
+            diagnostics: vec![diagnostic_at(0), diagnostic_at(5)],
+            ..CodeActionContext::default()
+        };
+        let request = build_code_action_request(
+            &virtual_uri,
+            range(5, 5),
+            context,
+            &RegionOffset::new(3, 0),
+            RequestId::new(1),
+            None,
+        );
+
+        let json = serde_json::to_value(&request).unwrap();
+        let diags = json["params"]["context"]["diagnostics"].as_array().unwrap();
+        assert_eq!(
+            diags.len(),
+            1,
+            "the above-region diagnostic must be dropped"
+        );
+        assert_eq!(diags[0]["range"]["start"]["line"], 2, "5 - region start 3");
     }
 
     #[test]
