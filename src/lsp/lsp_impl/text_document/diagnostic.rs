@@ -236,9 +236,11 @@ impl Kakehashi {
         // instead of once per (region × pull). One pool query for the whole
         // request; the resulting set is a cheap lookup inside the region loop.
         //
-        // Candidates: the distinct injection languages' configured servers.
-        // Configs are resolved here (cached) and kept owned so the candidate
-        // `&str`s borrow from them across the `await`.
+        // Candidates: the distinct injection languages' configured servers. The
+        // per-language config resolution is a cached lookup
+        // (`cached_configs_for_injection_language`); the owned `configs_by_lang`
+        // exists only so the candidate `&str`s can borrow from it across the
+        // `await`, and the region loop re-resolves (same cheap cached call).
         let incapable_servers = {
             let mut langs: Vec<&str> = virt_regions
                 .iter()
