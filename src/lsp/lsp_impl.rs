@@ -262,6 +262,11 @@ pub struct Kakehashi {
     /// discards it), so `did_open_impl` skips the synthetic diagnostic task — that
     /// avoids both the wasted downstream pull and the abort-vs-`didClose` race (#489).
     cli_mode: std::sync::atomic::AtomicBool,
+    /// Runtime opt-in for experimental features (`KAKEHASHI_EXPERIMENTAL=true`,
+    /// see [`crate::experimental`]) — currently the native lexical-resolution
+    /// layer. Copied from the environment once at construction; atomic only so
+    /// tests can toggle it per instance.
+    experimental: std::sync::atomic::AtomicBool,
     /// Per-document coalescing scheduler for the off-ingress parse
     /// (per-document-parse-scheduler ADR): `did_change` applies the edit and clears the
     /// tree synchronously, then schedules the (re)parse here so the parse runs off
@@ -344,6 +349,7 @@ impl Kakehashi {
                 kakehashi::captures_match_cache::CapturesMatchCache::new(),
             ),
             cli_mode: std::sync::atomic::AtomicBool::new(false),
+            experimental: std::sync::atomic::AtomicBool::new(crate::experimental::enabled()),
             parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
         }
     }
@@ -358,6 +364,20 @@ impl Kakehashi {
     /// Whether this instance runs as a one-shot CLI rather than an LSP server.
     pub(crate) fn is_cli_mode(&self) -> bool {
         self.cli_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether experimental features are enabled for this instance; see the
+    /// `experimental` field.
+    pub(crate) fn experimental_enabled(&self) -> bool {
+        self.experimental.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Toggle experimental features for this instance — tests only; the
+    /// production value comes from the environment at construction.
+    #[cfg(test)]
+    pub(crate) fn set_experimental(&self, enabled: bool) {
+        self.experimental
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Create a `ClientNotifier` for centralized client communication.
