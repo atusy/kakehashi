@@ -5,6 +5,7 @@ pub(crate) use coordinator::DiagnosticPublisher;
 pub(crate) mod kakehashi;
 mod lifecycle;
 mod parse_scheduler;
+mod region_offset;
 mod show_document_translation;
 mod snapshot_read;
 pub(crate) mod text_document;
