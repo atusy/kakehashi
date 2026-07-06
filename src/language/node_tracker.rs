@@ -670,10 +670,25 @@ impl NodeTracker {
     /// `shift_gen` back at 0) and passes against the not-yet-bumped epoch,
     /// leaving stale-lifetime coordinates alive in a reopened document's
     /// index with nothing left to reclaim them.
-    pub(crate) fn cleanup(&self, uri: &Url) {
+    ///
+    /// `reopened` guards the removal against the inverse race: didClose
+    /// runs this AFTER removing the document and OUTSIDE `edit_lock`, so a
+    /// fast reopen's parse may already have minted the NEW lifetime's ids
+    /// into this entry — an unconditional wipe would publish a snapshot
+    /// whose ids immediately resolve `null`. The probe is evaluated under
+    /// the entry's exclusive lock: probe-sees-open ⇒ the entry is the
+    /// reopened document's live index, keep it (the epoch bump above still
+    /// refuses any old-lifetime latch; old-lifetime entries it may carry
+    /// are position-keyed and bounded, invalidated by the new lifetime's
+    /// edits like any other). Probe-sees-closed ⇒ no new-lifetime mint can
+    /// have happened — mints are liveness-gated on the reopened snapshot,
+    /// whose insert happens-before any mint that passed the gate, which
+    /// happens-before this probe under the same entry lock — so the removal
+    /// reclaims only old-lifetime state.
+    pub(crate) fn cleanup(&self, uri: &Url, reopened: impl FnOnce() -> bool) {
         self.cleanup_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        self.entries.remove(uri);
+        self.entries.remove_if(uri, |_, _| !reopened());
     }
 
     /// Run `commit` only if `uri`'s (shift generation, cleanup epoch) still
@@ -855,6 +870,31 @@ mod tests {
         );
     }
 
+    /// A close raced by a completed reopen (the probe sees the document
+    /// open again) keeps the reopened lifetime's index — its freshly minted
+    /// ids must survive — while the epoch bump still refuses any
+    /// old-lifetime latch.
+    #[test]
+    fn cleanup_keeps_reopened_index_but_still_bumps_epoch() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("cleanup_reopen");
+        // Stands in for the reopened lifetime's first mint, which the raced
+        // didClose's cleanup must not wipe.
+        let id = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 0);
+        let pre_close_latch = tracker.mint_epoch(&uri);
+        tracker.cleanup(&uri, || true);
+        assert_eq!(
+            tracker.lookup_in_layer(&uri, 0, 4, "word", 0),
+            Some(id),
+            "a reopened document's index survives the raced close"
+        );
+        assert_eq!(
+            tracker.mint_batch_if_unshifted(&uri, pre_close_latch, [(10, 14, "word", 0)]),
+            None,
+            "the epoch bump still refuses latches taken before the close"
+        );
+    }
+
     /// A close (any document's) bumps the global cleanup epoch, so a latch
     /// taken before it refuses — the close/reopen ABA guard the per-URI
     /// generation alone cannot provide.
@@ -864,7 +904,7 @@ mod tests {
         let uri = test_uri("batch_mint_cleanup");
         let other = test_uri("batch_mint_other");
         let latch = tracker.mint_epoch(&uri);
-        tracker.cleanup(&other);
+        tracker.cleanup(&other, || false);
         assert_eq!(
             tracker.mint_batch_if_unshifted(&uri, latch, [(0, 4, "word", 0)]),
             None
@@ -909,7 +949,7 @@ mod tests {
         // to a post-reopen observation — including for a URI that never
         // tracked a node.
         let (_, epoch_before) = tracker.mint_epoch(&uri);
-        tracker.cleanup(&uri);
+        tracker.cleanup(&uri, || false);
         let (gen_after, epoch_after) = tracker.mint_epoch(&uri);
         assert_eq!(gen_after, 0, "the fresh index restarts at generation 0");
         assert!(
@@ -1059,7 +1099,7 @@ mod tests {
         let ulid_before = tracker.get_or_create(&uri, 0, 10, "code_block");
 
         // Cleanup
-        tracker.cleanup(&uri);
+        tracker.cleanup(&uri, || false);
 
         // After cleanup, same key should create NEW ULID
         let ulid_after = tracker.get_or_create(&uri, 0, 10, "code_block");
@@ -1081,7 +1121,7 @@ mod tests {
         let _ulid2 = tracker.get_or_create(&uri2, 0, 10, "code_block");
 
         // Cleanup only uri2
-        tracker.cleanup(&uri2);
+        tracker.cleanup(&uri2, || false);
 
         // uri1 should still have its ULID
         let ulid1_after = tracker.get_or_create(&uri1, 0, 10, "code_block");
@@ -1129,7 +1169,7 @@ mod tests {
         let ulid = tracker.get_or_create(&uri, 10, 20, "block");
         assert!(tracker.lookup_position(&uri, &ulid).is_some());
 
-        tracker.cleanup(&uri);
+        tracker.cleanup(&uri, || false);
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),

@@ -575,9 +575,11 @@ impl BridgeCoordinator {
 
     /// Remove all tracked regions for a document.
     ///
-    /// Called on didClose to prevent memory leaks.
-    pub(crate) fn cleanup(&self, uri: &Url) {
-        self.node_tracker.cleanup(uri)
+    /// Called on didClose to prevent memory leaks. `reopened` is the
+    /// raced-reopen probe forwarded to [`NodeTracker::cleanup`] — see the
+    /// removal guard there.
+    pub(crate) fn cleanup(&self, uri: &Url, reopened: impl FnOnce() -> bool) {
+        self.node_tracker.cleanup(uri, reopened)
     }
 
     // ========================================

@@ -51,8 +51,15 @@ impl Kakehashi {
         // Clean up all caches for this document (semantic tokens, injections, requests)
         self.cache.remove_document(&uri);
 
-        // Clean up region ID mappings for this document (lazy-node-identity-tracking)
-        self.bridge.cleanup(&uri);
+        // Clean up region ID mappings for this document
+        // (lazy-node-identity-tracking). This runs AFTER the removal above
+        // and outside the edit-lock section, so a fast reopen's parse may
+        // already have minted the NEW lifetime's ids — the probe (evaluated
+        // under the tracker entry's lock) skips the removal in that case
+        // instead of wiping a live index whose published ids would then
+        // resolve null. See NodeTracker::cleanup.
+        self.bridge
+            .cleanup(&uri, || self.documents.latest_snapshot(&uri).is_some());
 
         // Abort any in-progress synthetic diagnostic task for this document (pull-first-diagnostic-forwarding Phase 2)
         self.synthetic_diagnostics.remove_document(&uri);
