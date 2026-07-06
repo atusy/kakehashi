@@ -1,8 +1,9 @@
 //! Runtime opt-in for experimental features.
 //!
-//! Experimental features (currently the native lexical-resolution layer)
-//! ship in every binary but stay dormant unless the server process is
-//! started with `KAKEHASHI_EXPERIMENTAL=true`. The variable is read once
+//! Experimental features (currently the native lexical-resolution layer
+//! and documentColor / colorPresentation bridging) ship in every binary but
+//! stay dormant unless the server process is started with
+//! `KAKEHASHI_EXPERIMENTAL=true`. The variable is read once
 //! per process; consumers that need per-instance test control (e.g.
 //! [`crate::lsp::Kakehashi`]) copy the value at construction instead of
 //! re-reading it.
