@@ -802,6 +802,28 @@ impl Kakehashi {
                 } else {
                     match self.captures_walk_inflight.entry(key.clone()) {
                         dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                            // Re-check the memo before claiming winnership: a
+                            // concurrent winner may have stored its result and
+                            // dropped its marker between the memo check at the
+                            // top of the loop and this claim — claiming here
+                            // would re-run the identical walk right past its
+                            // fresh result. (Ordering is inflight-shard →
+                            // memo-shard; no path acquires them in reverse.)
+                            if let Some(hit) = self.captures_walk_cache.get(&key)
+                                && hit.parsed_version == snapshot.parsed_version
+                                && hit.incarnation == incarnation
+                                && hit.generation == generation
+                            {
+                                let result = hit.result.clone();
+                                drop(hit);
+                                return Ok(result.map(|(matches, skipped)| ComputedCaptures {
+                                    uri,
+                                    incarnation,
+                                    entry_content_version,
+                                    matches,
+                                    skipped,
+                                }));
+                            }
                             let notify = std::sync::Arc::new(tokio::sync::Notify::new());
                             vacant.insert(std::sync::Arc::clone(&notify));
                             flight_guard = Some(WalkFlightGuard {
