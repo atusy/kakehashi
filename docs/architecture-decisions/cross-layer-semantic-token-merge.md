@@ -43,7 +43,8 @@ defined for position and document-wide methods:
 cross-layer-aggregation **excluded** semantic tokens from its generic
 mechanism, with the reason: the progressive-refinement strategy is a *temporal*
 merge (native immediately, bridged tokens replacing them later), not an
-ordering, and "a future `merged`-style strategy may bring them in." This is
+ordering, and — in wording this decision now replaces with a direct
+reference — "a future `merged`-style strategy may bring them in." This is
 that decision.
 
 ### Why `preferred`/`concatenated` cannot express this
@@ -338,8 +339,9 @@ impossible (see Alternative D).
 
 ### `merged` representation
 
-Resolving the open cost cross-layer-aggregation flagged ("a stage-2-only
-`merged` would force either enum growth visible to stage 1 or a type split"):
+Resolving the open cost cross-layer-aggregation originally flagged — in its
+pre-revision wording, "a stage-2-only `merged` would force either enum growth
+visible to stage 1 or a type split"; its Neutral bullet now defers here:
 
 - `merged` is **not** added to `AggregationStrategy`. It is not a value any
   user writes anywhere. Stage 1 (`bridge.<key>.aggregation`) and other stage-2
@@ -542,7 +544,7 @@ Add `Merged` to the enum so users can write `strategy = "merged"` like
 **Rejected because**: it is meaningful for only two methods and needs temporal
 + legend machinery no other method has. Exposing it enum-wide invites
 `strategy = "merged"` on `hover` (meaningless) and forces the stage-1/stage-2
-type split cross-layer-aggregation called an "acceptable deferred cost." The
+type split cross-layer-aggregation deliberately deferred. The
 per-method internal default (formatting's precedent) gives users the real knob
 — layer rank via `priorities` — without polluting the strategy namespace.
 
