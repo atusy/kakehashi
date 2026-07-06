@@ -551,12 +551,12 @@ inside the existing safety contracts at each step:
   parse-seed/external-scanner issue, not a query-cursor issue, and the read paths
   are already stale-offset-hardened), but readers **write** persistent caches. The
   whole-document token cache (in `semantic_cache` / `cache`, keyed by text hash) is
-  closed by keying off the snapshot's text. The **injection-token cache** (keyed
-  `(Url, region_id)`) and the **node-tracker ULIDs** are *not* closed by
-  text-keying — they are closed only by moving region minting into the snapshot's
-  `populate` (§3) so a stale read consumes stale-but-consistent ids and mints
-  nothing. Naive stale-serve does neither and poisons both permanently (no
-  generation bump, no refresh today).
+  closed by keying off the snapshot's text. The **injection-token cache** and
+  the **node-tracker ULIDs** are *not* closed by text-keying — they are closed
+  by the content-addressed token-cache key and the §3 latch-gated mint
+  reconciliation (both now in) so a stale read consumes stale-but-consistent
+  ids and mints nothing. Naive stale-serve does neither and poisons both
+  permanently (no generation bump, no refresh today).
 - **A text-owning parse actor (per-document-parse-scheduler's Option 4).** Still
   rejected for the reason recorded there: reads bypass the owner, so owning the
   text buys nothing while resurrection-safety must still guard every reader
@@ -692,13 +692,17 @@ removed — `get_tree_with_wait`, `wait_for_epoch`, and the on-demand parse in
 
 Two Stage-2 pieces remain deliberately open:
 
-- The **§3 identity split** (snapshot-owned region ordinals + the
-  current-version tracker reconciliation, and the companion
-  injection-token-cache key rework). Until it lands, the readers whose region
-  resolution mints tracker ULIDs — the whole-document fan-out family and the
-  bridge-context requests — require a **current** snapshot (bounded wait,
-  degrade on staleness) instead of serving stale: a stale read must never
-  mint, and currency is the interim way to guarantee that.
+- The **reader-side remainder of the §3 identity split**. The writer half is
+  in: the tracker reconciliation is the latch-gated batch mint
+  (`mint_batch_if_unshifted`, see §3 above) in `populate` and the captures
+  walk, and the injection-token-cache key rework is content-addressed. What
+  stays open is the readers whose *inline* region resolution (the
+  non-prebuilt fallback) still mints tracker ULIDs — the whole-document
+  fan-out family and the bridge-context requests — which therefore still
+  require a **current** snapshot (bounded wait, degrade on staleness) instead
+  of serving stale: a stale read must never mint, and currency remains the
+  way to guarantee that until those readers consume snapshot-owned region
+  identity instead of minting.
 - Several notification-path consumers (pull diagnostics, `did_save`,
   `documentSymbol`/`documentColor`) still read the legacy store tree after the
   bounded current-wait; they migrate to `latest_snapshot` with the Stage-3
