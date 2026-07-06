@@ -52,6 +52,14 @@ pub(crate) enum TokenSnapshot {
     Stale,
     /// The client cancelled the request while it was parked.
     Cancelled,
+    /// A newer request for the same document superseded this one while it was
+    /// parked (`SemanticRequestTracker` flipped its token). Answer `Ok(None)`
+    /// — the same contract as a compute superseded mid-flight — instead of
+    /// riding out the park: on a client that supersedes without sending
+    /// `$/cancelRequest`, obsolete parked requests would otherwise hold
+    /// ingress admission slots until the parse settles or the backstop
+    /// expires.
+    Superseded,
 }
 
 impl Kakehashi {
@@ -123,6 +131,7 @@ impl Kakehashi {
         &self,
         uri: &Url,
         cancel_rx: Option<&mut crate::lsp::request_id::CancelReceiver>,
+        supersede: &crate::cancel::CancelToken,
     ) -> TokenSnapshot {
         use crate::lsp::lsp_impl::snapshot_read::{SnapshotWait, TOKEN_SETTLE_BACKSTOP};
         let wait = self.wait_for_current_snapshot(uri, TOKEN_SETTLE_BACKSTOP);
@@ -133,10 +142,20 @@ impl Kakehashi {
                     // Fires on $/cancelRequest (and on forwarder teardown,
                     // which the compute-race arms below treat as cancel too).
                     _ = rx => return TokenSnapshot::Cancelled,
+                    // Fires when a newer request for this document flips this
+                    // request's tracker token — release the park (and its
+                    // admission slot) instead of computing a discarded result.
+                    _ = supersede.cancelled() => return TokenSnapshot::Superseded,
                     outcome = wait => outcome,
                 }
             }
-            None => wait.await,
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = supersede.cancelled() => return TokenSnapshot::Superseded,
+                    outcome = wait => outcome,
+                }
+            }
         };
         match outcome {
             SnapshotWait::Current(snapshot) => TokenSnapshot::Current(snapshot),
@@ -197,7 +216,7 @@ impl Kakehashi {
         // the snapshot's own detected language — never a live re-detection
         // that could diverge from the tree's grammar.
         let snapshot = match self
-            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut())
+            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
             .await
         {
             TokenSnapshot::Current(snapshot) => snapshot,
@@ -228,6 +247,17 @@ impl Kakehashi {
                     uri, request_id
                 );
                 return Err(Error::request_cancelled());
+            }
+            TokenSnapshot::Superseded => {
+                // Same contract as a compute superseded mid-flight (below):
+                // the newer request answers; this one drops out quietly.
+                self.cache.finish_request(&uri, request_id);
+                log::debug!(
+                    target: "kakehashi::semantic",
+                    "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (superseded while parked)",
+                    uri, request_id
+                );
+                return Ok(None);
             }
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
@@ -504,7 +534,7 @@ impl Kakehashi {
         // steady-state typing path where a stale answer corrupts the editor's
         // existing highlights AND poisons the client's delta baseline).
         let snapshot = match self
-            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut())
+            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
             .await
         {
             TokenSnapshot::Current(snapshot) => snapshot,
@@ -537,6 +567,17 @@ impl Kakehashi {
                     uri, request_id
                 );
                 return Err(Error::request_cancelled());
+            }
+            TokenSnapshot::Superseded => {
+                // Same contract as a compute superseded mid-flight: the newer
+                // request answers; this one drops out quietly.
+                self.cache.finish_request(&uri, request_id);
+                log::debug!(
+                    target: "kakehashi::semantic",
+                    "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (superseded while parked)",
+                    uri, request_id
+                );
+                return Ok(None);
             }
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
@@ -1054,6 +1095,63 @@ mod tests {
             service.inner().cache.served_semantic_version(&uri),
             Some(1),
             "the response must be computed from the CURRENT snapshot"
+        );
+    }
+
+    /// A parked request superseded by a newer request for the same document
+    /// (the tracker flips its token — no `$/cancelRequest` involved) must
+    /// release promptly with the compute-superseded contract `Ok(None)`, not
+    /// hold its ingress admission slot until the parse settles or the
+    /// backstop expires.
+    #[tokio::test(start_paused = true)]
+    async fn semantic_tokens_full_superseded_while_parked_releases_with_none() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///serve_current_supersede.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        // No snapshot for the live content version → the handler parks.
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), "fn main() { }".to_string(), None);
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .semantic_tokens_full_impl(full_params(&uri))
+                    .await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "the handler must be parked awaiting the current snapshot"
+        );
+
+        // A newer request for the same URI supersedes the parked one.
+        let woke_at = tokio::time::Instant::now();
+        let _newer = service.inner().cache.start_request(&uri);
+
+        let result = request
+            .await
+            .expect("handler task must not panic")
+            .expect("a superseded parked request answers, not errors");
+        assert!(
+            result.is_none(),
+            "superseded-while-parked follows the compute-superseded contract (None)"
+        );
+        assert!(
+            woke_at.elapsed() < crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP,
+            "the park must release on supersession, not ride out the backstop"
         );
     }
 
