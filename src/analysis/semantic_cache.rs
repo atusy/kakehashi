@@ -12,7 +12,6 @@
 use crate::analysis::semantic::RawToken;
 use crate::language::injection::CacheableInjectionRegion;
 use dashmap::DashMap;
-use rust_lapper::{Interval, Lapper};
 use tower_lsp_server::ls_types::{Range, SemanticTokens};
 use url::Url;
 
@@ -231,83 +230,63 @@ impl Default for SemanticTokenRangeCache {
     }
 }
 
-/// Thread-safe map of injection regions per document.
+/// Thread-safe map of injection regions per document: the region set of the
+/// last COMMITTED populate pass.
 ///
-/// Tracks all `CacheableInjectionRegion`s for each document URI. The interval
-/// tree used to drive spatial token-cache invalidation; content addressing
-/// removed that production consumer (`find_overlapping` is now test-only), so
-/// today the map is populate-written state consumed by tests — and the natural
-/// substrate for the §3 mint reconciliation's reuse-by-position step, which is
-/// why it stays.
+/// Content addressing removed the spatial-invalidation consumer, so no
+/// production path reads this today — populate writes it at the commit point
+/// (a plain move of the already-built region vec, no per-populate index
+/// build) and tests observe it to pin what a committed pass recorded. The
+/// spatial queries are test-only linear scans; if the §3 mint-reconciliation
+/// split doesn't end up consuming the map, delete it and port the tests.
 pub struct InjectionMap {
-    /// Stores interval trees per document URI
-    /// Each Interval contains the byte range and the full CacheableInjectionRegion as data
-    lappers: DashMap<Url, Lapper<usize, CacheableInjectionRegion>>,
+    regions: DashMap<Url, Vec<CacheableInjectionRegion>>,
 }
 
 impl InjectionMap {
     /// Create a new empty injection map.
     pub fn new() -> Self {
         Self {
-            lappers: DashMap::new(),
+            regions: DashMap::new(),
         }
     }
 
     /// Store injection regions for a document, replacing any existing regions.
-    /// Builds an interval tree from the regions for efficient overlap queries.
+    /// A plain move — nothing on the pre-publish critical path is built here.
     pub fn insert(&self, uri: Url, regions: Vec<CacheableInjectionRegion>) {
-        // Convert regions to intervals for the Lapper
-        let intervals: Vec<Interval<usize, CacheableInjectionRegion>> = regions
-            .into_iter()
-            .map(|region| {
-                let start = region.byte_range.start;
-                let stop = region.byte_range.end;
-                Interval {
-                    start,
-                    stop,
-                    val: region,
-                }
-            })
-            .collect();
-
-        // Create Lapper from intervals (builds interval tree)
-        let lapper = Lapper::new(intervals);
-        self.lappers.insert(uri, lapper);
+        self.regions.insert(uri, regions);
     }
 
     /// Retrieve all injection regions for a document.
     #[cfg(test)]
     pub fn get(&self, uri: &Url) -> Option<Vec<CacheableInjectionRegion>> {
-        self.lappers
-            .get(uri)
-            .map(|entry| entry.iter().map(|interval| interval.val.clone()).collect())
+        self.regions.get(uri).map(|entry| entry.clone())
     }
 
     /// Remove all injection regions for a document (e.g., on document close).
     pub fn clear(&self, uri: &Url) {
-        self.lappers.remove(uri);
+        self.regions.remove(uri);
     }
 
-    /// Find the injection region containing the given byte position (test-only).
+    /// Find the injection region containing the given byte position (test-only
+    /// linear scan).
     #[cfg(test)]
     pub fn find_at_position(
         &self,
         uri: &Url,
         byte_position: usize,
     ) -> Option<CacheableInjectionRegion> {
-        self.lappers.get(uri).and_then(|lapper| {
-            // Find intervals that overlap the single byte position
-            lapper
-                .find(byte_position, byte_position + 1)
-                .next()
-                .map(|interval| interval.val.clone())
+        self.regions.get(uri).and_then(|regions| {
+            regions
+                .iter()
+                .find(|r| r.byte_range.start <= byte_position && byte_position < r.byte_range.end)
+                .cloned()
         })
     }
 
-    /// Find all injection regions that overlap with the given byte range.
-    ///
-    /// Test-only since content addressing removed the spatial invalidation
-    /// path that consumed it.
+    /// Find all injection regions that overlap with the given byte range
+    /// (test-only linear scan — content addressing removed the spatial
+    /// invalidation path that needed an index).
     #[cfg(test)]
     pub fn find_overlapping(
         &self,
@@ -315,10 +294,11 @@ impl InjectionMap {
         start: usize,
         end: usize,
     ) -> Option<Vec<CacheableInjectionRegion>> {
-        self.lappers.get(uri).map(|lapper| {
-            lapper
-                .find(start, end)
-                .map(|interval| interval.val.clone())
+        self.regions.get(uri).map(|regions| {
+            regions
+                .iter()
+                .filter(|r| r.byte_range.start < end && start < r.byte_range.end)
+                .cloned()
                 .collect()
         })
     }
@@ -424,14 +404,11 @@ impl InjectionTokenCache {
         validity_hash: u64,
         generation: u64,
     ) -> Option<Vec<RawToken>> {
-        let result = self
-            .cache
-            .get(uri)
-            .and_then(|doc| {
-                doc.get(&validity_hash)
-                    .filter(|entry| entry.generation == generation)
-                    .map(|entry| entry.tokens.clone())
-            });
+        let result = self.cache.get(uri).and_then(|doc| {
+            doc.get(&validity_hash)
+                .filter(|entry| entry.generation == generation)
+                .map(|entry| entry.tokens.clone())
+        });
 
         if result.is_some() {
             log::debug!(

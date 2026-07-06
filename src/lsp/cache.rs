@@ -358,9 +358,10 @@ impl CacheCoordinator {
             // token-cache sweep runs inside the commit closure, so a stale
             // pass performs no eviction at all.
             let committed = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
-                // Commit point: store the region set the token-cache
-                // bookkeeping (reanchor) keys off, and run the
-                // content-addressed token cache's eviction sweep with the
+                // Commit point: record the committed pass's region set (test
+                // observability today; no production reader since token
+                // eviction went content-addressed — a plain move), and run
+                // the content-addressed token cache's eviction sweep with the
                 // same epoch gate — a stale pass must not sweep entries the
                 // LIVE text's regions still hit (a wrongly swept entry is
                 // only a recompute, but a gratuitous one).
