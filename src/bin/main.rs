@@ -997,6 +997,13 @@ async fn run_lsp_server() {
     )
     .finish();
 
+    // Reap downstream servers when the editor terminates this process without
+    // completing the shutdown handshake (SIGTERM/SIGHUP) — without this, the
+    // spawned language servers are orphaned to launchd and can outlive the
+    // session indefinitely.
+    #[cfg(unix)]
+    service.inner().spawn_termination_cleanup();
+
     // Wrap service with RequestIdCapture to:
     // 1. Capture upstream request IDs (for ls-bridge-server-pool-coordination bridge requests)
     // 2. Forward $/cancelRequest notifications to downstream servers
@@ -1007,5 +1014,27 @@ async fn run_lsp_server() {
     // observe every edit that preceded them on the wire (#342).
     let service = IngressOrderGate::new(service);
 
-    Server::new(stdin, stdout, socket).serve(service).await;
+    // Lift tower-lsp's default 4-message `buffer_unordered` cap: editors fire
+    // bursts of concurrent requests per keystroke (Neovim: semanticTokens +
+    // captures lineages + diagnostics + …), and handlers park awaiting the
+    // per-URI parse snapshot. With only 4 slots, parked readers exhaust the
+    // buffer and the very didChange notifications that would release them
+    // queue behind — a priority inversion observed as multi-second
+    // handler-start delays. Ordering is IngressOrderGate's job (tickets are
+    // assigned synchronously in wire order, independent of this value) and
+    // CPU is the bounded ComputePool's, so a wider admission costs only
+    // parked futures. This NARROWS the inversion rather than removing it:
+    // the wedge threshold becomes INGRESS_CONCURRENCY + tower-lsp's 100-slot
+    // channel queue of outstanding messages, and a wedge self-heals within
+    // the parked readers' settle backstop. `$/cancelRequest` is immune either
+    // way — `RequestIdCapture::call` dispatches its forwarding as a detached
+    // fire-and-forget spawn and needs no admission slot to do so. Sized for
+    // the worst observed per-keystroke
+    // burst (≈10 concurrent reader parks per document) across several
+    // documents, with headroom.
+    const INGRESS_CONCURRENCY: usize = 64;
+    Server::new(stdin, stdout, socket)
+        .concurrency_level(INGRESS_CONCURRENCY)
+        .serve(service)
+        .await;
 }

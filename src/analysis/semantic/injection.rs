@@ -16,16 +16,11 @@ use tree_sitter::Query;
 /// the content hash + the region's first host line for re-anchoring, and whether
 /// the region satisfies the language-agnostic translation predicate this request.
 pub(super) struct RegionCacheInfo {
-    /// Position-based ULID, byte-identical to the one `populate_injections` mints,
-    /// so `invalidate_for_edits` evicts the same entry this stores under.
-    pub region_id: String,
-    /// Validity hash: the region's content hash folded with its resolved injection
-    /// language. Content distinguishes an edit; the language fold means two regions
-    /// that share a position-stable `region_id` and identical content bytes but
-    /// inject *different* languages get different hashes (barring a 64-bit
-    /// collision), so one won't serve the other's tokens — including a stale ULID
-    /// minted by a superseded request, which `populate_injections` never sees and
-    /// so can't evict by language change.
+    /// Content-addressed cache key ([`region_validity_hash`]): the region's
+    /// content hash folded with its resolved injection language. The content
+    /// half distinguishes an edit; the language fold means identical bytes
+    /// injecting *different* languages get different keys (barring a 64-bit
+    /// collision), so one can't serve the other's tokens.
     pub validity_hash: u64,
     /// `line_range.start`: the region's first host line, added back on reuse
     /// (`host_line = line_start + token.line`).

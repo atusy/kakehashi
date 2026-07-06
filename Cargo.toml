@@ -60,7 +60,6 @@ log = "0.4"
 lua-pattern = { version = "0.1", features = ["to-regex"] }
 path-clean = "1"
 regex = "1"
-rust-lapper = "1.1"
 schemars = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 # regex-fancy (pure Rust) over regex-onig (C oniguruma): we only compile
@@ -86,7 +85,7 @@ ignore = "0.4"
 tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "process", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "process", "fs", "signal"] }
 tokio-util = "0.7"
 toml = "1"
 tower = { version = "0.5", default-features = false }

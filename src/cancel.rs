@@ -15,28 +15,36 @@
 //! obsolete compute stops instead of running to completion (see
 //! `lsp::semantic_request_tracker::SemanticRequestTracker`).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// A shared, cheap-to-poll cancellation signal. Clones share the same flag, so
-/// one side can cancel a compute another side is running.
+/// A shared cancellation signal: cheap to poll from blocking compute AND
+/// awaitable from async parks. Clones share the same state, so one side can
+/// cancel a compute another side is running.
 ///
-/// The flag is monotonic (`false` → `true`, never reset) and carries no other
-/// state, so [`Ordering::Relaxed`] is sufficient — we only need eventual
-/// visibility of the flip, not to publish other memory through it.
+/// Backed by [`tokio_util::sync::CancellationToken`] (monotonic
+/// `false` → `true`, never reset): `is_cancelled` stays a single atomic load
+/// for the per-region compute checkpoints, while [`cancelled`](Self::cancelled)
+/// lets the serve-current parked waits complete promptly when a newer request
+/// supersedes this one — an `AtomicBool` alone made supersession invisible to
+/// a parked future until its next wakeup.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CancelToken(Arc<AtomicBool>);
+pub(crate) struct CancelToken(tokio_util::sync::CancellationToken);
 
 impl CancelToken {
     /// Signal cancellation to every holder of this token. Idempotent.
     pub(crate) fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.cancel();
     }
 
     /// Returns `true` once [`cancel`](Self::cancel) has been called on this
     /// token or any clone of it.
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.is_cancelled()
+    }
+
+    /// Completes when [`cancel`](Self::cancel) is called on this token or any
+    /// clone of it (immediately if it already was). Cancel-safe: dropping the
+    /// future loses nothing.
+    pub(crate) async fn cancelled(&self) {
+        self.0.cancelled().await;
     }
 }
 

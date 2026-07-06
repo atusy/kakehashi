@@ -258,20 +258,26 @@ The decision therefore **separates three concerns that today all ride the tracke
 - **Cross-edit token reuse** (the injection-token-cache-reuse benefit): the cache
   is already content-validated at read (its entry carries `validity_hash` = content
   ⊕ language, and the settings `generation`), but its *key* is today the tracker
-  ULID. The change is to **drop `region_id` from the key** — key on
-  `(uri, content_hash)`, keeping `validity_hash` and the settings `generation` as
-  entry metadata checked at read, not as key components. The key **must stay stable
+  ULID. The change is to **drop `region_id` from the key** — key on the content
+  identity (implemented as `(uri, validity_hash)`, the content ⊕ resolved-language
+  fold), keeping the settings `generation` as entry metadata checked at read, not
+  as a key component. The key **must stay stable
   across edits** for reuse to work, so it must not include anything that turns over
   per edit; the `generation` here is the **config/settings epoch** (bumped only on a
   settings reload, the #530 discipline — *not* the per-edit parse-run counter), so a
   byte-identical region reuses across edits and is invalidated only on a real config
   change. Two snapshots' byte-identical regions thus reuse tokens without any stable
-  id. That in turn reworks **eviction**:
-  `invalidate_for_edits` currently point-deletes by `region_id` via the interval
-  tree, which has no target once the key drops it, so it must become a content-keyed
-  clear (or a side index) — losing the "typed region preserves reuse on an unrelated
-  edit" optimization measured by the injection-token-cache-reuse work unless that
-  index is added. Reworking the key **and** the eviction surface is a **companion decision to injection-token-cache-reuse**, not silently folded in here.
+  id. That in turn reworks **eviction** — and this companion decision is now
+  **implemented**: the key is `(uri, validity_hash)` (content ⊕ resolved
+  language, one shared fold), spatial `invalidate_for_edits` is deleted
+  (content addressing self-invalidates: an edited region misses under its new
+  hash, and an unrelated edit cannot touch a region's entry at all — the
+  "typed region preserves reuse" property holds *without* the interval
+  index), and the growth bound is a per-populate **live-hash sweep** run
+  inside the mint-epoch commit (a stale pass sweeps nothing). The live set
+  comes from the discovery's own per-region cache identities so the sweep and
+  the store/read path can never disagree on the fold. Free extras: duplicate
+  fences share one entry, and an undo back to previous content is a hit.
 - **Cross-edit bridge / virtual-document identity** — the stable handle a
   downstream language server's virtual document is keyed by — **remains the shared `NodeTracker` ULID**, a live-position (`content_version`) concern. Because regions
   are only *discovered* by a parse, minting still originates from a parse pass, but
@@ -301,20 +307,41 @@ reconciliation above is the one place a parse still mints them.
 Any reader that must resolve against **live** positions is position-critical
 (below).
 
-- **Serve-stale, actively refreshed** — `semanticTokens` full/delta. Compute
-  against the snapshot's consistent `(text, tree, injection_regions)`; caches key
-  off the snapshot's `(text, parsed_version)` so nothing is poisoned. When the
-  parse loop publishes a fresh snapshot it emits `workspace/semanticTokens/refresh`.
-  The trigger is added at the **parse-loop** publish point, **not** in the
-  `didChange` handler — `didChange` deliberately does not emit refresh because a
+- **Serve-current (parked wait), refresh as backstop** — `semanticTokens`
+  full/delta. The handler parks (racing the client's `$/cancelRequest`) until
+  the latest snapshot is **current** (`parsed_version == content_version`),
+  then computes against that snapshot's consistent
+  `(text, tree, injection_regions)`; caches key off the snapshot's
+  `(text, parsed_version)` so nothing is poisoned.
+
+  Stage 2 originally shipped this reader as *serve-stale + refresh* (answer
+  from the latest completed snapshot immediately; let the parse loop's
+  `workspace/semanticTokens/refresh` re-drive the client once a fresher one
+  lands). Live-editor evidence overturned that: the dominant client
+  (`vim.lsp.semantic_tokens`) stamps a response with the buffer version **at
+  request time** and draws it as soon as that version matches the live buffer
+  (extmarks placed with `strict = false`), so tokens computed for older text
+  render visibly misplaced on *unchanged* lines until the refresh round-trip
+  converges — highlight corruption, not mere latency. While the server stays
+  silent instead, the editor keeps its previous tokens as extmarks that shift
+  naturally with edits: the acceptable degradation. Serving stale is strictly
+  worse than parking for every client that draws responses against the live
+  buffer, and parking is affordable because the wait is bounded by parse
+  completion (every edit's parse resolution publishes), not by typing — a
+  superseding request (the client re-requests per edit) or `$/cancelRequest`
+  releases a parked handler early.
+
+  On the settle backstop expiring (pipeline pathologically behind), the
+  handler rejects with `ContentModified` and the parse loop's settled+stale
+  refresh gate re-drives the client once the parse lands. The refresh trigger
+  stays at the **parse-loop** publish point, **not** in the `didChange`
+  handler — `didChange` deliberately does not emit refresh because a
   synchronous client (vim-lsp on Vim) cannot answer a server request while
   processing a notification; emitting from the off-ingress loop, after the
-  notification returns, avoids that reentrancy. This **reverses the current handler**, which *rejects* a stale/superseded `semanticTokens` full/delta with
-  `None` (via `check_text_staleness` and the merged compute-superseded
-  `is_cancelled` bail) rather than serving a trailing snapshot. Stage 2 replaces
-  reject-on-stale with serve-stale + refresh; the `CancelToken` bail then narrows to
-  reclaiming the superseded compute's CPU (§4) without also discarding the — now
-  servable — snapshot. This is a decision Stage 2 deliberately overwrites.
+  notification returns, avoids that reentrancy. Under serve-current the gate
+  rarely fires (a parked request records the served version at settle); it
+  remains for the backstop path and non-edit token changes. The `CancelToken`
+  bail stays narrowed to reclaiming a superseded compute's CPU (§4).
 - **Serve-stale, passively refreshed** — whole-document, no-position reads:
   `documentSymbol`, `documentColor`, `documentLink`, `foldingRange`, `codeLens`
   (the `whole_document_preferred_fan_out` family), and pull-mode
@@ -352,35 +379,41 @@ Any reader that must resolve against **live** positions is position-critical
   - `kakehashi/captures/range` uses `null` where the LSP requests use
     `ContentModified` — `null` is the re-sync signal captures-protocol already
     defines ("on null, call full again"), and a JSON-RPC *error* would violate that
-    contract. But `null`-**on-routine-staleness must be avoided for `captures/full`**:
-    it is a per-keystroke highlighter, so returning `null` while the snapshot merely
-    trails, against a client contracted to re-request on `null`, is a busy-spin
-    (edit → stale → `null` → re-request → still stale → …). So `captures/full`
-    instead **serves-stale**, like `semanticTokens`: it returns the latest snapshot's
-    matches (one edit behind, healing on the next edit's captures request, which the
-    client sends per keystroke anyway), and reserves `null` for the cases the
-    protocol actually means it — no snapshot yet (pre-first-parse) or a delta with no
-    lineage. The match node-ids are the snapshot's own; a one-edit-stale id
-    self-heals, the same relaxation `semanticTokens` takes. When a served `full`
-    installs lineage, it carries the computed `parsed_version` and — under
-    `edit_lock` — stores it **only if `incarnation` and the current `content_version`
-    still match** (today `store_lineage` re-checks only incarnation), else stores
-    nothing and returns `null`, so the lineage never records matches for a text the
-    client no longer has.
+    contract. `captures/full` and `full/delta` take the **serve-current parked
+    wait**, like `semanticTokens`. This revises the original serve-stale choice,
+    which was motivated by avoiding a `null` busy-spin (edit → stale → `null` →
+    re-request → …): live-editor evidence (capture 01KWSECM…) showed serve-stale
+    *creating* exactly that spin one layer down — every stale walk completed its
+    full compute, was then voided by the lineage still-current gate, answered
+    `null`, and triggered a re-request that walked the next trailing snapshot
+    (41 walks in ~15s, most doomed, saturating the compute pool and queueing the
+    semantic delta ~10s behind them). Parking costs a `watch` subscription,
+    releases on the parse's own publish (or the client's cancel), and each
+    settle then walks once per kind with lineage installing. `null` remains for
+    what the protocol means by it: no snapshot yet (pre-first-parse), the settle
+    backstop, and a delta with no lineage. When a served `full` installs
+    lineage, it carries the computed `parsed_version` and — under `edit_lock` —
+    stores it **only if `incarnation` and the current `content_version` still
+    match**, else stores nothing and returns `null`, so the lineage never
+    records matches for a text the client no longer has (under serve-current
+    this guards the resolve→delivery window).
 
-Only two bounded waits remain, both deliberate: the **first parse after `didOpen`**
-(the snapshot is `None`; it waits briefly on `watch::changed()` then serves `null` —
-the same decoupling parse-decoupled-document-lifecycle applies to its host tier),
-and the **explicit-action wait** above (`formatting`/`rename`). No *per-keystroke*
-read ever waits.
+Three bounded waits remain, all deliberate: the **first parse after `didOpen`**
+(the snapshot is `None`; it waits briefly on `watch::changed()` then serves each
+reader's empty fallback — protocol `null` for captures/node, an empty
+`SemanticTokens` for the token handlers — the same decoupling
+parse-decoupled-document-lifecycle applies to its host tier),
+the **explicit-action wait** above (`formatting`/`rename`), and the
+**serve-current token wait** (`semanticTokens` full/delta — parked, not
+polling; bounded by parse completion and released early by supersede/cancel).
+No other *per-keystroke* read ever waits.
 
-*(`kakehashi/node/*` stays staleness-reject rather than serve-stale: a node
-request resolves to a specific live-position node, so a stale-position answer is
-wrong, not merely late — and unlike `captures/full` it has no per-keystroke
-re-request to heal it. `captures/full` can afford serve-stale precisely because its
-matches are snapshot-consistent and its per-edit re-request heals a one-edit-stale
-node-id; giving `node/*` the same would need a per-snapshot tracker view, which
-this decision does not commit to.)*
+*(`kakehashi/node/*` stays staleness-reject: a node request resolves to a
+specific live-position node, so a stale-position answer is wrong, not merely
+late — and it has no per-keystroke re-request to heal it. Serving it stale
+would need a per-snapshot tracker view, which this decision does not commit
+to; parking it like the token readers is possible but unmotivated — its
+implicit-trigger cadence means the client's next natural request heals.)*
 
 ### 4. All tree-CPU runs on one bounded compute pool
 
@@ -469,8 +502,9 @@ inside the existing safety contracts at each step:
   detect-and-spawn is near the lock, and even that need not hold it. The region is
   re-minted on a later reconciliation once the grammar lands. Only the fast
   tracker-mint itself runs under `edit_lock`. Convert
-  `semanticTokens` **and `captures/full`** to serve-stale (the latter reserving
-  `null` for no-snapshot / no-lineage, not routine staleness); the whole-document
+  `semanticTokens` full/delta and `captures/full` to the serve-current parked
+  wait (the latter reserving
+  `null` for no-snapshot / no-lineage / the settle backstop); the whole-document
   passive-refresh family (`documentSymbol`/`documentColor`/`documentLink`/
   `foldingRange`/`codeLens`/pull-`diagnostic`) to serve-stale; the position/range
   family — `semanticTokens/range`, `node/*`, `captures/range`,
@@ -520,19 +554,27 @@ inside the existing safety contracts at each step:
   fallback. This decision *reuses* the scheduler and its epoch rather than
   replacing them with an actor.
 - **Block all readers until fully current (status quo).** Rejected: it is the
-  behavior producing the 0.5–1.4 s waits. The user explicitly accepts a one-edit
-  stale highlight (healed by refresh) in exchange for never blocking, with
-  position-critical requests staleness-rejecting rather than serving stale.
+  behavior producing the 0.5–1.4 s waits — those waits were *synchronous*
+  (inline parses and lock convoys on the request path, stalling unrelated
+  documents). The `semanticTokens` full/delta reader has since moved back to a
+  **parked** current-wait (§3) because live-editor evidence showed serve-stale
+  corrupting drawn highlights; the crucial difference from the status quo is
+  that the park is a cheap `watch` subscription bounded by the off-ingress
+  parse (§4 keeps the runtime pollable), released early by supersede/cancel,
+  and never blocks other documents or other readers.
 
 ## Consequences
 
 ### Positive
 
 - Document lifecycle is fully decoupled from parsing: `didChange` never awaits a
-  parse, and no *per-keystroke* read blocks on a parse. The only two bounded waits
-  are deliberate and rare: the first-parse wait after `didOpen` (no snapshot yet)
-  and the explicit-action wait (`formatting`/`rename`) that trades a jarring no-op
-  for a short pause on a user-triggered command.
+  parse, and no read *blocks* the runtime on a parse. The bounded waits are
+  deliberate: the first-parse wait after `didOpen` (no snapshot yet), the
+  explicit-action wait (`formatting`/`rename`) that trades a jarring no-op
+  for a short pause on a user-triggered command, and the serve-current token
+  park (§3) — a `watch` subscription released by the parse's own publish,
+  chosen over serve-stale because answering from a trailing snapshot corrupts
+  what the editor draws.
 - The async runtime is never blocked by tree-CPU: with all synchronous tree work
   on the bounded pool, a slow parse on one document cannot freeze the request loop,
   timers, diagnostics, or another document's async handlers — the specific defect
@@ -557,20 +599,23 @@ inside the existing safety contracts at each step:
 
 ### Negative
 
-- Highlight-class results may be **stale — usually one edit, potentially several under sustained typing** (the scheduler coalesces) — until a fresh snapshot
-  publishes. `semanticTokens` is re-driven by an added
-  post-edit `semanticTokens/refresh` (emitted from the parse loop to dodge the
-  synchronous-client reentrancy that keeps it out of `didChange`);
-  `documentSymbol`/`documentColor` self-correct only on the client's next natural
-  request (no active refresh added).
+- Highlight-class results trail the input until a fresh snapshot publishes.
+  `semanticTokens` full/delta **parks** for the current snapshot (silence keeps
+  the editor's shifted extmarks intact — see §3) and falls back to
+  `ContentModified` + the settle refresh only past its backstop; `captures/full`
+  and `full/delta` take the same parked wait (§3 — revised from the original
+  serve-stale on live-editor evidence), answering `null` (their protocol
+  re-sync signal) past the backstop; `documentSymbol`/`documentColor`
+  self-correct only on the client's next natural request (no active refresh
+  added).
 - Staleness-reject requests (`kakehashi/node/*`, range requests, formatting) return
   `ContentModified` during the reparse window (`captures/range` returns `null`, its
   protocol re-sync signal). The LSP spec does not mandate retry on `ContentModified`,
   so on a client that does not re-request (e.g. Neovim's built-in client for
   formatting) that keystroke's request **no-ops** until the next natural request;
   `formatting`/`rename`/`selectionRange` mitigate with the brief bounded wait.
-  `captures/full` is *not* in this class — it serves-stale (§3) to avoid a
-  null-then-re-request busy-spin during typing. Keeping `node/*` staleness-reject
+  `captures/full` is *not* in this class — it takes the serve-current parked
+  wait (§3). Keeping `node/*` staleness-reject
   rather than serve-stale is the cost of not forking a per-snapshot tracker view now.
 - The `#342`/`#374` stale-tree guarantee (a reader observes at least its own edit)
   is relaxed to "a reader observes a *consistent* snapshot that may trail the input
@@ -623,8 +668,11 @@ dequeue hook (§4).
 incarnation guard, `u64::MAX` close sentinel, reserved in `next_incarnation`
 and refused by the guard itself); the parse loop dual-writes on every
 resolution path and emits `semanticTokens/refresh` at its publish point;
-`semanticTokens` full/delta and `captures/full` serve-stale (the lineage store
-gains the §3 request-entry version guard); `semanticTokens/range` and the
+`semanticTokens` full/delta serve-current via the parked wait (initially
+shipped serve-stale; revised on live-editor evidence — see §3) and
+`captures/full` likewise serve-current (initially serve-stale; revised after
+its stale walks proved guaranteed-null compute waste — the lineage store
+keeps the §3 request-entry version guard for the resolve→delivery window); `semanticTokens/range` and the
 bridge/formatting/node families staleness-reject (`ContentModified`, or the
 protocol-appropriate `null`); `formatting`, `rangeFormatting`, and
 `selectionRange` take the explicit-action bounded wait (the two formatting

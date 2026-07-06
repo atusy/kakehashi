@@ -76,10 +76,9 @@ impl Kakehashi {
             self.bridge.apply_input_edits(&uri, &edit_infos)
         };
 
-        // Invalidate injection caches for regions overlapping with edits. Must run
-        // here (pre-edit invalidation) before the off-ingress reparse loop
-        // repopulates the injection map from the freshly parsed tree.
-        self.cache.invalidate_for_edits(&uri, &edits);
+        // No pre-edit injection-token-cache invalidation: the cache is
+        // content-addressed, so an edited region simply misses under its new
+        // content hash and the old entry is swept by the reparse's populate.
 
         // Apply the edit to the store and CLEAR the reader-visible tree
         // synchronously, here under the edit lock (per-document-parse-scheduler ADR).

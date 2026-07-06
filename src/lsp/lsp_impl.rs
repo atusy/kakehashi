@@ -225,7 +225,10 @@ pub struct Kakehashi {
     /// `resultId` falls back to a full response only when a single mode slot
     /// is live (unambiguous), otherwise `null`.
     #[allow(clippy::type_complexity)]
-    captures_cache: dashmap::DashMap<(Url, String), [Option<(String, Vec<serde_json::Value>)>; 2]>,
+    captures_cache: dashmap::DashMap<
+        (Url, String),
+        [Option<(String, std::sync::Arc<Vec<serde_json::Value>>)>; 2],
+    >,
     /// Memoized captures walk results per `(uri, kind, injection-mode)`,
     /// tagged with the exact inputs they were computed from — snapshot
     /// `(parsed_version, incarnation)` and the settings generation. A typing
@@ -237,6 +240,14 @@ pub struct Kakehashi {
     #[allow(clippy::type_complexity)]
     captures_walk_cache:
         dashmap::DashMap<(Url, String, bool), kakehashi::captures::CachedCapturesWalk>,
+    /// Single-flight markers for in-progress captures walks, keyed like the
+    /// walk memo above: concurrent identical requests (a client's `full` +
+    /// `delta`s for one kind) park on the winner's `Notify` and serve the
+    /// memo instead of re-executing the walk. Entries are removed by the
+    /// winner's drop guard; the map only ever holds walks currently running.
+    #[allow(clippy::type_complexity)]
+    captures_walk_inflight:
+        dashmap::DashMap<(Url, String, bool), std::sync::Arc<tokio::sync::Notify>>,
     /// True when the process runs as a one-shot CLI (`kakehashi diagnose`/`format`)
     /// rather than a long-lived LSP server. Set once by `cli_initialize`. No editor
     /// consumes a proactive `publishDiagnostics` in CLI mode (the stub client pump
@@ -320,6 +331,7 @@ impl Kakehashi {
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
             captures_walk_cache: dashmap::DashMap::new(),
+            captures_walk_inflight: dashmap::DashMap::new(),
             cli_mode: std::sync::atomic::AtomicBool::new(false),
             parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
         }

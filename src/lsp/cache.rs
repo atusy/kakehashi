@@ -11,10 +11,8 @@
 //! `bump_semantic_token_generation`) so post-reload requests recompute; `didChange`
 //! never invalidates.
 
-use std::collections::{HashMap, HashSet};
-
 use tower_lsp_server::ls_types::SemanticTokens;
-use tree_sitter::{InputEdit, Tree};
+use tree_sitter::Tree;
 use url::Url;
 
 use crate::analysis::{
@@ -134,48 +132,6 @@ impl CacheCoordinator {
         self.injection_token_cache.clear_document(uri);
     }
 
-    // ========================================================================
-    // Edit handling (did_change)
-    // ========================================================================
-
-    /// Invalidate injection caches for regions that overlap with edits.
-    ///
-    /// Called by `did_change` BEFORE the tree is cleared and the off-ingress reparse
-    /// is scheduled, so it uses pre-edit byte offsets against pre-edit injection
-    /// regions: edits outside injections preserve caches, edits inside invalidate
-    /// only affected regions.
-    ///
-    /// Uses an O(log n) interval tree query.
-    pub(crate) fn invalidate_for_edits(&self, uri: &Url, edits: &[InputEdit]) {
-        if edits.is_empty() {
-            return;
-        }
-
-        // Find all regions that overlap with any edit using O(log n) queries
-        for edit in edits {
-            let edit_start = edit.start_byte;
-            let edit_end = edit.old_end_byte;
-
-            // Query interval tree for overlapping regions (O(log n) instead of O(n))
-            if let Some(overlapping_regions) = self
-                .injection_map
-                .find_overlapping(uri, edit_start, edit_end)
-            {
-                for region in overlapping_regions {
-                    // This region is affected - invalidate its cache
-                    self.injection_token_cache.remove(uri, &region.region_id);
-                    log::debug!(
-                        target: "kakehashi::injection_cache",
-                        "Invalidated injection cache for {} region (edit bytes {}..{})",
-                        region.language,
-                        edit_start,
-                        edit_end
-                    );
-                }
-            }
-        }
-    }
-
     /// Invalidate semantic token cache for a document.
     ///
     /// Note: This should NOT be called during `didChange` - the cached tokens are
@@ -194,16 +150,6 @@ impl CacheCoordinator {
             );
         }
         self.semantic_cache.remove(uri);
-    }
-
-    /// Remove injection token cache entries for specific ULIDs.
-    ///
-    /// Called when region IDs are invalidated (e.g., due to edits touching their START).
-    /// The corresponding virtual documents become orphaned in downstream LSs.
-    pub(crate) fn remove_injection_tokens_for_ulids(&self, uri: &Url, ulids: &[ulid::Ulid]) {
-        for ulid in ulids {
-            self.injection_token_cache.remove(uri, &ulid.to_string());
-        }
     }
 
     // ========================================================================
@@ -290,14 +236,6 @@ impl CacheCoordinator {
                 return PopulatedInjections::empty(generation);
             }
 
-            // Get existing regions for cache cleanup and content comparison
-            let existing_regions = self.injection_map.get(uri);
-
-            // Build lookup map for existing regions by region_id (skip if no existing regions)
-            let existing_by_id: Option<HashMap<&str, &CacheableInjectionRegion>> = existing_regions
-                .as_ref()
-                .map(|regions| regions.iter().map(|r| (r.region_id.as_str(), r)).collect());
-
             // Convert to CacheableInjectionRegion using position-based ULIDs
             // NodeTracker provides stable IDs based on (uri, start_byte, end_byte, kind)
             let cacheable_regions: Vec<CacheableInjectionRegion> = regions
@@ -316,50 +254,9 @@ impl CacheCoordinator {
                         minted_ids.push(ulid);
                     }
                     let region_id = ulid.to_string();
-                    let new_region =
-                        CacheableInjectionRegion::from_region_info(info, &region_id, text);
-
-                    // Check if content_hash or language changed - invalidate semantic token cache
-                    // Position-based ULIDs are stable, but cached tokens become invalid when:
-                    // - content_hash changes: code content was modified
-                    // - language changes: info string changed (e.g., ```lua → ```python)
-                    //
-                    // NOTE: This may double-invalidate regions already handled by invalidate_for_edits().
-                    // This is intentional and correct because the two functions serve different purposes:
-                    // - invalidate_for_edits(): Called BEFORE parse, handles spatial overlap (edit touched region)
-                    // - This code: Called AFTER parse, handles semantic change (content/language changed)
-                    // Double removal is idempotent (DashMap remove on missing key is a no-op), so this
-                    // is safe. Combining these checks would require tracking invalidation state, adding
-                    // complexity for negligible performance gain.
-                    //
-                    // Skip this check entirely if no existing regions (first document open)
-                    if let Some(ref map) = existing_by_id
-                        && let Some(old) = map.get(region_id.as_str())
-                    {
-                        let content_changed = old.content_hash != new_region.content_hash;
-                        let language_changed = old.language != new_region.language;
-                        if content_changed || language_changed {
-                            self.injection_token_cache.remove(uri, &region_id);
-                        }
-                    }
-
-                    new_region
+                    CacheableInjectionRegion::from_region_info(info, &region_id, text)
                 })
                 .collect();
-
-            // Find stale region IDs that are no longer present
-            if let Some(old_regions) = existing_regions {
-                let new_region_ids: HashSet<_> = cacheable_regions
-                    .iter()
-                    .map(|r| r.region_id.as_str())
-                    .collect();
-                for old in old_regions.iter() {
-                    if !new_region_ids.contains(old.region_id.as_str()) {
-                        // This region no longer exists - clear its cache
-                        self.injection_token_cache.remove(uri, &old.region_id);
-                    }
-                }
-            }
 
             // Bridge-downstream regions from the SAME collected `regions`
             // (parse-snapshot ADR §3, never discover twice): the exact
@@ -424,6 +321,28 @@ impl CacheCoordinator {
                 generation,
             );
 
+            // Live-hash set for the content-addressed injection-token cache's
+            // eviction sweep, taken from the DISCOVERY's own per-region cache
+            // identities — the exact fold and language resolution the
+            // store/read path uses (deriving it from any other resolver would
+            // silently evict live entries whenever the two resolvers
+            // disagree). A PARTIAL discovery (combined group present) still
+            // carries every single region's identity, so the sweep keeps the
+            // entries the inline path stores for those docs. `None` discovery
+            // (below the gate — the same singles count that gates the inline
+            // store path) yields an empty set: the token cache is inactive
+            // there, so sweeping everything for the document is the correct
+            // bound.
+            let live_hashes: std::collections::HashSet<u64> = discovery
+                .as_ref()
+                .map(|d| {
+                    d.regions
+                        .iter()
+                        .filter_map(|r| r.token_cache.as_ref().map(|tc| tc.validity_hash))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Exit half of the mint reconciliation, atomic with coordinate
             // shifts: the commit runs under the tracker entry's shared lock
             // and only while the (shift generation, cleanup epoch) latch
@@ -436,12 +355,19 @@ impl CacheCoordinator {
             // replaces it), and withhold the region-id-bearing products; the
             // snapshot then rides without regions and every reader falls
             // back inline, byte-identically to the pre-lever path. The
-            // token-cache evictions this pass already performed are
-            // conservative (idempotent removes) and need no rollback.
+            // token-cache sweep runs inside the commit closure, so a stale
+            // pass performs no eviction at all.
             let committed = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
-                // Commit point: store the region set the token-cache
-                // bookkeeping (reanchor/eviction) keys off.
+                // Commit point: record the committed pass's region set (test
+                // observability today; no production reader since token
+                // eviction went content-addressed — a plain move), and run
+                // the content-addressed token cache's eviction sweep with the
+                // same epoch gate — a stale pass must not sweep entries the
+                // LIVE text's regions still hit (a wrongly swept entry is
+                // only a recompute, but a gratuitous one).
                 self.injection_map.insert(uri.clone(), cacheable_regions);
+                self.injection_token_cache
+                    .retain_document(uri, &live_hashes);
             });
             if committed.is_none() {
                 for id in &minted_ids {
@@ -889,20 +815,21 @@ print("hello")
         let initial_content_hash = regions[0].content_hash;
         assert_eq!(regions[0].language, "lua");
 
-        // Store region-local tokens under the region's current content hash.
-        cache.injection_token_cache.store(
-            &uri,
-            &initial_region_id,
-            initial_content_hash,
-            0,
-            injection_raw_tokens(),
-        );
+        // Store region-local tokens under the region's LIVE validity hash (the
+        // content ⊕ resolved-language fold the production path uses; with no
+        // lua parser registered the resolver falls back to the raw
+        // identifier, deterministically).
+        let initial_validity =
+            crate::analysis::semantic_cache::region_validity_hash(initial_content_hash, "lua");
+        cache
+            .injection_token_cache
+            .store(&uri, initial_validity, 0, injection_raw_tokens());
 
         // Verify tokens are stored
         assert!(
             cache
                 .injection_token_cache
-                .get(&uri, &initial_region_id, initial_content_hash, 0)
+                .get(&uri, initial_validity, 0)
                 .is_some(),
             "tokens should be cached before language change"
         );
@@ -953,18 +880,16 @@ print("hello")
             "language should be updated to python"
         );
 
-        // CRITICAL ASSERTION: Cached tokens should be INVALIDATED
-        // This is the key behavior that wasn't tested before.
-        // The invalidation happens at lines 231-235 in populate_injections:
-        //   if content_changed || language_changed {
-        //       self.injection_token_cache.remove(uri, &region_id);
-        //   }
+        // CRITICAL ASSERTION: the old-language entry must be gone. Content
+        // addressing gives this twice over: the read path now looks up the
+        // python fold (a natural miss), and populate's eviction sweep drops
+        // the lua-fold entry because it is no longer in the live hash set.
         assert!(
             cache
                 .injection_token_cache
-                .get(&uri, &initial_region_id, initial_content_hash, 0)
+                .get(&uri, initial_validity, 0)
                 .is_none(),
-            "cached tokens should be invalidated when language changes"
+            "the old-language entry must be swept when the language changes"
         );
     }
 
@@ -1022,19 +947,17 @@ print("hello")
         let initial_region_id = regions[0].region_id.clone();
         let initial_content_hash = regions[0].content_hash;
 
-        // Store region-local tokens under the region's current content hash.
-        cache.injection_token_cache.store(
-            &uri,
-            &initial_region_id,
-            initial_content_hash,
-            0,
-            injection_raw_tokens(),
-        );
+        // Store region-local tokens under the region's LIVE validity hash.
+        let initial_validity =
+            crate::analysis::semantic_cache::region_validity_hash(initial_content_hash, "lua");
+        cache
+            .injection_token_cache
+            .store(&uri, initial_validity, 0, injection_raw_tokens());
 
         assert!(
             cache
                 .injection_token_cache
-                .get(&uri, &initial_region_id, initial_content_hash, 0)
+                .get(&uri, initial_validity, 0)
                 .is_some(),
             "tokens should be cached before content change"
         );
@@ -1078,13 +1001,15 @@ print("goodbye")
             "content_hash should change"
         );
 
-        // Cached tokens should be invalidated due to content change
+        // The old-content entry must be swept: its hash left the live set
+        // when the region's content changed (the read path also misses
+        // naturally, keyed by the NEW content).
         assert!(
             cache
                 .injection_token_cache
-                .get(&uri, &initial_region_id, initial_content_hash, 0)
+                .get(&uri, initial_validity, 0)
                 .is_none(),
-            "cached tokens should be invalidated when content changes"
+            "the old-content entry must be swept when the content changes"
         );
     }
 

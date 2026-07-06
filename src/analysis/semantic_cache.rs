@@ -2,16 +2,16 @@
 //!
 //! Three layers (all `DashMap`-backed for concurrent access):
 //! - `SemanticTokenCache`: per-URI tokens, served when LSP `result_id` matches.
-//! - `InjectionMap`: per-URI interval tree (rust_lapper) of injection regions
-//!   keyed by region_id (ULID), giving O(log n) overlap queries so an edit only
-//!   invalidates regions it actually touches.
-//! - `InjectionTokenCache`: per-(URI, region_id) tokens, reusable when an edit
-//!   lies outside that region.
+//! - `InjectionMap`: per-URI set of injection regions from the last committed
+//!   populate pass (spatial queries are test-only since token eviction went
+//!   content-addressed).
+//! - `InjectionTokenCache`: per-(URI, content-validity-hash) region tokens —
+//!   content-addressed, so an edit outside a region can't touch its entry and
+//!   byte-identical regions reuse each other's tokens.
 
 use crate::analysis::semantic::RawToken;
 use crate::language::injection::CacheableInjectionRegion;
 use dashmap::DashMap;
-use rust_lapper::{Interval, Lapper};
 use tower_lsp_server::ls_types::{Range, SemanticTokens};
 use url::Url;
 
@@ -230,90 +230,75 @@ impl Default for SemanticTokenRangeCache {
     }
 }
 
-/// Thread-safe map of injection regions per document.
+/// Thread-safe map of injection regions per document: the region set of the
+/// last COMMITTED populate pass.
 ///
-/// Tracks all `CacheableInjectionRegion`s for each document URI,
-/// enabling targeted cache invalidation when only specific injections change.
-/// Uses interval tree (rust_lapper) for O(log n) overlap queries.
+/// Content addressing removed the spatial-invalidation consumer, so no
+/// production path reads this today — populate writes it at the commit point
+/// (a plain move of the already-built region vec, no per-populate index
+/// build) and tests observe it to pin what a committed pass recorded. The
+/// spatial queries are test-only linear scans; if the §3 mint-reconciliation
+/// split doesn't end up consuming the map, delete it and port the tests.
 pub struct InjectionMap {
-    /// Stores interval trees per document URI
-    /// Each Interval contains the byte range and the full CacheableInjectionRegion as data
-    lappers: DashMap<Url, Lapper<usize, CacheableInjectionRegion>>,
+    regions: DashMap<Url, Vec<CacheableInjectionRegion>>,
 }
 
 impl InjectionMap {
     /// Create a new empty injection map.
     pub fn new() -> Self {
         Self {
-            lappers: DashMap::new(),
+            regions: DashMap::new(),
         }
     }
 
     /// Store injection regions for a document, replacing any existing regions.
-    /// Builds an interval tree from the regions for efficient overlap queries.
+    /// A plain move — nothing on the pre-publish critical path is built here.
     pub fn insert(&self, uri: Url, regions: Vec<CacheableInjectionRegion>) {
-        // Convert regions to intervals for the Lapper
-        let intervals: Vec<Interval<usize, CacheableInjectionRegion>> = regions
-            .into_iter()
-            .map(|region| {
-                let start = region.byte_range.start;
-                let stop = region.byte_range.end;
-                Interval {
-                    start,
-                    stop,
-                    val: region,
-                }
-            })
-            .collect();
-
-        // Create Lapper from intervals (builds interval tree)
-        let lapper = Lapper::new(intervals);
-        self.lappers.insert(uri, lapper);
+        self.regions.insert(uri, regions);
     }
 
     /// Retrieve all injection regions for a document.
+    #[cfg(test)]
     pub fn get(&self, uri: &Url) -> Option<Vec<CacheableInjectionRegion>> {
-        self.lappers
-            .get(uri)
-            .map(|entry| entry.iter().map(|interval| interval.val.clone()).collect())
+        self.regions.get(uri).map(|entry| entry.clone())
     }
 
     /// Remove all injection regions for a document (e.g., on document close).
     pub fn clear(&self, uri: &Url) {
-        self.lappers.remove(uri);
+        self.regions.remove(uri);
     }
 
-    /// Find the injection region containing the given byte position (test-only).
+    /// Find the injection region containing the given byte position (test-only
+    /// linear scan).
     #[cfg(test)]
     pub fn find_at_position(
         &self,
         uri: &Url,
         byte_position: usize,
     ) -> Option<CacheableInjectionRegion> {
-        self.lappers.get(uri).and_then(|lapper| {
-            // Find intervals that overlap the single byte position
-            lapper
-                .find(byte_position, byte_position + 1)
-                .next()
-                .map(|interval| interval.val.clone())
+        self.regions.get(uri).and_then(|regions| {
+            regions
+                .iter()
+                .find(|r| r.byte_range.start <= byte_position && byte_position < r.byte_range.end)
+                .cloned()
         })
     }
 
-    /// Find all injection regions that overlap with the given byte range.
-    ///
-    /// Uses O(log n) interval tree query instead of O(n) iteration through all regions.
-    ///
-    /// Returns `Some(Vec)` with overlapping regions (may be empty), or `None` if URI unknown.
+    /// Find all injection regions that overlap with the given byte range
+    /// (test-only linear scan — content addressing removed the spatial
+    /// invalidation path that needed an index).
+    #[cfg(test)]
     pub fn find_overlapping(
         &self,
         uri: &Url,
         start: usize,
         end: usize,
     ) -> Option<Vec<CacheableInjectionRegion>> {
-        self.lappers.get(uri).map(|lapper| {
-            lapper
-                .find(start, end)
-                .map(|interval| interval.val.clone())
+        self.regions.get(uri).map(|regions| {
+            regions
+                .iter()
+                .filter(|r| r.byte_range.start < end && start < r.byte_range.end)
+                .cloned()
                 .collect()
         })
     }
@@ -332,29 +317,57 @@ impl Default for InjectionMap {
 /// hot path can reuse them across edits that don't touch the region, re-anchoring
 /// them to the region's current host line at read time.
 ///
-/// The key is just `(uri, region_id)`; the validity lives in the *value* — the
-/// same shape `SemanticTokenCache` uses for its `cache_key`. `validity_hash`
-/// folds the region's content hash with its resolved injection language (a
-/// content edit OR a language change at the same position misses on read), and
-/// `generation` is the settings/query generation (a config reload changes it, so
-/// old-query tokens stop matching) — the race-safe fold, not a bare `clear()`.
-/// Keeping these out of the *key* means each region holds exactly one entry
-/// (`store` overwrites), so `remove` is an O(1) point delete instead of a full
-/// scan and stale validity-siblings can't accumulate.
+/// The key is `(uri, validity_hash)` — **content-addressed** (parse-snapshot
+/// ADR §3's companion decision), where `validity_hash` folds the region's
+/// content hash with its resolved injection language (see
+/// [`region_validity_hash`]). Content addressing replaces the earlier
+/// tracker-ULID key: a byte-identical region reuses tokens across edits with
+/// no stable id at all (undo round-trips and duplicate fences hit for free),
+/// and no read path needs the tracker — the identity decoupling the §3 mint
+/// split relies on. An entry can never be *wrong* for its key (the key IS the
+/// content), so spatial edit invalidation disappears; eviction is a
+/// per-populate sweep ([`retain_document`](Self::retain_document)) that drops
+/// hashes no longer present in the parse's live region set — without it,
+/// typing inside a region would leak one entry per keystroke content.
+///
+/// `generation` (the settings/query epoch — bumped on config reload only,
+/// never per edit, the #530 discipline) stays in the *value* and is checked
+/// at read, so stale-generation entries read as misses even before the
+/// reload's `clear()` reclaims them.
 ///
 /// `supports_multiline` is deliberately *not* in the validity: it changes
 /// multiline-token emission, but it comes from the client capabilities snapshot
 /// (a `OnceLock` set once at `initialize()`), so it is session-constant and
 /// cannot flip mid-session — no entry can outlive a change to it.
 pub(crate) struct InjectionTokenCache {
-    cache: DashMap<(Url, String), CachedRegionTokens>,
+    /// Outer key: document; inner key: `validity_hash`. Nested (rather than a
+    /// flat `(Url, u64)` key) so the per-populate eviction sweep touches only
+    /// the swept document's entries — a flat `DashMap::retain` scans every
+    /// shard of every document under write locks on each parse commit. Reads
+    /// and stores are single-threaded per request (pre-fan-out resolve loop /
+    /// post-fan-in store loop), so the coarser per-document entry adds no
+    /// contention, and the read path drops its per-lookup `Url` clone.
+    cache: DashMap<Url, std::collections::HashMap<u64, CachedRegionTokens>>,
 }
 
-/// A region's cached tokens with the validity they were computed under.
+/// The per-region validity/cache key: the region's content hash folded with
+/// its **resolved** injection language, so identical bytes injecting a
+/// different language (or a language re-resolution after install) get a
+/// different key barring a 64-bit collision. One definition shared by the
+/// store/read path and populate's eviction sweep — the two must never drift.
+///
+/// Accepted bound: the 64-bit FNV-1a fold is not collision-resistant, and a
+/// collision has no secondary gate — but an accidental one is ~2⁻⁶⁴ and a
+/// *crafted* one only mis-highlights the crafting user's own buffer (tokens
+/// never cross documents: the outer key is the URI), so a cryptographic hash
+/// isn't worth its per-keystroke cost here.
+pub(crate) fn region_validity_hash(content_hash: u64, resolved_lang: &str) -> u64 {
+    content_hash ^ crate::text::fnv1a_hash(resolved_lang).wrapping_mul(0x100000001b3)
+}
+
+/// A region's cached tokens with the generation they were computed under.
 #[derive(Clone)]
 struct CachedRegionTokens {
-    /// Content hash folded with the resolved injection language.
-    validity_hash: u64,
     /// Settings/query generation in effect when these were computed.
     generation: u64,
     /// Region-local pre-finalize tokens.
@@ -369,57 +382,59 @@ impl InjectionTokenCache {
         }
     }
 
-    /// Store region-local tokens for an injection region, tagged with the
-    /// validity (`validity_hash` = content ⊕ resolved language, plus settings
-    /// `generation`) they were computed under. Overwrites any prior entry for the
-    /// region, so a region never holds more than one (possibly stale) entry.
+    /// Store region-local tokens under the region's content-addressed
+    /// `validity_hash`, tagged with the settings `generation` they were
+    /// computed under. Overwrites any prior entry for the same content —
+    /// byte-identical regions (including duplicates within one document)
+    /// share the entry.
     pub(crate) fn store(
         &self,
         uri: &Url,
-        region_id: &str,
         validity_hash: u64,
         generation: u64,
         tokens: Vec<RawToken>,
     ) {
-        self.cache.insert(
-            (uri.clone(), region_id.to_string()),
-            CachedRegionTokens {
-                validity_hash,
-                generation,
-                tokens,
-            },
-        );
+        // `get_mut` first: the steady-state store (document entry exists)
+        // avoids the `Url` clone the `entry` API needs for its owned key —
+        // the same discipline as `record_served_semantic_version`.
+        if let Some(mut doc) = self.cache.get_mut(uri) {
+            doc.insert(validity_hash, CachedRegionTokens { generation, tokens });
+            return;
+        }
+        self.cache
+            .entry(uri.clone())
+            .or_default()
+            .insert(validity_hash, CachedRegionTokens { generation, tokens });
     }
 
-    /// Retrieve region-local tokens iff the stored entry was computed under this
-    /// exact validity — same content + resolved language, same settings
-    /// generation. A mismatch (content/language edit or config reload) reads as a
-    /// miss so the region is recomputed.
+    /// Retrieve region-local tokens for this exact content (`validity_hash`
+    /// keys content ⊕ resolved language) iff they were computed under the
+    /// same settings generation. A config reload reads as a miss so the
+    /// region is recomputed under the new queries.
     pub(crate) fn get(
         &self,
         uri: &Url,
-        region_id: &str,
         validity_hash: u64,
         generation: u64,
     ) -> Option<Vec<RawToken>> {
-        let result = self
-            .cache
-            .get(&(uri.clone(), region_id.to_string()))
-            .filter(|entry| entry.validity_hash == validity_hash && entry.generation == generation)
-            .map(|entry| entry.tokens.clone());
+        let result = self.cache.get(uri).and_then(|doc| {
+            doc.get(&validity_hash)
+                .filter(|entry| entry.generation == generation)
+                .map(|entry| entry.tokens.clone())
+        });
 
         if result.is_some() {
             log::debug!(
                 target: "kakehashi::injection_cache",
-                "Cache HIT for injection region '{}' in {}",
-                region_id,
+                "Cache HIT for injection content {:#018x} in {}",
+                validity_hash,
                 uri.path()
             );
         } else {
             log::trace!(
                 target: "kakehashi::injection_cache",
-                "Cache MISS for injection region '{}' in {}",
-                region_id,
+                "Cache MISS for injection content {:#018x} in {}",
+                validity_hash,
                 uri.path()
             );
         }
@@ -427,16 +442,27 @@ impl InjectionTokenCache {
         result
     }
 
-    /// Remove an injection region's cached entry — an O(1) point delete, since a
-    /// region holds at most one entry. Called on eviction (edit-overlap,
-    /// content/language change, region removed).
-    pub(crate) fn remove(&self, uri: &Url, region_id: &str) {
-        self.cache.remove(&(uri.clone(), region_id.to_string()));
+    /// Eviction sweep (the content-addressed replacement for per-region point
+    /// deletes): keep only entries whose hash is in the parse's `live` region
+    /// set. Called by `populate_injections` after each parse — without it,
+    /// typing inside a region would leak one entry per keystroke content.
+    /// Entries are never *incorrect* (the key is the content), so a sweep
+    /// racing a store of an already-dead hash merely leaks that entry until
+    /// the next sweep.
+    pub(crate) fn retain_document(&self, uri: &Url, live: &std::collections::HashSet<u64>) {
+        // One shard write lock for both the sweep and the empty-entry
+        // reclaim: `remove_if_mut` mutates in place and removes only when
+        // the closure returns true, so a concurrent store can never land
+        // between the sweep and the reclaim.
+        self.cache.remove_if_mut(uri, |_, doc| {
+            doc.retain(|hash, _| live.contains(hash));
+            doc.is_empty()
+        });
     }
 
     /// Remove all cached tokens for a document (all its injection regions).
     pub(crate) fn clear_document(&self, uri: &Url) {
-        self.cache.retain(|key, _| &key.0 != uri);
+        self.cache.remove(uri);
     }
 
     /// Drop every cached entry. Used on a settings/query reload (alongside the
@@ -448,22 +474,19 @@ impl InjectionTokenCache {
         self.cache.clear();
     }
 
-    /// `(region_id, validity_hash, generation)` currently stored for a document —
-    /// lets a test confirm what the hot path persisted and overwrite a specific
-    /// entry to prove the reuse path reads it.
+    /// `(validity_hash, generation)` currently stored for a document — lets a
+    /// test confirm what the hot path persisted and overwrite a specific entry
+    /// to prove the reuse path reads it.
     #[cfg(test)]
-    pub(crate) fn test_keys(&self, uri: &Url) -> Vec<(String, u64, u64)> {
+    pub(crate) fn test_keys(&self, uri: &Url) -> Vec<(u64, u64)> {
         self.cache
-            .iter()
-            .filter(|e| &e.key().0 == uri)
-            .map(|e| {
-                (
-                    e.key().1.clone(),
-                    e.value().validity_hash,
-                    e.value().generation,
-                )
+            .get(uri)
+            .map(|doc| {
+                doc.iter()
+                    .map(|(hash, entry)| (*hash, entry.generation))
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
 }
 
@@ -764,69 +787,100 @@ mod tests {
         let tokens2 = vec![raw_token(1, 2, 10)];
 
         // Store region-local tokens under a content hash + generation.
-        cache.store(&uri, "region-1", 0xAA, 0, tokens1.clone());
-        cache.store(&uri, "region-2", 0xBB, 0, tokens2.clone());
+        cache.store(&uri, 0xAA, 0, tokens1.clone());
+        cache.store(&uri, 0xBB, 0, tokens2.clone());
 
         // Retrieve by the full validity key.
-        let retrieved1 = cache.get(&uri, "region-1", 0xAA, 0);
+        let retrieved1 = cache.get(&uri, 0xAA, 0);
         assert!(retrieved1.is_some(), "Should retrieve tokens for region-1");
         assert_eq!(retrieved1.unwrap()[0].length, 5);
 
-        let retrieved2 = cache.get(&uri, "region-2", 0xBB, 0);
+        let retrieved2 = cache.get(&uri, 0xBB, 0);
         assert!(retrieved2.is_some(), "Should retrieve tokens for region-2");
         assert_eq!(retrieved2.unwrap()[0].length, 10);
 
-        // Non-existent region returns None
-        assert!(cache.get(&uri, "region-3", 0xAA, 0).is_none());
+        // Unknown content hash returns None
+        assert!(cache.get(&uri, 0xCC, 0).is_none());
 
         // Non-existent URI returns None
         let other_uri = Url::parse("file:///other.md").unwrap();
-        assert!(cache.get(&other_uri, "region-1", 0xAA, 0).is_none());
+        assert!(cache.get(&other_uri, 0xAA, 0).is_none());
     }
 
     #[test]
     fn injection_token_cache_validity_key_gates_reads() {
         let cache = InjectionTokenCache::new();
         let uri = Url::parse("file:///t.md").unwrap();
-        cache.store(&uri, "r", 0x1111, 7, vec![raw_token(0, 0, 4)]);
+        cache.store(&uri, 0x1111, 7, vec![raw_token(0, 0, 4)]);
 
         // Exact key hits.
-        assert!(cache.get(&uri, "r", 0x1111, 7).is_some());
+        assert!(cache.get(&uri, 0x1111, 7).is_some());
 
         // A different content hash (region content changed) misses.
         assert!(
-            cache.get(&uri, "r", 0x2222, 7).is_none(),
+            cache.get(&uri, 0x2222, 7).is_none(),
             "content-hash mismatch must miss so edited content is recomputed"
         );
 
         // A different generation (settings/query reload) misses, even for the
         // same content — the race-safe fold, not a bare clear.
         assert!(
-            cache.get(&uri, "r", 0x1111, 8).is_none(),
+            cache.get(&uri, 0x1111, 8).is_none(),
             "generation mismatch must miss so post-reload requests recompute"
         );
     }
 
     #[test]
-    fn injection_token_cache_store_overwrites_and_remove_is_point_delete() {
+    fn injection_token_cache_sweep_bounds_distinct_contents() {
         let cache = InjectionTokenCache::new();
         let uri = Url::parse("file:///t.md").unwrap();
 
-        // Validity lives in the value, so a second store for the same region
-        // OVERWRITES the first — a region never accumulates stale siblings, which
-        // is what lets `remove` be an O(1) point delete.
-        cache.store(&uri, "r", 0x1111, 0, vec![raw_token(0, 0, 4)]);
-        cache.store(&uri, "r", 0x2222, 0, vec![raw_token(0, 0, 5)]);
-        assert!(
-            cache.get(&uri, "r", 0x1111, 0).is_none(),
-            "the overwritten (old-validity) entry must be gone"
-        );
-        let current = cache.get(&uri, "r", 0x2222, 0).expect("latest entry hits");
-        assert_eq!(current[0].length, 5);
+        // Content-addressed: distinct contents COEXIST (an edited region's old
+        // entry stays readable-by-nobody until swept; an undo back to 0x1111
+        // would hit again).
+        cache.store(&uri, 0x1111, 0, vec![raw_token(0, 0, 4)]);
+        cache.store(&uri, 0x2222, 0, vec![raw_token(0, 0, 5)]);
+        assert!(cache.get(&uri, 0x1111, 0).is_some());
+        assert!(cache.get(&uri, 0x2222, 0).is_some());
 
-        // remove drops that single entry.
-        cache.remove(&uri, "r");
-        assert!(cache.get(&uri, "r", 0x2222, 0).is_none());
+        // Identical content overwrites in place (one entry per content).
+        cache.store(&uri, 0x2222, 0, vec![raw_token(0, 0, 6)]);
+        assert_eq!(cache.get(&uri, 0x2222, 0).expect("hits")[0].length, 6);
+
+        // The populate sweep is the growth bound: only live hashes survive,
+        // and other documents' entries are untouched.
+        let other_uri = Url::parse("file:///other.md").unwrap();
+        cache.store(&other_uri, 0x1111, 0, vec![raw_token(0, 0, 7)]);
+        let live = std::collections::HashSet::from([0x2222]);
+        cache.retain_document(&uri, &live);
+        assert!(cache.get(&uri, 0x1111, 0).is_none(), "dead hash swept");
+        assert!(cache.get(&uri, 0x2222, 0).is_some(), "live hash retained");
+        assert!(
+            cache.get(&other_uri, 0x1111, 0).is_some(),
+            "other documents' entries survive a sweep"
+        );
+    }
+
+    /// The validity fold must separate resolved languages for identical bytes
+    /// (the #530 wrong-language discipline) and be deterministic — the store/
+    /// read path and populate's eviction sweep both compute it and must agree.
+    #[test]
+    fn region_validity_hash_separates_languages_and_is_deterministic() {
+        let content_hash = 0xDEAD_BEEF_u64;
+        assert_eq!(
+            region_validity_hash(content_hash, "lua"),
+            region_validity_hash(content_hash, "lua"),
+        );
+        assert_ne!(
+            region_validity_hash(content_hash, "lua"),
+            region_validity_hash(content_hash, "python"),
+            "identical bytes injecting a different language must key differently"
+        );
+        assert_ne!(
+            region_validity_hash(0x1111, "lua"),
+            region_validity_hash(0x2222, "lua"),
+            "different content must key differently for the same language"
+        );
     }
 
     #[test]
@@ -858,8 +912,16 @@ mod tests {
         ];
         injection_map.insert(uri.clone(), regions);
 
-        // Set up cached tokens for the lua region, keyed by its content hash.
-        token_cache.store(&uri, "lua-region-1", 11111, 0, vec![raw_token(0, 0, 3)]);
+        // Set up cached tokens for the lua region, keyed by the cache's real
+        // contract: the content ⊕ resolved-language fold, never the raw
+        // content hash (identical bytes injecting a different language must
+        // not share an entry).
+        token_cache.store(
+            &uri,
+            region_validity_hash(11111, "lua"),
+            0,
+            vec![raw_token(0, 0, 3)],
+        );
 
         // Find region containing byte offset and get its cached tokens
         let regions = injection_map.get(&uri).unwrap();
@@ -869,10 +931,15 @@ mod tests {
         let region = region_at_byte_30.unwrap();
         assert_eq!(region.language, "lua");
 
-        // Use region_id + content_hash to get cached tokens
-        let cached = token_cache.get(&uri, &region.region_id, region.content_hash, 0);
+        // Content-addressed lookup through the same fold the read path uses.
+        let cached = token_cache.get(&uri, region_validity_hash(region.content_hash, "lua"), 0);
         assert!(cached.is_some(), "Should have cached tokens for lua region");
         assert_eq!(cached.unwrap()[0].length, 3);
+        // The raw content hash alone must MISS — the fold is load-bearing.
+        assert!(
+            token_cache.get(&uri, region.content_hash, 0).is_none(),
+            "raw content hash without the language fold must not hit"
+        );
     }
 
     #[test]

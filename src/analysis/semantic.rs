@@ -182,7 +182,7 @@ pub(crate) async fn handle_semantic_tokens_full(
                 .and_then(|p| {
                     p.discovery
                         .as_ref()
-                        .filter(|d| d.generation == p.generation)
+                        .filter(|d| d.generation == p.generation && d.complete)
                 })
                 .map(|d| d.regions.len().to_string())
                 .unwrap_or_else(|| "none".to_string()),

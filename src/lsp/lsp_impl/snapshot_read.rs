@@ -30,10 +30,34 @@ pub(crate) enum SnapshotWait {
 /// handlers' `snapshot_for_tokens` and the explicit-action
 /// `wait_for_current_snapshot`): generous on purpose, because it only runs
 /// while the lifetime has NO snapshot and every open-parse resolution path
-/// publishes one (tree, tree-less give-up, or the didClose sentinel) — so it
-/// is bounded by parse completion, not wall time. One constant so the two
-/// reader classes cannot drift apart.
+/// publishes one (tree, tree-less give-up, or the didClose sentinel) — the
+/// wait is normally RELEASED by that publish long before this wall-clock
+/// deadline; the deadline exists for the pathological case (a parse pipeline
+/// that never resolves), and an unusually slow first parse that outruns it
+/// degrades to the reader's empty fallback. One constant so the two reader
+/// classes cannot drift apart.
 pub(crate) const FIRST_PARSE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Settle backstop for the serve-current token readers (`semanticTokens`
+/// full/delta): how long a token request may park waiting for the snapshot to
+/// catch up with the live text before rejecting with `ContentModified`.
+///
+/// Like the first-parse backstop this is a wall-clock deadline that is
+/// normally never reached: every edit's parse resolution publishes and
+/// releases the park, so it expires only when the parse pipeline is slow
+/// enough (saturation, a pathologically slow parse) that the snapshot cannot
+/// catch up within it. Generous on purpose:
+/// while the request parks, the client keeps drawing its previous tokens
+/// (shifted by the editor across edits), which is strictly better than
+/// receiving tokens computed for text it no longer has. On expiry the parse
+/// loop's settle refresh re-drives the client once the snapshot lands.
+///
+/// This constant governs the *stale* park only (a snapshot exists but
+/// trails). A document with NO snapshot for its lifetime parks on
+/// [`FIRST_PARSE_BACKSTOP`] instead, regardless of the caller's `wait` — a
+/// token reader's worst-case park is therefore the first-parse bound (15s),
+/// not this.
+pub(crate) const TOKEN_SETTLE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Kakehashi {
     /// Wait (bounded) until `uri`'s latest snapshot is current, re-resolving

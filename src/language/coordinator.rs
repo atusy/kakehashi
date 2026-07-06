@@ -997,7 +997,10 @@ impl LanguageCoordinator {
         identifier: &str,
         content: &str,
     ) -> Option<(String, LanguageLoadResult)> {
-        log::debug!(
+        // trace!, not debug!: this runs per injection region per parse/walk
+        // (thousands per keystroke on injection-heavy documents), and at
+        // debug level the log volume itself becomes a measurable cost.
+        log::trace!(
             target: "kakehashi::language_detection",
             "Resolving injection language for identifier='{}', content_len={}",
             identifier,
@@ -1008,7 +1011,7 @@ impl LanguageCoordinator {
         if identifier != "plaintext"
             && let Some(found) = self.try_load_with_base(identifier)
         {
-            log::debug!(
+            log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via identifier (direct or base)",
                 identifier, found.0
@@ -1020,7 +1023,7 @@ impl LanguageCoordinator {
         if let Some(normalized) = super::heuristic::detect_from_token(identifier)
             && let Some(found) = self.try_load_with_base(&normalized)
         {
-            log::debug!(
+            log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via syntect token (direct or base)",
                 identifier, found.0
@@ -1032,7 +1035,7 @@ impl LanguageCoordinator {
         if let Some(first_line_lang) = super::heuristic::detect_from_first_line(content)
             && let Some(found) = self.try_load_with_base(&first_line_lang)
         {
-            log::debug!(
+            log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via first-line detection (direct or base)",
                 identifier, found.0
@@ -1040,7 +1043,7 @@ impl LanguageCoordinator {
             return Some(found);
         }
 
-        log::debug!(
+        log::trace!(
             target: "kakehashi::language_detection",
             "Failed to resolve injection language for identifier='{}'",
             identifier

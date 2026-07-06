@@ -747,6 +747,7 @@ pub(crate) fn collect_document_layer_trees(
         host_text,
         host_tree,
         None,
+        None,
         &mut |language, tree, depth| {
             // The host layer (depth 0) already lives on the snapshot as
             // `ParseSnapshot::tree`; store only the injected layers.
@@ -799,6 +800,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     host_text: &str,
     host_tree: &tree_sitter::Tree,
     byte_filter: Option<&std::ops::Range<usize>>,
+    cancel: Option<&crate::cancel::CancelToken>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
     visit(host_language, host_tree, 0);
@@ -810,6 +812,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
         host_text,
         1,
         byte_filter,
+        cancel,
         visit,
     );
 }
@@ -823,6 +826,7 @@ fn walk_child_layers(
     host_text: &str,
     depth: usize,
     byte_filter: Option<&std::ops::Range<usize>>,
+    cancel: Option<&crate::cancel::CancelToken>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
     // Allows injected depths 1..=MAX_INJECTION_DEPTH — deliberately matching
@@ -834,6 +838,11 @@ fn walk_child_layers(
     if depth > MAX_INJECTION_DEPTH {
         return;
     }
+    // Cancellation checkpoint before the per-depth injection query and the
+    // per-region resolve+parse below — the walk's expensive units.
+    if crate::cancel::is_cancelled(cancel) {
+        return;
+    }
     for (region, absolute_ranges) in effective_child_regions(
         coordinator,
         parent_language,
@@ -842,6 +851,14 @@ fn walk_child_layers(
         host_text,
         byte_filter,
     ) {
+        // Per-region checkpoint: each iteration below runs a language
+        // resolve + a full injected-region reparse, so on an
+        // injection-heavy document a cancel landing mid-loop must not pay
+        // for the remaining siblings before the per-depth check above sees
+        // it on the next recursion.
+        if crate::cancel::is_cancelled(cancel) {
+            return;
+        }
         let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
@@ -866,6 +883,7 @@ fn walk_child_layers(
             host_text,
             depth + 1,
             byte_filter,
+            cancel,
             visit,
         );
     }
@@ -912,6 +930,7 @@ mod tests {
             "markdown",
             text,
             &tree,
+            None,
             None,
             &mut |lang, layer_tree, depth| {
                 if depth == 0 {

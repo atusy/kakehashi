@@ -428,6 +428,89 @@ impl Kakehashi {
         }
     }
 
+    /// Arm a Unix-signal watcher that reaps the downstream server pool when
+    /// the process is terminated WITHOUT the LSP shutdown handshake.
+    ///
+    /// Editors escalate: Neovim SIGTERMs a server that hasn't exited shortly
+    /// after `shutdown`/`exit`, and a user restart can kill it outright. With
+    /// no handler, kakehashi dies mid-handshake and its downstream children
+    /// are orphaned — observed live as a `with-logging emmylua_ls` wrapper
+    /// re-parented to launchd and running for hours, because not every
+    /// downstream exits on stdin EOF. On SIGTERM/SIGHUP this persists the
+    /// crash-detection marker (`parsing_in_progress` — a kill mid-parse is
+    /// precisely what that marker detects) and runs the same bounded
+    /// `shutdown_all` as the graceful path (LSP handshake, then
+    /// SIGTERM→SIGKILL escalation, global timeout), then exits with the
+    /// conventional 128+signal status. Unlike `shutdown_impl` it does NOT
+    /// stop in-process work (forwarding loops, timers) — the process exits
+    /// immediately after the reap, so only the two effects that outlive the
+    /// process matter. A second signal during the reap aborts it and exits
+    /// immediately — installing a handler replaces the default kill-now
+    /// disposition, so impatient senders must keep working. A SIGKILL still
+    /// orphans children — nothing can intercept it — but the escalation path
+    /// an editor actually takes starts with SIGTERM, which this converts
+    /// into a clean reap.
+    ///
+    /// Server mode only (the one-shot CLI has no downstream pool worth a
+    /// watcher); `pub` because the binary arms it before serving.
+    #[cfg(unix)]
+    pub fn spawn_termination_cleanup(&self) {
+        let bridge = std::sync::Arc::clone(&self.bridge);
+        let failed_parsers = self.auto_install.failed_parsers_handle();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (mut term, mut hup) = match (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::hangup()),
+            ) {
+                (Ok(term), Ok(hup)) => (term, hup),
+                (term, hup) => {
+                    log::warn!(
+                        "termination cleanup disabled: signal handler install failed \
+                         (SIGTERM: {:?}, SIGHUP: {:?})",
+                        term.err(),
+                        hup.err()
+                    );
+                    return;
+                }
+            };
+            // Platform signal numbers straight from the SignalKind
+            // constructors (tokio exposes the libc constants via
+            // `as_raw_value`), so the 128+signum exit status is correct even
+            // on a Unix that renumbers them — no hard-coded 1/15.
+            let signum = tokio::select! {
+                _ = term.recv() => SignalKind::terminate().as_raw_value(),
+                _ = hup.recv() => SignalKind::hangup().as_raw_value(),
+            };
+            log::info!("received signal {signum}: reaping downstream servers before exit");
+            // Crash-detection parity with `shutdown_impl`: a kill mid-parse is
+            // exactly the case the `parsing_in_progress` marker exists for, so
+            // persist it before the (comparatively slow) downstream reap.
+            if let Err(e) = failed_parsers.persist_state() {
+                log::warn!(
+                    target: "kakehashi::crash_recovery",
+                    "Failed to persist crash detection state on signal: {e}"
+                );
+            }
+            // Race the reap against a SECOND signal: the installed handler
+            // replaced the default kill-now disposition, so without this arm a
+            // repeat SIGTERM during the bounded (~13s worst-case) reap would be
+            // silently swallowed. An impatient sender gets an immediate exit;
+            // still-running downstreams fall back to their own stdin-EOF /
+            // kill handling.
+            tokio::select! {
+                _ = bridge.shutdown_all() => {}
+                _ = term.recv() => {
+                    log::warn!("second SIGTERM during reap: exiting immediately");
+                }
+                _ = hup.recv() => {
+                    log::warn!("second SIGHUP during reap: exiting immediately");
+                }
+            }
+            std::process::exit(128 + signum);
+        });
+    }
+
     pub(crate) async fn shutdown_impl(&self) -> Result<()> {
         // Persist crash detection state before shutdown
         // This enables crash recovery to detect if parsing was in progress

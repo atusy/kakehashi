@@ -212,6 +212,13 @@ impl AutoInstallManager {
         self.failed_parsers.persist_state()
     }
 
+    /// Clone-handle to the crash-detection registry (`Arc`-backed), for tasks
+    /// that outlive `&self` — the signal-reap task persists crash-detection
+    /// state before exiting, exactly like the graceful shutdown path.
+    pub fn failed_parsers_handle(&self) -> FailedParserRegistry {
+        self.failed_parsers.clone()
+    }
+
     /// Attempt to install a language parser.
     ///
     /// Intentionally isolated to enable unit testing without LSP infrastructure:
