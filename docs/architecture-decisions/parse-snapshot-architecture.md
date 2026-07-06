@@ -287,12 +287,14 @@ The decision therefore **separates three concerns that today all ride the tracke
   derives its region geometry, then maps that geometry to tracker ULIDs in one
   batch — reusing an existing id by position, minting a fresh one for a
   genuinely new region — with the latch re-checked under the tracker entry's
-  exclusive lock, the same lock the `didChange` edit-shift takes. (The check is
-  the tracker's own shift-latch rather than a `parsed_version == content_version`
-  comparison under `edit_lock`: the latch detects exactly the events that would
-  make the pass's coordinates stale — an edit-shift or a close/reopen — and
-  holding the mint inside the shifting lock is what makes the currency check and
-  the mint atomic.) A batch that passes is *correct-at-birth* — a later edit
+  exclusive lock, the same lock the `didChange` edit-shift takes. The latch is
+  necessary but not sufficient on its own: `didChange` shifts the tracker
+  BEFORE it bumps `content_version`, so the pass captures the latch **and**
+  validates liveness + lifetime + currency (incarnation and
+  `parsed_version == content_version`) in one critical section under
+  `edit_lock` (`populate_injections_on_pool`) — atomic against the shift/bump
+  pair — and everything landing after that section is what the latch re-check
+  inside the batch mint/commit catches. A batch that passes is *correct-at-birth* — a later edit
   shifts its ids like any live entry — so there is no purge machinery; a batch
   the latch refuses minted **nothing**: the stale pass withholds every
   region-id-bearing product and defers identity to the next current pass, the
