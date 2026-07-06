@@ -279,11 +279,52 @@ impl ParseCoordinator {
         tree: tree_sitter::Tree,
         language_name: String,
         incarnation: u64,
+        content_version: u64,
     ) -> PopulatedSnapshotRegions {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
-        let documents = std::sync::Arc::clone(&self.documents);
+        // Latch + at-mint validity gate, taken UNDER this document's edit
+        // lock so the pair is atomic against `did_change` (which holds the
+        // same lock across its tracker edit-shift AND its
+        // `content_version` bump — the ADR's "only the fast tracker-mint
+        // runs under edit_lock" obligation). Lock-free latch-then-validate
+        // is NOT enough here: didChange shifts the tracker BEFORE it bumps
+        // the version, so a latch taken after the shift with a version read
+        // before the bump would look current on both counts and let this
+        // pass mint its old-tree coordinates into the shifted index as
+        // correct-at-birth. Under the lock, the gate checks:
+        // - liveness + lifetime (a didClose that ran to COMPLETION leaves
+        //   the tracker at `(0, epoch+1)` — indistinguishable from a
+        //   reopen's first mint, so the latch alone cannot refuse it; the
+        //   reopen case fails the incarnation check);
+        // - currency (`content_version` unchanged since the parse's CAS —
+        //   an edit that already landed makes this pass's tree stale).
+        // Anything landing AFTER the lock drops is caught by the latch
+        // re-check inside the batch mint / commit (`cleanup` bumps the
+        // epoch before it removes; an edit-shift bumps the generation).
+        // Skipping populate matches the stale/closed outcome everywhere
+        // else: the snapshot (if it still publishes) rides without regions.
+        let entry_mint_epoch = {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let latch = tracker.mint_epoch(&uri);
+            let valid = self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == content_version
+            });
+            if !valid {
+                // The edit_lock() accessor above materializes a lock entry
+                // even for a document a didClose already removed — drop it
+                // so raced closes can't grow the map (the did_change stray
+                // rule).
+                if self.documents.latest_snapshot(&uri).is_none() {
+                    self.documents.remove_edit_lock(&uri);
+                }
+                return PopulatedSnapshotRegions::default();
+            }
+            latch
+        };
         // Coarse per-parse gate: with no runnable bridge server configured,
         // the bridge-region build (per-region content copies) is pure waste
         // on the pre-publish critical path. `None` on the snapshot makes a
@@ -294,32 +335,6 @@ impl ParseCoordinator {
             .any_bridge_server_runnable();
         self.compute_pool
             .run(None, move || {
-                // Latch FIRST, validate liveness SECOND — the captures
-                // walk's ordering, and it is load-bearing: `mint_epoch` is
-                // two unsynchronized reads, so a close+reopen completing
-                // between them yields `(old_gen, new_epoch)`; only a
-                // liveness check taken AFTER the latch is guaranteed to see
-                // that reopen's new incarnation and bail before anything
-                // mints under the mixed latch.
-                let entry_mint_epoch = tracker.mint_epoch(&uri);
-                // At-mint liveness gate (the captures walk's
-                // `mint_into_tracker` discipline, applied to the writer): a
-                // didClose that ran to COMPLETION after this parse's CAS
-                // leaves the tracker's post-cleanup state — `(0, epoch+1)` —
-                // indistinguishable from a reopen's legitimate first mint,
-                // so populate's shift latch alone cannot refuse this pass.
-                // Gate on the document still being open in this same
-                // lifetime before minting anything; a close landing AFTER
-                // this check is caught by the latch instead (`cleanup` bumps
-                // the epoch before it removes). Skipping populate here
-                // matches the closed-document outcome everywhere else: the
-                // snapshot (if it still publishes) rides without regions.
-                if documents
-                    .latest_snapshot(&uri)
-                    .is_none_or(|view| view.slot.current_incarnation != incarnation)
-                {
-                    return PopulatedSnapshotRegions::default();
-                }
                 let populated = cache.populate_injections(
                     &uri,
                     &text,
@@ -542,6 +557,7 @@ impl ParseCoordinator {
                         tree.clone(),
                         language_name.clone(),
                         incarnation,
+                        content_version,
                     )
                     .await
                 } else {
@@ -799,6 +815,7 @@ impl ParseCoordinator {
                     tree.clone(),
                     language_name.clone(),
                     expected_incarnation,
+                    content_version,
                 )
                 .await
             } else {
@@ -993,6 +1010,7 @@ impl ParseCoordinator {
                     tree.clone(),
                     language_name.clone(),
                     incarnation,
+                    content_version,
                 )
                 .await
             } else {
