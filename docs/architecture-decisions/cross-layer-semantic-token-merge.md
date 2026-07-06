@@ -80,7 +80,8 @@ That is a distinct third operation, which this decision names `merged`.
   during parsing of an already-open document (language-server-bridge;
   ls-bridge-async-connection handles the async I/O) — so their legends are
   unknown when kakehashi must declare its own. The merge cannot widen the
-  legend per server.
+  legend per server at runtime; the only extension point is static — entries
+  the user declares in config, known before `initialize` (§3).
 - **Flat non-overlapping output by default.** Unless the client sets
   `overlappingTokenSupport`, exactly one token may cover each character — so a
   per-region *single winner*, not a stack.
@@ -184,17 +185,30 @@ presumes `native` participates, the default; the qualification below covers a
 config that suppresses it.)
 
 1. The first response to a `semanticTokens/full` request returns the
-   **synchronously-available set immediately** — the native set when `native`
-   is in `priorities` (the default), bridged layers fetched in parallel but not
-   awaited even if one could return first. If `priorities` **omits** `native`
+   **synchronously-available set immediately** — when `native` is in
+   `priorities` (the default): the native set, merged with any bridged sets
+   already on hand (current, or stale-shifted per the version contract below);
+   bridged layers still in flight are not awaited even if one could return
+   first. If `priorities` **omits** `native`
    (e.g. `["host"]`), there is no instant local layer: the first response is
    whatever bridged set is already cached for the current version, or an empty
    result if none is — and the bridged layers still refine via step 2. Omitting
    native therefore trades instant highlighting for bridged-only output; the
-   default keeps the instant-paint guarantee.
+   default keeps the instant-paint guarantee. Config validation **warns** when
+   `priorities` omits `native`, so the trade is explicit, not accidental.
 2. When a bridged layer responds, kakehashi recomputes the level-2 sweep and
    emits `workspace/semanticTokens/refresh`; the client re-requests and
    receives the merged set (as a `full/delta` where the client supports it).
+
+**Refresh coalescing.** Bridged layers respond independently; firing
+`workspace/semanticTokens/refresh` per response would make the client repaint
+once per layer — N injections, N visible convergence steps. Refreshes are
+therefore **coalesced**: responses landing within a short quiescence window
+(after open, after an edit, or after the previous refresh) are batched into a
+single refresh; a layer that responds after the window fires its own. The
+window length is an implementation concern; the policy — batch within a
+window, never block a refresh on the slowest layer — is decided here, because
+it fixes how many intermediate paints the user sees.
 
 **Delta baseline contract.** Every array kakehashi returns — the first response
 (native-only by default, or a cached/empty bridged set when `native` is
@@ -206,46 +220,83 @@ response. This keeps the first-response → merged transition expressible as an
 ordinary delta, with no special baseline bookkeeping.
 
 **Version contract (owned by the merge).** Each layer's contribution carries
-the host document version it was computed against. The level-2 sweep includes a
-bridged set **only if its version equals the current host snapshot**; a set
-that predates the snapshot — e.g. a bridged response that landed, triggered a
-refresh, and was then outdated by a host edit before the client re-requested —
-is excluded, and that region falls through to the next layer in `priorities`
-(ultimately the always-current native set when `native` participates; otherwise
-the region is simply untokenized) until a fresh bridged set arrives and fires
-another refresh. This is what makes deferring the *recompute mechanism* (Out of Scope)
-safe: a stale set never enters the sweep, so the merge never lands tokens on
-shifted coordinates. Native is recomputed synchronously per request and is
-always current by construction.
+the host document version it was computed against. A bridged set whose version
+equals the current host snapshot participates as-is. A **stale** set (version
+older than the snapshot) is **not excluded wholesale** — hard exclusion would
+downgrade every bridged region to native colors on each keystroke (the client
+re-requests after `didChange`, when every bridged set is necessarily stale)
+and flip them back when the servers catch up: a per-edit color oscillation
+across the whole document, precisely the stale handling editors themselves
+avoid by shifting tokens locally. Instead the merge is **stale-tolerant**: the
+edit deltas between the set's version and the current snapshot — already
+tracked to sync virtual documents on host change (virtual-document-model) —
+are replayed over the token positions, shifting each token to its post-edit
+location. A token overlapping an edited range cannot be shifted soundly and is
+dropped, falling through to the next layer for that region only. The shifted
+set participates in the sweep until a fresh set arrives and fires another
+refresh. When the edit trail is unavailable — full-text-only sync, a version
+gap after reopen — the set is excluded as the conservative fallback, so
+unshifted stale coordinates never reach the sweep. Native is recomputed
+synchronously per request and is always current by construction.
 
 This temporal ordering — native now, refined later — is precisely what
 `preferred`/`concatenated` (synchronous, one-shot) cannot represent, and why
 `merged` is a separate operation rather than a strategy value.
 
-### 3. Legend translation — bounded to the standard slice
+### 3. Legend translation — the advertised slice, user-extensible
 
-kakehashi advertises a **fixed** legend: `LEGEND_TYPES` / `LEGEND_MODIFIERS`
-(`src/analysis/semantic/legend.rs`) are **exactly** the standard LSP set (23
-types, 10 modifiers) — not a superset. Bridged tokens are decoded with the
-server's own legend, then re-encoded into kakehashi's:
+kakehashi advertises a legend that is **fixed at `initialize` but composed
+from two sources**: the standard LSP set — `LEGEND_TYPES` / `LEGEND_MODIFIERS`
+(`src/analysis/semantic/legend.rs`), exactly the standard 23 types and 10
+modifiers — plus **user-declared extra entries** read from config at startup:
 
-- Token types/modifiers that **are** standard map **1:1, losslessly**.
-- A token whose **type** is outside the standard set has **no slot** in the
-  advertised legend and is **dropped** (with a debug log), not coerced. There
+```toml
+[semanticTokens.extraLegend]
+tokenTypes = ["lifetime", "selfKeyword", "builtinType", "formatSpecifier"]
+tokenModifiers = ["mutable", "consuming"]
+```
+
+Extra entries are appended after the standard ones, so standard indices stay
+stable. Because config is read before kakehashi answers `initialize`, this
+extension is protocol-legal: the legend is still declared exactly once and
+never changes afterward — what Alternative D rejects is widening it
+*dynamically* per bridged server. Two bounds follow: `tokenModifiers` are
+encoded as bit flags in an integer, so standard + extra modifiers must fit the
+client's integer width (practically 32); and the client's theme must actually
+style the extra types — kakehashi passes them through, it cannot make an
+editor color a type it has no rule for (Neovim exposes them as
+`@lsp.type.<name>` groups; VS Code needs a theme rule or
+`semanticTokenColorCustomizations`).
+
+Bridged tokens are decoded with the server's own legend, then re-encoded into
+kakehashi's advertised legend:
+
+- Token types/modifiers present in the advertised legend — standard or extra —
+  map **1:1, losslessly**.
+- A token whose **type** is outside the advertised legend has **no slot** and
+  is **dropped** (with a debug log), not coerced. There
   is deliberately **no fuzzy "nearest standard type" matching** — guessing that
   rust-analyzer's `selfKeyword` is "really" `keyword` would mislabel as often
   as it helps, and dropping does not create a hole: the level-2 sweep falls
   through to the next layer in `priorities` (ultimately native tree-sitter),
   which may still highlight that character when native tokenized it; otherwise
   it stays untokenized, matching native-only behavior. Because the legend is
-  frozen at
-  `initialize` and bridged servers connect afterward, kakehashi **cannot**
-  widen the legend to admit the custom type instead.
+  frozen at `initialize` and bridged servers connect afterward, kakehashi
+  **cannot** widen the legend at that point — the remedy is the user-declared
+  `extraLegend` route above, applied *before* the freeze.
 - **Modifiers** are handled independently of the type: a token whose base type
   *is* standard is emitted even if it carries non-standard modifiers; the
   unknown modifiers are simply dropped (mirroring `resolve_capture`'s existing
   "unknown modifiers are silently ignored" behavior in `legend.rs`). Only an
   unmappable *base type* drops the whole token.
+- **Dropping is loud, not silent.** When a bridged server's `initialize`
+  result arrives, its legend is diffed against kakehashi's advertised one:
+  types and modifiers with no slot trigger **one `window/showMessage` warning
+  per server per session**, naming the server and the unmapped entries and
+  pointing at `semanticTokens.extraLegend` (the full list also goes to
+  `window/logMessage`). The user learns *at connect time* what to register to
+  stop the drops — silent narrowing was the discoverability hole in the drop
+  rule, and the warning closes it without any fuzzy matching.
 - **Standard-typed bridged tokens are trusted wholesale.** When a server labels
   a character with a standard type kakehashi would classify differently, the
   *server's* label wins (it is the higher-ranked layer) — this is intentional,
@@ -258,17 +309,19 @@ server's own legend, then re-encoded into kakehashi's:
   distrusts) is a possible future extension — the existing capture-mapping
   machinery is the natural home — but is **out of scope** here.
 
-**Honest consequence**: cross-layer tokens deliver the *standard slice* of a
-server's output, not its full richness. The motivating server, rust-analyzer,
-expresses much of its type-awareness through ~30 **custom** types
-(`lifetime`, `selfKeyword`, `builtinType`, `formatSpecifier`, …) that this
-merge drops (falling through to native). The win is real but bounded — richer
-*standard-typed*
-tokens (e.g. resolved `type` vs. tree-sitter's `variable`), not the server's
-complete legend. The ADR states this plainly so the merge is not mistaken for
-lossless pass-through; advertising a wider non-standard legend, or
-renegotiating it after the bridge connects, is **out of scope** (see
-Alternative D).
+**Honest consequence**: out of the box, cross-layer tokens deliver the
+*standard slice* of a server's output, not its full richness. The motivating
+server, rust-analyzer, expresses much of its type-awareness through ~30
+**custom** types (`lifetime`, `selfKeyword`, `builtinType`, `formatSpecifier`,
+…) that the default legend drops (falling through to native) — and dropping is
+not only a richness loss but a *consistency* one: the same construct can
+render in the server's color where it used a standard type and in
+tree-sitter's where it did not, a per-character patchwork. The ceiling is
+user-liftable — registering those types in `semanticTokens.extraLegend` passes
+them through losslessly, and the connect-time warning names exactly what to
+register — but lifting it costs a maintained list plus client-theme rules for
+the extra types. Automatic widening or post-connect renegotiation stays
+impossible (see Alternative D).
 
 ### `merged` representation
 
@@ -329,21 +382,23 @@ Resolving the open cost cross-layer-aggregation flagged ("a stage-2-only
   semantic-token-overlap-resolution Phase 4 already opened for the intra-layer
   sweep; it is decided there, not here. This decision specifies the
   universally-correct non-overlapping path only.
-- **Custom (non-standard) bridged token types.** Admitting them would require a
-  wider advertised legend negotiated *after* the bridge connects, which LSP
-  does not allow against an already-initialized legend (Alternative D).
+- **Automatic legend widening.** §3's `extraLegend` admits custom types the
+  user declares up front; *discovering* a bridged server's legend at runtime
+  and widening kakehashi's to match would mean renegotiating an
+  already-initialized legend, which LSP does not allow (Alternative D). The
+  connect-time warning is the designed substitute: it tells the user what to
+  declare, it never declares it for them.
 - **Re-fetching/recomputing stale bridged sets** — *the mechanism*, not the
   contract. The version contract the merge enforces is in scope and stated in
   §2 (every layer contribution carries the host version it was computed
-  against; the merge excludes any set whose version ≠ the current snapshot,
-  falling back to the next layer for that region until a fresh set arrives).
-  What is deferred to bridge infrastructure is *how* a stale virt set is
-  recomputed and *when* the refresh fires after an edit — the same
-  edit-invalidation every bridged response already relies on
-  (virtual-document-model syncs virtual docs on host change; old in-flight
-  requests are cancelled). The merge never needs to repair stale coordinates
-  because the contract forbids a stale set from entering the sweep in the first
-  place.
+  against; a stale set is edit-shifted where the edit trail allows, excluded
+  where it does not, until a fresh set arrives). What is deferred to bridge
+  infrastructure is *how* a stale virt set is recomputed and *when* the
+  re-fetch happens after an edit — the same edit-invalidation every bridged
+  response already relies on (virtual-document-model syncs virtual docs on
+  host change; old in-flight requests are cancelled). The sweep never sees
+  unshifted stale coordinates: a set is either shifted to the current snapshot
+  or excluded.
 - **Per-injection-language rank relative to host.** Inherited verbatim from
   cross-layer-aggregation's Out of Scope: `priorities` ranks the three layer
   kinds, not individual injection languages.
@@ -353,10 +408,19 @@ Resolving the open cost cross-layer-aggregation flagged ("a stage-2-only
 ### Positive
 
 - **Closes cross-layer-aggregation's deferred question** with a concrete design
-  that reuses its `priorities` field unchanged — no new config surface.
+  that reuses its `priorities` field unchanged; the only new config surface is
+  the optional `semanticTokens.extraLegend` table (§3).
 - **Instant highlighting preserved.** Native-first temporal refinement keeps
   the zero-latency tree-sitter experience; bridged richness arrives as a
   refresh, never blocking the first paint.
+- **Stable colors while typing.** The stale-tolerant version contract (§2)
+  keeps bridged tokens on screen across edits by shifting them, instead of
+  reverting the document to native colors on every keystroke and flipping back
+  after each bridged response.
+- **The legend ceiling is user-liftable.** `semanticTokens.extraLegend` plus
+  the connect-time warning turn dropped custom types from a silent hard bound
+  into a discoverable, opt-in extension — without fuzzy matching or protocol
+  violations.
 - **Thin new surface.** The genuinely new code is the level-2 sweep (a
   re-parameterization of the existing one), the pre-level-2 virt collapse
   (another application of the same deepest-first sweep, over per-injection virt
@@ -370,22 +434,26 @@ Resolving the open cost cross-layer-aggregation flagged ("a stage-2-only
 
 ### Negative
 
-- **Bounded, not lossless, richness.** The standard-slice legend constraint
-  means the headline server (rust-analyzer) loses ~30 custom types to
-  the drop. The feature's value is real but smaller than "full
-  server-quality tokens" — this is half the answer to "is the complexity worth
-  it," and is stated rather than hidden.
-- **Refresh thrash.** Each bridged layer responding independently triggers a
-  recompute + `workspace/semanticTokens/refresh`. N bridged injections in one
-  document can mean N refreshes unless responses within a window are debounced
-  before refreshing — debouncing is an implementation concern flagged here, not
-  designed.
-- **Temporal flicker.** Tokens visibly change color shortly after open as
-  bridged results land. Inherent to progressive refinement (request-strategies
-  Strategy 1); the alternative (block on all layers) is rejected below.
-- **Two-coordinate bookkeeping.** virt→host remap must be exact, or merged
-  tokens land on the wrong characters — a sharper failure mode than for
-  position requests, where one wrong location is visible in isolation.
+- **Bounded-by-default richness.** Out of the box the headline server
+  (rust-analyzer) loses ~30 custom types to the drop, with the per-character
+  patchwork §3 describes. Lifting the bound is manual: the user maintains the
+  `extraLegend` list, and their editor theme must style the extra types.
+- **Refresh coalescing is load-bearing.** §2's quiescence-window policy bounds
+  how many intermediate paints the user sees, but the window length is a
+  tuning knob: too short re-admits per-layer thrash, too long delays bridged
+  richness.
+- **Temporal flicker at open.** Tokens visibly change color shortly after open
+  as bridged results first land. Inherent to progressive refinement
+  (request-strategies Strategy 1); the alternative (block on all layers) is
+  rejected below. The stale-tolerant contract confines this to first
+  convergence — steady-state typing no longer oscillates.
+- **Two-coordinate bookkeeping, plus edit replay.** virt→host remap must be
+  exact, or merged tokens land on the wrong characters — a sharper failure
+  mode than for position requests, where one wrong location is visible in
+  isolation. The stale-shift contract adds a second exactness obligation:
+  replaying edit deltas over token positions. Injection-fence boundaries —
+  where clipped/split bridged fragments meet native tokens — are the most
+  visible artifact zone and the natural focus for merge tests.
 
 ### Neutral
 
@@ -435,9 +503,13 @@ nothing is dropped.
 **Rejected because**: LSP fixes the legend at `initialize`, and bridged servers
 are spawned only *afterward* — on injection detection (language-server-bridge) —
 so their legends are unknowable when kakehashi must declare its own. There is no protocol-legal way
-to grow the legend post-initialize. The fixed standard set is the only
-legend available at the binding moment; the standard-slice bound is a
-consequence of LSP, not a kakehashi choice.
+to grow the legend post-initialize. What survives from this alternative is its
+*static* half, adopted in §3: entries the **user** declares in
+`semanticTokens.extraLegend` are known from config before `initialize`, so
+they extend the legend without renegotiation, and the connect-time warning
+tells the user what a server offered that the declared legend lacks. What
+stays rejected is the automatic union — kakehashi never grows the legend on
+its own.
 
 ### E. Make `merged` a user-selectable `AggregationStrategy`
 
