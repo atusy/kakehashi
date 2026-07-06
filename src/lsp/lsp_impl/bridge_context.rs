@@ -944,15 +944,6 @@ impl Kakehashi {
         host_parse: impl Fn(serde_json::Value) -> Option<R>,
         is_nonempty: impl Fn(&R) -> bool,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
-        let Ok(uri) = uri_to_url(lsp_uri) else {
-            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
-            return Ok(None);
-        };
-        let Some(host_language) = self.document_language(&uri) else {
-            return Ok(None);
-        };
-        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
-
         let host = async {
             match self.resolve_host_bridge_context(lsp_uri, layer_method) {
                 Some(ctx) => Ok(self
@@ -962,6 +953,46 @@ impl Kakehashi {
                 None => Ok(None),
             }
         };
+
+        self.walk_layer_futures(
+            lsp_uri,
+            layer_method,
+            request_method,
+            virt,
+            host,
+            native,
+            is_nonempty,
+        )
+        .await
+    }
+
+    /// Race pre-built virt/host/native layer futures under the resolved
+    /// layer priorities (cross-layer-aggregation, `preferred` semantics),
+    /// with walk-wide cancel subscription and upstream-registry sweep.
+    ///
+    /// This is the walk core behind [`Self::walk_layers_with_native`];
+    /// handlers that need a custom host arm (e.g. codeAction's per-server
+    /// title suffixing, which the verbatim raw-value host arm cannot
+    /// express) build their own host future and call this directly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layer_futures<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return Ok(None);
+        };
+        let Some(host_language) = self.document_language(&uri) else {
+            return Ok(None);
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
 
         // Subscribe for the WHOLE walk before either arm runs: the arms'
         // own subscribe attempts then find the id taken and proceed without
