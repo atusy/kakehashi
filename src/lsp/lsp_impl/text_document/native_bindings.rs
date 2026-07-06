@@ -246,7 +246,9 @@ impl Kakehashi {
                 &layer_language,
                 uri,
                 content_text.len(),
-                move |mut parser| {
+                // The work-unit deadline is for main-document parses;
+                // parse_with_ranges self-bounds at NATIVE_PARSE_BUDGET.
+                move |mut parser, _deadline| {
                     let tree = parse_with_ranges(
                         &mut parser,
                         &content_text,
@@ -421,8 +423,8 @@ mod tests {
     "#;
 
     /// A server with the rust grammar registered, a bindings query in the
-    /// store, and one open (unparsed) rust document — the on-demand parse in
-    /// `native_bindings_answer` supplies the tree.
+    /// store, and one open, pre-parsed rust document — readers never parse
+    /// (parse-snapshot ADR §3), so the harness supplies the tree up front.
     fn server_with_doc(text: &str) -> (LspService<Kakehashi>, Url, Uri) {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
@@ -438,11 +440,16 @@ mod tests {
 
         let url = Url::parse("file:///test/native_bindings.rs").unwrap();
         let uri = Uri::from_str(url.as_str()).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None);
         server.documents.insert(
             url.clone(),
             text.to_string(),
             Some("rust".to_string()),
-            None,
+            tree,
         );
         (service, url, uri)
     }
@@ -661,11 +668,16 @@ mod tests {
 
         let url = Url::parse("file:///test/native_bindings.md").unwrap();
         let uri = Uri::from_str(url.as_str()).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None);
         server.documents.insert(
             url.clone(),
             text.to_string(),
             Some("markdown".to_string()),
-            None,
+            tree,
         );
         (service, uri)
     }
