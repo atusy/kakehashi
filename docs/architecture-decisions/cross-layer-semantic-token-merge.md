@@ -207,9 +207,18 @@ config that suppresses it.)
 2. When a bridged layer responds, kakehashi recomputes the level-2 sweep and
    emits `workspace/semanticTokens/refresh`; the client re-requests and
    receives the merged set (as a `full/delta` where the client supports it).
-   Refresh is sent **only when the client advertised
-   `workspace.semanticTokens.refreshSupport`** — LSP makes the request an
-   optional client capability. Without it kakehashi cannot prompt a re-pull:
+   A refresh fires only when the newly accepted contribution **changes the
+   merged result** for the current snapshot; a response identical to the
+   layer's already-accepted contribution is absorbed silently. Symmetrically,
+   a request does **not** start a new fetch for a layer whose accepted
+   contribution is already current for the snapshot. Both halves are
+   load-bearing: without them, the refresh-triggered re-request would itself
+   spawn fetches whose unchanged responses fire the next refresh — an
+   unbounded request → refresh loop on an idle document. Refresh is sent
+   **only when the client advertised
+   `workspace.semanticTokens.refreshSupport`** — LSP gates the request behind
+   that optional client capability. Without it kakehashi cannot prompt a
+   re-pull:
    bridged refinement then surfaces only on the client's own next request
    (typically after an edit), and a passive document stays on its first-paint
    set. This degradation is carried under Consequences.
