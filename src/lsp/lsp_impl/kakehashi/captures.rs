@@ -793,19 +793,29 @@ impl Kakehashi {
                             skipped,
                         }));
                 }
-                let notify = match self.captures_walk_inflight.entry(key.clone()) {
-                    dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-                        vacant.insert(std::sync::Arc::clone(&notify));
-                        flight_guard = Some(WalkFlightGuard {
-                            map: &self.captures_walk_inflight,
-                            key: key.clone(),
-                            notify,
-                        });
-                        break;
-                    }
-                    dashmap::mapref::entry::Entry::Occupied(occupied) => {
-                        std::sync::Arc::clone(occupied.get())
+                // `get` before `entry`: the loser path (marker present) is
+                // the one taken repeatedly under a burst, and `entry` would
+                // clone the (Url, String) key just to find it occupied. Only
+                // a would-be winner pays the owned-key clone.
+                let notify = if let Some(current) = self.captures_walk_inflight.get(&key) {
+                    std::sync::Arc::clone(&current)
+                } else {
+                    match self.captures_walk_inflight.entry(key.clone()) {
+                        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+                            vacant.insert(std::sync::Arc::clone(&notify));
+                            flight_guard = Some(WalkFlightGuard {
+                                map: &self.captures_walk_inflight,
+                                key: key.clone(),
+                                notify,
+                            });
+                            break;
+                        }
+                        // A racing winner claimed the marker between the get
+                        // and the entry: park on it like any loser.
+                        dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                            std::sync::Arc::clone(occupied.get())
+                        }
                     }
                 };
                 // Register interest BEFORE re-validating the marker: enable()

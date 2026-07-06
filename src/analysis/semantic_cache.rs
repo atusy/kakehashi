@@ -911,8 +911,16 @@ mod tests {
         ];
         injection_map.insert(uri.clone(), regions);
 
-        // Set up cached tokens for the lua region, keyed by its content hash.
-        token_cache.store(&uri, 11111, 0, vec![raw_token(0, 0, 3)]);
+        // Set up cached tokens for the lua region, keyed by the cache's real
+        // contract: the content ⊕ resolved-language fold, never the raw
+        // content hash (identical bytes injecting a different language must
+        // not share an entry).
+        token_cache.store(
+            &uri,
+            region_validity_hash(11111, "lua"),
+            0,
+            vec![raw_token(0, 0, 3)],
+        );
 
         // Find region containing byte offset and get its cached tokens
         let regions = injection_map.get(&uri).unwrap();
@@ -922,10 +930,15 @@ mod tests {
         let region = region_at_byte_30.unwrap();
         assert_eq!(region.language, "lua");
 
-        // Content-addressed lookup: the region's content hash is the key half.
-        let cached = token_cache.get(&uri, region.content_hash, 0);
+        // Content-addressed lookup through the same fold the read path uses.
+        let cached = token_cache.get(&uri, region_validity_hash(region.content_hash, "lua"), 0);
         assert!(cached.is_some(), "Should have cached tokens for lua region");
         assert_eq!(cached.unwrap()[0].length, 3);
+        // The raw content hash alone must MISS — the fold is load-bearing.
+        assert!(
+            token_cache.get(&uri, region.content_hash, 0).is_none(),
+            "raw content hash without the language fold must not hit"
+        );
     }
 
     #[test]

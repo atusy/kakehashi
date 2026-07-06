@@ -851,6 +851,14 @@ fn walk_child_layers(
         host_text,
         byte_filter,
     ) {
+        // Per-region checkpoint: each iteration below runs a language
+        // resolve + a full injected-region reparse, so on an
+        // injection-heavy document a cancel landing mid-loop must not pay
+        // for the remaining siblings before the per-depth check above sees
+        // it on the next recursion.
+        if crate::cancel::is_cancelled(cancel) {
+            return;
+        }
         let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
