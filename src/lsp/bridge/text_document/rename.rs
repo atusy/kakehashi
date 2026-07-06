@@ -636,6 +636,7 @@ mod tests {
 
         match edit.document_changes.unwrap() {
             DocumentChanges::Edits(edits) => {
+                assert_eq!(edits.len(), 1);
                 assert_eq!(edits[0].text_document.uri, host_uri);
                 assert_eq!(
                     edits[0].text_document.version, None,
