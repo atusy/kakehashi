@@ -12,7 +12,7 @@
 
 **Aspirational — deferred with a specified design and trigger.** Semantic
 tokens are **native-only today**: `textDocument/semanticTokens/{full,range}` is
-not bridged (request-strategies marks the semanticTokens row ❌ Not
+not bridged (language-server-bridge-request-strategies marks the semanticTokens row ❌ Not
 implemented), and
 cross-layer-aggregation deliberately scoped semantic tokens out of its
 `preferred`/`concatenated` mechanism. This decision does **not** schedule
@@ -75,7 +75,7 @@ That is a distinct third operation, which this decision names `merged`.
 - **Preserve instant highlighting.** Native tree-sitter tokens are local and
   fast; bridged tokens arrive 10s–1000s of ms later. The user must see
   highlighting immediately, so the merge is inherently *temporal*, not a
-  request that blocks on all layers (request-strategies Strategy 1).
+  request that blocks on all layers (language-server-bridge-request-strategies Strategy 1).
 - **One advertised legend, fixed at `initialize`.** LSP binds the
   `SemanticTokensLegend` when the capability is registered — for kakehashi's
   static registration, at `initialize`. (Re-registering with a new legend via
@@ -147,7 +147,7 @@ native finalize          host server          virt server(s)
   registration order, which is a `HashMap` iteration artifact and unstable.
   Users wanting a specific intra-group ranking list those servers explicitly
   before `"*"`. For semantic
-  tokens this **supersedes** request-strategies' provisional "Later server
+  tokens this **supersedes** language-server-bridge-request-strategies' provisional "Later server
   wins for overlapping ranges" rule, which predates this decision. The same
   per-target collapse applies within each injection's
   `bridge.<inj>` before the cross-injection nesting collapse below, so every
@@ -198,7 +198,7 @@ today's behavior.
 
 ### 2. Temporal refinement (progressive)
 
-The merge is not one-shot. It adopts request-strategies Strategy 1's
+The merge is not one-shot. It adopts language-server-bridge-request-strategies Strategy 1's
 parallel-fetch-with-progressive-refinement shape, but makes one choice Strategy
 1 leaves open: where Strategy 1 permits using a bridged response directly if it
 wins the race, this merge is **deliberately native-first** — the first response
@@ -314,7 +314,7 @@ synchronously per request and is always current by construction.
 **Shift definition.** The shift is an absolute-position mapping obtained by
 folding the retained `contentChanges` **in order** through their intermediate
 document states — never as independent shifts against the original text,
-which mis-places tokens as soon as one batch contains two edits. Each edit
+which misplaces tokens as soon as one batch contains two edits. Each edit
 moves same-line positions after it by a character delta, later lines by a
 line delta, and combines both for a token on the boundary line of a line
 merge or split; a token whose range intersects any edited range is the drop
@@ -326,8 +326,9 @@ shifts the whole token right; an insertion at its end leaves the token in
 place (the new text falls after it). A non-empty replacement drops any token
 whose *interior* it touches and shifts tokens entirely beyond it, under the
 same affinity at the shared endpoints. This ordered fold is the "second
-exactness obligation" the Consequences carry. A shifted set is thereafter **treated as computed against
-the version it was shifted to** *for sweep participation only*: it satisfies
+exactness obligation" the Consequences carry. A shifted set is thereafter
+**treated as computed against the version it was shifted to** *for sweep
+participation only*: it satisfies
 the participation check for that snapshot while staying **stale by source**,
 so it never satisfies the no-refetch test in step 2 above — display currency
 and source freshness are distinct states. A later edit re-shifts it from
@@ -594,7 +595,7 @@ visible to stage 1 or a type split"; its Neutral bullet now defers here:
   richness.
 - **Temporal flicker at open.** Tokens visibly change color shortly after open
   as bridged results first land. Inherent to progressive refinement
-  (request-strategies Strategy 1); the alternative (block on all layers) is
+  (language-server-bridge-request-strategies Strategy 1); the alternative (block on all layers) is
   rejected below. The stale-tolerant contract confines this to first
   convergence — steady-state typing no longer oscillates.
 - **Two-coordinate bookkeeping, plus edit replay.** virt→host remap must be
@@ -633,7 +634,7 @@ Await native, host, and virt, run the sweep once, return the final set.
 
 **Rejected because**: it destroys instant highlighting. Bridged servers can
 take seconds on first request; the user would stare at an unhighlighted buffer.
-request-strategies Strategy 1 exists precisely to avoid this; `merged` adopts
+language-server-bridge-request-strategies Strategy 1 exists precisely to avoid this; `merged` adopts
 its temporal shape.
 
 ### C. Always return layered/overlapping tokens, let the client merge
