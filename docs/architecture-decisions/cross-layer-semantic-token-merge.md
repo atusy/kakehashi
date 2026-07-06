@@ -344,7 +344,12 @@ truncating; and the client's theme must actually
 style the extra types — kakehashi passes them through, it cannot make an
 editor color a type it has no rule for (Neovim exposes them as
 `@lsp.type.<name>` groups; VS Code needs a theme rule or
-`semanticTokenColorCustomizations`).
+`semanticTokenColorCustomizations`). A third check runs at `initialize`:
+extra entries are compared against what the upstream client announced in
+`textDocument.semanticTokens.tokenTypes` / `tokenModifiers` — an entry the
+client did not announce is **skipped with a warning** rather than advertised,
+since the client never declared it renderable and tokens carrying it would
+name a type the client has no notion of.
 
 Bridged tokens are decoded with the server's own legend, then re-encoded into
 kakehashi's advertised legend:
