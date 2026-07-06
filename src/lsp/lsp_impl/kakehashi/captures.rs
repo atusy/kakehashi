@@ -663,7 +663,18 @@ impl Kakehashi {
         // heals on a later request.
         let snapshot = {
             use crate::lsp::lsp_impl::snapshot_read::{SnapshotWait, TOKEN_SETTLE_BACKSTOP};
-            let wait = self.wait_for_current_snapshot(&uri, TOKEN_SETTLE_BACKSTOP);
+            // The parked settle wait is the full/delta policy. `range` is the
+            // position/range class (ADR §3): its byte range is authored
+            // against the LIVE text and it fires per redraw, so it
+            // staleness-rejects to `null` IMMEDIATELY (zero stale wait —
+            // only the bounded first-parse wait inside applies) instead of
+            // holding an ingress slot for up to the backstop.
+            let stale_wait = if lsp_range.is_some() {
+                std::time::Duration::ZERO
+            } else {
+                TOKEN_SETTLE_BACKSTOP
+            };
+            let wait = self.wait_for_current_snapshot(&uri, stale_wait);
             let outcome = match cancel_rx.as_mut() {
                 Some(rx) => {
                     tokio::select! {
@@ -701,10 +712,11 @@ impl Kakehashi {
         if snapshot.incarnation != view.slot.current_incarnation {
             return Ok(None);
         }
-        // `range` is the position/range class: its byte range is authored
-        // against the LIVE text, so a trailing snapshot cannot answer it.
-        // `null` — the captures protocol's re-sync signal — not ContentModified
-        // (a JSON-RPC error would violate the captures contract).
+        // `range` re-check against the LIVE version read above: the resolve
+        // returned a then-current snapshot, but an edit can land between it
+        // and this read. `null` — the captures protocol's re-sync signal —
+        // not ContentModified (a JSON-RPC error would violate the captures
+        // contract). Defense in depth behind the zero-stale-wait resolve.
         if lsp_range.is_some() && entry_content_version != snapshot.parsed_version {
             log::debug!(
                 target: "kakehashi::captures",
@@ -1368,6 +1380,76 @@ mod tests {
         assert!(
             woke_at.elapsed() < crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP,
             "the handler must wake on the publish, not ride out the backstop"
+        );
+    }
+
+    /// `captures/range` is the position/range class: a trailing snapshot must
+    /// re-sync via `null` IMMEDIATELY (zero stale wait) — the parked settle
+    /// wait is the full/delta policy only. A per-redraw viewport request that
+    /// parked would hold an ingress slot for up to the backstop.
+    #[tokio::test(start_paused = true)]
+    async fn captures_range_stale_rejects_immediately_via_null() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///captures_range_stale.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let incarnation = service
+            .inner()
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document just inserted")
+            .slot
+            .current_incarnation;
+        let landed = service
+            .inner()
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from("fn main() {}"),
+                        tree: None,
+                        language: Some("rust".to_string()),
+                        parsed_version: 0,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test snapshot must land");
+        // Edit past the published parse: the v0 snapshot now trails.
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), "fn main() { }".to_string(), None);
+
+        let started_at = tokio::time::Instant::now();
+        let result = service
+            .inner()
+            .kakehashi_captures_range(CapturesRangeParams {
+                text_document: TextDocumentIdentifier {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+                },
+                kind: "highlights".to_string(),
+                range: Range::default(),
+                injection: false,
+            })
+            .await
+            .expect("range must not error");
+        assert_eq!(result, Value::Null, "trailing snapshot re-syncs via null");
+        assert!(
+            started_at.elapsed() < crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP,
+            "range must reject immediately, not park out the settle backstop"
         );
     }
 
