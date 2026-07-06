@@ -65,39 +65,53 @@ mod tests {
     /// The compiled `.so` is cached under the OS temp dir and reused, so
     /// repeated `cargo test` runs never re-fetch or re-compile; only a cold
     /// cache (first run, or after the temp dir is cleared) needs the network.
-    /// Concurrent fixture threads are safe: `install_parser` compiles to a
-    /// per-process temp file and atomically renames into place, so a lost race
-    /// surfaces as `AlreadyExists` over an already-good library.
+    /// The grammar revision tracks nvim-treesitter (via `install_parser`'s
+    /// metadata), matching how the rest of the tool sources parsers.
+    ///
+    /// A process-wide `OnceLock` memoizes the loaded grammar so the install +
+    /// load runs exactly once no matter how many fixture threads race here —
+    /// serializing it avoids concurrent installs racing on the shared metadata
+    /// cache and avoids duplicate compiles.
     fn dockerfile_language() -> tree_sitter::Language {
         use crate::install::parser::{
             InstallOptions, ParserCompile, ParserInstallError, install_parser, parser_file_exists,
         };
         use crate::language::loader::ParserLoader;
+        use std::sync::OnceLock;
 
-        let cache_dir = std::env::temp_dir().join("kakehashi-test-grammars");
-        let library = parser_file_exists("dockerfile", &cache_dir).unwrap_or_else(|| {
-            let options = InstallOptions {
-                data_dir: cache_dir.clone(),
-                force: false,
-                verbose: false,
-                no_cache: false,
-                // The test harness binary has no `__compile-parser` subcommand to
-                // re-exec, so compile in-process (see ParserCompile docs).
-                compile: ParserCompile::InProcess,
-            };
-            match install_parser("dockerfile", &options) {
-                Ok(result) => result.install_path,
-                Err(ParserInstallError::AlreadyExists(path)) => path,
-                Err(e) => panic!(
-                    "auto-install dockerfile grammar into {}: {e}",
-                    cache_dir.display()
-                ),
-            }
-        });
-
-        ParserLoader::new()
-            .load_language(&library, "dockerfile")
-            .unwrap_or_else(|e| panic!("load dockerfile grammar {}: {e}", library.display()))
+        static DOCKERFILE: OnceLock<tree_sitter::Language> = OnceLock::new();
+        DOCKERFILE
+            .get_or_init(|| {
+                let cache_dir = std::env::temp_dir().join("kakehashi-test-grammars");
+                let library = parser_file_exists("dockerfile", &cache_dir).unwrap_or_else(|| {
+                    let options = InstallOptions {
+                        data_dir: cache_dir.clone(),
+                        force: false,
+                        verbose: false,
+                        no_cache: false,
+                        // The test harness binary has no `__compile-parser`
+                        // subcommand to re-exec, so compile in-process (see
+                        // ParserCompile docs).
+                        compile: ParserCompile::InProcess,
+                    };
+                    match install_parser("dockerfile", &options) {
+                        Ok(result) => result.install_path,
+                        // Belt-and-braces for a separate concurrent process that
+                        // installed it between our existence check and here.
+                        Err(ParserInstallError::AlreadyExists(path)) => path,
+                        Err(e) => panic!(
+                            "auto-install dockerfile grammar into {}: {e}",
+                            cache_dir.display()
+                        ),
+                    }
+                });
+                ParserLoader::new()
+                    .load_language(&library, "dockerfile")
+                    .unwrap_or_else(|e| {
+                        panic!("load dockerfile grammar {}: {e}", library.display())
+                    })
+            })
+            .clone()
     }
 
     /// The asset source with `; inherits:` parents concatenated from the
@@ -930,6 +944,19 @@ mod tests {
         }
 
         #[test]
+        fn class_bodies_do_not_capture_outer_locals() {
+            // A class body opens a fresh local scope; a bare name there is a
+            // method call, never the enclosing local.
+            let text = "value = 1\nclass Box\n  value\nend\n";
+            let m = model_for("ruby", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "value", 1)),
+                None,
+                "class body must not see the enclosing local"
+            );
+        }
+
+        #[test]
         fn bare_calls_resolve_to_methods_receivers_stay_members() {
             let text = "def helper(x)\n  x\nend\ndef go\n  helper(1)\nend\nobj.helper\n";
             let m = model_for("ruby", text);
@@ -1037,6 +1064,23 @@ mod tests {
         }
 
         #[test]
+        fn loop_reassignment_updates_the_enclosing_local() {
+            // Re-assigning inside a loop an `x` that already exists in the
+            // enclosing function updates that binding (outer-or-local), rather
+            // than splitting off a separate loop-local one.
+            let text =
+                "function f()\n    x = 0\n    while c\n        x = 1\n    end\n    return x\nend\n";
+            let m = model_for("julia", text);
+            let outer = m.binding_at(nth(text, "x", 0)).unwrap();
+            assert_eq!(
+                m.binding_at(nth(text, "x", 1)),
+                Some(outer),
+                "loop assignment merges into the enclosing x, not a new binding"
+            );
+            assert_eq!(m.binding_at(nth(text, "x", 2)), Some(outer));
+        }
+
+        #[test]
         fn struct_names_resolve_and_functions_hoist() {
             let text =
                 "mk()\nstruct Box\n    size::Int\nend\nfunction mk()\n    return Box(1)\nend\n";
@@ -1089,6 +1133,16 @@ mod tests {
                 None,
                 "Dockerfiles are sequential: a use above the ARG is undefined"
             );
+        }
+
+        #[test]
+        fn env_expansion_within_an_instruction_uses_the_pre_instruction_value() {
+            // Docker evaluates ${A} in `ENV A=new B=${A}` with A's
+            // pre-instruction value, so the expansion resolves to the earlier
+            // definition, not the same-instruction redefinition.
+            let text = "ENV A=old\nENV A=new B=${A}\n";
+            let m = model_for("dockerfile", text);
+            assert_resolves(&m, text, "A", 2, 0);
         }
     }
 
@@ -1413,6 +1467,19 @@ mod tests {
             let m = model_for("yaml", text);
             assert_resolves(&m, text, "tag", 1, 0);
             assert_resolves(&m, text, "tag", 3, 2);
+        }
+
+        #[test]
+        fn anchors_do_not_cross_documents() {
+            // Anchors are document-scoped: an alias never resolves an anchor
+            // defined in another `---` document.
+            let text = "first: &base 1\n---\nsecond: *base\n";
+            let m = model_for("yaml", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "base", 1)),
+                None,
+                "an alias must not resolve an anchor in another document"
+            );
         }
     }
 

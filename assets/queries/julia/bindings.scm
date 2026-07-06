@@ -1,8 +1,12 @@
 ; Lexical name bindings for Julia (lexical-name-resolution ADR).
 ;
 ; Functions, loops, let blocks, comprehensions, and modules open scopes;
-; if/begin blocks do not. Assignments are scope-wide like Python's
-; (a name assigned anywhere in a function is local throughout). Types
+; if/begin blocks do not. An assignment writes an enclosing local when one
+; is visible and otherwise introduces a scope-local one (outer-or-local):
+; `x` first-assigned in a loop is loop-local, but re-assigning an `x` that
+; already exists in the enclosing function updates that same binding
+; rather than splitting it. A name is visible across its whole scope
+; (assignments are hoisted within their own scope). Types
 ; and values share the default namespace (annotations and constructor
 ; calls are plain identifiers). Field access (obj.size) resolves only
 ; the value — the member stays uncaptured. Short-form definitions
@@ -50,9 +54,12 @@
 (arrow_function_expression . (tuple_expression (identifier) @definition.parameter))
 
 ; ── Assignments and binders ──────────────────────────────────────────────
-(assignment . (identifier) @definition)
-(assignment . (tuple_expression (identifier) @definition))
-(assignment . (open_tuple (identifier) @definition))
+((assignment . (identifier) @definition)
+ (#set! definition.rebind "outer-or-local"))
+((assignment . (tuple_expression (identifier) @definition))
+ (#set! definition.rebind "outer-or-local"))
+((assignment . (open_tuple (identifier) @definition))
+ (#set! definition.rebind "outer-or-local"))
 (for_binding . (identifier) @definition)
 (for_binding . (tuple_expression (identifier) @definition))
 (let_binding . (identifier) @definition)

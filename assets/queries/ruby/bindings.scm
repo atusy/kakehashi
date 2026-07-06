@@ -8,15 +8,20 @@
 ; (obj.run) and setter definitions are member access — never captured.
 
 ; ── Scopes ──────────────────────────────────────────────────────────────
-; Methods see methods, constants, and instance variables outward, never
-; locals. Classes and modules are labelled for ivar registration.
+; Methods, classes, and modules all open a fresh local scope: they see
+; methods, constants, and instance variables outward but never enclosing
+; locals (a bare name in a class body is a method call, not the outer
+; local). Class/module scopes are also labelled for ivar registration.
 ((method) @scope
  (#set! scope.inherits "method constant ivar"))
 ((singleton_method) @scope
  (#set! scope.inherits "method constant ivar"))
-(class) @scope.class
-(module) @scope.class
-(singleton_class) @scope.class
+((class) @scope.class
+ (#set! scope.inherits "method constant ivar"))
+((module) @scope.class
+ (#set! scope.inherits "method constant ivar"))
+((singleton_class) @scope.class
+ (#set! scope.inherits "method constant ivar"))
 (block) @scope
 (do_block) @scope
 (lambda) @scope

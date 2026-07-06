@@ -19,7 +19,11 @@
 ; ── ARG / ENV variables ──────────────────────────────────────────────────
 ((arg_instruction name: (unquoted_string) @definition) @_arg
  (#set! definition.visibility "after"))
-((env_pair name: (unquoted_string) @definition) @_env
+; Anchor `after` to the whole ENV instruction, not the pair: Docker uses
+; the pre-instruction value for a `${VAR}` expansion within the same
+; instruction, so an earlier pair must not be visible to a later one
+; (`ENV A=old` then `ENV A=new B=${A}` — B sees old).
+((env_instruction (env_pair name: (unquoted_string) @definition)) @_env
  (#set! definition.visibility "after"))
 
 ; ${VAR} / $VAR expansions in image tags, paths, and values.

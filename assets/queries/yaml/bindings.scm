@@ -5,7 +5,10 @@
 ; definition, and re-defining an anchor name shadows it for later
 ; aliases (each `&name` is a fresh binding). Everything else in a YAML
 ; document — keys, values, tags — carries no name binding and stays
-; silent.
+; silent. Anchors are document-scoped: each `---` document is its own
+; scope, so an alias never resolves an anchor in another document.
+
+(document) @scope
 
 ((anchor (anchor_name) @definition.anchor) @_a
  (#set! definition.namespace "anchor")
