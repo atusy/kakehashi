@@ -82,7 +82,7 @@ fn open_markdown(client: &mut LspClient) {
 /// Issue `textDocument/codeAction` over the lua fence line, retrying while
 /// the result is null (cold downstream still handshaking).
 fn code_action_with_retry(client: &mut LspClient) -> Vec<Value> {
-    for _ in 0..20 {
+    for _ in 0..300 {
         let response = client.send_request(
             "textDocument/codeAction",
             json!({
@@ -99,7 +99,7 @@ fn code_action_with_retry(client: &mut LspClient) -> Vec<Value> {
         {
             return actions.clone();
         }
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(50));
     }
     panic!("textDocument/codeAction never returned actions");
 }
