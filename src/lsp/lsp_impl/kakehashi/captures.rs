@@ -1116,6 +1116,8 @@ fn execute_captures_walk(
     // Layer-entry hashes this walk read or wrote — the live set for the
     // post-walk sweep (host slots self-replace and need no sweep).
     let mut touched_layer_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Hit/miss counters for the walk log line (cache-behavior diagnostics).
+    let (mut layers_reused, mut layers_executed) = (0usize, 0usize);
 
     let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
         // Per-layer cancellation checkpoint: a cancelled walk stops doing
@@ -1159,8 +1161,10 @@ fn execute_captures_walk(
             if depth > 0 {
                 touched_layer_hashes.insert(hash);
             }
+            layers_reused += 1;
             (cached, anchor)
         } else {
+            layers_executed += 1;
             let mut fresh = execute_query(&kind_query.query, layer_tree, text, byte_range.clone());
             // Rebase to anchor-relative before storing; a refusal (a capture
             // below the layer anchor, e.g. a root node reaching outside its
@@ -1346,6 +1350,10 @@ fn execute_captures_walk(
     if cache_full_walk && injection && mint_into_tracker {
         match_cache.sweep_layers(uri, kind, &touched_layer_hashes);
     }
+    log::debug!(
+        target: "kakehashi::captures",
+        "walk {uri} kind={kind}: match-cache reused={layers_reused} executed={layers_executed}",
+    );
 
     // The kind is "available" when at least one visited language COMPILED
     // the file — a host without a context.scm still surfaces the embedded
