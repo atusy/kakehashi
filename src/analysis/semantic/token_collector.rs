@@ -3,8 +3,10 @@
 //! This module handles the collection of raw tokens from a single document's
 //! highlight query, including multiline token handling and byte-to-UTF16 conversion.
 
+use std::collections::HashMap;
+
 use crate::config::CaptureMappings;
-use crate::text::position::byte_to_utf16_col;
+use crate::text::position::Utf16LineIndex;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
 use super::legend::{CaptureResult, resolve_capture};
@@ -23,6 +25,25 @@ fn is_in_exclusion_range(node: &Node, ranges: &[(usize, usize)]) -> bool {
             && node_end <= range_end
             && (node_start != range_start || node_end != range_end)
     })
+}
+
+/// Resolve a byte column to a UTF-16 column against `host_line`'s cached
+/// index, building the index on first use for that line.
+///
+/// A single host line commonly receives several `byte_to_utf16` queries (one
+/// pair of start/end per capture, times however many captures land on that
+/// line), so caching by line number turns what would be an O(line_len)
+/// rescan per query into one O(line_len) build plus O(log line_len) lookups.
+fn cached_utf16_col(
+    cache: &mut HashMap<usize, Utf16LineIndex>,
+    host_line: usize,
+    line_text: &str,
+    byte_col: usize,
+) -> usize {
+    cache
+        .entry(host_line)
+        .or_insert_with(|| Utf16LineIndex::new(line_text))
+        .byte_to_utf16(byte_col)
 }
 
 /// Extract the `#set! priority N` value for a pattern, defaulting to 100.
@@ -342,6 +363,10 @@ pub(super) fn collect_host_tokens(
     // Split content text into lines for byte offset calculations
     let content_lines: Vec<&str> = text.lines().collect();
 
+    // Lazily-built byte->UTF-16 lookup per host line, shared across every
+    // capture below. See `cached_utf16_col`.
+    let mut utf16_cache: HashMap<usize, Utf16LineIndex> = HashMap::new();
+
     // Collect tokens from this document's highlight query
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
@@ -389,7 +414,12 @@ pub(super) fn collect_host_tokens(
                 } else {
                     start_pos.column
                 };
-                let start_utf16 = byte_to_utf16_col(host_line_text, byte_offset_in_host);
+                let start_utf16 = cached_utf16_col(
+                    &mut utf16_cache,
+                    host_line,
+                    host_line_text,
+                    byte_offset_in_host,
+                );
 
                 // For trailing newline case, use the line length as end position
                 let end_byte_offset_in_host = if is_trailing_newline {
@@ -399,7 +429,12 @@ pub(super) fn collect_host_tokens(
                 } else {
                     end_pos.column
                 };
-                let end_utf16 = byte_to_utf16_col(host_line_text, end_byte_offset_in_host);
+                let end_utf16 = cached_utf16_col(
+                    &mut utf16_cache,
+                    host_line,
+                    host_line_text,
+                    end_byte_offset_in_host,
+                );
 
                 all_tokens.push(RawToken {
                     line: host_line,
@@ -429,7 +464,12 @@ pub(super) fn collect_host_tokens(
                     } else {
                         start_pos.column
                     };
-                    let start_utf16 = byte_to_utf16_col(host_start_line_text, start_byte_offset);
+                    let start_utf16 = cached_utf16_col(
+                        &mut utf16_cache,
+                        host_start_line,
+                        host_start_line_text,
+                        start_byte_offset,
+                    );
 
                     let mut total_length_utf16 = 0usize;
                     for row in start_pos.row..=end_pos.row {
@@ -446,8 +486,10 @@ pub(super) fn collect_host_tokens(
                             &prefix_widths,
                         );
 
-                        let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
-                        let line_end_utf16 = byte_to_utf16_col(line_text, line_end);
+                        let line_start_utf16 =
+                            cached_utf16_col(&mut utf16_cache, host_row, line_text, line_start);
+                        let line_end_utf16 =
+                            cached_utf16_col(&mut utf16_cache, host_row, line_text, line_end);
                         total_length_utf16 += line_end_utf16 - line_start_utf16;
 
                         if row < end_pos.row {
@@ -489,8 +531,18 @@ pub(super) fn collect_host_tokens(
                             &prefix_widths,
                         );
 
-                        let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
-                        let end_utf16 = byte_to_utf16_col(host_line_text, line_end_byte);
+                        let start_utf16 = cached_utf16_col(
+                            &mut utf16_cache,
+                            host_row,
+                            host_line_text,
+                            line_start_byte,
+                        );
+                        let end_utf16 = cached_utf16_col(
+                            &mut utf16_cache,
+                            host_row,
+                            host_line_text,
+                            line_end_byte,
+                        );
 
                         if end_utf16 > start_utf16 {
                             all_tokens.push(RawToken {
@@ -775,6 +827,50 @@ mod tests {
         assert!(
             !tokens.is_empty(),
             "Token with exact-match exclusion range should NOT be suppressed"
+        );
+    }
+
+    #[test]
+    fn collect_host_tokens_utf16_columns_correct_for_multiple_tokens_after_cjk_prefix() {
+        // Two identifiers on the same line, with a 3-char CJK string literal
+        // between them, so both byte->UTF-16 conversions land on the SAME
+        // host_line (exercising the Utf16LineIndex cache across two lookups
+        // on one line) and the second identifier's byte and UTF-16 columns
+        // genuinely diverge (each CJK char is 3 bytes but 1 UTF-16 unit).
+        let code = "let x = \"あいう\"; let y = 1;";
+        let tree = parse_rust_tree(code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @variable").unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+
+        let mut tokens = Vec::new();
+        collect_host_tokens(
+            code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            code,
+            &lines,
+            &build_line_start_bytes(code),
+            0,
+            0,
+            false,
+            &[],
+            &[],
+            &mut tokens,
+        );
+
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(
+            (tokens[0].column, tokens[0].length),
+            (4, 1),
+            "x: byte col 4 == utf16 col 4 (pure ASCII prefix)"
+        );
+        assert_eq!(
+            (tokens[1].column, tokens[1].length),
+            (19, 1),
+            "y: byte col 25, but utf16 col 19 (three 3-byte CJK chars each collapse to 1 utf16 unit)"
         );
     }
 
