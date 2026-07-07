@@ -18,6 +18,13 @@ use tree_sitter::Language;
 /// Maximum length (in characters) for pattern previews in log messages.
 const MAX_PREVIEW_LEN: usize = 60;
 
+/// Backstop wait for a loser parked in [`LanguageCoordinator::ensure_language_loaded_async`]'s
+/// single-flight: bounds worst-case latency if a notification is ever
+/// somehow missed. A first load is expected to finish in the tens of
+/// milliseconds (dlopen + query compile); this is purely defense-in-depth,
+/// not a tuning knob for expected load time.
+const LANGUAGE_LOAD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Context for loading a query, including metadata for log messages.
 struct QueryLoadContext<'a> {
     language_id: &'a str,
@@ -153,6 +160,17 @@ impl LanguageCoordinator {
     /// the same language through [`load_inflight`](Self::load_inflight) so a
     /// request burst against one cold language (or a host document injecting
     /// it into many regions) loads it exactly once.
+    ///
+    /// Only the winner's [`LanguageLoadResult`] carries the load's events
+    /// (log messages, warnings) — a loser that parked and woke re-derives
+    /// its own success/failure from `language_registry`/`failed_loads`
+    /// (never the winner's result directly), so on a failed load every
+    /// loser in the burst gets an empty `LanguageLoadResult::default()`
+    /// with no events, even though the winner already logged the error
+    /// once. Matches the synchronous [`ensure_language_loaded`](Self::ensure_language_loaded)'s
+    /// existing cached-failure behavior — a caller must not assume every
+    /// invocation surfaces load events for a language it didn't win the
+    /// race to load.
     pub(crate) async fn ensure_language_loaded_async(
         self: &Arc<Self>,
         language_id: &str,
@@ -206,11 +224,11 @@ impl LanguageCoordinator {
                             coordinator.try_load_language_by_id(&owned_id)
                         })
                         .await
-                        .unwrap_or_else(|_| {
+                        .unwrap_or_else(|join_error| {
                             LanguageLoadResult::failure_with(LanguageEvent::log(
                                 LanguageLogLevel::Error,
                                 format!(
-                                    "language load for '{language_id}' panicked on the blocking pool"
+                                    "language load for '{language_id}' failed on the blocking pool: {join_error}"
                                 ),
                             ))
                         });
@@ -248,7 +266,7 @@ impl LanguageCoordinator {
             if winner_live {
                 tokio::select! {
                     _ = &mut notified => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = tokio::time::sleep(LANGUAGE_LOAD_WAIT_TIMEOUT) => {}
                 }
             }
             // Loop back: re-check registry/failed_loads/in-flight from
