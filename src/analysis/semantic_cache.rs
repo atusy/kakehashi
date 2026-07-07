@@ -575,12 +575,17 @@ mod tests {
         );
     }
 
-    /// Pins the named worst-case from #576: a delta-baseline read must NOT
-    /// clone the previous token vector to feed the comparison — `&Arc<T>`
-    /// deref-coerces to `&T` at the call, so the strong count must be
-    /// unaffected by `calculate_delta_or_full` borrowing it.
+    /// Pins the named worst-case from #576: a delta-baseline read must not
+    /// perform an extra `Arc::clone` (refcount bump) to feed the
+    /// comparison — `&Arc<T>` deref-coerces to `&T` at the call, so
+    /// `calculate_delta_or_full` borrowing it should leave the strong count
+    /// unchanged. This only detects a stray `Arc::clone`; it cannot detect
+    /// a deep clone of the underlying `SemanticTokens` (which wouldn't
+    /// touch this Arc's refcount at all) — that guarantee instead comes
+    /// from `calculate_delta_or_full`'s signature taking `&SemanticTokens`,
+    /// not an owned value.
     #[test]
-    fn delta_baseline_comparison_does_not_clone_the_cached_arc() {
+    fn delta_baseline_comparison_does_not_bump_the_cached_arcs_refcount() {
         let cache = SemanticTokenCache::new();
         let uri = Url::parse("file:///arc_no_clone_on_delta.rs").unwrap();
         let previous = SemanticTokens {
