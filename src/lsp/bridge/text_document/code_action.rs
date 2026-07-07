@@ -182,11 +182,19 @@ fn translate_edit_host_ward_strict(
 /// `request_virtual_uri` (a cross-region edit). The shared host transform
 /// silently filters such text edits; the resolve path uses this to fail soft
 /// instead, since a partially-applied resolved edit is worse than none.
+///
+/// A foreign key that carries ZERO edits is a no-op — the transform strips it
+/// cleanly and it applies nothing — so it does NOT count as touching a foreign
+/// region (consistent with `workspace_edit_is_empty`'s inner-vector check).
+/// Only foreign entries with real edits would be silently dropped, and those
+/// are what must reject the whole action.
 fn workspace_edit_touches_foreign_region(edit: &WorkspaceEdit, request_virtual_uri: &str) -> bool {
     let is_foreign =
         |uri: &str| VirtualDocumentUri::is_virtual_uri(uri) && uri != request_virtual_uri;
     if let Some(changes) = &edit.changes
-        && changes.keys().any(|k| is_foreign(k.as_str()))
+        && changes
+            .iter()
+            .any(|(k, edits)| is_foreign(k.as_str()) && !edits.is_empty())
     {
         return true;
     }
@@ -194,9 +202,11 @@ fn workspace_edit_touches_foreign_region(edit: &WorkspaceEdit, request_virtual_u
         None => false,
         Some(DocumentChanges::Edits(edits)) => edits
             .iter()
-            .any(|e| is_foreign(e.text_document.uri.as_str())),
+            .any(|e| is_foreign(e.text_document.uri.as_str()) && !e.edits.is_empty()),
         Some(DocumentChanges::Operations(ops)) => ops.iter().any(|op| match op {
-            DocumentChangeOperation::Edit(e) => is_foreign(e.text_document.uri.as_str()),
+            DocumentChangeOperation::Edit(e) => {
+                is_foreign(e.text_document.uri.as_str()) && !e.edits.is_empty()
+            }
             // File ops on virtual URIs are rejected by the transform itself
             // (it returns false), so they need no foreign check here.
             DocumentChangeOperation::Op(_) => false,
@@ -1827,15 +1837,27 @@ mod tests {
         .unwrap();
         assert!(!workspace_edit_touches_foreign_region(&clean, &own));
 
-        // A different region's virtual URI is foreign.
+        // A different region's virtual URI carrying a REAL edit is foreign.
         let cross: WorkspaceEdit = serde_json::from_value(json!({
             "changes": {
                 own.clone(): [],
-                other: []
+                other.clone(): [{ "range": {"start": {"line":0,"character":0}, "end": {"line":0,"character":1}}, "newText": "z" }]
             }
         }))
         .unwrap();
         assert!(workspace_edit_touches_foreign_region(&cross, &own));
+
+        // A foreign key carrying ZERO edits is a vacuous no-op — the transform
+        // strips it cleanly — so a mix of a real own-region edit and an EMPTY
+        // foreign entry is NOT cross-region (the action must not be rejected).
+        let mixed: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": {
+                own.clone(): [{ "range": {"start": {"line":0,"character":0}, "end": {"line":0,"character":1}}, "newText": "y" }],
+                other: []
+            }
+        }))
+        .unwrap();
+        assert!(!workspace_edit_touches_foreign_region(&mixed, &own));
     }
 
     #[test]
