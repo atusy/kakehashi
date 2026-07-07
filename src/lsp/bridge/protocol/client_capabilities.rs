@@ -124,6 +124,13 @@ fn build_baseline_capabilities(
     ClientCapabilities {
         text_document: Some(text_document),
         workspace: Some(WorkspaceClientCapabilities {
+            // The bridge handles inbound `workspace/applyEdit` (#568 PR 5),
+            // translating virtual-document edits to the host document and
+            // relaying the editor's response. Advertise it so a spec-compliant
+            // downstream server actually issues applyEdit (e.g. rust-analyzer's
+            // "extract into function") instead of assuming the client can't
+            // apply edits.
+            apply_edit: Some(true),
             diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),

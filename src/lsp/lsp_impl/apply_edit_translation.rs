@@ -159,6 +159,13 @@ fn transform_params_to_host(
 /// `changes` map, `documentChanges` text edits, and file-operation URIs.
 /// Deduplicated (a URI appearing in both shapes counts once); order follows
 /// discovery and is only meaningful for the single-element case.
+///
+/// A text-edit entry (`changes` value or a `TextDocumentEdit`) with an EMPTY
+/// edit vector is a no-op and does NOT count as touching its URI: an edit that
+/// is real-file-only but carries a stray empty virtual entry must forward
+/// verbatim, not be routed down the virtual-translation path (and then fail
+/// `applied: false`). File operations always count — a create/rename/delete is
+/// a real change even with no accompanying text edits.
 fn collect_virtual_uris(edit: &WorkspaceEdit) -> Vec<String> {
     let mut uris: Vec<String> = Vec::new();
     let mut push = |uri: &str| {
@@ -168,20 +175,27 @@ fn collect_virtual_uris(edit: &WorkspaceEdit) -> Vec<String> {
     };
 
     if let Some(changes) = &edit.changes {
-        for uri in changes.keys() {
-            push(uri.as_str());
+        for (uri, edits) in changes {
+            if !edits.is_empty() {
+                push(uri.as_str());
+            }
         }
     }
     match &edit.document_changes {
         Some(DocumentChanges::Edits(edits)) => {
             for edit in edits {
-                push(edit.text_document.uri.as_str());
+                if !edit.edits.is_empty() {
+                    push(edit.text_document.uri.as_str());
+                }
             }
         }
         Some(DocumentChanges::Operations(ops)) => {
             for op in ops {
                 match op {
-                    DocumentChangeOperation::Edit(edit) => push(edit.text_document.uri.as_str()),
+                    DocumentChangeOperation::Edit(edit) if !edit.edits.is_empty() => {
+                        push(edit.text_document.uri.as_str())
+                    }
+                    DocumentChangeOperation::Edit(_) => {}
                     DocumentChangeOperation::Op(ResourceOp::Create(create)) => {
                         push(create.uri.as_str())
                     }
@@ -414,5 +428,43 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(collect_virtual_uris(&edit), vec![uri]);
+    }
+
+    #[test]
+    fn collect_virtual_uris_ignores_empty_text_edit_entries() {
+        // An edit with real-file changes plus a STRAY EMPTY virtual entry must
+        // not be routed down the virtual-translation path: the empty virtual
+        // entry is a no-op, so it doesn't count as touching a virtual document.
+        let uri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let changes_edit: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": {
+                uri.clone(): [],
+                "file:///real.lua": [text_edit(0)]
+            }
+        }))
+        .unwrap();
+        assert!(
+            collect_virtual_uris(&changes_edit).is_empty(),
+            "an empty virtual `changes` entry must not count as touched"
+        );
+
+        // Same for a `documentChanges` TextDocumentEdit with no edits.
+        let doc_changes_edit: WorkspaceEdit = serde_json::from_value(json!({
+            "documentChanges": [
+                { "textDocument": { "uri": uri.clone(), "version": null }, "edits": [] }
+            ]
+        }))
+        .unwrap();
+        assert!(
+            collect_virtual_uris(&doc_changes_edit).is_empty(),
+            "an empty virtual `documentChanges` edit must not count as touched"
+        );
+
+        // A NON-empty virtual entry still counts.
+        let non_empty: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": { uri.clone(): [text_edit(0)] }
+        }))
+        .unwrap();
+        assert_eq!(collect_virtual_uris(&non_empty), vec![uri]);
     }
 }

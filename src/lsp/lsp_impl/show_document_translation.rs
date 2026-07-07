@@ -10,8 +10,8 @@
 //! the right spot.
 //!
 //! The offset is rebuilt from the live parse exactly as the goto path does
-//! (`region_id → node byte range → resolve injection → RegionOffset`, via the
-//! shared [`resolve_region_offset`](super::region_offset::resolve_region_offset)),
+//! (`region_id → node byte range → resolve injection → RegionOffset`) via the
+//! shared [`resolve_region_offset`](super::region_offset::resolve_region_offset),
 //! so a showDocument-to-a-region can't disagree with goto on the same region.
 //!
 //! Once the URI resolves to a currently-open virtual document, the editor always
