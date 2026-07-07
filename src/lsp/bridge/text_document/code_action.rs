@@ -124,10 +124,17 @@ fn build_code_action_request(
     // don't exist: above-region ones saturate to (0,0) and can false-match a
     // different diagnostic at the top of the virtual document; ones past the
     // region land beyond the virtual document. Keep only diagnostics whose
-    // WHOLE range fits the region's `[start, end)` extent (`region_end` is
-    // exclusive, so a diagnostic ending exactly at it is in) — bounding by
-    // the region, NOT the (possibly zero-length, cursor) request range, which
-    // would wrongly drop a diagnostic sitting at the cursor.
+    // WHOLE range fits the region — bounding by the region, NOT the (possibly
+    // zero-length, cursor) request range, which would wrongly drop a
+    // diagnostic sitting at the cursor.
+    //
+    // `region_end` is `virtual_content`'s end mapped to host coords, i.e. the
+    // valid end-of-content LSP position (one past the last char / start of a
+    // trailing empty line). `end <= region_end` is therefore INCLUSIVE on
+    // purpose: an end-of-content diagnostic (e.g. "missing semicolon") is
+    // real and maps to a valid virtual position. For a well-formed diagnostic
+    // (`start <= end`), `end <= region_end` already forces any `start` at
+    // `region_end` to be zero-length there — still valid, not a leak.
     context.diagnostics.retain(|diagnostic| {
         host_position_within_region(diagnostic.range.start, offset)
             && diagnostic.range.end <= region_end
