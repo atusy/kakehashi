@@ -200,9 +200,10 @@ today's behavior.
 ### 2. Temporal refinement (progressive)
 
 The merge is not one-shot. It adopts language-server-bridge-request-strategies Strategy 1's
-parallel-fetch-with-progressive-refinement shape, but makes one choice Strategy
-1 leaves open: where Strategy 1 permits using a bridged response directly if it
-wins the race, this merge is **deliberately native-first** — the first response
+parallel-fetch-with-progressive-refinement shape, but **overrides** one choice
+Strategy 1 makes: where Strategy 1 uses whichever response wins the race
+(bridged directly if it arrives first), this merge is **deliberately
+native-first** — the first response
 never waits on a race outcome. Native tokens are local and effectively always
 ready first; tying the instant-paint guarantee to a race would make the
 zero-latency experience nondeterministic for no benefit. (Native-first
