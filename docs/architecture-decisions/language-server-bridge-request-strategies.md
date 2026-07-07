@@ -300,7 +300,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 ### Positive
 
 - **Optimized UX per feature**: Each method gets the strategy that best fits its characteristics
-- **Fast visual feedback**: Semantic tokens appear instantly via parallel fetch
+- **Fast visual feedback**: Native tree-sitter semantic tokens appear instantly today; the parallel-fetch enrichment with bridged tokens is aspirational (cross-layer-semantic-token-merge)
 - **Accurate navigation**: Go-to-definition uses authoritative language server
 - **Safe editing**: Cross-file edits are filtered to prevent corruption
 - **Comprehensive diagnostics**: Aggregated from multiple sources

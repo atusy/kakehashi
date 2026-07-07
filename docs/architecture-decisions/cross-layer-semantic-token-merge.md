@@ -143,7 +143,8 @@ native finalize          host server          virt server(s)
   position as one group (aggregation-priorities-wildcard's first-win rest
   group); the sweep needs a total order, so ties inside the group break by
   **server name**, matching the by-name sort the bridge coordinator already
-  imposes on candidate lists for determinism (`coordinator.rs`) — not
+  imposes on candidate lists for determinism
+  (`src/lsp/bridge/coordinator.rs`) — not
   registration order, which is a `HashMap` iteration artifact and unstable.
   Users wanting a specific intra-group ranking list those servers explicitly
   before `"*"`. For semantic
@@ -293,7 +294,8 @@ edit deltas between the set's version and the current snapshot are replayed
 over the token positions, shifting each token to its post-edit location. The
 trail those deltas come from is **new bookkeeping this decision requires**:
 today nothing retains per-version edits — both bridge sync paths send full
-text (virt `did_change.rs`, host `host.rs`), and the incremental `InputEdit`s
+text (virt `src/lsp/bridge/text_document/did_change.rs`, host
+`src/lsp/bridge/text_document/host.rs`), and the incremental `InputEdit`s
 from the client are applied to the tree seed and discarded
 (`src/document/model.rs`) — so the implementation must retain the client's
 incremental `contentChanges` keyed by host version. The trail stays bounded
