@@ -357,6 +357,60 @@ fn lazy_action_resolve_surfaces_server_changed_title() {
 }
 
 #[test]
+fn multistep_resolve_forwards_the_server_changed_title() {
+    // A still-lazy resolve (no edit) that CHANGES the title must carry the new
+    // title into the routing envelope, so a SECOND resolve forwards the title
+    // the server last advertised — the match-by-title contract. The mock's
+    // second resolve only materializes an edit when it receives the "(step2)"
+    // title; if the bridge dropped the tracked title, the action stays lazy
+    // forever and no edit ever appears.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-multistep", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+    assert_eq!(lazy["title"], "Lazy organize imports — mock-codeaction");
+
+    // First resolve: the server stays lazy (no edit) but renames the action.
+    let step1 = client.send_request("codeAction/resolve", lazy.clone());
+    let step1 = &step1["result"];
+    assert_eq!(
+        step1["title"], "Lazy organize imports (step2) — mock-codeaction",
+        "the server's step-1 title change must be surfaced"
+    );
+    assert!(
+        step1["edit"].is_null(),
+        "still lazy after step 1 (no edit yet), got: {step1:?}"
+    );
+    // The envelope must still be present so a second resolve routes back.
+    assert_eq!(step1["data"]["kakehashi"]["origin"], "mock-codeaction");
+    assert_eq!(
+        step1["data"]["kakehashi"]["original_title"], "Lazy organize imports (step2)",
+        "the envelope must track the server-changed title for the next resolve"
+    );
+
+    // Second resolve: the bridge must forward the tracked "(step2)" title, so
+    // the mock now materializes the edit.
+    let step2 = client.send_request("codeAction/resolve", step1.clone());
+    let step2 = &step2["result"];
+    let edits = &step2["edit"]["changes"][MARKDOWN_URI];
+    assert!(
+        edits.is_array(),
+        "the second resolve must materialize the edit — proves the tracked \
+         title reached the server, got: {step2:?}"
+    );
+    assert_eq!(
+        edits[0]["newText"],
+        "organized:Lazy organize imports (step2)"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn lazy_action_is_eager_resolved_without_resolve_support() {
     // A client WITHOUT resolveSupport/dataSupport cannot resolve a lazy
     // action, so the bridge eager-resolves it downstream: the codeAction
