@@ -580,14 +580,25 @@ fn main() {
                     // VIRTUAL document URI. A virtual-URI file op cannot be
                     // represented in the host document, so the bridge must
                     // disable the action (with disabledSupport) rather than
-                    // return an enabled action that applies nothing.
+                    // return an enabled action that applies nothing. ALSO change
+                    // the title and attach a diagnostic (virtual line 0): the
+                    // disabled outcome must carry the server's most accurate
+                    // title (re-suffixed) and its host-translated diagnostics,
+                    // not the pre-resolve action's.
                     respond(
                         &mut writer,
                         id,
                         json!({
-                            "title": title,
+                            "title": format!("{title} (fileop)"),
                             "kind": "source.organizeImports",
                             "data": data,
+                            "diagnostics": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 5 }
+                                },
+                                "message": "fileop diag"
+                            }],
                             "edit": {
                                 "documentChanges": [
                                     { "kind": "create", "uri": target_uri }
