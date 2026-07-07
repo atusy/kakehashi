@@ -15,7 +15,9 @@ use tower_lsp_server::ls_types::{
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::{FanInResult, dispatch_host_preferred, dispatch_preferred};
-use crate::lsp::bridge::{HostDocument, bridge_code_actions, parse_code_actions_leniently};
+use crate::lsp::bridge::{
+    HostDocument, UpstreamCodeActionCaps, bridge_code_actions, parse_code_actions_leniently,
+};
 
 const METHOD: &str = "textDocument/codeAction";
 
@@ -29,16 +31,11 @@ impl Kakehashi {
         let lsp_uri = params.text_document.uri;
         let range = params.range;
         let context = params.context;
-        let client_supports_disabled = self.client_supports_code_action_disabled();
+        let upstream_caps = self.upstream_code_action_caps();
 
-        let virt = self.code_action_virt_layer(
-            &lsp_uri,
-            range,
-            context,
-            work_done_token,
-            client_supports_disabled,
-        );
-        let host = self.code_action_host_layer(&lsp_uri, raw_params, client_supports_disabled);
+        let virt =
+            self.code_action_virt_layer(&lsp_uri, range, context, work_done_token, upstream_caps);
+        let host = self.code_action_host_layer(&lsp_uri, raw_params, upstream_caps);
         self.walk_layer_futures(
             &lsp_uri,
             METHOD,
@@ -51,17 +48,25 @@ impl Kakehashi {
         .await
     }
 
-    /// Whether the upstream client can render `CodeAction.disabled`
-    /// (LSP 3.16 `disabledSupport`). Gates the disable-vs-drop policy for
-    /// actions the bridge cannot execute yet.
-    fn client_supports_code_action_disabled(&self) -> bool {
-        self.settings_manager
+    /// The upstream client's codeAction capabilities that gate the bridge
+    /// policy: `disabledSupport` (LSP 3.16) drives disable-vs-drop for
+    /// actions the bridge cannot execute yet; `isPreferredSupport`
+    /// (LSP 3.15) gates the isPreferred passthrough.
+    fn upstream_code_action_caps(&self) -> UpstreamCodeActionCaps {
+        let code_action = self
+            .settings_manager
             .client_capabilities_lock()
             .get()
             .and_then(|caps| caps.text_document.as_ref())
-            .and_then(|td| td.code_action.as_ref())
-            .and_then(|ca| ca.disabled_support)
-            .unwrap_or(false)
+            .and_then(|td| td.code_action.as_ref());
+        UpstreamCodeActionCaps {
+            disabled_support: code_action
+                .and_then(|ca| ca.disabled_support)
+                .unwrap_or(false),
+            is_preferred_support: code_action
+                .and_then(|ca| ca.is_preferred_support)
+                .unwrap_or(false),
+        }
     }
 
     /// Virt layer: bridge the injection region under the requested range.
@@ -71,7 +76,7 @@ impl Kakehashi {
         range: Range,
         context: CodeActionContext,
         client_progress_token: Option<NumberOrString>,
-        client_supports_disabled: bool,
+        upstream_caps: UpstreamCodeActionCaps,
     ) -> Result<Option<CodeActionResponse>> {
         let Some(mut ctx) = self
             .resolve_bridge_contexts_for_range_overlap(lsp_uri, range, METHOD)
@@ -105,7 +110,7 @@ impl Kakehashi {
                             &t.virtual_content,
                             t.upstream_id,
                             t.client_progress_token,
-                            client_supports_disabled,
+                            upstream_caps,
                         )
                         .await
                 }
@@ -127,7 +132,7 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         raw_params: serde_json::Value,
-        client_supports_disabled: bool,
+        upstream_caps: UpstreamCodeActionCaps,
     ) -> Result<Option<CodeActionResponse>> {
         let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
             return Ok(None);
@@ -160,7 +165,7 @@ impl Kakehashi {
                         Some(bridge_code_actions(
                             actions,
                             &t.server_name,
-                            client_supports_disabled,
+                            upstream_caps,
                             None,
                         ))
                     }))
