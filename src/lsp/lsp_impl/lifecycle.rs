@@ -1119,30 +1119,44 @@ fn spawn_upstream_request(
                         failure_reason: Some(failure_reason),
                         failed_change: None,
                     },
-                    Ok(params) => {
-                        let id = client.next_request_id();
-                        let value = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
-                        forward_with_cancel(
-                            &client,
-                            id,
-                            "workspace/applyEdit",
-                            value,
-                            &cancel.token,
-                        )
-                        .await
-                        .and_then(|v| serde_json::from_value::<ApplyWorkspaceEditResponse>(v).ok())
-                        // Editor error/cancel, or a response that didn't parse
-                        // as an ApplyWorkspaceEditResponse: the protocol default
-                        // — the edit was not applied.
-                        .unwrap_or(ApplyWorkspaceEditResponse {
+                    // Serializing the (typed) translated params ~never fails,
+                    // but forwarding `params: null` on the off chance it did
+                    // would send the editor an invalid request; answer local
+                    // applied:false with a serialization reason instead.
+                    Ok(params) => match serde_json::to_value(params) {
+                        Ok(value) => {
+                            let id = client.next_request_id();
+                            forward_with_cancel(
+                                &client,
+                                id,
+                                "workspace/applyEdit",
+                                value,
+                                &cancel.token,
+                            )
+                            .await
+                            .and_then(|v| {
+                                serde_json::from_value::<ApplyWorkspaceEditResponse>(v).ok()
+                            })
+                            // Editor error/cancel, or a response that didn't
+                            // parse as an ApplyWorkspaceEditResponse: the
+                            // protocol default — the edit was not applied.
+                            .unwrap_or(ApplyWorkspaceEditResponse {
+                                applied: false,
+                                failure_reason: Some(
+                                    "kakehashi: no valid workspace/applyEdit response from the editor"
+                                        .to_string(),
+                                ),
+                                failed_change: None,
+                            })
+                        }
+                        Err(e) => ApplyWorkspaceEditResponse {
                             applied: false,
-                            failure_reason: Some(
-                                "kakehashi: no valid workspace/applyEdit response from the editor"
-                                    .to_string(),
-                            ),
+                            failure_reason: Some(format!(
+                                "kakehashi: could not serialize the workspace/applyEdit request: {e}"
+                            )),
                             failed_change: None,
-                        })
-                    }
+                        },
+                    },
                 };
                 inbound_request_registry.unregister(
                     cancel.connection_id,
