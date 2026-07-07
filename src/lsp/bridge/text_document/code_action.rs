@@ -138,6 +138,19 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
     }));
 }
 
+/// Whether a `WorkspaceEdit` carries no actual edits. After the host
+/// transform filters cross-region text edits, a resolved edit can end up
+/// empty; returning it would look "resolved" but do nothing when applied.
+fn workspace_edit_is_empty(edit: &tower_lsp_server::ls_types::WorkspaceEdit) -> bool {
+    let changes_empty = edit.changes.as_ref().is_none_or(|c| c.is_empty());
+    let doc_changes_empty = match &edit.document_changes {
+        None => true,
+        Some(tower_lsp_server::ls_types::DocumentChanges::Edits(edits)) => edits.is_empty(),
+        Some(tower_lsp_server::ls_types::DocumentChanges::Operations(ops)) => ops.is_empty(),
+    };
+    changes_empty && doc_changes_empty
+}
+
 /// The exclusive host-document end of an injection region: the position just
 /// past its `virtual_content`, mapped back to host coordinates. Bounds the
 /// in-region diagnostic filter position-precisely (line AND column), so a
@@ -379,9 +392,12 @@ impl LanguageServerPool {
             return action;
         }
 
-        // Translate the resolved edit host-ward; a cross-region edit that
-        // cannot be represented in the host document fails soft (return the
-        // original action unresolved rather than an unappliable edit).
+        // Translate the resolved edit host-ward. Fail soft (return the
+        // original action unresolved) when it can't be represented in the
+        // host document: a virtual-URI file op (transform returns false), OR
+        // the transform filtered every text edit as cross-region and left the
+        // edit empty — an empty resolved edit is worse than an unresolved
+        // action (the user would apply it and nothing would happen).
         match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
             (Some(edit), Some(host_uri_lsp)) => {
                 let virtual_uri = VirtualDocumentUri::new(
@@ -390,7 +406,9 @@ impl LanguageServerPool {
                     &envelope.region_id,
                 )
                 .to_uri_string();
-                if !transform_workspace_edit_to_host(edit, &virtual_uri, host_uri_lsp, &offset) {
+                if !transform_workspace_edit_to_host(edit, &virtual_uri, host_uri_lsp, &offset)
+                    || workspace_edit_is_empty(edit)
+                {
                     re_envelope_action(&mut action, &envelope);
                     return action;
                 }
@@ -762,11 +780,14 @@ fn bridge_code_action(
             }
         }
         None => {
-            // No edit, no command: a lazy action to be completed via
-            // `codeAction/resolve`. LSP 3.18 allows `data` to be absent (a
-            // title-only lazy action matched by title), so it is lazy when it
-            // carries `data` OR the origin server advertises resolve.
-            if action.data.is_some() || server_resolves {
+            // No edit, no command: only resolvable if the ORIGIN server
+            // advertises `codeAction/resolve`. `data` alone doesn't make an
+            // action lazy — without `resolveProvider` the client (or the
+            // bridge) can never issue the resolve, so a data-carrying action
+            // from a non-resolving server would stay unresolved forever. LSP
+            // 3.18 also allows a lazy action to be title-only (no `data`), so
+            // the server's capability — not `data` — is the deciding factor.
+            if server_resolves {
                 // Envelope it (virt layer) if the client can resolve the edit,
                 // so a later `codeAction/resolve` routes back to the origin;
                 // otherwise it can never be completed — disable it (an
@@ -1278,7 +1299,9 @@ mod tests {
 
     #[test]
     fn lazy_data_only_action_is_disabled() {
-        let actions = transform(
+        // Server resolves but the client can't envelope (no data/resolve
+        // support); the sync path disables it (eager-resolve covers prod).
+        let actions = transform_server_resolves(
             json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
             caps(true),
         )
@@ -1494,9 +1517,10 @@ mod tests {
 
     #[test]
     fn lazy_action_is_enveloped_for_resolve_capable_client() {
-        // With data+resolve support, a lazy (data-only) action is kept and its
-        // `data` wrapped in the routing envelope instead of being disabled.
-        let actions = transform(
+        // With data+resolve support (client) AND a resolve-capable server, a
+        // lazy (data-only) action is kept and its `data` wrapped in the
+        // routing envelope instead of being disabled.
+        let actions = transform_server_resolves(
             json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
             caps_resolve(),
         )
@@ -1548,6 +1572,38 @@ mod tests {
     }
 
     #[test]
+    fn data_only_action_dropped_when_server_cannot_resolve() {
+        // A data-carrying action from a server that does NOT advertise resolve
+        // can never be resolved (data is only the resolve round-trip payload),
+        // so it must be dropped, not enveloped forever.
+        let actions = transform(
+            json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
+            caps_resolve(),
+        )
+        .unwrap();
+        assert!(actions.is_empty(), "got: {actions:?}");
+    }
+
+    #[test]
+    fn workspace_edit_is_empty_detects_no_edits() {
+        use tower_lsp_server::ls_types::WorkspaceEdit;
+        assert!(workspace_edit_is_empty(&WorkspaceEdit::default()));
+        assert!(workspace_edit_is_empty(&WorkspaceEdit {
+            changes: Some(Default::default()),
+            ..Default::default()
+        }));
+        // A non-empty changes map is not empty.
+        let edit: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": { "file:///x.lua": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "newText": "y"
+            }] }
+        }))
+        .unwrap();
+        assert!(!workspace_edit_is_empty(&edit));
+    }
+
+    #[test]
     fn lazy_action_not_enveloped_when_resolve_support_lacks_edit() {
         // dataSupport is on but resolveSupport does NOT advertise "edit" — the
         // client cannot materialize the edit lazily, so the action must not be
@@ -1559,7 +1615,7 @@ mod tests {
             data_support: true,
             resolve_edit_support: false,
         };
-        let actions = transform(
+        let actions = transform_server_resolves(
             json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
             no_edit_resolve,
         )
