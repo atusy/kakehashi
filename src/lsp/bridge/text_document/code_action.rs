@@ -159,6 +159,25 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
     !changes_has_edit && !doc_changes_has_edit
 }
 
+/// Translate an action's edit host-ward with resolve-grade validation, in
+/// place. Returns `false` (leaving the edit partially mutated — the caller
+/// must discard the action) when the edit can't be faithfully represented in
+/// the host document: it touches another injection region (the shared
+/// transform would silently filter those edits and partially apply the rest),
+/// contains a virtual-URI file op (transform returns false), or ends up empty.
+/// Used by BOTH the initial-response policy and the codeAction/resolve path so
+/// cross-region edits are rejected uniformly, never partially applied.
+fn translate_edit_host_ward_strict(
+    edit: &mut WorkspaceEdit,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+) -> bool {
+    !workspace_edit_touches_foreign_region(edit, request_virtual_uri)
+        && transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset)
+        && !workspace_edit_is_empty(edit)
+}
+
 /// Whether a `WorkspaceEdit` touches a virtual document OTHER than
 /// `request_virtual_uri` (a cross-region edit). The shared host transform
 /// silently filters such text edits; the resolve path uses this to fail soft
@@ -479,10 +498,7 @@ impl LanguageServerPool {
                     &envelope.region_id,
                 )
                 .to_uri_string();
-                if workspace_edit_touches_foreign_region(edit, &virtual_uri)
-                    || !transform_workspace_edit_to_host(edit, &virtual_uri, host_uri_lsp, &offset)
-                    || workspace_edit_is_empty(edit)
-                {
+                if !translate_edit_host_ward_strict(edit, &virtual_uri, host_uri_lsp, &offset) {
                     re_envelope_action(&mut action, &envelope);
                     return action;
                 }
@@ -837,8 +853,13 @@ fn bridge_code_action(
 
     match &mut action.edit {
         Some(edit) => {
+            // Virt layer: translate host-ward with resolve-grade validation
+            // (the same check the client-driven resolve path uses), so an
+            // edit touching another region — including an eager-resolved lazy
+            // action's edit, which flows through here — is disabled, never
+            // partially applied.
             if let Some(virt) = virt
-                && !transform_workspace_edit_to_host(
+                && !translate_edit_host_ward_strict(
                     edit,
                     virt.request_virtual_uri,
                     virt.host_uri,
