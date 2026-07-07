@@ -870,14 +870,25 @@ fn bridge_code_action(
             }
         }
         None => {
-            // No edit, no command: only resolvable if the ORIGIN server
-            // advertises `codeAction/resolve`. `data` alone doesn't make an
-            // action lazy — without `resolveProvider` the client (or the
-            // bridge) can never issue the resolve, so a data-carrying action
-            // from a non-resolving server would stay unresolved forever. LSP
-            // 3.18 also allows a lazy action to be title-only (no `data`), so
-            // the server's capability — not `data` — is the deciding factor.
-            if server_resolves {
+            // No edit, no command: is this a lazy (resolve-deferred) action?
+            //
+            // Virt layer: the *bridge* issues the `codeAction/resolve`, so the
+            // origin server must advertise `resolveProvider` — `data` alone
+            // doesn't make it lazy (the bridge could never complete it), and
+            // LSP 3.18 allows a lazy action to be title-only, so the server's
+            // capability is the deciding factor.
+            //
+            // Host layer (`virt` is None): resolve is NOT bridged, so the
+            // bridge can't issue a resolve regardless of the server's
+            // capability. A `data`-carrying action is still a lazy action the
+            // server intends to be resolved — surface it as a `REASON_RESOLVE`
+            // disabled placeholder (the PR 3 behavior) rather than dropping it,
+            // so `disabledSupport` clients see why it can't run.
+            let is_lazy = match virt {
+                Some(_) => server_resolves,
+                None => action.data.is_some(),
+            };
+            if is_lazy {
                 // Envelope it (virt layer) if the client can resolve the edit,
                 // so a later `codeAction/resolve` routes back to the origin;
                 // otherwise it can never be completed — disable it (an
@@ -889,9 +900,9 @@ fn bridge_code_action(
                 }
                 return disable_action(action, REASON_RESOLVE, server_name, upstream_caps);
             }
-            // No edit, no command, no data, and the server can't resolve:
-            // selecting it would do nothing — drop it rather than clutter the
-            // menu.
+            // Nothing actionable (no edit, no command, and either no `data` or a
+            // non-resolving virt origin): selecting it would do nothing — drop
+            // it rather than clutter the menu.
             return None;
         }
     }
