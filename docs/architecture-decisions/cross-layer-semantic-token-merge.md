@@ -305,9 +305,17 @@ history — and an in-flight request whose base version is older than its
 server's currently accepted version will have its response discarded on
 arrival by monotonic acceptance, so its base need not be covered either.
 Retention therefore spans back only to the **minimum currently-accepted
-version across active servers** (a tighter, hang-proof bound than the oldest
-in-flight base — a slow or stuck server cannot force unbounded trail growth),
-and truncates as accepted versions advance. This cost is carried under
+version across active servers**, tighter than the oldest in-flight base. That
+minimum alone is not yet bounded: a stuck server whose accepted version never
+advances would pin it while edits keep arriving, so the trail is additionally
+capped at a **maximum version lag** `L`. When a server's accepted version
+falls more than `L` behind the current snapshot, its contribution is
+**evicted** — dropped from the sweep (that region falls through to the next
+layer, exactly the stale-exclusion fallback) and excluded from the minimum —
+so the trail truncates to at most `L` edits regardless of a hung server; a
+later fresh response re-enters that server at the current version. This makes
+the bound genuinely hang-proof, at the cost of a far-behind server briefly
+losing its tokens until it catches up. This cost is carried under
 Consequences, not hidden. A token overlapping an edited range cannot be
 shifted soundly and is dropped, falling through to the next layer for that
 region only. The shifted set participates in the sweep until a fresh set
