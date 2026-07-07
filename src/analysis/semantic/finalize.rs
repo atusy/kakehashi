@@ -163,7 +163,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
         // 2. Sweep the intervals, maintaining a max-heap of active tokens.
         // Transparent tokens are never pushed — they only contributed
         // breakpoints above and never compete for winning.
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(line_tokens.len());
         let mut next_token = 0;
 
         for window in breakpoints.windows(2) {
@@ -1253,6 +1253,30 @@ mod tests {
                 (10, 6, mapped("comment")),
                 (16, 2, mapped("variable")),
                 (18, 2, mapped("keyword")),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_identical_priority_tuple_later_token_wins_tie() {
+        // Parent [0,10) and child [3,7) share an IDENTICAL token_priority tuple
+        // (priority, depth, node_byte_len, pattern_index all equal) — this is
+        // the one case the heap's HeapEntry::Ord needs its line_index tie-break
+        // for, since BinaryHeap has no other way to prefer one over the other.
+        // The child appears later in the column-sorted line_tokens slice, so it
+        // must win the overlap, reproducing Iterator::max_by_key's documented
+        // "last element wins on ties" semantics that the old rescan relied on.
+        let tokens = vec![
+            make_token_full(0, 0, 10, mapped("keyword"), 0, 5, 100, 3),
+            make_token_full(0, 3, 4, mapped("variable"), 0, 5, 100, 3),
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![
+                (0, 3, mapped("keyword")),
+                (3, 4, mapped("variable")),
+                (7, 3, mapped("keyword")),
             ]
         );
     }
