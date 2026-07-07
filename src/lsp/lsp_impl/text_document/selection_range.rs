@@ -34,7 +34,10 @@ impl Kakehashi {
         };
 
         // Ensure language is loaded (handles race condition with didOpen)
-        let load_result = self.language.ensure_language_loaded(&language_name);
+        let load_result = self
+            .language
+            .ensure_language_loaded_async(&language_name)
+            .await;
         if !load_result.success {
             return Ok(None);
         }

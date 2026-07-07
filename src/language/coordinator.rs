@@ -24,6 +24,25 @@ struct QueryLoadContext<'a> {
     query_kind: QueryKind,
 }
 
+/// RAII single-flight marker for [`LanguageCoordinator::ensure_language_loaded_async`]:
+/// on drop, removes this language's in-flight entry (only if it still points
+/// at this guard's own `Notify` — a reload's `failed_loads.clear()` never
+/// touches this map, so nothing else contends the removal) and wakes every
+/// parked loser, whether the load succeeded, failed, or panicked mid-flight.
+struct LanguageLoadFlightGuard<'a> {
+    map: &'a dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
+    key: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for LanguageLoadFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.map
+            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.notify));
+        self.notify.notify_waiters();
+    }
+}
+
 /// Coordinates language runtime components (registry, queries, configs).
 pub(crate) struct LanguageCoordinator {
     query_store: QueryStore,
@@ -53,6 +72,18 @@ pub(crate) struct LanguageCoordinator {
     /// failed load succeed) before the hygiene clear. Read-validated against
     /// `failed_loads` entries; see there.
     load_generation: std::sync::atomic::AtomicU64,
+    /// Single-flight marker for [`ensure_language_loaded_async`](Self::ensure_language_loaded_async):
+    /// a language with an in-flight first load has an entry here, so a
+    /// concurrent request for the same language parks on the winner's
+    /// `Notify` instead of independently dlopen-ing the parser and
+    /// recompiling its queries (#575). Scoped to the async entry point only
+    /// — the synchronous `ensure_language_loaded` (called from non-tokio
+    /// contexts: the ComputePool-run selection-range walk, tests) does not
+    /// participate, so a sync caller racing an async one on the same
+    /// language can still duplicate the load once; narrower than the
+    /// pre-#575 free-for-all, and the common case (an LSP request burst)
+    /// goes exclusively through the async path.
+    load_inflight: dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
 }
 
 impl Default for LanguageCoordinator {
@@ -74,6 +105,7 @@ impl LanguageCoordinator {
             failed_loads: dashmap::DashMap::new(),
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
+            load_inflight: dashmap::DashMap::new(),
         }
     }
 
@@ -109,6 +141,94 @@ impl LanguageCoordinator {
                 .insert(language_id.to_string(), current_generation);
         }
         result
+    }
+
+    /// Async twin of [`ensure_language_loaded`](Self::ensure_language_loaded)
+    /// for tokio-worker call sites (document-open/reparse, injection
+    /// discovery): a language's first load runs the parser `.so` dlopen plus
+    /// disk reads and `tree_sitter::Query` compilation for every query kind
+    /// — tens of milliseconds of blocking work that must not run inline on
+    /// an async task (#575). Runs the same [`try_load_language_by_id`]
+    /// through `spawn_blocking`, and single-flights concurrent callers for
+    /// the same language through [`load_inflight`](Self::load_inflight) so a
+    /// request burst against one cold language (or a host document injecting
+    /// it into many regions) loads it exactly once.
+    pub(crate) async fn ensure_language_loaded_async(
+        self: &Arc<Self>,
+        language_id: &str,
+    ) -> LanguageLoadResult {
+        loop {
+            if self.language_registry.contains(language_id) {
+                return LanguageLoadResult::success_with(Vec::new());
+            }
+            let current_generation = self
+                .load_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            if self
+                .failed_loads
+                .get(language_id)
+                .is_some_and(|generation| *generation == current_generation)
+            {
+                return LanguageLoadResult::default();
+            }
+
+            // `get` before `entry`: the loser path (marker present) is the
+            // common case under a burst, and `entry` would clone the owned
+            // key just to find it occupied.
+            let notify = if let Some(current) = self.load_inflight.get(language_id) {
+                Arc::clone(&current)
+            } else {
+                match self.load_inflight.entry(language_id.to_string()) {
+                    dashmap::mapref::entry::Entry::Occupied(occupied) => Arc::clone(occupied.get()),
+                    dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                        // Re-check inside the claim: a winner may have
+                        // registered the language and dropped its marker
+                        // between the top-of-loop check and this claim.
+                        if self.language_registry.contains(language_id) {
+                            return LanguageLoadResult::success_with(Vec::new());
+                        }
+                        let notify = Arc::new(tokio::sync::Notify::new());
+                        vacant.insert(Arc::clone(&notify));
+                        // RAII: removes the marker and wakes every parked
+                        // loser on ANY exit from here (success, failure, or
+                        // a panic unwinding through `spawn_blocking`'s
+                        // JoinError) — a load that never wakes its losers
+                        // would wedge the language forever under a burst.
+                        let _guard = LanguageLoadFlightGuard {
+                            map: &self.load_inflight,
+                            key: language_id.to_string(),
+                            notify: Arc::clone(&notify),
+                        };
+
+                        let coordinator = Arc::clone(self);
+                        let owned_id = language_id.to_string();
+                        let result = tokio::task::spawn_blocking(move || {
+                            coordinator.try_load_language_by_id(&owned_id)
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            LanguageLoadResult::failure_with(LanguageEvent::log(
+                                LanguageLogLevel::Error,
+                                format!(
+                                    "language load for '{language_id}' panicked on the blocking pool"
+                                ),
+                            ))
+                        });
+
+                        if !result.success {
+                            self.failed_loads
+                                .insert(language_id.to_string(), current_generation);
+                        }
+                        return result;
+                    }
+                }
+            };
+            notify.notified().await;
+            // Loop back: re-check registry/failed_loads/in-flight from
+            // scratch rather than trusting the winner's outcome directly —
+            // the winner may have failed (loser re-derives the same
+            // failed_loads verdict) or a reload may have landed concurrently.
+        }
     }
 
     /// Initialize from workspace-level settings and return coordination events.
@@ -1279,6 +1399,48 @@ mod tests {
     use crate::config::settings::RawWorkspaceSettings;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Pins the #575 single-flight fix: a caller that arrives while another
+    /// caller already claimed the in-flight marker for a language must PARK
+    /// on that marker (not independently attempt its own load), and must
+    /// wake once the marker is cleared and notified. Simulates a winner
+    /// mid-load by claiming the marker directly (mirroring
+    /// `captures_full_single_flight_loser_serves_winner_memo`'s technique) —
+    /// a real dlopen fixture isn't needed to pin the coordination mechanic.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_load_for_the_same_language_parks_on_the_in_flight_winner() {
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        coordinator
+            .load_inflight
+            .insert("nosuchlang".to_string(), Arc::clone(&notify));
+
+        let loser = Arc::clone(&coordinator);
+        let request =
+            tokio::spawn(async move { loser.ensure_language_loaded_async("nosuchlang").await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "a concurrent caller must park on the in-flight winner, not race it"
+        );
+
+        coordinator.load_inflight.remove("nosuchlang");
+        notify.notify_waiters();
+
+        // Woken, the loser loops back: the registry still doesn't contain
+        // the language and no `failed_loads` entry exists (the simulated
+        // winner never really ran), so it becomes its own winner and
+        // attempts a fresh load — which fails fast (no search paths
+        // configured) rather than hanging or panicking.
+        let result = request
+            .await
+            .expect("the parked task must not panic on wake");
+        assert!(
+            !result.success,
+            "a language with no search paths configured cannot load"
+        );
+    }
 
     #[test]
     fn test_injection_direct_identifier_first() {

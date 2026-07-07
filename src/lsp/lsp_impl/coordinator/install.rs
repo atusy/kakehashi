@@ -204,7 +204,7 @@ impl InstallCoordinator {
         self.apply_raw_settings(updated_raw_settings, updated_settings)
             .await;
 
-        let load_result = self.language.ensure_language_loaded(language);
+        let load_result = self.language.ensure_language_loaded_async(language).await;
         self.notifier()
             .log_language_events(&load_result.events)
             .await;

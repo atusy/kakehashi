@@ -322,7 +322,10 @@ impl Kakehashi {
         // Ensure language is loaded before trying to get queries.
         // This handles the race condition where semanticTokens/full arrives
         // before didOpen finishes loading the language.
-        let load_result = self.language.ensure_language_loaded(&language_name);
+        let load_result = self
+            .language
+            .ensure_language_loaded_async(&language_name)
+            .await;
         if !load_result.success {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
@@ -644,7 +647,10 @@ impl Kakehashi {
         // Ensure language is loaded before trying to get queries.
         // This handles the race condition where semanticTokens/full/delta arrives
         // before didOpen finishes loading the language.
-        let load_result = self.language.ensure_language_loaded(&language_name);
+        let load_result = self
+            .language
+            .ensure_language_loaded_async(&language_name)
+            .await;
         if !load_result.success {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(

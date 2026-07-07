@@ -83,7 +83,12 @@ impl Kakehashi {
         let Some(language) = self.document_language(&uri) else {
             return Ok(None);
         };
-        if !self.language.ensure_language_loaded(&language).success {
+        if !self
+            .language
+            .ensure_language_loaded_async(&language)
+            .await
+            .success
+        {
             return Ok(None);
         }
 

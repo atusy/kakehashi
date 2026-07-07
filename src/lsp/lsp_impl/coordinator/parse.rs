@@ -503,7 +503,10 @@ impl ParseCoordinator {
                 return false;
             }
 
-            let load_result = self.language.ensure_language_loaded(&language_name);
+            let load_result = self
+                .language
+                .ensure_language_loaded_async(&language_name)
+                .await;
             events.extend(load_result.events);
 
             // This is the document-open parse: there is no prior tree to seed an
@@ -750,7 +753,10 @@ impl ParseCoordinator {
             self.documents.publish_giveup_snapshot(&uri);
             return;
         }
-        let load_result = self.language.ensure_language_loaded(&language_name);
+        let load_result = self
+            .language
+            .ensure_language_loaded_async(&language_name)
+            .await;
         let mut events = load_result.events;
 
         for _ in 0..MAX_REPARSE_ATTEMPTS {
@@ -960,7 +966,10 @@ impl ParseCoordinator {
             advance_watermark();
             return;
         }
-        let load_result = self.language.ensure_language_loaded(&language_name);
+        let load_result = self
+            .language
+            .ensure_language_loaded_async(&language_name)
+            .await;
 
         let text_len = text.len();
         let auto_install = self.auto_install.clone();
