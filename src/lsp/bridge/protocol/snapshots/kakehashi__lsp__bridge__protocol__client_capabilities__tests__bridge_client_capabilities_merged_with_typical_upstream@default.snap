@@ -101,7 +101,6 @@ expression: merged
       "codeActionLiteralSupport": {
         "codeActionKind": {
           "valueSet": [
-            "",
             "quickfix",
             "refactor",
             "refactor.extract",
