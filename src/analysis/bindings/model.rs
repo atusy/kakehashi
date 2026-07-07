@@ -261,18 +261,31 @@ impl BindingsModel {
     ///
     /// Descends the scope tree from the root instead of scanning every
     /// scope: tree-sitter node ranges nest-or-are-disjoint, so at most one
-    /// child of any scope can contain `p`, making this O(depth) rather than
-    /// O(scopes) — the previous linear filter+max_by_key ran on every
-    /// reference/definition registration, i.e. O(refs x scopes) overall.
+    /// child of any scope can contain `p`. `children[s]` is populated in the
+    /// same outer-first, start-ascending order as `scopes` itself, so that
+    /// one child is found by binary search rather than a linear scan — a
+    /// linear `.find()` here would degrade back to O(fan-out) per level
+    /// (e.g. a flat scope tree with many top-level siblings), which for a
+    /// wide-but-shallow tree is little better than the O(scopes) the tree
+    /// descent replaced. This is O(depth x log(fan-out)) overall — the
+    /// previous linear filter+max_by_key ran on every reference/definition
+    /// registration, i.e. O(refs x scopes) / O(defs x scopes) overall.
     fn innermost_scope_at(&self, p: usize) -> usize {
         let mut current = 0;
-        while let Some(&next) = self.children[current].iter().find(|&&c| {
-            let range = &self.scopes[c].byte_range;
-            range.start <= p && p < range.end
-        }) {
-            current = next;
+        loop {
+            let children = &self.children[current];
+            // The last child whose start is <= p — the only candidate that
+            // could contain p, since siblings are disjoint and start-sorted.
+            let idx = children.partition_point(|&c| self.scopes[c].byte_range.start <= p);
+            let Some(&next) = idx.checked_sub(1).and_then(|i| children.get(i)) else {
+                return current;
+            };
+            if p < self.scopes[next].byte_range.end {
+                current = next;
+            } else {
+                return current;
+            }
         }
-        current
     }
 
     /// In-scope selection: among the scope's bindings for `name` in
@@ -1091,5 +1104,47 @@ mod tests {
         for &child in &children_of_fn_body {
             assert_eq!(model.scopes[child].parent, Some(fn_body));
         }
+    }
+
+    #[test]
+    fn innermost_scope_at_binary_searches_correctly_across_many_wide_siblings() {
+        // Five same-depth sibling blocks directly under the fn body — a
+        // flat, wide scope tree. Exercises the partition_point binary
+        // search across several children, including the LAST sibling
+        // (which an off-by-one in the search would be most likely to miss)
+        // and the gap between siblings (owned by the parent, not either
+        // neighbor).
+        let text = "fn f() { {a;} {b;} {c;} {d;} {e;} }";
+        let model = model_for(text, BASIC);
+        let fn_body = 1;
+        let children = model.children[fn_body].clone();
+        assert_eq!(children.len(), 5);
+
+        let e_pos = nth(text, "e", 0);
+        assert_eq!(
+            model.innermost_scope_at(e_pos),
+            *children.last().unwrap(),
+            "a position in the last sibling must resolve to that sibling"
+        );
+
+        // The single space between "} {b" is outside every block — owned
+        // by the fn body, not either neighboring sibling.
+        let gap = text.find("} {b").unwrap() + 1;
+        assert_eq!(
+            model.innermost_scope_at(gap),
+            fn_body,
+            "the gap between siblings belongs to the parent scope"
+        );
+    }
+
+    #[test]
+    fn innermost_scope_at_on_root_only_document_returns_root() {
+        // No @scope captures at all: children[0] is empty, so the binary
+        // search's first partition_point call must terminate immediately
+        // rather than panicking on an empty slice.
+        let text = "fn main() { x; }";
+        let model = model_for(text, "(identifier) @reference");
+        assert_eq!(model.innermost_scope_at(0), 0);
+        assert_eq!(model.innermost_scope_at(text.len()), 0);
     }
 }
