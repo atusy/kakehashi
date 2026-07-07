@@ -1121,8 +1121,7 @@ fn spawn_upstream_request(
                     },
                     Ok(params) => {
                         let id = client.next_request_id();
-                        let value =
-                            serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
+                        let value = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
                         forward_with_cancel(
                             &client,
                             id,
@@ -2786,7 +2785,10 @@ mod tests {
         assert_eq!(req.method(), "workspace/applyEdit");
         let id = req.id().expect("request has an id").clone();
         let _ = responses
-            .send(Response::from_ok(id, serde_json::json!({ "applied": true })))
+            .send(Response::from_ok(
+                id,
+                serde_json::json!({ "applied": true }),
+            ))
             .await;
 
         let response = reply_rx.await.expect("reply delivered");

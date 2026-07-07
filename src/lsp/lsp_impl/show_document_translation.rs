@@ -117,7 +117,9 @@ impl ShowDocumentTranslator {
 
     /// Rebuild the region's current host offset from the live parse via the
     /// shared [`resolve_region_offset`]. On `None` the caller opens the host
-    /// document without a selection rather than risk a wrong one.
+    /// document without a selection rather than risk a wrong one. showDocument
+    /// only needs the offset (it translates a single selection position, not an
+    /// edit), so the region-end bound is discarded.
     fn region_offset(&self, host_url: &Url, region_id: &str) -> Option<RegionOffset> {
         resolve_region_offset(
             &self.documents,
@@ -126,6 +128,7 @@ impl ShowDocumentTranslator {
             host_url,
             region_id,
         )
+        .map(|(offset, _region_end)| offset)
     }
 }
 

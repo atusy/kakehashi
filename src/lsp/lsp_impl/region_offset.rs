@@ -11,11 +11,13 @@
 
 use std::sync::Arc;
 
+use tower_lsp_server::ls_types::Position;
 use url::Url;
 
 use crate::document::DocumentStore;
 use crate::language::{InjectionResolver, LanguageCoordinator};
 use crate::lsp::bridge::{BridgeCoordinator, RegionOffset};
+use crate::text::PositionMapper;
 
 /// Rebuild the region's current host offset from the live parse, keyed by its
 /// `region_id` (a ULID in production). Returns `None` when the offset can't be
@@ -28,7 +30,7 @@ pub(super) fn resolve_region_offset(
     bridge: &BridgeCoordinator,
     host_url: &Url,
     region_id: &str,
-) -> Option<RegionOffset> {
+) -> Option<(RegionOffset, Position)> {
     let ulid = ulid::Ulid::from_string(region_id).ok()?;
     let (start_byte, _end, _kind, _layer) = bridge.node_tracker().lookup_node(host_url, &ulid)?;
     // Snapshot is owned, so the document handle (a store lock) is released
@@ -56,11 +58,17 @@ pub(super) fn resolve_region_offset(
     if resolved.region.region_id != region_id {
         return None;
     }
+    // The region's exclusive host-document end, content-precise (the injection
+    // region's own byte range mapped through the live host text). Callers that
+    // translate an inbound edit use it to reject a range that runs past the
+    // region into unrelated host text.
+    let region_end =
+        PositionMapper::new(snapshot.text()).byte_to_position(resolved.region.byte_range.end)?;
     // `start` is `Copy`; move `line_column_offsets` out (no clone — `resolved`
     // is dropped after this).
     let start_line = resolved.region.line_range.start;
-    Some(RegionOffset::with_per_line_offsets(
-        start_line,
-        resolved.line_column_offsets,
+    Some((
+        RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets),
+        region_end,
     ))
 }
