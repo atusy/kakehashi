@@ -273,12 +273,25 @@ response. This keeps the first-response → merged transition expressible as an
 ordinary delta, with no special baseline bookkeeping.
 
 **Version contract (owned by the merge).** Each layer's contribution carries
-the host document version it was computed against. Acceptance is **monotonic
+the host document version it was computed against **and the settings
+generation in force when it was computed** — the same `token_generation` the
+native cache already folds into its key
+(`src/lsp/lsp_impl/text_document/semantic_tokens.rs`), because a settings
+reload can change bridge-server eligibility, downstream settings, or the
+advertised legend without touching the document version. A contribution whose
+settings generation is stale is treated exactly like a document-version-stale
+one: it is **not source-fresh**, so it never satisfies the no-refetch test
+(the layer is re-fetched under the new generation) and is dropped from the
+sweep if it cannot be reconciled — this is what stops a settings reload from
+being suppressed indefinitely by a contribution that merely matches the
+document snapshot. (Edit-shifting still keys on the document version alone;
+generation change forces a re-fetch, not a shift.) Acceptance is **monotonic
 per layer**: in-flight requests can complete out of order, and a response
 computed against an older host version than the layer's currently accepted
 contribution is discarded — a late straggler never replaces newer tokens with
 older, edit-shifted ones. The unit all of these contracts operate on is the
-**per-server contribution** — tracked as (layer, server, version) — and a
+**per-server contribution** — tracked as (layer, server, version,
+generation) — and a
 layer's level-1 stream is derived from its accepted per-server contributions,
 so acceptance monotonicity and the material-change refresh test stay
 well-defined when a bridge target dispatches to multiple servers (§1). A
