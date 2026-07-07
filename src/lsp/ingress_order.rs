@@ -289,12 +289,12 @@ enum Role {
 /// snapshots the document, which must reflect every edit before the save).
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
-/// document snapshot (#568). `codeLens/resolve` is a reader too (#355): its
-/// freshness gate reads tracker/document state, so it must observe every
-/// `didChange` that preceded it on the wire — but its params carry no
-/// `textDocument`, so the URI comes from the routing envelope in
-/// `params.data.kakehashi.host_uri` (unenveloped lenses pass through
-/// ungated; their handler returns them unchanged anyway). The
+/// document snapshot (#568). `codeLens/resolve` and `codeAction/resolve` are
+/// readers too (#355, #568): their freshness gates read tracker/document
+/// state, so they must observe every `didChange` that preceded them on the
+/// wire — but their params carry no `textDocument`, so the URI comes from the
+/// routing envelope in `params.data.kakehashi.host_uri` (unenveloped items
+/// pass through ungated; their handlers return them unchanged anyway). The
 /// `kakehashi/node/*` protocol stays unclassified on purpose: node ids
 /// carry their own staleness handling (`null` → client re-acquires), so
 /// gating those point lookups would add latency without changing
@@ -325,7 +325,7 @@ fn classify(req: &Request) -> Option<Role> {
             let uri = text_document_uri(req)?;
             Some(Role::Reader { uri })
         }
-        "codeLens/resolve" => {
+        "codeLens/resolve" | "codeAction/resolve" => {
             let raw = req.params()?["data"]["kakehashi"]["host_uri"].as_str()?;
             Some(Role::Reader {
                 uri: normalize_uri(raw),
@@ -694,6 +694,26 @@ mod tests {
         assert!(
             classify(&unenveloped).is_none(),
             "unenveloped codeLens/resolve passes through ungated"
+        );
+
+        // codeAction/resolve is classified the same way (#568): the URI comes
+        // from the routing envelope, enveloped actions gate as readers.
+        let enveloped_action = Request::build("codeAction/resolve")
+            .params(serde_json::json!({
+                "title": "Fix — ruff",
+                "data": { "kakehashi": { "host_uri": URI } }
+            }))
+            .finish();
+        assert!(
+            matches!(classify(&enveloped_action), Some(Role::Reader { ref uri }) if uri == URI),
+            "enveloped codeAction/resolve must be a reader keyed by the envelope's host_uri"
+        );
+        let unenveloped_action = Request::build("codeAction/resolve")
+            .params(serde_json::json!({ "title": "Fix", "data": { "custom": true } }))
+            .finish();
+        assert!(
+            classify(&unenveloped_action).is_none(),
+            "unenveloped codeAction/resolve passes through ungated"
         );
     }
 
