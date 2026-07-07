@@ -458,7 +458,8 @@ impl LanguageServerPool {
                 re_envelope_action(&mut action, &envelope);
                 return action;
             }
-            resolved.title = suffixed_title;
+            resolved.title =
+                resuffix_resolved_title(std::mem::take(&mut resolved.title), suffixed_title, server_name);
             resolved.edit = None;
             resolved.command = None;
             resolved.data = None;
@@ -514,9 +515,11 @@ impl LanguageServerPool {
             (None, _) => {}
         }
 
-        // Re-apply the "{title} — {server}" suffix (the server echoed the
-        // original title back).
-        resolved.title = suffixed_title;
+        // Re-apply the "{title} — {server}" suffix. The server normally echoes
+        // the restored original title back, but if it changed the title during
+        // resolve (allowed by LSP) that change is kept and re-suffixed.
+        resolved.title =
+            resuffix_resolved_title(std::mem::take(&mut resolved.title), suffixed_title, server_name);
 
         // Once resolve has materialized an edit, the action is complete and
         // its edit is host-translated. Re-enveloping it would let a second
@@ -884,6 +887,17 @@ fn bridge_code_action(
             // server intends to be resolved — surface it as a `REASON_RESOLVE`
             // disabled placeholder (the PR 3 behavior) rather than dropping it,
             // so `disabledSupport` clients see why it can't run.
+            //
+            // Deliberate scope boundary: `data` presence is an intrinsic lazy
+            // signal needing no capability plumbing, so it is the host gate.
+            // Recognizing a TITLE-ONLY host lazy action (LSP 3.18) would require
+            // threading the host server's `resolveProvider` through
+            // `send_host_raw_request` — but the resulting placeholder could
+            // never be resolved (host resolve is unbridged), so it would be pure
+            // menu clutter. This matches PR 3 exactly (its `data.is_some() ||
+            // server_resolves` gate also dropped title-only host lazy actions)
+            // and is deferred alongside host-layer resolve support, not a
+            // regression.
             let is_lazy = match virt {
                 Some(_) => server_resolves,
                 None => action.data.is_some(),
@@ -923,6 +937,23 @@ fn bridge_code_action(
 /// `"{title} — {server}"`: applied to every bridged action, unconditionally.
 fn suffix_title(title: String, server_name: &str) -> String {
     format!("{title} — {server_name}")
+}
+
+/// Re-apply the `"— {server}"` suffix after a `codeAction/resolve` round-trip.
+/// The server normally echoes the original (restored) title back, but LSP lets
+/// it change the title during resolve — keep that change and re-suffix it.
+/// Fall back to the pre-resolve suffixed title only if the server cleared the
+/// title entirely (a suffix-only `"— {server}"` would be meaningless).
+fn resuffix_resolved_title(
+    server_title: String,
+    suffixed_fallback: String,
+    server_name: &str,
+) -> String {
+    if server_title.is_empty() {
+        suffixed_fallback
+    } else {
+        suffix_title(server_title, server_name)
+    }
 }
 
 /// Turn an action the bridge cannot execute into a `disabled` entry: the

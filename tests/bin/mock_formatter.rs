@@ -169,7 +169,13 @@ fn main() {
                     // resolve materializes a COMMAND (not an edit) — the bridge
                     // must fail soft (command execution is unbridged), never
                     // handing the command to the editor.
-                    "code-action-lazy" | "code-action-lazy-cmd" => json!({
+                    // `code-action-lazy-retitle` is like `code-action-lazy` but
+                    // its resolve returns a CHANGED title (LSP lets a server
+                    // rewrite the title on resolve) — the bridge must surface
+                    // the server's new title (re-suffixed), not the pre-resolve
+                    // one.
+                    "code-action-lazy" | "code-action-lazy-cmd"
+                    | "code-action-lazy-retitle" => json!({
                         "codeActionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -480,7 +486,10 @@ fn main() {
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
                     .map(|_uri| {
-                        if mode == "code-action-lazy" || mode == "code-action-lazy-cmd" {
+                        if mode == "code-action-lazy"
+                            || mode == "code-action-lazy-cmd"
+                            || mode == "code-action-lazy-retitle"
+                        {
                             // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
                             json!([{
@@ -554,6 +563,16 @@ fn main() {
                     );
                     continue;
                 }
+                // `code-action-lazy-retitle`: return a title DIFFERENT from the
+                // one received. LSP lets a server rewrite the title on resolve;
+                // the bridge must surface this new title (re-suffixed), not the
+                // pre-resolve title it remembered. The discriminating test
+                // asserts the client sees the changed title.
+                let response_title = if mode == "code-action-lazy-retitle" {
+                    format!("{title} (resolved)")
+                } else {
+                    title.clone()
+                };
                 // Embed the RECEIVED title in the edit's newText: the bridge
                 // re-suffixes the response title (overwriting our echo), but it
                 // never rewrites newText, so this is the only place the test can
@@ -564,7 +583,7 @@ fn main() {
                     &mut writer,
                     id,
                     json!({
-                        "title": title,
+                        "title": response_title,
                         "kind": "source.organizeImports",
                         "data": data,
                         "edit": {

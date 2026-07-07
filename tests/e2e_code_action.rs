@@ -323,6 +323,40 @@ fn lazy_action_is_resolved_via_code_action_resolve() {
 }
 
 #[test]
+fn lazy_action_resolve_surfaces_server_changed_title() {
+    // LSP lets a server rewrite the action title on codeAction/resolve. The
+    // bridge must surface that NEW title (re-suffixed), not the pre-resolve
+    // title it remembered for the suffix. This discriminates the fix: an
+    // echo-only mock would look identical under the buggy "reuse suffixed_title"
+    // path, so the mock deliberately returns a changed title here.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-retitle", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+    assert_eq!(lazy["title"], "Lazy organize imports — mock-codeaction");
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    // The server changed the title to "Lazy organize imports (resolved)"; the
+    // bridge must keep that change and re-suffix it — NOT fall back to the
+    // remembered pre-resolve "Lazy organize imports — mock-codeaction".
+    assert_eq!(
+        resolved["title"], "Lazy organize imports (resolved) — mock-codeaction",
+        "the server's resolve-time title change must be surfaced (re-suffixed)"
+    );
+    // The edit still materializes: the mock forwards the RECEIVED (unsuffixed)
+    // title into newText, proving the round-trip restored the original title.
+    let edits = &resolved["edit"]["changes"][MARKDOWN_URI];
+    assert_eq!(edits[0]["newText"], "organized:Lazy organize imports");
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn lazy_action_is_eager_resolved_without_resolve_support() {
     // A client WITHOUT resolveSupport/dataSupport cannot resolve a lazy
     // action, so the bridge eager-resolves it downstream: the codeAction
