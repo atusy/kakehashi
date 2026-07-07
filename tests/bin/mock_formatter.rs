@@ -182,7 +182,8 @@ fn main() {
                     "code-action-lazy"
                     | "code-action-lazy-cmd"
                     | "code-action-lazy-retitle"
-                    | "code-action-lazy-multistep" => {
+                    | "code-action-lazy-multistep"
+                    | "code-action-lazy-fileop" => {
                         json!({
                             "codeActionProvider": { "resolveProvider": true },
                             "textDocumentSync": 1
@@ -499,6 +500,7 @@ fn main() {
                             || mode == "code-action-lazy-cmd"
                             || mode == "code-action-lazy-retitle"
                             || mode == "code-action-lazy-multistep"
+                            || mode == "code-action-lazy-fileop"
                         {
                             // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
@@ -569,6 +571,28 @@ fn main() {
                             "kind": "source.organizeImports",
                             "data": data,
                             "command": { "title": "Run it", "command": "mock.run" }
+                        }),
+                    );
+                    continue;
+                }
+                if mode == "code-action-lazy-fileop" {
+                    // Resolve to a CreateFile operation on the action's own
+                    // VIRTUAL document URI. A virtual-URI file op cannot be
+                    // represented in the host document, so the bridge must
+                    // disable the action (with disabledSupport) rather than
+                    // return an enabled action that applies nothing.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": title,
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "edit": {
+                                "documentChanges": [
+                                    { "kind": "create", "uri": target_uri }
+                                ]
+                            }
                         }),
                     );
                     continue;

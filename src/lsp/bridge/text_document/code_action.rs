@@ -487,13 +487,15 @@ impl LanguageServerPool {
             resolved.is_preferred = None;
         }
 
-        // Translate the resolved edit host-ward. Fail soft (return the
-        // original action unresolved) when it can't be faithfully represented
-        // in the host document: a virtual-URI file op (transform returns
-        // false); ANY cross-region edit (the shared transform would silently
-        // filter it, partially applying the rest); or an edit that ends up
-        // empty. Any of these is worse than an unresolved action — the user
-        // would apply it and get a partial or no-op change.
+        // Translate the resolved edit host-ward. When it can't be faithfully
+        // represented in the host document — a virtual-URI file op (transform
+        // returns false); ANY cross-region edit (the shared transform would
+        // silently filter it, partially applying the rest); or an edit that
+        // ends up empty — disable the action (or, without disabledSupport, fail
+        // soft to the unresolved action). Any of these is worse than a disabled
+        // action: the user would apply it and get a partial or no-op change.
+        // This is a PERMANENT failure, so `resolve_untranslatable_edit` disables
+        // rather than transient-fail-softing.
         match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
             (Some(edit), Some(host_uri_lsp)) => {
                 let virtual_uri = VirtualDocumentUri::new(
@@ -503,17 +505,25 @@ impl LanguageServerPool {
                 )
                 .to_uri_string();
                 if !translate_edit_host_ward_strict(edit, &virtual_uri, host_uri_lsp, &offset) {
-                    re_envelope_action(&mut action, &envelope);
-                    return action;
+                    return resolve_untranslatable_edit(
+                        action,
+                        &envelope,
+                        suffixed_title,
+                        upstream_caps,
+                    );
                 }
             }
             // The server resolved an edit, but the host URI couldn't be rebuilt
             // to translate it (a `url`/`Uri` parser divergence). Shipping the
-            // untranslated virtual-coordinate edit would be unappliable — fail
-            // soft, same as the cross-region case.
+            // untranslated virtual-coordinate edit would be unappliable — same
+            // permanent failure as the cross-region case.
             (Some(_), None) => {
-                re_envelope_action(&mut action, &envelope);
-                return action;
+                return resolve_untranslatable_edit(
+                    action,
+                    &envelope,
+                    suffixed_title,
+                    upstream_caps,
+                );
             }
             (None, _) => {}
         }
@@ -967,6 +977,37 @@ fn resuffix_resolved_title(
     } else {
         suffix_title(server_title, server_name)
     }
+}
+
+/// A resolved edit that cannot be represented in the host document
+/// (cross-region, a virtual-URI file op, or an empty edit) is a PERMANENT
+/// failure — re-requesting the resolve yields the identical result. Unlike the
+/// TRANSIENT fail-softs (stale region, connect/send errors, where the client
+/// re-requests and the window is short), the honest outcome here is to disable
+/// the action with a reason, mirroring the initial codeAction path's
+/// `REASON_CROSS_REGION` disable — otherwise the client shows an enabled action
+/// that applies nothing. A client without `disabledSupport` can't render a
+/// disabled action, and resolve must return a `CodeAction` (it can't drop like
+/// the initial path), so it falls back to the unresolved-with-envelope action.
+fn resolve_untranslatable_edit(
+    mut action: CodeAction,
+    envelope: &CodeActionEnvelope,
+    suffixed_title: String,
+    upstream_caps: UpstreamCodeActionCaps,
+) -> CodeAction {
+    if !upstream_caps.disabled_support {
+        re_envelope_action(&mut action, envelope);
+        return action;
+    }
+    action.title = suffixed_title;
+    action.edit = None;
+    action.command = None;
+    action.data = None;
+    action.is_preferred = None;
+    action.disabled = Some(CodeActionDisabled {
+        reason: REASON_CROSS_REGION.to_string(),
+    });
+    action
 }
 
 /// Turn an action the bridge cannot execute into a `disabled` entry: the
