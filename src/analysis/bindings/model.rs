@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use super::collect::{
-    Collection, DefinitionCapture, Inherits, Rebind, RedirectTarget, ReferenceCapture, ScopeTarget,
-    Visibility,
+    Collection, DefinitionCapture, Inherits, Rebind, RedirectTarget, ReferenceCapture,
+    ScopeCapture, ScopeTarget, Visibility,
 };
 
 /// Index into [`BindingsModel::bindings`].
@@ -64,7 +64,7 @@ pub(crate) struct BindingsModel {
 
 impl BindingsModel {
     pub(crate) fn build(collection: Collection) -> Self {
-        let scopes = build_scope_tree(&collection);
+        let scopes = build_scope_tree(collection.root_range, collection.scopes);
         let mut children = vec![Vec::new(); scopes.len()];
         for (i, scope) in scopes.iter().enumerate().skip(1) {
             // Every non-root scope has a parent (assigned in build_scope_tree).
@@ -465,9 +465,14 @@ impl BindingsModel {
 
 /// Build the scope tree: dedupe captures by byte range (merging properties),
 /// prepend the implicit root scope, and nest by containment.
-fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
+///
+/// Takes `root_range`/`scopes` by value (rather than `&Collection`) since
+/// `collection.scopes` is never used again after this call — moving each
+/// capture's `label`/`inherits` (a `String`/`Vec<String>`-carrying enum)
+/// into its `Scope` avoids cloning them.
+fn build_scope_tree(root_range: Range<usize>, scopes: Vec<ScopeCapture>) -> Vec<Scope> {
     let mut root = Scope {
-        byte_range: collection.root_range.clone(),
+        byte_range: root_range,
         label: None,
         inherits: Inherits::All,
         visible_to_nested: true,
@@ -486,7 +491,7 @@ fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
     // into an O(1) hash lookup.
     let mut deduped: Vec<Scope> = Vec::new();
     let mut by_range: HashMap<(usize, usize), usize> = HashMap::new();
-    for capture in &collection.scopes {
+    for capture in scopes {
         let range_key = (capture.byte_range.start, capture.byte_range.end);
         let merge_into = if capture.byte_range == root.byte_range {
             &mut root
@@ -495,9 +500,9 @@ fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
         } else {
             by_range.insert(range_key, deduped.len());
             deduped.push(Scope {
-                byte_range: capture.byte_range.clone(),
-                label: capture.label.clone(),
-                inherits: capture.inherits.clone(),
+                byte_range: capture.byte_range,
+                label: capture.label,
+                inherits: capture.inherits,
                 visible_to_nested: capture.visible_to_nested,
                 parent: None,
                 depth: 0,
@@ -507,10 +512,10 @@ fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
             continue;
         };
         if merge_into.label.is_none() {
-            merge_into.label = capture.label.clone();
+            merge_into.label = capture.label;
         }
         if merge_into.inherits == Inherits::All {
-            merge_into.inherits = capture.inherits.clone();
+            merge_into.inherits = capture.inherits;
         }
         merge_into.visible_to_nested &= capture.visible_to_nested;
     }
