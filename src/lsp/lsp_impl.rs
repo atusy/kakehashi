@@ -17,7 +17,7 @@ use tower_lsp_server::ls_types::request::{
     GotoImplementationResponse, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
 };
 use tower_lsp_server::ls_types::{
-    CodeActionParams, CodeActionResponse, CodeLens, CodeLensParams, CompletionItem,
+    CodeAction, CodeActionParams, CodeActionResponse, CodeLens, CodeLensParams, CompletionItem,
     CompletionParams, CompletionResponse, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
@@ -730,6 +730,10 @@ impl LanguageServer for Kakehashi {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         self.code_action_impl(params).await
+    }
+
+    async fn code_action_resolve(&self, params: CodeAction) -> Result<CodeAction> {
+        self.code_action_resolve_impl(params).await
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
