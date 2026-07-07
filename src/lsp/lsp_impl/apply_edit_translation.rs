@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{
-    ApplyWorkspaceEditParams, DocumentChangeOperation, DocumentChanges, ResourceOp, Uri,
+    ApplyWorkspaceEditParams, DocumentChangeOperation, DocumentChanges, Position, ResourceOp, Uri,
     WorkspaceEdit,
 };
 
@@ -39,6 +39,7 @@ use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{
     BridgeCoordinator, RegionOffset, VirtualDocumentUri, transform_workspace_edit_to_host,
+    workspace_edit_within_region,
 };
 
 use super::region_offset::resolve_region_offset;
@@ -88,16 +89,13 @@ impl ApplyEditTranslator {
             // different transforms. A partially-applied edit is worse than
             // none, so reject the whole edit.
             _ => {
-                return Err(
-                    "kakehashi: the edit spans multiple injected regions; \
+                return Err("kakehashi: the edit spans multiple injected regions; \
                      it cannot be applied to the host document"
-                        .to_string(),
-                );
+                    .to_string());
             }
         };
 
-        let Some((host_url, region_id)) = self.bridge.resolve_virtual_uri(virtual_uri).await
-        else {
+        let Some((host_url, region_id)) = self.bridge.resolve_virtual_uri(virtual_uri).await else {
             return Err(format!(
                 "kakehashi: the edit targets an unknown virtual document: {virtual_uri}"
             ));
@@ -107,7 +105,7 @@ impl ApplyEditTranslator {
                 "kakehashi: the virtual document's host URI is unmappable: {host_url}"
             ));
         };
-        let Some(offset) = resolve_region_offset(
+        let Some((offset, region_end)) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
@@ -123,7 +121,7 @@ impl ApplyEditTranslator {
             );
         };
 
-        transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset)?;
+        transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset, region_end)?;
         Ok(params)
     }
 }
@@ -131,16 +129,27 @@ impl ApplyEditTranslator {
 /// Rewrite `params.edit` to host coordinates via the shared WorkspaceEdit
 /// transform. Pure mutation, split out so it can be unit-tested without a live
 /// parse. `Err` when the edit performs file operations on a virtual document
-/// (the transform's whole-edit reject).
+/// (the transform's whole-edit reject) or when a translated range escapes the
+/// region end (`region_end`) — a stale/malformed downstream edit whose range
+/// runs past the region would otherwise land in unrelated host text after the
+/// fence and corrupt the buffer.
 fn transform_params_to_host(
     params: &mut ApplyWorkspaceEditParams,
     virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
+    region_end: Position,
 ) -> Result<(), String> {
     if !transform_workspace_edit_to_host(&mut params.edit, virtual_uri, host_uri, offset) {
         return Err(
             "kakehashi: the edit performs file operations on a virtual document".to_string(),
+        );
+    }
+    if !workspace_edit_within_region(&params.edit, host_uri, region_end) {
+        return Err(
+            "kakehashi: the edit extends past the injected region; it cannot be applied to the \
+             host document without corrupting surrounding text"
+                .to_string(),
         );
     }
     Ok(())
@@ -314,8 +323,16 @@ mod tests {
         .unwrap();
         let host = host_uri();
 
-        transform_params_to_host(&mut params, &uri, &host, &RegionOffset::new(10, 2))
-            .expect("text-only edit must transform");
+        // Generous region end: this test exercises translation + annotation
+        // passthrough, not the region-bounds guard (which has its own test).
+        transform_params_to_host(
+            &mut params,
+            &uri,
+            &host,
+            &RegionOffset::new(10, 2),
+            Position::new(u32::MAX, u32::MAX),
+        )
+        .expect("text-only edit must transform");
 
         assert_eq!(params.label.as_deref(), Some("extract function"));
         let changes = params.edit.changes.expect("changes survive");
@@ -341,11 +358,48 @@ mod tests {
             ]
         }));
 
-        let reason =
-            transform_params_to_host(&mut params, &uri, &host_uri(), &RegionOffset::new(10, 0))
-                .expect_err("virtual-URI file ops must reject the whole edit");
+        let reason = transform_params_to_host(
+            &mut params,
+            &uri,
+            &host_uri(),
+            &RegionOffset::new(10, 0),
+            Position::default(),
+        )
+        .expect_err("virtual-URI file ops must reject the whole edit");
         assert!(
             reason.contains("file operations on a virtual document"),
+            "reason should name the failure: {reason}"
+        );
+    }
+
+    #[test]
+    fn transform_params_to_host_rejects_edit_past_region_end() {
+        // The region occupies a single host line (offset line 10). An edit whose
+        // virtual range runs onto virtual line 3 translates to host line 13 —
+        // past the region end — and would corrupt unrelated host text. It must
+        // be rejected, not forwarded.
+        let uri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut params = params_with_edit(json!({
+            "changes": { uri.clone(): [{
+                "range": {
+                    "start": { "line": 3, "character": 0 },
+                    "end": { "line": 3, "character": 4 }
+                },
+                "newText": "oops"
+            }] }
+        }));
+        // Region end is host line 10 (a one-line region at the offset line).
+        let region_end = Position::new(10, 11);
+        let reason = transform_params_to_host(
+            &mut params,
+            &uri,
+            &host_uri(),
+            &RegionOffset::new(10, 0),
+            region_end,
+        )
+        .expect_err("an edit past the region end must reject the whole edit");
+        assert!(
+            reason.contains("past the injected region"),
             "reason should name the failure: {reason}"
         );
     }

@@ -84,15 +84,16 @@ pub(in crate::lsp::bridge) fn handle(
     // response without a special-cased "loop gone" reply path.
     let response_id = id.clone();
     tokio::spawn(async move {
-        let result: ApplyWorkspaceEditResponse = reply_rx.await.unwrap_or_else(|_| {
-            ApplyWorkspaceEditResponse {
-                applied: false,
-                failure_reason: Some(
-                    "kakehashi: the editor did not answer workspace/applyEdit".to_string(),
-                ),
-                failed_change: None,
-            }
-        });
+        let result: ApplyWorkspaceEditResponse =
+            reply_rx
+                .await
+                .unwrap_or_else(|_| ApplyWorkspaceEditResponse {
+                    applied: false,
+                    failure_reason: Some(
+                        "kakehashi: the editor did not answer workspace/applyEdit".to_string(),
+                    ),
+                    failed_change: None,
+                });
         // The typed struct serializes infallibly in practice; the fallback keeps
         // the no-panic guarantee with the same protocol default.
         let result = serde_json::to_value(result)
