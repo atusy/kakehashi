@@ -102,12 +102,15 @@ fn build_code_action_request(
 ) -> JsonRpcRequest<CodeActionParams> {
     let mut virtual_range = host_range;
     translate_host_range_to_virtual(&mut virtual_range, offset);
-    // Out-of-region diagnostics would saturate to virtual (0,0) and could
-    // false-match a different diagnostic the server published at the top of
-    // the virtual document — drop them instead of clamping.
-    context
-        .diagnostics
-        .retain(|diagnostic| host_position_within_region(diagnostic.range.start, offset));
+    // Out-of-region diagnostics would translate to virtual coordinates that
+    // don't exist: above-region ones saturate to (0,0) and can false-match a
+    // different diagnostic at the top of the virtual document; below-region
+    // ones land past the virtual document's end. `host_range` is already
+    // clamped to the region, so its end bounds the region from below.
+    context.diagnostics.retain(|diagnostic| {
+        host_position_within_region(diagnostic.range.start, offset)
+            && diagnostic.range.start < host_range.end
+    });
     for diagnostic in &mut context.diagnostics {
         translate_host_range_to_virtual(&mut diagnostic.range, offset);
     }
@@ -236,14 +239,21 @@ fn bridge_code_action(
         CodeActionOrCommand::CodeAction(action) => action,
     };
 
-    // A server-side disabled action is only representable with disabledSupport.
+    // A server-side disabled action needs no further policy: its own reason
+    // already explains why it can't run, and it's only representable with
+    // disabledSupport. Suffix it, strip any payload (we can't execute it and
+    // a virt edit here would still be in untranslated coordinates), and keep
+    // the server's own reason — never overwrite it with a generic one.
     if action.disabled.is_some() {
         if !upstream_caps.disabled_support {
             return None;
         }
-        // A disabled action must not steer the client's auto-fix keybinding,
-        // whatever path surfaces it.
+        action.title = suffix_title(action.title, server_name);
+        action.edit = None;
+        action.command = None;
+        action.data = None;
         action.is_preferred = None;
+        return Some(CodeActionOrCommand::CodeAction(action));
     }
 
     // isPreferred is its own client capability (LSP 3.15); the downstream
@@ -289,6 +299,9 @@ fn bridge_code_action(
             if action.data.is_some() {
                 return disable_action(action, REASON_RESOLVE, server_name, upstream_caps);
             }
+            // No edit, no command, no data, not server-disabled: selecting it
+            // would do nothing — drop it rather than clutter the menu.
+            return None;
         }
     }
 
@@ -430,12 +443,13 @@ mod tests {
 
     #[test]
     fn code_action_request_drops_out_of_region_diagnostics() {
-        // A diagnostic above the region would clamp to virtual (0,0) and
-        // could false-match a different diagnostic the server published at
-        // the top of the virtual document — it must be dropped, not clamped.
+        // A diagnostic above the region clamps to virtual (0,0) and could
+        // false-match a different diagnostic at the top of the virtual
+        // document; one below the (region-clamped) request range lands past
+        // the virtual document's end — both must be dropped, not clamped.
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let context = CodeActionContext {
-            diagnostics: vec![diagnostic_at(0), diagnostic_at(5)],
+            diagnostics: vec![diagnostic_at(0), diagnostic_at(5), diagnostic_at(40)],
             ..CodeActionContext::default()
         };
         let request = build_code_action_request(
@@ -452,7 +466,7 @@ mod tests {
         assert_eq!(
             diags.len(),
             1,
-            "the above-region diagnostic must be dropped"
+            "diagnostics above and below the region must be dropped"
         );
         assert_eq!(diags[0]["range"]["start"]["line"], 2, "5 - region start 3");
     }
@@ -706,6 +720,14 @@ mod tests {
             action.is_preferred, None,
             "a disabled action must not steer auto-fix"
         );
+    }
+
+    #[test]
+    fn payloadless_action_is_dropped() {
+        // No edit, no command, no data, not server-disabled: selecting it can
+        // do nothing, so it must not clutter the menu.
+        let actions = transform(json!([{ "title": "Ghost" }]), caps(true)).unwrap();
+        assert!(actions.is_empty(), "got: {actions:?}");
     }
 
     #[test]
