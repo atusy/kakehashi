@@ -435,6 +435,18 @@ fn lazy_action_resolving_to_untranslatable_edit_is_disabled() {
         resolved["disabled"]["reason"], "the edit cannot be represented in the host document",
         "an untranslatable resolved edit must surface disabled, got: {resolved:?}"
     );
+    // The disabled outcome must reflect the RESOLVE RESPONSE, not the pre-resolve
+    // action: the server changed the title to "... (fileop)" and attached a
+    // diagnostic on virtual line 0 — both must survive on the disabled action
+    // (title re-suffixed, diagnostic host-translated to line 3).
+    assert_eq!(
+        resolved["title"], "Lazy organize imports (fileop) — mock-codeaction",
+        "the server's resolve-time title change must survive on the disabled action, got: {resolved:?}"
+    );
+    assert_eq!(
+        resolved["diagnostics"][0]["range"]["start"]["line"], 3,
+        "the resolve's host-translated diagnostics must survive on the disabled action, got: {resolved:?}"
+    );
     assert!(
         resolved["edit"].is_null(),
         "the unusable edit must be stripped, got: {resolved:?}"

@@ -496,7 +496,7 @@ impl LanguageServerPool {
         // action: the user would apply it and get a partial or no-op change.
         // This is a PERMANENT failure, so `resolve_untranslatable_edit` disables
         // rather than transient-fail-softing.
-        match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
+        let untranslatable = match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
             (Some(edit), Some(host_uri_lsp)) => {
                 let virtual_uri = VirtualDocumentUri::new(
                     host_uri_lsp,
@@ -504,28 +504,24 @@ impl LanguageServerPool {
                     &envelope.region_id,
                 )
                 .to_uri_string();
-                if !translate_edit_host_ward_strict(edit, &virtual_uri, host_uri_lsp, &offset) {
-                    return resolve_untranslatable_edit(
-                        action,
-                        &envelope,
-                        suffixed_title,
-                        upstream_caps,
-                    );
-                }
+                !translate_edit_host_ward_strict(edit, &virtual_uri, host_uri_lsp, &offset)
             }
             // The server resolved an edit, but the host URI couldn't be rebuilt
             // to translate it (a `url`/`Uri` parser divergence). Shipping the
             // untranslated virtual-coordinate edit would be unappliable — same
             // permanent failure as the cross-region case.
-            (Some(_), None) => {
-                return resolve_untranslatable_edit(
-                    action,
-                    &envelope,
-                    suffixed_title,
-                    upstream_caps,
-                );
-            }
-            (None, _) => {}
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if untranslatable {
+            return resolve_untranslatable_edit(
+                resolved,
+                action,
+                &envelope,
+                suffixed_title,
+                server_name,
+                upstream_caps,
+            );
         }
 
         // Re-apply the "{title} — {server}" suffix. The server normally echoes
@@ -986,28 +982,45 @@ fn resuffix_resolved_title(
 /// re-requests and the window is short), the honest outcome here is to disable
 /// the action with a reason, mirroring the initial codeAction path's
 /// `REASON_CROSS_REGION` disable — otherwise the client shows an enabled action
-/// that applies nothing. A client without `disabledSupport` can't render a
-/// disabled action, and resolve must return a `CodeAction` (it can't drop like
-/// the initial path), so it falls back to the unresolved-with-envelope action.
+/// that applies nothing.
+///
+/// `resolved` is the resolve RESPONSE (carrying the unusable edit plus any
+/// server-provided title change and already-host-translated diagnostics);
+/// `original` is the pre-resolve action (its `data` holds the inner payload,
+/// and it carries no edit). The disabled outcome is built from `resolved` so
+/// the user sees the server's most accurate title/diagnostics; only a client
+/// without `disabledSupport` (which can't render a disabled action, and resolve
+/// must return a `CodeAction` — it can't drop like the initial path) falls back
+/// to the unresolved-with-envelope `original`, which must never carry the
+/// untranslatable edit.
 fn resolve_untranslatable_edit(
-    mut action: CodeAction,
+    mut resolved: CodeAction,
+    mut original: CodeAction,
     envelope: &CodeActionEnvelope,
     suffixed_title: String,
+    server_name: &str,
     upstream_caps: UpstreamCodeActionCaps,
 ) -> CodeAction {
     if !upstream_caps.disabled_support {
-        re_envelope_action(&mut action, envelope);
-        return action;
+        re_envelope_action(&mut original, envelope);
+        return original;
     }
-    action.title = suffixed_title;
-    action.edit = None;
-    action.command = None;
-    action.data = None;
-    action.is_preferred = None;
-    action.disabled = Some(CodeActionDisabled {
+    // Disable the RESOLVED action: keep its (resuffixed) title and its
+    // already-host-translated diagnostics — both retrieved successfully — and
+    // strip only the unusable payload. Mirrors the server-`disabled` branch.
+    resolved.title = resuffix_resolved_title(
+        std::mem::take(&mut resolved.title),
+        suffixed_title,
+        server_name,
+    );
+    resolved.edit = None;
+    resolved.command = None;
+    resolved.data = None;
+    resolved.is_preferred = None;
+    resolved.disabled = Some(CodeActionDisabled {
         reason: REASON_CROSS_REGION.to_string(),
     });
-    action
+    resolved
 }
 
 /// Turn an action the bridge cannot execute into a `disabled` entry: the
