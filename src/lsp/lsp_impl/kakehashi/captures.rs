@@ -38,8 +38,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use tower_lsp_server::jsonrpc::{Error as JsonRpcError, Result};
 use tower_lsp_server::ls_types::{Range, TextDocumentIdentifier, Uri};
@@ -375,9 +376,82 @@ struct ComputedCaptures {
     skipped: std::sync::Arc<Vec<Value>>,
 }
 
+/// Serialize an `Arc<Vec<Value>>` field as its borrowed slice, without
+/// requiring serde's `rc` feature (which would add `Serialize`/`Deserialize`
+/// for every `Arc<T>`/`Rc<T>` crate-wide just for this one field shape).
+fn serialize_arc_vec<S: Serializer>(
+    v: &Arc<Vec<Value>>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    v.as_slice().serialize(s)
+}
+
+/// Wire shape for `kakehashi/captures/full` and the full-fallback branch of
+/// `kakehashi/captures/full/delta`.
+///
+/// Holds `Arc` clones (a refcount bump, not a deep copy) of the memoized
+/// match/skip arrays so the handler can move the originals into the lineage
+/// cache after building this response. `tower-lsp-server` forces every
+/// handler return type through `serde_json::to_value` before the wire write
+/// (`IntoResponse for Result<R, Error>`) — that one pass is unavoidable, but
+/// returning this struct as `R` instead of a `json!`-built `Value` means
+/// that pass serializes straight off these borrowed slices instead of
+/// re-walking an already-built `Value` tree a second time.
+#[derive(Debug, Serialize)]
+pub struct CapturesFullResponse {
+    #[serde(rename = "resultId")]
+    result_id: String,
+    #[serde(serialize_with = "serialize_arc_vec")]
+    matches: Arc<Vec<Value>>,
+    #[serde(serialize_with = "serialize_arc_vec")]
+    skipped: Arc<Vec<Value>>,
+}
+
+/// Wire shape for `kakehashi/captures/range` (no `resultId`: range results
+/// have no stable lineage to diff against).
+#[derive(Debug, Serialize)]
+pub struct CapturesRangeResponse {
+    #[serde(serialize_with = "serialize_arc_vec")]
+    matches: Arc<Vec<Value>>,
+    #[serde(serialize_with = "serialize_arc_vec")]
+    skipped: Arc<Vec<Value>>,
+}
+
+/// A single positional edit in a `kakehashi/captures/full/delta` response:
+/// replace `deleteCount` matches starting at `start` with `data`. Typed
+/// (rather than `json!`-built) for the same reason as `CapturesFullResponse` —
+/// `data` is already a `Vec<Value>` from `matches_delta_edit`, so this avoids
+/// re-walking it into a fresh `Value` tree before the one inherent
+/// `serde_json::to_value` pass tower-lsp-server performs anyway.
+#[derive(Debug, Serialize)]
+pub struct CapturesDeltaEdit {
+    start: usize,
+    #[serde(rename = "deleteCount")]
+    delete_count: usize,
+    data: Vec<Value>,
+}
+
+/// Wire shape for `kakehashi/captures/full/delta`: either a positional edit
+/// over the previous matches, or a full result (stale `previousResultId`,
+/// or lineage advanced during the await — LSP convention lets a server
+/// always answer a delta request with a full one).
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum CapturesDeltaResponse {
+    Edits {
+        #[serde(rename = "resultId")]
+        result_id: String,
+        edits: Vec<CapturesDeltaEdit>,
+    },
+    Full(CapturesFullResponse),
+}
+
 impl Kakehashi {
     /// Handler for `kakehashi/captures/full`.
-    pub async fn kakehashi_captures_full(&self, params: CapturesFullParams) -> Result<Value> {
+    pub async fn kakehashi_captures_full(
+        &self,
+        params: CapturesFullParams,
+    ) -> Result<Option<CapturesFullResponse>> {
         let computed = self
             .compute_captures(
                 &params.text_document.uri,
@@ -387,17 +461,18 @@ impl Kakehashi {
             )
             .await?;
         let Some(c) = computed else {
-            return Ok(Value::Null);
+            return Ok(None);
         };
         let result_id = next_result_id();
-        // `json!` serializes interpolated values **by reference**, so the
-        // originals are still owned afterwards and move into the cache insert
-        // below — exactly one materialization of the matches per request.
-        let response = json!({
-            "resultId": result_id,
-            "matches": &*c.matches,
-            "skipped": &*c.skipped,
-        });
+        // `Arc::clone` is a refcount bump, not a deep copy — the originals
+        // stay in `c` and move into the cache insert below, while this
+        // response holds its own cheap handle for the eventual (single,
+        // tower-lsp-server-forced) serialization pass.
+        let response = CapturesFullResponse {
+            result_id: result_id.clone(),
+            matches: Arc::clone(&c.matches),
+            skipped: Arc::clone(&c.skipped),
+        };
         // A full that cannot install lineage (the text moved past the computed
         // snapshot, or a close/reopen raced) answers `null` instead: handing
         // out a `resultId` with no stored lineage would make the client's next
@@ -408,9 +483,9 @@ impl Kakehashi {
             .store_lineage(c, params.kind, params.injection, result_id)
             .await
         {
-            return Ok(Value::Null);
+            return Ok(None);
         }
-        Ok(response)
+        Ok(Some(response))
     }
 
     /// Store a fresh lineage in this mode's slot, unless the document closed
@@ -471,7 +546,7 @@ impl Kakehashi {
     pub async fn kakehashi_captures_full_delta(
         &self,
         params: CapturesDeltaParams,
-    ) -> Result<Value> {
+    ) -> Result<Option<CapturesDeltaResponse>> {
         if !is_valid_kind(&params.kind) {
             return Err(JsonRpcError::invalid_params(format!(
                 "invalid capture kind {:?}: expected [A-Za-z0-9_-]+",
@@ -483,7 +558,7 @@ impl Kakehashi {
                 target: "kakehashi::captures",
                 "invalid URI: {}", params.text_document.uri.as_str()
             );
-            return Ok(Value::Null);
+            return Ok(None);
         };
         let key = (uri, params.kind.clone());
 
@@ -511,14 +586,14 @@ impl Kakehashi {
             }
         });
         let Some((injection, matched)) = probe else {
-            return Ok(Value::Null);
+            return Ok(None);
         };
 
         let computed = self
             .compute_captures(&params.text_document.uri, &params.kind, None, injection)
             .await?;
         let Some(c) = computed else {
-            return Ok(Value::Null);
+            return Ok(None);
         };
 
         // The stale-id fallback was justified by exactly one live mode slot —
@@ -537,7 +612,7 @@ impl Kakehashi {
                 matches!(live.as_slice(), [only] if *only == usize::from(injection))
             });
             if !still_single {
-                return Ok(Value::Null);
+                return Ok(None);
             }
         }
 
@@ -548,8 +623,8 @@ impl Kakehashi {
         // end of this statement. The slot is re-verified against
         // `previousResultId` because another request for the same mode may
         // have advanced the lineage during the await above; if it did, fall
-        // back to a full result. `json!` serializes by reference, so
-        // `result_id` and `c.matches` stay owned and move into the store.
+        // back to a full result. The full-fallback branch `Arc::clone`s (not
+        // deep-copies) `c.matches`/`c.skipped`, mirroring `kakehashi_captures_full`.
         let slot_index = usize::from(injection);
         let response = match self.captures_cache.get(&key) {
             Some(entry)
@@ -562,22 +637,25 @@ impl Kakehashi {
                     .as_ref()
                     .expect("slot verified Some by the guard above");
                 let edits = match matches_delta_edit(prev_matches, &c.matches[..]) {
-                    None => json!([]),
-                    Some((start, delete_count, data)) => json!([{
-                        "start": start,
-                        "deleteCount": delete_count,
-                        "data": data,
-                    }]),
+                    None => Vec::new(),
+                    Some((start, delete_count, data)) => vec![CapturesDeltaEdit {
+                        start,
+                        delete_count,
+                        data,
+                    }],
                 };
-                json!({ "resultId": result_id, "edits": edits })
+                CapturesDeltaResponse::Edits {
+                    result_id: result_id.clone(),
+                    edits,
+                }
             }
             // Stale id (or lineage advanced during the await): full result
             // under the resolved mode (LSP convention — a server may always
             // answer a delta with a full).
-            _ => json!({
-                "resultId": result_id,
-                "matches": &*c.matches,
-                "skipped": &*c.skipped,
+            _ => CapturesDeltaResponse::Full(CapturesFullResponse {
+                result_id: result_id.clone(),
+                matches: Arc::clone(&c.matches),
+                skipped: Arc::clone(&c.skipped),
             }),
         };
         // Same gate as `full`: a delta whose fresh lineage cannot install
@@ -585,9 +663,9 @@ impl Kakehashi {
         // `null` — the client re-acquires via `full` (its baseline slot may
         // have been superseded by the failed rotation's circumstances anyway).
         if !self.store_lineage(c, key.1, injection, result_id).await {
-            return Ok(Value::Null);
+            return Ok(None);
         }
-        Ok(response)
+        Ok(Some(response))
     }
 
     /// Handler for `kakehashi/captures/range`.
@@ -595,7 +673,10 @@ impl Kakehashi {
     /// No `resultId` — range results depend on the viewport, so there is no
     /// stable lineage to diff against (matching semanticTokens/range, which
     /// likewise has no delta variant).
-    pub async fn kakehashi_captures_range(&self, params: CapturesRangeParams) -> Result<Value> {
+    pub async fn kakehashi_captures_range(
+        &self,
+        params: CapturesRangeParams,
+    ) -> Result<Option<CapturesRangeResponse>> {
         let computed = self
             .compute_captures(
                 &params.text_document.uri,
@@ -604,10 +685,10 @@ impl Kakehashi {
                 params.injection,
             )
             .await?;
-        Ok(match computed {
-            Some(c) => json!({ "matches": &*c.matches, "skipped": &*c.skipped }),
-            None => Value::Null,
-        })
+        Ok(computed.map(|c| CapturesRangeResponse {
+            matches: Arc::clone(&c.matches),
+            skipped: Arc::clone(&c.skipped),
+        }))
     }
 
     /// Shared pipeline: validate `kind`, resolve the document, load + compile
@@ -1492,6 +1573,67 @@ mod tests {
         ns.iter().map(|n| json!(n)).collect()
     }
 
+    /// Pins the wire shape of the struct-based response against the
+    /// `json!`-built shape it replaced: same keys, same values, matches/
+    /// skipped still arrays (not re-wrapped or renamed) despite now being
+    /// serialized off `Arc<Vec<Value>>` fields instead of a pre-built `Value`.
+    #[test]
+    fn captures_full_response_serializes_like_the_old_json_macro_shape() {
+        let response = CapturesFullResponse {
+            result_id: "r1".to_string(),
+            matches: Arc::new(vals(&[1, 2])),
+            skipped: Arc::new(vals(&[3])),
+        };
+        let expected = json!({
+            "resultId": "r1",
+            "matches": [1, 2],
+            "skipped": [3],
+        });
+        assert_eq!(serde_json::to_value(&response).unwrap(), expected);
+    }
+
+    #[test]
+    fn captures_range_response_serializes_like_the_old_json_macro_shape() {
+        let response = CapturesRangeResponse {
+            matches: Arc::new(vals(&[1])),
+            skipped: Arc::new(Vec::new()),
+        };
+        let expected = json!({ "matches": [1], "skipped": [] });
+        assert_eq!(serde_json::to_value(&response).unwrap(), expected);
+    }
+
+    #[test]
+    fn captures_delta_response_edits_variant_serializes_like_the_old_json_macro_shape() {
+        let response = CapturesDeltaResponse::Edits {
+            result_id: "r2".to_string(),
+            edits: vec![CapturesDeltaEdit {
+                start: 0,
+                delete_count: 1,
+                data: vals(&[1]),
+            }],
+        };
+        let expected = json!({
+            "resultId": "r2",
+            "edits": [{"start": 0, "deleteCount": 1, "data": [1]}],
+        });
+        assert_eq!(serde_json::to_value(&response).unwrap(), expected);
+    }
+
+    #[test]
+    fn captures_delta_response_full_variant_serializes_like_the_old_json_macro_shape() {
+        let response = CapturesDeltaResponse::Full(CapturesFullResponse {
+            result_id: "r3".to_string(),
+            matches: Arc::new(vals(&[9])),
+            skipped: Arc::new(Vec::new()),
+        });
+        let expected = json!({
+            "resultId": "r3",
+            "matches": [9],
+            "skipped": [],
+        });
+        assert_eq!(serde_json::to_value(&response).unwrap(), expected);
+    }
+
     /// Serve-current (ADR §3, revised): a captures request arriving while the
     /// latest snapshot trails the live text parks until the current snapshot
     /// publishes instead of walking the trailing one (whose result the
@@ -1575,7 +1717,7 @@ mod tests {
             .expect("captures full must not error");
         // Tree-less snapshot → the walk degrades to the protocol null; what
         // matters here is WHEN it answered (after currency), not the shape.
-        assert_eq!(result, Value::Null);
+        assert!(result.is_none());
         // Discriminate woke-on-publish from backstop-timeout: under the
         // paused clock a handler that missed the publish would only answer
         // after auto-advancing through the settle backstop.
@@ -1648,7 +1790,7 @@ mod tests {
             })
             .await
             .expect("range must not error");
-        assert_eq!(result, Value::Null, "trailing snapshot re-syncs via null");
+        assert!(result.is_none(), "trailing snapshot re-syncs via null");
         assert!(
             started_at.elapsed() < crate::lsp::lsp_impl::snapshot_read::TOKEN_SETTLE_BACKSTOP,
             "range must reject immediately, not park out the settle backstop"
@@ -1761,9 +1903,10 @@ mod tests {
         let result = request
             .await
             .expect("handler task must not panic")
-            .expect("captures full must not error");
+            .expect("captures full must not error")
+            .expect("winner memo is Some");
         assert_eq!(
-            result["matches"][0], sentinel,
+            result.matches[0], sentinel,
             "the loser must serve the winner's memo, not run its own walk"
         );
     }
