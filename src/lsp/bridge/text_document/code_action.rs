@@ -46,7 +46,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
-        client_supports_disabled: bool,
+        upstream_caps: UpstreamCodeActionCaps,
     ) -> io::Result<Option<CodeActionResponse>> {
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(host_uri))
@@ -79,7 +79,7 @@ impl LanguageServerPool {
                     ctx.host_uri_lsp,
                     ctx.offset,
                     server_name,
-                    client_supports_disabled,
+                    upstream_caps,
                 )
             },
         )
@@ -133,7 +133,7 @@ fn transform_code_action_response_to_host(
     host_uri: &Uri,
     offset: &RegionOffset,
     server_name: &str,
-    client_supports_disabled: bool,
+    upstream_caps: UpstreamCodeActionCaps,
 ) -> Option<CodeActionResponse> {
     if response_has_jsonrpc_error(&response, "textDocument/codeAction") {
         return None;
@@ -144,7 +144,7 @@ fn transform_code_action_response_to_host(
     Some(bridge_code_actions(
         actions,
         server_name,
-        client_supports_disabled,
+        upstream_caps,
         Some(&VirtLayerContext {
             request_virtual_uri,
             host_uri,
@@ -188,17 +188,26 @@ pub(crate) struct VirtLayerContext<'a> {
     offset: &'a RegionOffset,
 }
 
+/// Upstream client capabilities that gate the bridge action policy
+/// (LSP 3.15/3.16 `isPreferredSupport` / `disabledSupport`): fields the
+/// client did not advertise must not reach it.
+#[derive(Clone, Copy)]
+pub(crate) struct UpstreamCodeActionCaps {
+    pub(crate) disabled_support: bool,
+    pub(crate) is_preferred_support: bool,
+}
+
 /// Apply the bridge policy to a downstream server's actions: title suffix,
 /// command/lazy-action disabling, and (virt layer) coordinate translation.
 pub(crate) fn bridge_code_actions(
     actions: Vec<CodeActionOrCommand>,
     server_name: &str,
-    client_supports_disabled: bool,
+    upstream_caps: UpstreamCodeActionCaps,
     virt: Option<&VirtLayerContext<'_>>,
 ) -> Vec<CodeActionOrCommand> {
     actions
         .into_iter()
-        .filter_map(|item| bridge_code_action(item, server_name, client_supports_disabled, virt))
+        .filter_map(|item| bridge_code_action(item, server_name, upstream_caps, virt))
         .collect()
 }
 
@@ -209,7 +218,7 @@ const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host do
 fn bridge_code_action(
     item: CodeActionOrCommand,
     server_name: &str,
-    client_supports_disabled: bool,
+    upstream_caps: UpstreamCodeActionCaps,
     virt: Option<&VirtLayerContext<'_>>,
 ) -> Option<CodeActionOrCommand> {
     let mut action = match item {
@@ -221,7 +230,7 @@ fn bridge_code_action(
                 command.title,
                 REASON_COMMANDS,
                 server_name,
-                client_supports_disabled,
+                upstream_caps,
             );
         }
         CodeActionOrCommand::CodeAction(action) => action,
@@ -229,11 +238,18 @@ fn bridge_code_action(
 
     // A server-side disabled action is only representable with disabledSupport.
     if action.disabled.is_some() {
-        if !client_supports_disabled {
+        if !upstream_caps.disabled_support {
             return None;
         }
         // A disabled action must not steer the client's auto-fix keybinding,
         // whatever path surfaces it.
+        action.is_preferred = None;
+    }
+
+    // isPreferred is its own client capability (LSP 3.15); the downstream
+    // baseline advertises it unconditionally, so strip it for clients that
+    // did not opt in.
+    if !upstream_caps.is_preferred_support {
         action.is_preferred = None;
     }
 
@@ -250,12 +266,7 @@ fn bridge_code_action(
     // only the edit half of an edit+command action would be worse than
     // disabling the whole action.
     if action.command.is_some() {
-        return disable_action(
-            action,
-            REASON_COMMANDS,
-            server_name,
-            client_supports_disabled,
-        );
+        return disable_action(action, REASON_COMMANDS, server_name, upstream_caps);
     }
 
     match &mut action.edit {
@@ -268,12 +279,7 @@ fn bridge_code_action(
                     virt.offset,
                 )
             {
-                return disable_action(
-                    action,
-                    REASON_CROSS_REGION,
-                    server_name,
-                    client_supports_disabled,
-                );
+                return disable_action(action, REASON_CROSS_REGION, server_name, upstream_caps);
             }
         }
         None => {
@@ -281,12 +287,7 @@ fn bridge_code_action(
             // (its payload hides behind `data`). We don't advertise resolve
             // yet, so it can never be completed.
             if action.data.is_some() {
-                return disable_action(
-                    action,
-                    REASON_RESOLVE,
-                    server_name,
-                    client_supports_disabled,
-                );
+                return disable_action(action, REASON_RESOLVE, server_name, upstream_caps);
             }
         }
     }
@@ -311,9 +312,9 @@ fn disable_action(
     mut action: CodeAction,
     reason: &str,
     server_name: &str,
-    client_supports_disabled: bool,
+    upstream_caps: UpstreamCodeActionCaps,
 ) -> Option<CodeActionOrCommand> {
-    if !client_supports_disabled {
+    if !upstream_caps.disabled_support {
         return None;
     }
     action.title = suffix_title(action.title, server_name);
@@ -335,9 +336,9 @@ fn disabled_placeholder(
     title: String,
     reason: &str,
     server_name: &str,
-    client_supports_disabled: bool,
+    upstream_caps: UpstreamCodeActionCaps,
 ) -> Option<CodeActionOrCommand> {
-    if !client_supports_disabled {
+    if !upstream_caps.disabled_support {
         return None;
     }
     Some(CodeActionOrCommand::CodeAction(CodeAction {
@@ -477,9 +478,16 @@ mod tests {
     // Response transform
     // ==========================================================================
 
+    fn caps(disabled_support: bool) -> UpstreamCodeActionCaps {
+        UpstreamCodeActionCaps {
+            disabled_support,
+            is_preferred_support: true,
+        }
+    }
+
     fn transform(
         result: serde_json::Value,
-        client_supports_disabled: bool,
+        upstream_caps: UpstreamCodeActionCaps,
     ) -> Option<CodeActionResponse> {
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
@@ -489,7 +497,7 @@ mod tests {
             &host_uri,
             &RegionOffset::new(10, 0),
             "ruff",
-            client_supports_disabled,
+            upstream_caps,
         )
     }
 
@@ -513,7 +521,7 @@ mod tests {
 
     #[test]
     fn null_result_returns_none() {
-        assert!(transform(serde_json::Value::Null, true).is_none());
+        assert!(transform(serde_json::Value::Null, caps(true)).is_none());
     }
 
     #[test]
@@ -525,7 +533,7 @@ mod tests {
                 { "kind": "quickfix" },
                 edit_carrying_action("Remove unused import")
             ]),
-            true,
+            caps(true),
         )
         .unwrap();
         assert_eq!(actions.len(), 1, "valid action must survive: {actions:?}");
@@ -537,8 +545,11 @@ mod tests {
 
     #[test]
     fn edit_carrying_action_is_translated_and_suffixed() {
-        let actions =
-            transform(json!([edit_carrying_action("Remove unused import")]), true).unwrap();
+        let actions = transform(
+            json!([edit_carrying_action("Remove unused import")]),
+            caps(true),
+        )
+        .unwrap();
 
         assert_eq!(actions.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
@@ -563,7 +574,7 @@ mod tests {
             },
             "message": "unused"
         }]);
-        let actions = transform(json!([action]), true).unwrap();
+        let actions = transform(json!([action]), caps(true)).unwrap();
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
             panic!("Expected CodeAction");
         };
@@ -578,7 +589,7 @@ mod tests {
     fn bare_command_becomes_disabled_placeholder() {
         let actions = transform(
             json!([{ "title": "Run organize imports", "command": "ruff.organizeImports" }]),
-            true,
+            caps(true),
         )
         .unwrap();
 
@@ -594,7 +605,7 @@ mod tests {
     fn bare_command_is_dropped_without_disabled_support() {
         let actions = transform(
             json!([{ "title": "Run organize imports", "command": "ruff.organizeImports" }]),
-            false,
+            caps(false),
         )
         .unwrap();
         assert!(actions.is_empty());
@@ -604,7 +615,7 @@ mod tests {
     fn command_carrying_action_is_disabled_with_payload_stripped() {
         let mut action = edit_carrying_action("Fix all");
         action["command"] = json!({ "title": "post", "command": "ruff.postFix" });
-        let actions = transform(json!([action]), true).unwrap();
+        let actions = transform(json!([action]), caps(true)).unwrap();
 
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
             panic!("Expected CodeAction");
@@ -619,8 +630,11 @@ mod tests {
 
     #[test]
     fn lazy_data_only_action_is_disabled() {
-        let actions =
-            transform(json!([{ "title": "Lazy fix", "data": { "id": 7 } }]), true).unwrap();
+        let actions = transform(
+            json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
+            caps(true),
+        )
+        .unwrap();
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
             panic!("Expected CodeAction");
         };
@@ -632,7 +646,7 @@ mod tests {
     fn kept_action_strips_untranslated_data() {
         let mut action = edit_carrying_action("Fix");
         action["data"] = json!({ "virtualUri": make_virtual_uri_string() });
-        let actions = transform(json!([action]), true).unwrap();
+        let actions = transform(json!([action]), caps(true)).unwrap();
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
             panic!("Expected CodeAction");
         };
@@ -644,6 +658,31 @@ mod tests {
     }
 
     #[test]
+    fn is_preferred_stripped_without_client_support() {
+        let mut action = edit_carrying_action("Fix");
+        action["isPreferred"] = json!(true);
+        let no_pref = UpstreamCodeActionCaps {
+            disabled_support: true,
+            is_preferred_support: false,
+        };
+        let actions = transform(json!([action.clone()]), no_pref).unwrap();
+        let CodeActionOrCommand::CodeAction(bridged) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            bridged.is_preferred, None,
+            "isPreferred must not reach a client without isPreferredSupport"
+        );
+
+        // With support it passes through.
+        let actions = transform(json!([action]), caps(true)).unwrap();
+        let CodeActionOrCommand::CodeAction(bridged) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(bridged.is_preferred, Some(true));
+    }
+
+    #[test]
     fn server_disabled_command_action_keeps_server_reason() {
         let actions = transform(
             json!([{
@@ -652,7 +691,7 @@ mod tests {
                 "disabled": { "reason": "wrong scope" },
                 "isPreferred": true
             }]),
-            true,
+            caps(true),
         )
         .unwrap();
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
@@ -682,7 +721,7 @@ mod tests {
                 ]
             }
         });
-        let actions = transform(json!([action]), true).unwrap();
+        let actions = transform(json!([action]), caps(true)).unwrap();
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
             panic!("Expected CodeAction");
         };
@@ -703,7 +742,7 @@ mod tests {
                 ]
             }
         });
-        let actions = transform(json!([action]), false).unwrap();
+        let actions = transform(json!([action]), caps(false)).unwrap();
         assert!(actions.is_empty());
     }
 
@@ -711,7 +750,7 @@ mod tests {
     fn server_disabled_action_dropped_without_disabled_support() {
         let actions = transform(
             json!([{ "title": "Not applicable here", "disabled": { "reason": "wrong scope" } }]),
-            false,
+            caps(false),
         )
         .unwrap();
         assert!(actions.is_empty());
@@ -740,7 +779,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let bridged = bridge_code_actions(actions, "marksman", true, None);
+        let bridged = bridge_code_actions(actions, "marksman", caps(true), None);
         assert_eq!(bridged.len(), 2);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");

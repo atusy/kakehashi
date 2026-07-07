@@ -69,7 +69,8 @@ pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{
-    CodeLensEnvelope, bridge_code_actions, extract_code_lens_envelope, parse_code_actions_leniently,
+    CodeLensEnvelope, UpstreamCodeActionCaps, bridge_code_actions, extract_code_lens_envelope,
+    parse_code_actions_leniently,
 };
 pub(crate) use workspace::WorkspaceFolderSet;
 
