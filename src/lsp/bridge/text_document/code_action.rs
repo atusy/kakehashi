@@ -9,8 +9,15 @@
 //! users can see which downstream server each action comes from.
 
 use std::io;
+use std::sync::Arc;
 
-use crate::config::settings::BridgeServerConfig;
+use log::warn;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
+use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
+use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::text::PositionMapper;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
@@ -19,12 +26,114 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region,
     response_has_jsonrpc_error, transform_workspace_edit_to_host, translate_host_range_to_virtual,
     translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
+use super::completion::EnvelopeOffset;
+
+/// Wrapper key inside `CodeAction.data` that identifies the origin server.
+const ENVELOPE_KEY: &str = "kakehashi";
+
+/// Envelope stored in `CodeAction.data` for routing `codeAction/resolve`
+/// (#568 PR 4), mirroring [`CodeLensEnvelope`](super::code_lens::CodeLensEnvelope).
+///
+/// Carries everything resolve-time routing and coordinate translation need:
+/// the origin server, the host document + region the action came from, the
+/// injection language (to reconstruct the virtual URI for edit re-keying), the
+/// offset snapshot, the action's ORIGINAL (unsuffixed) title (servers may
+/// match a resolve request by title/content, so it must be restored before
+/// forwarding), and the downstream's own `data` preserved verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct CodeActionEnvelope {
+    /// Server name identifying which downstream produced the action.
+    pub(crate) origin: String,
+    /// Host document URI the action belongs to (resolve params carry no
+    /// textDocument, so the envelope must).
+    pub(crate) host_uri: String,
+    /// ULID of the injection region the action came from; the resolve handler's
+    /// freshness gate looks it up in the node tracker (fail-soft when stale).
+    pub(crate) region_id: String,
+    /// Injection language of the region — needed together with `region_id` +
+    /// `host_uri` to rebuild the virtual URI so a resolved edit's `changes`
+    /// map can be re-keyed to the host document.
+    pub(crate) injection_language: String,
+    /// Region offset snapshot for coordinate translation at resolve time.
+    pub(crate) offset: EnvelopeOffset,
+    /// The action's original (unsuffixed) title, restored before forwarding a
+    /// resolve so a server matching by title still matches.
+    pub(crate) original_title: String,
+    /// The downstream server's original `data` value (preserved verbatim).
+    pub(crate) inner: Option<Value>,
+}
+
+/// Everything needed to wrap an action's `data` in a routing envelope.
+pub(crate) struct CodeActionEnvelopeContext<'a> {
+    server_name: &'a str,
+    host_uri: &'a str,
+    region_id: &'a str,
+    injection_language: &'a str,
+    offset: &'a RegionOffset,
+}
+
+/// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
+/// the CURRENT (unsuffixed) title as `original_title`. Call before suffixing.
+fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext) {
+    let inner = action.data.take();
+    let envelope = CodeActionEnvelope {
+        origin: ctx.server_name.to_string(),
+        host_uri: ctx.host_uri.to_string(),
+        region_id: ctx.region_id.to_string(),
+        injection_language: ctx.injection_language.to_string(),
+        offset: EnvelopeOffset::from(ctx.offset),
+        original_title: action.title.clone(),
+        inner,
+    };
+    action.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+}
+
+/// Extract the envelope from an action's `data` without modifying the action.
+pub(crate) fn extract_code_action_envelope(action: &CodeAction) -> Option<CodeActionEnvelope> {
+    let data = action.data.as_ref()?;
+    let wrapper = data.get(ENVELOPE_KEY)?;
+    serde_json::from_value(wrapper.clone()).ok()
+}
+
+/// Extract the envelope and restore the downstream's original `data` value.
+///
+/// On success, `action.data` is set back to `inner` (the action's title is
+/// left suffixed — the dispatch path restores `original_title` explicitly
+/// before forwarding). Returns `None` if not an envelope (action unchanged).
+fn strip_code_action_envelope(action: &mut CodeAction) -> Option<CodeActionEnvelope> {
+    let mut envelope = extract_code_action_envelope(action)?;
+    action.data = envelope.inner.take();
+    Some(envelope)
+}
+
+/// Restore the envelope into an action's `data` field (fail-soft return path).
+///
+/// The action's CURRENT `data` becomes the new `inner` (mirrors
+/// `re_envelope_lens`): `strip` moved the downstream's original data back into
+/// `action.data`, and after a resolve the field may hold the server's updated
+/// data — either way it is what a subsequent resolve must receive. The
+/// `original_title` is taken from the envelope (the action's live title is the
+/// suffixed one), so it survives repeated strip/re-envelope cycles.
+fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
+    let inner = action.data.take();
+    action.data = Some(serde_json::json!({
+        ENVELOPE_KEY: CodeActionEnvelope {
+            origin: envelope.origin.clone(),
+            host_uri: envelope.host_uri.clone(),
+            region_id: envelope.region_id.clone(),
+            injection_language: envelope.injection_language.clone(),
+            offset: envelope.offset.clone(),
+            original_title: envelope.original_title.clone(),
+            inner,
+        }
+    }));
+}
 
 /// The exclusive host-document end of an injection region: the position just
 /// past its `virtual_content`, mapped back to host coordinates. Bounds the
@@ -70,38 +179,295 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/codeAction") {
             return Ok(None);
         }
-        self.execute_bridge_request_with_handle(
-            handle,
-            host_uri,
-            injection_language,
+
+        // Phase 1: send the request and parse the raw actions (still in virtual
+        // coordinates, no policy applied) — the bridge policy is deferred to
+        // phase 3 so phase 2 can eager-resolve lazy actions asynchronously.
+        let region_end = region_host_end(virtual_content, &offset);
+        let raw = self
+            .execute_bridge_request_with_handle(
+                Arc::clone(&handle),
+                host_uri,
+                injection_language,
+                region_id,
+                &offset,
+                virtual_content,
+                upstream_request_id.clone(),
+                |virtual_uri, request_id| {
+                    build_code_action_request(
+                        virtual_uri,
+                        host_range,
+                        context,
+                        &offset,
+                        region_end,
+                        request_id,
+                        client_progress_token,
+                    )
+                },
+                |response, _ctx| parse_code_action_response_raw(response),
+            )
+            .await?;
+        let Some(mut actions) = raw else {
+            return Ok(None);
+        };
+
+        // Phase 2: eager-resolve fallback. A client without resolve+data
+        // support can never complete a lazy action and may strip our routing
+        // envelope, so resolve those actions downstream now (bounded: only the
+        // lazy ones). Failures fall through to the phase-3 REASON_RESOLVE path.
+        if !upstream_caps.can_envelope() {
+            self.eager_resolve_lazy_actions(&handle, &mut actions, upstream_request_id)
+                .await;
+        }
+
+        // Phase 3: apply the bridge policy (coordinate translation, title
+        // suffix, disable/drop, and — for envelope-capable clients — the
+        // resolve routing envelope).
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let virtual_uri_string =
+            VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id).to_uri_string();
+        let virt = VirtLayerContext {
+            request_virtual_uri: &virtual_uri_string,
+            host_uri: &host_uri_lsp,
+            offset: &offset,
             region_id,
-            &offset,
-            virtual_content,
-            upstream_request_id,
-            |virtual_uri, request_id| {
-                build_code_action_request(
-                    virtual_uri,
-                    host_range,
-                    context,
-                    &offset,
-                    region_host_end(virtual_content, &offset),
-                    request_id,
-                    client_progress_token,
-                )
-            },
-            |response, ctx| {
-                transform_code_action_response_to_host(
-                    response,
-                    &ctx.virtual_uri_string,
-                    ctx.host_uri_lsp,
-                    ctx.offset,
-                    server_name,
-                    upstream_caps,
-                )
-            },
-        )
-        .await
+            injection_language,
+            host_uri_string: host_uri.as_str(),
+            server_name,
+        };
+        Ok(Some(bridge_code_actions(
+            actions,
+            server_name,
+            upstream_caps,
+            Some(&virt),
+        )))
     }
+
+    /// Eager-resolve the lazy (data-only) actions in place: for a client that
+    /// cannot resolve them itself, materialize their `edit`/`command` via a
+    /// `codeAction/resolve` round-trip on the SAME connection while it is still
+    /// live. Actions that fail to resolve stay lazy and are disabled/dropped by
+    /// the phase-3 policy. Only lazy actions are touched (bounded fan-out).
+    async fn eager_resolve_lazy_actions(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        actions: &mut [CodeActionOrCommand],
+        upstream_id: Option<UpstreamId>,
+    ) {
+        if !handle.has_capability("codeAction/resolve") {
+            return;
+        }
+        for item in actions.iter_mut() {
+            let CodeActionOrCommand::CodeAction(action) = item else {
+                continue;
+            };
+            // Lazy = only `data`, no edit/command, not server-disabled.
+            let is_lazy = action.edit.is_none()
+                && action.command.is_none()
+                && action.disabled.is_none()
+                && action.data.is_some();
+            if !is_lazy {
+                continue;
+            }
+            if let Some(resolved) = self
+                .send_code_action_resolve_on_handle(handle, action.clone(), upstream_id.clone())
+                .await
+            {
+                *action = resolved;
+            }
+        }
+    }
+
+    /// Route a `codeAction/resolve` request to the origin downstream server,
+    /// identified by the envelope in `action.data` (#568 PR 4). An action
+    /// without an envelope (host-layer or foreign) passes through unchanged.
+    /// Fails soft at every step: any failure returns the action unresolved
+    /// with its envelope restored (mirrors `dispatch_code_lens_resolve`).
+    pub(crate) async fn dispatch_code_action_resolve(
+        &self,
+        mut action: CodeAction,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> CodeAction {
+        let Some(envelope) = strip_code_action_envelope(&mut action) else {
+            return action;
+        };
+
+        if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+        let Some(config) = resolve_with_wildcard(
+            &settings.language_servers,
+            &envelope.origin,
+            merge_bridge_server_configs,
+        ) else {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        };
+
+        self.send_code_action_resolve_request(&config, action, envelope, upstream_id)
+            .await
+    }
+
+    /// Reconnect to the origin `(server, root)`, restore the original title,
+    /// translate coordinates back to virtual, forward `codeAction/resolve`,
+    /// then translate the resolved edit/diagnostics host-ward, re-suffix, and
+    /// re-envelope. Every failure path returns the action unresolved.
+    async fn send_code_action_resolve_request(
+        &self,
+        server_config: &BridgeServerConfig,
+        mut action: CodeAction,
+        envelope: CodeActionEnvelope,
+        upstream_id: Option<UpstreamId>,
+    ) -> CodeAction {
+        let server_name = &envelope.origin;
+        let host_url = Url::parse(&envelope.host_uri).ok();
+        let handle = match self
+            .get_or_create_connection(server_name, server_config, host_url.as_ref())
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve: failed to connect to {server_name}: {e}"
+                );
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+        };
+        if !handle.has_capability("codeAction/resolve") {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+
+        let offset = RegionOffset::from(&envelope.offset);
+        let host_uri_lsp = host_url
+            .as_ref()
+            .and_then(|u| crate::lsp::lsp_impl::url_to_uri(u).ok());
+
+        // Forward with the ORIGINAL (unsuffixed) title restored and any
+        // client-supplied ranges translated back to virtual coordinates. Keep
+        // the suffixed title to re-apply to the resolved response.
+        let mut outgoing = action.clone();
+        let suffixed_title =
+            std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
+        translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
+
+        let Some(mut resolved) = self
+            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
+            .await
+        else {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        };
+
+        // Translate the resolved edit host-ward; a cross-region edit that
+        // cannot be represented in the host document fails soft (return the
+        // original action unresolved rather than an unappliable edit).
+        if let (Some(edit), Some(host_uri_lsp)) = (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
+            let virtual_uri =
+                VirtualDocumentUri::new(host_uri_lsp, &envelope.injection_language, &envelope.region_id)
+                    .to_uri_string();
+            if !transform_workspace_edit_to_host(edit, &virtual_uri, host_uri_lsp, &offset) {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+        }
+        if let Some(diagnostics) = &mut resolved.diagnostics {
+            for diagnostic in diagnostics {
+                translate_virtual_range_to_host(&mut diagnostic.range, &offset);
+            }
+        }
+
+        // Re-apply the "{title} — {server}" suffix (the server echoed the
+        // original title back). A downstream that omits `data` must not erase
+        // the envelope's `inner` — carry the original forward.
+        resolved.title = suffixed_title;
+        if resolved.data.is_none() {
+            resolved.data = action.data.take();
+        }
+        re_envelope_action(&mut resolved, &envelope);
+        resolved
+    }
+
+    /// Send a `codeAction/resolve` request on an already-connected handle and
+    /// parse the response into a resolved `CodeAction`. Returns `None` on any
+    /// failure (register/send/wait/parse) so callers can fail soft.
+    async fn send_code_action_resolve_on_handle(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        action: CodeAction,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<CodeAction> {
+        let connection_key = handle.key();
+        if let Some(ref id) = upstream_id {
+            self.register_upstream_request(id.clone(), connection_key);
+        }
+        let (request_id, response_rx) = match handle.register_request_with_upstream(upstream_id.clone())
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve: failed to register request: {e}"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
+            }
+        };
+
+        let request = JsonRpcRequest::new(request_id.as_i64(), "codeAction/resolve", &action);
+        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+
+        if let Err(e) = handle.send_request(request, request_id) {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: failed to send request: {e}"
+            );
+            if let Some(ref id) = upstream_id {
+                self.unregister_upstream_request(id, connection_key);
+            }
+            return None;
+        }
+
+        let response = handle.wait_for_response(request_id, response_rx).await;
+        router_guard.disarm();
+        if let Some(ref id) = upstream_id {
+            self.unregister_upstream_request(id, connection_key);
+        }
+
+        parse_code_action_resolve_response(response.ok()?)
+    }
+}
+
+/// Translate an action's host-space ranges (diagnostics) back to virtual
+/// coordinates before forwarding a `codeAction/resolve`. A lazy action being
+/// resolved normally carries no `edit`, so only diagnostic ranges are handled;
+/// an inverse edit transform is not implemented (see `transform_workspace_edit_to_host`).
+fn translate_action_ranges_host_to_virtual(action: &mut CodeAction, offset: &RegionOffset) {
+    if let Some(diagnostics) = &mut action.diagnostics {
+        for diagnostic in diagnostics {
+            translate_host_range_to_virtual(&mut diagnostic.range, offset);
+        }
+    }
+}
+
+/// Parse a JSON-RPC `codeAction/resolve` response into a `CodeAction`.
+/// Returns `None` for errors, null results, and deserialization failures.
+fn parse_code_action_resolve_response(mut response: serde_json::Value) -> Option<CodeAction> {
+    if response_has_jsonrpc_error(&response, "codeAction/resolve") {
+        return None;
+    }
+    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    if result.is_null() {
+        return None;
+    }
+    serde_json::from_value(result).ok()
 }
 
 /// Build a JSON-RPC code action request for a downstream language server.
@@ -157,31 +523,17 @@ fn build_code_action_request(
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/codeAction", params)
 }
 
-/// Transform a code action response from virtual to host coordinates.
-fn transform_code_action_response_to_host(
+/// Parse a code action response into raw (virtual-coordinate, unpoliced)
+/// actions. The bridge policy is applied later so an eager-resolve pass can
+/// materialize lazy actions in between (see `send_code_action_request`).
+fn parse_code_action_response_raw(
     mut response: serde_json::Value,
-    request_virtual_uri: &str,
-    host_uri: &Uri,
-    offset: &RegionOffset,
-    server_name: &str,
-    upstream_caps: UpstreamCodeActionCaps,
-) -> Option<CodeActionResponse> {
+) -> Option<Vec<CodeActionOrCommand>> {
     if response_has_jsonrpc_error(&response, "textDocument/codeAction") {
         return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
-    let actions = parse_code_actions_leniently(result)?;
-
-    Some(bridge_code_actions(
-        actions,
-        server_name,
-        upstream_caps,
-        Some(&VirtLayerContext {
-            request_virtual_uri,
-            host_uri,
-            offset,
-        }),
-    ))
+    parse_code_actions_leniently(result)
 }
 
 /// Parse a code action result value item by item: one malformed action must
@@ -217,6 +569,27 @@ pub(crate) struct VirtLayerContext<'a> {
     request_virtual_uri: &'a str,
     host_uri: &'a Uri,
     offset: &'a RegionOffset,
+    /// Origin routing metadata for the `codeAction/resolve` envelope; carried
+    /// alongside the coordinate context so a kept action that still needs
+    /// resolve can be enveloped in one pass.
+    region_id: &'a str,
+    injection_language: &'a str,
+    /// The host document URI as a parseable string for the envelope
+    /// (`host_uri` above is the `Uri` form used for edit re-keying).
+    host_uri_string: &'a str,
+    server_name: &'a str,
+}
+
+impl VirtLayerContext<'_> {
+    fn envelope_ctx(&self) -> CodeActionEnvelopeContext<'_> {
+        CodeActionEnvelopeContext {
+            server_name: self.server_name,
+            host_uri: self.host_uri_string,
+            region_id: self.region_id,
+            injection_language: self.injection_language,
+            offset: self.offset,
+        }
+    }
 }
 
 /// Upstream client capabilities that gate the bridge action policy
@@ -226,6 +599,21 @@ pub(crate) struct VirtLayerContext<'a> {
 pub(crate) struct UpstreamCodeActionCaps {
     pub(crate) disabled_support: bool,
     pub(crate) is_preferred_support: bool,
+    /// LSP 3.16 `dataSupport`: the client round-trips `data` between
+    /// `textDocument/codeAction` and `codeAction/resolve`.
+    pub(crate) data_support: bool,
+    /// LSP 3.16 `resolveSupport`: the client can issue `codeAction/resolve`.
+    pub(crate) resolve_support: bool,
+}
+
+impl UpstreamCodeActionCaps {
+    /// Whether a lazy (data-only) action can be handed to the client as-is
+    /// with a routing envelope: needs BOTH `dataSupport` (the client preserves
+    /// our envelope) and `resolveSupport` (the client will actually resolve it).
+    /// Otherwise the bridge must eager-resolve downstream instead.
+    fn can_envelope(&self) -> bool {
+        self.data_support && self.resolve_support
+    }
 }
 
 /// Apply the bridge policy to a downstream server's actions: title suffix,
@@ -243,7 +631,7 @@ pub(crate) fn bridge_code_actions(
 }
 
 const REASON_COMMANDS: &str = "kakehashi does not bridge command execution yet";
-const REASON_RESOLVE: &str = "kakehashi does not bridge codeAction/resolve yet";
+const REASON_RESOLVE: &str = "this action could not be resolved to an applicable edit";
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
 
 fn bridge_code_action(
@@ -309,6 +697,12 @@ fn bridge_code_action(
         return disable_action(action, REASON_COMMANDS, server_name, upstream_caps);
     }
 
+    // An action carrying `data` that the client can resolve is kept lazy and
+    // wrapped in the routing envelope (virt layer only). This covers BOTH the
+    // pure-lazy (no edit) and edit+data shapes: the envelope preserves `data`
+    // so a later `codeAction/resolve` reaches the origin server.
+    let envelope = virt.filter(|_| upstream_caps.can_envelope() && action.data.is_some());
+
     match &mut action.edit {
         Some(edit) => {
             if let Some(virt) = virt
@@ -323,10 +717,16 @@ fn bridge_code_action(
             }
         }
         None => {
-            // No edit, no command: a lazy action that needs codeAction/resolve
-            // (its payload hides behind `data`). We don't advertise resolve
-            // yet, so it can never be completed.
+            // No edit, no command: a lazy action whose payload hides behind
+            // `data`. Envelope it if the client can resolve it (above);
+            // otherwise it can never be completed — disable/drop it (an
+            // eager-resolve pass already ran for non-envelope clients).
             if action.data.is_some() {
+                if let Some(virt) = envelope {
+                    envelope_action_data(&mut action, &virt.envelope_ctx());
+                    action.title = suffix_title(action.title, server_name);
+                    return Some(CodeActionOrCommand::CodeAction(action));
+                }
                 return disable_action(action, REASON_RESOLVE, server_name, upstream_caps);
             }
             // No edit, no command, no data, not server-disabled: selecting it
@@ -335,10 +735,13 @@ fn bridge_code_action(
         }
     }
 
-    // The bridge can't answer codeAction/resolve yet, and untranslated
-    // `data` can embed virtual URIs/coordinates — strip it on the kept path
-    // too (PR 4's envelope replaces this).
-    action.data = None;
+    // Kept edit-carrying action. Envelope its `data` for resolve routing when
+    // the client can use it; otherwise strip it — untranslated `data` can
+    // embed virtual URIs/coordinates and the client cannot resolve it anyway.
+    match envelope {
+        Some(virt) => envelope_action_data(&mut action, &virt.envelope_ctx()),
+        None => action.data = None,
+    }
     action.title = suffix_title(action.title, server_name);
     Some(CodeActionOrCommand::CodeAction(action))
 }
@@ -623,27 +1026,50 @@ mod tests {
     // Response transform
     // ==========================================================================
 
+    /// Caps WITHOUT data/resolve support: lazy actions are disabled and kept
+    /// actions have their `data` stripped (no routing envelope).
     fn caps(disabled_support: bool) -> UpstreamCodeActionCaps {
         UpstreamCodeActionCaps {
             disabled_support,
             is_preferred_support: true,
+            data_support: false,
+            resolve_support: false,
         }
     }
 
+    /// Caps WITH data + resolve support: actions carrying `data` are kept and
+    /// wrapped in the routing envelope.
+    fn caps_resolve() -> UpstreamCodeActionCaps {
+        UpstreamCodeActionCaps {
+            disabled_support: true,
+            is_preferred_support: true,
+            data_support: true,
+            resolve_support: true,
+        }
+    }
+
+    /// The full sync response transform (parse + bridge policy), matching the
+    /// production virt-layer path minus the async eager-resolve step.
     fn transform(
         result: serde_json::Value,
         upstream_caps: UpstreamCodeActionCaps,
     ) -> Option<CodeActionResponse> {
-        let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
-        transform_code_action_response_to_host(
-            json!({"jsonrpc": "2.0", "id": 42, "result": result}),
-            &virtual_uri,
-            &host_uri,
-            &RegionOffset::new(10, 0),
-            "ruff",
-            upstream_caps,
-        )
+        let virtual_uri = make_virtual_uri_string();
+        let offset = RegionOffset::new(10, 0);
+        let actions = parse_code_action_response_raw(json!({
+            "jsonrpc": "2.0", "id": 42, "result": result
+        }))?;
+        let virt = VirtLayerContext {
+            request_virtual_uri: &virtual_uri,
+            host_uri: &host_uri,
+            offset: &offset,
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            injection_language: "lua",
+            host_uri_string: "file:///test.md",
+            server_name: "ruff",
+        };
+        Some(bridge_code_actions(actions, "ruff", upstream_caps, Some(&virt)))
     }
 
     fn edit_carrying_action(title: &str) -> serde_json::Value {
@@ -809,6 +1235,8 @@ mod tests {
         let no_pref = UpstreamCodeActionCaps {
             disabled_support: true,
             is_preferred_support: false,
+            data_support: false,
+            resolve_support: false,
         };
         let actions = transform(json!([action.clone()]), no_pref).unwrap();
         let CodeActionOrCommand::CodeAction(bridged) = &actions[0] else {
@@ -979,5 +1407,219 @@ mod tests {
             placeholder.disabled.as_ref().unwrap().reason,
             REASON_COMMANDS
         );
+    }
+
+    // ==========================================================================
+    // PR 4: envelope + codeAction/resolve
+    // ==========================================================================
+
+    #[test]
+    fn lazy_action_is_enveloped_for_resolve_capable_client() {
+        // With data+resolve support, a lazy (data-only) action is kept and its
+        // `data` wrapped in the routing envelope instead of being disabled.
+        let actions = transform(
+            json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
+            caps_resolve(),
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert!(action.disabled.is_none(), "lazy action must be kept");
+        assert_eq!(action.title, "Lazy fix — ruff", "suffix still applies");
+        let envelope = extract_code_action_envelope(action).expect("envelope present");
+        assert_eq!(envelope.origin, "ruff");
+        assert_eq!(envelope.region_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(envelope.injection_language, "lua");
+        assert_eq!(
+            envelope.original_title, "Lazy fix",
+            "the UNSUFFIXED title is stored for resolve-time restore"
+        );
+        assert_eq!(envelope.inner, Some(json!({ "id": 7 })));
+        assert_eq!(envelope.offset.line, 10);
+    }
+
+    #[test]
+    fn edit_carrying_action_with_data_is_enveloped_not_stripped() {
+        // An edit+data action keeps BOTH: the edit is host-translated and the
+        // data is preserved in the envelope (a later resolve may still fire).
+        let mut action = edit_carrying_action("Fix");
+        action["data"] = json!({ "server": "state" });
+        let actions = transform(json!([action]), caps_resolve()).unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        assert_eq!(
+            changes.get(&make_host_uri()).unwrap()[0].range.start.line,
+            10,
+            "edit still host-translated"
+        );
+        let envelope = extract_code_action_envelope(action).expect("envelope present");
+        assert_eq!(envelope.inner, Some(json!({ "server": "state" })));
+    }
+
+    #[test]
+    fn dataless_action_is_not_enveloped() {
+        // An edit-only action has nothing to resolve; no envelope is attached.
+        let actions =
+            transform(json!([edit_carrying_action("Fix")]), caps_resolve()).unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert!(
+            action.data.is_none(),
+            "an action with no data needs no routing envelope"
+        );
+    }
+
+    // -- envelope round-trip -------------------------------------------------
+
+    fn envelope_ctx_for_test<'a>(offset: &'a RegionOffset) -> CodeActionEnvelopeContext<'a> {
+        CodeActionEnvelopeContext {
+            server_name: "ruff",
+            host_uri: "file:///test.md",
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            injection_language: "lua",
+            offset,
+        }
+    }
+
+    #[test]
+    fn strip_restores_data_and_captures_original_title() {
+        let offset = RegionOffset::new(3, 0);
+        let mut action = CodeAction {
+            title: "Organize imports".to_string(),
+            data: Some(json!({ "kind": "organize" })),
+            ..CodeAction::default()
+        };
+        envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
+        // Suffix happens after enveloping in production; simulate it.
+        action.title = suffix_title(action.title, "ruff");
+
+        let envelope = strip_code_action_envelope(&mut action).expect("envelope present");
+        assert_eq!(
+            action.data,
+            Some(json!({ "kind": "organize" })),
+            "strip restores the downstream's original data"
+        );
+        assert_eq!(
+            envelope.original_title, "Organize imports",
+            "the pre-suffix title is preserved for downstream title matching"
+        );
+        // strip moves `inner` back into `action.data` (asserted above), so the
+        // returned envelope's own `inner` is drained — matching the code_lens
+        // strip contract.
+        assert_eq!(envelope.inner, None);
+    }
+
+    #[test]
+    fn re_envelope_round_trips_after_strip() {
+        let offset = RegionOffset::new(3, 0);
+        let mut action = CodeAction {
+            title: "Fix".to_string(),
+            data: Some(json!({ "id": 1 })),
+            ..CodeAction::default()
+        };
+        envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
+        let envelope = strip_code_action_envelope(&mut action).expect("envelope");
+        re_envelope_action(&mut action, &envelope);
+        let extracted = extract_code_action_envelope(&action).expect("re-enveloped");
+        assert_eq!(extracted.origin, "ruff");
+        assert_eq!(extracted.inner, Some(json!({ "id": 1 })));
+        assert_eq!(extracted.original_title, "Fix");
+    }
+
+    #[test]
+    fn extract_returns_none_for_non_envelope_data() {
+        let action = CodeAction {
+            title: "x".to_string(),
+            data: Some(json!({ "custom": true })),
+            ..CodeAction::default()
+        };
+        assert!(extract_code_action_envelope(&action).is_none());
+    }
+
+    // -- resolve response parsing --------------------------------------------
+
+    #[test]
+    fn parse_resolve_response_happy_path() {
+        let response = json!({
+            "jsonrpc": "2.0", "id": 7,
+            "result": { "title": "Fix", "edit": { "changes": {} } }
+        });
+        let action = parse_code_action_resolve_response(response).expect("parsed");
+        assert_eq!(action.title, "Fix");
+        assert!(action.edit.is_some());
+    }
+
+    #[test]
+    fn parse_resolve_response_none_for_invalid() {
+        for response in [
+            json!({ "jsonrpc": "2.0", "id": 7, "result": null }),
+            json!({ "jsonrpc": "2.0", "id": 7 }),
+            json!({ "jsonrpc": "2.0", "id": 7, "error": { "code": -1, "message": "x" } }),
+        ] {
+            assert!(parse_code_action_resolve_response(response).is_none());
+        }
+    }
+
+    #[test]
+    fn outgoing_resolve_translates_diagnostics_to_virtual() {
+        // Before forwarding a resolve, host-space diagnostic ranges are pulled
+        // back to virtual coordinates so the downstream matches its own.
+        let offset = RegionOffset::new(10, 0);
+        let mut action = CodeAction {
+            title: "Fix".to_string(),
+            diagnostics: Some(vec![tower_lsp_server::ls_types::Diagnostic {
+                range: range(12, 12),
+                ..Default::default()
+            }]),
+            ..CodeAction::default()
+        };
+        translate_action_ranges_host_to_virtual(&mut action, &offset);
+        assert_eq!(
+            action.diagnostics.unwrap()[0].range.start.line,
+            2,
+            "12 - region offset 10"
+        );
+    }
+
+    // -- dispatch fail-soft ---------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_returns_non_envelope_action_unchanged() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let settings = WorkspaceSettings::default();
+        let action = CodeAction {
+            title: "x".to_string(),
+            data: Some(json!({ "custom": true })),
+            ..CodeAction::default()
+        };
+        let result = pool
+            .dispatch_code_action_resolve(action.clone(), &settings, None)
+            .await;
+        assert_eq!(result.data, Some(json!({ "custom": true })));
+    }
+
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_server_not_configured() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let settings = WorkspaceSettings::default();
+        let offset = RegionOffset::new(3, 0);
+        let mut action = CodeAction {
+            title: "Fix".to_string(),
+            data: Some(json!({ "id": 1 })),
+            ..CodeAction::default()
+        };
+        envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
+
+        let result = pool
+            .dispatch_code_action_resolve(action, &settings, None)
+            .await;
+        let envelope = extract_code_action_envelope(&result).expect("envelope restored");
+        assert_eq!(envelope.origin, "ruff");
+        assert_eq!(envelope.inner, Some(json!({ "id": 1 })));
+        assert!(result.edit.is_none(), "action stays unresolved");
     }
 }

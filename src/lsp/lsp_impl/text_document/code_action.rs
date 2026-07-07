@@ -9,15 +9,19 @@
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CodeActionContext, CodeActionParams, CodeActionResponse, MessageType, NumberOrString, Range,
-    Uri,
+    CodeAction, CodeActionContext, CodeActionParams, CodeActionResponse, MessageType,
+    NumberOrString, Range, Uri,
 };
+use ulid::Ulid;
+use url::Url;
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::{FanInResult, dispatch_host_preferred, dispatch_preferred};
 use crate::lsp::bridge::{
-    HostDocument, UpstreamCodeActionCaps, bridge_code_actions, parse_code_actions_leniently,
+    CodeActionEnvelope, HostDocument, UpstreamCodeActionCaps, bridge_code_actions,
+    extract_code_action_envelope, parse_code_actions_leniently,
 };
+use crate::text::PositionMapper;
 
 const METHOD: &str = "textDocument/codeAction";
 
@@ -66,7 +70,69 @@ impl Kakehashi {
             is_preferred_support: code_action
                 .and_then(|ca| ca.is_preferred_support)
                 .unwrap_or(false),
+            data_support: code_action.and_then(|ca| ca.data_support).unwrap_or(false),
+            // resolveSupport is present iff the client can issue
+            // codeAction/resolve; its `properties` list is advisory only —
+            // we always eager-resolve the full action, never a subset.
+            resolve_support: code_action
+                .map(|ca| ca.resolve_support.is_some())
+                .unwrap_or(false),
         }
+    }
+
+    /// `codeAction/resolve`: route the action back to the downstream server
+    /// that produced it, identified by the envelope in `action.data` (#568
+    /// PR 4). Fails soft at every step: an action without an envelope
+    /// (host-layer or foreign) passes through unchanged, and a stale region
+    /// returns the action unresolved with its envelope intact — clients
+    /// re-request actions on change, so the staleness window is short.
+    pub(crate) async fn code_action_resolve_impl(&self, action: CodeAction) -> Result<CodeAction> {
+        let Some(envelope) = extract_code_action_envelope(&action) else {
+            return Ok(action);
+        };
+
+        // Fail-soft staleness gate: resolving against a moved or invalidated
+        // region would translate a resolved edit with a stale offset and bind
+        // it to content the user has since edited.
+        if !self.code_action_region_is_fresh(&envelope) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: region {} is stale; returning action unresolved",
+                envelope.region_id
+            );
+            return Ok(action);
+        }
+
+        let settings = self.settings_manager.load_settings();
+        let upstream_id = crate::lsp::current_upstream_id();
+        let pool = self.bridge.pool_arc();
+        Ok(pool
+            .dispatch_code_action_resolve(action, &settings, upstream_id)
+            .await)
+    }
+
+    /// Whether the envelope's injection region still exists at the position it
+    /// had when the action was minted (mirrors `code_lens_region_is_fresh`).
+    fn code_action_region_is_fresh(&self, envelope: &CodeActionEnvelope) -> bool {
+        let Ok(uri) = Url::parse(&envelope.host_uri) else {
+            return false;
+        };
+        let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
+            return false;
+        };
+        let Some((start_byte, _end, _kind)) =
+            self.bridge.node_tracker().lookup_position(&uri, &ulid)
+        else {
+            return false;
+        };
+        let Some(doc) = self.documents.get(&uri) else {
+            return false;
+        };
+        let mapper = PositionMapper::new(doc.text());
+        let Some(position) = mapper.byte_to_position(start_byte) else {
+            return false;
+        };
+        position.line == envelope.offset.line && position.character == envelope.offset.column
     }
 
     /// Virt layer: bridge the injection region under the requested range.
