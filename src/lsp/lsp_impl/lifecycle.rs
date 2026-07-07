@@ -1131,12 +1131,13 @@ fn spawn_upstream_request(
                         )
                         .await
                         .and_then(|v| serde_json::from_value::<ApplyWorkspaceEditResponse>(v).ok())
-                        // Editor error/cancel/unparseable response: the protocol
-                        // default — the edit was not applied.
+                        // Editor error/cancel, or a response that didn't parse
+                        // as an ApplyWorkspaceEditResponse: the protocol default
+                        // — the edit was not applied.
                         .unwrap_or(ApplyWorkspaceEditResponse {
                             applied: false,
                             failure_reason: Some(
-                                "kakehashi: the editor returned no workspace/applyEdit response"
+                                "kakehashi: no valid workspace/applyEdit response from the editor"
                                     .to_string(),
                             ),
                             failed_change: None,

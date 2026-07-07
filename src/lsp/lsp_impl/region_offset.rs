@@ -1,13 +1,16 @@
 //! Rebuild an injection region's current host offset from the live parse.
 //!
 //! Shared by translators of inbound (downstream → editor) payloads that must
-//! map virtual-document coordinates back to the host document — today
-//! `window/showDocument` ([`ShowDocumentTranslator`]). The offset is rebuilt
-//! exactly as the goto request path does (`region_id → node byte range →
-//! resolve injection → RegionOffset`), so inbound translation can't disagree
-//! with goto on the same region.
+//! map virtual-document coordinates back to the host document —
+//! `window/showDocument` ([`ShowDocumentTranslator`]) and `workspace/applyEdit`
+//! ([`ApplyEditTranslator`]). The offset is rebuilt exactly as the goto request
+//! path does (`region_id → node byte range → resolve injection → RegionOffset`),
+//! so inbound translation can't disagree with goto on the same region. The
+//! region's content-precise host end is returned alongside so an edit translator
+//! can reject a range that escapes the region.
 //!
 //! [`ShowDocumentTranslator`]: super::show_document_translation::ShowDocumentTranslator
+//! [`ApplyEditTranslator`]: super::apply_edit_translation::ApplyEditTranslator
 
 use std::sync::Arc;
 
