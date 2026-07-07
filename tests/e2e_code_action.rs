@@ -353,3 +353,37 @@ fn lazy_action_is_eager_resolved_without_resolve_support() {
 
     shutdown(&mut client);
 }
+
+#[test]
+fn lazy_action_resolving_to_command_fails_soft() {
+    // A lazy action whose resolve materializes a COMMAND (not an edit) must
+    // not hand that command to the editor — command execution is unbridged.
+    // The bridge fails soft: the resolved action comes back unresolved, with
+    // no command and its routing envelope intact.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-cmd", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+    assert_eq!(lazy["data"]["kakehashi"]["origin"], "mock-codeaction");
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    assert!(
+        resolved["command"].is_null(),
+        "an unbridged command must never reach the editor, got: {resolved:?}"
+    );
+    assert!(
+        resolved["edit"].is_null(),
+        "the action stays unresolved (no edit), got: {resolved:?}"
+    );
+    assert_eq!(
+        resolved["data"]["kakehashi"]["origin"], "mock-codeaction",
+        "the routing envelope is preserved on the fail-soft path"
+    );
+
+    shutdown(&mut client);
+}

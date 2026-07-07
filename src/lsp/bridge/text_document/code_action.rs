@@ -367,6 +367,16 @@ impl LanguageServerPool {
             return action;
         };
 
+        // A resolve that materializes a `command` (or edit+command) can't be
+        // honored — command execution is unbridged, and applying only the edit
+        // half is worse than none (the initial codeAction path disables such
+        // actions). Fail soft: return the original action unresolved rather
+        // than hand the editor an executable downstream command.
+        if resolved.command.is_some() {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+
         // Translate the resolved edit host-ward; a cross-region edit that
         // cannot be represented in the host document fails soft (return the
         // original action unresolved rather than an unappliable edit).
