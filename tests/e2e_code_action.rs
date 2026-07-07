@@ -411,6 +411,43 @@ fn multistep_resolve_forwards_the_server_changed_title() {
 }
 
 #[test]
+fn lazy_action_resolving_to_untranslatable_edit_is_disabled() {
+    // A lazy action that resolves to an edit the bridge cannot represent in the
+    // host document (here a virtual-URI file op) is a PERMANENT failure —
+    // re-requesting yields the same result. For a disabledSupport client the
+    // bridge must return it `disabled` with a reason, NOT an enabled action
+    // that applies nothing (checklist item 5; mirrors the initial path).
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-fileop", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    // The discriminating assertion: an enabled no-op and a disabled action are
+    // indistinguishable to a test that only checks "no edit", so assert on
+    // `disabled` + reason.
+    assert_eq!(
+        resolved["disabled"]["reason"], "the edit cannot be represented in the host document",
+        "an untranslatable resolved edit must surface disabled, got: {resolved:?}"
+    );
+    assert!(
+        resolved["edit"].is_null(),
+        "the unusable edit must be stripped, got: {resolved:?}"
+    );
+    assert!(
+        resolved["data"].is_null(),
+        "a disabled action carries no routing envelope, got: {resolved:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn lazy_action_is_eager_resolved_without_resolve_support() {
     // A client WITHOUT resolveSupport/dataSupport cannot resolve a lazy
     // action, so the bridge eager-resolves it downstream: the codeAction
