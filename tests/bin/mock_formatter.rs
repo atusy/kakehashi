@@ -183,7 +183,8 @@ fn main() {
                     | "code-action-lazy-cmd"
                     | "code-action-lazy-retitle"
                     | "code-action-lazy-multistep"
-                    | "code-action-lazy-fileop" => {
+                    | "code-action-lazy-fileop"
+                    | "code-action-lazy-oob" => {
                         json!({
                             "codeActionProvider": { "resolveProvider": true },
                             "textDocumentSync": 1
@@ -501,6 +502,7 @@ fn main() {
                             || mode == "code-action-lazy-retitle"
                             || mode == "code-action-lazy-multistep"
                             || mode == "code-action-lazy-fileop"
+                            || mode == "code-action-lazy-oob"
                         {
                             // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
@@ -603,6 +605,34 @@ fn main() {
                                 "documentChanges": [
                                     { "kind": "create", "uri": target_uri }
                                 ]
+                            }
+                        }),
+                    );
+                    continue;
+                }
+                if mode == "code-action-lazy-oob" {
+                    // Resolve to an edit whose range runs PAST the injected
+                    // region (virtual line 5, while the lua fence has a single
+                    // content line). Translating it by the region offset lands
+                    // in host text after the fence — buffer corruption — so the
+                    // bridge must reject it (disable), not forward it.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": title,
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "edit": {
+                                "changes": {
+                                    target_uri: [{
+                                        "range": {
+                                            "start": { "line": 5, "character": 0 },
+                                            "end": { "line": 5, "character": 3 }
+                                        },
+                                        "newText": "oops"
+                                    }]
+                                }
                             }
                         }),
                     );

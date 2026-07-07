@@ -35,6 +35,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region,
     response_has_jsonrpc_error, transform_workspace_edit_to_host, translate_host_range_to_virtual,
     translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 
@@ -164,18 +165,23 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
 /// must discard the action) when the edit can't be faithfully represented in
 /// the host document: it touches another injection region (the shared
 /// transform would silently filter those edits and partially apply the rest),
-/// contains a virtual-URI file op (transform returns false), or ends up empty.
-/// Used by BOTH the initial-response policy and the codeAction/resolve path so
-/// cross-region edits are rejected uniformly, never partially applied.
+/// contains a virtual-URI file op (transform returns false), ends up empty, or
+/// a translated range escapes the region end (`region_end`) — a stale/malformed
+/// downstream edit whose virtual range runs past the region would otherwise land
+/// in unrelated host text after the fence. Used by BOTH the initial-response
+/// policy and the codeAction/resolve path so these are rejected uniformly,
+/// never partially applied.
 fn translate_edit_host_ward_strict(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
+    region_end: Position,
 ) -> bool {
     !workspace_edit_touches_foreign_region(edit, request_virtual_uri)
         && transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset)
         && !workspace_edit_is_empty(edit)
+        && workspace_edit_within_region(edit, host_uri, region_end)
 }
 
 /// Whether a `WorkspaceEdit` touches a virtual document OTHER than
@@ -315,6 +321,7 @@ impl LanguageServerPool {
             request_virtual_uri: &virtual_uri_string,
             host_uri: &host_uri_lsp,
             offset: &offset,
+            region_end: region_host_end(virtual_content, &offset),
             region_id,
             injection_language,
             host_uri_string: host_uri.as_str(),
@@ -399,6 +406,7 @@ impl LanguageServerPool {
         settings: &WorkspaceSettings,
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
+        region_end: Position,
     ) -> CodeAction {
         let Some(envelope) = strip_code_action_envelope(&mut action) else {
             return action;
@@ -417,8 +425,15 @@ impl LanguageServerPool {
             return action;
         };
 
-        self.send_code_action_resolve_request(&config, action, envelope, upstream_caps, upstream_id)
-            .await
+        self.send_code_action_resolve_request(
+            &config,
+            action,
+            envelope,
+            upstream_caps,
+            upstream_id,
+            region_end,
+        )
+        .await
     }
 
     /// Reconnect to the origin `(server, root)`, restore the original title,
@@ -432,6 +447,7 @@ impl LanguageServerPool {
         mut envelope: CodeActionEnvelope,
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
+        region_end: Position,
     ) -> CodeAction {
         let server_name = &envelope.origin;
         let host_url = Url::parse(&envelope.host_uri).ok();
@@ -542,7 +558,13 @@ impl LanguageServerPool {
                     &envelope.region_id,
                 )
                 .to_uri_string();
-                !translate_edit_host_ward_strict(edit, &virtual_uri, host_uri_lsp, &offset)
+                !translate_edit_host_ward_strict(
+                    edit,
+                    &virtual_uri,
+                    host_uri_lsp,
+                    &offset,
+                    region_end,
+                )
             }
             // The server resolved an edit, but the host URI couldn't be rebuilt
             // to translate it (a `url`/`Uri` parser divergence). Shipping the
@@ -772,6 +794,10 @@ pub(crate) struct VirtLayerContext<'a> {
     request_virtual_uri: &'a str,
     host_uri: &'a Uri,
     offset: &'a RegionOffset,
+    /// The region's exclusive host-document end: bounds an edit-carrying
+    /// action's translated ranges so a range past the region can't land in
+    /// unrelated host text after the fence.
+    region_end: Position,
     /// Origin routing metadata for the `codeAction/resolve` envelope; carried
     /// alongside the coordinate context so a kept action that still needs
     /// resolve can be enveloped in one pass.
@@ -924,6 +950,7 @@ fn bridge_code_action(
                     virt.request_virtual_uri,
                     virt.host_uri,
                     virt.offset,
+                    virt.region_end,
                 )
             {
                 return disable_action(action, REASON_CROSS_REGION, server_name, upstream_caps);
@@ -1394,6 +1421,13 @@ mod tests {
             request_virtual_uri: &virtual_uri,
             host_uri: &host_uri,
             offset: &offset,
+            // Generous end: these tests exercise the envelope/title/cross-region
+            // policy, not the region-bounds guard (which has its own test), so
+            // the region-end must not reject their in-region edits.
+            region_end: Position {
+                line: u32::MAX,
+                character: u32::MAX,
+            },
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             injection_language: "lua",
             host_uri_string: "file:///test.md",
@@ -2097,7 +2131,13 @@ mod tests {
             ..CodeAction::default()
         };
         let result = pool
-            .dispatch_code_action_resolve(action.clone(), &settings, caps_resolve(), None)
+            .dispatch_code_action_resolve(
+                action.clone(),
+                &settings,
+                caps_resolve(),
+                None,
+                Position::default(),
+            )
             .await;
         assert_eq!(result.data, Some(json!({ "custom": true })));
     }
@@ -2115,7 +2155,13 @@ mod tests {
         envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
 
         let result = pool
-            .dispatch_code_action_resolve(action, &settings, caps_resolve(), None)
+            .dispatch_code_action_resolve(
+                action,
+                &settings,
+                caps_resolve(),
+                None,
+                Position::default(),
+            )
             .await;
         let envelope = extract_code_action_envelope(&result).expect("envelope restored");
         assert_eq!(envelope.origin, "ruff");

@@ -12,7 +12,7 @@
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionParams, CodeActionResponse, MessageType,
-    NumberOrString, Range, Uri,
+    NumberOrString, Position, Range, Uri,
 };
 use ulid::Ulid;
 use url::Url;
@@ -97,56 +97,62 @@ impl Kakehashi {
 
         // Fail-soft staleness gate: resolving against a moved or invalidated
         // region would translate a resolved edit with a stale offset and bind
-        // it to content the user has since edited.
-        if !self.code_action_region_is_fresh(&envelope) {
+        // it to content the user has since edited. The same live lookup yields
+        // the region's current host-document end, which bounds the resolved
+        // edit so a stale/malformed one can't escape the region into unrelated
+        // host text (see `translate_edit_host_ward_strict`).
+        let Some(region_end) = self.code_action_region_end_if_fresh(&envelope) else {
             log::debug!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: region {} is stale; returning action unresolved",
                 envelope.region_id
             );
             return Ok(action);
-        }
+        };
 
         let settings = self.settings_manager.load_settings();
         let upstream_caps = self.upstream_code_action_caps();
         let upstream_id = crate::lsp::current_upstream_id();
         let pool = self.bridge.pool_arc();
         Ok(pool
-            .dispatch_code_action_resolve(action, &settings, upstream_caps, upstream_id)
+            .dispatch_code_action_resolve(action, &settings, upstream_caps, upstream_id, region_end)
             .await)
     }
 
-    /// Whether the envelope's injection region still exists at the position it
-    /// had when the action was minted (mirrors `code_lens_region_is_fresh`).
+    /// The region's current host-document END position if its start still sits
+    /// where the action was minted (freshness), else `None`. Combines the
+    /// staleness gate (mirrors `code_lens_region_is_fresh`) with the region-end
+    /// lookup the resolve path needs to bound the resolved edit — both read the
+    /// same live `lookup_position`, so they can't disagree.
+    ///
+    /// The end is the tracker's node end (byte-mapped to a host `Position`),
+    /// which for an inline injection may slightly over-approximate the content
+    /// end. That's a safe over-approximation for a bounds guard: it still
+    /// rejects an edit that runs past the region into unrelated host text; it
+    /// only permits a tiny over-reach within an inline node. (applyEdit uses the
+    /// content-precise `resolved.region.byte_range.end`; the two need not be
+    /// bit-identical.)
     ///
     /// Known limitation (shared with `code_lens_region_is_fresh`): for
     /// injections whose queries apply `#offset!` (today only YAML/TOML
     /// frontmatter in the bundled markdown queries), the envelope offset is
     /// `#offset!`-adjusted while the tracker stores the raw content-node
-    /// position, so this comparison never matches and resolve always fails soft
-    /// for those regions. That errs in the safe direction (the action stays
-    /// unresolved rather than translating a stale edit) and frontmatter code
-    /// actions have no known real-world producer; revisit if one appears.
-    fn code_action_region_is_fresh(&self, envelope: &CodeActionEnvelope) -> bool {
-        let Ok(uri) = Url::parse(&envelope.host_uri) else {
-            return false;
-        };
-        let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
-            return false;
-        };
-        let Some((start_byte, _end, _kind)) =
-            self.bridge.node_tracker().lookup_position(&uri, &ulid)
-        else {
-            return false;
-        };
-        let Some(doc) = self.documents.get(&uri) else {
-            return false;
-        };
+    /// position, so the freshness comparison never matches and resolve always
+    /// fails soft for those regions. That errs in the safe direction (the action
+    /// stays unresolved) and frontmatter code actions have no known real-world
+    /// producer; revisit if one appears.
+    fn code_action_region_end_if_fresh(&self, envelope: &CodeActionEnvelope) -> Option<Position> {
+        let uri = Url::parse(&envelope.host_uri).ok()?;
+        let ulid = envelope.region_id.parse::<Ulid>().ok()?;
+        let (start_byte, end_byte, _kind) =
+            self.bridge.node_tracker().lookup_position(&uri, &ulid)?;
+        let doc = self.documents.get(&uri)?;
         let mapper = PositionMapper::new(doc.text());
-        let Some(position) = mapper.byte_to_position(start_byte) else {
-            return false;
-        };
-        position.line == envelope.offset.line && position.character == envelope.offset.column
+        let start = mapper.byte_to_position(start_byte)?;
+        if start.line != envelope.offset.line || start.character != envelope.offset.column {
+            return None;
+        }
+        mapper.byte_to_position(end_byte)
     }
 
     /// Virt layer: bridge the injection region under the requested range.

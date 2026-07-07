@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use tower_lsp_server::ls_types::{
-    DocumentChangeOperation, DocumentChanges, OneOf, ResourceOp, TextDocumentEdit, TextEdit, Uri,
-    WorkspaceEdit,
+    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, ResourceOp,
+    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 
 use super::translation::{RegionOffset, translate_virtual_range_to_host};
@@ -175,6 +175,70 @@ fn transform_text_document_edit(
 
     // Case 3: Cross-region → filter out
     false
+}
+
+/// Whether every text edit targeting `host_uri` in a HOST-coordinate
+/// `WorkspaceEdit` ends at or before `region_end` — i.e. stays inside the
+/// injection region it was translated from.
+///
+/// Call this AFTER `transform_workspace_edit_to_host`. Virtual→host translation
+/// is purely additive (it only ADDS the region's start line and per-line column
+/// offsets — see `translate_virtual_range_to_host`), so a translated position
+/// can never fall below the region start; the sole escape is a `range.end` PAST
+/// `region_end`. A stale or malformed downstream edit whose virtual range
+/// extends beyond the (possibly shrunk) region content would otherwise
+/// translate to a plausible host range AFTER the fence — into unrelated host
+/// text or another injection. Callers must REJECT such an edit, never clamp:
+/// applyEdit answers `applied: false`, codeAction/resolve disables the action.
+/// Only `host_uri`'s edits are region-bounded; real-file edits (other URIs)
+/// keep their own extents and are not checked.
+pub(crate) fn workspace_edit_within_region(
+    edit: &WorkspaceEdit,
+    host_uri: &Uri,
+    region_end: Position,
+) -> bool {
+    let within = |end: Position| !position_after(end, region_end);
+    if let Some(changes) = &edit.changes
+        && let Some(edits) = changes.get(host_uri)
+        && !edits.iter().all(|e| within(e.range.end))
+    {
+        return false;
+    }
+    let doc_edits_within = |edits: &[OneOf<TextEdit, AnnotatedTextEdit>]| {
+        edits.iter().all(|one_of| {
+            let range = match one_of {
+                OneOf::Left(text_edit) => text_edit.range,
+                OneOf::Right(annotated) => annotated.text_edit.range,
+            };
+            within(range.end)
+        })
+    };
+    match &edit.document_changes {
+        None => {}
+        Some(DocumentChanges::Edits(edits)) => {
+            for e in edits {
+                if e.text_document.uri == *host_uri && !doc_edits_within(&e.edits) {
+                    return false;
+                }
+            }
+        }
+        Some(DocumentChanges::Operations(ops)) => {
+            for op in ops {
+                if let DocumentChangeOperation::Edit(e) = op
+                    && e.text_document.uri == *host_uri
+                    && !doc_edits_within(&e.edits)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `a` is strictly after `b` in `(line, character)` order.
+fn position_after(a: Position, b: Position) -> bool {
+    (a.line, a.character) > (b.line, b.character)
 }
 
 #[cfg(test)]
@@ -413,5 +477,78 @@ mod tests {
             }
             DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
         }
+    }
+
+    #[test]
+    fn within_region_bounds_the_host_uri_edits_only() {
+        let host_uri = make_host_uri();
+        // The region ends at host line 3, character 11 (exclusive end mapped to
+        // host coords). An edit ending at or before that is in-region.
+        let region_end = Position {
+            line: 3,
+            character: 11,
+        };
+
+        let in_bounds = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 5}}, "newText": "x" }
+            ] }
+        }));
+        assert!(workspace_edit_within_region(
+            &in_bounds, &host_uri, region_end
+        ));
+
+        // An edit whose end line runs PAST the region end — the corruption
+        // vector: a stale/oversized virtual range translated into host text
+        // after the fence. Must be rejected.
+        let past_end_line = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 8, "character": 0}}, "newText": "x" }
+            ] }
+        }));
+        assert!(!workspace_edit_within_region(
+            &past_end_line,
+            &host_uri,
+            region_end
+        ));
+
+        // Past the end COLUMN on the end line is also rejected (inline injection
+        // over-reach within the last line).
+        let past_end_col = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 20}}, "newText": "x" }
+            ] }
+        }));
+        assert!(!workspace_edit_within_region(
+            &past_end_col,
+            &host_uri,
+            region_end
+        ));
+
+        // A REAL file (different URI) is not region-bounded — its own extent
+        // applies, so an out-of-region-looking range there is fine.
+        let real_file = parse_workspace_edit(json!({
+            "changes": { "file:///other.lua": [
+                { "range": {"start": {"line": 99, "character": 0}, "end": {"line": 99, "character": 0}}, "newText": "x" }
+            ] }
+        }));
+        assert!(workspace_edit_within_region(
+            &real_file, &host_uri, region_end
+        ));
+
+        // documentChanges (Edits) targeting the host URI is bounded too.
+        let doc_changes_oob = parse_workspace_edit(json!({
+            "documentChanges": [{
+                "textDocument": { "uri": host_uri.as_str(), "version": null },
+                "edits": [
+                    { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 9, "character": 0}}, "newText": "x" }
+                ]
+            }]
+        }));
+        assert!(!workspace_edit_within_region(
+            &doc_changes_oob,
+            &host_uri,
+            region_end
+        ));
     }
 }
