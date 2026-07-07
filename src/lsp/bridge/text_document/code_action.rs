@@ -343,24 +343,47 @@ impl LanguageServerPool {
         if !handle.has_capability("codeAction/resolve") {
             return;
         }
-        for item in actions.iter_mut() {
-            let CodeActionOrCommand::CodeAction(action) = item else {
-                continue;
-            };
-            // Lazy = no edit/command, not server-disabled. `data` is NOT
-            // required: this loop already gated on the server advertising
-            // resolve, so a title-only action here is a resolvable lazy action
-            // (LSP 3.18), not a no-op.
-            let is_lazy =
-                action.edit.is_none() && action.command.is_none() && action.disabled.is_none();
-            if !is_lazy {
-                continue;
+        // Collect the lazy actions' indices + clones, resolve them CONCURRENTLY
+        // on the shared connection (its ResponseRouter multiplexes by
+        // request_id), then splice results back by index. Sequential awaits
+        // would block the codeAction response for the SUM of resolve times when
+        // a server returns several lazy actions (organize-imports / batch
+        // quickfix). Lazy = no edit/command, not server-disabled; `data` is NOT
+        // required (already gated on the server advertising resolve, so a
+        // title-only action here is a resolvable lazy action per LSP 3.18).
+        let pending: Vec<(usize, CodeAction)> = actions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| match item {
+                CodeActionOrCommand::CodeAction(action)
+                    if action.edit.is_none()
+                        && action.command.is_none()
+                        && action.disabled.is_none() =>
+                {
+                    Some((idx, action.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let resolved = futures::future::join_all(pending.into_iter().map(|(idx, action)| {
+            let upstream_id = upstream_id.clone();
+            async move {
+                (
+                    idx,
+                    self.send_code_action_resolve_on_handle(handle, action, upstream_id)
+                        .await,
+                )
             }
-            if let Some(resolved) = self
-                .send_code_action_resolve_on_handle(handle, action.clone(), upstream_id.clone())
-                .await
+        }))
+        .await;
+        for (idx, outcome) in resolved {
+            if let Some(materialized) = outcome
+                && let CodeActionOrCommand::CodeAction(slot) = &mut actions[idx]
             {
-                *action = resolved;
+                *slot = materialized;
             }
         }
     }
