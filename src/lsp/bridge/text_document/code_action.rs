@@ -243,6 +243,7 @@ impl LanguageServerPool {
             actions,
             server_name,
             upstream_caps,
+            handle.has_capability("codeAction/resolve"),
             Some(&virt),
         )))
     }
@@ -265,11 +266,12 @@ impl LanguageServerPool {
             let CodeActionOrCommand::CodeAction(action) = item else {
                 continue;
             };
-            // Lazy = only `data`, no edit/command, not server-disabled.
-            let is_lazy = action.edit.is_none()
-                && action.command.is_none()
-                && action.disabled.is_none()
-                && action.data.is_some();
+            // Lazy = no edit/command, not server-disabled. `data` is NOT
+            // required: this loop already gated on the server advertising
+            // resolve, so a title-only action here is a resolvable lazy action
+            // (LSP 3.18), not a no-op.
+            let is_lazy =
+                action.edit.is_none() && action.command.is_none() && action.disabled.is_none();
             if !is_lazy {
                 continue;
             }
@@ -658,15 +660,23 @@ impl UpstreamCodeActionCaps {
 
 /// Apply the bridge policy to a downstream server's actions: title suffix,
 /// command/lazy-action disabling, and (virt layer) coordinate translation.
+///
+/// `server_resolves` is whether the origin server advertises
+/// `codeAction/resolve`: it decides whether a no-edit/no-command action with
+/// no `data` is a resolvable lazy action (LSP 3.18 allows a title-only lazy
+/// action) or a no-op to drop.
 pub(crate) fn bridge_code_actions(
     actions: Vec<CodeActionOrCommand>,
     server_name: &str,
     upstream_caps: UpstreamCodeActionCaps,
+    server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
 ) -> Vec<CodeActionOrCommand> {
     actions
         .into_iter()
-        .filter_map(|item| bridge_code_action(item, server_name, upstream_caps, virt))
+        .filter_map(|item| {
+            bridge_code_action(item, server_name, upstream_caps, server_resolves, virt)
+        })
         .collect()
 }
 
@@ -678,6 +688,7 @@ fn bridge_code_action(
     item: CodeActionOrCommand,
     server_name: &str,
     upstream_caps: UpstreamCodeActionCaps,
+    server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
 ) -> Option<CodeActionOrCommand> {
     let mut action = match item {
@@ -751,12 +762,15 @@ fn bridge_code_action(
             }
         }
         None => {
-            // No edit, no command: a lazy action whose payload hides behind
-            // `data`. Envelope it (virt layer) if the client can resolve the
-            // edit, so a later `codeAction/resolve` routes back to the origin;
-            // otherwise it can never be completed — disable/drop it (an
-            // eager-resolve pass already ran for non-envelope clients).
-            if action.data.is_some() {
+            // No edit, no command: a lazy action to be completed via
+            // `codeAction/resolve`. LSP 3.18 allows `data` to be absent (a
+            // title-only lazy action matched by title), so it is lazy when it
+            // carries `data` OR the origin server advertises resolve.
+            if action.data.is_some() || server_resolves {
+                // Envelope it (virt layer) if the client can resolve the edit,
+                // so a later `codeAction/resolve` routes back to the origin;
+                // otherwise it can never be completed — disable it (an
+                // eager-resolve pass already ran for non-envelope clients).
                 if let Some(virt) = virt.filter(|_| upstream_caps.can_envelope()) {
                     envelope_action_data(&mut action, &virt.envelope_ctx());
                     action.title = suffix_title(action.title, server_name);
@@ -764,8 +778,9 @@ fn bridge_code_action(
                 }
                 return disable_action(action, REASON_RESOLVE, server_name, upstream_caps);
             }
-            // No edit, no command, no data, not server-disabled: selecting it
-            // would do nothing — drop it rather than clutter the menu.
+            // No edit, no command, no data, and the server can't resolve:
+            // selecting it would do nothing — drop it rather than clutter the
+            // menu.
             return None;
         }
     }
@@ -1087,9 +1102,28 @@ mod tests {
 
     /// The full sync response transform (parse + bridge policy), matching the
     /// production virt-layer path minus the async eager-resolve step.
+    /// Assumes the origin server does NOT advertise resolve (title-only lazy
+    /// actions drop); use [`transform_server_resolves`] for the resolve case.
     fn transform(
         result: serde_json::Value,
         upstream_caps: UpstreamCodeActionCaps,
+    ) -> Option<CodeActionResponse> {
+        transform_impl(result, upstream_caps, false)
+    }
+
+    /// Like [`transform`] but with the origin server advertising resolve, so a
+    /// title-only action is a resolvable lazy action rather than a no-op.
+    fn transform_server_resolves(
+        result: serde_json::Value,
+        upstream_caps: UpstreamCodeActionCaps,
+    ) -> Option<CodeActionResponse> {
+        transform_impl(result, upstream_caps, true)
+    }
+
+    fn transform_impl(
+        result: serde_json::Value,
+        upstream_caps: UpstreamCodeActionCaps,
+        server_resolves: bool,
     ) -> Option<CodeActionResponse> {
         let host_uri = make_host_uri();
         let virtual_uri = make_virtual_uri_string();
@@ -1110,6 +1144,7 @@ mod tests {
             actions,
             "ruff",
             upstream_caps,
+            server_resolves,
             Some(&virt),
         ))
     }
@@ -1435,7 +1470,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let bridged = bridge_code_actions(actions, "marksman", caps(true), None);
+        let bridged = bridge_code_actions(actions, "marksman", caps(true), false, None);
         assert_eq!(bridged.len(), 2);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
@@ -1481,6 +1516,35 @@ mod tests {
         );
         assert_eq!(envelope.inner, Some(json!({ "id": 7 })));
         assert_eq!(envelope.offset.line, 10);
+    }
+
+    #[test]
+    fn title_only_action_is_lazy_when_server_resolves() {
+        // LSP 3.18: a lazy action may be title-only (no data) when the origin
+        // server advertises resolve — it must be enveloped, not dropped.
+        let actions = transform_server_resolves(
+            json!([{ "title": "Lazy organize imports" }]),
+            caps_resolve(),
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction, got: {actions:?}");
+        };
+        let envelope = extract_code_action_envelope(action).expect("envelope present");
+        assert_eq!(envelope.origin, "ruff");
+        assert_eq!(
+            envelope.inner, None,
+            "a title-only action has no inner data"
+        );
+        assert_eq!(envelope.original_title, "Lazy organize imports");
+    }
+
+    #[test]
+    fn title_only_action_is_dropped_when_server_cannot_resolve() {
+        // Same shape, but the server does NOT advertise resolve → the action
+        // is a no-op and must be dropped, not enveloped.
+        let actions = transform(json!([{ "title": "Ghost" }]), caps_resolve()).unwrap();
+        assert!(actions.is_empty(), "got: {actions:?}");
     }
 
     #[test]
