@@ -223,7 +223,34 @@ impl LanguageCoordinator {
                     }
                 }
             };
-            notify.notified().await;
+            // Register interest BEFORE re-validating the marker (mirrors
+            // `captures.rs`'s single-flight): `enable()` makes a
+            // `notify_waiters()` call that happens between here and the
+            // `.await` below visible to this waiter — awaiting bare
+            // `notify.notified()` without it has a lost-wakeup window
+            // between reading the `Arc<Notify>` above and this future's
+            // first poll, where a winner whose load finishes in that gap
+            // (e.g. the `search_paths.is_empty()` fast-fail) removes the
+            // marker and calls `notify_waiters()` before we're registered
+            // to receive it, hanging this task forever (no future winner
+            // for this language creates a fresh `Notify` to wake it). The
+            // re-check after `enable()` catches a winner that already
+            // exited before we registered — its `notify_waiters()` preceded
+            // our `enable()`, so we skip waiting and loop back immediately
+            // instead of awaiting a notification that already happened.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let winner_live = self
+                .load_inflight
+                .get(language_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, &notify));
+            if winner_live {
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
+            }
             // Loop back: re-check registry/failed_loads/in-flight from
             // scratch rather than trusting the winner's outcome directly —
             // the winner may have failed (loser re-derives the same
