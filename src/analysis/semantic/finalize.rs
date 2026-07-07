@@ -9,7 +9,8 @@
 //! relative position encoding (delta_line, delta_start), not the
 //! SemanticTokensDelta optimization which is handled by the `delta` module.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 use tower_lsp_server::ls_types::{SemanticToken, SemanticTokens, SemanticTokensResult};
 
@@ -79,6 +80,39 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
     result
 }
 
+/// Active-token candidate in the sweep-line heap, ordered by `token_priority`
+/// with ties broken by `line_index` (later token in the sorted-by-column
+/// order wins), matching the last-max semantics of `Iterator::max_by_key`.
+/// `end` is carried along but excluded from `Ord` — it's only needed to
+/// detect expiry, not to rank candidates.
+struct HeapEntry {
+    priority: (u32, usize, usize, usize),
+    end: usize,
+    line_index: usize,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.line_index == other.line_index
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then(self.line_index.cmp(&other.line_index))
+    }
+}
+
 /// Split overlapping tokens on the same line using a sweep line algorithm.
 ///
 /// For each line, collects breakpoints (start/end columns of all tokens),
@@ -88,6 +122,14 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
 ///
 /// This replaces the previous dedup-at-same-position approach, producing
 /// non-overlapping fragments that preserve both parent and child semantics.
+///
+/// Winner selection uses a max-heap of currently-active (emitted) tokens with
+/// lazy expiry instead of rescanning every line-token per interval: each
+/// token enters and leaves the heap exactly once, so this is O(k log k) per
+/// line rather than the O(k) per-interval rescan (O(k^2) per line) it
+/// replaced. This relies on breakpoints already covering every token's start
+/// and end, so within one interval "active" (start <= interval_start < end)
+/// is equivalent to "fully covers the interval".
 fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
     if tokens.is_empty() {
         return tokens;
@@ -118,7 +160,12 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
         breakpoints.sort_unstable();
         breakpoints.dedup();
 
-        // 2. For each interval [bp[i], bp[i+1]), find the winner
+        // 2. Sweep the intervals, maintaining a max-heap of active tokens.
+        // Transparent tokens are never pushed — they only contributed
+        // breakpoints above and never compete for winning.
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+        let mut next_token = 0;
+
         for window in breakpoints.windows(2) {
             let interval_start = window[0];
             let interval_end = window[1];
@@ -127,19 +174,29 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                 continue; // zero-length interval
             }
 
-            // Find the highest-priority *visible* token covering this interval.
-            // Transparent tokens only serve as breakpoint generators — they
-            // split intervals at their boundaries but don't compete for winning.
-            let winner = line_tokens
-                .iter()
-                .filter(|t| {
-                    t.column <= interval_start
-                        && t.column + t.length >= interval_end
-                        && t.kind.is_emitted()
-                })
-                .max_by_key(|t| token_priority(t));
+            while next_token < line_tokens.len() && line_tokens[next_token].column <= interval_start
+            {
+                let t = &line_tokens[next_token];
+                if t.kind.is_emitted() {
+                    heap.push(HeapEntry {
+                        priority: token_priority(t),
+                        end: t.column + t.length,
+                        line_index: next_token,
+                    });
+                }
+                next_token += 1;
+            }
 
-            if let Some(winner) = winner {
+            while let Some(top) = heap.peek() {
+                if top.end <= interval_start {
+                    heap.pop();
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(top) = heap.peek() {
+                let winner = &line_tokens[top.line_index];
                 result.push(winner.with_span(
                     current_line,
                     interval_start,
