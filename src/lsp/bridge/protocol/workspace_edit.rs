@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use tower_lsp_server::ls_types::{
-    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, ResourceOp,
-    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, Range,
+    ResourceOp, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 
 use super::translation::{RegionOffset, translate_virtual_range_to_host};
@@ -178,29 +178,39 @@ fn transform_text_document_edit(
 }
 
 /// Whether every text edit targeting `host_uri` in a HOST-coordinate
-/// `WorkspaceEdit` ends at or before `region_end` — i.e. stays inside the
-/// injection region it was translated from.
+/// `WorkspaceEdit` is fully CONTAINED in `[region_start, region_end]` — i.e.
+/// stays inside the injection region it was translated from.
 ///
-/// Call this AFTER `transform_workspace_edit_to_host`. Virtual→host translation
-/// is purely additive (it only ADDS the region's start line and per-line column
-/// offsets — see `translate_virtual_range_to_host`), so a translated position
-/// can never fall below the region start; the sole escape is a `range.end` PAST
-/// `region_end`. A stale or malformed downstream edit whose virtual range
-/// extends beyond the (possibly shrunk) region content would otherwise
-/// translate to a plausible host range AFTER the fence — into unrelated host
-/// text or another injection. Callers must REJECT such an edit, never clamp:
-/// applyEdit answers `applied: false`, codeAction/resolve disables the action.
-/// Only `host_uri`'s edits are region-bounded; real-file edits (other URIs)
-/// keep their own extents and are not checked.
+/// Call this AFTER `transform_workspace_edit_to_host`. Two escape vectors:
+/// - `range.end` PAST `region_end`: a stale/malformed downstream edit whose
+///   virtual range runs beyond the (possibly shrunk) region content translates
+///   to a plausible host range AFTER the fence — into unrelated host text.
+/// - `range.start` BEFORE `region_start`: virtual→host translation is additive,
+///   so a *translated* edit can't fall below the start (its minimum is virtual
+///   `(0,0)` → exactly `region_start`); but an edit already keyed to `host_uri`
+///   passes through the transform verbatim (real-file URIs are kept), so a
+///   downstream that emits a host-URI edit could reach host text BEFORE the
+///   region. The lower bound rejects those without touching any legitimate
+///   translated edit (which sits at or after `region_start`).
+///
+/// Callers must REJECT, never clamp: applyEdit answers `applied: false`,
+/// codeAction/resolve disables the action. Only `host_uri`'s edits are
+/// region-bounded; edits to OTHER real files keep their own extents (a
+/// downstream editing a genuinely different real file is a feature, not
+/// corruption), and host-URI file operations (create/rename/delete) are out of
+/// scope here — the transform already rejects *virtual*-URI file ops.
 pub(crate) fn workspace_edit_within_region(
     edit: &WorkspaceEdit,
     host_uri: &Uri,
+    region_start: Position,
     region_end: Position,
 ) -> bool {
-    let within = |end: Position| !position_after(end, region_end);
+    let within = |range: Range| {
+        !position_after(region_start, range.start) && !position_after(range.end, region_end)
+    };
     if let Some(changes) = &edit.changes
         && let Some(edits) = changes.get(host_uri)
-        && !edits.iter().all(|e| within(e.range.end))
+        && !edits.iter().all(|e| within(e.range))
     {
         return false;
     }
@@ -210,7 +220,7 @@ pub(crate) fn workspace_edit_within_region(
                 OneOf::Left(text_edit) => text_edit.range,
                 OneOf::Right(annotated) => annotated.text_edit.range,
             };
-            within(range.end)
+            within(range)
         })
     };
     match &edit.document_changes {
@@ -482,11 +492,17 @@ mod tests {
     #[test]
     fn within_region_bounds_the_host_uri_edits_only() {
         let host_uri = make_host_uri();
-        // The region ends at host line 3, character 11 (exclusive end mapped to
-        // host coords). An edit ending at or before that is in-region.
+        // A one-line region: starts at host (3, 0), ends at (3, 11).
+        let region_start = Position {
+            line: 3,
+            character: 0,
+        };
         let region_end = Position {
             line: 3,
             character: 11,
+        };
+        let check = |edit: &WorkspaceEdit| {
+            workspace_edit_within_region(edit, &host_uri, region_start, region_end)
         };
 
         let in_bounds = parse_workspace_edit(json!({
@@ -494,36 +510,33 @@ mod tests {
                 { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 5}}, "newText": "x" }
             ] }
         }));
-        assert!(workspace_edit_within_region(
-            &in_bounds, &host_uri, region_end
-        ));
+        assert!(check(&in_bounds));
 
-        // An edit whose end line runs PAST the region end — the corruption
-        // vector: a stale/oversized virtual range translated into host text
-        // after the fence. Must be rejected.
+        // range.end PAST region_end — the escape-after-the-fence vector. Rejected.
         let past_end_line = parse_workspace_edit(json!({
             "changes": { host_uri.as_str(): [
                 { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 8, "character": 0}}, "newText": "x" }
             ] }
         }));
-        assert!(!workspace_edit_within_region(
-            &past_end_line,
-            &host_uri,
-            region_end
-        ));
+        assert!(!check(&past_end_line));
 
-        // Past the end COLUMN on the end line is also rejected (inline injection
-        // over-reach within the last line).
+        // Past the end COLUMN on the end line (inline over-reach). Rejected.
         let past_end_col = parse_workspace_edit(json!({
             "changes": { host_uri.as_str(): [
                 { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 20}}, "newText": "x" }
             ] }
         }));
-        assert!(!workspace_edit_within_region(
-            &past_end_col,
-            &host_uri,
-            region_end
-        ));
+        assert!(!check(&past_end_col));
+
+        // range.start BEFORE region_start — a pass-through host-URI edit that was
+        // never translated (so the additive floor doesn't protect it) reaching
+        // host text ABOVE the region. Rejected even though its end is in-bounds.
+        let before_start = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 0, "character": 0}, "end": {"line": 3, "character": 5}}, "newText": "x" }
+            ] }
+        }));
+        assert!(!check(&before_start));
 
         // A REAL file (different URI) is not region-bounded — its own extent
         // applies, so an out-of-region-looking range there is fine.
@@ -532,12 +545,10 @@ mod tests {
                 { "range": {"start": {"line": 99, "character": 0}, "end": {"line": 99, "character": 0}}, "newText": "x" }
             ] }
         }));
-        assert!(workspace_edit_within_region(
-            &real_file, &host_uri, region_end
-        ));
+        assert!(check(&real_file));
 
-        // documentChanges (Edits) targeting the host URI is bounded too.
-        let doc_changes_oob = parse_workspace_edit(json!({
+        // documentChanges (Edits) targeting the host URI is bounded on both ends.
+        let doc_changes_past_end = parse_workspace_edit(json!({
             "documentChanges": [{
                 "textDocument": { "uri": host_uri.as_str(), "version": null },
                 "edits": [
@@ -545,10 +556,15 @@ mod tests {
                 ]
             }]
         }));
-        assert!(!workspace_edit_within_region(
-            &doc_changes_oob,
-            &host_uri,
-            region_end
-        ));
+        assert!(!check(&doc_changes_past_end));
+        let doc_changes_before_start = parse_workspace_edit(json!({
+            "documentChanges": [{
+                "textDocument": { "uri": host_uri.as_str(), "version": null },
+                "edits": [
+                    { "range": {"start": {"line": 1, "character": 0}, "end": {"line": 3, "character": 2}}, "newText": "x" }
+                ]
+            }]
+        }));
+        assert!(!check(&doc_changes_before_start));
     }
 }
