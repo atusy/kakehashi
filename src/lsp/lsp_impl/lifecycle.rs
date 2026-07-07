@@ -2847,8 +2847,17 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                // A NON-empty edit against a virtual URI that resolves to no open
+                // document: the translator can't map it, so the loop must reject
+                // it locally. (An empty edit array would be a no-op forwarded
+                // verbatim — see `collect_virtual_uris`.)
                 params: serde_json::from_value(serde_json::json!({
-                    "edit": { "changes": { virtual_uri: [] } }
+                    "edit": { "changes": { virtual_uri: [
+                        { "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 1 }
+                        }, "newText": "x" }
+                    ] } }
                 }))
                 .unwrap(),
                 reply: reply_tx,
