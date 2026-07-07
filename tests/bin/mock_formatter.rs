@@ -174,11 +174,20 @@ fn main() {
                     // rewrite the title on resolve) — the bridge must surface
                     // the server's new title (re-suffixed), not the pre-resolve
                     // one.
-                    "code-action-lazy" | "code-action-lazy-cmd"
-                    | "code-action-lazy-retitle" => json!({
-                        "codeActionProvider": { "resolveProvider": true },
-                        "textDocumentSync": 1
-                    }),
+                    // `code-action-lazy-multistep`: the first resolve returns NO
+                    // edit but a CHANGED title (still lazy); the second resolve
+                    // materializes the edit. Proves the bridge carries the
+                    // server-changed title into the routing envelope so a
+                    // match-by-title server sees the title it last advertised.
+                    "code-action-lazy"
+                    | "code-action-lazy-cmd"
+                    | "code-action-lazy-retitle"
+                    | "code-action-lazy-multistep" => {
+                        json!({
+                            "codeActionProvider": { "resolveProvider": true },
+                            "textDocumentSync": 1
+                        })
+                    }
                     // `diagnostics-push-pullcap` is BOTH: it advertises
                     // `diagnosticProvider` (pull-driven) AND pushes on didOpen
                     // (below). Used to prove `pullFallback = false` still
@@ -489,6 +498,7 @@ fn main() {
                         if mode == "code-action-lazy"
                             || mode == "code-action-lazy-cmd"
                             || mode == "code-action-lazy-retitle"
+                            || mode == "code-action-lazy-multistep"
                         {
                             // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
@@ -559,6 +569,51 @@ fn main() {
                             "kind": "source.organizeImports",
                             "data": data,
                             "command": { "title": "Run it", "command": "mock.run" }
+                        }),
+                    );
+                    continue;
+                }
+                if mode == "code-action-lazy-multistep" {
+                    // Two-step resolve. The mock distinguishes the steps by
+                    // whether the received title already carries the "(step2)"
+                    // marker — which the bridge only forwards if it tracked the
+                    // server-changed title into the routing envelope on step 1.
+                    if !title.contains("(step2)") {
+                        // Step 1: stay lazy (no edit), change the title, keep the
+                        // data so the bridge re-envelopes for a second resolve.
+                        respond(
+                            &mut writer,
+                            id,
+                            json!({
+                                "title": format!("{title} (step2)"),
+                                "kind": "source.organizeImports",
+                                "data": data
+                            }),
+                        );
+                        continue;
+                    }
+                    // Step 2: the received title carries "(step2)", proving the
+                    // bridge forwarded the tracked title — materialize the edit.
+                    // If the bridge had dropped the tracked title, this branch is
+                    // never reached and the action stays lazy forever.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": title,
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "edit": {
+                                "changes": {
+                                    target_uri: [{
+                                        "range": {
+                                            "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 5 }
+                                        },
+                                        "newText": format!("organized:{title}")
+                                    }]
+                                }
+                            }
                         }),
                     );
                     continue;

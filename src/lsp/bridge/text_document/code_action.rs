@@ -391,7 +391,7 @@ impl LanguageServerPool {
         &self,
         server_config: &BridgeServerConfig,
         mut action: CodeAction,
-        envelope: CodeActionEnvelope,
+        mut envelope: CodeActionEnvelope,
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
     ) -> CodeAction {
@@ -458,8 +458,11 @@ impl LanguageServerPool {
                 re_envelope_action(&mut action, &envelope);
                 return action;
             }
-            resolved.title =
-                resuffix_resolved_title(std::mem::take(&mut resolved.title), suffixed_title, server_name);
+            resolved.title = resuffix_resolved_title(
+                std::mem::take(&mut resolved.title),
+                suffixed_title,
+                server_name,
+            );
             resolved.edit = None;
             resolved.command = None;
             resolved.data = None;
@@ -517,9 +520,11 @@ impl LanguageServerPool {
 
         // Re-apply the "{title} — {server}" suffix. The server normally echoes
         // the restored original title back, but if it changed the title during
-        // resolve (allowed by LSP) that change is kept and re-suffixed.
-        resolved.title =
-            resuffix_resolved_title(std::mem::take(&mut resolved.title), suffixed_title, server_name);
+        // resolve (allowed by LSP) that change is kept and re-suffixed. Capture
+        // the raw (unsuffixed) server title first — the still-lazy path below
+        // needs it to keep the envelope's title in sync.
+        let server_title = std::mem::take(&mut resolved.title);
+        resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
 
         // Once resolve has materialized an edit, the action is complete and
         // its edit is host-translated. Re-enveloping it would let a second
@@ -531,6 +536,14 @@ impl LanguageServerPool {
         if resolved.edit.is_some() {
             resolved.data = None;
         } else {
+            // Still lazy: a future resolve restores `envelope.original_title`
+            // and forwards it downstream. If the server changed the title on
+            // THIS resolve, track the new (unsuffixed) title so a title-matching
+            // server sees the title it last advertised, not the stale initial
+            // one. (The envelope exists precisely for match-by-title servers.)
+            if !server_title.is_empty() {
+                envelope.original_title = server_title;
+            }
             if resolved.data.is_none() {
                 resolved.data = action.data.take();
             }
