@@ -54,7 +54,6 @@ expression: capabilities
       "codeActionLiteralSupport": {
         "codeActionKind": {
           "valueSet": [
-            "",
             "quickfix",
             "refactor",
             "refactor.extract",

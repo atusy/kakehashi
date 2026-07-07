@@ -70,7 +70,6 @@ expression: request
           "codeActionLiteralSupport": {
             "codeActionKind": {
               "valueSet": [
-                "",
                 "quickfix",
                 "refactor",
                 "refactor.extract",

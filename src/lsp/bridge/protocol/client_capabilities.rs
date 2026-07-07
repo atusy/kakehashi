@@ -80,7 +80,6 @@ fn build_baseline_capabilities(
             code_action_literal_support: Some(CodeActionLiteralSupport {
                 code_action_kind: CodeActionKindLiteralSupport {
                     value_set: [
-                        "",
                         "quickfix",
                         "refactor",
                         "refactor.extract",

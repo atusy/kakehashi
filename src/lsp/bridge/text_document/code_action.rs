@@ -68,6 +68,9 @@ impl LanguageServerPool {
                     host_range,
                     context,
                     &offset,
+                    // The region spans this many host lines; bounds the
+                    // in-region diagnostic filter from below.
+                    virtual_content.lines().count() as u32,
                     request_id,
                     client_progress_token,
                 )
@@ -97,6 +100,7 @@ fn build_code_action_request(
     host_range: Range,
     mut context: CodeActionContext,
     offset: &RegionOffset,
+    region_line_count: u32,
     request_id: RequestId,
     client_progress_token: Option<NumberOrString>,
 ) -> JsonRpcRequest<CodeActionParams> {
@@ -105,11 +109,13 @@ fn build_code_action_request(
     // Out-of-region diagnostics would translate to virtual coordinates that
     // don't exist: above-region ones saturate to (0,0) and can false-match a
     // different diagnostic at the top of the virtual document; below-region
-    // ones land past the virtual document's end. `host_range` is already
-    // clamped to the region, so its end bounds the region from below.
+    // ones land past the virtual document's end. Bound by the region's own
+    // line span — NOT the (possibly zero-length, cursor) request range, which
+    // would wrongly drop a diagnostic sitting exactly at the cursor.
+    let region_end_line = offset.line().saturating_add(region_line_count);
     context.diagnostics.retain(|diagnostic| {
         host_position_within_region(diagnostic.range.start, offset)
-            && diagnostic.range.start < host_range.end
+            && diagnostic.range.start.line < region_end_line
     });
     for diagnostic in &mut context.diagnostics {
         translate_host_range_to_virtual(&mut diagnostic.range, offset);
@@ -239,6 +245,17 @@ fn bridge_code_action(
         CodeActionOrCommand::CodeAction(action) => action,
     };
 
+    // The action's own diagnostics came back in virtual coordinates —
+    // translate them before any early return so every surfaced action
+    // (including a disabled one) carries host coordinates.
+    if let Some(virt) = virt
+        && let Some(diagnostics) = &mut action.diagnostics
+    {
+        for diagnostic in diagnostics {
+            translate_virtual_range_to_host(&mut diagnostic.range, virt.offset);
+        }
+    }
+
     // A server-side disabled action needs no further policy: its own reason
     // already explains why it can't run, and it's only representable with
     // disabledSupport. Suffix it, strip any payload (we can't execute it and
@@ -261,15 +278,6 @@ fn bridge_code_action(
     // did not opt in.
     if !upstream_caps.is_preferred_support {
         action.is_preferred = None;
-    }
-
-    // The action's own diagnostics came back in virtual coordinates.
-    if let Some(virt) = virt
-        && let Some(diagnostics) = &mut action.diagnostics
-    {
-        for diagnostic in diagnostics {
-            translate_virtual_range_to_host(&mut diagnostic.range, virt.offset);
-        }
     }
 
     // Commands are not executable until executeCommand is bridged; applying
@@ -421,6 +429,7 @@ mod tests {
             range(5, 5),
             context,
             &RegionOffset::new(3, 0),
+            10,
             RequestId::new(1),
             None,
         );
@@ -457,6 +466,8 @@ mod tests {
             range(5, 5),
             context,
             &RegionOffset::new(3, 0),
+            // Region spans host lines 3..13; line-5 diagnostic is in, line-40 is out.
+            10,
             RequestId::new(1),
             None,
         );
@@ -472,6 +483,45 @@ mod tests {
     }
 
     #[test]
+    fn code_action_request_keeps_in_region_diagnostic_for_cursor_request() {
+        // A zero-length (cursor) request: a diagnostic exactly at the cursor
+        // is in-region and must survive — the region span, not the request
+        // range end, bounds the filter.
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let cursor = Position {
+            line: 5,
+            character: 3,
+        };
+        let context = CodeActionContext {
+            diagnostics: vec![Diagnostic {
+                range: Range {
+                    start: cursor,
+                    end: cursor,
+                },
+                ..Diagnostic::default()
+            }],
+            ..CodeActionContext::default()
+        };
+        let request = build_code_action_request(
+            &virtual_uri,
+            Range {
+                start: cursor,
+                end: cursor,
+            },
+            context,
+            &RegionOffset::new(3, 0),
+            10,
+            RequestId::new(1),
+            None,
+        );
+
+        let json = serde_json::to_value(&request).unwrap();
+        let diags = json["params"]["context"]["diagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1, "the cursor diagnostic must survive");
+        assert_eq!(diags[0]["range"]["start"]["line"], 2, "5 - region start 3");
+    }
+
+    #[test]
     fn code_action_request_carries_work_done_token() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_code_action_request(
@@ -479,6 +529,7 @@ mod tests {
             range(5, 5),
             CodeActionContext::default(),
             &RegionOffset::new(3, 0),
+            10,
             test_request_id(),
             Some(NumberOrString::String("wd-1".to_string())),
         );
@@ -720,6 +771,37 @@ mod tests {
             action.is_preferred, None,
             "a disabled action must not steer auto-fix"
         );
+    }
+
+    #[test]
+    fn server_disabled_action_diagnostics_are_translated_to_host() {
+        // A disabled action can still carry diagnostics; on the virt layer
+        // those are in virtual coordinates and must reach the client in host
+        // coordinates even though the action short-circuits the policy.
+        let actions = transform(
+            json!([{
+                "title": "Not here",
+                "disabled": { "reason": "wrong scope" },
+                "diagnostics": [{
+                    "range": {
+                        "start": { "line": 2, "character": 0 },
+                        "end": { "line": 2, "character": 5 }
+                    },
+                    "message": "unused"
+                }]
+            }]),
+            caps(true),
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            action.diagnostics.as_ref().unwrap()[0].range.start.line,
+            12,
+            "2 + region offset 10 — disabled actions get translated too"
+        );
+        assert_eq!(action.disabled.as_ref().unwrap().reason, "wrong scope");
     }
 
     #[test]
