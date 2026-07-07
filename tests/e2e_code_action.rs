@@ -278,6 +278,43 @@ fn code_action_over_fence(client: &mut LspClient) -> Vec<Value> {
 }
 
 #[test]
+fn resolve_fails_soft_when_envelope_offset_diverges_from_live() {
+    // The resolve path translates using the envelope's SNAPSHOT offset. If the
+    // live region offset has diverged (e.g. an interior blockquote-prefix edit
+    // changed a per-line column offset while the start held), translating with
+    // the stale offset would bind the edit to wrong host columns. The freshness
+    // gate re-resolves the live offset and compares the WHOLE thing, so a
+    // divergence must fail soft (action returned unresolved, envelope intact).
+    //
+    // Simulated by tampering the envelope's `line_column_offsets` to a vector
+    // that can't match the live single-line region (whose offset is `[0]`): a
+    // start-only freshness check would still pass it (same start line/column).
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    let mut tampered = actions[0].clone();
+    // Live region offset is `[0]`; make the snapshot offset diverge on an
+    // interior line the start-only check never looked at.
+    tampered["data"]["kakehashi"]["offset"]["line_column_offsets"] = json!([0, 99]);
+
+    let resolved = client.send_request("codeAction/resolve", tampered.clone());
+    let resolved = &resolved["result"];
+    assert!(
+        resolved["edit"].is_null(),
+        "a diverged snapshot offset must fail soft (no edit), got: {resolved:?}"
+    );
+    assert_eq!(
+        resolved["data"]["kakehashi"]["origin"], "mock-codeaction",
+        "the routing envelope is kept intact for a re-request, got: {resolved:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn lazy_action_is_resolved_via_code_action_resolve() {
     // A resolve-capable client gets the lazy action back with a routing
     // envelope; codeAction/resolve then materializes the edit, re-keyed to the
