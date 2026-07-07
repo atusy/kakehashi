@@ -1149,6 +1149,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn split_winner_reverts_to_lower_priority_token_after_higher_one_expires() {
+        // Long low-priority token [0,20) pi=0 spans the whole line.
+        // Short high-priority token [5,10) pi=1 wins only inside its own span;
+        // the sweep must revert to the low-priority token once the high one
+        // expires, i.e. the heap can't just remember "last winner" — it needs
+        // to expose the next-highest active token as older ones expire.
+        let tokens = vec![
+            make_token_with_priority(0, 0, 20, "keyword", 0, 0, 50),
+            make_token_with_priority(0, 5, 5, "variable", 0, 1, 100),
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![
+                (0, 5, mapped("keyword")),
+                (5, 5, mapped("variable")),
+                (10, 10, mapped("keyword")),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_many_overlapping_tokens_picks_correct_winner_per_interval() {
+        // Five tokens with increasing priority, each nested inside the previous
+        // one's span but ending at different points, so several expire mid-sweep
+        // in a non-trivial order — a straightforward stress case for the heap's
+        // active-set tracking beyond simple two/three-token nesting.
+        let tokens = vec![
+            make_token_with_priority(0, 0, 20, "keyword", 0, 0, 10),
+            make_token_with_priority(0, 2, 16, "variable", 0, 1, 20),
+            make_token_with_priority(0, 4, 8, "string", 0, 2, 30),
+            make_token_with_priority(0, 6, 10, "comment", 0, 3, 40),
+            make_token_with_priority(0, 8, 2, "operator", 0, 4, 50),
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![
+                (0, 2, mapped("keyword")),
+                (2, 2, mapped("variable")),
+                (4, 2, mapped("string")),
+                (6, 2, mapped("comment")),
+                (8, 2, mapped("operator")),
+                (10, 6, mapped("comment")),
+                (16, 2, mapped("variable")),
+                (18, 2, mapped("keyword")),
+            ]
+        );
+    }
+
     // ── region_intervals_on_line tests ─────────────────────────────
 
     #[test]
