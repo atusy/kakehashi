@@ -89,8 +89,13 @@ pub(in crate::lsp::bridge) fn handle(
                 .await
                 .unwrap_or_else(|_| ApplyWorkspaceEditResponse {
                     applied: false,
+                    // `reply_rx` drops for BOTH a lost editor response AND a
+                    // never-forwarded request (forwarding loop gone / enqueue
+                    // failed). Keep the single unified drop path (see below) but
+                    // word the reason neutrally so a transport failure isn't
+                    // misattributed to the editor.
                     failure_reason: Some(
-                        "kakehashi: the editor did not answer workspace/applyEdit".to_string(),
+                        "kakehashi: no workspace/applyEdit response was produced".to_string(),
                     ),
                     failed_change: None,
                 });
