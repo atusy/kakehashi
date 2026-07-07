@@ -24,8 +24,9 @@ use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::text::PositionMapper;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
-    CodeActionResponse, NumberOrString, PartialResultParams, Position, Range,
-    TextDocumentIdentifier, Uri, WorkDoneProgressParams,
+    CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
+    PartialResultParams, Position, Range, TextDocumentIdentifier, Uri, WorkDoneProgressParams,
+    WorkspaceEdit,
 };
 use url::Url;
 
@@ -138,17 +139,50 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
     }));
 }
 
-/// Whether a `WorkspaceEdit` carries no actual edits. After the host
-/// transform filters cross-region text edits, a resolved edit can end up
-/// empty; returning it would look "resolved" but do nothing when applied.
-fn workspace_edit_is_empty(edit: &tower_lsp_server::ls_types::WorkspaceEdit) -> bool {
-    let changes_empty = edit.changes.as_ref().is_none_or(|c| c.is_empty());
-    let doc_changes_empty = match &edit.document_changes {
-        None => true,
-        Some(tower_lsp_server::ls_types::DocumentChanges::Edits(edits)) => edits.is_empty(),
-        Some(tower_lsp_server::ls_types::DocumentChanges::Operations(ops)) => ops.is_empty(),
+/// Whether a `WorkspaceEdit` carries no actual change. Checks the INNER edit
+/// vectors, not just the outer containers: a `changes` map whose every value
+/// is an empty `TextEdit[]`, or `documentChanges` whose every entry has empty
+/// `edits`, is still a no-op. A file operation counts as a real change.
+fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
+    let changes_has_edit = edit
+        .changes
+        .as_ref()
+        .is_some_and(|c| c.values().any(|edits| !edits.is_empty()));
+    let doc_changes_has_edit = match &edit.document_changes {
+        None => false,
+        Some(DocumentChanges::Edits(edits)) => edits.iter().any(|e| !e.edits.is_empty()),
+        Some(DocumentChanges::Operations(ops)) => ops.iter().any(|op| match op {
+            DocumentChangeOperation::Edit(e) => !e.edits.is_empty(),
+            DocumentChangeOperation::Op(_) => true, // a create/rename/delete is a real change
+        }),
     };
-    changes_empty && doc_changes_empty
+    !changes_has_edit && !doc_changes_has_edit
+}
+
+/// Whether a `WorkspaceEdit` touches a virtual document OTHER than
+/// `request_virtual_uri` (a cross-region edit). The shared host transform
+/// silently filters such text edits; the resolve path uses this to fail soft
+/// instead, since a partially-applied resolved edit is worse than none.
+fn workspace_edit_touches_foreign_region(edit: &WorkspaceEdit, request_virtual_uri: &str) -> bool {
+    let is_foreign =
+        |uri: &str| VirtualDocumentUri::is_virtual_uri(uri) && uri != request_virtual_uri;
+    if let Some(changes) = &edit.changes
+        && changes.keys().any(|k| is_foreign(k.as_str()))
+    {
+        return true;
+    }
+    match &edit.document_changes {
+        None => false,
+        Some(DocumentChanges::Edits(edits)) => edits
+            .iter()
+            .any(|e| is_foreign(e.text_document.uri.as_str())),
+        Some(DocumentChanges::Operations(ops)) => ops.iter().any(|op| match op {
+            DocumentChangeOperation::Edit(e) => is_foreign(e.text_document.uri.as_str()),
+            // File ops on virtual URIs are rejected by the transform itself
+            // (it returns false), so they need no foreign check here.
+            DocumentChangeOperation::Op(_) => false,
+        }),
+    }
 }
 
 /// The exclusive host-document end of an injection region: the position just
@@ -393,11 +427,12 @@ impl LanguageServerPool {
         }
 
         // Translate the resolved edit host-ward. Fail soft (return the
-        // original action unresolved) when it can't be represented in the
-        // host document: a virtual-URI file op (transform returns false), OR
-        // the transform filtered every text edit as cross-region and left the
-        // edit empty — an empty resolved edit is worse than an unresolved
-        // action (the user would apply it and nothing would happen).
+        // original action unresolved) when it can't be faithfully represented
+        // in the host document: a virtual-URI file op (transform returns
+        // false); ANY cross-region edit (the shared transform would silently
+        // filter it, partially applying the rest); or an edit that ends up
+        // empty. Any of these is worse than an unresolved action — the user
+        // would apply it and get a partial or no-op change.
         match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
             (Some(edit), Some(host_uri_lsp)) => {
                 let virtual_uri = VirtualDocumentUri::new(
@@ -406,7 +441,8 @@ impl LanguageServerPool {
                     &envelope.region_id,
                 )
                 .to_uri_string();
-                if !transform_workspace_edit_to_host(edit, &virtual_uri, host_uri_lsp, &offset)
+                if workspace_edit_touches_foreign_region(edit, &virtual_uri)
+                    || !transform_workspace_edit_to_host(edit, &virtual_uri, host_uri_lsp, &offset)
                     || workspace_edit_is_empty(edit)
                 {
                     re_envelope_action(&mut action, &envelope);
@@ -1586,12 +1622,20 @@ mod tests {
 
     #[test]
     fn workspace_edit_is_empty_detects_no_edits() {
-        use tower_lsp_server::ls_types::WorkspaceEdit;
         assert!(workspace_edit_is_empty(&WorkspaceEdit::default()));
         assert!(workspace_edit_is_empty(&WorkspaceEdit {
             changes: Some(Default::default()),
             ..Default::default()
         }));
+        // A changes map whose only value is an empty TextEdit[] is still empty.
+        let vacuous: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": { "file:///x.lua": [] }
+        }))
+        .unwrap();
+        assert!(
+            workspace_edit_is_empty(&vacuous),
+            "a changes map of empty edit vectors is a no-op"
+        );
         // A non-empty changes map is not empty.
         let edit: WorkspaceEdit = serde_json::from_value(json!({
             "changes": { "file:///x.lua": [{
@@ -1601,6 +1645,33 @@ mod tests {
         }))
         .unwrap();
         assert!(!workspace_edit_is_empty(&edit));
+    }
+
+    #[test]
+    fn workspace_edit_touches_foreign_region_detects_other_virtual_uris() {
+        let host_uri = make_host_uri();
+        let own = VirtualDocumentUri::new(&host_uri, "lua", "region-0").to_uri_string();
+        let other = VirtualDocumentUri::new(&host_uri, "lua", "region-1").to_uri_string();
+
+        // Own region + a real file: not foreign.
+        let clean: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": {
+                own.clone(): [{ "range": {"start": {"line":0,"character":0}, "end": {"line":0,"character":1}}, "newText": "y" }],
+                "file:///real.lua": []
+            }
+        }))
+        .unwrap();
+        assert!(!workspace_edit_touches_foreign_region(&clean, &own));
+
+        // A different region's virtual URI is foreign.
+        let cross: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": {
+                own.clone(): [],
+                other: []
+            }
+        }))
+        .unwrap();
+        assert!(workspace_edit_touches_foreign_region(&cross, &own));
     }
 
     #[test]
