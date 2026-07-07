@@ -145,9 +145,13 @@ fn transform_params_to_host(
             "kakehashi: the edit performs file operations on a virtual document".to_string(),
         );
     }
-    if !workspace_edit_within_region(&params.edit, host_uri, region_end) {
+    // Region host start = where a translated virtual (0,0) lands; bound the
+    // edit on BOTH ends so a pass-through host-URI edit can't reach host text
+    // above OR below the injected region.
+    let region_start = Position::new(offset.line(), offset.column_for_line(0));
+    if !workspace_edit_within_region(&params.edit, host_uri, region_start, region_end) {
         return Err(
-            "kakehashi: the edit extends past the injected region; it cannot be applied to the \
+            "kakehashi: the edit extends outside the injected region; it cannot be applied to the \
              host document without corrupting surrounding text"
                 .to_string(),
         );
@@ -413,7 +417,38 @@ mod tests {
         )
         .expect_err("an edit past the region end must reject the whole edit");
         assert!(
-            reason.contains("past the injected region"),
+            reason.contains("outside the injected region"),
+            "reason should name the failure: {reason}"
+        );
+    }
+
+    #[test]
+    fn transform_params_to_host_rejects_edit_before_region_start() {
+        // A pass-through host-URI edit above the region: keyed to the HOST doc
+        // (not the virtual URI), so the transform leaves it untranslated. Its
+        // range sits before the region start — must be rejected, not forwarded.
+        let mut params = params_with_edit(json!({
+            "changes": { "file:///project/doc.md": [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 2, "character": 0 }
+                },
+                "newText": "sneaky"
+            }] }
+        }));
+        // Region starts at host line 10; the host edit above it (lines 0-2) is
+        // fully below the region start.
+        let uri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let reason = transform_params_to_host(
+            &mut params,
+            &uri,
+            &host_uri(),
+            &RegionOffset::new(10, 0),
+            Position::new(10, 11),
+        )
+        .expect_err("a host edit before the region start must reject the whole edit");
+        assert!(
+            reason.contains("outside the injected region"),
             "reason should name the failure: {reason}"
         );
     }
