@@ -93,8 +93,12 @@ fn apply_offset_to_position(
     }
 
     // Start of the line containing byte_pos, found by scanning backward from
-    // byte_pos rather than forward from the document start.
-    let current_line_start = text[..byte_pos.min(text.len())]
+    // byte_pos rather than forward from the document start. Snap to a char
+    // boundary first: unlike the char_indices()-based scan this replaced,
+    // slicing at a raw byte_pos panics if it lands mid-codepoint (e.g. a
+    // stale tree-sitter offset) — the caller's later clamp/snap only applies
+    // to the *returned* value, not this internal slice.
+    let current_line_start = text[..floor_char_boundary(text, byte_pos.min(text.len()))]
         .rfind('\n')
         .map(|i| i + 1)
         .unwrap_or(0);
@@ -283,6 +287,17 @@ mod tests {
         // value against the whole-scan behavior this function replaced.
         let text = "line 1\nline 2";
         assert_eq!(apply_offset_to_position(text, 6, 5, 0), 7);
+    }
+
+    #[test]
+    fn test_apply_offset_to_position_mid_codepoint_byte_pos_does_not_panic() {
+        // A stale/malformed byte_pos landing inside a multi-byte character
+        // must not panic the internal line-start slice — it should behave as
+        // if snapped to the enclosing char boundary.
+        let text = "line 1\nあ\nline 3";
+        // Byte 8 is the second byte of "あ" (starts at byte 7, 3 bytes).
+        let _ = apply_offset_to_position(text, 8, 1, 0);
+        let _ = apply_offset_to_position(text, 8, -1, 0);
     }
 
     #[test]
