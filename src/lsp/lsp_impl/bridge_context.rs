@@ -1119,16 +1119,17 @@ impl Kakehashi {
         // First intersecting region that resolves to bridge server configs
         // wins: unconfigured injections (e.g. markdown_inline) must not
         // shadow a configured region further down the document.
+        let mapper = PositionMapper::new(snapshot.text());
         regions.into_iter().find_map(|resolved| {
             let region_start = Position {
                 line: resolved.region.line_range.start,
                 character: resolved.region.start_column,
             };
-            // line_range end is exclusive.
-            let region_end = Position {
-                line: resolved.region.line_range.end,
-                character: 0,
-            };
+            // Byte-precise end: synthesizing (line_range.end, 0) would
+            // over-approximate a same-line inline injection through the end
+            // of its line, matching ranges entirely after the injected
+            // content and clamping to columns outside the virtual document.
+            let region_end = mapper.byte_to_position(resolved.region.byte_range.end)?;
             if !range_intersects_region(&range, region_start, region_end) {
                 return None;
             }
