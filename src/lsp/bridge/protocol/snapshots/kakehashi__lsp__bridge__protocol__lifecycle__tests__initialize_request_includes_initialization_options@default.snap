@@ -84,7 +84,13 @@ expression: request
             }
           },
           "isPreferredSupport": true,
-          "disabledSupport": true
+          "disabledSupport": true,
+          "dataSupport": true,
+          "resolveSupport": {
+            "properties": [
+              "edit"
+            ]
+          }
         },
         "documentLink": {
           "dynamicRegistration": false,

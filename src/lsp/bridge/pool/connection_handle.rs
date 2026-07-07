@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
-    CodeActionProviderCapability, ColorProviderCapability, DeclarationCapability,
+    CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability, DeclarationCapability,
     FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
     LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
@@ -572,6 +572,15 @@ impl ConnectionHandle {
                     CodeActionProviderCapability::Simple(true)
                         | CodeActionProviderCapability::Options(_)
                 )
+            ),
+            // resolve_provider only exists on the Options form; Simple(_)
+            // advertises no resolve support (mirror codeLens/resolve).
+            "codeAction/resolve" => matches!(
+                caps.code_action_provider,
+                Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                    resolve_provider: Some(true),
+                    ..
+                }))
             ),
             "textDocument/codeLens" => caps.code_lens_provider.is_some(),
             "codeLens/resolve" => caps
