@@ -490,8 +490,9 @@ fn build_scope_tree(root_range: Range<usize>, scopes: Vec<ScopeCapture>) -> Vec<
     // `by_range` maps a range to its index in `deduped`, turning the merge
     // lookup from an O(scopes) linear scan per capture (O(scopes^2) total)
     // into an O(1) hash lookup.
-    let mut deduped: Vec<Scope> = Vec::new();
-    let mut by_range: HashMap<(usize, usize), usize> = HashMap::new();
+    let scopes_len = scopes.len();
+    let mut deduped: Vec<Scope> = Vec::with_capacity(scopes_len);
+    let mut by_range: HashMap<(usize, usize), usize> = HashMap::with_capacity(scopes_len);
     for capture in scopes {
         let range_key = (capture.byte_range.start, capture.byte_range.end);
         let merge_into = if capture.byte_range == root.byte_range {
@@ -537,7 +538,8 @@ fn build_scope_tree(root_range: Range<usize>, scopes: Vec<ScopeCapture>) -> Vec<
     // once popped can contain a later (later-starting) scope again. This
     // replaces an O(scopes) scan-for-innermost-container per scope
     // (O(scopes^2) total) with one push/pop per scope (O(scopes) total).
-    let mut scopes = vec![root];
+    let mut scopes = Vec::with_capacity(deduped.len() + 1);
+    scopes.push(root);
     let mut ancestors: Vec<usize> = vec![0]; // root always contains everything
     for mut scope in deduped {
         while ancestors.len() > 1 {
