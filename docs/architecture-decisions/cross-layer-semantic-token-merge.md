@@ -545,7 +545,8 @@ visible to stage 1 or a type split"; its Neutral bullet now defers here:
   where it does not, until a fresh set arrives). What is deferred to bridge
   infrastructure is *how* a stale virt set is recomputed and *when* the
   re-fetch happens after an edit — the same edit-invalidation every bridged
-  response already relies on (virtual-document-model syncs virtual docs on
+  response already relies on (language-server-bridge-virtual-document-model
+  syncs virtual docs on
   host change). The bridge does **not** cancel its own in-flight downstream
   requests on edit — it only forwards an upstream `$/cancelRequest` when one
   arrives — so late responses from superseded requests are expected, and are
