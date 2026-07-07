@@ -14,6 +14,7 @@
 use std::io;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -360,9 +361,12 @@ impl LanguageServerPool {
         // request_id), then splice results back by index. Sequential awaits
         // would block the codeAction response for the SUM of resolve times when
         // a server returns several lazy actions (organize-imports / batch
-        // quickfix). Lazy = no edit/command, not server-disabled; `data` is NOT
-        // required (already gated on the server advertising resolve, so a
-        // title-only action here is a resolvable lazy action per LSP 3.18).
+        // quickfix). Concurrency is CAPPED (`buffer_unordered`) so a server that
+        // returns a very large lazy-action list can't burst an unbounded number
+        // of in-flight resolves onto one connection. Lazy = no edit/command, not
+        // server-disabled; `data` is NOT required (already gated on the server
+        // advertising resolve, so a title-only action here is a resolvable lazy
+        // action per LSP 3.18).
         let pending: Vec<(usize, CodeAction)> = actions
             .iter()
             .enumerate()
@@ -380,17 +384,22 @@ impl LanguageServerPool {
         if pending.is_empty() {
             return;
         }
-        let resolved = futures::future::join_all(pending.into_iter().map(|(idx, action)| {
-            let upstream_id = upstream_id.clone();
-            async move {
-                (
-                    idx,
-                    self.send_code_action_resolve_on_handle(handle, action, upstream_id)
-                        .await,
-                )
-            }
-        }))
-        .await;
+        /// Max concurrent eager `codeAction/resolve`s on one connection.
+        const MAX_CONCURRENT_EAGER_RESOLVES: usize = 8;
+        let resolved: Vec<(usize, Option<CodeAction>)> =
+            futures::stream::iter(pending.into_iter().map(|(idx, action)| {
+                let upstream_id = upstream_id.clone();
+                async move {
+                    (
+                        idx,
+                        self.send_code_action_resolve_on_handle(handle, action, upstream_id)
+                            .await,
+                    )
+                }
+            }))
+            .buffer_unordered(MAX_CONCURRENT_EAGER_RESOLVES)
+            .collect()
+            .await;
         for (idx, outcome) in resolved {
             if let Some(materialized) = outcome
                 && let CodeActionOrCommand::CodeAction(slot) = &mut actions[idx]
