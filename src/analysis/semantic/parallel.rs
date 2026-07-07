@@ -73,10 +73,11 @@ pub(crate) struct InjectionCacheCtx<'a> {
     ///
     /// Accepted residual: an edit landing DURING the fan-out can still let
     /// this pass mint from a just-staled snapshot. Unlike the captures walk
-    /// (whose ids go out on the wire and get a post-walk purge), region ids
+    /// (whose ids go out on the wire, so its mints run through the
+    /// latch-gated `mint_batch_if_unshifted` reconciliation), region ids
     /// stay internal cache keys — a phantom entry is orphaned, never
     /// resolved, and the token cache stays correct via its content-hash
-    /// validity gate — so the purge machinery is not worth its cost here.
+    /// validity gate — so the latch gating is not worth its cost here.
     pub mint_regions: bool,
     /// Owned discovery for this tree (#529), or `None`. Reused — skipping the
     /// injection query — only when its `generation` still matches `generation`

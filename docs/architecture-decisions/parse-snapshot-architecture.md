@@ -281,28 +281,41 @@ The decision therefore **separates three concerns that today all ride the tracke
 - **Cross-edit bridge / virtual-document identity** — the stable handle a
   downstream language server's virtual document is keyed by — **remains the shared `NodeTracker` ULID**, a live-position (`content_version`) concern. Because regions
   are only *discovered* by a parse, minting still originates from a parse pass, but
-  as a distinct **current-version reconciliation step**, not off the stale-read
-  path: the tracker ULID mint that `populate_injections` performs inline today
-  **moves out of `populate` into a distinct reconciliation step**. When a pass
-  completes and (under `edit_lock`) its `parsed_version` still equals
-  `content_version`, that step maps the snapshot's region geometry to tracker ULIDs
-  — reusing an existing id by position, minting a fresh one for a genuinely new
-  region — exactly what the mint discovery does today, just gated and relocated. If the
-  pass is stale (`content_version` moved on), reconciliation is skipped and deferred
-  to the next current pass; the tracker is meanwhile kept live by the ordinary
-  `didChange` edit-shift (`apply_input_edits`), so the bridge always resolves
-  against a `content_version`-consistent index. A *stale-tree read* still never
-  mints or mutates it — only the current-version reconciliation does. So `populate`
-  splits into two: derive the snapshot-owned ordinals + geometry (always), and (only
-  at current version) reconcile tracker ULIDs.
+  as a distinct **reconciliation step**, not an inline per-region mint off the
+  stale-read path. **Implemented** (`NodeTracker::mint_batch_if_unshifted`):
+  the pass latches the tracker's (shift generation, cleanup epoch) at entry,
+  derives its region geometry, then maps that geometry to tracker ULIDs in one
+  batch — reusing an existing id by position, minting a fresh one for a
+  genuinely new region — with the latch re-checked under the tracker entry's
+  exclusive lock, the same lock the `didChange` edit-shift takes. The latch is
+  necessary but not sufficient on its own: `didChange` shifts the tracker
+  BEFORE it bumps `content_version`, so the pass captures the latch **and**
+  validates liveness + lifetime + currency (incarnation and
+  `parsed_version == content_version`) in one critical section under
+  `edit_lock` (`populate_injections_on_pool`) — atomic against the shift/bump
+  pair — and everything landing after that section is what the latch re-check
+  inside the batch mint/commit catches. A batch that passes is *correct-at-birth* — a later edit
+  shifts its ids like any live entry — so there is no purge machinery; a batch
+  the latch refuses minted **nothing**: the stale pass withholds every
+  region-id-bearing product and defers identity to the next current pass, the
+  tracker meanwhile kept live by the ordinary `didChange` edit-shift
+  (`apply_input_edits`), so the bridge always resolves against a
+  `content_version`-consistent index. A *stale-tree read* still never mints or
+  mutates it — only the latch-gated reconciliation does. So `populate` splits in
+  two: derive the snapshot-owned geometry (always), and (only while unshifted)
+  reconcile tracker ULIDs. The captures walk applies the same primitive
+  per layer — one latch-gated batch per visited layer instead of one tracker
+  lock acquisition per capture.
 
 So a stale-tree reader reads self-consistent ordinals + geometry from its own
 snapshot and touches no shared identity index (the mint-race and the
 undefined-id-on-gate-failure both vanish); token reuse is content-keyed; and the
 one identity that genuinely needs cross-edit stability (the bridge's) keeps the
 tracker that already provides it. This ADR commits only to *not* mutating shared
-identities from a **stale** parse pass or any read path — the current-version
-reconciliation above is the one place a parse still mints them.
+identities from a **stale** parse pass or any **stale** read path — the
+latch-gated reconciliation above is where a parse mints them, and the
+currency-gated inline readers (the Stage-2 remainder below) still mint on
+their current-snapshot path.
 
 Any reader that must resolve against **live** positions is position-critical
 (below).
@@ -492,8 +505,8 @@ inside the existing safety contracts at each step:
   `latest_snapshot` retains a servable tree across an edit's `tree.take()`; the two
   stores may transiently sit at different versions (a lost legacy CAS just reseeds
   next pass), but no **reader** sees the difference because every reader reads the
-  snapshot, not the legacy tree. Split `populate` into ordinal/geometry derivation
-  (snapshot-owned) and the current-version tracker reconciliation (§3). Take the
+  snapshot, not the legacy tree. `populate`'s split into geometry derivation and
+  the latch-gated tracker reconciliation (§3) is **already in**. Take the
   grammar auto-install off the read handlers (`compute_captures` no longer triggers
   `ensure_injection_languages_loaded_for_document` inline): the parse loop
   *detects* a missing injected grammar and spawns the install as a **detached
@@ -501,7 +514,7 @@ inside the existing safety contracts at each step:
   **never on the ingress path and never under `edit_lock`** — only the O(1)
   detect-and-spawn is near the lock, and even that need not hold it. The region is
   re-minted on a later reconciliation once the grammar lands. Only the fast
-  tracker-mint itself runs under `edit_lock`. Convert
+  latch-gated tracker-mint itself runs inside the tracker's shifting lock. Convert
   `semanticTokens` full/delta and `captures/full` to the serve-current parked
   wait (the latter reserving
   `null` for no-snapshot / no-lineage / the settle backstop); the whole-document
@@ -542,12 +555,12 @@ inside the existing safety contracts at each step:
   parse-seed/external-scanner issue, not a query-cursor issue, and the read paths
   are already stale-offset-hardened), but readers **write** persistent caches. The
   whole-document token cache (in `semantic_cache` / `cache`, keyed by text hash) is
-  closed by keying off the snapshot's text. The **injection-token cache** (keyed
-  `(Url, region_id)`) and the **node-tracker ULIDs** are *not* closed by
-  text-keying — they are closed only by moving region minting into the snapshot's
-  `populate` (§3) so a stale read consumes stale-but-consistent ids and mints
-  nothing. Naive stale-serve does neither and poisons both permanently (no
-  generation bump, no refresh today).
+  closed by keying off the snapshot's text. The **injection-token cache** and
+  the **node-tracker ULIDs** are *not* closed by text-keying — they are closed
+  by the content-addressed token-cache key and the §3 latch-gated mint
+  reconciliation (both now in) so a stale read consumes stale-but-consistent
+  ids and mints nothing. Naive stale-serve does neither and poisons both
+  permanently (no generation bump, no refresh today).
 - **A text-owning parse actor (per-document-parse-scheduler's Option 4).** Still
   rejected for the reason recorded there: reads bypass the owner, so owning the
   text buys nothing while resurrection-safety must still guard every reader
@@ -683,13 +696,17 @@ removed — `get_tree_with_wait`, `wait_for_epoch`, and the on-demand parse in
 
 Two Stage-2 pieces remain deliberately open:
 
-- The **§3 identity split** (snapshot-owned region ordinals + the
-  current-version tracker reconciliation, and the companion
-  injection-token-cache key rework). Until it lands, the readers whose region
-  resolution mints tracker ULIDs — the whole-document fan-out family and the
-  bridge-context requests — require a **current** snapshot (bounded wait,
-  degrade on staleness) instead of serving stale: a stale read must never
-  mint, and currency is the interim way to guarantee that.
+- The **reader-side remainder of the §3 identity split**. The writer half is
+  in: the tracker reconciliation is the latch-gated batch mint
+  (`mint_batch_if_unshifted`, see §3 above) in `populate` and the captures
+  walk, and the injection-token-cache key rework is content-addressed. What
+  stays open is the readers whose *inline* region resolution (the
+  non-prebuilt fallback) still mints tracker ULIDs — the whole-document
+  fan-out family and the bridge-context requests — which therefore still
+  require a **current** snapshot (bounded wait, degrade on staleness) instead
+  of serving stale: a stale read must never mint, and currency remains the
+  way to guarantee that until those readers consume snapshot-owned region
+  identity instead of minting.
 - Several notification-path consumers (pull diagnostics, `did_save`,
   `documentSymbol`/`documentColor`) still read the legacy store tree after the
   bounded current-wait; they migrate to `latest_snapshot` with the Stage-3

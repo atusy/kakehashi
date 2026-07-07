@@ -171,6 +171,16 @@ fn metadata_object(pairs: &[(String, Option<String>)]) -> Option<Value> {
     Some(Value::Object(map))
 }
 
+/// Shape an LSP `Position` as its wire object by direct construction —
+/// `{"line": .., "character": ..}` — avoiding the serde round-trip a `json!`
+/// expression embed would pay per capture endpoint on the walk hot path.
+fn position_value(position: tower_lsp_server::ls_types::Position) -> Value {
+    let mut map = serde_json::Map::with_capacity(2);
+    map.insert("line".to_owned(), Value::from(position.line));
+    map.insert("character".to_owned(), Value::from(position.character));
+    Value::Object(map)
+}
+
 /// A memoized full-mode captures walk result, tagged with the exact inputs
 /// it was computed from: the snapshot identity `(parsed_version,
 /// incarnation)` and the settings `generation`. Named fields (three adjacent
@@ -894,6 +904,39 @@ impl Kakehashi {
         let snapshot_for_layers = std::sync::Arc::clone(&snapshot);
         let walk_cancel = cancel_token.clone();
         let inner_cancel = cancel_token.clone();
+        // Mint latch + currency gate, taken atomically UNDER the document's
+        // edit lock (populate's discipline, see
+        // `populate_injections_on_pool`): `did_change` shifts the tracker
+        // BEFORE it bumps `content_version` under this same lock, so a
+        // lock-free latch + version check could observe the intermediate
+        // state — latch matching the already-shifted tracker, version not
+        // yet bumped — and let the walk's per-layer batches mint
+        // old-snapshot coordinates as correct-at-birth. Under the lock the
+        // pair is atomic; an edit (or close) landing after the lock drops
+        // fails the per-layer batch latch instead, degrading that layer to
+        // the read-only fallback. Taken before the pool dispatch: an edit
+        // during the queue wait now refuses the batches rather than
+        // flipping the gate, the same read-only outcome; the sweep it
+        // permits stays bounded by the single-flight winner guard (see the
+        // sweep note in `execute_captures_walk`).
+        let (entry_mint_epoch, mint_into_tracker) = {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let latch = tracker.mint_epoch(&uri);
+            let latest = self.documents.latest_snapshot(&uri);
+            let current = latest.as_ref().is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == parsed_version
+            });
+            if latest.is_none() {
+                // Reclaim the lock entry edit_lock() materialized for a
+                // closed document (identity+share-checked — see
+                // `remove_edit_lock_if_unshared`).
+                self.documents
+                    .remove_edit_lock_if_unshared(&uri, &edit_lock);
+            }
+            (latch, current)
+        };
         let walk_future = self
             .compute_pool
             .run(Some(cancel_token.clone()), move || {
@@ -955,8 +998,8 @@ impl Kakehashi {
                     &language,
                     &tracker,
                     &documents,
-                    parsed_version,
-                    incarnation,
+                    entry_mint_epoch,
+                    mint_into_tracker,
                     generation,
                     &match_cache,
                     Some(&inner_cancel),
@@ -1052,8 +1095,8 @@ fn execute_captures_walk(
     language: &crate::language::LanguageCoordinator,
     tracker: &crate::language::NodeTracker,
     documents: &crate::document::DocumentStore,
-    parsed_version: u64,
-    incarnation: u64,
+    entry_mint_epoch: (u64, u64),
+    mint_into_tracker: bool,
     generation: u64,
     match_cache: &super::captures_match_cache::CapturesMatchCache,
     cancel: Option<&crate::cancel::CancelToken>,
@@ -1062,33 +1105,24 @@ fn execute_captures_walk(
     // index (didChange shifts every entry before the reparse), so a trailing
     // snapshot's byte offsets must never be written into it — they would be
     // wrong-space entries that later edits keep shifting as if they were live
-    // (the "a stale read never mints" invariant, see snapshot_read.rs). The
-    // handler resolves a CURRENT snapshot (serve-current park), but an edit
-    // can land between that resolution and this work-unit reaching the front
-    // of the pool queue; a walk that starts outrun still returns matches
-    // (voided later by the lineage gate) but goes READ-ONLY on the tracker: a
-    // position the intervening edits did not shift reuses its live id (so
-    // the delta lineage stays a minimal diff), and an unknown position gets
-    // an unregistered id — resolving one via `kakehashi/node/*` yields
-    // `null`, the protocol's re-sync signal, and the client's next
-    // current-snapshot request mints real ones. Checked here inside the
-    // work-unit so the entry window is the walk itself, not the pool-queue
-    // wait; the walk-duration residual — an edit landing DURING the walk —
-    // is closed by the post-walk reconciliation below, which purges this
-    // walk's own mints when the snapshot is no longer current on exit.
-    // Latched BEFORE the currency check: an edit landing between the two
-    // bumps the generation (making later mints purge-eligible) or fails the
-    // currency check itself — either way no wrong-space mint survives. The
-    // epoch half covers close/reopen, which REPLACES the per-URI index (its
-    // generation restarts at 0).
-    let (entry_shift_gen, entry_cleanup_epoch) = tracker.mint_epoch(uri);
-    let mint_into_tracker = documents.latest_snapshot(uri).is_some_and(|view| {
-        view.slot.current_incarnation == incarnation && view.content_version == parsed_version
-    });
-    // Ids THIS walk created (as opposed to reused), with the shift
-    // generation each creation observed — the purge set for the post-walk
-    // reconciliation.
-    let mut minted_ids: Vec<(ulid::Ulid, u64)> = Vec::new();
+    // (the "a stale read never mints" invariant, see snapshot_read.rs).
+    // `entry_mint_epoch` + `mint_into_tracker` are captured by the CALLER,
+    // atomically under the document's edit lock (see `compute_captures`) —
+    // `did_change` shifts the tracker BEFORE it bumps `content_version`
+    // under that lock, so computing the pair lock-free here could observe
+    // the intermediate state and mint old-snapshot coordinates as
+    // correct-at-birth. A stale-at-entry serve (`mint_into_tracker` false)
+    // goes READ-ONLY on the tracker: a position the intervening edits did
+    // not shift reuses its live id (so the delta lineage stays a minimal
+    // diff), and an unknown position gets an unregistered id — resolving
+    // one via `kakehashi/node/*` yields `null`, the protocol's re-sync
+    // signal, and the client's next current-snapshot request mints real
+    // ones. An edit landing AFTER the caller's gate — during the pool-queue
+    // wait or the walk itself — fails the per-layer batch latch instead
+    // (`mint_batch_if_unshifted` re-checks it under the tracker entry's
+    // exclusive lock; the epoch half covers close/reopen, whose per-URI
+    // generation restarts at 0), degrading those layers to the same
+    // read-only resolution. Either way no wrong-space mint EXISTS, ever.
     let mapper = PositionMapper::new(text);
 
     // Range scoping: clamped conversion (like other viewport-shaped
@@ -1217,60 +1251,87 @@ fn execute_captures_walk(
                 (arc, 0)
             }
         };
+        // Per-layer id reconciliation (the §3 walk lever): resolve every
+        // capture's ULID in ONE tracker entry-lock acquisition instead of
+        // one per capture (~20k on an injection-heavy document). Minted in
+        // the layer's depth, so the id resolves in its minting layer via
+        // kakehashi/node/* (per-layer Scope rule). The batch is keyed on the
+        // walk's entry latch: a mid-walk edit refuses it wholesale (nothing
+        // minted — no wrong-space entries, no purge), and the layer degrades
+        // to the stale serve's read-only resolution below. Ids are minted
+        // for every capture, including one whose span later fails position
+        // mapping and is dropped from the response — under a current
+        // snapshot every span maps by construction, so the difference is
+        // theoretical; the alignment (one id per capture, match order) is
+        // what the shaping loop indexes by.
+        let capture_keys = || {
+            layer_matches.iter().flat_map(|m| {
+                m.captures
+                    .iter()
+                    .map(|c| (c.start_byte + anchor, c.end_byte + anchor, c.kind, depth))
+            })
+        };
+        let layer_ulids: Vec<ulid::Ulid> = if mint_into_tracker {
+            tracker.mint_batch_if_unshifted(uri, entry_mint_epoch, capture_keys())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            // Read-only resolution (stale-at-entry serve, or a mid-walk edit
+            // refusing the batch): a position the intervening edits did not
+            // shift reuses its live id; an unknown position gets a fresh
+            // UNREGISTERED id — NOT Ulid::default() (the nil id), since
+            // unregistered ids must still be unique per capture.
+            capture_keys()
+                .map(|(start, end, kind, layer)| {
+                    match tracker.lookup_in_layer(uri, start, end, kind, layer) {
+                        Some(live) => live,
+                        None => ulid::Ulid::new(),
+                    }
+                })
+                .collect()
+        });
+        let mut capture_idx = 0usize;
         for m in layer_matches.iter() {
-            let match_metadata = metadata_object(&m.metadata);
             let captures: Vec<Value> = m
                 .captures
                 .iter()
                 .filter_map(|c| {
+                    // Consume this capture's reconciled id FIRST (the batch
+                    // is aligned one-id-per-capture in match order), so a
+                    // dropped capture cannot shift later captures' ids.
+                    let ulid = layer_ulids[capture_idx];
+                    capture_idx += 1;
                     // A capture whose bytes don't map to positions (corrupt
                     // span) is dropped rather than failing the whole request.
                     let start_byte = c.start_byte + anchor;
                     let end_byte = c.end_byte + anchor;
                     let start = mapper.byte_to_position(start_byte)?;
                     let end = mapper.byte_to_position(end_byte)?;
-                    // Minted in the layer's depth, so the id resolves in
-                    // its minting layer via kakehashi/node/* (per-layer
-                    // Scope rule). Same mint as `mint_node_info`, done via
-                    // the tracker handle since this runs off `self`. On a
-                    // stale serve the tracker is read-only (see the
-                    // currency gate above).
-                    let ulid = if mint_into_tracker {
-                        let (ulid, created, shift_gen) = tracker.get_or_create_in_layer_tracked(
-                            uri, start_byte, end_byte, c.kind, depth,
-                        );
-                        // Recorded for the post-walk purge: if an edit lands
-                        // mid-walk, entries created after its shift were
-                        // minted in a superseded coordinate space and must
-                        // not persist. Both `created` and the observed
-                        // generation are determined atomically under the
-                        // tracker's entry lock, so an id a concurrent,
-                        // still-current request created (and handed out) is
-                        // never mis-attributed here and wrongly purged.
-                        if created {
-                            minted_ids.push((ulid, shift_gen));
-                        }
-                        ulid
-                    } else {
-                        match tracker.lookup_in_layer(uri, start_byte, end_byte, c.kind, depth) {
-                            Some(live) => live,
-                            // NOT Ulid::default() (the nil id): unregistered
-                            // ids must still be unique per capture.
-                            None => ulid::Ulid::new(),
-                        }
-                    };
-                    let node = json!({ "id": ulid.to_string(), "kind": c.kind });
-                    let mut capture = json!({
-                        "name": c.name,
-                        "node": node,
-                        "range": { "start": start, "end": end },
-                    });
+                    // Direct Map construction, MOVING every sub-value: a
+                    // `json!` literal with non-literal expressions funnels
+                    // them through `to_value(&expr)` — a full re-serialization
+                    // (deep copy) of each nested Value plus the drop of the
+                    // original, which profiling showed as ~37% of the walk on
+                    // an injection-heavy document. The field order below IS
+                    // the wire shape (`envelope_wire_shape_is_stable`).
+                    let mut node = serde_json::Map::with_capacity(2);
+                    node.insert("id".to_owned(), Value::String(ulid.to_string()));
+                    node.insert("kind".to_owned(), Value::String(c.kind.to_owned()));
+                    let mut range = serde_json::Map::with_capacity(2);
+                    range.insert("start".to_owned(), position_value(start));
+                    range.insert("end".to_owned(), position_value(end));
+                    let has_meta = !c.metadata.is_empty();
+                    let mut capture = serde_json::Map::with_capacity(3 + usize::from(has_meta));
+                    capture.insert("name".to_owned(), Value::String(c.name.clone()));
+                    capture.insert("node".to_owned(), Value::Object(node));
+                    capture.insert("range".to_owned(), Value::Object(range));
                     // Capture-scoped `#set! @cap key value` metadata,
                     // only when the capture was annotated.
                     if let Some(meta) = metadata_object(&c.metadata) {
-                        capture["metadata"] = meta;
+                        capture.insert("metadata".to_owned(), meta);
                     }
-                    Some(capture)
+                    Some(Value::Object(capture))
                 })
                 .collect();
             // Mirror execute_query's invariant: clients never see an empty
@@ -1278,19 +1339,35 @@ fn execute_captures_walk(
             if captures.is_empty() {
                 continue;
             }
-            let mut envelope = json!({
-                "patternIndex": m.pattern_index,
-                "language": layer_language,
-                "captures": captures,
-            });
+            // Shaped after the empty-captures bail so a skipped envelope
+            // allocates nothing.
+            let match_metadata = metadata_object(&m.metadata);
+            let mut envelope =
+                serde_json::Map::with_capacity(3 + usize::from(match_metadata.is_some()));
+            envelope.insert("patternIndex".to_owned(), Value::from(m.pattern_index));
+            envelope.insert(
+                "language".to_owned(),
+                Value::String(layer_language.to_owned()),
+            );
+            envelope.insert("captures".to_owned(), Value::Array(captures));
             // Match-level `#set!` metadata, only when the pattern set any
             // (treesitter-directive-set!) — absent otherwise, so patterns
             // without directives keep their pre-metadata wire shape.
             if let Some(meta) = match_metadata {
-                envelope["metadata"] = meta;
+                envelope.insert("metadata".to_owned(), meta);
             }
-            matches.push(envelope);
+            matches.push(Value::Object(envelope));
         }
+        // The alignment contract the unchecked indexing above relies on:
+        // `capture_keys()` and the shaping loop enumerate the same captures
+        // in the same order, so the loop consumes EXACTLY the batch. A
+        // future divergence (a filter on one side but not the other) trips
+        // this in tests instead of panicking on an index in production.
+        debug_assert_eq!(
+            capture_idx,
+            layer_ulids.len(),
+            "capture_keys() and the shaping loop must enumerate the same captures"
+        );
     };
 
     if injection {
@@ -1328,33 +1405,10 @@ fn execute_captures_walk(
         visit(language_id, tree, 0);
     }
 
-    // Post-walk reconciliation, the other half of the currency gate: the
-    // entry latch cannot see an edit (or close/reopen) that lands DURING the
-    // walk. A creation whose observed shift generation still equals the
-    // entry latch — with the cleanup epoch also unchanged — is
-    // correct-at-birth: no edit intervened, and later edits shift it like
-    // any live entry. A generation mismatch means the mint landed AFTER some
-    // edit's shift, i.e. in a superseded coordinate space — coordinate
-    // comparison could not detect this once a second edit moves the
-    // wrong-space entry again. An epoch mismatch means a close/reopen
-    // replaced some index mid-walk (per-URI generations restart at 0, so
-    // the generation alone could ABA); purging our own mints then is
-    // conservative but bounded — one null re-sync. The response still
-    // carries purged ids, which resolve `null` (the protocol's re-sync
-    // signal), the same degradation as a stale-at-entry serve.
-    if !minted_ids.is_empty() {
-        let (_, exit_cleanup_epoch) = tracker.mint_epoch(uri);
-        for (id, shift_gen) in &minted_ids {
-            if *shift_gen != entry_shift_gen || exit_cleanup_epoch != entry_cleanup_epoch {
-                tracker.remove_id(uri, id);
-            }
-        }
-    }
-
     // A cancelled walk must not shape a partial result: the caller answers
     // the protocol cancellation, and nothing may reach the walk memo. The
-    // minted-id reconciliation above still ran, so entries minted before the
-    // bail were purged/kept under the same rules as a completed walk — only
+    // per-layer batch mints that ran before the bail were latch-gated
+    // (correct-at-birth), so no post-walk reconciliation is needed — only
     // the response is discarded.
     if crate::cancel::is_cancelled(cancel) {
         return None;
@@ -1836,13 +1890,7 @@ mod tests {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///stale_mint.rs").unwrap();
         store.insert(uri.clone(), text.to_string(), Some("rust".into()), None);
-        let incarnation = store
-            .latest_snapshot(&uri)
-            .unwrap()
-            .slot
-            .current_incarnation;
-
-        // Current (parsed_version == content_version == 0): minting is live.
+        // Current serve: the caller-computed gate is true (minting live).
         let tracker = NodeTracker::new();
         let match_cache = super::super::captures_match_cache::CapturesMatchCache::new();
         let (matches, _) = execute_captures_walk(
@@ -1857,8 +1905,8 @@ mod tests {
             &coordinator,
             &tracker,
             &store,
-            0,
-            incarnation,
+            tracker.mint_epoch(&uri),
+            true,
             0,
             &match_cache,
             None,
@@ -1887,8 +1935,8 @@ mod tests {
             &coordinator,
             &tracker,
             &store,
-            0,
-            incarnation,
+            tracker.mint_epoch(&uri),
+            false,
             0,
             &match_cache,
             None,
@@ -1919,8 +1967,8 @@ mod tests {
             &coordinator,
             &stale_tracker,
             &store,
-            0,
-            incarnation,
+            stale_tracker.mint_epoch(&uri),
+            false,
             0,
             &match_cache,
             None,
@@ -1988,15 +2036,15 @@ mod tests {
 
     impl MatchCacheRig {
         fn new(uri: &str, text: &str) -> Self {
+            Self::new_with_query(uri, text, "(identifier) @local.reference\n")
+        }
+
+        fn new_with_query(uri: &str, text: &str, locals_scm: &str) -> Self {
             use crate::config::WorkspaceSettings;
             let dir = tempfile::tempdir().unwrap();
             let query_dir = dir.path().join("queries/rust");
             std::fs::create_dir_all(&query_dir).unwrap();
-            std::fs::write(
-                query_dir.join("locals.scm"),
-                "(identifier) @local.reference\n",
-            )
-            .unwrap();
+            std::fs::write(query_dir.join("locals.scm"), locals_scm).unwrap();
             let coordinator = std::sync::Arc::new(crate::language::LanguageCoordinator::new());
             coordinator.load_settings(&WorkspaceSettings {
                 search_paths: vec![dir.path().to_string_lossy().into_owned()],
@@ -2025,7 +2073,7 @@ mod tests {
             parsed_version: u64,
             lsp_range: Option<Range>,
         ) -> Option<(Vec<Value>, Vec<Value>)> {
-            self.walk_with(text, layers, parsed_version, lsp_range, true, None)
+            self.walk_with(text, layers, parsed_version, lsp_range, true, None, 0)
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -2037,6 +2085,11 @@ mod tests {
             lsp_range: Option<Range>,
             injection: bool,
             cancel: Option<&crate::cancel::CancelToken>,
+            // The kind-query compile cache is PROCESS-WIDE, keyed
+            // (language, kind file, generation) — a rig with a custom
+            // locals.scm must walk under a generation no other test uses,
+            // or it silently serves another rig's compiled query.
+            generation: u64,
         ) -> Option<(Vec<Value>, Vec<Value>)> {
             let mut parser = tree_sitter::Parser::new();
             parser
@@ -2049,6 +2102,13 @@ mod tests {
                 .unwrap()
                 .slot
                 .current_incarnation;
+            // Latch-then-validate, mirroring the production caller
+            // (`compute_captures` takes both under the edit lock).
+            let entry_mint_epoch = self.tracker.mint_epoch(&self.uri);
+            let mint_into_tracker = self.store.latest_snapshot(&self.uri).is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == parsed_version
+            });
             execute_captures_walk(
                 &self.uri,
                 "locals",
@@ -2061,13 +2121,184 @@ mod tests {
                 &self.coordinator,
                 &self.tracker,
                 &self.store,
-                parsed_version,
-                incarnation,
-                0,
+                entry_mint_epoch,
+                mint_into_tracker,
+                generation,
                 &self.match_cache,
                 cancel,
             )
         }
+    }
+
+    /// Batch id reconciliation alignment: every capture in a current serve
+    /// carries the id of ITS OWN span — resolvable via `lookup_node` to
+    /// exactly the byte range and kind the response reports for it. An
+    /// off-by-one in the one-id-per-capture alignment (e.g. a dropped
+    /// capture shifting later ids) would pair some capture with a
+    /// neighbor's id and fail the span equality.
+    #[test]
+    fn current_serve_ids_align_one_per_capture_with_their_own_spans() {
+        let code = "let alpha = beta + gamma;\n";
+        let text = format!("AAAA\n{code}");
+        let start = text.find(code).unwrap();
+        let rig = MatchCacheRig::new("file:///batch_align.rs", &text);
+        let layer = rust_layer(&text, start, text.len());
+        let (matches, _) = rig
+            .walk(&text, &[layer], 0, None)
+            .expect("kind query should load");
+        let mapper = PositionMapper::new(&text);
+        let to_pos = |p: &Value| {
+            tower_lsp_server::ls_types::Position::new(
+                u32::try_from(p["line"].as_u64().unwrap()).unwrap(),
+                u32::try_from(p["character"].as_u64().unwrap()).unwrap(),
+            )
+        };
+        let mut seen = 0;
+        for m in &matches {
+            for c in m["captures"].as_array().unwrap() {
+                let id: ulid::Ulid = c["node"]["id"].as_str().unwrap().parse().unwrap();
+                let (s, e, kind, _layer) = rig
+                    .tracker
+                    .lookup_node(&rig.uri, &id)
+                    .expect("a current serve mints resolvable ids");
+                assert_eq!(
+                    mapper.position_to_byte_clamped(to_pos(&c["range"]["start"])),
+                    s,
+                    "capture start must be the id's own tracked start"
+                );
+                assert_eq!(
+                    mapper.position_to_byte_clamped(to_pos(&c["range"]["end"])),
+                    e,
+                    "capture end must be the id's own tracked end"
+                );
+                assert_eq!(c["node"]["kind"].as_str().unwrap(), kind);
+                seen += 1;
+            }
+        }
+        assert!(
+            seen >= 4,
+            "host and layer captures should both contribute (got {seen})"
+        );
+    }
+
+    /// The wire shape of a match envelope, pinned byte-for-byte — field
+    /// order included. The shaping loop builds envelopes by direct Map
+    /// construction (moving sub-values instead of re-serializing them
+    /// through the json! macro), and this serialization is what keeps that
+    /// construction from drifting the JSON the captures protocol documents.
+    #[test]
+    fn envelope_wire_shape_is_stable() {
+        let text = "fn x() {}\n";
+        let rig = MatchCacheRig::new("file:///wire_shape.rs", text);
+        let (matches, _) = rig
+            .walk(text, &[], 0, None)
+            .expect("kind query should load");
+        assert_eq!(matches.len(), 1, "one identifier expected");
+        let m = &matches[0];
+        let id = m["captures"][0]["node"]["id"].as_str().unwrap().to_owned();
+        let expected = format!(
+            "{{\"patternIndex\":0,\"language\":\"rust\",\"captures\":[\
+             {{\"name\":\"local.reference\",\
+             \"node\":{{\"id\":\"{id}\",\"kind\":\"identifier\"}},\
+             \"range\":{{\"start\":{{\"line\":0,\"character\":3}},\
+             \"end\":{{\"line\":0,\"character\":4}}}}}}]}}"
+        );
+        assert_eq!(serde_json::to_string(m).unwrap(), expected);
+    }
+
+    /// The dropped-capture half of the alignment invariant: a capture whose
+    /// span fails position mapping is dropped from the response, and the
+    /// SURVIVING captures must keep their own ids — consuming the batch
+    /// index after the drop (instead of before) would hand the survivor the
+    /// dropped capture's id. Unmappable spans cannot come from a real tree,
+    /// so one is planted as a cached-matches sentinel (the walk trusts the
+    /// content-addressed cache).
+    #[test]
+    fn dropped_capture_does_not_shift_surviving_capture_ids() {
+        let text = "fn x() {}\n";
+        let rig = MatchCacheRig::new("file:///drop_align.rs", text);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let (anchor, hash) =
+            super::super::captures_match_cache::tree_cache_key("locals", "rust", &tree, text);
+        assert_eq!(anchor, 0, "host layer anchors at 0");
+        rig.match_cache.store_host(
+            &rig.uri,
+            "locals",
+            hash,
+            0,
+            std::sync::Arc::new(vec![crate::language::query_exec::MatchData {
+                pattern_index: 0,
+                captures: vec![
+                    // Unmappable span (beyond EOF): dropped by the position
+                    // filter AFTER its id was consumed from the batch.
+                    crate::language::query_exec::CapturedNode {
+                        name: "dropped".to_string(),
+                        start_byte: text.len() + 10,
+                        end_byte: text.len() + 12,
+                        kind: "identifier",
+                        metadata: Vec::new(),
+                    },
+                    crate::language::query_exec::CapturedNode {
+                        name: "survivor".to_string(),
+                        start_byte: 3,
+                        end_byte: 4,
+                        kind: "identifier",
+                        metadata: Vec::new(),
+                    },
+                ],
+                metadata: Vec::new(),
+            }]),
+            || true,
+        );
+
+        let (matches, _) = rig
+            .walk(text, &[], 0, None)
+            .expect("kind query should load");
+        let envelope = &matches[0];
+        let captures = envelope["captures"].as_array().unwrap();
+        assert_eq!(captures.len(), 1, "the unmappable capture is dropped");
+        assert_eq!(captures[0]["name"], "survivor");
+        let id: ulid::Ulid = captures[0]["node"]["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            rig.tracker.lookup_node(&rig.uri, &id),
+            Some((3, 4, "identifier", 0)),
+            "the survivor must keep ITS OWN id, not inherit the dropped capture's"
+        );
+    }
+
+    /// Wire position of the optional `metadata` field, pinned byte-for-byte
+    /// at both levels: last key of the capture object and last key of the
+    /// match envelope (the `#set!` directives' documented shape).
+    #[test]
+    fn metadata_wire_position_is_stable() {
+        let text = "fn x() {}\n";
+        let rig = MatchCacheRig::new_with_query(
+            "file:///wire_shape_meta.rs",
+            text,
+            "((identifier) @local.reference\n  (#set! @local.reference ck \"cv\")\n  (#set! mk \"mv\"))\n",
+        );
+        // Unique generation: the process-wide kind-query compile cache would
+        // otherwise serve another rig's plain locals.scm (see walk_with).
+        let (matches, _) = rig
+            .walk_with(text, &[], 0, None, true, None, 7777)
+            .expect("kind query should load");
+        assert_eq!(matches.len(), 1, "one identifier expected");
+        let m = &matches[0];
+        let id = m["captures"][0]["node"]["id"].as_str().unwrap().to_owned();
+        let expected = format!(
+            "{{\"patternIndex\":0,\"language\":\"rust\",\"captures\":[\
+             {{\"name\":\"local.reference\",\
+             \"node\":{{\"id\":\"{id}\",\"kind\":\"identifier\"}},\
+             \"range\":{{\"start\":{{\"line\":0,\"character\":3}},\
+             \"end\":{{\"line\":0,\"character\":4}}}},\
+             \"metadata\":{{\"ck\":\"cv\"}}}}],\
+             \"metadata\":{{\"mk\":\"mv\"}}}}"
+        );
+        assert_eq!(serde_json::to_string(m).unwrap(), expected);
     }
 
     fn capture_names(matches: &[Value]) -> Vec<String> {
@@ -2383,6 +2614,7 @@ mod tests {
             None,
             true,
             Some(&cancel),
+            0,
         );
         assert!(cancelled.is_none(), "a cancelled walk serves nothing");
         assert!(
@@ -2398,7 +2630,7 @@ mod tests {
     fn host_slot_serves_on_content_recurrence() {
         let text = "let a = 1;\n";
         let rig = MatchCacheRig::new("file:///match_cache_host.rs", text);
-        rig.walk_with(text, &[], 0, None, false, None)
+        rig.walk_with(text, &[], 0, None, false, None, 0)
             .expect("kind query should load");
 
         // Host key for the same content: parse without included ranges.
@@ -2437,7 +2669,7 @@ mod tests {
 
         // Same content again (undo/redo shape): must serve the host slot.
         let (matches, _) = rig
-            .walk_with(text, &[], 0, None, false, None)
+            .walk_with(text, &[], 0, None, false, None, 0)
             .expect("kind query should load");
         assert!(
             capture_names(&matches)

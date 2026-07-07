@@ -30,12 +30,13 @@ use url::Url;
 pub(crate) struct NodeTracker {
     entries: DashMap<Url, UriEntries>,
     /// Bumped by every [`cleanup`](Self::cleanup) (didClose). Folded into the
-    /// serve-stale walks' generation latch so a close/reopen — which removes
-    /// the per-URI index and would reset its `shift_gen` to 0 (ABA) — can
-    /// never make an old-lifetime latch compare equal. Global (not per-URI)
-    /// so closed documents leave NO retained state; the cost is that a close
-    /// of any document mid-walk purges that walk's own mints — a rare event
-    /// with a one-null-re-sync consequence.
+    /// mint latch ([`mint_epoch`](Self::mint_epoch)) so a close/reopen —
+    /// which removes the per-URI index and would reset its `shift_gen` to 0
+    /// (ABA) — can never make an old-lifetime latch compare equal. Global
+    /// (not per-URI) so closed documents leave NO retained state; the cost
+    /// is that a close of any document mid-pass refuses that pass's
+    /// remaining mint batches — a rare event with a one-null-re-sync
+    /// consequence.
     cleanup_epoch: std::sync::atomic::AtomicU64,
 }
 
@@ -51,34 +52,24 @@ struct UriEntries {
     reverse: HashMap<Ulid, PositionKey>,
     /// Count of coordinate shifts (edit applications) this index has
     /// received. Read/written under the same DashMap entry lock as the maps,
-    /// so a mint that records the generation it observed can atomically
-    /// prove "no shift intervened between my snapshot's currency check and
-    /// this insert" — the serve-stale purge's correct-at-birth predicate
-    /// (coordinate comparison alone cannot: with two mid-walk edits, an
-    /// entry minted between them is shifted by the second yet still missed
-    /// the first).
+    /// so [`mint_batch_if_unshifted`](NodeTracker::mint_batch_if_unshifted)
+    /// can atomically prove "no shift intervened between the pass's latch
+    /// and this batch" — the correct-at-birth predicate (coordinate
+    /// comparison alone cannot: with two mid-pass edits, an entry minted
+    /// between them is shifted by the second yet still missed the first).
     shift_gen: u64,
 }
 
 impl UriEntries {
     /// Get or insert a ULID for a position key, keeping both maps in sync.
     fn get_or_insert(&mut self, key: PositionKey) -> Ulid {
-        self.get_or_insert_tracked(key).0
-    }
-
-    /// [`get_or_insert`](Self::get_or_insert) that also reports whether this
-    /// call CREATED the id (`true`) or found an existing one (`false`) — an
-    /// atomic distinction the serve-stale purge needs: a separate
-    /// lookup-then-create races a concurrent creator, mis-attributing (and
-    /// then wrongly purging) an id another, still-current request handed out.
-    fn get_or_insert_tracked(&mut self, key: PositionKey) -> (Ulid, bool, u64) {
         if let Some(existing) = self.forward.get(&key) {
-            return (*existing, false, self.shift_gen);
+            return *existing;
         }
         let ulid = Ulid::new();
         self.forward.insert(key, ulid);
         self.reverse.insert(ulid, key);
-        (ulid, true, self.shift_gen)
+        ulid
     }
 
     /// Lookup a position key by ULID.
@@ -338,40 +329,11 @@ impl NodeTracker {
         entry.get_or_insert(key)
     }
 
-    /// [`get_or_create_in_layer`](Self::get_or_create_in_layer) that also
-    /// reports whether this call CREATED the id — atomically under the same
-    /// entry lock, so a concurrent creator can never be mis-attributed. The
-    /// serve-stale captures walk purges only ids it created itself; purging
-    /// on a lookup-then-create basis would race another, still-current
-    /// request into handing out an id this walk then deletes. The third
-    /// element is the [`shift generation`](Self::shift_generation) observed
-    /// atomically with the insert: a creation whose generation equals the
-    /// one latched alongside the walk's currency check is correct-at-birth
-    /// (no edit shift intervened); a mismatch marks the entry as minted in a
-    /// superseded coordinate space.
-    pub(crate) fn get_or_create_in_layer_tracked(
-        &self,
-        uri: &Url,
-        start: usize,
-        end: usize,
-        kind: &'static str,
-        layer: usize,
-    ) -> (Ulid, bool, u64) {
-        let key = PositionKey::new(start, end, kind, layer);
-        // `get_mut` first: the hot path (index already exists) avoids the
-        // `Url` clone `entry()` needs for its owned key.
-        if let Some(mut entry) = self.entries.get_mut(uri) {
-            return entry.get_or_insert_tracked(key);
-        }
-        let mut entry = self.entries.entry(uri.clone()).or_default();
-        entry.get_or_insert_tracked(key)
-    }
-
     /// The count of coordinate shifts (edit applications) `uri`'s index has
-    /// received — see `get_or_create_in_layer_tracked` for the atomicity
-    /// contract. `0` for an index no edit has touched yet (edits bump the
-    /// generation even for a URI with no entries, so a latch taken before
-    /// the first mint still detects an intervening shift).
+    /// received — see [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted)
+    /// for the atomicity contract. `0` for an index no edit has touched yet
+    /// (edits bump the generation even for a URI with no entries, so a latch
+    /// taken before the first mint still detects an intervening shift).
     pub(crate) fn shift_generation(&self, uri: &Url) -> u64 {
         self.entries.get(uri).map(|e| e.shift_gen).unwrap_or(0)
     }
@@ -409,24 +371,6 @@ impl NodeTracker {
         let entries = self.entries.get(uri)?;
         let key = entries.lookup(ulid)?;
         Some((key.start_byte, key.end_byte, key.kind, key.layer))
-    }
-
-    /// Remove `ulid` from `uri`'s index (both directions).
-    ///
-    /// Used by the serve-stale walks' post-walk reconciliation: an id whose
-    /// creation observed a shift generation different from the one latched
-    /// with the walk's currency check was minted in a superseded coordinate
-    /// space (it missed at least one edit's correction — coordinate
-    /// comparison cannot detect this once a LATER edit moves the entry
-    /// again) and must not persist as live. The removed id then resolves
-    /// like a never-issued one — the captures protocol's re-sync signal (no
-    /// tombstone, per lazy-node-identity-tracking).
-    pub(crate) fn remove_id(&self, uri: &Url, ulid: &Ulid) {
-        if let Some(mut entries) = self.entries.get_mut(uri)
-            && let Some(key) = entries.reverse.remove(ulid)
-        {
-            entries.forward.remove(&key);
-        }
     }
 
     /// Get the ULID for a position in a layer if it exists, without creating
@@ -712,14 +656,66 @@ impl NodeTracker {
     ///
     /// Called on didClose to prevent memory leaks. The removal resets the
     /// URI's `shift_gen`, so the global [`cleanup_epoch`](Self::cleanup_epoch)
-    /// is bumped instead: the serve-stale walks fold it into their latch
+    /// is bumped instead: the latch-gated passes fold it into their latch
     /// ([`mint_epoch`](Self::mint_epoch)), making an old-lifetime latch
     /// unequal to any post-close/reopen observation without retaining any
     /// per-closed-URI state.
-    pub(crate) fn cleanup(&self, uri: &Url) {
-        self.entries.remove(uri);
+    ///
+    /// The bump runs BEFORE the removal, and the order is load-bearing: a
+    /// latch check that passes reads the pre-bump epoch, so it strictly
+    /// precedes this close in epoch order, and whatever it minted is wiped
+    /// by the removal that follows — a closed document still leaves no
+    /// state. Removing FIRST would open a gap where a pre-close latch
+    /// `(0, E)` re-materializes the just-removed entry (`or_default`,
+    /// `shift_gen` back at 0) and passes against the not-yet-bumped epoch,
+    /// leaving stale-lifetime coordinates alive in a reopened document's
+    /// index with nothing left to reclaim them.
+    ///
+    /// `reopened` guards the removal against the inverse race: didClose
+    /// runs this AFTER removing the document and OUTSIDE `edit_lock`, so a
+    /// fast reopen's parse may already have minted the NEW lifetime's ids
+    /// into this entry — an unconditional wipe would publish a snapshot
+    /// whose ids immediately resolve `null`. The probe is evaluated under
+    /// the entry's exclusive lock: probe-sees-open ⇒ the entry is the
+    /// reopened document's live index, keep it (the epoch bump above still
+    /// refuses any old-lifetime latch; old-lifetime entries it may carry
+    /// are position-keyed and bounded, invalidated by the new lifetime's
+    /// edits like any other). ACCEPTED residual of that keep: a pre-close
+    /// id can stay resolvable against the reopened document instead of
+    /// degrading to `null` — this is the didOpen-racing-didClose lifecycle
+    /// class the close path deliberately defers to a per-document
+    /// lifecycle-epoch gate (see the residual notes in `did_close.rs`);
+    /// separating the lifetimes here would need incarnation-tagged
+    /// entries, while the alternative (unconditional wipe) nulls the
+    /// reopened snapshot's ENTIRE id set — strictly worse.
+    /// Probe-sees-closed ⇒ no new-lifetime mint can
+    /// have happened — mints are liveness-gated on the reopened snapshot,
+    /// whose insert happens-before any mint that passed the gate, which
+    /// happens-before this probe under the same entry lock — so the removal
+    /// reclaims only old-lifetime state.
+    ///
+    /// Lock-order contract: `reopened` runs while this method holds `uri`'s
+    /// entry (shard) lock, so it MUST NOT touch this tracker (self-deadlock)
+    /// and may only take locks that never call back into the tracker while
+    /// held — the document-store read the didClose probe performs is fine
+    /// (the store never re-enters the tracker under its own locks); a future
+    /// probe must preserve that one-way ordering.
+    ///
+    /// Memory-ordering note (why `Release` on the bump suffices, no
+    /// `SeqCst` needed): the only way another thread can OBSERVE the
+    /// removal is through the entry's shard lock (`get_mut` /
+    /// `entry().or_default()`), and that lock's release/acquire pair makes
+    /// every write sequenced before the removal — including this bump —
+    /// visible to the observer, so a check that finds the entry gone always
+    /// reads the bumped epoch and refuses. A check that instead wins the
+    /// shard lock BEFORE the removal may still read the pre-bump epoch and
+    /// pass, but it then minted into the still-present entry, which the
+    /// removal (queued behind that same lock) wipes — a closed document
+    /// leaves no state on either interleaving.
+    pub(crate) fn cleanup(&self, uri: &Url, reopened: impl FnOnce() -> bool) {
         self.cleanup_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.entries.remove_if(uri, |_, _| !reopened());
     }
 
     /// Run `commit` only if `uri`'s (shift generation, cleanup epoch) still
@@ -754,11 +750,89 @@ impl NodeTracker {
         Some(commit())
     }
 
-    /// The (per-URI shift generation, global cleanup epoch) pair the
-    /// serve-stale walks latch alongside their currency check and compare at
-    /// exit: a mismatch in either half means the mint landed in a superseded
-    /// coordinate space (an edit shifted the index, or a close/reopen
-    /// replaced it) and must be purged.
+    /// Mint every `(start, end, kind, layer)` key — reusing an existing id
+    /// by position, drawing a fresh ULID for a genuinely new key — under ONE
+    /// acquisition of the URI's entry lock, but only if the (shift
+    /// generation, cleanup epoch) latch still equals `expected`.
+    ///
+    /// This is the mint half of the parse-snapshot ADR §3 **reconciliation
+    /// step**: the latch is checked while HOLDING the entry's exclusive lock
+    /// — the same lock coordinate shifts (`apply_*_edits`) and `cleanup`
+    /// acquire — so a batch that passes serializes strictly before any
+    /// concurrent shift. Every id it mints is therefore *correct-at-birth*
+    /// (its coordinates match the live text at mint time; later edits shift
+    /// it like any live entry), which is why callers need no post-pass purge
+    /// set: a refused batch (`None`) minted **nothing** — the stale pass
+    /// simply defers identity to the next current pass. Correct-at-birth is
+    /// **relative to the latch**: the batch only proves no shift happened
+    /// since `expected` was read, so callers must take it (via
+    /// [`mint_epoch`](Self::mint_epoch)) at or before validating that the
+    /// coordinates they are about to mint belong to the live text.
+    ///
+    /// `keys` is consumed while this method holds the entry's exclusive
+    /// lock — like `commit_if_unshifted`'s closure, it MUST NOT touch this
+    /// tracker (a re-entrant access to the same URI or shard would
+    /// self-deadlock). An entry materialized only to fail the check stays
+    /// behind as an empty index — the same bounded residue
+    /// [`commit_if_unshifted`](Self::commit_if_unshifted) documents.
+    ///
+    /// Returns the ids aligned with `keys`' iteration order.
+    pub(crate) fn mint_batch_if_unshifted(
+        &self,
+        uri: &Url,
+        expected: (u64, u64),
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
+    ) -> Option<Vec<Ulid>> {
+        // `get_mut` first: the hot path (index already exists — every batch
+        // after a document's first) avoids the `Url` clone `entry()` needs
+        // for its owned key. The absent-entry `entry().or_default()`
+        // fallback stays load-bearing: it serializes the latch check with a
+        // concurrent FIRST edit on a never-minted URI.
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            return self.mint_batch_in_entry(&mut entry, expected, keys);
+        }
+        let mut entry = self.entries.entry(uri.clone()).or_default();
+        self.mint_batch_in_entry(&mut entry, expected, keys)
+    }
+
+    /// The latch check + mint body of
+    /// [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted), run while
+    /// the caller holds `entry`'s exclusive lock.
+    fn mint_batch_in_entry(
+        &self,
+        entry: &mut UriEntries,
+        expected: (u64, u64),
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
+    ) -> Option<Vec<Ulid>> {
+        let epoch = self
+            .cleanup_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if (entry.shift_gen, epoch) != expected {
+            return None;
+        }
+        Some(
+            keys.into_iter()
+                .map(|(start, end, kind, layer)| {
+                    entry.get_or_insert(PositionKey::new(start, end, kind, layer))
+                })
+                .collect(),
+        )
+    }
+
+    /// The (per-URI shift generation, global cleanup epoch) pair a pass
+    /// latches at entry and hands to
+    /// [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted): a
+    /// mismatch in either half means the pass's coordinates were superseded
+    /// (an edit shifted the index, or a close/reopen replaced it) and the
+    /// batch refuses to mint.
+    ///
+    /// The two halves are read WITHOUT mutual synchronization, so a
+    /// close+reopen completing between them yields a mixed
+    /// `(old_gen, new_epoch)` latch that can match the reopened index.
+    /// Callers therefore must latch FIRST and validate the pass's
+    /// liveness/currency (incarnation, snapshot version) AFTER — only a
+    /// post-latch check is guaranteed to observe the lifetime change that
+    /// produced the mixed latch and bail before minting under it.
     pub(crate) fn mint_epoch(&self, uri: &Url) -> (u64, u64) {
         (
             self.shift_generation(uri),
@@ -782,38 +856,92 @@ mod tests {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
     }
 
-    /// The tracked mint reports created-vs-reused and the observed shift
-    /// generation atomically; `remove_id` erases both directions with no
-    /// tombstone (a later mint draws a fresh id).
+    /// The batch reconciliation mint reuses an existing id by position and
+    /// mints fresh ids for genuinely new keys — all under one entry lock,
+    /// gated on the latch (parse-snapshot ADR §3 reconciliation).
     #[test]
-    fn tracked_mint_reports_creation_and_shift_generation_atomically() {
+    fn batch_mint_reuses_by_position_and_mints_new_under_one_latch() {
         let tracker = NodeTracker::new();
-        let uri = test_uri("purge");
-        let (id, created, observed_gen) =
-            tracker.get_or_create_in_layer_tracked(&uri, 0, 4, "word", 1);
-        assert!(created, "first mint creates");
-        assert_eq!(observed_gen, 0, "no edit has shifted this index yet");
-        let (again, created_again, _) =
-            tracker.get_or_create_in_layer_tracked(&uri, 0, 4, "word", 1);
-        assert_eq!(again, id);
-        assert!(!created_again, "re-mint reuses, atomically attributed");
-
-        tracker.remove_id(&uri, &id);
-        assert!(tracker.lookup_node(&uri, &id).is_none(), "reverse purged");
+        let uri = test_uri("batch_mint");
+        let existing = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 0);
+        let latch = tracker.mint_epoch(&uri);
+        let ulids = tracker
+            .mint_batch_if_unshifted(&uri, latch, [(0, 4, "word", 0), (10, 14, "word", 1)])
+            .expect("an unshifted latch mints");
+        assert_eq!(ulids[0], existing, "existing position reuses its id");
         assert_eq!(
-            tracker.lookup_in_layer(&uri, 0, 4, "word", 1),
-            None,
-            "forward purged"
+            tracker.lookup_in_layer(&uri, 10, 14, "word", 1),
+            Some(ulids[1]),
+            "new position minted live"
         );
-
-        let fresh = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 1);
-        assert_ne!(fresh, id, "re-mint draws a fresh id");
     }
 
-    /// Every edit application advances the shift generation — including on a
-    /// URI with no entries yet — and a post-edit mint observes the advanced
-    /// generation, marking it as minted in a superseded coordinate space
-    /// relative to a pre-edit latch.
+    /// A latch an edit has shifted refuses the whole batch — nothing is
+    /// minted (the stale pass defers to the next current pass; there is no
+    /// purge because there is nothing to purge).
+    #[test]
+    fn batch_mint_refuses_shifted_latch_and_mints_nothing() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("batch_mint_shifted");
+        let latch = tracker.mint_epoch(&uri);
+        let _ = tracker.apply_input_edits(&uri, &[EditInfo::new(0, 0, 3)]);
+        assert_eq!(
+            tracker.mint_batch_if_unshifted(&uri, latch, [(0, 4, "word", 0)]),
+            None,
+            "a shifted latch refuses"
+        );
+        assert_eq!(
+            tracker.lookup_in_layer(&uri, 0, 4, "word", 0),
+            None,
+            "the refused batch minted nothing"
+        );
+    }
+
+    /// A close raced by a completed reopen (the probe sees the document
+    /// open again) keeps the reopened lifetime's index — its freshly minted
+    /// ids must survive — while the epoch bump still refuses any
+    /// old-lifetime latch.
+    #[test]
+    fn cleanup_keeps_reopened_index_but_still_bumps_epoch() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("cleanup_reopen");
+        // Stands in for the reopened lifetime's first mint, which the raced
+        // didClose's cleanup must not wipe.
+        let id = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 0);
+        let pre_close_latch = tracker.mint_epoch(&uri);
+        tracker.cleanup(&uri, || true);
+        assert_eq!(
+            tracker.lookup_in_layer(&uri, 0, 4, "word", 0),
+            Some(id),
+            "a reopened document's index survives the raced close"
+        );
+        assert_eq!(
+            tracker.mint_batch_if_unshifted(&uri, pre_close_latch, [(10, 14, "word", 0)]),
+            None,
+            "the epoch bump still refuses latches taken before the close"
+        );
+    }
+
+    /// A close (any document's) bumps the global cleanup epoch, so a latch
+    /// taken before it refuses — the close/reopen ABA guard the per-URI
+    /// generation alone cannot provide.
+    #[test]
+    fn batch_mint_refuses_after_cleanup_epoch_bump() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("batch_mint_cleanup");
+        let other = test_uri("batch_mint_other");
+        let latch = tracker.mint_epoch(&uri);
+        tracker.cleanup(&other, || false);
+        assert_eq!(
+            tracker.mint_batch_if_unshifted(&uri, latch, [(0, 4, "word", 0)]),
+            None
+        );
+    }
+
+    /// Edit application advances the shift generation — including on a URI
+    /// with no entries yet — and a latch taken AFTER the edit still mints.
+    /// (That a latch taken BEFORE the edit refuses is pinned separately by
+    /// `batch_mint_refuses_shifted_latch_and_mints_nothing`.)
     #[test]
     fn shift_generation_advances_on_every_edit_even_without_entries() {
         let tracker = NodeTracker::new();
@@ -828,12 +956,12 @@ mod tests {
             "the latch-before-first-mint case must detect this edit"
         );
 
-        let (_, created, observed_gen) =
-            tracker.get_or_create_in_layer_tracked(&uri, 10, 14, "word", 0);
-        assert!(created);
-        assert_eq!(
-            observed_gen, 1,
-            "a post-edit mint observes the advanced generation"
+        let post_edit_latch = tracker.mint_epoch(&uri);
+        assert!(
+            tracker
+                .mint_batch_if_unshifted(&uri, post_edit_latch, [(10, 14, "word", 0)])
+                .is_some(),
+            "a latch taken after the edit mints"
         );
 
         let _ = tracker.apply_text_diff(&uri, "aaaa aaaa aaaa", "aaaa aaaa bbbb aaaa");
@@ -848,7 +976,7 @@ mod tests {
         // to a post-reopen observation — including for a URI that never
         // tracked a node.
         let (_, epoch_before) = tracker.mint_epoch(&uri);
-        tracker.cleanup(&uri);
+        tracker.cleanup(&uri, || false);
         let (gen_after, epoch_after) = tracker.mint_epoch(&uri);
         assert_eq!(gen_after, 0, "the fresh index restarts at generation 0");
         assert!(
@@ -998,7 +1126,7 @@ mod tests {
         let ulid_before = tracker.get_or_create(&uri, 0, 10, "code_block");
 
         // Cleanup
-        tracker.cleanup(&uri);
+        tracker.cleanup(&uri, || false);
 
         // After cleanup, same key should create NEW ULID
         let ulid_after = tracker.get_or_create(&uri, 0, 10, "code_block");
@@ -1020,7 +1148,7 @@ mod tests {
         let _ulid2 = tracker.get_or_create(&uri2, 0, 10, "code_block");
 
         // Cleanup only uri2
-        tracker.cleanup(&uri2);
+        tracker.cleanup(&uri2, || false);
 
         // uri1 should still have its ULID
         let ulid1_after = tracker.get_or_create(&uri1, 0, 10, "code_block");
@@ -1068,7 +1196,7 @@ mod tests {
         let ulid = tracker.get_or_create(&uri, 10, 20, "block");
         assert!(tracker.lookup_position(&uri, &ulid).is_some());
 
-        tracker.cleanup(&uri);
+        tracker.cleanup(&uri, || false);
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),

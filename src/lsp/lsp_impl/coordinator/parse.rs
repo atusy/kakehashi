@@ -278,10 +278,59 @@ impl ParseCoordinator {
         text: std::sync::Arc<str>,
         tree: tree_sitter::Tree,
         language_name: String,
+        incarnation: u64,
+        content_version: u64,
     ) -> PopulatedSnapshotRegions {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        // Latch + at-mint validity gate, taken UNDER this document's edit
+        // lock so the pair is atomic against `did_change` (which holds the
+        // same lock across its tracker edit-shift AND its
+        // `content_version` bump — the ADR's "only the fast tracker-mint
+        // runs under edit_lock" obligation). Lock-free latch-then-validate
+        // is NOT enough here: didChange shifts the tracker BEFORE it bumps
+        // the version, so a latch taken after the shift with a version read
+        // before the bump would look current on both counts and let this
+        // pass mint its old-tree coordinates into the shifted index as
+        // correct-at-birth. Under the lock, the gate checks:
+        // - liveness + lifetime (a didClose that ran to COMPLETION leaves
+        //   the tracker at `(0, epoch+1)` — indistinguishable from a
+        //   reopen's first mint, so the latch alone cannot refuse it; the
+        //   reopen case fails the incarnation check);
+        // - currency (`content_version` unchanged since the parse's CAS —
+        //   an edit that already landed makes this pass's tree stale).
+        // Anything landing AFTER the lock drops is caught by the latch
+        // re-check inside the batch mint / commit (`cleanup` bumps the
+        // epoch before it removes; an edit-shift bumps the generation).
+        // Skipping populate matches the stale/closed outcome everywhere
+        // else: the snapshot (if it still publishes) rides without regions.
+        let entry_mint_epoch = {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let latch = tracker.mint_epoch(&uri);
+            let latest = self.documents.latest_snapshot(&uri);
+            let valid = latest.as_ref().is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == content_version
+            });
+            if !valid {
+                // The edit_lock() accessor above materializes a lock entry
+                // even for a document a didClose already removed — drop it
+                // so raced closes can't grow the map (the did_change stray
+                // rule). Identity- AND share-checked: a reopen racing this
+                // probe may already be reusing this very entry (or have
+                // installed a new one) for the new lifetime's edits, and
+                // removing it from under a queued edit would let the next
+                // edit mint a fresh mutex and run concurrently.
+                if latest.is_none() {
+                    self.documents
+                        .remove_edit_lock_if_unshared(&uri, &edit_lock);
+                }
+                return PopulatedSnapshotRegions::default();
+            }
+            latch
+        };
         // Coarse per-parse gate: with no runnable bridge server configured,
         // the bridge-region build (per-region content copies) is pure waste
         // on the pre-publish critical path. `None` on the snapshot makes a
@@ -292,15 +341,24 @@ impl ParseCoordinator {
             .any_bridge_server_runnable();
         self.compute_pool
             .run(None, move || {
-                let populated = cache.populate_injections(
+                // A refused pass (`None`) maps to all-`None` region fields —
+                // the snapshot then rides WITHOUT regions and readers fall
+                // back to inline resolution. Mapping it to the ran-and-empty
+                // shape instead would publish "no injections" for a pass
+                // that never derived anything, blanking the document's
+                // injections until the next parse.
+                let Some(populated) = cache.populate_injections(
                     &uri,
                     &text,
                     &tree,
                     &language_name,
                     &language,
                     &tracker,
+                    entry_mint_epoch,
                     build_bridge_regions,
-                );
+                ) else {
+                    return PopulatedSnapshotRegions::default();
+                };
                 PopulatedSnapshotRegions {
                     discovery: populated.discovery.map(std::sync::Arc::new),
                     bridge_regions: populated
@@ -512,6 +570,8 @@ impl ParseCoordinator {
                         text.clone(),
                         tree.clone(),
                         language_name.clone(),
+                        incarnation,
+                        content_version,
                     )
                     .await
                 } else {
@@ -768,6 +828,8 @@ impl ParseCoordinator {
                     text.clone(),
                     tree.clone(),
                     language_name.clone(),
+                    expected_incarnation,
+                    content_version,
                 )
                 .await
             } else {
@@ -961,6 +1023,8 @@ impl ParseCoordinator {
                     text.clone(),
                     tree.clone(),
                     language_name.clone(),
+                    incarnation,
+                    content_version,
                 )
                 .await
             } else {
