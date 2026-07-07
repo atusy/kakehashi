@@ -11,10 +11,11 @@
 use std::io;
 
 use crate::config::settings::BridgeServerConfig;
+use crate::text::PositionMapper;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
-    CodeActionResponse, NumberOrString, PartialResultParams, Range, TextDocumentIdentifier, Uri,
-    WorkDoneProgressParams,
+    CodeActionResponse, NumberOrString, PartialResultParams, Position, Range,
+    TextDocumentIdentifier, Uri, WorkDoneProgressParams,
 };
 use url::Url;
 
@@ -22,8 +23,23 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region,
     response_has_jsonrpc_error, transform_workspace_edit_to_host, translate_host_range_to_virtual,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
+
+/// The exclusive host-document end of an injection region: the position just
+/// past its `virtual_content`, mapped back to host coordinates. Bounds the
+/// in-region diagnostic filter position-precisely (line AND column), so a
+/// diagnostic after an inline same-line injection is dropped, not leaked.
+fn region_host_end(virtual_content: &str, offset: &RegionOffset) -> Position {
+    let mut end = PositionMapper::new(virtual_content)
+        .byte_to_position(virtual_content.len())
+        .unwrap_or(Position {
+            line: 0,
+            character: 0,
+        });
+    translate_virtual_position_to_host(&mut end, offset);
+    end
+}
 
 impl LanguageServerPool {
     /// Send a code action request and wait for the response.
@@ -68,9 +84,7 @@ impl LanguageServerPool {
                     host_range,
                     context,
                     &offset,
-                    // The region spans this many host lines; bounds the
-                    // in-region diagnostic filter from below.
-                    virtual_content.lines().count() as u32,
+                    region_host_end(virtual_content, &offset),
                     request_id,
                     client_progress_token,
                 )
@@ -100,7 +114,7 @@ fn build_code_action_request(
     host_range: Range,
     mut context: CodeActionContext,
     offset: &RegionOffset,
-    region_line_count: u32,
+    region_end: Position,
     request_id: RequestId,
     client_progress_token: Option<NumberOrString>,
 ) -> JsonRpcRequest<CodeActionParams> {
@@ -108,14 +122,13 @@ fn build_code_action_request(
     translate_host_range_to_virtual(&mut virtual_range, offset);
     // Out-of-region diagnostics would translate to virtual coordinates that
     // don't exist: above-region ones saturate to (0,0) and can false-match a
-    // different diagnostic at the top of the virtual document; below-region
-    // ones land past the virtual document's end. Bound by the region's own
-    // line span — NOT the (possibly zero-length, cursor) request range, which
-    // would wrongly drop a diagnostic sitting exactly at the cursor.
-    let region_end_line = offset.line().saturating_add(region_line_count);
+    // different diagnostic at the top of the virtual document; ones past the
+    // region land beyond the virtual document. Bound by the region's own
+    // [start, end) extent — NOT the (possibly zero-length, cursor) request
+    // range, which would wrongly drop a diagnostic sitting at the cursor.
     context.diagnostics.retain(|diagnostic| {
         host_position_within_region(diagnostic.range.start, offset)
-            && diagnostic.range.start.line < region_end_line
+            && diagnostic.range.start < region_end
     });
     for diagnostic in &mut context.diagnostics {
         translate_host_range_to_virtual(&mut diagnostic.range, offset);
@@ -429,7 +442,10 @@ mod tests {
             range(5, 5),
             context,
             &RegionOffset::new(3, 0),
-            10,
+            Position {
+                line: 13,
+                character: 0,
+            },
             RequestId::new(1),
             None,
         );
@@ -467,7 +483,10 @@ mod tests {
             context,
             &RegionOffset::new(3, 0),
             // Region spans host lines 3..13; line-5 diagnostic is in, line-40 is out.
-            10,
+            Position {
+                line: 13,
+                character: 0,
+            },
             RequestId::new(1),
             None,
         );
@@ -510,7 +529,10 @@ mod tests {
             },
             context,
             &RegionOffset::new(3, 0),
-            10,
+            Position {
+                line: 13,
+                character: 0,
+            },
             RequestId::new(1),
             None,
         );
@@ -529,7 +551,10 @@ mod tests {
             range(5, 5),
             CodeActionContext::default(),
             &RegionOffset::new(3, 0),
-            10,
+            Position {
+                line: 13,
+                character: 0,
+            },
             test_request_id(),
             Some(NumberOrString::String("wd-1".to_string())),
         );
