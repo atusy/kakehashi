@@ -302,20 +302,13 @@ impl LanguageServerPool {
         // Phase 3: apply the bridge policy (coordinate translation, title
         // suffix, disable/drop, and — for envelope-capable clients — the
         // resolve routing envelope).
-        // Fail soft on a rare `url`/`Uri` parser divergence (mirrors the
-        // resolve path's optional `host_uri_lsp`): skip this server rather than
-        // failing the whole codeAction request, per the bridge's fail-soft
-        // contract.
-        let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
-            Ok(uri) => uri,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "codeAction: host URI {host_uri} could not be converted to an LSP Uri ({e}); skipping bridge"
-                );
-                return Ok(None);
-            }
-        };
+        // NOTE: a `url_to_uri` failure here is already unreachable — the shared
+        // `execute_bridge_request_observed` converts the same `host_uri` first
+        // (pool/execute.rs) and hard-fails there — so a local fail-soft would be
+        // dead code. Making the host-URI conversion fail-soft end-to-end is a
+        // shared-helper change tracked in #615.
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let virtual_uri_string =
             VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id).to_uri_string();
         let virt = VirtLayerContext {
