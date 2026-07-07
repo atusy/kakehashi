@@ -145,11 +145,10 @@ fn transform_params_to_host(
             "kakehashi: the edit performs file operations on a virtual document".to_string(),
         );
     }
-    // Region host start = where a translated virtual (0,0) lands; bound the
-    // edit on BOTH ends so a pass-through host-URI edit can't reach host text
-    // above OR below the injected region.
-    let region_start = Position::new(offset.line(), offset.column_for_line(0));
-    if !workspace_edit_within_region(&params.edit, host_uri, region_start, region_end) {
+    // Bound the edit to the region on both ends, per line, so a pass-through
+    // host-URI edit can't reach host text above/below the region or into a
+    // line's prefix (blockquote `> `).
+    if !workspace_edit_within_region(&params.edit, host_uri, offset, region_end) {
         return Err(
             "kakehashi: the edit extends outside the injected region; it cannot be applied to the \
              host document without corrupting surrounding text"

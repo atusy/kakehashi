@@ -1,5 +1,6 @@
 //! Cancellation registry for downstream-initiated requests forwarded to the
-//! editor (`window/showMessageRequest`, `window/showDocument`).
+//! editor (`window/showMessageRequest`, `window/showDocument`,
+//! `workspace/applyEdit`).
 //!
 //! When a downstream server sends `$/cancelRequest` for such a request — or its
 //! connection dies while one is in flight — the bridge must tell the editor to
