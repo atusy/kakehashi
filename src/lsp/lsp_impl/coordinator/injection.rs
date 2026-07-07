@@ -135,7 +135,7 @@ impl InjectionCoordinator {
         let Some(tree) = doc.tree().cloned() else {
             return Vec::new();
         };
-        let text = doc.text().to_string();
+        let text = doc.text_arc();
         drop(doc);
 
         let Some(regions) =

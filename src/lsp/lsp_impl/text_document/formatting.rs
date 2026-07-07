@@ -133,7 +133,7 @@ impl Kakehashi {
         let upstream_request_id = crate::lsp::current_upstream_id();
         let mut cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
         cancel_state.request_error_sink = request_error_sink;
-        let original = snapshot.text().to_string();
+        let original = snapshot.text_arc();
 
         let result = match layer_cfg.strategy {
             AggregationStrategy::Preferred => {
@@ -168,13 +168,13 @@ impl Kakehashi {
                 // default order (virt before host) satisfies this; an order
                 // placing virt after a producing host is skipped with a
                 // warning rather than formatting against stale regions.
-                let mut current = original.clone();
+                let mut current = original.to_string();
                 let mut producers = 0usize;
                 let mut sole_edits: Option<Vec<TextEdit>> = None;
                 for layer in &layer_cfg.priorities {
                     let edits = match layer {
                         LayerSource::Virt => {
-                            if current != original {
+                            if current.as_str() != &*original {
                                 log::warn!(
                                     target: "kakehashi::formatting",
                                     "cross-layer concatenated formatting: virt placed after a \
