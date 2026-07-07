@@ -400,13 +400,24 @@ impl LanguageServerPool {
         }
 
         // Re-apply the "{title} — {server}" suffix (the server echoed the
-        // original title back). A downstream that omits `data` must not erase
-        // the envelope's `inner` — carry the original forward.
+        // original title back).
         resolved.title = suffixed_title;
-        if resolved.data.is_none() {
-            resolved.data = action.data.take();
+
+        // Once resolve has materialized an edit, the action is complete and
+        // its edit is host-translated. Re-enveloping it would let a second
+        // resolve forward that host-coordinate edit back downstream (no
+        // inverse transform) — so strip the data instead, mirroring the
+        // initial-response policy for edit-carrying actions. Only a still-lazy
+        // resolved action (no edit) keeps a routing envelope for a further
+        // resolve.
+        if resolved.edit.is_some() {
+            resolved.data = None;
+        } else {
+            if resolved.data.is_none() {
+                resolved.data = action.data.take();
+            }
+            re_envelope_action(&mut resolved, &envelope);
         }
-        re_envelope_action(&mut resolved, &envelope);
         resolved
     }
 
@@ -619,17 +630,19 @@ pub(crate) struct UpstreamCodeActionCaps {
     /// LSP 3.16 `dataSupport`: the client round-trips `data` between
     /// `textDocument/codeAction` and `codeAction/resolve`.
     pub(crate) data_support: bool,
-    /// LSP 3.16 `resolveSupport`: the client can issue `codeAction/resolve`.
-    pub(crate) resolve_support: bool,
+    /// LSP 3.16 `resolveSupport` includes `"edit"`: the client can lazily
+    /// resolve an action's `edit` (not merely issue `codeAction/resolve`).
+    pub(crate) resolve_edit_support: bool,
 }
 
 impl UpstreamCodeActionCaps {
     /// Whether a lazy (data-only) action can be handed to the client as-is
     /// with a routing envelope: needs BOTH `dataSupport` (the client preserves
-    /// our envelope) and `resolveSupport` (the client will actually resolve it).
-    /// Otherwise the bridge must eager-resolve downstream instead.
+    /// our envelope) and `resolveSupport` advertising `"edit"` (the client
+    /// will actually resolve the edit). Otherwise the bridge must
+    /// eager-resolve downstream instead.
     fn can_envelope(&self) -> bool {
-        self.data_support && self.resolve_support
+        self.data_support && self.resolve_edit_support
     }
 }
 
@@ -714,12 +727,6 @@ fn bridge_code_action(
         return disable_action(action, REASON_COMMANDS, server_name, upstream_caps);
     }
 
-    // An action carrying `data` that the client can resolve is kept lazy and
-    // wrapped in the routing envelope (virt layer only). This covers BOTH the
-    // pure-lazy (no edit) and edit+data shapes: the envelope preserves `data`
-    // so a later `codeAction/resolve` reaches the origin server.
-    let envelope = virt.filter(|_| upstream_caps.can_envelope() && action.data.is_some());
-
     match &mut action.edit {
         Some(edit) => {
             if let Some(virt) = virt
@@ -735,11 +742,12 @@ fn bridge_code_action(
         }
         None => {
             // No edit, no command: a lazy action whose payload hides behind
-            // `data`. Envelope it if the client can resolve it (above);
+            // `data`. Envelope it (virt layer) if the client can resolve the
+            // edit, so a later `codeAction/resolve` routes back to the origin;
             // otherwise it can never be completed — disable/drop it (an
             // eager-resolve pass already ran for non-envelope clients).
             if action.data.is_some() {
-                if let Some(virt) = envelope {
+                if let Some(virt) = virt.filter(|_| upstream_caps.can_envelope()) {
                     envelope_action_data(&mut action, &virt.envelope_ctx());
                     action.title = suffix_title(action.title, server_name);
                     return Some(CodeActionOrCommand::CodeAction(action));
@@ -752,13 +760,15 @@ fn bridge_code_action(
         }
     }
 
-    // Kept edit-carrying action. Envelope its `data` for resolve routing when
-    // the client can use it; otherwise strip it — untranslated `data` can
-    // embed virtual URIs/coordinates and the client cannot resolve it anyway.
-    match envelope {
-        Some(virt) => envelope_action_data(&mut action, &virt.envelope_ctx()),
-        None => action.data = None,
-    }
+    // Kept edit-carrying action: strip its `data`. We deliberately do NOT
+    // envelope an edit-carrying action for resolve — its `edit` has already
+    // been translated to host coordinates, and forwarding a later
+    // `codeAction/resolve` would send that host-coordinate edit back to a
+    // server that produced virtual coordinates (there is no inverse edit
+    // transform). The edit is the payload; resolving supplementary fields on
+    // an already-complete action is not supported. Untranslated `data` can
+    // also embed virtual URIs, so it must not leak.
+    action.data = None;
     action.title = suffix_title(action.title, server_name);
     Some(CodeActionOrCommand::CodeAction(action))
 }
@@ -1050,7 +1060,7 @@ mod tests {
             disabled_support,
             is_preferred_support: true,
             data_support: false,
-            resolve_support: false,
+            resolve_edit_support: false,
         }
     }
 
@@ -1061,7 +1071,7 @@ mod tests {
             disabled_support: true,
             is_preferred_support: true,
             data_support: true,
-            resolve_support: true,
+            resolve_edit_support: true,
         }
     }
 
@@ -1260,7 +1270,7 @@ mod tests {
             disabled_support: true,
             is_preferred_support: false,
             data_support: false,
-            resolve_support: false,
+            resolve_edit_support: false,
         };
         let actions = transform(json!([action.clone()]), no_pref).unwrap();
         let CodeActionOrCommand::CodeAction(bridged) = &actions[0] else {
@@ -1464,9 +1474,38 @@ mod tests {
     }
 
     #[test]
-    fn edit_carrying_action_with_data_is_enveloped_not_stripped() {
-        // An edit+data action keeps BOTH: the edit is host-translated and the
-        // data is preserved in the envelope (a later resolve may still fire).
+    fn lazy_action_not_enveloped_when_resolve_support_lacks_edit() {
+        // dataSupport is on but resolveSupport does NOT advertise "edit" — the
+        // client cannot materialize the edit lazily, so the action must not be
+        // handed out enveloped; it's disabled (an eager-resolve pass covers the
+        // real request path).
+        let no_edit_resolve = UpstreamCodeActionCaps {
+            disabled_support: true,
+            is_preferred_support: true,
+            data_support: true,
+            resolve_edit_support: false,
+        };
+        let actions = transform(
+            json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
+            no_edit_resolve,
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            action.disabled.as_ref().unwrap().reason,
+            REASON_RESOLVE,
+            "a client that can't resolve `edit` must not receive an envelope"
+        );
+    }
+
+    #[test]
+    fn edit_carrying_action_with_data_is_stripped_not_enveloped() {
+        // An edit+data action keeps the host-translated edit but has its data
+        // STRIPPED, never enveloped: the edit is already complete, and
+        // forwarding a resolve would send the host-coordinate edit back to a
+        // server expecting virtual coordinates (no inverse edit transform).
         let mut action = edit_carrying_action("Fix");
         action["data"] = json!({ "server": "state" });
         let actions = transform(json!([action]), caps_resolve()).unwrap();
@@ -1479,8 +1518,10 @@ mod tests {
             10,
             "edit still host-translated"
         );
-        let envelope = extract_code_action_envelope(action).expect("envelope present");
-        assert_eq!(envelope.inner, Some(json!({ "server": "state" })));
+        assert!(
+            action.data.is_none(),
+            "an edit-carrying action's data must be stripped, not enveloped: {action:?}"
+        );
     }
 
     #[test]

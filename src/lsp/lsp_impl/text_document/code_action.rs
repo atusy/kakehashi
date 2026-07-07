@@ -73,11 +73,13 @@ impl Kakehashi {
                 .and_then(|ca| ca.is_preferred_support)
                 .unwrap_or(false),
             data_support: code_action.and_then(|ca| ca.data_support).unwrap_or(false),
-            // resolveSupport is present iff the client can issue
-            // codeAction/resolve; its `properties` list is advisory only —
-            // we always eager-resolve the full action, never a subset.
-            resolve_support: code_action
-                .map(|ca| ca.resolve_support.is_some())
+            // The client can lazily resolve `edit` only if its resolveSupport
+            // properties list includes "edit". A client advertising
+            // resolveSupport WITHOUT "edit" cannot materialize a lazy action's
+            // edit, so it must not be handed one (eager-resolve instead).
+            resolve_edit_support: code_action
+                .and_then(|ca| ca.resolve_support.as_ref())
+                .map(|rs| rs.properties.iter().any(|p| p == "edit"))
                 .unwrap_or(false),
         }
     }
