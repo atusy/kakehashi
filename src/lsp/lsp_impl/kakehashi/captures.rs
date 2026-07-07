@@ -417,6 +417,20 @@ pub struct CapturesRangeResponse {
     skipped: Arc<Vec<Value>>,
 }
 
+/// A single positional edit in a `kakehashi/captures/full/delta` response:
+/// replace `deleteCount` matches starting at `start` with `data`. Typed
+/// (rather than `json!`-built) for the same reason as `CapturesFullResponse` —
+/// `data` is already a `Vec<Value>` from `matches_delta_edit`, so this avoids
+/// re-walking it into a fresh `Value` tree before the one inherent
+/// `serde_json::to_value` pass tower-lsp-server performs anyway.
+#[derive(Debug, Serialize)]
+pub struct CapturesDeltaEdit {
+    start: usize,
+    #[serde(rename = "deleteCount")]
+    delete_count: usize,
+    data: Vec<Value>,
+}
+
 /// Wire shape for `kakehashi/captures/full/delta`: either a positional edit
 /// over the previous matches, or a full result (stale `previousResultId`,
 /// or lineage advanced during the await — LSP convention lets a server
@@ -427,7 +441,7 @@ pub enum CapturesDeltaResponse {
     Edits {
         #[serde(rename = "resultId")]
         result_id: String,
-        edits: Value,
+        edits: Vec<CapturesDeltaEdit>,
     },
     Full(CapturesFullResponse),
 }
@@ -623,12 +637,12 @@ impl Kakehashi {
                     .as_ref()
                     .expect("slot verified Some by the guard above");
                 let edits = match matches_delta_edit(prev_matches, &c.matches[..]) {
-                    None => json!([]),
-                    Some((start, delete_count, data)) => json!([{
-                        "start": start,
-                        "deleteCount": delete_count,
-                        "data": data,
-                    }]),
+                    None => Vec::new(),
+                    Some((start, delete_count, data)) => vec![CapturesDeltaEdit {
+                        start,
+                        delete_count,
+                        data,
+                    }],
                 };
                 CapturesDeltaResponse::Edits {
                     result_id: result_id.clone(),
@@ -1592,7 +1606,11 @@ mod tests {
     fn captures_delta_response_edits_variant_serializes_like_the_old_json_macro_shape() {
         let response = CapturesDeltaResponse::Edits {
             result_id: "r2".to_string(),
-            edits: json!([{"start": 0, "deleteCount": 1, "data": [1]}]),
+            edits: vec![CapturesDeltaEdit {
+                start: 0,
+                delete_count: 1,
+                data: vals(&[1]),
+            }],
         };
         let expected = json!({
             "resultId": "r2",
