@@ -332,7 +332,10 @@ mod tests {
     #[test]
     fn utf16_line_index_matches_byte_to_utf16_col_out_of_bounds() {
         // Past the end of the line, on both ASCII and non-ASCII content —
-        // exercises the "no boundary found" fallback that clamps to line_len.
+        // exercises the "no boundary found" fallback, which clamps to the
+        // line's end: byte length for ASCII (byte offset == UTF-16 offset),
+        // but the line's UTF-16 WIDTH for non-ASCII (e.g. "こんにちは" is
+        // 15 bytes but clamps to UTF-16 column 5).
         for line in ["hello", "こんにちは", "a👋b"] {
             let index = Utf16LineIndex::new(line);
             let past_end = line.len() + 5;

@@ -27,23 +27,24 @@ fn is_in_exclusion_range(node: &Node, ranges: &[(usize, usize)]) -> bool {
     })
 }
 
-/// Resolve a byte column to a UTF-16 column against `host_line`'s cached
-/// index, building the index on first use for that line.
+/// Fetch `host_line`'s cached UTF-16 index, building it on first use for
+/// that line.
 ///
-/// A single host line commonly receives several `byte_to_utf16` queries (one
-/// pair of start/end per capture, times however many captures land on that
-/// line), so caching by line number turns what would be an O(line_len)
-/// rescan per query into one O(line_len) build plus O(log line_len) lookups.
-fn cached_utf16_col(
-    cache: &mut HashMap<usize, Utf16LineIndex>,
+/// A single host line commonly receives a start/end pair of `byte_to_utf16`
+/// queries per capture, times however many captures land on that line.
+/// Returning the index (rather than resolving one column per call) lets a
+/// caller reuse a single `HashMap` lookup for both the start and end column
+/// of one token, on top of caching by line number turning what would be an
+/// O(line_len) rescan per query into one O(line_len) build plus O(log
+/// line_len) lookups.
+fn cached_line_index<'a>(
+    cache: &'a mut HashMap<usize, Utf16LineIndex>,
     host_line: usize,
     line_text: &str,
-    byte_col: usize,
-) -> usize {
+) -> &'a Utf16LineIndex {
     cache
         .entry(host_line)
         .or_insert_with(|| Utf16LineIndex::new(line_text))
-        .byte_to_utf16(byte_col)
 }
 
 /// Extract the `#set! priority N` value for a pattern, defaulting to 100.
@@ -364,7 +365,7 @@ pub(super) fn collect_host_tokens(
     let content_lines: Vec<&str> = text.lines().collect();
 
     // Lazily-built byte->UTF-16 lookup per host line, shared across every
-    // capture below. See `cached_utf16_col`.
+    // capture below. See `cached_line_index`.
     let mut utf16_cache: HashMap<usize, Utf16LineIndex> = HashMap::new();
 
     // Collect tokens from this document's highlight query
@@ -414,12 +415,8 @@ pub(super) fn collect_host_tokens(
                 } else {
                     start_pos.column
                 };
-                let start_utf16 = cached_utf16_col(
-                    &mut utf16_cache,
-                    host_line,
-                    host_line_text,
-                    byte_offset_in_host,
-                );
+                let line_index = cached_line_index(&mut utf16_cache, host_line, host_line_text);
+                let start_utf16 = line_index.byte_to_utf16(byte_offset_in_host);
 
                 // For trailing newline case, use the line length as end position
                 let end_byte_offset_in_host = if is_trailing_newline {
@@ -429,12 +426,7 @@ pub(super) fn collect_host_tokens(
                 } else {
                     end_pos.column
                 };
-                let end_utf16 = cached_utf16_col(
-                    &mut utf16_cache,
-                    host_line,
-                    host_line_text,
-                    end_byte_offset_in_host,
-                );
+                let end_utf16 = line_index.byte_to_utf16(end_byte_offset_in_host);
 
                 all_tokens.push(RawToken {
                     line: host_line,
@@ -464,12 +456,9 @@ pub(super) fn collect_host_tokens(
                     } else {
                         start_pos.column
                     };
-                    let start_utf16 = cached_utf16_col(
-                        &mut utf16_cache,
-                        host_start_line,
-                        host_start_line_text,
-                        start_byte_offset,
-                    );
+                    let start_utf16 =
+                        cached_line_index(&mut utf16_cache, host_start_line, host_start_line_text)
+                            .byte_to_utf16(start_byte_offset);
 
                     let mut total_length_utf16 = 0usize;
                     for row in start_pos.row..=end_pos.row {
@@ -486,10 +475,9 @@ pub(super) fn collect_host_tokens(
                             &prefix_widths,
                         );
 
-                        let line_start_utf16 =
-                            cached_utf16_col(&mut utf16_cache, host_row, line_text, line_start);
-                        let line_end_utf16 =
-                            cached_utf16_col(&mut utf16_cache, host_row, line_text, line_end);
+                        let line_index = cached_line_index(&mut utf16_cache, host_row, line_text);
+                        let line_start_utf16 = line_index.byte_to_utf16(line_start);
+                        let line_end_utf16 = line_index.byte_to_utf16(line_end);
                         total_length_utf16 += line_end_utf16 - line_start_utf16;
 
                         if row < end_pos.row {
@@ -531,18 +519,10 @@ pub(super) fn collect_host_tokens(
                             &prefix_widths,
                         );
 
-                        let start_utf16 = cached_utf16_col(
-                            &mut utf16_cache,
-                            host_row,
-                            host_line_text,
-                            line_start_byte,
-                        );
-                        let end_utf16 = cached_utf16_col(
-                            &mut utf16_cache,
-                            host_row,
-                            host_line_text,
-                            line_end_byte,
-                        );
+                        let line_index =
+                            cached_line_index(&mut utf16_cache, host_row, host_line_text);
+                        let start_utf16 = line_index.byte_to_utf16(line_start_byte);
+                        let end_utf16 = line_index.byte_to_utf16(line_end_byte);
 
                         if end_utf16 > start_utf16 {
                             all_tokens.push(RawToken {
@@ -860,6 +840,11 @@ mod tests {
             &[],
             &mut tokens,
         );
+
+        // collect_host_tokens doesn't guarantee match/emission order, so sort
+        // by column before asserting rather than relying on tree-sitter's
+        // query-iteration order to place x before y.
+        tokens.sort_by_key(|t| t.column);
 
         assert_eq!(tokens.len(), 2);
         assert_eq!(
