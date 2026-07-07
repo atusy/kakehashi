@@ -4,7 +4,7 @@
 //! highlight query, including multiline token handling and byte-to-UTF16 conversion.
 
 use crate::config::CaptureMappings;
-use crate::text::position::byte_to_utf16_col;
+use crate::text::position::Utf16LineIndex;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
 use super::legend::{CaptureResult, resolve_capture};
@@ -23,6 +23,37 @@ fn is_in_exclusion_range(node: &Node, ranges: &[(usize, usize)]) -> bool {
             && node_end <= range_end
             && (node_start != range_start || node_end != range_end)
     })
+}
+
+/// Fetch `row`'s cached UTF-16 index, building it on first use for that row.
+///
+/// A single line commonly receives a start/end pair of `byte_to_utf16`
+/// queries per capture, times however many captures land on that line.
+/// Returning the index (rather than resolving one column per call) lets a
+/// caller reuse a single lookup for both the start and end column of one
+/// token, on top of caching by line number turning what would be an
+/// O(line_len) rescan per query into one O(line_len) build plus O(log
+/// line_len) lookups.
+///
+/// `row` must be the CONTENT-local row (`start_pos.row` / the multiline
+/// loop's `row`), not the host-absolute line — this cache is scoped to one
+/// `collect_host_tokens` call, and an injection can start deep into a large
+/// host document. Indexing by the absolute host line would resize the
+/// vector to cover every line from 0 up to that point (e.g. a one-line
+/// injection at host line 10,000 forcing a 10,001-element vector) for a
+/// cache that only ever holds a handful of entries. The content-local row
+/// is dense and small (bounded by the content's own line count), which is
+/// what makes `Vec<Option<_>>` — O(1), no hashing, cache-friendly — a better
+/// fit here than a `HashMap`.
+fn cached_line_index<'a>(
+    cache: &'a mut Vec<Option<Utf16LineIndex>>,
+    row: usize,
+    line_text: &str,
+) -> &'a Utf16LineIndex {
+    if row >= cache.len() {
+        cache.resize_with(row + 1, || None);
+    }
+    cache[row].get_or_insert_with(|| Utf16LineIndex::new(line_text))
 }
 
 /// Extract the `#set! priority N` value for a pattern, defaulting to 100.
@@ -342,6 +373,10 @@ pub(super) fn collect_host_tokens(
     // Split content text into lines for byte offset calculations
     let content_lines: Vec<&str> = text.lines().collect();
 
+    // Lazily-built byte->UTF-16 lookup per host line, shared across every
+    // capture below. See `cached_line_index`.
+    let mut utf16_cache: Vec<Option<Utf16LineIndex>> = Vec::new();
+
     // Collect tokens from this document's highlight query
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
@@ -389,7 +424,8 @@ pub(super) fn collect_host_tokens(
                 } else {
                     start_pos.column
                 };
-                let start_utf16 = byte_to_utf16_col(host_line_text, byte_offset_in_host);
+                let line_index = cached_line_index(&mut utf16_cache, start_pos.row, host_line_text);
+                let start_utf16 = line_index.byte_to_utf16(byte_offset_in_host);
 
                 // For trailing newline case, use the line length as end position
                 let end_byte_offset_in_host = if is_trailing_newline {
@@ -399,7 +435,7 @@ pub(super) fn collect_host_tokens(
                 } else {
                     end_pos.column
                 };
-                let end_utf16 = byte_to_utf16_col(host_line_text, end_byte_offset_in_host);
+                let end_utf16 = line_index.byte_to_utf16(end_byte_offset_in_host);
 
                 all_tokens.push(RawToken {
                     line: host_line,
@@ -429,7 +465,9 @@ pub(super) fn collect_host_tokens(
                     } else {
                         start_pos.column
                     };
-                    let start_utf16 = byte_to_utf16_col(host_start_line_text, start_byte_offset);
+                    let start_utf16 =
+                        cached_line_index(&mut utf16_cache, start_pos.row, host_start_line_text)
+                            .byte_to_utf16(start_byte_offset);
 
                     let mut total_length_utf16 = 0usize;
                     for row in start_pos.row..=end_pos.row {
@@ -446,8 +484,9 @@ pub(super) fn collect_host_tokens(
                             &prefix_widths,
                         );
 
-                        let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
-                        let line_end_utf16 = byte_to_utf16_col(line_text, line_end);
+                        let line_index = cached_line_index(&mut utf16_cache, row, line_text);
+                        let line_start_utf16 = line_index.byte_to_utf16(line_start);
+                        let line_end_utf16 = line_index.byte_to_utf16(line_end);
                         total_length_utf16 += line_end_utf16 - line_start_utf16;
 
                         if row < end_pos.row {
@@ -489,8 +528,9 @@ pub(super) fn collect_host_tokens(
                             &prefix_widths,
                         );
 
-                        let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
-                        let end_utf16 = byte_to_utf16_col(host_line_text, line_end_byte);
+                        let line_index = cached_line_index(&mut utf16_cache, row, host_line_text);
+                        let start_utf16 = line_index.byte_to_utf16(line_start_byte);
+                        let end_utf16 = line_index.byte_to_utf16(line_end_byte);
 
                         if end_utf16 > start_utf16 {
                             all_tokens.push(RawToken {
@@ -775,6 +815,55 @@ mod tests {
         assert!(
             !tokens.is_empty(),
             "Token with exact-match exclusion range should NOT be suppressed"
+        );
+    }
+
+    #[test]
+    fn collect_host_tokens_utf16_columns_correct_for_multiple_tokens_after_cjk_prefix() {
+        // Two identifiers on the same line, with a 3-char CJK string literal
+        // between them, so both byte->UTF-16 conversions land on the SAME
+        // host_line (exercising the Utf16LineIndex cache across two lookups
+        // on one line) and the second identifier's byte and UTF-16 columns
+        // genuinely diverge (each CJK char is 3 bytes but 1 UTF-16 unit).
+        let code = "let x = \"あいう\"; let y = 1;";
+        let tree = parse_rust_tree(code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @variable").unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+
+        let mut tokens = Vec::new();
+        collect_host_tokens(
+            code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            code,
+            &lines,
+            &build_line_start_bytes(code),
+            0,
+            0,
+            false,
+            &[],
+            &[],
+            &mut tokens,
+        );
+
+        // collect_host_tokens doesn't guarantee match/emission order, so sort
+        // by column before asserting rather than relying on tree-sitter's
+        // query-iteration order to place x before y.
+        tokens.sort_by_key(|t| t.column);
+
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(
+            (tokens[0].column, tokens[0].length),
+            (4, 1),
+            "x: byte col 4 == utf16 col 4 (pure ASCII prefix)"
+        );
+        assert_eq!(
+            (tokens[1].column, tokens[1].length),
+            (19, 1),
+            "y: byte col 25, but utf16 col 19 (three 3-byte CJK chars each collapse to 1 utf16 unit)"
         );
     }
 

@@ -171,6 +171,56 @@ pub fn convert_byte_to_utf16_in_line(line_text: &str, byte_pos: usize) -> Option
     }
 }
 
+/// Per-line byte→UTF-16 column lookup, amortizing the cost of repeated
+/// `byte_to_utf16_col` calls against the same line across multiple tokens.
+///
+/// ASCII lines keep `byte_to_utf16_col`'s fast path (byte offset == UTF-16
+/// offset, clamped to the line length) with no allocation. Non-ASCII lines
+/// build a sorted `(byte, utf16)` boundary table once, O(line_len), then
+/// resolve each query via binary search, O(log line_len) — replacing the
+/// O(line_len) per-char decode loop `byte_to_utf16_col` would otherwise
+/// re-run from column 0 on every call against that line.
+pub(crate) struct Utf16LineIndex {
+    line_len: usize,
+    // None for ASCII lines (fast path needs no table). Always starts at
+    // (0, 0) and ends with (line_len, total_utf16_width) for non-ASCII lines.
+    boundaries: Option<Vec<(usize, usize)>>,
+}
+
+impl Utf16LineIndex {
+    pub(crate) fn new(line: &str) -> Self {
+        if line.as_bytes().is_ascii() {
+            return Self {
+                line_len: line.len(),
+                boundaries: None,
+            };
+        }
+
+        let mut boundaries = Vec::with_capacity(line.len() + 1);
+        let mut utf16_offset = 0;
+        for (byte, ch) in line.char_indices() {
+            boundaries.push((byte, utf16_offset));
+            utf16_offset += ch.len_utf16();
+        }
+        boundaries.push((line.len(), utf16_offset));
+        Self {
+            line_len: line.len(),
+            boundaries: Some(boundaries),
+        }
+    }
+
+    /// Same semantics as `byte_to_utf16_col`: an out-of-bounds or
+    /// mid-codepoint `byte_col` resolves to the nearest valid boundary at or
+    /// before it.
+    pub(crate) fn byte_to_utf16(&self, byte_col: usize) -> usize {
+        let Some(boundaries) = &self.boundaries else {
+            return byte_col.min(self.line_len);
+        };
+        let idx = boundaries.partition_point(|&(b, _)| b <= byte_col);
+        boundaries[idx.saturating_sub(1)].1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +270,80 @@ mod tests {
         assert_eq!(byte_to_utf16_col(line, 2), 1);
         // byte 3 is mid-emoji → falls back to 1
         assert_eq!(byte_to_utf16_col(line, 3), 1);
+    }
+
+    #[test]
+    fn utf16_line_index_matches_byte_to_utf16_col_ascii() {
+        let line = "hello world";
+        let index = Utf16LineIndex::new(line);
+        for byte_col in [0, 5, 11] {
+            assert_eq!(
+                index.byte_to_utf16(byte_col),
+                byte_to_utf16_col(line, byte_col)
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_line_index_matches_byte_to_utf16_col_japanese() {
+        let line = "こんにちは";
+        let index = Utf16LineIndex::new(line);
+        for byte_col in [0, 3, 6, 15] {
+            assert_eq!(
+                index.byte_to_utf16(byte_col),
+                byte_to_utf16_col(line, byte_col)
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_line_index_matches_byte_to_utf16_col_mixed_ascii_and_japanese() {
+        let line = "let x = \"あいうえお\"";
+        let index = Utf16LineIndex::new(line);
+        for byte_col in [0, 8, 9, 12, 24] {
+            assert_eq!(
+                index.byte_to_utf16(byte_col),
+                byte_to_utf16_col(line, byte_col)
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_line_index_matches_byte_to_utf16_col_mid_character_fallback() {
+        let line = "こんにちは";
+        let index = Utf16LineIndex::new(line);
+        for byte_col in [1, 2, 4] {
+            assert_eq!(
+                index.byte_to_utf16(byte_col),
+                byte_to_utf16_col(line, byte_col)
+            );
+        }
+
+        let line = "a👋b";
+        let index = Utf16LineIndex::new(line);
+        for byte_col in [2, 3] {
+            assert_eq!(
+                index.byte_to_utf16(byte_col),
+                byte_to_utf16_col(line, byte_col)
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_line_index_matches_byte_to_utf16_col_out_of_bounds() {
+        // Past the end of the line, on both ASCII and non-ASCII content —
+        // exercises the "no boundary found" fallback, which clamps to the
+        // line's end: byte length for ASCII (byte offset == UTF-16 offset),
+        // but the line's UTF-16 WIDTH for non-ASCII (e.g. "こんにちは" is
+        // 15 bytes but clamps to UTF-16 column 5).
+        for line in ["hello", "こんにちは", "a👋b"] {
+            let index = Utf16LineIndex::new(line);
+            let past_end = line.len() + 5;
+            assert_eq!(
+                index.byte_to_utf16(past_end),
+                byte_to_utf16_col(line, past_end)
+            );
+        }
     }
 
     #[test]
