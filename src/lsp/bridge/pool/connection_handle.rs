@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
-    CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability, DeclarationCapability,
-    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
-    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
-    TypeDefinitionProviderCapability,
+    CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
+    DeclarationCapability, FoldingRangeProviderCapability, HoverProviderCapability,
+    ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
+    SaveOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;

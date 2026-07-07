@@ -527,10 +527,19 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or("Lazy organize imports")
                     .to_string();
-                let data = message.pointer("/params/data").cloned().unwrap_or(Value::Null);
+                let data = message
+                    .pointer("/params/data")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 // Resolve against the virtual document the action came from —
                 // the mock received its URI via didOpen (single-doc tests).
                 let target_uri = documents.keys().next().cloned().unwrap_or_default();
+                // Embed the RECEIVED title in the edit's newText: the bridge
+                // re-suffixes the response title (overwriting our echo), but it
+                // never rewrites newText, so this is the only place the test can
+                // observe which title actually reached the server. If the bridge
+                // failed to restore the original (unsuffixed) title before
+                // forwarding, the mock would see "... — mock-codeaction" here.
                 respond(
                     &mut writer,
                     id,
@@ -545,7 +554,7 @@ fn main() {
                                         "start": { "line": 0, "character": 0 },
                                         "end": { "line": 0, "character": 5 }
                                     },
-                                    "newText": "organized"
+                                    "newText": format!("organized:{title}")
                                 }]
                             }
                         }

@@ -1,4 +1,6 @@
-//! Code action method for Kakehashi (#568, edit-carrying actions only).
+//! Code action method for Kakehashi (#568). Edit-carrying and lazy actions
+//! are both bridged; `code_action_resolve_impl` routes `codeAction/resolve`
+//! back to the origin server via the `data` envelope.
 //!
 //! Walks the resolved layer order (cross-layer-aggregation): the virt layer
 //! bridges the injection region under the requested range, the host layer

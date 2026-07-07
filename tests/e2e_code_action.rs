@@ -314,7 +314,10 @@ fn lazy_action_is_resolved_via_code_action_resolve() {
     );
     // Virtual line 0 = host line 3 (fence content line).
     assert_eq!(edits[0]["range"]["start"]["line"], 3);
-    assert_eq!(edits[0]["newText"], "organized");
+    // The mock embeds the title it RECEIVED into newText. The bridge must have
+    // restored the unsuffixed original before forwarding the resolve — if it
+    // forwarded the suffixed title, this would be "organized:... — mock-codeaction".
+    assert_eq!(edits[0]["newText"], "organized:Lazy organize imports");
 
     shutdown(&mut client);
 }
@@ -339,7 +342,10 @@ fn lazy_action_is_eager_resolved_without_resolve_support() {
         "eager-resolve must materialize the edit inline, got: {action:?}"
     );
     assert_eq!(edits[0]["range"]["start"]["line"], 3);
-    assert_eq!(edits[0]["newText"], "organized");
+    // Eager-resolve forwards the raw (unsuffixed) title downstream; the mock
+    // echoes it into newText, proving the materialization came from the
+    // resolve round-trip with the correct title.
+    assert_eq!(edits[0]["newText"], "organized:Lazy organize imports");
     assert!(
         action["data"].is_null(),
         "a client without dataSupport must not receive a routing envelope"

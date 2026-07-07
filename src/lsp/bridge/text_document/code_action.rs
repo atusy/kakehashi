@@ -1,8 +1,11 @@
-//! Code action request handling for bridge connections (#568, stage "PR 3").
+//! Code action request handling for bridge connections (#568).
 //!
-//! Edit-carrying actions only: `codeAction/resolve` and `Command` execution
-//! are not bridged yet. Actions that would need them surface as
-//! `disabled: { reason }` when the upstream client supports it and are
+//! Edit-carrying and lazy (resolve-deferred) actions are both bridged:
+//! `codeAction/resolve` is routed back to the origin server via the
+//! `CodeActionEnvelope` in `CodeAction.data` (PR 4), or eagerly resolved
+//! downstream when the upstream client lacks `dataSupport`/`resolveSupport`.
+//! Only `Command` execution remains unbridged — command-carrying actions
+//! surface as `disabled: { reason }` when the client supports it and are
 //! dropped otherwise (LSP 3.16 `disabledSupport`).
 //!
 //! Every bridged action title gets the `"{title} — {server}"` suffix so
@@ -367,14 +370,28 @@ impl LanguageServerPool {
         // Translate the resolved edit host-ward; a cross-region edit that
         // cannot be represented in the host document fails soft (return the
         // original action unresolved rather than an unappliable edit).
-        if let (Some(edit), Some(host_uri_lsp)) = (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
-            let virtual_uri =
-                VirtualDocumentUri::new(host_uri_lsp, &envelope.injection_language, &envelope.region_id)
-                    .to_uri_string();
-            if !transform_workspace_edit_to_host(edit, &virtual_uri, host_uri_lsp, &offset) {
+        match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
+            (Some(edit), Some(host_uri_lsp)) => {
+                let virtual_uri = VirtualDocumentUri::new(
+                    host_uri_lsp,
+                    &envelope.injection_language,
+                    &envelope.region_id,
+                )
+                .to_uri_string();
+                if !transform_workspace_edit_to_host(edit, &virtual_uri, host_uri_lsp, &offset) {
+                    re_envelope_action(&mut action, &envelope);
+                    return action;
+                }
+            }
+            // The server resolved an edit, but the host URI couldn't be rebuilt
+            // to translate it (a `url`/`Uri` parser divergence). Shipping the
+            // untranslated virtual-coordinate edit would be unappliable — fail
+            // soft, same as the cross-region case.
+            (Some(_), None) => {
                 re_envelope_action(&mut action, &envelope);
                 return action;
             }
+            (None, _) => {}
         }
         if let Some(diagnostics) = &mut resolved.diagnostics {
             for diagnostic in diagnostics {
@@ -406,20 +423,20 @@ impl LanguageServerPool {
         if let Some(ref id) = upstream_id {
             self.register_upstream_request(id.clone(), connection_key);
         }
-        let (request_id, response_rx) = match handle.register_request_with_upstream(upstream_id.clone())
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "codeAction/resolve: failed to register request: {e}"
-                );
-                if let Some(ref id) = upstream_id {
-                    self.unregister_upstream_request(id, connection_key);
+        let (request_id, response_rx) =
+            match handle.register_request_with_upstream(upstream_id.clone()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "codeAction/resolve: failed to register request: {e}"
+                    );
+                    if let Some(ref id) = upstream_id {
+                        self.unregister_upstream_request(id, connection_key);
+                    }
+                    return None;
                 }
-                return None;
-            }
-        };
+            };
 
         let request = JsonRpcRequest::new(request_id.as_i64(), "codeAction/resolve", &action);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
@@ -1070,7 +1087,12 @@ mod tests {
             host_uri_string: "file:///test.md",
             server_name: "ruff",
         };
-        Some(bridge_code_actions(actions, "ruff", upstream_caps, Some(&virt)))
+        Some(bridge_code_actions(
+            actions,
+            "ruff",
+            upstream_caps,
+            Some(&virt),
+        ))
     }
 
     fn edit_carrying_action(title: &str) -> serde_json::Value {
@@ -1225,7 +1247,9 @@ mod tests {
         assert!(action.edit.is_some(), "edit must survive");
         assert!(
             action.data.is_none(),
-            "untranslated data must not leak until the PR 4 envelope exists"
+            "for a client without data/resolve support the untranslated data \
+             is stripped (the routing envelope is only added for envelope-capable \
+             clients — see edit_carrying_action_with_data_is_enveloped_not_stripped)"
         );
     }
 
@@ -1463,8 +1487,7 @@ mod tests {
     #[test]
     fn dataless_action_is_not_enveloped() {
         // An edit-only action has nothing to resolve; no envelope is attached.
-        let actions =
-            transform(json!([edit_carrying_action("Fix")]), caps_resolve()).unwrap();
+        let actions = transform(json!([edit_carrying_action("Fix")]), caps_resolve()).unwrap();
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
             panic!("Expected CodeAction");
         };
@@ -1523,12 +1546,33 @@ mod tests {
             ..CodeAction::default()
         };
         envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
+        // The full envelope before the round-trip; strip drains inner into
+        // action.data and re_envelope must restore every field identically.
+        let original = extract_code_action_envelope(&action).expect("enveloped");
         let envelope = strip_code_action_envelope(&mut action).expect("envelope");
         re_envelope_action(&mut action, &envelope);
         let extracted = extract_code_action_envelope(&action).expect("re-enveloped");
-        assert_eq!(extracted.origin, "ruff");
-        assert_eq!(extracted.inner, Some(json!({ "id": 1 })));
-        assert_eq!(extracted.original_title, "Fix");
+        assert_eq!(
+            extracted, original,
+            "re-envelope must preserve EVERY field (a dropped field would leak here)"
+        );
+    }
+
+    #[test]
+    fn strip_leaves_non_envelope_data_intact() {
+        // The mutating strip must not touch a non-envelope `data` (mirrors the
+        // code_lens strip contract); only `extract`/`dispatch` cover it otherwise.
+        let mut action = CodeAction {
+            title: "x".to_string(),
+            data: Some(json!({ "custom": true })),
+            ..CodeAction::default()
+        };
+        assert!(strip_code_action_envelope(&mut action).is_none());
+        assert_eq!(
+            action.data,
+            Some(json!({ "custom": true })),
+            "non-envelope data must survive a strip attempt untouched"
+        );
     }
 
     #[test]
