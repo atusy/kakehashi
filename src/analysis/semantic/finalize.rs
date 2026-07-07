@@ -140,6 +140,13 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
 
     let mut result = Vec::with_capacity(tokens.len());
 
+    // Reused across lines (`.clear()` at the top of each iteration) instead
+    // of reallocating per line — a document sweep touches one of these per
+    // line, so this avoids thousands of small heap allocations on large
+    // documents.
+    let mut breakpoints: Vec<usize> = Vec::new();
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+
     // Group tokens by line and process each line independently
     let mut line_start = 0;
     while line_start < tokens.len() {
@@ -152,7 +159,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
         let line_tokens = &tokens[line_start..line_end];
 
         // 1. Collect all breakpoints (start and end columns)
-        let mut breakpoints = Vec::with_capacity(line_tokens.len() * 2);
+        breakpoints.clear();
         for t in line_tokens {
             breakpoints.push(t.column);
             breakpoints.push(t.column + t.length);
@@ -163,7 +170,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
         // 2. Sweep the intervals, maintaining a max-heap of active tokens.
         // Transparent tokens are never pushed — they only contributed
         // breakpoints above and never compete for winning.
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(line_tokens.len());
+        heap.clear();
         let mut next_token = 0;
 
         for window in breakpoints.windows(2) {
