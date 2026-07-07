@@ -161,6 +161,14 @@ fn main() {
                         "codeActionProvider": true,
                         "textDocumentSync": 1
                     }),
+                    // `code-action-lazy`: advertises resolveProvider and
+                    // returns one LAZY action (data only, no edit) whose edit
+                    // is materialized on codeAction/resolve — the
+                    // rust-analyzer shape that motivates PR 4 (#568).
+                    "code-action-lazy" => json!({
+                        "codeActionProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
                     // `diagnostics-push-pullcap` is BOTH: it advertises
                     // `diagnosticProvider` (pull-driven) AND pushes on didOpen
                     // (below). Used to prove `pullFallback = false` still
@@ -463,39 +471,86 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/codeAction" => {
-                // `code-action` mode: one edit-carrying quickfix (an edit on
-                // the requested document at virtual line 0) plus one bare
-                // Command action (not executable until executeCommand is
-                // bridged — must surface as disabled/dropped, never verbatim).
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
-                    .map(|uri| {
-                        json!([
-                            {
-                                "title": "Replace with fixed",
-                                "kind": "quickfix",
-                                "edit": {
-                                    "changes": {
-                                        uri: [{
-                                            "range": {
-                                                "start": { "line": 0, "character": 0 },
-                                                "end": { "line": 0, "character": 5 }
-                                            },
-                                            "newText": "fixed"
-                                        }]
+                    .map(|_uri| {
+                        if mode == "code-action-lazy" {
+                            // One LAZY action: data only, no edit. The edit is
+                            // materialized on codeAction/resolve (below).
+                            json!([{
+                                "title": "Lazy organize imports",
+                                "kind": "source.organizeImports",
+                                "data": { "mock": "lazy-1" }
+                            }])
+                        } else {
+                            // `code-action` mode: one edit-carrying quickfix (an
+                            // edit on the requested document at virtual line 0)
+                            // plus one bare Command action (not executable until
+                            // executeCommand is bridged — must surface as
+                            // disabled/dropped, never verbatim).
+                            json!([
+                                {
+                                    "title": "Replace with fixed",
+                                    "kind": "quickfix",
+                                    "edit": {
+                                        "changes": {
+                                            _uri: [{
+                                                "range": {
+                                                    "start": { "line": 0, "character": 0 },
+                                                    "end": { "line": 0, "character": 5 }
+                                                },
+                                                "newText": "fixed"
+                                            }]
+                                        }
                                     }
+                                },
+                                {
+                                    "title": "Run mock command",
+                                    "command": "mock.run"
                                 }
-                            },
-                            {
-                                "title": "Run mock command",
-                                "command": "mock.run"
-                            }
-                        ])
+                            ])
+                        }
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+            }
+            "codeAction/resolve" => {
+                // Materialize the lazy action's edit, echoing the original
+                // (unsuffixed) title and data back so the test can prove the
+                // bridge restored the title and round-tripped the data. The
+                // edit targets virtual line 0 of the region the action came
+                // from — the bridge re-keys it to the host document.
+                let title = message
+                    .pointer("/params/title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Lazy organize imports")
+                    .to_string();
+                let data = message.pointer("/params/data").cloned().unwrap_or(Value::Null);
+                // Resolve against the virtual document the action came from —
+                // the mock received its URI via didOpen (single-doc tests).
+                let target_uri = documents.keys().next().cloned().unwrap_or_default();
+                respond(
+                    &mut writer,
+                    id,
+                    json!({
+                        "title": title,
+                        "kind": "source.organizeImports",
+                        "data": data,
+                        "edit": {
+                            "changes": {
+                                target_uri: [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 5 }
+                                    },
+                                    "newText": "organized"
+                                }]
+                            }
+                        }
+                    }),
+                );
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-fail" {
