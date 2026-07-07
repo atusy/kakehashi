@@ -286,10 +286,13 @@ sweep if it cannot be reconciled — this is what stops a settings reload from
 being suppressed indefinitely by a contribution that merely matches the
 document snapshot. (Edit-shifting still keys on the document version alone;
 generation change forces a re-fetch, not a shift.) Acceptance is **monotonic
-per layer**: in-flight requests can complete out of order, and a response
-computed against an older host version than the layer's currently accepted
-contribution is discarded — a late straggler never replaces newer tokens with
-older, edit-shifted ones. The unit all of these contracts operate on is the
+per layer**, ordered on the pair `(host version, settings generation)`:
+in-flight requests can complete out of order, and a response whose
+`(version, generation)` is behind the layer's currently accepted contribution
+on either component is discarded — a late straggler never replaces newer
+tokens with older, edit-shifted ones, and a response from an old generation
+can never overwrite state already accepted under a newer generation at the
+same document version. The unit all of these contracts operate on is the
 **per-server contribution** — tracked as (layer, server, version,
 generation) — and a
 layer's level-1 stream is derived from its accepted per-server contributions,
