@@ -84,10 +84,10 @@ impl SemanticTokenCache {
         uri: &Url,
         language: &str,
         cache_key: u64,
-    ) -> Option<CachedSemanticTokens> {
+    ) -> Option<Arc<SemanticTokens>> {
         self.cache.get(uri).and_then(|entry| {
             if entry.cache_key == cache_key && entry.language == language {
-                Some(entry.clone())
+                Some(Arc::clone(&entry.tokens))
             } else {
                 None
             }
@@ -106,14 +106,10 @@ impl SemanticTokenCache {
     /// Returns None if:
     /// - No tokens are cached for this URI
     /// - The cached result_id doesn't match the expected one
-    pub fn get_if_valid(
-        &self,
-        uri: &Url,
-        expected_result_id: &str,
-    ) -> Option<CachedSemanticTokens> {
+    pub fn get_if_valid(&self, uri: &Url, expected_result_id: &str) -> Option<Arc<SemanticTokens>> {
         self.cache.get(uri).and_then(|entry| {
             if entry.tokens.result_id.as_deref() == Some(expected_result_id) {
-                Some(entry.clone())
+                Some(Arc::clone(&entry.tokens))
             } else {
                 None
             }
@@ -600,16 +596,16 @@ mod tests {
         cache.store(uri.clone(), previous, "rust".to_string(), 0);
 
         let cached = cache.get_if_valid(&uri, "1").unwrap();
-        let before = Arc::strong_count(&cached.tokens);
+        let before = Arc::strong_count(&cached);
 
         let current = SemanticTokens {
             result_id: Some("2".to_string()),
             data: vec![],
         };
-        let _ = crate::analysis::semantic::calculate_delta_or_full(&cached.tokens, &current, "1");
+        let _ = crate::analysis::semantic::calculate_delta_or_full(&cached, &current, "1");
 
         assert_eq!(
-            Arc::strong_count(&cached.tokens),
+            Arc::strong_count(&cached),
             before,
             "borrowing the cached Arc for the delta comparison must not clone it"
         );
@@ -671,7 +667,7 @@ mod tests {
             valid.is_some(),
             "Should return tokens when result_id matches"
         );
-        assert_eq!(valid.unwrap().tokens.data[0].length, 10);
+        assert_eq!(valid.unwrap().data[0].length, 10);
 
         // Mismatched result_id returns None
         let invalid = cache.get_if_valid(&uri, "99");
@@ -702,7 +698,7 @@ mod tests {
         // cached tokens.
         let hit = cache.get_if_current(&uri, "rust", 0xABCD);
         assert!(hit.is_some(), "should hit when the content hash matches");
-        assert_eq!(hit.unwrap().tokens.result_id, Some("7".to_string()));
+        assert_eq!(hit.unwrap().result_id, Some("7".to_string()));
 
         // Different content hash => the text changed => recompute (miss).
         assert!(

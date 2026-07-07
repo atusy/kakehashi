@@ -462,11 +462,17 @@ impl CacheCoordinator {
             self.log_cache_miss(uri, expected_result_id);
         }
 
-        result.map(|cached| cached.tokens)
+        result
     }
 
-    /// Log diagnostic information for cache misses.
+    /// Log diagnostic information for cache misses. Gated on the target's
+    /// debug level so the miss path — the steady-state case for any request
+    /// whose `previousResultId` has already advanced — skips the cache
+    /// lookup and clone entirely when debug logs aren't emitted.
     fn log_cache_miss(&self, uri: &Url, expected_result_id: &str) {
+        if !log::log_enabled!(target: "kakehashi::semantic_cache", log::Level::Debug) {
+            return;
+        }
         if let Some(cached) = self.semantic_cache.get(uri) {
             log::debug!(
                 target: "kakehashi::semantic_cache",
@@ -582,9 +588,7 @@ impl CacheCoordinator {
         language: &str,
         cache_key: u64,
     ) -> Option<std::sync::Arc<SemanticTokens>> {
-        self.semantic_cache
-            .get_if_current(uri, language, cache_key)
-            .map(|cached| cached.tokens)
+        self.semantic_cache.get_if_current(uri, language, cache_key)
     }
 
     /// Bump the settings generation on a settings/query reload so every cached
