@@ -108,10 +108,11 @@ impl Kakehashi {
         }
 
         let settings = self.settings_manager.load_settings();
+        let upstream_caps = self.upstream_code_action_caps();
         let upstream_id = crate::lsp::current_upstream_id();
         let pool = self.bridge.pool_arc();
         Ok(pool
-            .dispatch_code_action_resolve(action, &settings, upstream_id)
+            .dispatch_code_action_resolve(action, &settings, upstream_caps, upstream_id)
             .await)
     }
 

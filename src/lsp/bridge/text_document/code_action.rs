@@ -340,6 +340,7 @@ impl LanguageServerPool {
         &self,
         mut action: CodeAction,
         settings: &WorkspaceSettings,
+        upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
     ) -> CodeAction {
         let Some(envelope) = strip_code_action_envelope(&mut action) else {
@@ -359,7 +360,7 @@ impl LanguageServerPool {
             return action;
         };
 
-        self.send_code_action_resolve_request(&config, action, envelope, upstream_id)
+        self.send_code_action_resolve_request(&config, action, envelope, upstream_caps, upstream_id)
             .await
     }
 
@@ -372,6 +373,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         mut action: CodeAction,
         envelope: CodeActionEnvelope,
+        upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
     ) -> CodeAction {
         let server_name = &envelope.origin;
@@ -422,6 +424,20 @@ impl LanguageServerPool {
         // actions). Fail soft: return the original action unresolved rather
         // than hand the editor an executable downstream command.
         if resolved.command.is_some() {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+
+        // Sanitize resolved fields against the upstream client's capabilities:
+        // the server may set `isPreferred`/`disabled` on resolve even though
+        // the real client never opted into them (the bridge advertises both to
+        // downstream servers in its baseline). Mirror the initial-path policy.
+        if !upstream_caps.is_preferred_support {
+            resolved.is_preferred = None;
+        }
+        if resolved.disabled.is_some() && !upstream_caps.disabled_support {
+            // The client can't render a disabled action; hand back the
+            // original (already-sanitized) action unresolved instead.
             re_envelope_action(&mut action, &envelope);
             return action;
         }
@@ -1883,7 +1899,7 @@ mod tests {
             ..CodeAction::default()
         };
         let result = pool
-            .dispatch_code_action_resolve(action.clone(), &settings, None)
+            .dispatch_code_action_resolve(action.clone(), &settings, caps_resolve(), None)
             .await;
         assert_eq!(result.data, Some(json!({ "custom": true })));
     }
@@ -1901,7 +1917,7 @@ mod tests {
         envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
 
         let result = pool
-            .dispatch_code_action_resolve(action, &settings, None)
+            .dispatch_code_action_resolve(action, &settings, caps_resolve(), None)
             .await;
         let envelope = extract_code_action_envelope(&result).expect("envelope restored");
         assert_eq!(envelope.origin, "ruff");
