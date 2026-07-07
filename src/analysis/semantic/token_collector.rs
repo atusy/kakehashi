@@ -25,10 +25,9 @@ fn is_in_exclusion_range(node: &Node, ranges: &[(usize, usize)]) -> bool {
     })
 }
 
-/// Fetch `host_line`'s cached UTF-16 index, building it on first use for
-/// that line.
+/// Fetch `row`'s cached UTF-16 index, building it on first use for that row.
 ///
-/// A single host line commonly receives a start/end pair of `byte_to_utf16`
+/// A single line commonly receives a start/end pair of `byte_to_utf16`
 /// queries per capture, times however many captures land on that line.
 /// Returning the index (rather than resolving one column per call) lets a
 /// caller reuse a single lookup for both the start and end column of one
@@ -36,19 +35,25 @@ fn is_in_exclusion_range(node: &Node, ranges: &[(usize, usize)]) -> bool {
 /// O(line_len) rescan per query into one O(line_len) build plus O(log
 /// line_len) lookups.
 ///
-/// `host_line` is a dense index bounded by the host document's line count
-/// (never sparse/huge), so a `Vec<Option<_>>` indexed directly beats a
-/// `HashMap` here: O(1) with no hashing and better cache locality, at the
-/// cost of resizing to cover line numbers as they're first seen.
+/// `row` must be the CONTENT-local row (`start_pos.row` / the multiline
+/// loop's `row`), not the host-absolute line — this cache is scoped to one
+/// `collect_host_tokens` call, and an injection can start deep into a large
+/// host document. Indexing by the absolute host line would resize the
+/// vector to cover every line from 0 up to that point (e.g. a one-line
+/// injection at host line 10,000 forcing a 10,001-element vector) for a
+/// cache that only ever holds a handful of entries. The content-local row
+/// is dense and small (bounded by the content's own line count), which is
+/// what makes `Vec<Option<_>>` — O(1), no hashing, cache-friendly — a better
+/// fit here than a `HashMap`.
 fn cached_line_index<'a>(
     cache: &'a mut Vec<Option<Utf16LineIndex>>,
-    host_line: usize,
+    row: usize,
     line_text: &str,
 ) -> &'a Utf16LineIndex {
-    if host_line >= cache.len() {
-        cache.resize_with(host_line + 1, || None);
+    if row >= cache.len() {
+        cache.resize_with(row + 1, || None);
     }
-    cache[host_line].get_or_insert_with(|| Utf16LineIndex::new(line_text))
+    cache[row].get_or_insert_with(|| Utf16LineIndex::new(line_text))
 }
 
 /// Extract the `#set! priority N` value for a pattern, defaulting to 100.
@@ -419,7 +424,7 @@ pub(super) fn collect_host_tokens(
                 } else {
                     start_pos.column
                 };
-                let line_index = cached_line_index(&mut utf16_cache, host_line, host_line_text);
+                let line_index = cached_line_index(&mut utf16_cache, start_pos.row, host_line_text);
                 let start_utf16 = line_index.byte_to_utf16(byte_offset_in_host);
 
                 // For trailing newline case, use the line length as end position
@@ -461,7 +466,7 @@ pub(super) fn collect_host_tokens(
                         start_pos.column
                     };
                     let start_utf16 =
-                        cached_line_index(&mut utf16_cache, host_start_line, host_start_line_text)
+                        cached_line_index(&mut utf16_cache, start_pos.row, host_start_line_text)
                             .byte_to_utf16(start_byte_offset);
 
                     let mut total_length_utf16 = 0usize;
@@ -479,7 +484,7 @@ pub(super) fn collect_host_tokens(
                             &prefix_widths,
                         );
 
-                        let line_index = cached_line_index(&mut utf16_cache, host_row, line_text);
+                        let line_index = cached_line_index(&mut utf16_cache, row, line_text);
                         let line_start_utf16 = line_index.byte_to_utf16(line_start);
                         let line_end_utf16 = line_index.byte_to_utf16(line_end);
                         total_length_utf16 += line_end_utf16 - line_start_utf16;
@@ -523,8 +528,7 @@ pub(super) fn collect_host_tokens(
                             &prefix_widths,
                         );
 
-                        let line_index =
-                            cached_line_index(&mut utf16_cache, host_row, host_line_text);
+                        let line_index = cached_line_index(&mut utf16_cache, row, host_line_text);
                         let start_utf16 = line_index.byte_to_utf16(line_start_byte);
                         let end_utf16 = line_index.byte_to_utf16(line_end_byte);
 
