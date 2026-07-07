@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use super::collect::{
-    Collection, DefinitionCapture, Inherits, Rebind, RedirectTarget, ReferenceCapture, ScopeTarget,
-    Visibility,
+    Collection, DefinitionCapture, Inherits, Rebind, RedirectTarget, ReferenceCapture,
+    ScopeCapture, ScopeTarget, Visibility,
 };
 
 /// Index into [`BindingsModel::bindings`].
@@ -53,14 +53,26 @@ struct Binding {
 #[derive(Debug)]
 pub(crate) struct BindingsModel {
     scopes: Vec<Scope>,
+    /// `children[s]` are the direct child scopes of scope `s`, in the same
+    /// outer-first order as `scopes` itself. Built once from each scope's
+    /// `parent` link so `innermost_scope_at` can descend the tree instead of
+    /// scanning every scope.
+    children: Vec<Vec<usize>>,
     bindings: Vec<Binding>,
     references: Vec<ReferenceCapture>,
 }
 
 impl BindingsModel {
     pub(crate) fn build(collection: Collection) -> Self {
+        let scopes = build_scope_tree(collection.root_range, collection.scopes);
+        let mut children = vec![Vec::new(); scopes.len()];
+        for (i, scope) in scopes.iter().enumerate().skip(1) {
+            // Every non-root scope has a parent (assigned in build_scope_tree).
+            children[scope.parent.expect("non-root scope has a parent")].push(i);
+        }
         let mut model = BindingsModel {
-            scopes: build_scope_tree(&collection),
+            scopes,
+            children,
             bindings: Vec::new(),
             references: collection.references,
         };
@@ -246,14 +258,35 @@ impl BindingsModel {
     /// The innermost scope containing byte `p` (the root contains
     /// everything, including positions outside its node range — an injected
     /// layer's cursor is clamped by construction).
+    ///
+    /// Descends the scope tree from the root instead of scanning every
+    /// scope: tree-sitter node ranges nest-or-are-disjoint, so at most one
+    /// child of any scope can contain `p`. `children[s]` is populated in the
+    /// same outer-first, start-ascending order as `scopes` itself, so that
+    /// one child is found by binary search rather than a linear scan — a
+    /// linear `.find()` here would degrade back to O(fan-out) per level
+    /// (e.g. a flat scope tree with many top-level siblings), which for a
+    /// wide-but-shallow tree is little better than the O(scopes) the tree
+    /// descent replaced. This is O(depth x log(fan-out)) overall — the
+    /// previous linear filter+max_by_key ran on every reference/definition
+    /// registration, i.e. O(refs x scopes) / O(defs x scopes) overall.
     fn innermost_scope_at(&self, p: usize) -> usize {
-        self.scopes
-            .iter()
-            .enumerate()
-            .filter(|(i, s)| *i == 0 || (s.byte_range.start <= p && p < s.byte_range.end))
-            .max_by_key(|(_, s)| s.depth)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        let mut current = 0;
+        loop {
+            let children = &self.children[current];
+            // The last child whose start is <= p — the only candidate that
+            // could contain p, since siblings are disjoint and start-sorted.
+            let idx = children.partition_point(|&c| self.scopes[c].byte_range.start <= p);
+            if idx == 0 {
+                return current;
+            }
+            let next = children[idx - 1];
+            if p < self.scopes[next].byte_range.end {
+                current = next;
+            } else {
+                return current;
+            }
+        }
     }
 
     /// In-scope selection: among the scope's bindings for `name` in
@@ -433,9 +466,14 @@ impl BindingsModel {
 
 /// Build the scope tree: dedupe captures by byte range (merging properties),
 /// prepend the implicit root scope, and nest by containment.
-fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
+///
+/// Takes `root_range`/`scopes` by value (rather than `&Collection`) since
+/// `collection.scopes` is never used again after this call — moving each
+/// capture's `label`/`inherits` (a `String`/`Vec<String>`-carrying enum)
+/// into its `Scope` avoids cloning them.
+fn build_scope_tree(root_range: Range<usize>, scopes: Vec<ScopeCapture>) -> Vec<Scope> {
     let mut root = Scope {
-        byte_range: collection.root_range.clone(),
+        byte_range: root_range,
         label: None,
         inherits: Inherits::All,
         visible_to_nested: true,
@@ -448,20 +486,25 @@ fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
     // Dedupe by range; a node captured as @scope by several patterns merges:
     // first label wins, first non-default inherits wins, visible-to-nested
     // ANDs (any pattern hiding the scope hides it).
-    let mut deduped: Vec<Scope> = Vec::new();
-    for capture in &collection.scopes {
+    //
+    // `by_range` maps a range to its index in `deduped`, turning the merge
+    // lookup from an O(scopes) linear scan per capture (O(scopes^2) total)
+    // into an O(1) hash lookup.
+    let scopes_len = scopes.len();
+    let mut deduped: Vec<Scope> = Vec::with_capacity(scopes_len);
+    let mut by_range: HashMap<(usize, usize), usize> = HashMap::with_capacity(scopes_len);
+    for capture in scopes {
+        let range_key = (capture.byte_range.start, capture.byte_range.end);
         let merge_into = if capture.byte_range == root.byte_range {
             &mut root
-        } else if let Some(existing) = deduped
-            .iter_mut()
-            .find(|s| s.byte_range == capture.byte_range)
-        {
-            existing
+        } else if let Some(&existing) = by_range.get(&range_key) {
+            &mut deduped[existing]
         } else {
+            by_range.insert(range_key, deduped.len());
             deduped.push(Scope {
-                byte_range: capture.byte_range.clone(),
-                label: capture.label.clone(),
-                inherits: capture.inherits.clone(),
+                byte_range: capture.byte_range,
+                label: capture.label,
+                inherits: capture.inherits,
                 visible_to_nested: capture.visible_to_nested,
                 parent: None,
                 depth: 0,
@@ -471,10 +514,10 @@ fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
             continue;
         };
         if merge_into.label.is_none() {
-            merge_into.label = capture.label.clone();
+            merge_into.label = capture.label;
         }
         if merge_into.inherits == Inherits::All {
-            merge_into.inherits = capture.inherits.clone();
+            merge_into.inherits = capture.inherits;
         }
         merge_into.visible_to_nested &= capture.visible_to_nested;
     }
@@ -489,22 +532,29 @@ fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
             .then(b.byte_range.end.cmp(&a.byte_range.end))
     });
 
-    let mut scopes = vec![root];
+    // Parent assignment: `deduped` arrives outer-first with ranges that
+    // nest-or-are-disjoint, so the parent of each scope is the nearest
+    // enclosing predecessor still on the ancestor stack — no predecessor
+    // once popped can contain a later (later-starting) scope again. This
+    // replaces an O(scopes) scan-for-innermost-container per scope
+    // (O(scopes^2) total) with one push/pop per scope (O(scopes) total).
+    let mut scopes = Vec::with_capacity(deduped.len() + 1);
+    scopes.push(root);
+    let mut ancestors: Vec<usize> = vec![0]; // root always contains everything
     for mut scope in deduped {
-        let parent = scopes
-            .iter()
-            .enumerate()
-            .skip(1)
-            .filter(|(_, s)| {
-                s.byte_range.start <= scope.byte_range.start
-                    && scope.byte_range.end <= s.byte_range.end
-            })
-            .max_by_key(|(_, s)| s.depth)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        while ancestors.len() > 1 {
+            let top = *ancestors.last().expect("ancestors is non-empty");
+            let top_range = &scopes[top].byte_range;
+            if top_range.start <= scope.byte_range.start && scope.byte_range.end <= top_range.end {
+                break;
+            }
+            ancestors.pop();
+        }
+        let parent = *ancestors.last().expect("ancestors is non-empty");
         scope.parent = Some(parent);
         scope.depth = scopes[parent].depth + 1;
         scopes.push(scope);
+        ancestors.push(scopes.len() - 1);
     }
     scopes
 }
@@ -1004,5 +1054,105 @@ mod tests {
         );
         assert_eq!(model.scopes.len(), 1);
         assert_eq!(model.scopes[0].parent, None);
+    }
+
+    #[test]
+    fn scope_capture_twice_on_same_non_root_node_merges_properties() {
+        // Every (block) node is captured by TWO patterns at the SAME byte
+        // range: once plain (pattern 1) and once labeled (pattern 2). This
+        // exercises build_scope_tree's dedup HASH-HIT path (not just
+        // first-insert), since each range collides with an already-deduped
+        // scope rather than the root.
+        let text = "fn main() { { x; } }";
+        let model = model_for(
+            text,
+            r#"
+            (block) @scope
+            (block) @scope.labeled
+            (identifier) @reference
+            "#,
+        );
+        // root + outer fn-body block + inner block == 3, not 5: a naive
+        // "always push" dedup bug would leave a separate entry per pattern
+        // match instead of merging same-range captures.
+        assert_eq!(model.scopes.len(), 3);
+        assert!(
+            model.scopes[1..]
+                .iter()
+                .all(|s| s.label.as_deref() == Some("labeled")),
+            "every non-root scope merged pattern 2's label onto pattern 1's capture"
+        );
+    }
+
+    #[test]
+    fn scope_tree_parent_assignment_pops_back_to_correct_ancestor_across_siblings() {
+        // Three same-depth sibling blocks after a deeply nested chain,
+        // stress-testing the ancestor-stack pop logic in build_scope_tree:
+        // after the first deeply-nested branch is fully processed, the stack
+        // must pop all the way back to the function body before assigning
+        // the second and third siblings' parent — not leave a stale deep
+        // scope as their (incorrect) parent.
+        let text = "fn f() { { { x; } } { y; } { z; } }";
+        let model = model_for(
+            text,
+            r#"
+            (block) @scope
+            (identifier) @reference
+            "#,
+        );
+        // root(0), fn body(1), deep-branch outer(2), deep-branch inner(3),
+        // sibling 2(4), sibling 3(5).
+        assert_eq!(model.scopes.len(), 6);
+        let fn_body = 1;
+        assert_eq!(model.scopes[fn_body].parent, Some(0));
+        // All three top-level children of the fn body share the SAME parent,
+        // regardless of how deep the first one's subtree went.
+        let children_of_fn_body: Vec<usize> = model.children[fn_body].clone();
+        assert_eq!(children_of_fn_body.len(), 3, "three direct child blocks");
+        for &child in &children_of_fn_body {
+            assert_eq!(model.scopes[child].parent, Some(fn_body));
+        }
+    }
+
+    #[test]
+    fn innermost_scope_at_binary_searches_correctly_across_many_wide_siblings() {
+        // Five same-depth sibling blocks directly under the fn body — a
+        // flat, wide scope tree. Exercises the partition_point binary
+        // search across several children, including the LAST sibling
+        // (which an off-by-one in the search would be most likely to miss)
+        // and the gap between siblings (owned by the parent, not either
+        // neighbor).
+        let text = "fn f() { {a;} {b;} {c;} {d;} {e;} }";
+        let model = model_for(text, BASIC);
+        let fn_body = 1;
+        let children = model.children[fn_body].clone();
+        assert_eq!(children.len(), 5);
+
+        let e_pos = nth(text, "e", 0);
+        assert_eq!(
+            model.innermost_scope_at(e_pos),
+            *children.last().unwrap(),
+            "a position in the last sibling must resolve to that sibling"
+        );
+
+        // The single space between "} {b" is outside every block — owned
+        // by the fn body, not either neighboring sibling.
+        let gap = text.find("} {b").unwrap() + 1;
+        assert_eq!(
+            model.innermost_scope_at(gap),
+            fn_body,
+            "the gap between siblings belongs to the parent scope"
+        );
+    }
+
+    #[test]
+    fn innermost_scope_at_on_root_only_document_returns_root() {
+        // No @scope captures at all: children[0] is empty, so the binary
+        // search's first partition_point call must terminate immediately
+        // rather than panicking on an empty slice.
+        let text = "fn main() { x; }";
+        let model = model_for(text, "(identifier) @reference");
+        assert_eq!(model.innermost_scope_at(0), 0);
+        assert_eq!(model.innermost_scope_at(text.len()), 0);
     }
 }
