@@ -179,15 +179,10 @@ fn translate_edit_host_ward_strict(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
-    // The region's host START is the offset's start line at its line-0 column
-    // offset — exactly where a translated virtual `(0,0)` lands — so bounding on
-    // `[region_start, region_end]` rejects a pass-through host edit above the
-    // region without touching any legitimate translated edit.
-    let region_start = Position::new(offset.line(), offset.column_for_line(0));
     !workspace_edit_touches_foreign_region(edit, request_virtual_uri)
         && transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset)
         && !workspace_edit_is_empty(edit)
-        && workspace_edit_within_region(edit, host_uri, region_start, region_end)
+        && workspace_edit_within_region(edit, host_uri, offset, region_end)
 }
 
 /// Whether a `WorkspaceEdit` touches a virtual document OTHER than
