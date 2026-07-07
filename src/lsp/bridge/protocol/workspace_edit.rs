@@ -178,20 +178,26 @@ fn transform_text_document_edit(
 }
 
 /// Whether every text edit targeting `host_uri` in a HOST-coordinate
-/// `WorkspaceEdit` is fully CONTAINED in `[region_start, region_end]` — i.e.
-/// stays inside the injection region it was translated from.
+/// `WorkspaceEdit` is CONTAINED in the injection region — bounded above by
+/// `region_end` and below, PER LINE, by the region's line offset (`offset`).
 ///
 /// Call this AFTER `transform_workspace_edit_to_host`. Two escape vectors:
-/// - `range.end` PAST `region_end`: a stale/malformed downstream edit whose
+/// - a position PAST `region_end`: a stale/malformed downstream edit whose
 ///   virtual range runs beyond the (possibly shrunk) region content translates
 ///   to a plausible host range AFTER the fence — into unrelated host text.
-/// - `range.start` BEFORE `region_start`: virtual→host translation is additive,
-///   so a *translated* edit can't fall below the start (its minimum is virtual
-///   `(0,0)` → exactly `region_start`); but an edit already keyed to `host_uri`
-///   passes through the transform verbatim (real-file URIs are kept), so a
-///   downstream that emits a host-URI edit could reach host text BEFORE the
-///   region. The lower bound rejects those without touching any legitimate
-///   translated edit (which sits at or after `region_start`).
+/// - a position BELOW the region's per-line floor: virtual→host translation is
+///   additive (`translate_virtual_position_to_host` adds the start line and the
+///   line's column offset), so a *translated* position on virtual line `k`
+///   lands at host column `>= column_for_line(k)` — the floor, with equality at
+///   virtual column 0. But an edit already keyed to `host_uri` passes through
+///   the transform verbatim (real-file URIs are kept), so a host-URI edit could
+///   reach host text above the region OR into a line's prefix (e.g. a
+///   blockquote `> ` before the injected content on any line). The per-line
+///   floor rejects those and NEVER a legitimate translated edit.
+///
+/// Note: a single contiguous multi-line range inherently spans intermediate
+/// lines' prefixes — that's equally true of a legitimate translated multi-line
+/// edit, so only the range ENDPOINTS are floored, not every intermediate line.
 ///
 /// Callers must REJECT, never clamp: applyEdit answers `applied: false`,
 /// codeAction/resolve disables the action. Only `host_uri`'s edits are
@@ -202,12 +208,18 @@ fn transform_text_document_edit(
 pub(crate) fn workspace_edit_within_region(
     edit: &WorkspaceEdit,
     host_uri: &Uri,
-    region_start: Position,
+    offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
-    let within = |range: Range| {
-        !position_after(region_start, range.start) && !position_after(range.end, region_end)
+    // A host position is in-region iff it's at/after the region's start line, at
+    // /after that line's column floor, and at/before the region end.
+    let in_region = |p: Position| {
+        p.line >= offset.line() && {
+            let virtual_line = p.line - offset.line();
+            p.character >= offset.column_for_line(virtual_line) && !position_after(p, region_end)
+        }
     };
+    let within = |range: Range| in_region(range.start) && in_region(range.end);
     if let Some(changes) = &edit.changes
         && let Some(edits) = changes.get(host_uri)
         && !edits.iter().all(|e| within(e.range))
@@ -492,45 +504,42 @@ mod tests {
     #[test]
     fn within_region_bounds_the_host_uri_edits_only() {
         let host_uri = make_host_uri();
-        // A one-line region: starts at host (3, 0), ends at (3, 11).
-        let region_start = Position {
-            line: 3,
-            character: 0,
-        };
+        // A 2-line BLOCKQUOTE region: starts at host line 3, and every line has a
+        // `> ` prefix (column floor 2). Region end is host (4, 11).
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2]);
         let region_end = Position {
-            line: 3,
+            line: 4,
             character: 11,
         };
         let check = |edit: &WorkspaceEdit| {
-            workspace_edit_within_region(edit, &host_uri, region_start, region_end)
+            workspace_edit_within_region(edit, &host_uri, &offset, region_end)
         };
 
+        // In-region: line 3 at/after the floor (col 2), end within region.
         let in_bounds = parse_workspace_edit(json!({
             "changes": { host_uri.as_str(): [
-                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 5}}, "newText": "x" }
+                { "range": {"start": {"line": 3, "character": 2}, "end": {"line": 3, "character": 5}}, "newText": "x" }
             ] }
         }));
         assert!(check(&in_bounds));
 
-        // range.end PAST region_end — the escape-after-the-fence vector. Rejected.
+        // range.end PAST region_end line — escape after the fence. Rejected.
         let past_end_line = parse_workspace_edit(json!({
             "changes": { host_uri.as_str(): [
-                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 8, "character": 0}}, "newText": "x" }
+                { "range": {"start": {"line": 3, "character": 2}, "end": {"line": 8, "character": 0}}, "newText": "x" }
             ] }
         }));
         assert!(!check(&past_end_line));
 
-        // Past the end COLUMN on the end line (inline over-reach). Rejected.
+        // Past the end COLUMN on the end line. Rejected.
         let past_end_col = parse_workspace_edit(json!({
             "changes": { host_uri.as_str(): [
-                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 20}}, "newText": "x" }
+                { "range": {"start": {"line": 3, "character": 2}, "end": {"line": 4, "character": 20}}, "newText": "x" }
             ] }
         }));
         assert!(!check(&past_end_col));
 
-        // range.start BEFORE region_start — a pass-through host-URI edit that was
-        // never translated (so the additive floor doesn't protect it) reaching
-        // host text ABOVE the region. Rejected even though its end is in-bounds.
+        // start ABOVE the region (line 0). Rejected.
         let before_start = parse_workspace_edit(json!({
             "changes": { host_uri.as_str(): [
                 { "range": {"start": {"line": 0, "character": 0}, "end": {"line": 3, "character": 5}}, "newText": "x" }
@@ -538,8 +547,18 @@ mod tests {
         }));
         assert!(!check(&before_start));
 
-        // A REAL file (different URI) is not region-bounded — its own extent
-        // applies, so an out-of-region-looking range there is fine.
+        // PER-LINE FLOOR: a pass-through host edit into the SECOND line's `> `
+        // prefix (line 4, column 0 < that line's floor 2). A single line-0-derived
+        // region_start would let this through (line 4 > start line 3); the
+        // per-line floor rejects it. This is the blockquote-prefix escape.
+        let into_line_prefix = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 4, "character": 0}, "end": {"line": 4, "character": 5}}, "newText": "x" }
+            ] }
+        }));
+        assert!(!check(&into_line_prefix));
+
+        // A REAL file (different URI) is not region-bounded — fine.
         let real_file = parse_workspace_edit(json!({
             "changes": { "file:///other.lua": [
                 { "range": {"start": {"line": 99, "character": 0}, "end": {"line": 99, "character": 0}}, "newText": "x" }
@@ -547,24 +566,24 @@ mod tests {
         }));
         assert!(check(&real_file));
 
-        // documentChanges (Edits) targeting the host URI is bounded on both ends.
+        // documentChanges (Edits) host-URI edits are bounded the same way.
         let doc_changes_past_end = parse_workspace_edit(json!({
             "documentChanges": [{
                 "textDocument": { "uri": host_uri.as_str(), "version": null },
                 "edits": [
-                    { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 9, "character": 0}}, "newText": "x" }
+                    { "range": {"start": {"line": 3, "character": 2}, "end": {"line": 9, "character": 0}}, "newText": "x" }
                 ]
             }]
         }));
         assert!(!check(&doc_changes_past_end));
-        let doc_changes_before_start = parse_workspace_edit(json!({
+        let doc_changes_into_prefix = parse_workspace_edit(json!({
             "documentChanges": [{
                 "textDocument": { "uri": host_uri.as_str(), "version": null },
                 "edits": [
-                    { "range": {"start": {"line": 1, "character": 0}, "end": {"line": 3, "character": 2}}, "newText": "x" }
+                    { "range": {"start": {"line": 4, "character": 1}, "end": {"line": 4, "character": 3}}, "newText": "x" }
                 ]
             }]
         }));
-        assert!(!check(&doc_changes_before_start));
+        assert!(!check(&doc_changes_into_prefix));
     }
 }
