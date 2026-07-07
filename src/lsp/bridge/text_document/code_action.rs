@@ -428,18 +428,30 @@ impl LanguageServerPool {
             return action;
         }
 
-        // Sanitize resolved fields against the upstream client's capabilities:
-        // the server may set `isPreferred`/`disabled` on resolve even though
-        // the real client never opted into them (the bridge advertises both to
-        // downstream servers in its baseline). Mirror the initial-path policy.
+        // A resolve that marks the action `disabled` makes it non-executable —
+        // mirror the initial-path policy for server-disabled actions. Without
+        // upstream `disabledSupport` the client can't render it, so fail soft
+        // (return the original, already-sanitized action unresolved); with it,
+        // strip the payload (a disabled action must never carry an executable
+        // edit/command) and surface it disabled with its reason and suffix.
+        if resolved.disabled.is_some() {
+            if !upstream_caps.disabled_support {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+            resolved.title = suffixed_title;
+            resolved.edit = None;
+            resolved.command = None;
+            resolved.data = None;
+            resolved.is_preferred = None;
+            return resolved;
+        }
+
+        // isPreferred is its own client capability (LSP 3.15); the downstream
+        // baseline advertises it unconditionally, so strip it for clients that
+        // did not opt in.
         if !upstream_caps.is_preferred_support {
             resolved.is_preferred = None;
-        }
-        if resolved.disabled.is_some() && !upstream_caps.disabled_support {
-            // The client can't render a disabled action; hand back the
-            // original (already-sanitized) action unresolved instead.
-            re_envelope_action(&mut action, &envelope);
-            return action;
         }
 
         // Translate the resolved edit host-ward. Fail soft (return the
