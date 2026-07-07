@@ -252,7 +252,8 @@ fn command_action_surfaces_as_disabled_with_disabled_support() {
 }
 
 /// Issue codeAction over the lua fence line for the given client, retrying
-/// while the result is null (cold downstream still handshaking).
+/// while the result is null OR an empty array (cold downstream still
+/// handshaking) until a non-empty action list arrives.
 fn code_action_over_fence(client: &mut LspClient) -> Vec<Value> {
     for _ in 0..300 {
         let response = client.send_request(
