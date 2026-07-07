@@ -17,10 +17,11 @@ use tower_lsp_server::ls_types::{
 use ulid::Ulid;
 use url::Url;
 
-use super::super::Kakehashi;
+use super::super::{Kakehashi, detect_document_language};
+use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{FanInResult, dispatch_host_preferred, dispatch_preferred};
 use crate::lsp::bridge::{
-    CodeActionEnvelope, HostDocument, UpstreamCodeActionCaps, bridge_code_actions,
+    CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps, bridge_code_actions,
     extract_code_action_envelope, parse_code_actions_leniently,
 };
 use crate::text::PositionMapper;
@@ -119,40 +120,69 @@ impl Kakehashi {
             .await)
     }
 
-    /// The region's current host-document END position if its start still sits
-    /// where the action was minted (freshness), else `None`. Combines the
-    /// staleness gate (mirrors `code_lens_region_is_fresh`) with the region-end
-    /// lookup the resolve path needs to bound the resolved edit — both read the
-    /// same live `lookup_position`, so they can't disagree.
+    /// The region's current content-precise host-document END position if the
+    /// region is still FRESH — i.e. re-resolving it from the live parse yields
+    /// the SAME offset the action was minted with — else `None`.
     ///
-    /// The end is the tracker's node end (byte-mapped to a host `Position`),
-    /// which for an inline injection may slightly over-approximate the content
-    /// end. That's a safe over-approximation for a bounds guard: it still
-    /// rejects an edit that runs past the region into unrelated host text; it
-    /// only permits a tiny over-reach within an inline node. (applyEdit uses the
-    /// content-precise `resolved.region.byte_range.end`; the two need not be
-    /// bit-identical.)
+    /// The resolve path translates the resolved edit using the envelope's
+    /// SNAPSHOT offset (`RegionOffset::from(&envelope.offset)`). Re-resolve the
+    /// live offset and compare the WHOLE thing, not just the start: if any
+    /// per-line column offset diverged (e.g. an interior blockquote-prefix edit
+    /// left the start line intact) translating with the stale offset would bind
+    /// the edit to wrong host columns — corruption. On any divergence fail soft
+    /// (the client re-requests fresh actions), mirroring the stale-region case.
+    /// The same live resolution yields the content-precise region end used to
+    /// bound the edit (`resolved.region.byte_range.end`, matching applyEdit).
     ///
     /// Known limitation (shared with `code_lens_region_is_fresh`): for
     /// injections whose queries apply `#offset!` (today only YAML/TOML
     /// frontmatter in the bundled markdown queries), the envelope offset is
-    /// `#offset!`-adjusted while the tracker stores the raw content-node
-    /// position, so the freshness comparison never matches and resolve always
-    /// fails soft for those regions. That errs in the safe direction (the action
-    /// stays unresolved) and frontmatter code actions have no known real-world
-    /// producer; revisit if one appears.
+    /// `#offset!`-adjusted while the live resolution isn't, so the comparison
+    /// never matches and resolve always fails soft for those regions. That errs
+    /// in the safe direction (the action stays unresolved) and frontmatter code
+    /// actions have no known real-world producer; revisit if one appears.
     fn code_action_region_end_if_fresh(&self, envelope: &CodeActionEnvelope) -> Option<Position> {
-        let uri = Url::parse(&envelope.host_uri).ok()?;
+        let host_url = Url::parse(&envelope.host_uri).ok()?;
         let ulid = envelope.region_id.parse::<Ulid>().ok()?;
-        let (start_byte, end_byte, _kind) =
-            self.bridge.node_tracker().lookup_position(&uri, &ulid)?;
-        let doc = self.documents.get(&uri)?;
-        let mapper = PositionMapper::new(doc.text());
-        let start = mapper.byte_to_position(start_byte)?;
-        if start.line != envelope.offset.line || start.character != envelope.offset.column {
+        // Re-resolve the region from the LIVE parse (same construction as the
+        // goto/showDocument offset path), yielding the current per-line offset
+        // AND the content-precise host byte range.
+        let (start_byte, _end, _kind, _layer) =
+            self.bridge.node_tracker().lookup_node(&host_url, &ulid)?;
+        let snapshot = self.documents.get(&host_url)?.snapshot()?;
+        let language_name = detect_document_language(&self.language, &self.documents, &host_url)?;
+        let injection_query = self.language.injection_query(&language_name)?;
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &self.language,
+            self.bridge.node_tracker(),
+            &host_url,
+            snapshot.tree(),
+            snapshot.text(),
+            injection_query.as_ref(),
+            start_byte,
+        )?;
+        // The tracker byte and the freshly-resolved region can disagree after an
+        // edit (the byte now falls in a different live region); a mismatched
+        // region_id means we'd bound/translate against the wrong region.
+        if resolved.region.region_id != envelope.region_id {
             return None;
         }
-        mapper.byte_to_position(end_byte)
+        // Content-precise host end (matches applyEdit) — compute before moving
+        // `line_column_offsets` out of `resolved`.
+        let region_end = PositionMapper::new(snapshot.text())
+            .byte_to_position(resolved.region.byte_range.end)?;
+        let live_offset = RegionOffset::with_per_line_offsets(
+            resolved.region.line_range.start,
+            resolved.line_column_offsets,
+        );
+        // Compare the WHOLE offset, not just the start: a diverged interior
+        // per-line column offset (e.g. a blockquote-prefix edit that left the
+        // start line intact) would translate the resolved edit to wrong host
+        // columns. Fail soft on any divergence.
+        if live_offset != RegionOffset::from(&envelope.offset) {
+            return None;
+        }
+        Some(region_end)
     }
 
     /// Virt layer: bridge the injection region under the requested range.
