@@ -23,7 +23,7 @@ fn mock_formatter_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mock-lsp-formatter")
 }
 
-fn init_client(client_capabilities: Value) -> (LspClient, tempfile::TempDir) {
+fn init_client(client_capabilities: Value) -> (LspClient, Value, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("code_action.toml");
@@ -46,13 +46,29 @@ fn init_client(client_capabilities: Value) -> (LspClient, tempfile::TempDir) {
             }}
         }),
     );
+    client.send_notification("initialized", json!({}));
+    (client, init_response, config_dir)
+}
+
+/// Client capabilities with codeActionLiteralSupport (required for the
+/// bridge to advertise codeActionProvider at all — it can only produce
+/// CodeAction literals), optionally with disabledSupport.
+fn literal_support_caps(disabled_support: bool) -> Value {
+    let mut code_action = json!({
+        "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [] } }
+    });
+    if disabled_support {
+        code_action["disabledSupport"] = json!(true);
+    }
+    json!({ "textDocument": { "codeAction": code_action } })
+}
+
+fn assert_advertised(init_response: &Value) {
     assert_eq!(
         init_response["result"]["capabilities"]["codeActionProvider"],
         json!(true),
-        "codeActionProvider must be advertised (#568)"
+        "codeActionProvider must be advertised for literal-support clients (#568)"
     );
-    client.send_notification("initialized", json!({}));
-    (client, config_dir)
 }
 
 /// Markdown host: the lua fence content sits on host line 3.
@@ -107,7 +123,8 @@ fn code_action_with_retry(client: &mut LspClient) -> Vec<Value> {
 #[test]
 fn code_action_edit_is_host_translated_and_suffixed() {
     // No disabledSupport: the bare Command action must be dropped entirely.
-    let (mut client, _config_dir) = init_client(json!({}));
+    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(false));
+    assert_advertised(&init_response);
     open_markdown(&mut client);
 
     let actions = code_action_with_retry(&mut client);
@@ -137,7 +154,8 @@ fn whole_document_range_reaches_the_injection_region() {
     // Save-time flows (editor.codeActionsOnSave) request with a range that
     // starts at (0,0), OUTSIDE any injection — the bridge must still find
     // the overlapped region instead of skipping the virt layer.
-    let (mut client, _config_dir) = init_client(json!({}));
+    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(false));
+    assert_advertised(&init_response);
     open_markdown(&mut client);
 
     let actions = (0..300)
@@ -174,10 +192,23 @@ fn whole_document_range_reaches_the_injection_region() {
 }
 
 #[test]
+fn code_action_not_advertised_without_literal_support() {
+    // A client without codeActionLiteralSupport only understands Command[]
+    // responses, which the bridge cannot produce — the capability must be
+    // withheld so the client never asks.
+    let (mut client, init_response, _config_dir) = init_client(json!({}));
+    assert_eq!(
+        init_response["result"]["capabilities"]["codeActionProvider"],
+        Value::Null,
+        "codeActionProvider must be withheld without literal support"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
 fn command_action_surfaces_as_disabled_with_disabled_support() {
-    let (mut client, _config_dir) = init_client(json!({
-        "textDocument": { "codeAction": { "disabledSupport": true } }
-    }));
+    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    assert_advertised(&init_response);
     open_markdown(&mut client);
 
     let actions = code_action_with_retry(&mut client);

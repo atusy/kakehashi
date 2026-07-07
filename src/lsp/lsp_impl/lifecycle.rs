@@ -111,6 +111,17 @@ impl Kakehashi {
         self.bridge
             .pool()
             .set_workspace_folders(workspace_folders_for_bridge);
+        // Clients without codeActionLiteralSupport only understand
+        // `Command[]` responses, and the bridge can only produce CodeAction
+        // literals (commands aren't bridged) — withhold the capability for
+        // them (#568).
+        let client_supports_code_action_literals = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.code_action.as_ref())
+            .and_then(|ca| ca.code_action_literal_support.as_ref())
+            .is_some();
         self.bridge
             .pool()
             .set_client_capabilities(params.capabilities);
@@ -324,7 +335,8 @@ impl Kakehashi {
                 // servers are asked for complete (edit-carrying) actions, and
                 // narrowing kinds would stop clients from asking at all
                 // (#568).
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                code_action_provider: client_supports_code_action_literals
+                    .then_some(CodeActionProviderCapability::Simple(true)),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
                 }),
