@@ -123,12 +123,14 @@ fn build_code_action_request(
     // Out-of-region diagnostics would translate to virtual coordinates that
     // don't exist: above-region ones saturate to (0,0) and can false-match a
     // different diagnostic at the top of the virtual document; ones past the
-    // region land beyond the virtual document. Bound by the region's own
-    // [start, end) extent — NOT the (possibly zero-length, cursor) request
-    // range, which would wrongly drop a diagnostic sitting at the cursor.
+    // region land beyond the virtual document. Keep only diagnostics whose
+    // WHOLE range fits the region's `[start, end)` extent (`region_end` is
+    // exclusive, so a diagnostic ending exactly at it is in) — bounding by
+    // the region, NOT the (possibly zero-length, cursor) request range, which
+    // would wrongly drop a diagnostic sitting at the cursor.
     context.diagnostics.retain(|diagnostic| {
         host_position_within_region(diagnostic.range.start, offset)
-            && diagnostic.range.start < region_end
+            && diagnostic.range.end <= region_end
     });
     for diagnostic in &mut context.diagnostics {
         translate_host_range_to_virtual(&mut diagnostic.range, offset);
@@ -464,6 +466,52 @@ mod tests {
             "source.organizeImports"
         );
         assert_eq!(json["params"]["context"]["triggerKind"], 1);
+    }
+
+    #[test]
+    fn code_action_request_drops_diagnostic_straddling_region_end() {
+        // A diagnostic that starts in-region but ends past the region end
+        // would translate to a virtual end beyond the virtual document — the
+        // whole range must fit the region, so it's dropped.
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let straddling = Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 5,
+                    character: 0,
+                },
+                end: Position {
+                    line: 14,
+                    character: 0,
+                },
+            },
+            ..Diagnostic::default()
+        };
+        let context = CodeActionContext {
+            diagnostics: vec![straddling],
+            ..CodeActionContext::default()
+        };
+        let request = build_code_action_request(
+            &virtual_uri,
+            range(5, 5),
+            context,
+            &RegionOffset::new(3, 0),
+            Position {
+                line: 13,
+                character: 0,
+            },
+            RequestId::new(1),
+            None,
+        );
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(
+            json["params"]["context"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "a diagnostic ending past the region end must be dropped"
+        );
     }
 
     #[test]
