@@ -75,6 +75,12 @@ pub fn calculate_effective_range(
 }
 
 /// Apply row and column offset to a byte position in text
+///
+/// Walks only the span between `byte_pos` and the target line, in whichever
+/// direction `row_offset` points — never the whole document. `#offset!` rows
+/// are small (typically ±1, e.g. skipping a fence/frontmatter delimiter), so
+/// this is O(distance moved) rather than the O(document) two-full-scan
+/// approach it replaced.
 fn apply_offset_to_position(
     text: &str,
     byte_pos: usize,
@@ -86,59 +92,37 @@ fn apply_offset_to_position(
         return (byte_pos as i32 + col_offset).max(0) as usize;
     }
 
-    // Find the line containing the byte position
-    let mut current_line = 0;
-    let mut line_start_byte = 0;
+    // Start of the line containing byte_pos, found by scanning backward from
+    // byte_pos rather than forward from the document start.
+    let current_line_start = text[..byte_pos.min(text.len())]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
 
-    for (i, ch) in text.char_indices() {
-        if i >= byte_pos {
-            // Found the line containing our position
-            break;
-        }
-        if ch == '\n' {
-            current_line += 1;
-            line_start_byte = i + 1;
-        }
-    }
-
-    // Now find the target line (current_line + row_offset)
-    let target_line = (current_line as i32 + row_offset).max(0) as usize;
-
-    if row_offset > 0 {
-        // Moving forward - find the target line
-        let mut lines_seen = current_line;
-        let mut target_line_start = line_start_byte;
-
-        for (i, ch) in text[line_start_byte..].char_indices() {
-            if lines_seen == target_line {
-                break;
-            }
-            if ch == '\n' {
-                lines_seen += 1;
-                target_line_start = line_start_byte + i + 1;
+    let target_line_start = if row_offset > 0 {
+        // Overshooting the last line stops at that line's start (matching the
+        // original whole-scan behavior), not the document end.
+        let mut pos = current_line_start;
+        for _ in 0..row_offset {
+            match text[pos..].find('\n') {
+                Some(nl) => pos += nl + 1,
+                None => break,
             }
         }
-
-        // Apply column offset from the start of the target line
-        (target_line_start as i32 + col_offset).max(0) as usize
+        pos
     } else {
-        // Moving backward - count lines from the beginning
-        let mut lines_seen = 0;
-        let mut target_line_start = 0;
-
-        for (i, ch) in text.char_indices() {
-            if lines_seen == target_line {
-                target_line_start = i;
+        let mut pos = current_line_start;
+        for _ in 0..row_offset.unsigned_abs() {
+            if pos == 0 {
                 break;
             }
-            if ch == '\n' {
-                lines_seen += 1;
-            }
+            pos = text[..pos - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
         }
+        pos
+    };
 
-        // Apply column offset from the start of the target line
-        (target_line_start as i32 + col_offset).max(0) as usize
-    }
+    // Apply column offset from the start of the target line
+    (target_line_start as i32 + col_offset).max(0) as usize
 }
 
 #[cfg(test)]
@@ -290,6 +274,15 @@ mod tests {
         assert_eq!(effective.end, 13);
         // Slicing should be safe
         let _ = &text[effective.start..effective.end];
+    }
+
+    #[test]
+    fn test_apply_offset_to_position_positive_row_overshoot_clamps_to_last_line_start() {
+        // A row_offset overshooting the last line must clamp to that last
+        // line's start, not the document end — pins the exact overshoot
+        // value against the whole-scan behavior this function replaced.
+        let text = "line 1\nline 2";
+        assert_eq!(apply_offset_to_position(text, 6, 5, 0), 7);
     }
 
     #[test]
