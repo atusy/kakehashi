@@ -110,7 +110,7 @@ the internal, only composition for semantic-tokens methods.
 
 ### 1. Two-level resolution (spatial)
 
-```
+```text
 native finalize          host server          virt server(s)
 (existing two-stage   ┐  (one non-overlapping  one set per injection,
  sweep → one          │   set, real coords)     virtual coords
@@ -301,9 +301,13 @@ from the client are applied to the tree seed and discarded
 incremental `contentChanges` keyed by host version. The trail stays bounded
 because accepted contributions are re-shifted **eagerly on each edit**
 (adopting the new version per the identity below), so cached sets never need
-history — retention must span back only to the oldest base version among
-**in-flight** bridged requests, and truncates to the current version once the
-last such request lands or is cancelled. This cost is carried under
+history — and an in-flight request whose base version is older than its
+server's currently accepted version will have its response discarded on
+arrival by monotonic acceptance, so its base need not be covered either.
+Retention therefore spans back only to the **minimum currently-accepted
+version across active servers** (a tighter, hang-proof bound than the oldest
+in-flight base — a slow or stuck server cannot force unbounded trail growth),
+and truncates as accepted versions advance. This cost is carried under
 Consequences, not hidden. A token overlapping an edited range cannot be
 shifted soundly and is dropped, falling through to the next layer for that
 region only. The shifted set participates in the sweep until a fresh set
@@ -676,7 +680,7 @@ Add `Merged` to the enum so users can write `strategy = "merged"` like
 `preferred`/`concatenated`.
 
 **Rejected because**: it is meaningful for only two methods and needs temporal
-+ legend machinery no other method has. Exposing it enum-wide invites
+legend machinery no other method has. Exposing it enum-wide invites
 `strategy = "merged"` on `hover` (meaningless) and forces the stage-1/stage-2
 type split cross-layer-aggregation deliberately deferred. The
 per-method internal default (formatting's precedent) gives users the real knob
