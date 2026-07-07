@@ -277,9 +277,10 @@ impl BindingsModel {
             // The last child whose start is <= p — the only candidate that
             // could contain p, since siblings are disjoint and start-sorted.
             let idx = children.partition_point(|&c| self.scopes[c].byte_range.start <= p);
-            let Some(&next) = idx.checked_sub(1).and_then(|i| children.get(i)) else {
+            if idx == 0 {
                 return current;
-            };
+            }
+            let next = children[idx - 1];
             if p < self.scopes[next].byte_range.end {
                 current = next;
             } else {
