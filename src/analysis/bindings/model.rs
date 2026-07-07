@@ -53,14 +53,26 @@ struct Binding {
 #[derive(Debug)]
 pub(crate) struct BindingsModel {
     scopes: Vec<Scope>,
+    /// `children[s]` are the direct child scopes of scope `s`, in the same
+    /// outer-first order as `scopes` itself. Built once from each scope's
+    /// `parent` link so `innermost_scope_at` can descend the tree instead of
+    /// scanning every scope.
+    children: Vec<Vec<usize>>,
     bindings: Vec<Binding>,
     references: Vec<ReferenceCapture>,
 }
 
 impl BindingsModel {
     pub(crate) fn build(collection: Collection) -> Self {
+        let scopes = build_scope_tree(&collection);
+        let mut children = vec![Vec::new(); scopes.len()];
+        for (i, scope) in scopes.iter().enumerate().skip(1) {
+            // Every non-root scope has a parent (assigned in build_scope_tree).
+            children[scope.parent.expect("non-root scope has a parent")].push(i);
+        }
         let mut model = BindingsModel {
-            scopes: build_scope_tree(&collection),
+            scopes,
+            children,
             bindings: Vec::new(),
             references: collection.references,
         };
@@ -246,14 +258,21 @@ impl BindingsModel {
     /// The innermost scope containing byte `p` (the root contains
     /// everything, including positions outside its node range — an injected
     /// layer's cursor is clamped by construction).
+    ///
+    /// Descends the scope tree from the root instead of scanning every
+    /// scope: tree-sitter node ranges nest-or-are-disjoint, so at most one
+    /// child of any scope can contain `p`, making this O(depth) rather than
+    /// O(scopes) — the previous linear filter+max_by_key ran on every
+    /// reference/definition registration, i.e. O(refs x scopes) overall.
     fn innermost_scope_at(&self, p: usize) -> usize {
-        self.scopes
-            .iter()
-            .enumerate()
-            .filter(|(i, s)| *i == 0 || (s.byte_range.start <= p && p < s.byte_range.end))
-            .max_by_key(|(_, s)| s.depth)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        let mut current = 0;
+        while let Some(&next) = self.children[current].iter().find(|&&c| {
+            let range = &self.scopes[c].byte_range;
+            range.start <= p && p < range.end
+        }) {
+            current = next;
+        }
+        current
     }
 
     /// In-scope selection: among the scope's bindings for `name` in
@@ -448,16 +467,20 @@ fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
     // Dedupe by range; a node captured as @scope by several patterns merges:
     // first label wins, first non-default inherits wins, visible-to-nested
     // ANDs (any pattern hiding the scope hides it).
+    //
+    // `by_range` maps a range to its index in `deduped`, turning the merge
+    // lookup from an O(scopes) linear scan per capture (O(scopes^2) total)
+    // into an O(1) hash lookup.
     let mut deduped: Vec<Scope> = Vec::new();
+    let mut by_range: HashMap<(usize, usize), usize> = HashMap::new();
     for capture in &collection.scopes {
+        let range_key = (capture.byte_range.start, capture.byte_range.end);
         let merge_into = if capture.byte_range == root.byte_range {
             &mut root
-        } else if let Some(existing) = deduped
-            .iter_mut()
-            .find(|s| s.byte_range == capture.byte_range)
-        {
-            existing
+        } else if let Some(&existing) = by_range.get(&range_key) {
+            &mut deduped[existing]
         } else {
+            by_range.insert(range_key, deduped.len());
             deduped.push(Scope {
                 byte_range: capture.byte_range.clone(),
                 label: capture.label.clone(),
@@ -489,22 +512,28 @@ fn build_scope_tree(collection: &Collection) -> Vec<Scope> {
             .then(b.byte_range.end.cmp(&a.byte_range.end))
     });
 
+    // Parent assignment: `deduped` arrives outer-first with ranges that
+    // nest-or-are-disjoint, so the parent of each scope is the nearest
+    // enclosing predecessor still on the ancestor stack — no predecessor
+    // once popped can contain a later (later-starting) scope again. This
+    // replaces an O(scopes) scan-for-innermost-container per scope
+    // (O(scopes^2) total) with one push/pop per scope (O(scopes) total).
     let mut scopes = vec![root];
+    let mut ancestors: Vec<usize> = vec![0]; // root always contains everything
     for mut scope in deduped {
-        let parent = scopes
-            .iter()
-            .enumerate()
-            .skip(1)
-            .filter(|(_, s)| {
-                s.byte_range.start <= scope.byte_range.start
-                    && scope.byte_range.end <= s.byte_range.end
-            })
-            .max_by_key(|(_, s)| s.depth)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        while ancestors.len() > 1 {
+            let top = *ancestors.last().expect("ancestors is non-empty");
+            let top_range = &scopes[top].byte_range;
+            if top_range.start <= scope.byte_range.start && scope.byte_range.end <= top_range.end {
+                break;
+            }
+            ancestors.pop();
+        }
+        let parent = *ancestors.last().expect("ancestors is non-empty");
         scope.parent = Some(parent);
         scope.depth = scopes[parent].depth + 1;
         scopes.push(scope);
+        ancestors.push(scopes.len() - 1);
     }
     scopes
 }
@@ -1004,5 +1033,63 @@ mod tests {
         );
         assert_eq!(model.scopes.len(), 1);
         assert_eq!(model.scopes[0].parent, None);
+    }
+
+    #[test]
+    fn scope_capture_twice_on_same_non_root_node_merges_properties() {
+        // Every (block) node is captured by TWO patterns at the SAME byte
+        // range: once plain (pattern 1) and once labeled (pattern 2). This
+        // exercises build_scope_tree's dedup HASH-HIT path (not just
+        // first-insert), since each range collides with an already-deduped
+        // scope rather than the root.
+        let text = "fn main() { { x; } }";
+        let model = model_for(
+            text,
+            r#"
+            (block) @scope
+            (block) @scope.labeled
+            (identifier) @reference
+            "#,
+        );
+        // root + outer fn-body block + inner block == 3, not 5: a naive
+        // "always push" dedup bug would leave a separate entry per pattern
+        // match instead of merging same-range captures.
+        assert_eq!(model.scopes.len(), 3);
+        assert!(
+            model.scopes[1..]
+                .iter()
+                .all(|s| s.label.as_deref() == Some("labeled")),
+            "every non-root scope merged pattern 2's label onto pattern 1's capture"
+        );
+    }
+
+    #[test]
+    fn scope_tree_parent_assignment_pops_back_to_correct_ancestor_across_siblings() {
+        // Three same-depth sibling blocks after a deeply nested chain,
+        // stress-testing the ancestor-stack pop logic in build_scope_tree:
+        // after the first deeply-nested branch is fully processed, the stack
+        // must pop all the way back to the function body before assigning
+        // the second and third siblings' parent — not leave a stale deep
+        // scope as their (incorrect) parent.
+        let text = "fn f() { { { x; } } { y; } { z; } }";
+        let model = model_for(
+            text,
+            r#"
+            (block) @scope
+            (identifier) @reference
+            "#,
+        );
+        // root(0), fn body(1), deep-branch outer(2), deep-branch inner(3),
+        // sibling 2(4), sibling 3(5).
+        assert_eq!(model.scopes.len(), 6);
+        let fn_body = 1;
+        assert_eq!(model.scopes[fn_body].parent, Some(0));
+        // All three top-level children of the fn body share the SAME parent,
+        // regardless of how deep the first one's subtree went.
+        let children_of_fn_body: Vec<usize> = model.children[fn_body].clone();
+        assert_eq!(children_of_fn_body.len(), 3, "three direct child blocks");
+        for &child in &children_of_fn_body {
+            assert_eq!(model.scopes[child].parent, Some(fn_body));
+        }
     }
 }
