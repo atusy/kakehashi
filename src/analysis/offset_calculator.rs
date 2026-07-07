@@ -98,7 +98,7 @@ fn apply_offset_to_position(
     // slicing at a raw byte_pos panics if it lands mid-codepoint (e.g. a
     // stale tree-sitter offset) — the caller's later clamp/snap only applies
     // to the *returned* value, not this internal slice.
-    let current_line_start = text[..floor_char_boundary(text, byte_pos.min(text.len()))]
+    let current_line_start = text[..floor_char_boundary(text, byte_pos)]
         .rfind('\n')
         .map(|i| i + 1)
         .unwrap_or(0);

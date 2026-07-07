@@ -168,13 +168,13 @@ impl Kakehashi {
                 // default order (virt before host) satisfies this; an order
                 // placing virt after a producing host is skipped with a
                 // warning rather than formatting against stale regions.
-                let mut current = original.to_string();
+                let mut current: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(&original);
                 let mut producers = 0usize;
                 let mut sole_edits: Option<Vec<TextEdit>> = None;
                 for layer in &layer_cfg.priorities {
                     let edits = match layer {
                         LayerSource::Virt => {
-                            if current.as_str() != &*original {
+                            if current.as_ref() != &*original {
                                 log::warn!(
                                     target: "kakehashi::formatting",
                                     "cross-layer concatenated formatting: virt placed after a \
@@ -203,7 +203,9 @@ impl Kakehashi {
                     if let Some(edits) = edits
                         && !edits.is_empty()
                     {
-                        current = crate::text::edit::apply_text_edits(&current, &edits);
+                        current = std::borrow::Cow::Owned(crate::text::edit::apply_text_edits(
+                            &current, &edits,
+                        ));
                         producers += 1;
                         sole_edits = Some(edits);
                     }
