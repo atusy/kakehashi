@@ -118,6 +118,15 @@ impl Kakehashi {
 
     /// Whether the envelope's injection region still exists at the position it
     /// had when the action was minted (mirrors `code_lens_region_is_fresh`).
+    ///
+    /// Known limitation (shared with `code_lens_region_is_fresh`): for
+    /// injections whose queries apply `#offset!` (today only YAML/TOML
+    /// frontmatter in the bundled markdown queries), the envelope offset is
+    /// `#offset!`-adjusted while the tracker stores the raw content-node
+    /// position, so this comparison never matches and resolve always fails soft
+    /// for those regions. That errs in the safe direction (the action stays
+    /// unresolved rather than translating a stale edit) and frontmatter code
+    /// actions have no known real-world producer; revisit if one appears.
     fn code_action_region_is_fresh(&self, envelope: &CodeActionEnvelope) -> bool {
         let Ok(uri) = Url::parse(&envelope.host_uri) else {
             return false;
