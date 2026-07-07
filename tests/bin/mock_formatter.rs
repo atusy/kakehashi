@@ -165,7 +165,11 @@ fn main() {
                     // returns one LAZY action (data only, no edit) whose edit
                     // is materialized on codeAction/resolve — the
                     // rust-analyzer shape that motivates PR 4 (#568).
-                    "code-action-lazy" => json!({
+                    // `code-action-lazy-cmd` is like `code-action-lazy` but its
+                    // resolve materializes a COMMAND (not an edit) — the bridge
+                    // must fail soft (command execution is unbridged), never
+                    // handing the command to the editor.
+                    "code-action-lazy" | "code-action-lazy-cmd" => json!({
                         "codeActionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -476,8 +480,8 @@ fn main() {
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
                     .map(|_uri| {
-                        if mode == "code-action-lazy" {
-                            // One LAZY action: data only, no edit. The edit is
+                        if mode == "code-action-lazy" || mode == "code-action-lazy-cmd" {
+                            // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
                             json!([{
                                 "title": "Lazy organize imports",
@@ -534,6 +538,22 @@ fn main() {
                 // Resolve against the virtual document the action came from —
                 // the mock received its URI via didOpen (single-doc tests).
                 let target_uri = documents.keys().next().cloned().unwrap_or_default();
+                if mode == "code-action-lazy-cmd" {
+                    // Resolve to a COMMAND instead of an edit: command execution
+                    // is unbridged, so the bridge must fail soft and never hand
+                    // this command to the editor.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": title,
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "command": { "title": "Run it", "command": "mock.run" }
+                        }),
+                    );
+                    continue;
+                }
                 // Embed the RECEIVED title in the edit's newText: the bridge
                 // re-suffixes the response title (overwriting our echo), but it
                 // never rewrites newText, so this is the only place the test can
