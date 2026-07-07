@@ -448,7 +448,7 @@ impl CacheCoordinator {
         &self,
         uri: &Url,
         expected_result_id: &str,
-    ) -> Option<SemanticTokens> {
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
         let result = self.semantic_cache.get_if_valid(uri, expected_result_id);
 
         if result.is_some() {
@@ -462,11 +462,17 @@ impl CacheCoordinator {
             self.log_cache_miss(uri, expected_result_id);
         }
 
-        result.map(|cached| cached.tokens)
+        result
     }
 
-    /// Log diagnostic information for cache misses.
+    /// Log diagnostic information for cache misses. Gated on the target's
+    /// debug level so the miss path — the steady-state case for any request
+    /// whose `previousResultId` has already advanced — skips the cache
+    /// lookup and clone entirely when debug logs aren't emitted.
     fn log_cache_miss(&self, uri: &Url, expected_result_id: &str) {
+        if !log::log_enabled!(target: "kakehashi::semantic_cache", log::Level::Debug) {
+            return;
+        }
         if let Some(cached) = self.semantic_cache.get(uri) {
             log::debug!(
                 target: "kakehashi::semantic_cache",
@@ -567,7 +573,7 @@ impl CacheCoordinator {
         range: &tower_lsp_server::ls_types::Range,
         language: &str,
         cache_key: u64,
-    ) -> Option<SemanticTokens> {
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
         self.semantic_range_cache
             .get_if_current(uri, range, language, cache_key)
     }
@@ -581,10 +587,8 @@ impl CacheCoordinator {
         uri: &Url,
         language: &str,
         cache_key: u64,
-    ) -> Option<SemanticTokens> {
-        self.semantic_cache
-            .get_if_current(uri, language, cache_key)
-            .map(|cached| cached.tokens)
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
+        self.semantic_cache.get_if_current(uri, language, cache_key)
     }
 
     /// Bump the settings generation on a settings/query reload so every cached

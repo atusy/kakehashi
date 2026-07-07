@@ -1261,7 +1261,13 @@ pub(crate) fn collect_injection_tokens_parallel(
                 && rc.eligible
                 && let Some(local) = cc.cache.get(cc.uri, rc.validity_hash, cc.generation)
             {
-                hit_tokens.extend(reanchor_to_host(local, rc.line_start));
+                // `reanchor_to_host` mutates in place and each occurrence of
+                // this content needs its own re-anchored copy (a duplicate
+                // fence sharing this cache entry gets a different
+                // `line_start`), so this clone out of the Arc is the one
+                // legitimate materialization point — everything upstream
+                // (the cache hit itself) stayed O(1).
+                hit_tokens.extend(reanchor_to_host((*local).clone(), rc.line_start));
             } else {
                 miss_indices.push(i);
             }

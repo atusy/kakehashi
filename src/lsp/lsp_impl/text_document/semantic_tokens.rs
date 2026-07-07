@@ -62,6 +62,49 @@ pub(crate) enum TokenSnapshot {
     Superseded,
 }
 
+/// The delta handler's "current" tokens, either reused from the cache (an
+/// `Arc`, no deep copy yet) or freshly computed (already owned). Comparison
+/// against the previous baseline only needs a reference — [`as_ref`](Self::as_ref)
+/// — so the cache-hit case never clones unless a match arm downstream
+/// actually needs to store the value ([`into_owned`](Self::into_owned)),
+/// which a no-op/empty-edits delta never does.
+enum CurrentTokens {
+    Cached(std::sync::Arc<SemanticTokens>),
+    Owned(SemanticTokens),
+}
+
+impl CurrentTokens {
+    fn from_result(result: SemanticTokensResult) -> Self {
+        match result {
+            SemanticTokensResult::Tokens(tokens) => Self::Owned(tokens),
+            SemanticTokensResult::Partial(_) => Self::Owned(SemanticTokens {
+                result_id: None,
+                data: Vec::new(),
+            }),
+        }
+    }
+
+    fn as_ref(&self) -> &SemanticTokens {
+        match self {
+            Self::Cached(arc) => arc,
+            Self::Owned(tokens) => tokens,
+        }
+    }
+
+    fn into_owned(self) -> SemanticTokens {
+        match self {
+            // The cache entry may have been overwritten or evicted between
+            // this handle being taken and here, leaving this the sole
+            // strong ref — in that case the data is already effectively
+            // ours, and `try_unwrap` reclaims it instead of cloning.
+            Self::Cached(arc) => {
+                std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone())
+            }
+            Self::Owned(tokens) => tokens,
+        }
+    }
+}
+
 impl Kakehashi {
     /// Latest-completed snapshot resolution (parse-snapshot ADR §3): returns
     /// the newest published snapshot, which may trail the input. The only
@@ -347,7 +390,11 @@ impl Kakehashi {
                 self.cache
                     .record_served_semantic_version(&uri, snapshot.parsed_version);
                 self.cache.finish_request(&uri, request_id);
-                return Ok(Some(SemanticTokensResult::Tokens(cached)));
+                // The wire type owns its data (`ls_types::SemanticTokensResult`
+                // has no borrowing variant), so this is the one legitimate
+                // materialization point — everything upstream (the cache hit
+                // itself) stayed O(1) via the `Arc`.
+                return Ok(Some(SemanticTokensResult::Tokens((*cached).clone())));
             }
 
             // capture_mappings and supports_multiline were read before the await
@@ -672,9 +719,14 @@ impl Kakehashi {
                         },
                     )));
                 }
-                // Baseline differs: fall through to diff the cached tokens against
-                // the client's `previous_result_id` (still skips re-tokenization).
-                Some(SemanticTokensResult::Tokens(cached))
+                // Baseline differs: fall through to diff the cached tokens
+                // against the client's `previous_result_id` (still skips
+                // re-tokenization). Kept as the Arc — cloned into an owned
+                // `SemanticTokens` only in the match arms below that actually
+                // store, not unconditionally here (a stale-but-content-
+                // unchanged baseline lands in the empty-edits arm, which
+                // never needs ownership at all).
+                Some(CurrentTokens::Cached(cached))
             } else {
                 // capture_mappings and supports_multiline were read before the await
                 // above (consistent with the query and token_generation). Rayon-based
@@ -710,7 +762,7 @@ impl Kakehashi {
                     Some(cancel_token.clone()),
                 );
 
-                if let Some(cancel_rx) = cancel_rx {
+                let computed = if let Some(cancel_rx) = cancel_rx {
                     // Race between computation and cancel notification
                     tokio::pin!(cancel_rx);
                     tokio::select! {
@@ -737,7 +789,8 @@ impl Kakehashi {
                 } else {
                     // No cancel support - just await the computation
                     compute_future.await
-                }
+                };
+                computed.map(CurrentTokens::from_result)
             }
         };
 
@@ -756,19 +809,15 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Extract current tokens from the result
-        let current_tokens = match result.unwrap_or_else(|| {
-            SemanticTokensResult::Tokens(SemanticTokens {
+        // Current tokens from the result — kept lazy (`CurrentTokens::Cached`
+        // stays an `Arc`) until a downstream match arm actually needs an
+        // owned value to mutate and store.
+        let current_tokens = result.unwrap_or_else(|| {
+            CurrentTokens::Owned(SemanticTokens {
                 result_id: None,
                 data: Vec::new(),
             })
-        }) {
-            SemanticTokensResult::Tokens(tokens) => tokens,
-            SemanticTokensResult::Partial(_) => SemanticTokens {
-                result_id: None,
-                data: Vec::new(),
-            },
-        };
+        });
 
         // Early exit check before storing - prevents superseded request from overwriting cache
         if !self.cache.is_request_active(&uri, request_id) {
@@ -783,11 +832,35 @@ impl Kakehashi {
         // Get previous tokens from cache for delta calculation
         let previous_tokens = self.cache.get_tokens_if_valid(&uri, &previous_result_id);
 
-        // Calculate delta or return full tokens
-        let delta_result = match previous_tokens {
-            Some(prev) => calculate_delta_or_full(&prev, &current_tokens, &previous_result_id),
-            None => SemanticTokensFullDeltaResult::Tokens(current_tokens.clone()),
+        // No valid previous baseline: a full result is unavoidable either
+        // way, so this consumes `current_tokens` directly (a cheap
+        // `try_unwrap` when the Arc is uniquely owned) instead of routing
+        // through `delta_result`'s `Tokens` arm, which would clone it once
+        // to build the intermediate value and again for the cache store.
+        let Some(prev) = previous_tokens else {
+            let mut tokens = current_tokens.into_owned();
+            tokens.result_id = Some(next_result_id());
+            self.cache.store_tokens(
+                uri.clone(),
+                tokens.clone(),
+                language_name.clone(),
+                cache_key,
+            );
+            let final_result = SemanticTokensFullDeltaResult::Tokens(tokens);
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            log::debug!(
+                target: "kakehashi::semantic",
+                "[SEMANTIC_TOKENS_DELTA] DONE uri={} req={}",
+                uri, request_id
+            );
+            return Ok(Some(final_result));
         };
+
+        // Calculate delta or return full tokens
+        let delta_result =
+            calculate_delta_or_full(&prev, current_tokens.as_ref(), &previous_result_id);
 
         // Assign new result_id and store in cache
         let final_result = match delta_result {
@@ -806,13 +879,15 @@ impl Kakehashi {
                 // tokens, which already carry `previous_result_id`. Reuse that id
                 // and skip re-storing — the version token shouldn't advance when
                 // nothing changed, and the cache entry stays valid for the next
-                // request. Saves a clone + cache store + id rotation.
+                // request. Saves a clone + cache store + id rotation — and, when
+                // `current_tokens` came from the cache, this arm never pays the
+                // `into_owned` clone at all.
                 delta.result_id = Some(previous_result_id.clone());
                 SemanticTokensFullDeltaResult::TokensDelta(delta)
             }
             SemanticTokensFullDeltaResult::TokensDelta(mut delta) => {
                 // For delta, we still need to store the current tokens with new result_id
-                let mut stored_tokens = current_tokens;
+                let mut stored_tokens = current_tokens.into_owned();
                 stored_tokens.result_id = Some(next_result_id());
                 delta.result_id = stored_tokens.result_id.clone();
                 self.cache.store_tokens(
@@ -832,7 +907,7 @@ impl Kakehashi {
                     "[SEMANTIC_TOKENS_DELTA] Unexpected PartialTokensDelta variant for uri={}",
                     uri
                 );
-                let mut tokens = current_tokens;
+                let mut tokens = current_tokens.into_owned();
                 tokens.result_id = Some(next_result_id());
                 self.cache.store_tokens(
                     uri.clone(),
@@ -935,7 +1010,7 @@ impl Kakehashi {
             self.cache
                 .get_current_range_tokens(&uri, &domain_range, &language_name, cache_key)
         {
-            return Ok(Some(SemanticTokensRangeResult::Tokens(tokens)));
+            return Ok(Some(SemanticTokensRangeResult::Tokens((*tokens).clone())));
         }
 
         // Get capture mappings for token type resolution
