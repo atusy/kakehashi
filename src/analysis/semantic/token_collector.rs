@@ -3,8 +3,6 @@
 //! This module handles the collection of raw tokens from a single document's
 //! highlight query, including multiline token handling and byte-to-UTF16 conversion.
 
-use std::collections::HashMap;
-
 use crate::config::CaptureMappings;
 use crate::text::position::Utf16LineIndex;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
@@ -33,18 +31,24 @@ fn is_in_exclusion_range(node: &Node, ranges: &[(usize, usize)]) -> bool {
 /// A single host line commonly receives a start/end pair of `byte_to_utf16`
 /// queries per capture, times however many captures land on that line.
 /// Returning the index (rather than resolving one column per call) lets a
-/// caller reuse a single `HashMap` lookup for both the start and end column
-/// of one token, on top of caching by line number turning what would be an
+/// caller reuse a single lookup for both the start and end column of one
+/// token, on top of caching by line number turning what would be an
 /// O(line_len) rescan per query into one O(line_len) build plus O(log
 /// line_len) lookups.
+///
+/// `host_line` is a dense index bounded by the host document's line count
+/// (never sparse/huge), so a `Vec<Option<_>>` indexed directly beats a
+/// `HashMap` here: O(1) with no hashing and better cache locality, at the
+/// cost of resizing to cover line numbers as they're first seen.
 fn cached_line_index<'a>(
-    cache: &'a mut HashMap<usize, Utf16LineIndex>,
+    cache: &'a mut Vec<Option<Utf16LineIndex>>,
     host_line: usize,
     line_text: &str,
 ) -> &'a Utf16LineIndex {
-    cache
-        .entry(host_line)
-        .or_insert_with(|| Utf16LineIndex::new(line_text))
+    if host_line >= cache.len() {
+        cache.resize_with(host_line + 1, || None);
+    }
+    cache[host_line].get_or_insert_with(|| Utf16LineIndex::new(line_text))
 }
 
 /// Extract the `#set! priority N` value for a pattern, defaulting to 100.
@@ -366,7 +370,7 @@ pub(super) fn collect_host_tokens(
 
     // Lazily-built byte->UTF-16 lookup per host line, shared across every
     // capture below. See `cached_line_index`.
-    let mut utf16_cache: HashMap<usize, Utf16LineIndex> = HashMap::new();
+    let mut utf16_cache: Vec<Option<Utf16LineIndex>> = Vec::new();
 
     // Collect tokens from this document's highlight query
     let mut cursor = QueryCursor::new();
