@@ -1142,9 +1142,12 @@ fn spawn_upstream_request(
                             // protocol default — the edit was not applied.
                             .unwrap_or(ApplyWorkspaceEditResponse {
                                 applied: false,
+                                // Covers editor error, cancellation, AND an
+                                // unparseable response — neutral wording (like
+                                // the reader drop-path) so a cancel/transport
+                                // failure isn't misattributed to the editor.
                                 failure_reason: Some(
-                                    "kakehashi: no valid workspace/applyEdit response from the editor"
-                                        .to_string(),
+                                    "kakehashi: no valid workspace/applyEdit response".to_string(),
                                 ),
                                 failed_change: None,
                             })
