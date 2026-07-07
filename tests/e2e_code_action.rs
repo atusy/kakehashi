@@ -461,6 +461,35 @@ fn lazy_action_resolving_to_untranslatable_edit_is_disabled() {
 }
 
 #[test]
+fn lazy_action_resolving_out_of_region_is_disabled() {
+    // A resolve whose edit range runs PAST the injected region would, once
+    // translated by the region offset, land in host text after the fence —
+    // buffer corruption. The bridge must bound the resolved edit to the region
+    // and disable it (disabledSupport), never forward an out-of-region edit.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-oob", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    assert_eq!(
+        resolved["disabled"]["reason"], "the edit cannot be represented in the host document",
+        "an out-of-region resolved edit must be disabled, not forwarded: {resolved:?}"
+    );
+    assert!(
+        resolved["edit"].is_null(),
+        "the out-of-region edit must be stripped, got: {resolved:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn lazy_action_is_eager_resolved_without_resolve_support() {
     // A client WITHOUT resolveSupport/dataSupport cannot resolve a lazy
     // action, so the bridge eager-resolves it downstream: the codeAction
