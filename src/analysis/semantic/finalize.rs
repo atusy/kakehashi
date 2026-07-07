@@ -160,6 +160,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
 
         // 1. Collect all breakpoints (start and end columns)
         breakpoints.clear();
+        breakpoints.reserve(line_tokens.len() * 2);
         for t in line_tokens {
             breakpoints.push(t.column);
             breakpoints.push(t.column + t.length);
@@ -171,6 +172,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
         // Transparent tokens are never pushed — they only contributed
         // breakpoints above and never compete for winning.
         heap.clear();
+        heap.reserve(line_tokens.len());
         let mut next_token = 0;
 
         for window in breakpoints.windows(2) {
