@@ -12,13 +12,14 @@
 use crate::analysis::semantic::RawToken;
 use crate::language::injection::CacheableInjectionRegion;
 use dashmap::DashMap;
+use std::sync::Arc;
 use tower_lsp_server::ls_types::{Range, SemanticTokens};
 use url::Url;
 
 /// Cached semantic tokens for delta calculations.
 #[derive(Clone)]
 pub struct CachedSemanticTokens {
-    pub tokens: SemanticTokens,
+    pub tokens: Arc<SemanticTokens>,
     /// The resolved language these tokens were computed for. The `cache_key`
     /// folds only text ⊕ settings generation, so it can't tell the same URL
     /// re-opened under a DIFFERENT language apart. `didClose` evicts the entry
@@ -61,7 +62,7 @@ impl SemanticTokenCache {
         self.cache.insert(
             uri,
             CachedSemanticTokens {
-                tokens,
+                tokens: Arc::new(tokens),
                 language,
                 cache_key,
             },
@@ -142,7 +143,7 @@ impl Default for SemanticTokenCache {
 /// kept rather than a per-range map.
 #[derive(Clone)]
 pub struct CachedRangeTokens {
-    pub tokens: SemanticTokens,
+    pub tokens: Arc<SemanticTokens>,
     /// The viewport these tokens were computed for. A scroll changes the range, so
     /// a differing range is a miss even when text/settings are unchanged.
     pub range: Range,
@@ -184,7 +185,7 @@ impl SemanticTokenRangeCache {
         self.cache.insert(
             uri,
             CachedRangeTokens {
-                tokens,
+                tokens: Arc::new(tokens),
                 range,
                 language,
                 cache_key,
@@ -202,10 +203,10 @@ impl SemanticTokenRangeCache {
         range: &Range,
         language: &str,
         cache_key: u64,
-    ) -> Option<SemanticTokens> {
+    ) -> Option<Arc<SemanticTokens>> {
         self.cache.get(uri).and_then(|entry| {
             if entry.cache_key == cache_key && entry.range == *range && entry.language == language {
-                Some(entry.tokens.clone())
+                Some(Arc::clone(&entry.tokens))
             } else {
                 None
             }
@@ -371,7 +372,7 @@ struct CachedRegionTokens {
     /// Settings/query generation in effect when these were computed.
     generation: u64,
     /// Region-local pre-finalize tokens.
-    tokens: Vec<RawToken>,
+    tokens: Arc<Vec<RawToken>>,
 }
 
 impl InjectionTokenCache {
@@ -398,13 +399,22 @@ impl InjectionTokenCache {
         // avoids the `Url` clone the `entry` API needs for its owned key —
         // the same discipline as `record_served_semantic_version`.
         if let Some(mut doc) = self.cache.get_mut(uri) {
-            doc.insert(validity_hash, CachedRegionTokens { generation, tokens });
+            doc.insert(
+                validity_hash,
+                CachedRegionTokens {
+                    generation,
+                    tokens: Arc::new(tokens),
+                },
+            );
             return;
         }
-        self.cache
-            .entry(uri.clone())
-            .or_default()
-            .insert(validity_hash, CachedRegionTokens { generation, tokens });
+        self.cache.entry(uri.clone()).or_default().insert(
+            validity_hash,
+            CachedRegionTokens {
+                generation,
+                tokens: Arc::new(tokens),
+            },
+        );
     }
 
     /// Retrieve region-local tokens for this exact content (`validity_hash`
@@ -416,11 +426,11 @@ impl InjectionTokenCache {
         uri: &Url,
         validity_hash: u64,
         generation: u64,
-    ) -> Option<Vec<RawToken>> {
+    ) -> Option<Arc<Vec<RawToken>>> {
         let result = self.cache.get(uri).and_then(|doc| {
             doc.get(&validity_hash)
                 .filter(|entry| entry.generation == generation)
-                .map(|entry| entry.tokens.clone())
+                .map(|entry| Arc::clone(&entry.tokens))
         });
 
         if result.is_some() {
@@ -539,6 +549,66 @@ mod tests {
         assert!(
             cache.get(&other_uri).is_none(),
             "Non-existent URI should return None"
+        );
+    }
+
+    /// Two reads of the same entry must share the SAME allocation (an `Arc`
+    /// refcount bump), not deep-copy the token vector per read — the whole
+    /// point of wrapping the cache in `Arc` (#576).
+    #[test]
+    fn repeated_reads_share_the_same_arc_allocation_not_a_deep_copy() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///arc_share.rs").unwrap();
+        let tokens = SemanticTokens {
+            result_id: Some("1".to_string()),
+            data: vec![SemanticToken {
+                delta_line: 0,
+                delta_start: 0,
+                length: 5,
+                token_type: 0,
+                token_modifiers_bitset: 0,
+            }],
+        };
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
+
+        let first = cache.get(&uri).unwrap();
+        let second = cache.get(&uri).unwrap();
+        assert!(
+            Arc::ptr_eq(&first.tokens, &second.tokens),
+            "repeated reads must share one Arc allocation, not deep-copy"
+        );
+    }
+
+    #[test]
+    fn range_cache_repeated_reads_share_the_same_arc_allocation() {
+        let cache = SemanticTokenRangeCache::new();
+        let uri = Url::parse("file:///arc_share_range.rs").unwrap();
+        let range = Range::default();
+        let tokens = SemanticTokens {
+            result_id: None,
+            data: vec![],
+        };
+        cache.store(uri.clone(), range, "rust".to_string(), tokens, 0);
+
+        let first = cache.get_if_current(&uri, &range, "rust", 0).unwrap();
+        let second = cache.get_if_current(&uri, &range, "rust", 0).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeated reads must share one Arc allocation, not deep-copy"
+        );
+    }
+
+    #[test]
+    fn injection_cache_repeated_reads_share_the_same_arc_allocation() {
+        let cache = InjectionTokenCache::new();
+        let uri = Url::parse("file:///arc_share_injection.rs").unwrap();
+        cache.store(&uri, 0xABCD, 0, vec![]);
+
+        let first = cache.get(&uri, 0xABCD, 0).unwrap();
+        let second = cache.get(&uri, 0xABCD, 0).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeated reads must share one Arc allocation, not deep-copy"
         );
     }
 

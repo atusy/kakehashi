@@ -448,7 +448,7 @@ impl CacheCoordinator {
         &self,
         uri: &Url,
         expected_result_id: &str,
-    ) -> Option<SemanticTokens> {
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
         let result = self.semantic_cache.get_if_valid(uri, expected_result_id);
 
         if result.is_some() {
@@ -567,7 +567,7 @@ impl CacheCoordinator {
         range: &tower_lsp_server::ls_types::Range,
         language: &str,
         cache_key: u64,
-    ) -> Option<SemanticTokens> {
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
         self.semantic_range_cache
             .get_if_current(uri, range, language, cache_key)
     }
@@ -581,7 +581,7 @@ impl CacheCoordinator {
         uri: &Url,
         language: &str,
         cache_key: u64,
-    ) -> Option<SemanticTokens> {
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
         self.semantic_cache
             .get_if_current(uri, language, cache_key)
             .map(|cached| cached.tokens)

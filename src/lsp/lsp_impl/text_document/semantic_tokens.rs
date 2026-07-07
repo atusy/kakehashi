@@ -347,7 +347,11 @@ impl Kakehashi {
                 self.cache
                     .record_served_semantic_version(&uri, snapshot.parsed_version);
                 self.cache.finish_request(&uri, request_id);
-                return Ok(Some(SemanticTokensResult::Tokens(cached)));
+                // The wire type owns its data (`ls_types::SemanticTokensResult`
+                // has no borrowing variant), so this is the one legitimate
+                // materialization point — everything upstream (the cache hit
+                // itself) stayed O(1) via the `Arc`.
+                return Ok(Some(SemanticTokensResult::Tokens((*cached).clone())));
             }
 
             // capture_mappings and supports_multiline were read before the await
@@ -674,7 +678,9 @@ impl Kakehashi {
                 }
                 // Baseline differs: fall through to diff the cached tokens against
                 // the client's `previous_result_id` (still skips re-tokenization).
-                Some(SemanticTokensResult::Tokens(cached))
+                // `current_tokens` below gets mutated (`result_id`) and stored, so
+                // it needs its own owned copy regardless of the cache read.
+                Some(SemanticTokensResult::Tokens((*cached).clone()))
             } else {
                 // capture_mappings and supports_multiline were read before the await
                 // above (consistent with the query and token_generation). Rayon-based
@@ -935,7 +941,7 @@ impl Kakehashi {
             self.cache
                 .get_current_range_tokens(&uri, &domain_range, &language_name, cache_key)
         {
-            return Ok(Some(SemanticTokensRangeResult::Tokens(tokens)));
+            return Ok(Some(SemanticTokensRangeResult::Tokens((*tokens).clone())));
         }
 
         // Get capture mappings for token type resolution
