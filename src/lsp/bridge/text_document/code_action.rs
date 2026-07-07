@@ -418,22 +418,22 @@ impl LanguageServerPool {
             return action;
         };
 
-        // A resolve that materializes a `command` (or edit+command) can't be
-        // honored — command execution is unbridged, and applying only the edit
-        // half is worse than none (the initial codeAction path disables such
-        // actions). Fail soft: return the original action unresolved rather
-        // than hand the editor an executable downstream command.
-        if resolved.command.is_some() {
-            re_envelope_action(&mut action, &envelope);
-            return action;
+        // Translate the resolved action's own diagnostics host-ward first, so
+        // every surfaced action — including a disabled one returned below —
+        // carries host coordinates (mirrors the initial-path order).
+        if let Some(diagnostics) = &mut resolved.diagnostics {
+            for diagnostic in diagnostics {
+                translate_virtual_range_to_host(&mut diagnostic.range, &offset);
+            }
         }
 
         // A resolve that marks the action `disabled` makes it non-executable —
-        // mirror the initial-path policy for server-disabled actions. Without
-        // upstream `disabledSupport` the client can't render it, so fail soft
-        // (return the original, already-sanitized action unresolved); with it,
-        // strip the payload (a disabled action must never carry an executable
-        // edit/command) and surface it disabled with its reason and suffix.
+        // handle it BEFORE the command/edit policy (mirrors the initial path,
+        // so a disabled+command resolve is surfaced disabled, not failed soft).
+        // Without upstream `disabledSupport` the client can't render it, so
+        // fail soft (return the original, already-sanitized action unresolved);
+        // with it, strip the payload (a disabled action must never carry an
+        // executable edit/command) and surface it disabled with reason + suffix.
         if resolved.disabled.is_some() {
             if !upstream_caps.disabled_support {
                 re_envelope_action(&mut action, &envelope);
@@ -445,6 +445,16 @@ impl LanguageServerPool {
             resolved.data = None;
             resolved.is_preferred = None;
             return resolved;
+        }
+
+        // A resolve that materializes a `command` (or edit+command) can't be
+        // honored — command execution is unbridged, and applying only the edit
+        // half is worse than none (the initial codeAction path disables such
+        // actions). Fail soft: return the original action unresolved rather
+        // than hand the editor an executable downstream command.
+        if resolved.command.is_some() {
+            re_envelope_action(&mut action, &envelope);
+            return action;
         }
 
         // isPreferred is its own client capability (LSP 3.15); the downstream
@@ -486,11 +496,6 @@ impl LanguageServerPool {
                 return action;
             }
             (None, _) => {}
-        }
-        if let Some(diagnostics) = &mut resolved.diagnostics {
-            for diagnostic in diagnostics {
-                translate_virtual_range_to_host(&mut diagnostic.range, &offset);
-            }
         }
 
         // Re-apply the "{title} — {server}" suffix (the server echoed the
