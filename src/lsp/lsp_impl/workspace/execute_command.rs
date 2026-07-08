@@ -61,14 +61,23 @@ impl Kakehashi {
         if injections.is_empty() {
             return;
         }
-        self.bridge
-            .ensure_server_documents_open(
+        // Bound the best-effort pre-sync: `eager_open_virtual_documents` can wait
+        // up to the init timeout for a cold/stuck downstream to reach Ready, and
+        // this sits on the user-facing executeCommand path. If it doesn't finish
+        // quickly, skip it and dispatch anyway — the happy path (doc already
+        // open) returns immediately, and dispatch uses the fail-fast connection
+        // variant, so a slow downstream can't block command execution here.
+        const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        let _ = tokio::time::timeout(
+            SYNC_TIMEOUT,
+            self.bridge.ensure_server_documents_open(
                 settings,
                 &host_language,
                 &host_url,
                 injections,
                 route.origin,
-            )
-            .await;
+            ),
+        )
+        .await;
     }
 }
