@@ -246,9 +246,13 @@ impl ResolvedAggregationConfig {
 
 fn default_aggregation_strategy_for_method(method: &str) -> AggregationStrategy {
     match method {
-        "textDocument/diagnostic" | "textDocument/publishDiagnostics" => {
-            AggregationStrategy::Concatenated
-        }
+        // codeAction concatenates at BOTH levels (#568 PR 7): within a layer,
+        // every server's actions are merged; across layers, virt+host+native
+        // merge into one menu. Unlike formatting (competing whole-document
+        // edits), code actions from different servers are complementary.
+        "textDocument/diagnostic"
+        | "textDocument/publishDiagnostics"
+        | "textDocument/codeAction" => AggregationStrategy::Concatenated,
         _ => AggregationStrategy::Preferred,
     }
 }
