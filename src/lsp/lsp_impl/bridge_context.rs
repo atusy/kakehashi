@@ -284,9 +284,12 @@ pub(crate) async fn race_layers_preferred<R>(
 }
 
 /// Cross-layer `concatenated`: await ALL layers in `priorities` (a barrier,
-/// unlike [`race_layers_preferred`]'s first-wins) and merge their non-empty
-/// results in priority order via `combine`. A layer not in `priorities` is
-/// never awaited, so its future does no work. Errors (e.g. a cancelled layer)
+/// unlike [`race_layers_preferred`]'s first-wins) and merge every `Some(_)`
+/// contribution in priority order via `combine`. (It merges any `Some`, not
+/// only non-empty ones — it can't test `R` for emptiness generically; the
+/// codeAction layers already collapse empty→`None` before returning, so no
+/// `Some(empty)` reaches the fold.) A layer not in `priorities` is never
+/// awaited, so its future does no work. Errors (e.g. a cancelled layer)
 /// propagate. Ordering is stable by `priorities` regardless of which layer
 /// finishes first, so the merged menu keeps muscle-memory order.
 pub(crate) async fn race_layers_concatenated<R>(

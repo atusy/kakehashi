@@ -7,7 +7,8 @@
 //! (host-document-bridge) bridges the host document itself. Both apply the
 //! `"{title} — {server}"` suffix, so the host arm cannot use the generic
 //! verbatim raw-value walk — it dispatches typed per server to keep the
-//! server name ([`Kakehashi::walk_layer_futures`]).
+//! server name ([`Kakehashi::walk_layers_by_strategy`], the strategy-aware walk
+//! codeAction uses instead of the generic `walk_layer_futures`).
 //!
 //! codeAction defaults to `concatenated` at both aggregation levels (#568 PR 7):
 //! within a layer, every server's actions are merged (`concat_merge`); across
