@@ -3,8 +3,9 @@
 //! Walks the resolved layer order (cross-layer-aggregation): the virt layer
 //! bridges the injection region under the cursor, the host layer
 //! (host-document-bridge) bridges the host document itself with the real URI
-//! and the response verbatim. The first layer producing a non-empty result
-//! wins (`preferred`).
+//! and the response verbatim. The first layer producing completion items, or an
+//! incomplete `CompletionList` that asks the client to re-query, wins
+//! (`preferred`).
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
