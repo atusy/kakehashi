@@ -121,33 +121,54 @@ impl LanguageCoordinator {
     /// Visibility: pub(crate) - called by LSP layer (semantic_tokens, selection_range)
     /// and analysis modules to ensure parsers are available before use.
     pub(crate) fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
-        if self.language_registry.contains(language_id) {
-            return LanguageLoadResult::success_with(Vec::new());
-        }
         let current_generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        // Known-failed load UNDER THE CURRENT GENERATION: skip the filesystem
-        // scan (and the warning events — the first attempt already surfaced
-        // them). An old-generation entry is inert garbage, not a suppression
-        // (see `failed_loads`).
+        if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
+            return result;
+        }
+        let result = self.try_load_language_by_id(language_id);
+        if !result.success {
+            self.record_failed_load(language_id, current_generation);
+        }
+        result
+    }
+
+    /// Already-decided verdict for a load, or `None` when a real attempt is
+    /// needed. Single-sources the negative-cache/generation protocol shared by
+    /// the sync [`ensure_language_loaded`](Self::ensure_language_loaded) and the
+    /// async [`ensure_language_loaded_async`](Self::ensure_language_loaded_async)
+    /// so the twins cannot drift.
+    ///
+    /// A known-failed load UNDER THE CURRENT GENERATION skips the filesystem
+    /// scan (and the warning events — the first attempt already surfaced them).
+    /// An old-generation entry is inert garbage, not a suppression (see
+    /// [`failed_loads`](Self::failed_loads)).
+    fn cached_load_verdict(
+        &self,
+        language_id: &str,
+        current_generation: u64,
+    ) -> Option<LanguageLoadResult> {
+        if self.language_registry.contains(language_id) {
+            return Some(LanguageLoadResult::success_with(Vec::new()));
+        }
         if self
             .failed_loads
             .get(language_id)
             .is_some_and(|generation| *generation == current_generation)
         {
-            return LanguageLoadResult::default();
+            return Some(LanguageLoadResult::default());
         }
-        let result = self.try_load_language_by_id(language_id);
-        if !result.success {
-            // Tagged with the generation captured BEFORE the scan: if a
-            // reload landed mid-scan, the tag is already stale and this
-            // entry suppresses nothing — the store itself cannot re-poison,
-            // closing the check-then-insert window an insert-time gate had.
-            self.failed_loads
-                .insert(language_id.to_string(), current_generation);
-        }
-        result
+        None
+    }
+
+    /// Record a failed load, tagged with the generation captured BEFORE the
+    /// scan: if a reload landed mid-scan, the tag is already stale and this
+    /// entry suppresses nothing — the store itself cannot re-poison, closing
+    /// the check-then-insert window an insert-time gate had.
+    fn record_failed_load(&self, language_id: &str, current_generation: u64) {
+        self.failed_loads
+            .insert(language_id.to_string(), current_generation);
     }
 
     /// Async twin of [`ensure_language_loaded`](Self::ensure_language_loaded)
@@ -176,18 +197,11 @@ impl LanguageCoordinator {
         language_id: &str,
     ) -> LanguageLoadResult {
         loop {
-            if self.language_registry.contains(language_id) {
-                return LanguageLoadResult::success_with(Vec::new());
-            }
             let current_generation = self
                 .load_generation
                 .load(std::sync::atomic::Ordering::Acquire);
-            if self
-                .failed_loads
-                .get(language_id)
-                .is_some_and(|generation| *generation == current_generation)
-            {
-                return LanguageLoadResult::default();
+            if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
+                return result;
             }
 
             // `get` before `entry`: the loser path (marker present) is the
@@ -200,10 +214,14 @@ impl LanguageCoordinator {
                     dashmap::mapref::entry::Entry::Occupied(occupied) => Arc::clone(occupied.get()),
                     dashmap::mapref::entry::Entry::Vacant(vacant) => {
                         // Re-check inside the claim: a winner may have
-                        // registered the language and dropped its marker
-                        // between the top-of-loop check and this claim.
-                        if self.language_registry.contains(language_id) {
-                            return LanguageLoadResult::success_with(Vec::new());
+                        // registered the language (success) or recorded its
+                        // failure and dropped its marker between the
+                        // top-of-loop check and this claim — either verdict
+                        // spares us a redundant dlopen scan and re-log.
+                        if let Some(result) =
+                            self.cached_load_verdict(language_id, current_generation)
+                        {
+                            return result;
                         }
                         let notify = Arc::new(tokio::sync::Notify::new());
                         vacant.insert(Arc::clone(&notify));
@@ -234,8 +252,7 @@ impl LanguageCoordinator {
                         });
 
                         if !result.success {
-                            self.failed_loads
-                                .insert(language_id.to_string(), current_generation);
+                            self.record_failed_load(language_id, current_generation);
                         }
                         return result;
                     }
