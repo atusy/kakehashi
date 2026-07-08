@@ -823,3 +823,63 @@ fn lazy_action_resolving_to_command_surfaces_it_routed() {
 
     shutdown(&mut client);
 }
+
+#[test]
+fn code_action_over_a_multi_fence_range_merges_actions_from_every_region() {
+    // #628 multi-region: a codeAction range spanning TWO injected lua fences
+    // bridges BOTH and merges their actions into one menu — previously only the
+    // first fence was bridged.
+    // Two lua fences: bodies on host lines 3 and 9.
+    const TWO_FENCE: &str = "# A\n\n```lua\nlocal x = 1\n```\n\n# B\n\n```lua\nlocal y = 2\n```\n";
+    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    assert_advertised(&init_response);
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": MARKDOWN_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": TWO_FENCE
+            }
+        }),
+    );
+
+    // Range covering BOTH fence bodies (host line 3 through line 9).
+    let actions = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": { "uri": MARKDOWN_URI },
+                    "range": {
+                        "start": { "line": 3, "character": 0 },
+                        "end": { "line": 9, "character": 5 }
+                    },
+                    "context": { "diagnostics": [] }
+                }),
+            );
+            let actions = response["result"].as_array().cloned().unwrap_or_default();
+            if actions.len() >= 4 {
+                return Some(actions);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            None
+        })
+        .expect("codeAction over a two-fence range returns actions from both fences");
+
+    // Each fence contributes an edit action (targeting its own host line) plus a
+    // bare command → 4 actions. The two edit actions target the two DIFFERENT
+    // fences (host lines 3 and 9), proving both regions were bridged and merged.
+    let edit_lines: Vec<u64> = actions
+        .iter()
+        .filter_map(|a| a["edit"]["changes"][MARKDOWN_URI][0]["range"]["start"]["line"].as_u64())
+        .collect();
+    assert!(
+        edit_lines.contains(&3) && edit_lines.contains(&9),
+        "edits must come from BOTH fences (host lines 3 and 9), got: {edit_lines:?}"
+    );
+
+    shutdown(&mut client);
+}

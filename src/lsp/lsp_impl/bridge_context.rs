@@ -1205,39 +1205,49 @@ impl Kakehashi {
     }
 
     /// Range-overlap variant of [`Self::resolve_bridge_contexts_for_range`]:
-    /// bridge the FIRST region (document order) that intersects the range
-    /// and resolves to bridge server configs, clamping the request range to
-    /// that region so coordinate translation stays in-region — a range that
-    /// merely starts inside a region can still overshoot its end, and
-    /// save-time flows (`editor.codeActionsOnSave`) request with a
-    /// whole-document range starting at (0,0), outside any injection.
-    /// Unconfigured injections (e.g. `markdown_inline`) never shadow a
-    /// configured region further down. Only one region is bridged
-    /// (preferred semantics; multi-region merging is #568 stage 7).
-    pub(crate) async fn resolve_bridge_contexts_for_range_overlap(
+    /// bridge EVERY region (document order) that intersects the range and
+    /// resolves to bridge server configs, clamping the request range to each
+    /// region so coordinate translation stays in-region — a range that merely
+    /// starts inside a region can still overshoot its end, and save-time flows
+    /// (`editor.codeActionsOnSave`) request with a whole-document range starting
+    /// at (0,0), outside any injection. Unconfigured injections (e.g.
+    /// `markdown_inline`) contribute nothing but never shadow a configured region
+    /// further down. A range spanning several injection fences yields one context
+    /// per fence, and the caller merges their results into one menu (#628
+    /// multi-region). The common case (a range within a single fence) returns
+    /// exactly one context.
+    pub(crate) async fn resolve_bridge_contexts_for_all_overlapping_regions(
         &self,
         lsp_uri: &Uri,
         range: Range,
         method_name: &str,
-    ) -> Option<RangeRequestContext> {
+    ) -> Vec<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        self.resolve_first_region_overlapping_range(lsp_uri, range, method_name)
+        self.resolve_all_regions_overlapping_range(lsp_uri, range, method_name)
             .await
     }
 
     /// Whole-document region scan behind
-    /// [`Self::resolve_bridge_contexts_for_range_overlap`]; the tree is
+    /// [`Self::resolve_bridge_contexts_for_all_overlapping_regions`]; the tree is
     /// already fresh (the caller awaited it).
-    async fn resolve_first_region_overlapping_range(
+    async fn resolve_all_regions_overlapping_range(
         &self,
         lsp_uri: &Uri,
         range: Range,
         method_name: &str,
-    ) -> Option<RangeRequestContext> {
-        let uri = uri_to_url(lsp_uri).ok()?;
-        let snapshot = self.documents.get(&uri)?.snapshot()?;
-        let language_name = self.document_language(&uri)?;
-        let injection_query = self.language.injection_query(&language_name)?;
+    ) -> Vec<RangeRequestContext> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            return Vec::new();
+        };
+        let Some(snapshot) = self.documents.get(&uri).and_then(|d| d.snapshot()) else {
+            return Vec::new();
+        };
+        let Some(language_name) = self.document_language(&uri) else {
+            return Vec::new();
+        };
+        let Some(injection_query) = self.language.injection_query(&language_name) else {
+            return Vec::new();
+        };
 
         let regions = crate::language::InjectionResolver::resolve_all(
             &self.language,
@@ -1248,10 +1258,8 @@ impl Kakehashi {
             injection_query.as_ref(),
         );
 
-        // First intersecting region that resolves to bridge server configs
-        // wins: unconfigured injections (e.g. markdown_inline) must not
-        // shadow a configured region further down the document.
         let mapper = PositionMapper::new(snapshot.text());
+        let mut contexts = Vec::new();
         for resolved in regions {
             // Clamp to the region so the translated range is in-region; skip a
             // region the range never touches.
@@ -1265,20 +1273,19 @@ impl Kakehashi {
                 language_name: language_name.clone(),
                 upstream_request_id: current_upstream_id(),
             };
-            // An intersecting region that resolves to no bridge config does not
-            // shadow a configured region further down: skip to the next.
+            // A region that resolves to no bridge config contributes nothing.
             let Some(document) = self
                 .preamble_to_document_context(preamble, method_name)
                 .await
             else {
                 continue;
             };
-            return Some(RangeRequestContext {
+            contexts.push(RangeRequestContext {
                 document,
                 range: clamped,
             });
         }
-        None
+        contexts
     }
 }
 

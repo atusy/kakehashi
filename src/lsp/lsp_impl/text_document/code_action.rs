@@ -26,6 +26,7 @@ use tower_lsp_server::ls_types::{
 use ulid::Ulid;
 use url::Url;
 
+use super::super::bridge_context::RangeRequestContext;
 use super::super::{Kakehashi, detect_document_language};
 use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
@@ -275,24 +276,74 @@ impl Kakehashi {
         client_progress_token: Option<NumberOrString>,
         upstream_caps: UpstreamCodeActionCaps,
     ) -> Result<Option<CodeActionResponse>> {
-        let Some(mut ctx) = self
-            .resolve_bridge_contexts_for_range_overlap(lsp_uri, range, METHOD)
-            .await
-        else {
+        // EVERY injection region the range overlaps (usually one). A range
+        // spanning several fences dispatches to each and the results are merged
+        // into one menu (#628 multi-region), in document order. Latency scales
+        // with the overlapped-region count (bounded by the document's injection
+        // count); the common case is a range within a single fence.
+        let contexts = self
+            .resolve_bridge_contexts_for_all_overlapping_regions(lsp_uri, range, METHOD)
+            .await;
+        if contexts.is_empty() {
             return Ok(None);
+        }
+
+        // All overlapping regions share THIS request's upstream id. Hold the
+        // pool registration cleanup ONCE for the whole walk (single
+        // `unregister_all` after the loop) rather than per region. The cancel
+        // subscription here is usually a redundant duplicate — the caller
+        // (`walk_layers_by_strategy` → `run_layer_race`) already subscribes the
+        // same id across the whole virt future, so this returns `None` and the
+        // outer race's `select!` cancels the loop. Keeping it makes the walk
+        // self-cancelling even if ever driven outside that race.
+        let upstream_id = contexts[0].document.upstream_request_id.clone();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+
+        let mut progress_token = client_progress_token;
+        let walk = async {
+            let mut merged: CodeActionResponse = Vec::new();
+            for mut ctx in contexts {
+                // The work-done progress token is single-use → first region only.
+                ctx.document.client_progress_token = progress_token.take();
+                if let Some(actions) = self
+                    .dispatch_virt_region_code_action(ctx, &context, upstream_caps)
+                    .await?
+                {
+                    merged.extend(actions);
+                }
+            }
+            Ok((!merged.is_empty()).then_some(merged))
         };
-        ctx.document.client_progress_token = client_progress_token;
 
-        let (cancel_rx, _cancel_guard) =
-            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
+        // Cancel aborts the walk (dropping the in-flight region's dispatch).
+        let result = match cancel_rx {
+            Some(rx) => tokio::select! {
+                r = walk => r,
+                _ = rx => Ok(None),
+            },
+            None => walk.await,
+        };
+        self.bridge
+            .pool_arc()
+            .unregister_all_for_upstream_id(upstream_id.as_ref());
+        result
+    }
 
+    /// Fan out `textDocument/codeAction` across the servers bridging ONE
+    /// injection region, applying that region's within-layer strategy
+    /// (`bridge.<lang>.aggregation.<method>.strategy`): `preferred` returns the
+    /// highest-priority non-empty server; `concatenated` merges every server's
+    /// actions in priority order (#568 PR 7). One region of the multi-region
+    /// virt walk; cancellation and the upstream-id registration are held by the
+    /// caller for the whole walk, so this passes no `cancel_rx` of its own.
+    async fn dispatch_virt_region_code_action(
+        &self,
+        ctx: RangeRequestContext,
+        context: &CodeActionContext,
+        upstream_caps: UpstreamCodeActionCaps,
+    ) -> Result<Option<CodeActionResponse>> {
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
-        // One fan-out closure, dispatched by the within-layer strategy
-        // (`bridge.<lang>.aggregation.<method>.strategy`): `preferred` returns
-        // the highest-priority non-empty server; `concatenated` merges every
-        // server's actions in priority order (#568 PR 7). The closure moves into
-        // exactly one arm.
         let f = |t: FanOutTask| {
             let context = context.clone();
             async move {
@@ -314,31 +365,30 @@ impl Kakehashi {
                     .await
             }
         };
-        let result = match ctx.document.strategy {
+        // No `cancel_rx` here: the caller holds a single cancel subscription for
+        // the whole multi-region walk and aborts it on cancel.
+        match ctx.document.strategy {
             AggregationStrategy::Preferred => {
                 dispatch_preferred(
                     &ctx.document,
                     pool.clone(),
                     f,
                     |opt| matches!(opt, Some(v) if !v.is_empty()),
-                    cancel_rx,
+                    None,
                 )
                 .await
                 .handle(&self.client, "code action", None, Ok)
                 .await
             }
             AggregationStrategy::Concatenated => {
-                dispatch_concatenated(&ctx.document, pool.clone(), f, cancel_rx, None, None)
+                dispatch_concatenated(&ctx.document, pool.clone(), f, None, None, None)
                     .await
                     .handle(&self.client, "code action", None, |vecs| {
                         Ok(concat_merge(vecs))
                     })
                     .await
             }
-        };
-        pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
-
-        result
+        }
     }
 
     /// Host layer: forward the params verbatim to the host language's own
