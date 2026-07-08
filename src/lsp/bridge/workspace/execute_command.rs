@@ -98,6 +98,13 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability(METHOD) {
+            // Should be unreachable — the bridge only mints commands from servers
+            // it bridged — but if it happens, a log entry beats a silent drop
+            // (every other failure branch here warns).
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: {origin} does not advertise executeCommandProvider; ignoring '{command}'"
+            );
             return None;
         }
 
@@ -187,7 +194,20 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
 
-        parse_execute_command_response(response.ok()?)
+        // Fail soft, but not silently: surface timeouts / channel-closed like the
+        // other branches so execute-time issues are debuggable (sibling sweep of
+        // the codeAction/resolve logging fix).
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: wait for response failed on {connection_key:?}: {e}"
+                );
+                return None;
+            }
+        };
+        parse_execute_command_response(response)
     }
 }
 
