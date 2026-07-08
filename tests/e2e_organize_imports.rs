@@ -147,7 +147,18 @@ fn apply_edits(text: &str, edits: &[Value]) -> String {
             (s, en, new.to_string())
         })
         .collect();
-    spans.sort_by_key(|(s, _, _)| *s);
+    spans.sort_by_key(|(s, en, _)| (*s, *en));
+    // Overlapping edits would apply in an arbitrary order and could mask a
+    // translation bug behind a plausible-looking document — a valid LSP edit set
+    // is disjoint, so assert that before applying end-first.
+    for pair in spans.windows(2) {
+        assert!(
+            pair[1].0 >= pair[0].1,
+            "overlapping host edits: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
     let mut out = text.to_string();
     for (s, en, new) in spans.into_iter().rev() {
         out.replace_range(s..en, &new);
