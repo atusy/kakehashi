@@ -18,8 +18,12 @@ use ulid::Ulid;
 use url::Url;
 
 use super::super::{Kakehashi, detect_document_language};
+use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::server::{FanInResult, dispatch_host_preferred, dispatch_preferred};
+use crate::lsp::aggregation::server::{
+    FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
+    dispatch_host_preferred, dispatch_preferred,
+};
 use crate::lsp::bridge::{
     CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps, bridge_code_actions,
     extract_code_action_envelope, parse_code_actions_leniently,
@@ -27,6 +31,16 @@ use crate::lsp::bridge::{
 use crate::text::PositionMapper;
 
 const METHOD: &str = "textDocument/codeAction";
+
+/// Flatten the per-server results of a `concatenated` dispatch into one response
+/// in priority order (`dispatch_concatenated` yields them ordered). Each server
+/// contributes `Option<CodeActionResponse>`; drop the `None`s, concatenate the
+/// action lists, and collapse an all-empty merge to `None` so the layer counts
+/// as "no result" for cross-layer aggregation (#568 PR 7).
+fn concat_merge(vecs: Vec<Option<CodeActionResponse>>) -> Option<CodeActionResponse> {
+    let merged: CodeActionResponse = vecs.into_iter().flatten().flatten().collect();
+    (!merged.is_empty()).then_some(merged)
+}
 
 impl Kakehashi {
     pub(crate) async fn code_action_impl(
@@ -207,37 +221,57 @@ impl Kakehashi {
 
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
-        let result = dispatch_preferred(
-            &ctx.document,
-            pool.clone(),
-            |t| {
-                let context = context.clone();
-                async move {
-                    t.pool
-                        .send_code_action_request(
-                            &t.server_name,
-                            &t.server_config,
-                            &t.uri,
-                            range,
-                            context,
-                            &t.injection_language,
-                            &t.region_id,
-                            t.offset,
-                            &t.virtual_content,
-                            t.upstream_id,
-                            t.client_progress_token,
-                            upstream_caps,
-                        )
-                        .await
-                }
-            },
-            |opt| matches!(opt, Some(v) if !v.is_empty()),
-            cancel_rx,
-        )
-        .await;
+        // One fan-out closure, dispatched by the within-layer strategy
+        // (`bridge.<lang>.aggregation.<method>.strategy`): `preferred` returns
+        // the highest-priority non-empty server; `concatenated` merges every
+        // server's actions in priority order (#568 PR 7). The closure moves into
+        // exactly one arm.
+        let f = |t: FanOutTask| {
+            let context = context.clone();
+            async move {
+                t.pool
+                    .send_code_action_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &t.uri,
+                        range,
+                        context,
+                        &t.injection_language,
+                        &t.region_id,
+                        t.offset,
+                        &t.virtual_content,
+                        t.upstream_id,
+                        t.client_progress_token,
+                        upstream_caps,
+                    )
+                    .await
+            }
+        };
+        let result = match ctx.document.strategy {
+            AggregationStrategy::Preferred => {
+                dispatch_preferred(
+                    &ctx.document,
+                    pool.clone(),
+                    f,
+                    |opt| matches!(opt, Some(v) if !v.is_empty()),
+                    cancel_rx,
+                )
+                .await
+                .handle(&self.client, "code action", None, Ok)
+                .await
+            }
+            AggregationStrategy::Concatenated => {
+                dispatch_concatenated(&ctx.document, pool.clone(), f, cancel_rx, None, None)
+                    .await
+                    .handle(&self.client, "code action", None, |vecs| {
+                        Ok(concat_merge(vecs))
+                    })
+                    .await
+            }
+        };
         pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
 
-        result.handle(&self.client, "code action", None, Ok).await
+        result
     }
 
     /// Host layer: forward the params verbatim to the host language's own
@@ -255,51 +289,74 @@ impl Kakehashi {
         };
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
-        let result = dispatch_host_preferred(
-            &ctx,
-            pool.clone(),
-            move |t| {
-                let params = raw_params.clone();
-                async move {
-                    let raw = t
-                        .pool
-                        .send_host_raw_request(
-                            &t.server_name,
-                            &t.server_config,
-                            &HostDocument {
-                                uri: &t.uri,
-                                language_id: &t.language_id,
-                                text: &t.text,
-                            },
-                            METHOD,
-                            params,
-                            t.upstream_id,
-                        )
-                        .await?;
-                    Ok(raw.and_then(|value| {
-                        let actions = parse_code_actions_leniently(value)?;
-                        Some(bridge_code_actions(
-                            actions,
-                            &t.server_name,
-                            t.uri.as_str(),
-                            upstream_caps,
-                            // Host-layer codeAction/resolve is not bridged, so
-                            // host lazy actions are never enveloped/resolved.
-                            false,
-                            None,
-                        ))
-                    }))
-                }
-            },
-            |opt| matches!(opt, Some(v) if !v.is_empty()),
-            cancel_rx,
-        )
-        .await;
+        // One fan-out closure, dispatched by the within-host-layer strategy
+        // (`bridge._self.aggregation.<method>.strategy`); moves into one arm.
+        let f = move |t: HostFanOutTask| {
+            let params = raw_params.clone();
+            async move {
+                let raw = t
+                    .pool
+                    .send_host_raw_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &HostDocument {
+                            uri: &t.uri,
+                            language_id: &t.language_id,
+                            text: &t.text,
+                        },
+                        METHOD,
+                        params,
+                        t.upstream_id,
+                    )
+                    .await?;
+                Ok(raw.and_then(|value| {
+                    let actions = parse_code_actions_leniently(value)?;
+                    Some(bridge_code_actions(
+                        actions,
+                        &t.server_name,
+                        t.uri.as_str(),
+                        upstream_caps,
+                        // Host-layer codeAction/resolve is not bridged, so
+                        // host lazy actions are never enveloped/resolved.
+                        false,
+                        None,
+                    ))
+                }))
+            }
+        };
+        let result = match ctx.strategy {
+            AggregationStrategy::Preferred => {
+                let fan_in = dispatch_host_preferred(
+                    &ctx,
+                    pool.clone(),
+                    f,
+                    |opt| matches!(opt, Some(v) if !v.is_empty()),
+                    cancel_rx,
+                )
+                .await;
+                self.host_code_action_result(fan_in, |v| v).await
+            }
+            AggregationStrategy::Concatenated => {
+                let fan_in =
+                    dispatch_host_concatenated(&ctx, pool.clone(), f, cancel_rx, None, None).await;
+                self.host_code_action_result(fan_in, concat_merge).await
+            }
+        };
         pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
-        // Same quieting as the generic host arm: an all-empty host layer is
-        // the normal outcome whenever virt answers; only real failures log.
+        result
+    }
+
+    /// Fold a host-layer fan-in result into the handler's return, with the
+    /// host-arm quieting: an all-empty host layer is the normal outcome
+    /// whenever virt answers, so it stays SILENT (unlike [`FanInResult::handle`],
+    /// which logs a LOG-level message) and warns only on real failures.
+    async fn host_code_action_result<T>(
+        &self,
+        result: FanInResult<T>,
+        on_done: impl FnOnce(T) -> Option<CodeActionResponse>,
+    ) -> Result<Option<CodeActionResponse>> {
         match result {
-            FanInResult::Done(value) => Ok(value),
+            FanInResult::Done(value) => Ok(on_done(value)),
             FanInResult::NoResult { errors } => {
                 if errors > 0 {
                     self.client
