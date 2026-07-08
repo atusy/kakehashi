@@ -36,8 +36,9 @@ pub(crate) const CLOSED_INCARNATION: u64 = u64::MAX;
 pub(crate) struct ParseSnapshot {
     pub(crate) text: Arc<str>,
     pub(crate) tree: Option<Tree>,
-    /// The parse's own content-detected language — may refine the input-side
-    /// `language_id` guess; never written back to the input (ADR §1).
+    /// The parse's own content-detected language — the snapshot architecture's
+    /// reader-facing refinement, independent of whether the legacy store-backed
+    /// path also writes the detection back to `Document::language_id` (ADR §1).
     pub(crate) language: Option<String>,
     /// The `Document::content_version` the parse consumed.
     pub(crate) parsed_version: u64,
