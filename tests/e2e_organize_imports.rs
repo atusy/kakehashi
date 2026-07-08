@@ -75,10 +75,14 @@ fn init_ruff_client() -> (LspClient, tempfile::TempDir, tempfile::TempDir) {
     (client, workspace, config_dir)
 }
 
-/// A `file://` URI for `name` under the workspace root, so ruff sees the
-/// document inside its workspace (config discovery, out-of-workspace policy).
+/// A canonical `file://` URI for `name` under the workspace root, so ruff sees
+/// the document inside its workspace. Built via `Url::from_file_path` (not string
+/// formatting) so the URI is RFC-canonical/percent-encoded and kakehashi's
+/// `url::Url::parse` accepts it.
 fn doc_uri(workspace: &tempfile::TempDir, name: &str) -> String {
-    format!("file://{}/{name}", workspace.path().display())
+    url::Url::from_file_path(workspace.path().join(name))
+        .expect("valid file URI")
+        .to_string()
 }
 
 fn open(client: &mut LspClient, uri: &str, text: &str) {
@@ -147,8 +151,10 @@ fn apply_edits(text: &str, edits: &[Value]) -> String {
     out
 }
 
-/// Request codeAction over the python fence (host lines 3-6), retrying while the
-/// downstream is still cold.
+/// Request codeAction over the python fence — an LSP range of `(3,0)..(6,0)`,
+/// i.e. host lines 3-5 (end-exclusive), which covers the whole import block —
+/// retrying while the downstream is still cold. A JSON-RPC error is surfaced
+/// immediately (not retried) so a real failure is diagnosable.
 fn code_action_over_block(client: &mut LspClient, uri: &str, context: Value) -> Vec<Value> {
     for _ in 0..400 {
         let response = client.send_request(
@@ -161,6 +167,11 @@ fn code_action_over_block(client: &mut LspClient, uri: &str, context: Value) -> 
                 },
                 "context": context
             }),
+        );
+        assert!(
+            response.get("error").is_none(),
+            "codeAction returned a JSON-RPC error: {}",
+            response["error"]
         );
         if let Some(actions) = response["result"].as_array()
             && !actions.is_empty()
@@ -268,6 +279,11 @@ fn diagnostic_drives_a_quickfix_on_the_python_block() {
         let response = client.send_request(
             "textDocument/diagnostic",
             json!({ "textDocument": { "uri": uri } }),
+        );
+        assert!(
+            response.get("error").is_none(),
+            "diagnostic returned a JSON-RPC error: {}",
+            response["error"]
         );
         if let Some(items) = response["result"]["items"].as_array()
             && !items.is_empty()
