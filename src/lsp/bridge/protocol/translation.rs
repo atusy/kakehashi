@@ -16,7 +16,7 @@ use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// For blockquoted injections, `columns` has one entry per virtual line,
 /// each representing the width of the blockquote prefix (e.g., `> ` = 2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegionOffset {
     /// The starting line of the injection region in the host document.
     line: u32,

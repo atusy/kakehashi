@@ -1,30 +1,225 @@
-//! Code action request handling for bridge connections (#568, stage "PR 3").
+//! Code action request handling for bridge connections (#568).
 //!
-//! Edit-carrying actions only: `codeAction/resolve` and `Command` execution
-//! are not bridged yet. Actions that would need them surface as
-//! `disabled: { reason }` when the upstream client supports it and are
+//! Edit-carrying and lazy (resolve-deferred) actions are both bridged:
+//! `codeAction/resolve` is routed back to the origin server via the
+//! `CodeActionEnvelope` in `CodeAction.data` (PR 4), or eagerly resolved
+//! downstream when the upstream client lacks `dataSupport`/`resolveSupport`.
+//! Only `Command` execution remains unbridged — command-carrying actions
+//! surface as `disabled: { reason }` when the client supports it and are
 //! dropped otherwise (LSP 3.16 `disabledSupport`).
 //!
 //! Every bridged action title gets the `"{title} — {server}"` suffix so
 //! users can see which downstream server each action comes from.
 
 use std::io;
+use std::sync::Arc;
 
-use crate::config::settings::BridgeServerConfig;
+use futures::StreamExt;
+use log::warn;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
+use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
+use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::text::PositionMapper;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
-    CodeActionResponse, NumberOrString, PartialResultParams, Position, Range,
-    TextDocumentIdentifier, Uri, WorkDoneProgressParams,
+    CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
+    PartialResultParams, Position, Range, TextDocumentIdentifier, Uri, WorkDoneProgressParams,
+    WorkspaceEdit,
 };
 use url::Url;
 
-use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region,
     response_has_jsonrpc_error, transform_workspace_edit_to_host, translate_host_range_to_virtual,
     translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    workspace_edit_within_region,
 };
+use super::completion::EnvelopeOffset;
+
+/// Wrapper key inside `CodeAction.data` that identifies the origin server.
+const ENVELOPE_KEY: &str = "kakehashi";
+
+/// Envelope stored in `CodeAction.data` for routing `codeAction/resolve`
+/// (#568 PR 4), mirroring [`CodeLensEnvelope`](super::code_lens::CodeLensEnvelope).
+///
+/// Carries everything resolve-time routing and coordinate translation need:
+/// the origin server, the host document + region the action came from, the
+/// injection language (to reconstruct the virtual URI for edit re-keying), the
+/// offset snapshot, the action's ORIGINAL (unsuffixed) title (servers may
+/// match a resolve request by title/content, so it must be restored before
+/// forwarding), and the downstream's own `data` preserved verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct CodeActionEnvelope {
+    /// Server name identifying which downstream produced the action.
+    pub(crate) origin: String,
+    /// Host document URI the action belongs to (resolve params carry no
+    /// textDocument, so the envelope must).
+    pub(crate) host_uri: String,
+    /// ULID of the injection region the action came from; the resolve handler's
+    /// freshness gate looks it up in the node tracker (fail-soft when stale).
+    pub(crate) region_id: String,
+    /// Injection language of the region — needed together with `region_id` +
+    /// `host_uri` to rebuild the virtual URI so a resolved edit's `changes`
+    /// map can be re-keyed to the host document.
+    pub(crate) injection_language: String,
+    /// Region offset snapshot for coordinate translation at resolve time.
+    pub(crate) offset: EnvelopeOffset,
+    /// The action's original (unsuffixed) title, restored before forwarding a
+    /// resolve so a server matching by title still matches.
+    pub(crate) original_title: String,
+    /// The downstream server's original `data` value (preserved verbatim).
+    pub(crate) inner: Option<Value>,
+}
+
+/// Everything needed to wrap an action's `data` in a routing envelope.
+pub(crate) struct CodeActionEnvelopeContext<'a> {
+    server_name: &'a str,
+    host_uri: &'a str,
+    region_id: &'a str,
+    injection_language: &'a str,
+    offset: &'a RegionOffset,
+}
+
+/// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
+/// the CURRENT (unsuffixed) title as `original_title`. Call before suffixing.
+fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext) {
+    let inner = action.data.take();
+    let envelope = CodeActionEnvelope {
+        origin: ctx.server_name.to_string(),
+        host_uri: ctx.host_uri.to_string(),
+        region_id: ctx.region_id.to_string(),
+        injection_language: ctx.injection_language.to_string(),
+        offset: EnvelopeOffset::from(ctx.offset),
+        original_title: action.title.clone(),
+        inner,
+    };
+    action.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+}
+
+/// Extract the envelope from an action's `data` without modifying the action.
+pub(crate) fn extract_code_action_envelope(action: &CodeAction) -> Option<CodeActionEnvelope> {
+    let data = action.data.as_ref()?;
+    let wrapper = data.get(ENVELOPE_KEY)?;
+    serde_json::from_value(wrapper.clone()).ok()
+}
+
+/// Extract the envelope and restore the downstream's original `data` value.
+///
+/// On success, `action.data` is set back to `inner` (the action's title is
+/// left suffixed — the dispatch path restores `original_title` explicitly
+/// before forwarding). Returns `None` if not an envelope (action unchanged).
+fn strip_code_action_envelope(action: &mut CodeAction) -> Option<CodeActionEnvelope> {
+    let mut envelope = extract_code_action_envelope(action)?;
+    action.data = envelope.inner.take();
+    Some(envelope)
+}
+
+/// Restore the envelope into an action's `data` field (fail-soft return path).
+///
+/// The action's CURRENT `data` becomes the new `inner` (mirrors
+/// `re_envelope_lens`): `strip` moved the downstream's original data back into
+/// `action.data`, and after a resolve the field may hold the server's updated
+/// data — either way it is what a subsequent resolve must receive. The
+/// `original_title` is taken from the envelope (the action's live title is the
+/// suffixed one), so it survives repeated strip/re-envelope cycles.
+fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
+    let inner = action.data.take();
+    action.data = Some(serde_json::json!({
+        ENVELOPE_KEY: CodeActionEnvelope {
+            origin: envelope.origin.clone(),
+            host_uri: envelope.host_uri.clone(),
+            region_id: envelope.region_id.clone(),
+            injection_language: envelope.injection_language.clone(),
+            offset: envelope.offset.clone(),
+            original_title: envelope.original_title.clone(),
+            inner,
+        }
+    }));
+}
+
+/// Whether a `WorkspaceEdit` carries no actual change. Checks the INNER edit
+/// vectors, not just the outer containers: a `changes` map whose every value
+/// is an empty `TextEdit[]`, or `documentChanges` whose every entry has empty
+/// `edits`, is still a no-op. A file operation counts as a real change.
+fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
+    let changes_has_edit = edit
+        .changes
+        .as_ref()
+        .is_some_and(|c| c.values().any(|edits| !edits.is_empty()));
+    let doc_changes_has_edit = match &edit.document_changes {
+        None => false,
+        Some(DocumentChanges::Edits(edits)) => edits.iter().any(|e| !e.edits.is_empty()),
+        Some(DocumentChanges::Operations(ops)) => ops.iter().any(|op| match op {
+            DocumentChangeOperation::Edit(e) => !e.edits.is_empty(),
+            DocumentChangeOperation::Op(_) => true, // a create/rename/delete is a real change
+        }),
+    };
+    !changes_has_edit && !doc_changes_has_edit
+}
+
+/// Translate an action's edit host-ward with resolve-grade validation, in
+/// place. Returns `false` (leaving the edit partially mutated — the caller
+/// must discard the action) when the edit can't be faithfully represented in
+/// the host document: it touches another injection region (the shared
+/// transform would silently filter those edits and partially apply the rest),
+/// contains a virtual-URI file op (transform returns false), ends up empty, or
+/// a translated range escapes the region end (`region_end`) — a stale/malformed
+/// downstream edit whose virtual range runs past the region would otherwise land
+/// in unrelated host text after the fence. Used by BOTH the initial-response
+/// policy and the codeAction/resolve path so these are rejected uniformly,
+/// never partially applied.
+fn translate_edit_host_ward_strict(
+    edit: &mut WorkspaceEdit,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
+    !workspace_edit_touches_foreign_region(edit, request_virtual_uri)
+        && transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset)
+        && !workspace_edit_is_empty(edit)
+        && workspace_edit_within_region(edit, host_uri, offset, region_end)
+}
+
+/// Whether a `WorkspaceEdit` touches a virtual document OTHER than
+/// `request_virtual_uri` (a cross-region edit). The shared host transform
+/// silently filters such text edits; the resolve path uses this to fail soft
+/// instead, since a partially-applied resolved edit is worse than none.
+///
+/// A foreign key that carries ZERO edits is a no-op — the transform strips it
+/// cleanly and it applies nothing — so it does NOT count as touching a foreign
+/// region (consistent with `workspace_edit_is_empty`'s inner-vector check).
+/// Only foreign entries with real edits would be silently dropped, and those
+/// are what must reject the whole action.
+fn workspace_edit_touches_foreign_region(edit: &WorkspaceEdit, request_virtual_uri: &str) -> bool {
+    let is_foreign =
+        |uri: &str| VirtualDocumentUri::is_virtual_uri(uri) && uri != request_virtual_uri;
+    if let Some(changes) = &edit.changes
+        && changes
+            .iter()
+            .any(|(k, edits)| is_foreign(k.as_str()) && !edits.is_empty())
+    {
+        return true;
+    }
+    match &edit.document_changes {
+        None => false,
+        Some(DocumentChanges::Edits(edits)) => edits
+            .iter()
+            .any(|e| is_foreign(e.text_document.uri.as_str()) && !e.edits.is_empty()),
+        Some(DocumentChanges::Operations(ops)) => ops.iter().any(|op| match op {
+            DocumentChangeOperation::Edit(e) => {
+                is_foreign(e.text_document.uri.as_str()) && !e.edits.is_empty()
+            }
+            // File ops on virtual URIs are rejected by the transform itself
+            // (it returns false), so they need no foreign check here.
+            DocumentChangeOperation::Op(_) => false,
+        }),
+    }
+}
 
 /// The exclusive host-document end of an injection region: the position just
 /// past its `virtual_content`, mapped back to host coordinates. Bounds the
@@ -70,38 +265,458 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/codeAction") {
             return Ok(None);
         }
-        self.execute_bridge_request_with_handle(
-            handle,
-            host_uri,
-            injection_language,
+
+        // Phase 1: send the request and parse the raw actions (still in virtual
+        // coordinates, no policy applied) — the bridge policy is deferred to
+        // phase 3 so phase 2 can eager-resolve lazy actions asynchronously.
+        let region_end = region_host_end(virtual_content, &offset);
+        let raw = self
+            .execute_bridge_request_with_handle(
+                Arc::clone(&handle),
+                host_uri,
+                injection_language,
+                region_id,
+                &offset,
+                virtual_content,
+                upstream_request_id.clone(),
+                |virtual_uri, request_id| {
+                    build_code_action_request(
+                        virtual_uri,
+                        host_range,
+                        context,
+                        &offset,
+                        region_end,
+                        request_id,
+                        client_progress_token,
+                    )
+                },
+                |response, _ctx| parse_code_action_response_raw(response),
+            )
+            .await?;
+        let Some(mut actions) = raw else {
+            return Ok(None);
+        };
+
+        // Phase 2: eager-resolve fallback. A client without resolve+data
+        // support can never complete a lazy action and may strip our routing
+        // envelope, so resolve those actions downstream now (bounded: only the
+        // lazy ones). Failures fall through to the phase-3 REASON_RESOLVE path.
+        if !upstream_caps.can_envelope() {
+            self.eager_resolve_lazy_actions(&handle, &mut actions, upstream_request_id)
+                .await;
+        }
+
+        // Phase 3: apply the bridge policy (coordinate translation, title
+        // suffix, disable/drop, and — for envelope-capable clients — the
+        // resolve routing envelope).
+        // NOTE: a `url_to_uri` failure here is already unreachable — the shared
+        // `execute_bridge_request_observed` converts the same `host_uri` first
+        // (pool/execute.rs) and hard-fails there — so a local fail-soft would be
+        // dead code. Making the host-URI conversion fail-soft end-to-end is a
+        // shared-helper change tracked in #615.
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let virtual_uri_string =
+            VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id).to_uri_string();
+        let virt = VirtLayerContext {
+            request_virtual_uri: &virtual_uri_string,
+            host_uri: &host_uri_lsp,
+            offset: &offset,
+            // Reuse the value computed for phase 1 (line ~272): deterministic in
+            // `(virtual_content, offset)`, which are unchanged here.
+            region_end,
             region_id,
-            &offset,
-            virtual_content,
-            upstream_request_id,
-            |virtual_uri, request_id| {
-                build_code_action_request(
-                    virtual_uri,
-                    host_range,
-                    context,
-                    &offset,
-                    region_host_end(virtual_content, &offset),
-                    request_id,
-                    client_progress_token,
-                )
-            },
-            |response, ctx| {
-                transform_code_action_response_to_host(
-                    response,
-                    &ctx.virtual_uri_string,
-                    ctx.host_uri_lsp,
-                    ctx.offset,
-                    server_name,
-                    upstream_caps,
-                )
-            },
+            injection_language,
+            host_uri_string: host_uri.as_str(),
+            server_name,
+        };
+        Ok(Some(bridge_code_actions(
+            actions,
+            server_name,
+            upstream_caps,
+            handle.has_capability("codeAction/resolve"),
+            Some(&virt),
+        )))
+    }
+
+    /// Eager-resolve the lazy (data-only) actions in place: for a client that
+    /// cannot resolve them itself, materialize their `edit`/`command` via a
+    /// `codeAction/resolve` round-trip on the SAME connection while it is still
+    /// live. Actions that fail to resolve stay lazy and are disabled/dropped by
+    /// the phase-3 policy. Only lazy actions are touched (bounded fan-out).
+    async fn eager_resolve_lazy_actions(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        actions: &mut [CodeActionOrCommand],
+        upstream_id: Option<UpstreamId>,
+    ) {
+        if !handle.has_capability("codeAction/resolve") {
+            return;
+        }
+        // Collect the lazy actions' indices + clones, resolve them CONCURRENTLY
+        // on the shared connection (its ResponseRouter multiplexes by
+        // request_id), then splice results back by index. Sequential awaits
+        // would block the codeAction response for the SUM of resolve times when
+        // a server returns several lazy actions (organize-imports / batch
+        // quickfix). Concurrency is CAPPED (`buffer_unordered`) so a server that
+        // returns a very large lazy-action list can't burst an unbounded number
+        // of in-flight resolves onto one connection. Lazy = no edit/command, not
+        // server-disabled; `data` is NOT required (already gated on the server
+        // advertising resolve, so a title-only action here is a resolvable lazy
+        // action per LSP 3.18).
+        let pending: Vec<(usize, CodeAction)> = actions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| match item {
+                CodeActionOrCommand::CodeAction(action)
+                    if action.edit.is_none()
+                        && action.command.is_none()
+                        && action.disabled.is_none() =>
+                {
+                    Some((idx, action.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        /// Max concurrent eager `codeAction/resolve`s on one connection.
+        const MAX_CONCURRENT_EAGER_RESOLVES: usize = 8;
+        let resolved: Vec<(usize, Option<CodeAction>)> =
+            futures::stream::iter(pending.into_iter().map(|(idx, action)| {
+                let upstream_id = upstream_id.clone();
+                async move {
+                    (
+                        idx,
+                        self.send_code_action_resolve_on_handle(handle, action, upstream_id)
+                            .await,
+                    )
+                }
+            }))
+            .buffer_unordered(MAX_CONCURRENT_EAGER_RESOLVES)
+            .collect()
+            .await;
+        for (idx, outcome) in resolved {
+            if let Some(materialized) = outcome
+                && let CodeActionOrCommand::CodeAction(slot) = &mut actions[idx]
+            {
+                *slot = materialized;
+            }
+        }
+    }
+
+    /// Route a `codeAction/resolve` request to the origin downstream server,
+    /// identified by the envelope in `action.data` (#568 PR 4). An action
+    /// without an envelope (host-layer or foreign) passes through unchanged.
+    /// Fails soft at every step: any failure returns the action unresolved
+    /// with its envelope restored (mirrors `dispatch_code_lens_resolve`).
+    pub(crate) async fn dispatch_code_action_resolve(
+        &self,
+        mut action: CodeAction,
+        settings: &WorkspaceSettings,
+        upstream_caps: UpstreamCodeActionCaps,
+        upstream_id: Option<UpstreamId>,
+        region_end: Position,
+    ) -> CodeAction {
+        let Some(envelope) = strip_code_action_envelope(&mut action) else {
+            return action;
+        };
+
+        if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+        let Some(config) = resolve_with_wildcard(
+            &settings.language_servers,
+            &envelope.origin,
+            merge_bridge_server_configs,
+        ) else {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        };
+
+        self.send_code_action_resolve_request(
+            &config,
+            action,
+            envelope,
+            upstream_caps,
+            upstream_id,
+            region_end,
         )
         .await
     }
+
+    /// Reconnect to the origin `(server, root)`, restore the original title,
+    /// translate coordinates back to virtual, forward `codeAction/resolve`,
+    /// then translate the resolved edit/diagnostics host-ward, re-suffix, and
+    /// re-envelope. Every failure path returns the action unresolved.
+    async fn send_code_action_resolve_request(
+        &self,
+        server_config: &BridgeServerConfig,
+        mut action: CodeAction,
+        mut envelope: CodeActionEnvelope,
+        upstream_caps: UpstreamCodeActionCaps,
+        upstream_id: Option<UpstreamId>,
+        region_end: Position,
+    ) -> CodeAction {
+        let server_name = &envelope.origin;
+        let host_url = Url::parse(&envelope.host_uri).ok();
+        let handle = match self
+            .get_or_create_connection(server_name, server_config, host_url.as_ref())
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve: failed to connect to {server_name}: {e}"
+                );
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+        };
+        if !handle.has_capability("codeAction/resolve") {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+
+        let offset = RegionOffset::from(&envelope.offset);
+        let host_uri_lsp = host_url
+            .as_ref()
+            .and_then(|u| crate::lsp::lsp_impl::url_to_uri(u).ok());
+
+        // Forward with the ORIGINAL (unsuffixed) title restored and any
+        // client-supplied ranges translated back to virtual coordinates. Keep
+        // the suffixed title to re-apply to the resolved response.
+        let mut outgoing = action.clone();
+        let suffixed_title =
+            std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
+        translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
+
+        let Some(mut resolved) = self
+            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
+            .await
+        else {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        };
+
+        // Translate the resolved action's own diagnostics host-ward first, so
+        // every surfaced action — including a disabled one returned below —
+        // carries host coordinates (mirrors the initial-path order).
+        if let Some(diagnostics) = &mut resolved.diagnostics {
+            for diagnostic in diagnostics {
+                translate_virtual_range_to_host(&mut diagnostic.range, &offset);
+            }
+        }
+
+        // A resolve that marks the action `disabled` makes it non-executable —
+        // handle it BEFORE the command/edit policy (mirrors the initial path,
+        // so a disabled+command resolve is surfaced disabled, not failed soft).
+        // Without upstream `disabledSupport` the client can't render it, so
+        // fail soft (return the original, already-sanitized action unresolved);
+        // with it, strip the payload (a disabled action must never carry an
+        // executable edit/command) and surface it disabled with reason + suffix.
+        if resolved.disabled.is_some() {
+            if !upstream_caps.disabled_support {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+            resolved.title = resuffix_resolved_title(
+                std::mem::take(&mut resolved.title),
+                suffixed_title,
+                server_name,
+            );
+            resolved.edit = None;
+            resolved.command = None;
+            resolved.data = None;
+            resolved.is_preferred = None;
+            return resolved;
+        }
+
+        // A resolve that materializes a `command` (or edit+command) can't be
+        // honored — command execution is unbridged, and applying only the edit
+        // half is worse than none (the initial codeAction path disables such
+        // actions). Fail soft: return the original action unresolved rather
+        // than hand the editor an executable downstream command.
+        if resolved.command.is_some() {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+
+        // isPreferred is its own client capability (LSP 3.15); the downstream
+        // baseline advertises it unconditionally, so strip it for clients that
+        // did not opt in.
+        if !upstream_caps.is_preferred_support {
+            resolved.is_preferred = None;
+        }
+
+        // Translate the resolved edit host-ward. When it can't be faithfully
+        // represented in the host document — a virtual-URI file op (transform
+        // returns false); ANY cross-region edit (the shared transform would
+        // silently filter it, partially applying the rest); or an edit that
+        // ends up empty — disable the action (or, without disabledSupport, fail
+        // soft to the unresolved action). Any of these is worse than a disabled
+        // action: the user would apply it and get a partial or no-op change.
+        // This is a PERMANENT failure, so `resolve_untranslatable_edit` disables
+        // rather than transient-fail-softing.
+        let untranslatable = match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
+            (Some(edit), Some(host_uri_lsp)) => {
+                let virtual_uri = VirtualDocumentUri::new(
+                    host_uri_lsp,
+                    &envelope.injection_language,
+                    &envelope.region_id,
+                )
+                .to_uri_string();
+                !translate_edit_host_ward_strict(
+                    edit,
+                    &virtual_uri,
+                    host_uri_lsp,
+                    &offset,
+                    region_end,
+                )
+            }
+            // The server resolved an edit, but the host URI couldn't be rebuilt
+            // to translate it (a `url`/`Uri` parser divergence). Shipping the
+            // untranslated virtual-coordinate edit would be unappliable — same
+            // permanent failure as the cross-region case.
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if untranslatable {
+            return resolve_untranslatable_edit(
+                resolved,
+                action,
+                &envelope,
+                suffixed_title,
+                server_name,
+                upstream_caps,
+            );
+        }
+
+        // Re-apply the "{title} — {server}" suffix. The server normally echoes
+        // the restored original title back, but if it changed the title during
+        // resolve (allowed by LSP) that change is kept and re-suffixed. Capture
+        // the raw (unsuffixed) server title first — the still-lazy path below
+        // needs it to keep the envelope's title in sync.
+        let server_title = std::mem::take(&mut resolved.title);
+        resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
+
+        // Once resolve has materialized an edit, the action is complete and
+        // its edit is host-translated. Re-enveloping it would let a second
+        // resolve forward that host-coordinate edit back downstream (no
+        // inverse transform) — so strip the data instead, mirroring the
+        // initial-response policy for edit-carrying actions. Only a still-lazy
+        // resolved action (no edit) keeps a routing envelope for a further
+        // resolve.
+        if resolved.edit.is_some() {
+            resolved.data = None;
+        } else {
+            // Still lazy: a future resolve restores `envelope.original_title`
+            // and forwards it downstream. If the server changed the title on
+            // THIS resolve, track the new (unsuffixed) title so a title-matching
+            // server sees the title it last advertised, not the stale initial
+            // one. (The envelope exists precisely for match-by-title servers.)
+            if !server_title.is_empty() {
+                envelope.original_title = server_title;
+            }
+            if resolved.data.is_none() {
+                resolved.data = action.data.take();
+            }
+            re_envelope_action(&mut resolved, &envelope);
+        }
+        resolved
+    }
+
+    /// Send a `codeAction/resolve` request on an already-connected handle and
+    /// parse the response into a resolved `CodeAction`. Returns `None` on any
+    /// failure (register/send/wait/parse) so callers can fail soft.
+    async fn send_code_action_resolve_on_handle(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        action: CodeAction,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<CodeAction> {
+        let connection_key = handle.key();
+        if let Some(ref id) = upstream_id {
+            self.register_upstream_request(id.clone(), connection_key);
+        }
+        let (request_id, response_rx) =
+            match handle.register_request_with_upstream(upstream_id.clone()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "codeAction/resolve: failed to register request: {e}"
+                    );
+                    if let Some(ref id) = upstream_id {
+                        self.unregister_upstream_request(id, connection_key);
+                    }
+                    return None;
+                }
+            };
+
+        let request = JsonRpcRequest::new(request_id.as_i64(), "codeAction/resolve", &action);
+        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+
+        if let Err(e) = handle.send_request(request, request_id) {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: failed to send request: {e}"
+            );
+            if let Some(ref id) = upstream_id {
+                self.unregister_upstream_request(id, connection_key);
+            }
+            return None;
+        }
+
+        let response = handle.wait_for_response(request_id, response_rx).await;
+        router_guard.disarm();
+        if let Some(ref id) = upstream_id {
+            self.unregister_upstream_request(id, connection_key);
+        }
+
+        // Fail soft, but not silently: surface timeouts / channel-closed like the
+        // sibling codeLens/completion resolve paths so resolve-time issues are
+        // debuggable (qodo review finding).
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve failed for {connection_key:?}: {e}"
+                );
+                return None;
+            }
+        };
+        parse_code_action_resolve_response(response)
+    }
+}
+
+/// Translate an action's host-space ranges (diagnostics) back to virtual
+/// coordinates before forwarding a `codeAction/resolve`. A lazy action being
+/// resolved normally carries no `edit`, so only diagnostic ranges are handled;
+/// an inverse edit transform is not implemented (see `transform_workspace_edit_to_host`).
+fn translate_action_ranges_host_to_virtual(action: &mut CodeAction, offset: &RegionOffset) {
+    if let Some(diagnostics) = &mut action.diagnostics {
+        for diagnostic in diagnostics {
+            translate_host_range_to_virtual(&mut diagnostic.range, offset);
+        }
+    }
+}
+
+/// Parse a JSON-RPC `codeAction/resolve` response into a `CodeAction`.
+/// Returns `None` for errors, null results, and deserialization failures.
+fn parse_code_action_resolve_response(mut response: serde_json::Value) -> Option<CodeAction> {
+    if response_has_jsonrpc_error(&response, "codeAction/resolve") {
+        return None;
+    }
+    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    if result.is_null() {
+        return None;
+    }
+    serde_json::from_value(result).ok()
 }
 
 /// Build a JSON-RPC code action request for a downstream language server.
@@ -157,31 +772,17 @@ fn build_code_action_request(
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/codeAction", params)
 }
 
-/// Transform a code action response from virtual to host coordinates.
-fn transform_code_action_response_to_host(
+/// Parse a code action response into raw (virtual-coordinate, unpoliced)
+/// actions. The bridge policy is applied later so an eager-resolve pass can
+/// materialize lazy actions in between (see `send_code_action_request`).
+fn parse_code_action_response_raw(
     mut response: serde_json::Value,
-    request_virtual_uri: &str,
-    host_uri: &Uri,
-    offset: &RegionOffset,
-    server_name: &str,
-    upstream_caps: UpstreamCodeActionCaps,
-) -> Option<CodeActionResponse> {
+) -> Option<Vec<CodeActionOrCommand>> {
     if response_has_jsonrpc_error(&response, "textDocument/codeAction") {
         return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
-    let actions = parse_code_actions_leniently(result)?;
-
-    Some(bridge_code_actions(
-        actions,
-        server_name,
-        upstream_caps,
-        Some(&VirtLayerContext {
-            request_virtual_uri,
-            host_uri,
-            offset,
-        }),
-    ))
+    parse_code_actions_leniently(result)
 }
 
 /// Parse a code action result value item by item: one malformed action must
@@ -217,6 +818,31 @@ pub(crate) struct VirtLayerContext<'a> {
     request_virtual_uri: &'a str,
     host_uri: &'a Uri,
     offset: &'a RegionOffset,
+    /// The region's exclusive host-document end: bounds an edit-carrying
+    /// action's translated ranges so a range past the region can't land in
+    /// unrelated host text after the fence.
+    region_end: Position,
+    /// Origin routing metadata for the `codeAction/resolve` envelope; carried
+    /// alongside the coordinate context so a kept action that still needs
+    /// resolve can be enveloped in one pass.
+    region_id: &'a str,
+    injection_language: &'a str,
+    /// The host document URI as a parseable string for the envelope
+    /// (`host_uri` above is the `Uri` form used for edit re-keying).
+    host_uri_string: &'a str,
+    server_name: &'a str,
+}
+
+impl VirtLayerContext<'_> {
+    fn envelope_ctx(&self) -> CodeActionEnvelopeContext<'_> {
+        CodeActionEnvelopeContext {
+            server_name: self.server_name,
+            host_uri: self.host_uri_string,
+            region_id: self.region_id,
+            injection_language: self.injection_language,
+            offset: self.offset,
+        }
+    }
 }
 
 /// Upstream client capabilities that gate the bridge action policy
@@ -226,30 +852,56 @@ pub(crate) struct VirtLayerContext<'a> {
 pub(crate) struct UpstreamCodeActionCaps {
     pub(crate) disabled_support: bool,
     pub(crate) is_preferred_support: bool,
+    /// LSP 3.16 `dataSupport`: the client round-trips `data` between
+    /// `textDocument/codeAction` and `codeAction/resolve`.
+    pub(crate) data_support: bool,
+    /// LSP 3.16 `resolveSupport` includes `"edit"`: the client can lazily
+    /// resolve an action's `edit` (not merely issue `codeAction/resolve`).
+    pub(crate) resolve_edit_support: bool,
+}
+
+impl UpstreamCodeActionCaps {
+    /// Whether a lazy (data-only) action can be handed to the client as-is
+    /// with a routing envelope: needs BOTH `dataSupport` (the client preserves
+    /// our envelope) and `resolveSupport` advertising `"edit"` (the client
+    /// will actually resolve the edit). Otherwise the bridge must
+    /// eager-resolve downstream instead.
+    fn can_envelope(&self) -> bool {
+        self.data_support && self.resolve_edit_support
+    }
 }
 
 /// Apply the bridge policy to a downstream server's actions: title suffix,
 /// command/lazy-action disabling, and (virt layer) coordinate translation.
+///
+/// `server_resolves` is whether the origin server advertises
+/// `codeAction/resolve`: it decides whether a no-edit/no-command action with
+/// no `data` is a resolvable lazy action (LSP 3.18 allows a title-only lazy
+/// action) or a no-op to drop.
 pub(crate) fn bridge_code_actions(
     actions: Vec<CodeActionOrCommand>,
     server_name: &str,
     upstream_caps: UpstreamCodeActionCaps,
+    server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
 ) -> Vec<CodeActionOrCommand> {
     actions
         .into_iter()
-        .filter_map(|item| bridge_code_action(item, server_name, upstream_caps, virt))
+        .filter_map(|item| {
+            bridge_code_action(item, server_name, upstream_caps, server_resolves, virt)
+        })
         .collect()
 }
 
 const REASON_COMMANDS: &str = "kakehashi does not bridge command execution yet";
-const REASON_RESOLVE: &str = "kakehashi does not bridge codeAction/resolve yet";
+const REASON_RESOLVE: &str = "this action could not be resolved to an applicable edit";
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
 
 fn bridge_code_action(
     item: CodeActionOrCommand,
     server_name: &str,
     upstream_caps: UpstreamCodeActionCaps,
+    server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
 ) -> Option<CodeActionOrCommand> {
     let mut action = match item {
@@ -311,33 +963,80 @@ fn bridge_code_action(
 
     match &mut action.edit {
         Some(edit) => {
+            // Virt layer: translate host-ward with resolve-grade validation
+            // (the same check the client-driven resolve path uses), so an
+            // edit touching another region — including an eager-resolved lazy
+            // action's edit, which flows through here — is disabled, never
+            // partially applied.
             if let Some(virt) = virt
-                && !transform_workspace_edit_to_host(
+                && !translate_edit_host_ward_strict(
                     edit,
                     virt.request_virtual_uri,
                     virt.host_uri,
                     virt.offset,
+                    virt.region_end,
                 )
             {
                 return disable_action(action, REASON_CROSS_REGION, server_name, upstream_caps);
             }
         }
         None => {
-            // No edit, no command: a lazy action that needs codeAction/resolve
-            // (its payload hides behind `data`). We don't advertise resolve
-            // yet, so it can never be completed.
-            if action.data.is_some() {
+            // No edit, no command: is this a lazy (resolve-deferred) action?
+            //
+            // Virt layer: the *bridge* issues the `codeAction/resolve`, so the
+            // origin server must advertise `resolveProvider` — `data` alone
+            // doesn't make it lazy (the bridge could never complete it), and
+            // LSP 3.18 allows a lazy action to be title-only, so the server's
+            // capability is the deciding factor.
+            //
+            // Host layer (`virt` is None): resolve is NOT bridged, so the
+            // bridge can't issue a resolve regardless of the server's
+            // capability. A `data`-carrying action is still a lazy action the
+            // server intends to be resolved — surface it as a `REASON_RESOLVE`
+            // disabled placeholder (the PR 3 behavior) rather than dropping it,
+            // so `disabledSupport` clients see why it can't run.
+            //
+            // Deliberate scope boundary: `data` presence is an intrinsic lazy
+            // signal needing no capability plumbing, so it is the host gate.
+            // Recognizing a TITLE-ONLY host lazy action (LSP 3.18) would require
+            // threading the host server's `resolveProvider` through
+            // `send_host_raw_request` — but the resulting placeholder could
+            // never be resolved (host resolve is unbridged), so it would be pure
+            // menu clutter. This matches PR 3 exactly (its `data.is_some() ||
+            // server_resolves` gate also dropped title-only host lazy actions)
+            // and is deferred alongside host-layer resolve support, not a
+            // regression.
+            let is_lazy = match virt {
+                Some(_) => server_resolves,
+                None => action.data.is_some(),
+            };
+            if is_lazy {
+                // Envelope it (virt layer) if the client can resolve the edit,
+                // so a later `codeAction/resolve` routes back to the origin;
+                // otherwise it can never be completed — disable it (an
+                // eager-resolve pass already ran for non-envelope clients).
+                if let Some(virt) = virt.filter(|_| upstream_caps.can_envelope()) {
+                    envelope_action_data(&mut action, &virt.envelope_ctx());
+                    action.title = suffix_title(action.title, server_name);
+                    return Some(CodeActionOrCommand::CodeAction(action));
+                }
                 return disable_action(action, REASON_RESOLVE, server_name, upstream_caps);
             }
-            // No edit, no command, no data, not server-disabled: selecting it
-            // would do nothing — drop it rather than clutter the menu.
+            // Nothing actionable (no edit, no command, and either no `data` or a
+            // non-resolving virt origin): selecting it would do nothing — drop
+            // it rather than clutter the menu.
             return None;
         }
     }
 
-    // The bridge can't answer codeAction/resolve yet, and untranslated
-    // `data` can embed virtual URIs/coordinates — strip it on the kept path
-    // too (PR 4's envelope replaces this).
+    // Kept edit-carrying action: strip its `data`. We deliberately do NOT
+    // envelope an edit-carrying action for resolve — its `edit` has already
+    // been translated to host coordinates, and forwarding a later
+    // `codeAction/resolve` would send that host-coordinate edit back to a
+    // server that produced virtual coordinates (there is no inverse edit
+    // transform). The edit is the payload; resolving supplementary fields on
+    // an already-complete action is not supported. Untranslated `data` can
+    // also embed virtual URIs, so it must not leak.
     action.data = None;
     action.title = suffix_title(action.title, server_name);
     Some(CodeActionOrCommand::CodeAction(action))
@@ -346,6 +1045,71 @@ fn bridge_code_action(
 /// `"{title} — {server}"`: applied to every bridged action, unconditionally.
 fn suffix_title(title: String, server_name: &str) -> String {
     format!("{title} — {server_name}")
+}
+
+/// Re-apply the `"— {server}"` suffix after a `codeAction/resolve` round-trip.
+/// The server normally echoes the original (restored) title back, but LSP lets
+/// it change the title during resolve — keep that change and re-suffix it.
+/// Fall back to the pre-resolve suffixed title only if the server cleared the
+/// title entirely (a suffix-only `"— {server}"` would be meaningless).
+fn resuffix_resolved_title(
+    server_title: String,
+    suffixed_fallback: String,
+    server_name: &str,
+) -> String {
+    if server_title.is_empty() {
+        suffixed_fallback
+    } else {
+        suffix_title(server_title, server_name)
+    }
+}
+
+/// A resolved edit that cannot be represented in the host document
+/// (cross-region, a virtual-URI file op, or an empty edit) is a PERMANENT
+/// failure — re-requesting the resolve yields the identical result. Unlike the
+/// TRANSIENT fail-softs (stale region, connect/send errors, where the client
+/// re-requests and the window is short), the honest outcome here is to disable
+/// the action with a reason, mirroring the initial codeAction path's
+/// `REASON_CROSS_REGION` disable — otherwise the client shows an enabled action
+/// that applies nothing.
+///
+/// `resolved` is the resolve RESPONSE (carrying the unusable edit plus any
+/// server-provided title change and already-host-translated diagnostics);
+/// `original` is the pre-resolve action (its `data` holds the inner payload,
+/// and it carries no edit). The disabled outcome is built from `resolved` so
+/// the user sees the server's most accurate title/diagnostics; only a client
+/// without `disabledSupport` (which can't render a disabled action, and resolve
+/// must return a `CodeAction` — it can't drop like the initial path) falls back
+/// to the unresolved-with-envelope `original`, which must never carry the
+/// untranslatable edit.
+fn resolve_untranslatable_edit(
+    mut resolved: CodeAction,
+    mut original: CodeAction,
+    envelope: &CodeActionEnvelope,
+    suffixed_title: String,
+    server_name: &str,
+    upstream_caps: UpstreamCodeActionCaps,
+) -> CodeAction {
+    if !upstream_caps.disabled_support {
+        re_envelope_action(&mut original, envelope);
+        return original;
+    }
+    // Disable the RESOLVED action: keep its (resuffixed) title and its
+    // already-host-translated diagnostics — both retrieved successfully — and
+    // strip only the unusable payload. Mirrors the server-`disabled` branch.
+    resolved.title = resuffix_resolved_title(
+        std::mem::take(&mut resolved.title),
+        suffixed_title,
+        server_name,
+    );
+    resolved.edit = None;
+    resolved.command = None;
+    resolved.data = None;
+    resolved.is_preferred = None;
+    resolved.disabled = Some(CodeActionDisabled {
+        reason: REASON_CROSS_REGION.to_string(),
+    });
+    resolved
 }
 
 /// Turn an action the bridge cannot execute into a `disabled` entry: the
@@ -624,27 +1388,82 @@ mod tests {
     // Response transform
     // ==========================================================================
 
+    /// Caps WITHOUT data/resolve support: lazy actions are disabled and kept
+    /// actions have their `data` stripped (no routing envelope).
     fn caps(disabled_support: bool) -> UpstreamCodeActionCaps {
         UpstreamCodeActionCaps {
             disabled_support,
             is_preferred_support: true,
+            data_support: false,
+            resolve_edit_support: false,
         }
     }
 
+    /// Caps WITH data + resolve support: actions carrying `data` are kept and
+    /// wrapped in the routing envelope.
+    fn caps_resolve() -> UpstreamCodeActionCaps {
+        UpstreamCodeActionCaps {
+            disabled_support: true,
+            is_preferred_support: true,
+            data_support: true,
+            resolve_edit_support: true,
+        }
+    }
+
+    /// The full sync response transform (parse + bridge policy), matching the
+    /// production virt-layer path minus the async eager-resolve step.
+    /// Assumes the origin server does NOT advertise resolve (title-only lazy
+    /// actions drop); use [`transform_server_resolves`] for the resolve case.
     fn transform(
         result: serde_json::Value,
         upstream_caps: UpstreamCodeActionCaps,
     ) -> Option<CodeActionResponse> {
-        let virtual_uri = make_virtual_uri_string();
+        transform_impl(result, upstream_caps, false)
+    }
+
+    /// Like [`transform`] but with the origin server advertising resolve, so a
+    /// title-only action is a resolvable lazy action rather than a no-op.
+    fn transform_server_resolves(
+        result: serde_json::Value,
+        upstream_caps: UpstreamCodeActionCaps,
+    ) -> Option<CodeActionResponse> {
+        transform_impl(result, upstream_caps, true)
+    }
+
+    fn transform_impl(
+        result: serde_json::Value,
+        upstream_caps: UpstreamCodeActionCaps,
+        server_resolves: bool,
+    ) -> Option<CodeActionResponse> {
         let host_uri = make_host_uri();
-        transform_code_action_response_to_host(
-            json!({"jsonrpc": "2.0", "id": 42, "result": result}),
-            &virtual_uri,
-            &host_uri,
-            &RegionOffset::new(10, 0),
+        let virtual_uri = make_virtual_uri_string();
+        let offset = RegionOffset::new(10, 0);
+        let actions = parse_code_action_response_raw(json!({
+            "jsonrpc": "2.0", "id": 42, "result": result
+        }))?;
+        let virt = VirtLayerContext {
+            request_virtual_uri: &virtual_uri,
+            host_uri: &host_uri,
+            offset: &offset,
+            // Generous end: these tests exercise the envelope/title/cross-region
+            // policy, not the region-bounds guard (which has its own test), so
+            // the region-end must not reject their in-region edits.
+            region_end: Position {
+                line: u32::MAX,
+                character: u32::MAX,
+            },
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            injection_language: "lua",
+            host_uri_string: "file:///test.md",
+            server_name: "ruff",
+        };
+        Some(bridge_code_actions(
+            actions,
             "ruff",
             upstream_caps,
-        )
+            server_resolves,
+            Some(&virt),
+        ))
     }
 
     fn edit_carrying_action(title: &str) -> serde_json::Value {
@@ -776,7 +1595,9 @@ mod tests {
 
     #[test]
     fn lazy_data_only_action_is_disabled() {
-        let actions = transform(
+        // Server resolves but the client can't envelope (no data/resolve
+        // support); the sync path disables it (eager-resolve covers prod).
+        let actions = transform_server_resolves(
             json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
             caps(true),
         )
@@ -799,7 +1620,9 @@ mod tests {
         assert!(action.edit.is_some(), "edit must survive");
         assert!(
             action.data.is_none(),
-            "untranslated data must not leak until the PR 4 envelope exists"
+            "for a client without data/resolve support the untranslated data \
+             is stripped (the routing envelope is only added for envelope-capable \
+             clients — see edit_carrying_action_with_data_is_enveloped_not_stripped)"
         );
     }
 
@@ -810,6 +1633,8 @@ mod tests {
         let no_pref = UpstreamCodeActionCaps {
             disabled_support: true,
             is_preferred_support: false,
+            data_support: false,
+            resolve_edit_support: false,
         };
         let actions = transform(json!([action.clone()]), no_pref).unwrap();
         let CodeActionOrCommand::CodeAction(bridged) = &actions[0] else {
@@ -964,7 +1789,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let bridged = bridge_code_actions(actions, "marksman", caps(true), None);
+        let bridged = bridge_code_actions(actions, "marksman", caps(true), false, None);
         assert_eq!(bridged.len(), 2);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
@@ -980,5 +1805,391 @@ mod tests {
             placeholder.disabled.as_ref().unwrap().reason,
             REASON_COMMANDS
         );
+    }
+
+    // ==========================================================================
+    // PR 4: envelope + codeAction/resolve
+    // ==========================================================================
+
+    #[test]
+    fn lazy_action_is_enveloped_for_resolve_capable_client() {
+        // With data+resolve support (client) AND a resolve-capable server, a
+        // lazy (data-only) action is kept and its `data` wrapped in the
+        // routing envelope instead of being disabled.
+        let actions = transform_server_resolves(
+            json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
+            caps_resolve(),
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert!(action.disabled.is_none(), "lazy action must be kept");
+        assert_eq!(action.title, "Lazy fix — ruff", "suffix still applies");
+        let envelope = extract_code_action_envelope(action).expect("envelope present");
+        assert_eq!(envelope.origin, "ruff");
+        assert_eq!(envelope.region_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(envelope.injection_language, "lua");
+        assert_eq!(
+            envelope.original_title, "Lazy fix",
+            "the UNSUFFIXED title is stored for resolve-time restore"
+        );
+        assert_eq!(envelope.inner, Some(json!({ "id": 7 })));
+        assert_eq!(envelope.offset.line, 10);
+    }
+
+    #[test]
+    fn title_only_action_is_lazy_when_server_resolves() {
+        // LSP 3.18: a lazy action may be title-only (no data) when the origin
+        // server advertises resolve — it must be enveloped, not dropped.
+        let actions = transform_server_resolves(
+            json!([{ "title": "Lazy organize imports" }]),
+            caps_resolve(),
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction, got: {actions:?}");
+        };
+        let envelope = extract_code_action_envelope(action).expect("envelope present");
+        assert_eq!(envelope.origin, "ruff");
+        assert_eq!(
+            envelope.inner, None,
+            "a title-only action has no inner data"
+        );
+        assert_eq!(envelope.original_title, "Lazy organize imports");
+    }
+
+    #[test]
+    fn title_only_action_is_dropped_when_server_cannot_resolve() {
+        // Same shape, but the server does NOT advertise resolve → the action
+        // is a no-op and must be dropped, not enveloped.
+        let actions = transform(json!([{ "title": "Ghost" }]), caps_resolve()).unwrap();
+        assert!(actions.is_empty(), "got: {actions:?}");
+    }
+
+    #[test]
+    fn data_only_action_dropped_when_server_cannot_resolve() {
+        // A data-carrying action from a server that does NOT advertise resolve
+        // can never be resolved (data is only the resolve round-trip payload),
+        // so it must be dropped, not enveloped forever.
+        let actions = transform(
+            json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
+            caps_resolve(),
+        )
+        .unwrap();
+        assert!(actions.is_empty(), "got: {actions:?}");
+    }
+
+    #[test]
+    fn workspace_edit_is_empty_detects_no_edits() {
+        assert!(workspace_edit_is_empty(&WorkspaceEdit::default()));
+        assert!(workspace_edit_is_empty(&WorkspaceEdit {
+            changes: Some(Default::default()),
+            ..Default::default()
+        }));
+        // A changes map whose only value is an empty TextEdit[] is still empty.
+        let vacuous: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": { "file:///x.lua": [] }
+        }))
+        .unwrap();
+        assert!(
+            workspace_edit_is_empty(&vacuous),
+            "a changes map of empty edit vectors is a no-op"
+        );
+        // A non-empty changes map is not empty.
+        let edit: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": { "file:///x.lua": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "newText": "y"
+            }] }
+        }))
+        .unwrap();
+        assert!(!workspace_edit_is_empty(&edit));
+    }
+
+    #[test]
+    fn workspace_edit_touches_foreign_region_detects_other_virtual_uris() {
+        let host_uri = make_host_uri();
+        let own = VirtualDocumentUri::new(&host_uri, "lua", "region-0").to_uri_string();
+        let other = VirtualDocumentUri::new(&host_uri, "lua", "region-1").to_uri_string();
+
+        // Own region + a real file: not foreign.
+        let clean: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": {
+                own.clone(): [{ "range": {"start": {"line":0,"character":0}, "end": {"line":0,"character":1}}, "newText": "y" }],
+                "file:///real.lua": []
+            }
+        }))
+        .unwrap();
+        assert!(!workspace_edit_touches_foreign_region(&clean, &own));
+
+        // A different region's virtual URI carrying a REAL edit is foreign.
+        let cross: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": {
+                own.clone(): [],
+                other.clone(): [{ "range": {"start": {"line":0,"character":0}, "end": {"line":0,"character":1}}, "newText": "z" }]
+            }
+        }))
+        .unwrap();
+        assert!(workspace_edit_touches_foreign_region(&cross, &own));
+
+        // A foreign key carrying ZERO edits is a vacuous no-op — the transform
+        // strips it cleanly — so a mix of a real own-region edit and an EMPTY
+        // foreign entry is NOT cross-region (the action must not be rejected).
+        let mixed: WorkspaceEdit = serde_json::from_value(json!({
+            "changes": {
+                own.clone(): [{ "range": {"start": {"line":0,"character":0}, "end": {"line":0,"character":1}}, "newText": "y" }],
+                other: []
+            }
+        }))
+        .unwrap();
+        assert!(!workspace_edit_touches_foreign_region(&mixed, &own));
+    }
+
+    #[test]
+    fn lazy_action_not_enveloped_when_resolve_support_lacks_edit() {
+        // dataSupport is on but resolveSupport does NOT advertise "edit" — the
+        // client cannot materialize the edit lazily, so the action must not be
+        // handed out enveloped; it's disabled (an eager-resolve pass covers the
+        // real request path).
+        let no_edit_resolve = UpstreamCodeActionCaps {
+            disabled_support: true,
+            is_preferred_support: true,
+            data_support: true,
+            resolve_edit_support: false,
+        };
+        let actions = transform_server_resolves(
+            json!([{ "title": "Lazy fix", "data": { "id": 7 } }]),
+            no_edit_resolve,
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            action.disabled.as_ref().unwrap().reason,
+            REASON_RESOLVE,
+            "a client that can't resolve `edit` must not receive an envelope"
+        );
+    }
+
+    #[test]
+    fn edit_carrying_action_with_data_is_stripped_not_enveloped() {
+        // An edit+data action keeps the host-translated edit but has its data
+        // STRIPPED, never enveloped: the edit is already complete, and
+        // forwarding a resolve would send the host-coordinate edit back to a
+        // server expecting virtual coordinates (no inverse edit transform).
+        let mut action = edit_carrying_action("Fix");
+        action["data"] = json!({ "server": "state" });
+        let actions = transform(json!([action]), caps_resolve()).unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        assert_eq!(
+            changes.get(&make_host_uri()).unwrap()[0].range.start.line,
+            10,
+            "edit still host-translated"
+        );
+        assert!(
+            action.data.is_none(),
+            "an edit-carrying action's data must be stripped, not enveloped: {action:?}"
+        );
+    }
+
+    #[test]
+    fn dataless_action_is_not_enveloped() {
+        // An edit-only action has nothing to resolve; no envelope is attached.
+        let actions = transform(json!([edit_carrying_action("Fix")]), caps_resolve()).unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert!(
+            action.data.is_none(),
+            "an action with no data needs no routing envelope"
+        );
+    }
+
+    // -- envelope round-trip -------------------------------------------------
+
+    fn envelope_ctx_for_test<'a>(offset: &'a RegionOffset) -> CodeActionEnvelopeContext<'a> {
+        CodeActionEnvelopeContext {
+            server_name: "ruff",
+            host_uri: "file:///test.md",
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            injection_language: "lua",
+            offset,
+        }
+    }
+
+    #[test]
+    fn strip_restores_data_and_captures_original_title() {
+        let offset = RegionOffset::new(3, 0);
+        let mut action = CodeAction {
+            title: "Organize imports".to_string(),
+            data: Some(json!({ "kind": "organize" })),
+            ..CodeAction::default()
+        };
+        envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
+        // Suffix happens after enveloping in production; simulate it.
+        action.title = suffix_title(action.title, "ruff");
+
+        let envelope = strip_code_action_envelope(&mut action).expect("envelope present");
+        assert_eq!(
+            action.data,
+            Some(json!({ "kind": "organize" })),
+            "strip restores the downstream's original data"
+        );
+        assert_eq!(
+            envelope.original_title, "Organize imports",
+            "the pre-suffix title is preserved for downstream title matching"
+        );
+        // strip moves `inner` back into `action.data` (asserted above), so the
+        // returned envelope's own `inner` is drained — matching the code_lens
+        // strip contract.
+        assert_eq!(envelope.inner, None);
+    }
+
+    #[test]
+    fn re_envelope_round_trips_after_strip() {
+        let offset = RegionOffset::new(3, 0);
+        let mut action = CodeAction {
+            title: "Fix".to_string(),
+            data: Some(json!({ "id": 1 })),
+            ..CodeAction::default()
+        };
+        envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
+        // The full envelope before the round-trip; strip drains inner into
+        // action.data and re_envelope must restore every field identically.
+        let original = extract_code_action_envelope(&action).expect("enveloped");
+        let envelope = strip_code_action_envelope(&mut action).expect("envelope");
+        re_envelope_action(&mut action, &envelope);
+        let extracted = extract_code_action_envelope(&action).expect("re-enveloped");
+        assert_eq!(
+            extracted, original,
+            "re-envelope must preserve EVERY field (a dropped field would leak here)"
+        );
+    }
+
+    #[test]
+    fn strip_leaves_non_envelope_data_intact() {
+        // The mutating strip must not touch a non-envelope `data` (mirrors the
+        // code_lens strip contract); only `extract`/`dispatch` cover it otherwise.
+        let mut action = CodeAction {
+            title: "x".to_string(),
+            data: Some(json!({ "custom": true })),
+            ..CodeAction::default()
+        };
+        assert!(strip_code_action_envelope(&mut action).is_none());
+        assert_eq!(
+            action.data,
+            Some(json!({ "custom": true })),
+            "non-envelope data must survive a strip attempt untouched"
+        );
+    }
+
+    #[test]
+    fn extract_returns_none_for_non_envelope_data() {
+        let action = CodeAction {
+            title: "x".to_string(),
+            data: Some(json!({ "custom": true })),
+            ..CodeAction::default()
+        };
+        assert!(extract_code_action_envelope(&action).is_none());
+    }
+
+    // -- resolve response parsing --------------------------------------------
+
+    #[test]
+    fn parse_resolve_response_happy_path() {
+        let response = json!({
+            "jsonrpc": "2.0", "id": 7,
+            "result": { "title": "Fix", "edit": { "changes": {} } }
+        });
+        let action = parse_code_action_resolve_response(response).expect("parsed");
+        assert_eq!(action.title, "Fix");
+        assert!(action.edit.is_some());
+    }
+
+    #[test]
+    fn parse_resolve_response_none_for_invalid() {
+        for response in [
+            json!({ "jsonrpc": "2.0", "id": 7, "result": null }),
+            json!({ "jsonrpc": "2.0", "id": 7 }),
+            json!({ "jsonrpc": "2.0", "id": 7, "error": { "code": -1, "message": "x" } }),
+        ] {
+            assert!(parse_code_action_resolve_response(response).is_none());
+        }
+    }
+
+    #[test]
+    fn outgoing_resolve_translates_diagnostics_to_virtual() {
+        // Before forwarding a resolve, host-space diagnostic ranges are pulled
+        // back to virtual coordinates so the downstream matches its own.
+        let offset = RegionOffset::new(10, 0);
+        let mut action = CodeAction {
+            title: "Fix".to_string(),
+            diagnostics: Some(vec![tower_lsp_server::ls_types::Diagnostic {
+                range: range(12, 12),
+                ..Default::default()
+            }]),
+            ..CodeAction::default()
+        };
+        translate_action_ranges_host_to_virtual(&mut action, &offset);
+        assert_eq!(
+            action.diagnostics.unwrap()[0].range.start.line,
+            2,
+            "12 - region offset 10"
+        );
+    }
+
+    // -- dispatch fail-soft ---------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_returns_non_envelope_action_unchanged() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let settings = WorkspaceSettings::default();
+        let action = CodeAction {
+            title: "x".to_string(),
+            data: Some(json!({ "custom": true })),
+            ..CodeAction::default()
+        };
+        let result = pool
+            .dispatch_code_action_resolve(
+                action.clone(),
+                &settings,
+                caps_resolve(),
+                None,
+                Position::default(),
+            )
+            .await;
+        assert_eq!(result.data, Some(json!({ "custom": true })));
+    }
+
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_server_not_configured() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let settings = WorkspaceSettings::default();
+        let offset = RegionOffset::new(3, 0);
+        let mut action = CodeAction {
+            title: "Fix".to_string(),
+            data: Some(json!({ "id": 1 })),
+            ..CodeAction::default()
+        };
+        envelope_action_data(&mut action, &envelope_ctx_for_test(&offset));
+
+        let result = pool
+            .dispatch_code_action_resolve(
+                action,
+                &settings,
+                caps_resolve(),
+                None,
+                Position::default(),
+            )
+            .await;
+        let envelope = extract_code_action_envelope(&result).expect("envelope restored");
+        assert_eq!(envelope.origin, "ruff");
+        assert_eq!(envelope.inner, Some(json!({ "id": 1 })));
+        assert!(result.edit.is_none(), "action stays unresolved");
     }
 }

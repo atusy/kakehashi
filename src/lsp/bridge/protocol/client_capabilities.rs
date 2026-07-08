@@ -17,8 +17,9 @@ fn build_baseline_capabilities(
     experimental: bool,
 ) -> ClientCapabilities {
     use tower_lsp_server::ls_types::{
-        CodeActionClientCapabilities, CodeActionKindLiteralSupport, CodeActionLiteralSupport,
-        CompletionClientCapabilities, CompletionItemCapability, DiagnosticClientCapabilities,
+        CodeActionCapabilityResolveSupport, CodeActionClientCapabilities,
+        CodeActionKindLiteralSupport, CodeActionLiteralSupport, CompletionClientCapabilities,
+        CompletionItemCapability, DiagnosticClientCapabilities,
         DiagnosticWorkspaceClientCapabilities, DocumentLinkClientCapabilities,
         DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities,
         GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
@@ -72,9 +73,10 @@ fn build_baseline_capabilities(
             ..Default::default()
         }),
         // Without codeActionLiteralSupport, older servers fall back to
-        // returning bare Commands only (issue #568). No dataSupport /
-        // resolveSupport yet: servers must return complete (edit-carrying)
-        // actions until codeAction/resolve is bridged.
+        // returning bare Commands only (issue #568). `dataSupport` +
+        // `resolveSupport(["edit"])` let lazy servers (rust-analyzer-style)
+        // return actions whose `edit` is filled in on `codeAction/resolve`
+        // (PR 4) — the bridge routes that resolve back to the origin server.
         code_action: Some(CodeActionClientCapabilities {
             dynamic_registration: Some(false),
             code_action_literal_support: Some(CodeActionLiteralSupport {
@@ -96,6 +98,10 @@ fn build_baseline_capabilities(
             }),
             is_preferred_support: Some(true),
             disabled_support: Some(true),
+            data_support: Some(true),
+            resolve_support: Some(CodeActionCapabilityResolveSupport {
+                properties: vec!["edit".to_string()],
+            }),
             ..Default::default()
         }),
         diagnostic: Some(DiagnosticClientCapabilities {

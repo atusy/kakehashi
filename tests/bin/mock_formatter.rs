@@ -161,6 +161,35 @@ fn main() {
                         "codeActionProvider": true,
                         "textDocumentSync": 1
                     }),
+                    // `code-action-lazy`: advertises resolveProvider and
+                    // returns one LAZY action (data only, no edit) whose edit
+                    // is materialized on codeAction/resolve — the
+                    // rust-analyzer shape that motivates PR 4 (#568).
+                    // `code-action-lazy-cmd` is like `code-action-lazy` but its
+                    // resolve materializes a COMMAND (not an edit) — the bridge
+                    // must fail soft (command execution is unbridged), never
+                    // handing the command to the editor.
+                    // `code-action-lazy-retitle` is like `code-action-lazy` but
+                    // its resolve returns a CHANGED title (LSP lets a server
+                    // rewrite the title on resolve) — the bridge must surface
+                    // the server's new title (re-suffixed), not the pre-resolve
+                    // one.
+                    // `code-action-lazy-multistep`: the first resolve returns NO
+                    // edit but a CHANGED title (still lazy); the second resolve
+                    // materializes the edit. Proves the bridge carries the
+                    // server-changed title into the routing envelope so a
+                    // match-by-title server sees the title it last advertised.
+                    "code-action-lazy"
+                    | "code-action-lazy-cmd"
+                    | "code-action-lazy-retitle"
+                    | "code-action-lazy-multistep"
+                    | "code-action-lazy-fileop"
+                    | "code-action-lazy-oob" => {
+                        json!({
+                            "codeActionProvider": { "resolveProvider": true },
+                            "textDocumentSync": 1
+                        })
+                    }
                     // `diagnostics-push-pullcap` is BOTH: it advertises
                     // `diagnosticProvider` (pull-driven) AND pushes on didOpen
                     // (below). Used to prove `pullFallback = false` still
@@ -463,39 +492,233 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/codeAction" => {
-                // `code-action` mode: one edit-carrying quickfix (an edit on
-                // the requested document at virtual line 0) plus one bare
-                // Command action (not executable until executeCommand is
-                // bridged — must surface as disabled/dropped, never verbatim).
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
-                    .map(|uri| {
-                        json!([
-                            {
-                                "title": "Replace with fixed",
-                                "kind": "quickfix",
-                                "edit": {
-                                    "changes": {
-                                        uri: [{
-                                            "range": {
-                                                "start": { "line": 0, "character": 0 },
-                                                "end": { "line": 0, "character": 5 }
-                                            },
-                                            "newText": "fixed"
-                                        }]
+                    .map(|_uri| {
+                        if mode == "code-action-lazy"
+                            || mode == "code-action-lazy-cmd"
+                            || mode == "code-action-lazy-retitle"
+                            || mode == "code-action-lazy-multistep"
+                            || mode == "code-action-lazy-fileop"
+                            || mode == "code-action-lazy-oob"
+                        {
+                            // One LAZY action: data only, no edit. The payload is
+                            // materialized on codeAction/resolve (below).
+                            json!([{
+                                "title": "Lazy organize imports",
+                                "kind": "source.organizeImports",
+                                "data": { "mock": "lazy-1" }
+                            }])
+                        } else {
+                            // `code-action` mode: one edit-carrying quickfix (an
+                            // edit on the requested document at virtual line 0)
+                            // plus one bare Command action (not executable until
+                            // executeCommand is bridged — must surface as
+                            // disabled/dropped, never verbatim).
+                            json!([
+                                {
+                                    "title": "Replace with fixed",
+                                    "kind": "quickfix",
+                                    "edit": {
+                                        "changes": {
+                                            _uri: [{
+                                                "range": {
+                                                    "start": { "line": 0, "character": 0 },
+                                                    "end": { "line": 0, "character": 5 }
+                                                },
+                                                "newText": "fixed"
+                                            }]
+                                        }
                                     }
+                                },
+                                {
+                                    "title": "Run mock command",
+                                    "command": "mock.run"
                                 }
-                            },
-                            {
-                                "title": "Run mock command",
-                                "command": "mock.run"
-                            }
-                        ])
+                            ])
+                        }
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+            }
+            "codeAction/resolve" => {
+                // Materialize the lazy action's edit, echoing the original
+                // (unsuffixed) title and data back so the test can prove the
+                // bridge restored the title and round-tripped the data. The
+                // edit targets virtual line 0 of the region the action came
+                // from — the bridge re-keys it to the host document.
+                let title = message
+                    .pointer("/params/title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Lazy organize imports")
+                    .to_string();
+                let data = message
+                    .pointer("/params/data")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                // Resolve against the virtual document the action came from —
+                // the mock received its URI via didOpen (single-doc tests).
+                let target_uri = documents.keys().next().cloned().unwrap_or_default();
+                if mode == "code-action-lazy-cmd" {
+                    // Resolve to a COMMAND instead of an edit: command execution
+                    // is unbridged, so the bridge must fail soft and never hand
+                    // this command to the editor.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": title,
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "command": { "title": "Run it", "command": "mock.run" }
+                        }),
+                    );
+                    continue;
+                }
+                if mode == "code-action-lazy-fileop" {
+                    // Resolve to a CreateFile operation on the action's own
+                    // VIRTUAL document URI. A virtual-URI file op cannot be
+                    // represented in the host document, so the bridge must
+                    // disable the action (with disabledSupport) rather than
+                    // return an enabled action that applies nothing. ALSO change
+                    // the title and attach a diagnostic (virtual line 0): the
+                    // disabled outcome must carry the server's most accurate
+                    // title (re-suffixed) and its host-translated diagnostics,
+                    // not the pre-resolve action's.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": format!("{title} (fileop)"),
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "diagnostics": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 5 }
+                                },
+                                "message": "fileop diag"
+                            }],
+                            "edit": {
+                                "documentChanges": [
+                                    { "kind": "create", "uri": target_uri }
+                                ]
+                            }
+                        }),
+                    );
+                    continue;
+                }
+                if mode == "code-action-lazy-oob" {
+                    // Resolve to an edit whose range runs PAST the injected
+                    // region (virtual line 5, while the lua fence has a single
+                    // content line). Translating it by the region offset lands
+                    // in host text after the fence — buffer corruption — so the
+                    // bridge must reject it (disable), not forward it.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": title,
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "edit": {
+                                "changes": {
+                                    target_uri: [{
+                                        "range": {
+                                            "start": { "line": 5, "character": 0 },
+                                            "end": { "line": 5, "character": 3 }
+                                        },
+                                        "newText": "oops"
+                                    }]
+                                }
+                            }
+                        }),
+                    );
+                    continue;
+                }
+                if mode == "code-action-lazy-multistep" {
+                    // Two-step resolve. The mock distinguishes the steps by
+                    // whether the received title already carries the "(step2)"
+                    // marker — which the bridge only forwards if it tracked the
+                    // server-changed title into the routing envelope on step 1.
+                    if !title.contains("(step2)") {
+                        // Step 1: stay lazy (no edit), change the title, keep the
+                        // data so the bridge re-envelopes for a second resolve.
+                        respond(
+                            &mut writer,
+                            id,
+                            json!({
+                                "title": format!("{title} (step2)"),
+                                "kind": "source.organizeImports",
+                                "data": data
+                            }),
+                        );
+                        continue;
+                    }
+                    // Step 2: the received title carries "(step2)", proving the
+                    // bridge forwarded the tracked title — materialize the edit.
+                    // If the bridge had dropped the tracked title, this branch is
+                    // never reached and the action stays lazy forever.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": title,
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "edit": {
+                                "changes": {
+                                    target_uri: [{
+                                        "range": {
+                                            "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 5 }
+                                        },
+                                        "newText": format!("organized:{title}")
+                                    }]
+                                }
+                            }
+                        }),
+                    );
+                    continue;
+                }
+                // `code-action-lazy-retitle`: return a title DIFFERENT from the
+                // one received. LSP lets a server rewrite the title on resolve;
+                // the bridge must surface this new title (re-suffixed), not the
+                // pre-resolve title it remembered. The discriminating test
+                // asserts the client sees the changed title.
+                let response_title = if mode == "code-action-lazy-retitle" {
+                    format!("{title} (resolved)")
+                } else {
+                    title.clone()
+                };
+                // Embed the RECEIVED title in the edit's newText: the bridge
+                // re-suffixes the response title (overwriting our echo), but it
+                // never rewrites newText, so this is the only place the test can
+                // observe which title actually reached the server. If the bridge
+                // failed to restore the original (unsuffixed) title before
+                // forwarding, the mock would see "... — mock-codeaction" here.
+                respond(
+                    &mut writer,
+                    id,
+                    json!({
+                        "title": response_title,
+                        "kind": "source.organizeImports",
+                        "data": data,
+                        "edit": {
+                            "changes": {
+                                target_uri: [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 5 }
+                                    },
+                                    "newText": format!("organized:{title}")
+                                }]
+                            }
+                        }
+                    }),
+                );
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-fail" {

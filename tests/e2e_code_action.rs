@@ -1,14 +1,18 @@
-//! E2E tests for bridged `textDocument/codeAction` (#568, edit-carrying
-//! stage), using the `mock-lsp-formatter` test binary in `code-action` mode
-//! (one edit-carrying quickfix + one bare Command action).
+//! E2E tests for bridged `textDocument/codeAction` (#568), using the
+//! `mock-lsp-formatter` test binary in `code-action` mode (one edit-carrying
+//! quickfix + one bare Command action) and `code-action-lazy` mode (one
+//! resolve-only action).
 //!
 //! Proves end-to-end:
-//! - `codeActionProvider` is advertised upstream.
+//! - `codeActionProvider{resolveProvider}` is advertised upstream.
 //! - The request range is translated host→virtual, the returned edit is
 //!   re-keyed to the host URI with host-translated ranges, and the title
 //!   carries the `"{title} — {server}"` suffix.
 //! - A bare Command action surfaces as a disabled placeholder for a client
 //!   with `disabledSupport`, and is dropped for a client without it.
+//! - A lazy action is enveloped and resolved via `codeAction/resolve` for a
+//!   resolve-capable client, and eager-resolved downstream (edit inline) for a
+//!   client lacking resolve/data support (PR 4).
 
 #![cfg(feature = "e2e")]
 
@@ -24,6 +28,13 @@ fn mock_formatter_bin() -> &'static str {
 }
 
 fn init_client(client_capabilities: Value) -> (LspClient, Value, tempfile::TempDir) {
+    init_client_mode("code-action", client_capabilities)
+}
+
+fn init_client_mode(
+    mock_mode: &str,
+    client_capabilities: Value,
+) -> (LspClient, Value, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("code_action.toml");
@@ -42,7 +53,7 @@ fn init_client(client_capabilities: Value) -> (LspClient, Value, tempfile::TempD
             "capabilities": client_capabilities,
             "workspaceFolders": null,
             "initializationOptions": { "languageServers": {
-                "mock-codeaction": { "cmd": [bin, "code-action"], "languages": ["lua"] }
+                "mock-codeaction": { "cmd": [bin, mock_mode], "languages": ["lua"] }
             }}
         }),
     );
@@ -63,11 +74,23 @@ fn literal_support_caps(disabled_support: bool) -> Value {
     json!({ "textDocument": { "codeAction": code_action } })
 }
 
+/// Literal support PLUS dataSupport + resolveSupport — the client can hold a
+/// lazy action's routing envelope and issue codeAction/resolve (PR 4).
+fn resolve_support_caps() -> Value {
+    json!({ "textDocument": { "codeAction": {
+        "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [] } },
+        "disabledSupport": true,
+        "dataSupport": true,
+        "resolveSupport": { "properties": ["edit"] }
+    }}})
+}
+
 fn assert_advertised(init_response: &Value) {
+    // PR 4 advertises the Options form so `resolveProvider` can be declared.
     assert_eq!(
-        init_response["result"]["capabilities"]["codeActionProvider"],
+        init_response["result"]["capabilities"]["codeActionProvider"]["resolveProvider"],
         json!(true),
-        "codeActionProvider must be advertised for literal-support clients (#568)"
+        "codeActionProvider{{resolveProvider}} must be advertised for literal-support clients (#568)"
     );
 }
 
@@ -223,6 +246,347 @@ fn command_action_surfaces_as_disabled_with_disabled_support() {
     assert!(
         disabled[0]["command"].is_null() && disabled[0]["edit"].is_null(),
         "a disabled placeholder must not carry an executable payload"
+    );
+
+    shutdown(&mut client);
+}
+
+/// Issue codeAction over the lua fence line for the given client, retrying
+/// while the result is null OR an empty array (cold downstream still
+/// handshaking) until a non-empty action list arrives.
+fn code_action_over_fence(client: &mut LspClient) -> Vec<Value> {
+    for _ in 0..300 {
+        let response = client.send_request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": MARKDOWN_URI },
+                "range": {
+                    "start": { "line": 3, "character": 0 },
+                    "end": { "line": 3, "character": 5 }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        );
+        if let Some(actions) = response["result"].as_array()
+            && !actions.is_empty()
+        {
+            return actions.clone();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("textDocument/codeAction never returned actions");
+}
+
+#[test]
+fn resolve_fails_soft_when_envelope_offset_diverges_from_live() {
+    // The resolve path translates using the envelope's SNAPSHOT offset. If the
+    // live region offset has diverged (e.g. an interior blockquote-prefix edit
+    // changed a per-line column offset while the start held), translating with
+    // the stale offset would bind the edit to wrong host columns. The freshness
+    // gate re-resolves the live offset and compares the WHOLE thing, so a
+    // divergence must fail soft (action returned unresolved, envelope intact).
+    //
+    // Simulated by tampering the envelope's `line_column_offsets` to a vector
+    // that can't match the live single-line region (whose offset is `[0]`): a
+    // start-only freshness check would still pass it (same start line/column).
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    let mut tampered = actions[0].clone();
+    // Live region offset is `[0]`; make the snapshot offset diverge on an
+    // interior line the start-only check never looked at.
+    tampered["data"]["kakehashi"]["offset"]["line_column_offsets"] = json!([0, 99]);
+
+    let resolved = client.send_request("codeAction/resolve", tampered.clone());
+    let resolved = &resolved["result"];
+    assert!(
+        resolved["edit"].is_null(),
+        "a diverged snapshot offset must fail soft (no edit), got: {resolved:?}"
+    );
+    assert_eq!(
+        resolved["data"]["kakehashi"]["origin"], "mock-codeaction",
+        "the routing envelope is kept intact for a re-request, got: {resolved:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn lazy_action_is_resolved_via_code_action_resolve() {
+    // A resolve-capable client gets the lazy action back with a routing
+    // envelope; codeAction/resolve then materializes the edit, re-keyed to the
+    // host document with the suffix preserved.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+    assert_eq!(lazy["title"], "Lazy organize imports — mock-codeaction");
+    assert!(
+        lazy["edit"].is_null(),
+        "the action is still lazy (no edit yet), got: {lazy:?}"
+    );
+    // The routing envelope must be present under the kakehashi data key.
+    assert_eq!(lazy["data"]["kakehashi"]["origin"], "mock-codeaction");
+    assert_eq!(
+        lazy["data"]["kakehashi"]["original_title"], "Lazy organize imports",
+        "the unsuffixed title is stored for downstream title matching"
+    );
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    assert_eq!(
+        resolved["title"], "Lazy organize imports — mock-codeaction",
+        "the suffix is re-applied after resolve"
+    );
+    let edits = &resolved["edit"]["changes"][MARKDOWN_URI];
+    assert!(
+        edits.is_array(),
+        "the resolved edit must be re-keyed to the host URI, got: {resolved:?}"
+    );
+    // Virtual line 0 = host line 3 (fence content line).
+    assert_eq!(edits[0]["range"]["start"]["line"], 3);
+    // The mock embeds the title it RECEIVED into newText. The bridge must have
+    // restored the unsuffixed original before forwarding the resolve — if it
+    // forwarded the suffixed title, this would be "organized:... — mock-codeaction".
+    assert_eq!(edits[0]["newText"], "organized:Lazy organize imports");
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn lazy_action_resolve_surfaces_server_changed_title() {
+    // LSP lets a server rewrite the action title on codeAction/resolve. The
+    // bridge must surface that NEW title (re-suffixed), not the pre-resolve
+    // title it remembered for the suffix. This discriminates the fix: an
+    // echo-only mock would look identical under the buggy "reuse suffixed_title"
+    // path, so the mock deliberately returns a changed title here.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-retitle", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+    assert_eq!(lazy["title"], "Lazy organize imports — mock-codeaction");
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    // The server changed the title to "Lazy organize imports (resolved)"; the
+    // bridge must keep that change and re-suffix it — NOT fall back to the
+    // remembered pre-resolve "Lazy organize imports — mock-codeaction".
+    assert_eq!(
+        resolved["title"], "Lazy organize imports (resolved) — mock-codeaction",
+        "the server's resolve-time title change must be surfaced (re-suffixed)"
+    );
+    // The edit still materializes: the mock forwards the RECEIVED (unsuffixed)
+    // title into newText, proving the round-trip restored the original title.
+    let edits = &resolved["edit"]["changes"][MARKDOWN_URI];
+    assert_eq!(edits[0]["newText"], "organized:Lazy organize imports");
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn multistep_resolve_forwards_the_server_changed_title() {
+    // A still-lazy resolve (no edit) that CHANGES the title must carry the new
+    // title into the routing envelope, so a SECOND resolve forwards the title
+    // the server last advertised — the match-by-title contract. The mock's
+    // second resolve only materializes an edit when it receives the "(step2)"
+    // title; if the bridge dropped the tracked title, the action stays lazy
+    // forever and no edit ever appears.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-multistep", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+    assert_eq!(lazy["title"], "Lazy organize imports — mock-codeaction");
+
+    // First resolve: the server stays lazy (no edit) but renames the action.
+    let step1 = client.send_request("codeAction/resolve", lazy.clone());
+    let step1 = &step1["result"];
+    assert_eq!(
+        step1["title"], "Lazy organize imports (step2) — mock-codeaction",
+        "the server's step-1 title change must be surfaced"
+    );
+    assert!(
+        step1["edit"].is_null(),
+        "still lazy after step 1 (no edit yet), got: {step1:?}"
+    );
+    // The envelope must still be present so a second resolve routes back.
+    assert_eq!(step1["data"]["kakehashi"]["origin"], "mock-codeaction");
+    assert_eq!(
+        step1["data"]["kakehashi"]["original_title"], "Lazy organize imports (step2)",
+        "the envelope must track the server-changed title for the next resolve"
+    );
+
+    // Second resolve: the bridge must forward the tracked "(step2)" title, so
+    // the mock now materializes the edit.
+    let step2 = client.send_request("codeAction/resolve", step1.clone());
+    let step2 = &step2["result"];
+    let edits = &step2["edit"]["changes"][MARKDOWN_URI];
+    assert!(
+        edits.is_array(),
+        "the second resolve must materialize the edit — proves the tracked \
+         title reached the server, got: {step2:?}"
+    );
+    assert_eq!(
+        edits[0]["newText"],
+        "organized:Lazy organize imports (step2)"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn lazy_action_resolving_to_untranslatable_edit_is_disabled() {
+    // A lazy action that resolves to an edit the bridge cannot represent in the
+    // host document (here a virtual-URI file op) is a PERMANENT failure —
+    // re-requesting yields the same result. For a disabledSupport client the
+    // bridge must return it `disabled` with a reason, NOT an enabled action
+    // that applies nothing (checklist item 5; mirrors the initial path).
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-fileop", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    // The discriminating assertion: an enabled no-op and a disabled action are
+    // indistinguishable to a test that only checks "no edit", so assert on
+    // `disabled` + reason.
+    assert_eq!(
+        resolved["disabled"]["reason"], "the edit cannot be represented in the host document",
+        "an untranslatable resolved edit must surface disabled, got: {resolved:?}"
+    );
+    // The disabled outcome must reflect the RESOLVE RESPONSE, not the pre-resolve
+    // action: the server changed the title to "... (fileop)" and attached a
+    // diagnostic on virtual line 0 — both must survive on the disabled action
+    // (title re-suffixed, diagnostic host-translated to line 3).
+    assert_eq!(
+        resolved["title"], "Lazy organize imports (fileop) — mock-codeaction",
+        "the server's resolve-time title change must survive on the disabled action, got: {resolved:?}"
+    );
+    assert_eq!(
+        resolved["diagnostics"][0]["range"]["start"]["line"], 3,
+        "the resolve's host-translated diagnostics must survive on the disabled action, got: {resolved:?}"
+    );
+    assert!(
+        resolved["edit"].is_null(),
+        "the unusable edit must be stripped, got: {resolved:?}"
+    );
+    assert!(
+        resolved["data"].is_null(),
+        "a disabled action carries no routing envelope, got: {resolved:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn lazy_action_resolving_out_of_region_is_disabled() {
+    // A resolve whose edit range runs PAST the injected region would, once
+    // translated by the region offset, land in host text after the fence —
+    // buffer corruption. The bridge must bound the resolved edit to the region
+    // and disable it (disabledSupport), never forward an out-of-region edit.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-oob", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    assert_eq!(
+        resolved["disabled"]["reason"], "the edit cannot be represented in the host document",
+        "an out-of-region resolved edit must be disabled, not forwarded: {resolved:?}"
+    );
+    assert!(
+        resolved["edit"].is_null(),
+        "the out-of-region edit must be stripped, got: {resolved:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn lazy_action_is_eager_resolved_without_resolve_support() {
+    // A client WITHOUT resolveSupport/dataSupport cannot resolve a lazy
+    // action, so the bridge eager-resolves it downstream: the codeAction
+    // response already carries the materialized, host-translated edit.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy", literal_support_caps(false));
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "got: {actions:?}");
+    let action = &actions[0];
+    assert_eq!(action["title"], "Lazy organize imports — mock-codeaction");
+    let edits = &action["edit"]["changes"][MARKDOWN_URI];
+    assert!(
+        edits.is_array(),
+        "eager-resolve must materialize the edit inline, got: {action:?}"
+    );
+    assert_eq!(edits[0]["range"]["start"]["line"], 3);
+    // Eager-resolve forwards the raw (unsuffixed) title downstream; the mock
+    // echoes it into newText, proving the materialization came from the
+    // resolve round-trip with the correct title.
+    assert_eq!(edits[0]["newText"], "organized:Lazy organize imports");
+    assert!(
+        action["data"].is_null(),
+        "a client without dataSupport must not receive a routing envelope"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn lazy_action_resolving_to_command_fails_soft() {
+    // A lazy action whose resolve materializes a COMMAND (not an edit) must
+    // not hand that command to the editor — command execution is unbridged.
+    // The bridge fails soft: the resolved action comes back unresolved, with
+    // no command and its routing envelope intact.
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-cmd", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    assert_eq!(actions.len(), 1, "one lazy action, got: {actions:?}");
+    let lazy = &actions[0];
+    assert_eq!(lazy["data"]["kakehashi"]["origin"], "mock-codeaction");
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    assert!(
+        resolved["command"].is_null(),
+        "an unbridged command must never reach the editor, got: {resolved:?}"
+    );
+    assert!(
+        resolved["edit"].is_null(),
+        "the action stays unresolved (no edit), got: {resolved:?}"
+    );
+    assert_eq!(
+        resolved["data"]["kakehashi"]["origin"], "mock-codeaction",
+        "the routing envelope is preserved on the fail-soft path"
     );
 
     shutdown(&mut client);

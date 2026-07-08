@@ -113,7 +113,13 @@ expression: merged
         }
       },
       "isPreferredSupport": true,
-      "disabledSupport": true
+      "disabledSupport": true,
+      "dataSupport": true,
+      "resolveSupport": {
+        "properties": [
+          "edit"
+        ]
+      }
     },
     "documentLink": {
       "dynamicRegistration": false,
