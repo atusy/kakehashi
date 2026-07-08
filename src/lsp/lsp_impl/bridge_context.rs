@@ -1091,12 +1091,13 @@ impl Kakehashi {
     ) -> Option<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         self.resolve_first_region_overlapping_range(lsp_uri, range, method_name)
+            .await
     }
 
     /// Whole-document region scan behind
     /// [`Self::resolve_bridge_contexts_for_range_overlap`]; the tree is
     /// already fresh (the caller awaited it).
-    fn resolve_first_region_overlapping_range(
+    async fn resolve_first_region_overlapping_range(
         &self,
         lsp_uri: &Uri,
         range: Range,
@@ -1120,7 +1121,7 @@ impl Kakehashi {
         // wins: unconfigured injections (e.g. markdown_inline) must not
         // shadow a configured region further down the document.
         let mapper = PositionMapper::new(snapshot.text());
-        regions.into_iter().find_map(|resolved| {
+        for resolved in regions {
             let region_start = Position {
                 line: resolved.region.line_range.start,
                 character: resolved.region.start_column,
@@ -1129,9 +1130,11 @@ impl Kakehashi {
             // over-approximate a same-line inline injection through the end
             // of its line, matching ranges entirely after the injected
             // content and clamping to columns outside the virtual document.
-            let region_end = mapper.byte_to_position(resolved.region.byte_range.end)?;
+            let Some(region_end) = mapper.byte_to_position(resolved.region.byte_range.end) else {
+                continue;
+            };
             if !range_intersects_region(&range, region_start, region_end) {
-                return None;
+                continue;
             }
             // Clamp to the region so the translated range is in-region.
             let clamped = Range {
@@ -1145,12 +1148,20 @@ impl Kakehashi {
                 language_name: language_name.clone(),
                 upstream_request_id: current_upstream_id(),
             };
-            let document = self.preamble_to_document_context(preamble, method_name)?;
-            Some(RangeRequestContext {
+            // An intersecting region that resolves to no bridge config does not
+            // shadow a configured region further down: skip to the next.
+            let Some(document) = self
+                .preamble_to_document_context(preamble, method_name)
+                .await
+            else {
+                continue;
+            };
+            return Some(RangeRequestContext {
                 document,
                 range: clamped,
-            })
-        })
+            });
+        }
+        None
     }
 }
 
