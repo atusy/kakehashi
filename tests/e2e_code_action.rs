@@ -194,7 +194,11 @@ fn code_action_edit_is_host_translated_and_suffixed() {
         .expect("the executable command action");
     assert_eq!(command["title"], "Run mock command — mock-codeaction");
     assert!(
-        is_routed_command(command["command"].as_str().unwrap(), "mock-codeaction", "mock.run"),
+        is_routed_command(
+            command["command"].as_str().unwrap(),
+            "mock-codeaction",
+            "mock.run"
+        ),
         "command name must encode the origin server, got: {command:?}"
     );
 
@@ -284,7 +288,11 @@ fn command_action_surfaces_as_executable_with_a_routed_name() {
         "an executable command is not disabled, got: {command:?}"
     );
     assert!(
-        is_routed_command(command["command"].as_str().unwrap(), "mock-codeaction", "mock.run"),
+        is_routed_command(
+            command["command"].as_str().unwrap(),
+            "mock-codeaction",
+            "mock.run"
+        ),
         "command name must encode the origin server, got: {command:?}"
     );
 
