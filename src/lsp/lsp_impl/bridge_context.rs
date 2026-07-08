@@ -1122,24 +1122,10 @@ impl Kakehashi {
         // shadow a configured region further down the document.
         let mapper = PositionMapper::new(snapshot.text());
         for resolved in regions {
-            let region_start = Position {
-                line: resolved.region.line_range.start,
-                character: resolved.region.start_column,
-            };
-            // Byte-precise end: synthesizing (line_range.end, 0) would
-            // over-approximate a same-line inline injection through the end
-            // of its line, matching ranges entirely after the injected
-            // content and clamping to columns outside the virtual document.
-            let Some(region_end) = mapper.byte_to_position(resolved.region.byte_range.end) else {
+            // Clamp to the region so the translated range is in-region; skip a
+            // region the range never touches.
+            let Some(clamped) = clamp_range_to_region(&resolved, &range, &mapper) else {
                 continue;
-            };
-            if !range_intersects_region(&range, region_start, region_end) {
-                continue;
-            }
-            // Clamp to the region so the translated range is in-region.
-            let clamped = Range {
-                start: range.start.max(region_start),
-                end: range.end.min(region_end),
             };
 
             let preamble = PreambleResult {
@@ -1163,6 +1149,33 @@ impl Kakehashi {
         }
         None
     }
+}
+
+/// Clamp `range` to `resolved`'s injection region for an in-region translated
+/// request, or `None` when the region does not intersect the range (or its
+/// byte-precise end is unmappable). Pure geometry — no bridge-config lookup, so
+/// the async region scan stays focused on config resolution.
+fn clamp_range_to_region(
+    resolved: &ResolvedInjection,
+    range: &Range,
+    mapper: &PositionMapper,
+) -> Option<Range> {
+    let region_start = Position {
+        line: resolved.region.line_range.start,
+        character: resolved.region.start_column,
+    };
+    // Byte-precise end: synthesizing (line_range.end, 0) would over-approximate
+    // a same-line inline injection through the end of its line, matching ranges
+    // entirely after the injected content and clamping to columns outside the
+    // virtual document.
+    let region_end = mapper.byte_to_position(resolved.region.byte_range.end)?;
+    if !range_intersects_region(range, region_start, region_end) {
+        return None;
+    }
+    Some(Range {
+        start: range.start.max(region_start),
+        end: range.end.min(region_end),
+    })
 }
 
 /// Position-precise intersection of an LSP request range with an injection
