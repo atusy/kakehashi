@@ -280,7 +280,10 @@ impl InjectionCoordinator {
                 lang.clone()
             };
 
-            let load_result = self.language.ensure_language_loaded(&resolved_lang);
+            let load_result = self
+                .language
+                .ensure_language_loaded_async(&resolved_lang)
+                .await;
             if load_result.success {
                 load_events.extend(load_result.events);
                 continue;

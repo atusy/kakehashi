@@ -18,10 +18,36 @@ use tree_sitter::Language;
 /// Maximum length (in characters) for pattern previews in log messages.
 const MAX_PREVIEW_LEN: usize = 60;
 
+/// Backstop wait for a loser parked in [`LanguageCoordinator::ensure_language_loaded_async`]'s
+/// single-flight: bounds worst-case latency if a notification is ever
+/// somehow missed. A first load is expected to finish in the tens of
+/// milliseconds (dlopen + query compile); this is purely defense-in-depth,
+/// not a tuning knob for expected load time.
+const LANGUAGE_LOAD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Context for loading a query, including metadata for log messages.
 struct QueryLoadContext<'a> {
     language_id: &'a str,
     query_kind: QueryKind,
+}
+
+/// RAII single-flight marker for [`LanguageCoordinator::ensure_language_loaded_async`]:
+/// on drop, removes this language's in-flight entry (only if it still points
+/// at this guard's own `Notify` — a reload's `failed_loads.clear()` never
+/// touches this map, so nothing else contends the removal) and wakes every
+/// parked loser, whether the load succeeded, failed, or panicked mid-flight.
+struct LanguageLoadFlightGuard<'a> {
+    map: &'a dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
+    key: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for LanguageLoadFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.map
+            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.notify));
+        self.notify.notify_waiters();
+    }
 }
 
 /// Coordinates language runtime components (registry, queries, configs).
@@ -53,6 +79,18 @@ pub(crate) struct LanguageCoordinator {
     /// failed load succeed) before the hygiene clear. Read-validated against
     /// `failed_loads` entries; see there.
     load_generation: std::sync::atomic::AtomicU64,
+    /// Single-flight marker for [`ensure_language_loaded_async`](Self::ensure_language_loaded_async):
+    /// a language with an in-flight first load has an entry here, so a
+    /// concurrent request for the same language parks on the winner's
+    /// `Notify` instead of independently dlopen-ing the parser and
+    /// recompiling its queries (#575). Scoped to the async entry point only
+    /// — the synchronous `ensure_language_loaded` (called from non-tokio
+    /// contexts: the ComputePool-run selection-range walk, tests) does not
+    /// participate, so a sync caller racing an async one on the same
+    /// language can still duplicate the load once; narrower than the
+    /// pre-#575 free-for-all, and the common case (an LSP request burst)
+    /// goes exclusively through the async path.
+    load_inflight: dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
 }
 
 impl Default for LanguageCoordinator {
@@ -74,6 +112,7 @@ impl LanguageCoordinator {
             failed_loads: dashmap::DashMap::new(),
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
+            load_inflight: dashmap::DashMap::new(),
         }
     }
 
@@ -82,33 +121,207 @@ impl LanguageCoordinator {
     /// Visibility: pub(crate) - called by LSP layer (semantic_tokens, selection_range)
     /// and analysis modules to ensure parsers are available before use.
     pub(crate) fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
-        if self.language_registry.contains(language_id) {
-            return LanguageLoadResult::success_with(Vec::new());
-        }
         let current_generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        // Known-failed load UNDER THE CURRENT GENERATION: skip the filesystem
-        // scan (and the warning events — the first attempt already surfaced
-        // them). An old-generation entry is inert garbage, not a suppression
-        // (see `failed_loads`).
+        if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
+            return result;
+        }
+        let result = self.try_load_language_by_id(language_id);
+        if !result.success {
+            self.record_failed_load(language_id, current_generation);
+        }
+        result
+    }
+
+    /// Already-decided verdict for a load, or `None` when a real attempt is
+    /// needed. Single-sources the negative-cache/generation protocol shared by
+    /// the sync [`ensure_language_loaded`](Self::ensure_language_loaded) and the
+    /// async [`ensure_language_loaded_async`](Self::ensure_language_loaded_async)
+    /// so the twins cannot drift.
+    ///
+    /// A known-failed load UNDER THE CURRENT GENERATION skips the filesystem
+    /// scan (and the warning events — the first attempt already surfaced them).
+    /// An old-generation entry is inert garbage, not a suppression (see
+    /// [`failed_loads`](Self::failed_loads)).
+    fn cached_load_verdict(
+        &self,
+        language_id: &str,
+        current_generation: u64,
+    ) -> Option<LanguageLoadResult> {
+        if self.language_registry.contains(language_id) {
+            return Some(LanguageLoadResult::success_with(Vec::new()));
+        }
         if self
             .failed_loads
             .get(language_id)
             .is_some_and(|generation| *generation == current_generation)
         {
-            return LanguageLoadResult::default();
+            return Some(LanguageLoadResult::default());
         }
-        let result = self.try_load_language_by_id(language_id);
-        if !result.success {
-            // Tagged with the generation captured BEFORE the scan: if a
-            // reload landed mid-scan, the tag is already stale and this
-            // entry suppresses nothing — the store itself cannot re-poison,
-            // closing the check-then-insert window an insert-time gate had.
-            self.failed_loads
-                .insert(language_id.to_string(), current_generation);
+        None
+    }
+
+    /// Record a failed load, tagged with the generation captured BEFORE the
+    /// scan: if a reload landed mid-scan, the tag is already stale and this
+    /// entry suppresses nothing — the store itself cannot re-poison, closing
+    /// the check-then-insert window an insert-time gate had.
+    fn record_failed_load(&self, language_id: &str, current_generation: u64) {
+        self.failed_loads
+            .insert(language_id.to_string(), current_generation);
+    }
+
+    /// Async twin of [`ensure_language_loaded`](Self::ensure_language_loaded)
+    /// for tokio-worker call sites (document-open/reparse, injection
+    /// discovery): a language's first load runs the parser `.so` dlopen plus
+    /// disk reads and `tree_sitter::Query` compilation for every query kind
+    /// — tens of milliseconds of blocking work that must not run inline on
+    /// an async task (#575). Runs the same [`try_load_language_by_id`]
+    /// through `spawn_blocking`, and single-flights concurrent callers for
+    /// the same language through [`load_inflight`](Self::load_inflight) so a
+    /// request burst against one cold language (or a host document injecting
+    /// it into many regions) collapses to a single load in the common case.
+    /// Not a hard exactly-once guarantee: the synchronous
+    /// `ensure_language_loaded` path does not participate (see `load_inflight`),
+    /// and a cancelled winner can be briefly double-loaded — both are benign,
+    /// idempotent re-registers.
+    ///
+    /// Only the winner's [`LanguageLoadResult`] carries the load's events
+    /// (log messages, warnings) — a loser that parked and woke re-derives
+    /// its own success/failure from `language_registry`/`failed_loads`
+    /// (never the winner's result directly), so on a failed load every
+    /// loser in the burst gets an empty `LanguageLoadResult::default()`
+    /// with no events, even though the winner already logged the error
+    /// once. Matches the synchronous [`ensure_language_loaded`](Self::ensure_language_loaded)'s
+    /// existing cached-failure behavior — a caller must not assume every
+    /// invocation surfaces load events for a language it didn't win the
+    /// race to load.
+    pub(crate) async fn ensure_language_loaded_async(
+        self: &Arc<Self>,
+        language_id: &str,
+    ) -> LanguageLoadResult {
+        loop {
+            let current_generation = self
+                .load_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
+                return result;
+            }
+
+            // `get` before `entry`: the loser path (marker present) is the
+            // common case under a burst, and `entry` would clone the owned
+            // key just to find it occupied.
+            let notify = if let Some(current) = self.load_inflight.get(language_id) {
+                Arc::clone(&current)
+            } else {
+                match self.load_inflight.entry(language_id.to_string()) {
+                    dashmap::mapref::entry::Entry::Occupied(occupied) => Arc::clone(occupied.get()),
+                    dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                        // Re-check inside the claim: a winner may have
+                        // registered the language (success) or recorded its
+                        // failure and dropped its marker between the
+                        // top-of-loop check and this claim — either verdict
+                        // spares us a redundant dlopen scan and re-log.
+                        if let Some(result) =
+                            self.cached_load_verdict(language_id, current_generation)
+                        {
+                            return result;
+                        }
+                        let notify = Arc::new(tokio::sync::Notify::new());
+                        vacant.insert(Arc::clone(&notify));
+                        // RAII: removes the marker and wakes every parked
+                        // loser on ANY exit from this arm — a normal return
+                        // (load succeeded or failed), a panic INSIDE the
+                        // closure (caught and surfaced as a `JoinError` value
+                        // below, so the fn still returns normally), OR this
+                        // future being dropped mid-`.await` by request
+                        // cancellation. Cancellation is why RAII is required:
+                        // the detached `spawn_blocking` closure runs on to
+                        // completion and registers the language, but the
+                        // marker must be cleared and losers woken NOW, or a
+                        // loser re-parks every backstop interval indefinitely.
+                        // A loser promoted by that cancellation may briefly
+                        // double-load; benign — `immortal_library` caches the
+                        // dlopen and registry/query inserts are idempotent
+                        // overwrites.
+                        let _guard = LanguageLoadFlightGuard {
+                            map: &self.load_inflight,
+                            key: language_id.to_string(),
+                            notify: Arc::clone(&notify),
+                        };
+
+                        let coordinator = Arc::clone(self);
+                        let owned_id = language_id.to_string();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let result = coordinator.try_load_language_by_id(&owned_id);
+                            // Record the failure INSIDE the blocking task so a
+                            // winner cancelled mid-`.await` (its future dropped)
+                            // still populates the negative cache: the detached
+                            // task runs to completion regardless of the awaiting
+                            // task's fate, so without this the scan+log would
+                            // repeat for every later caller until one survives
+                            // the await. Idempotent with the JoinError branch's
+                            // record below.
+                            if !result.success {
+                                coordinator.record_failed_load(&owned_id, current_generation);
+                            }
+                            result
+                        })
+                        .await
+                        .unwrap_or_else(|join_error| {
+                            // Reached only when the closure PANICKED (the
+                            // awaiting task is alive here, so this is not the
+                            // cancellation path) — the in-closure record never
+                            // ran, so record the synthetic failure here.
+                            self.record_failed_load(language_id, current_generation);
+                            LanguageLoadResult::failure_with(LanguageEvent::log(
+                                LanguageLogLevel::Error,
+                                format!(
+                                    "language load for '{language_id}' failed on the blocking pool: {join_error}"
+                                ),
+                            ))
+                        });
+
+                        return result;
+                    }
+                }
+            };
+            // Register interest BEFORE re-validating the marker (mirrors
+            // `captures.rs`'s single-flight): `enable()` makes a
+            // `notify_waiters()` call that happens between here and the
+            // `.await` below visible to this waiter — awaiting bare
+            // `notify.notified()` without it has a lost-wakeup window
+            // between reading the `Arc<Notify>` above and this future's
+            // first poll, where a winner whose load finishes in that gap
+            // (e.g. the `search_paths.is_empty()` fast-fail) removes the
+            // marker and calls `notify_waiters()` before we're registered
+            // to receive it. A bare `notify.notified().await` here would then
+            // block on a notification that already fired, resolving only via
+            // the 1s backstop below (and, without it, never — no future
+            // winner for this language creates a fresh `Notify` to wake it).
+            // The
+            // re-check after `enable()` catches a winner that already
+            // exited before we registered — its `notify_waiters()` preceded
+            // our `enable()`, so we skip waiting and loop back immediately
+            // instead of awaiting a notification that already happened.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let winner_live = self
+                .load_inflight
+                .get(language_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, &notify));
+            if winner_live {
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = tokio::time::sleep(LANGUAGE_LOAD_WAIT_TIMEOUT) => {}
+                }
+            }
+            // Loop back: re-check registry/failed_loads/in-flight from
+            // scratch rather than trusting the winner's outcome directly —
+            // the winner may have failed (loser re-derives the same
+            // failed_loads verdict) or a reload may have landed concurrently.
         }
-        result
     }
 
     /// Initialize from workspace-level settings and return coordination events.
@@ -1279,6 +1492,122 @@ mod tests {
     use crate::config::settings::RawWorkspaceSettings;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Pins the #575 single-flight fix: a caller that arrives while another
+    /// caller already claimed the in-flight marker for a language must PARK
+    /// on that marker (not independently attempt its own load), and must
+    /// wake once the marker is cleared and notified. Simulates a winner
+    /// mid-load by claiming the marker directly (mirroring
+    /// `captures_full_single_flight_loser_serves_winner_memo`'s technique) —
+    /// a real dlopen fixture isn't needed to pin the coordination mechanic.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_load_for_the_same_language_parks_on_the_in_flight_winner() {
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        coordinator
+            .load_inflight
+            .insert("nosuchlang".to_string(), Arc::clone(&notify));
+
+        let loser = Arc::clone(&coordinator);
+        let request =
+            tokio::spawn(async move { loser.ensure_language_loaded_async("nosuchlang").await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "a concurrent caller must park on the in-flight winner, not race it"
+        );
+
+        coordinator.load_inflight.remove("nosuchlang");
+        notify.notify_waiters();
+
+        // Woken, the loser loops back: the registry still doesn't contain
+        // the language and no `failed_loads` entry exists (the simulated
+        // winner never really ran), so it becomes its own winner and
+        // attempts a fresh load — which fails fast (no search paths
+        // configured) rather than hanging or panicking.
+        let result = request
+            .await
+            .expect("the parked task must not panic on wake");
+        assert!(
+            !result.success,
+            "a language with no search paths configured cannot load"
+        );
+    }
+
+    /// Two callers racing the SAME cold language must run the load exactly
+    /// once: only the winner's `try_load_language_by_id` runs and returns the
+    /// "no search paths" event; the other caller (parked-then-cached, or
+    /// arrived after the negative-cache entry landed) re-derives its verdict
+    /// and returns an empty `LanguageLoadResult::default()`. Deleting the
+    /// single-flight would let BOTH run the load -> two event-bearing results.
+    /// Also pins the loser-gets-empty-events-on-failure contract.
+    #[tokio::test]
+    async fn two_concurrent_callers_run_the_load_once() {
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let a = Arc::clone(&coordinator);
+        let b = Arc::clone(&coordinator);
+        let (ra, rb) = tokio::join!(
+            async move { a.ensure_language_loaded_async("nosuchlang").await },
+            async move { b.ensure_language_loaded_async("nosuchlang").await },
+        );
+
+        let with_events = [&ra, &rb].iter().filter(|r| !r.events.is_empty()).count();
+        assert_eq!(
+            with_events, 1,
+            "the load must run once, not once per caller"
+        );
+        assert!(!ra.success && !rb.success, "no search paths -> both fail");
+        assert!(
+            coordinator.load_inflight.is_empty(),
+            "the RAII guard must clear the in-flight marker on exit"
+        );
+    }
+
+    /// The 1s [`LANGUAGE_LOAD_WAIT_TIMEOUT`] backstop must free a loser whose
+    /// wakeup was lost. Simulate the lost wakeup by removing the winner's
+    /// marker WITHOUT notifying: only the backstop can now unpark the loser,
+    /// which loops back and (finding no marker) becomes its own winner.
+    /// Deleting the `sleep` arm makes this hang -> test timeout.
+    ///
+    /// NOTE: this pins the backstop's *recovery value*, not the `enable()` +
+    /// `winner_live` recheck of the lost-wakeup fix (b428a1f9c) directly. That
+    /// recheck branch is only reachable under true cross-thread timing — the
+    /// loser prologue from `load_inflight.get()` through the recheck runs in a
+    /// single uninterrupted poll with no `.await` seam, so a current-thread
+    /// runtime cannot place a winner's `remove_if`+`notify_waiters()` at the
+    /// one instant that would diverge the two branches. It is therefore not
+    /// deterministically testable; a timing-based stress test was
+    /// deliberately omitted to keep the suite flake-free.
+    #[tokio::test(start_paused = true)]
+    async fn parked_loser_recovers_via_backstop_when_wake_is_lost() {
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        coordinator
+            .load_inflight
+            .insert("nosuchlang".to_string(), Arc::clone(&notify));
+
+        let loser = Arc::clone(&coordinator);
+        let request =
+            tokio::spawn(async move { loser.ensure_language_loaded_async("nosuchlang").await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "the loser must park while the marker is live"
+        );
+
+        // Remove the marker but never notify: a lost wakeup. Only the backstop
+        // can free the loser now.
+        coordinator.load_inflight.remove("nosuchlang");
+        tokio::time::sleep(LANGUAGE_LOAD_WAIT_TIMEOUT + std::time::Duration::from_millis(1)).await;
+
+        let result = request.await.expect("the loser must not panic");
+        assert!(
+            !result.success,
+            "loops back, becomes winner, fast-fails on no search paths"
+        );
+    }
 
     #[test]
     fn test_injection_direct_identifier_first() {

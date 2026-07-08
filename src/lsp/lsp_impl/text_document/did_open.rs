@@ -53,7 +53,7 @@ impl Kakehashi {
         let mut skip_parse = false; // Track if auto-install was triggered
 
         if let Some(ref lang) = language_name {
-            let load_result = self.language.ensure_language_loaded(lang);
+            let load_result = self.language.ensure_language_loaded_async(lang).await;
 
             // Defer SemanticTokensRefresh events until after parse_document completes
             // to avoid race condition where tokens are requested before tree exists.
