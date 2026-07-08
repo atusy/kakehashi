@@ -167,10 +167,12 @@ impl Kakehashi {
         // edit so a stale/malformed one can't escape the region into unrelated
         // host text (see `translate_edit_host_ward_strict`).
         //
-        // Host-layer actions carry no region (verbatim, no translation), so the
-        // gate — which ULID-parses `region_id` and would fail on the empty host
-        // one — is skipped; `region_end` is unused on the host resolve path.
-        let region_end = if envelope.host_layer {
+        // A genuine host-layer action carries no region (verbatim, no
+        // translation), so the gate — which ULID-parses `region_id` and would
+        // fail on the empty host one — is skipped; `region_end` is unused on the
+        // host resolve path. `is_host_layer` requires the empty `region_id`, so a
+        // client can't flip `host_layer` on a virt envelope to skip the gate.
+        let region_end = if envelope.is_host_layer() {
             Position::default()
         } else {
             match self.code_action_region_end_if_fresh(&envelope) {

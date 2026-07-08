@@ -83,6 +83,18 @@ pub(crate) struct CodeActionEnvelope {
     pub(crate) host_layer: bool,
 }
 
+impl CodeActionEnvelope {
+    /// Whether this is a genuine HOST-layer envelope: `host_layer` set AND no
+    /// region identity. A host envelope is minted with an empty `region_id`
+    /// ([`envelope_host_action`]), so requiring that here means a client can't
+    /// flip `host_layer = true` on a VIRT envelope (which keeps its `region_id`)
+    /// to route it through the translation-free host path and skip the region
+    /// freshness / coordinate validation.
+    pub(crate) fn is_host_layer(&self) -> bool {
+        self.host_layer && self.region_id.is_empty()
+    }
+}
+
 /// Everything needed to wrap an action's `data` in a routing envelope.
 pub(crate) struct CodeActionEnvelopeContext<'a> {
     server_name: &'a str,
@@ -488,8 +500,10 @@ impl LanguageServerPool {
         };
 
         // Host-layer actions are already in host coordinates — route their
-        // resolve to the host server VERBATIM (no translation, #627).
-        if envelope.host_layer {
+        // resolve to the host server VERBATIM (no translation, #627). A genuine
+        // host envelope has no region identity; requiring that blocks a client
+        // flipping `host_layer` on a virt envelope to skip translation.
+        if envelope.is_host_layer() {
             return self
                 .send_host_code_action_resolve(
                     &config,
@@ -1229,12 +1243,11 @@ fn bridge_code_action(
             // LSP 3.18 allows a lazy action to be title-only, so the server's
             // capability is the deciding factor.
             //
-            // Host layer (`virt` is None): resolve is NOT bridged, so the
-            // bridge can't issue a resolve regardless of the server's
-            // capability. A `data`-carrying action is still a lazy action the
-            // server intends to be resolved — surface it as a `REASON_RESOLVE`
-            // disabled placeholder (the PR 3 behavior) rather than dropping it,
-            // so `disabledSupport` clients see why it can't run.
+            // Host layer (`virt` is None): host-layer `codeAction/resolve` is now
+            // bridged (#627), so a host lazy action from a resolving server is
+            // enveloped for resolve-routing (below); one from a non-resolving
+            // server is surfaced as a `REASON_RESOLVE` disabled placeholder so
+            // `disabledSupport` clients see why it can't run.
             //
             // Now that host-layer resolve is bridged (#627), the host gate
             // mirrors the virt one: a title-only action (LSP 3.18, no `data`)
