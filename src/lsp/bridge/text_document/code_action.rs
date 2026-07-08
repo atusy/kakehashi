@@ -366,12 +366,13 @@ fn disable_action(
     action.data = None;
     // A disabled action must not steer the client's auto-fix keybinding.
     action.is_preferred = None;
-    // Keep the server's own reason when it already disabled the action.
-    if action.disabled.is_none() {
-        action.disabled = Some(CodeActionDisabled {
-            reason: reason.to_string(),
-        });
-    }
+    // `disable_action` is only reached for actions the SERVER did not disable:
+    // `bridge_code_action` handles a server-disabled action (keeping its own
+    // reason) and returns before ever calling here. So the bridge always owns
+    // the reason on this path — assign it unconditionally.
+    action.disabled = Some(CodeActionDisabled {
+        reason: reason.to_string(),
+    });
     Some(CodeActionOrCommand::CodeAction(action))
 }
 
