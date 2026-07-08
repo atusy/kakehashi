@@ -163,27 +163,42 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
 }
 
 /// Translate an action's edit host-ward with resolve-grade validation, in
-/// place. Returns `false` (leaving the edit partially mutated — the caller
-/// must discard the action) when the edit can't be faithfully represented in
-/// the host document: it touches another injection region (the shared
-/// transform would silently filter those edits and partially apply the rest),
-/// contains a virtual-URI file op (transform returns false), ends up empty, or
-/// a translated range escapes the region end (`region_end`) — a stale/malformed
-/// downstream edit whose virtual range runs past the region would otherwise land
-/// in unrelated host text after the fence. Used by BOTH the initial-response
-/// policy and the codeAction/resolve path so these are rejected uniformly,
-/// never partially applied.
+/// place. Returns `Err(reason)` (leaving the edit partially mutated — the caller
+/// must discard the action and disable it with `reason`) when the edit can't be
+/// faithfully represented in the host document. The reason distinguishes two
+/// permanent failures the client shows to the user:
+/// - [`REASON_CROSS_REGION`] — the edit touches another injection region (the
+///   shared transform would silently filter those and partially apply the rest),
+///   contains a virtual-URI file op (transform returns false), or a translated
+///   range escapes the region end (`region_end`) — a stale/malformed downstream
+///   edit whose virtual range runs past the region would otherwise land in
+///   unrelated host text after the fence.
+/// - [`REASON_RESOLVE`] — the edit ended up empty: the server produced nothing
+///   applicable, which reads as "could not be resolved to an applicable edit",
+///   not "cannot be represented in the host document".
+///
+/// Used by BOTH the initial-response policy and the codeAction/resolve path so
+/// these are rejected uniformly, never partially applied.
 fn translate_edit_host_ward_strict(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
     region_end: Position,
-) -> bool {
-    !workspace_edit_touches_foreign_region(edit, request_virtual_uri)
-        && transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset)
-        && !workspace_edit_is_empty(edit)
-        && workspace_edit_within_region(edit, host_uri, offset, region_end)
+) -> Result<(), &'static str> {
+    if workspace_edit_touches_foreign_region(edit, request_virtual_uri) {
+        return Err(REASON_CROSS_REGION);
+    }
+    if !transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset) {
+        return Err(REASON_CROSS_REGION);
+    }
+    if workspace_edit_is_empty(edit) {
+        return Err(REASON_RESOLVE);
+    }
+    if !workspace_edit_within_region(edit, host_uri, offset, region_end) {
+        return Err(REASON_CROSS_REGION);
+    }
+    Ok(())
 }
 
 /// Whether a `WorkspaceEdit` touches a virtual document OTHER than
@@ -572,7 +587,7 @@ impl LanguageServerPool {
         // action: the user would apply it and get a partial or no-op change.
         // This is a PERMANENT failure, so `resolve_untranslatable_edit` disables
         // rather than transient-fail-softing.
-        let untranslatable = match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
+        let disable_reason = match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
             (Some(edit), Some(host_uri_lsp)) => {
                 let virtual_uri = VirtualDocumentUri::new(
                     host_uri_lsp,
@@ -580,22 +595,23 @@ impl LanguageServerPool {
                     &envelope.region_id,
                 )
                 .to_uri_string();
-                !translate_edit_host_ward_strict(
+                translate_edit_host_ward_strict(
                     edit,
                     &virtual_uri,
                     host_uri_lsp,
                     &offset,
                     region_end,
                 )
+                .err()
             }
             // The server resolved an edit, but the host URI couldn't be rebuilt
             // to translate it (a `url`/`Uri` parser divergence). Shipping the
             // untranslated virtual-coordinate edit would be unappliable — same
             // permanent failure as the cross-region case.
-            (Some(_), None) => true,
-            (None, _) => false,
+            (Some(_), None) => Some(REASON_CROSS_REGION),
+            (None, _) => None,
         };
-        if untranslatable {
+        if let Some(reason) = disable_reason {
             return resolve_untranslatable_edit(
                 resolved,
                 action,
@@ -603,6 +619,7 @@ impl LanguageServerPool {
                 suffixed_title,
                 server_name,
                 upstream_caps,
+                reason,
             );
         }
 
@@ -1004,7 +1021,7 @@ fn bridge_code_action(
             // action's edit, which flows through here — is disabled, never
             // partially applied.
             if let Some(virt) = virt
-                && !translate_edit_host_ward_strict(
+                && let Err(reason) = translate_edit_host_ward_strict(
                     edit,
                     virt.request_virtual_uri,
                     virt.host_uri,
@@ -1012,7 +1029,7 @@ fn bridge_code_action(
                     virt.region_end,
                 )
             {
-                return disable_action(action, REASON_CROSS_REGION, server_name, upstream_caps);
+                return disable_action(action, reason, server_name, upstream_caps);
             }
         }
         None => {
@@ -1112,9 +1129,10 @@ fn resuffix_resolved_title(
 /// failure — re-requesting the resolve yields the identical result. Unlike the
 /// TRANSIENT fail-softs (stale region, connect/send errors, where the client
 /// re-requests and the window is short), the honest outcome here is to disable
-/// the action with a reason, mirroring the initial codeAction path's
-/// `REASON_CROSS_REGION` disable — otherwise the client shows an enabled action
-/// that applies nothing.
+/// the action with the `reason` the classifier returned (`REASON_CROSS_REGION`,
+/// or `REASON_RESOLVE` for an empty resolved edit), mirroring the initial
+/// codeAction path — otherwise the client shows an enabled action that applies
+/// nothing.
 ///
 /// `resolved` is the resolve RESPONSE (carrying the unusable edit plus any
 /// server-provided title change and already-host-translated diagnostics);
@@ -1132,6 +1150,7 @@ fn resolve_untranslatable_edit(
     suffixed_title: String,
     server_name: &str,
     upstream_caps: UpstreamCodeActionCaps,
+    reason: &'static str,
 ) -> CodeAction {
     if !upstream_caps.disabled_support {
         re_envelope_action(&mut original, envelope);
@@ -1150,7 +1169,7 @@ fn resolve_untranslatable_edit(
     resolved.data = None;
     resolved.is_preferred = None;
     resolved.disabled = Some(CodeActionDisabled {
-        reason: REASON_CROSS_REGION.to_string(),
+        reason: reason.to_string(),
     });
     resolved
 }
@@ -1775,6 +1794,29 @@ mod tests {
             REASON_CROSS_REGION
         );
         assert!(action.edit.is_none(), "untranslated edit must not leak");
+    }
+
+    #[test]
+    fn empty_edit_is_disabled_as_unresolvable_not_cross_region() {
+        // An edit that ends up empty (an empty `TextEdit[]` on the request's OWN
+        // region — not foreign, not a file op) is a "could not be resolved to an
+        // applicable edit" outcome, so it disables with REASON_RESOLVE. Using
+        // REASON_CROSS_REGION here (the pre-fix behavior) would misleadingly
+        // claim a host-representation problem where none exists (#615 item 1).
+        let action = json!({
+            "title": "Organize imports",
+            "edit": { "changes": { make_virtual_uri_string(): [] } }
+        });
+        let actions = transform(json!([action]), caps(true)).unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            action.disabled.as_ref().unwrap().reason,
+            REASON_RESOLVE,
+            "empty edit must disable as unresolvable, not cross-region"
+        );
+        assert!(action.edit.is_none(), "unusable edit must not leak");
     }
 
     #[test]
