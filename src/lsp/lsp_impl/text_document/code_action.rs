@@ -86,38 +86,25 @@ impl Kakehashi {
         let virt =
             self.code_action_virt_layer(&lsp_uri, range, context, work_done_token, upstream_caps);
         let host = self.code_action_host_layer(&lsp_uri, raw_params, upstream_caps);
-        // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`):
-        // `preferred` returns the highest-priority non-empty layer; `concatenated`
-        // merges every layer's actions in priority order into one menu (#568 PR 7).
-        let result = match self.cross_layer_strategy(&lsp_uri, METHOD) {
-            AggregationStrategy::Preferred => {
-                self.walk_layer_futures(
-                    &lsp_uri,
-                    METHOD,
-                    METHOD,
-                    virt,
-                    host,
-                    std::future::ready(Ok(None)),
-                    |actions: &CodeActionResponse| !actions.is_empty(),
-                )
-                .await
-            }
-            AggregationStrategy::Concatenated => {
-                self.walk_layers_concatenated(
-                    &lsp_uri,
-                    METHOD,
-                    METHOD,
-                    virt,
-                    host,
-                    std::future::ready(Ok(None)),
-                    |mut acc: CodeActionResponse, next| {
-                        acc.extend(next);
-                        acc
-                    },
-                )
-                .await
-            }
-        };
+        // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`),
+        // resolved once inside the walk: `preferred` returns the highest-priority
+        // non-empty layer; `concatenated` merges every layer's actions in priority
+        // order into one menu (#568 PR 7).
+        let result = self
+            .walk_layers_by_strategy(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                virt,
+                host,
+                std::future::ready(Ok(None)),
+                |actions: &CodeActionResponse| !actions.is_empty(),
+                |mut acc: CodeActionResponse, next| {
+                    acc.extend(next);
+                    acc
+                },
+            )
+            .await;
         // Collapse the cross-source isPreferred collision on the FINAL menu,
         // regardless of the cross-layer strategy: WITHIN-layer concatenation can
         // merge several servers' actions into one layer even when the cross-layer
