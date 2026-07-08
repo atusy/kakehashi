@@ -37,6 +37,10 @@ impl Kakehashi {
             self.notifier().log_warning(warning).await;
         }
 
+        if raw_workspace_settings_is_empty(&parsed.settings) {
+            return;
+        }
+
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
         // so merging preserves languages and other fields set during initialize.
@@ -82,8 +86,7 @@ struct ClientConfigurationUpdate {
 fn parse_client_configuration(
     value: serde_json::Value,
 ) -> Result<ClientConfigurationUpdate, serde_json::Error> {
-    let raw_value = unwrap_kakehashi_settings(value);
-    let warnings = ignored_key_warnings(&raw_value);
+    let (raw_value, warnings) = normalize_kakehashi_settings(value);
     let settings = serde_json::from_value::<RawWorkspaceSettings>(raw_value.clone())?;
 
     Ok(ClientConfigurationUpdate {
@@ -93,37 +96,56 @@ fn parse_client_configuration(
     })
 }
 
-fn unwrap_kakehashi_settings(value: serde_json::Value) -> serde_json::Value {
-    value
+fn normalize_kakehashi_settings(value: serde_json::Value) -> (serde_json::Value, Vec<String>) {
+    let Some(inner) = value
         .get("settings")
         .and_then(|settings| settings.get("kakehashi"))
-        .cloned()
-        .or_else(|| value.get("kakehashi").cloned())
-        .unwrap_or(value)
+        .or_else(|| value.get("kakehashi"))
+    else {
+        let warnings = ignored_key_warnings(&value);
+        return (value, warnings);
+    };
+
+    let mut warnings = Vec::new();
+    let mut raw_value = inner.clone();
+
+    if let Some(raw_object) = raw_value.as_object_mut() {
+        if let Some(root_object) = value.as_object() {
+            for (key, candidate) in root_object {
+                if key == "settings" || key == "kakehashi" {
+                    continue;
+                }
+
+                if is_known_configuration_key(key) {
+                    raw_object
+                        .entry(key.clone())
+                        .or_insert_with(|| candidate.clone());
+                } else {
+                    warnings.push(key.clone());
+                }
+            }
+        }
+    }
+
+    warnings.extend(ignored_keys(&raw_value));
+    warnings.sort();
+    warnings.dedup();
+
+    if warnings.is_empty() {
+        (raw_value, Vec::new())
+    } else {
+        (
+            raw_value,
+            vec![format!(
+                "Ignored unknown client configuration key(s): {}",
+                warnings.join(", ")
+            )],
+        )
+    }
 }
 
 fn ignored_key_warnings(value: &serde_json::Value) -> Vec<String> {
-    let Some(object) = value.as_object() else {
-        return Vec::new();
-    };
-
-    let mut ignored: Vec<_> = object
-        .keys()
-        .filter(|key| {
-            !matches!(
-                key.as_str(),
-                "searchPaths"
-                    | "languages"
-                    | "captureMappings"
-                    | "autoInstall"
-                    | "diagnosticsDebounceMs"
-                    | "languageServers"
-            )
-        })
-        .cloned()
-        .collect();
-    ignored.sort();
-
+    let ignored = ignored_keys(value);
     if ignored.is_empty() {
         Vec::new()
     } else {
@@ -132,6 +154,41 @@ fn ignored_key_warnings(value: &serde_json::Value) -> Vec<String> {
             ignored.join(", ")
         )]
     }
+}
+
+fn ignored_keys(value: &serde_json::Value) -> Vec<String> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+
+    let mut ignored: Vec<_> = object
+        .keys()
+        .filter(|key| !is_known_configuration_key(key))
+        .cloned()
+        .collect();
+    ignored.sort();
+    ignored
+}
+
+fn is_known_configuration_key(key: &str) -> bool {
+    matches!(
+        key,
+        "searchPaths"
+            | "languages"
+            | "captureMappings"
+            | "autoInstall"
+            | "diagnosticsDebounceMs"
+            | "languageServers"
+    )
+}
+
+fn raw_workspace_settings_is_empty(settings: &RawWorkspaceSettings) -> bool {
+    settings.search_paths.is_none()
+        && settings.languages.is_empty()
+        && settings.capture_mappings.is_empty()
+        && settings.auto_install.is_none()
+        && settings.diagnostics_debounce_ms.is_none()
+        && settings.language_servers.is_none()
 }
 
 #[cfg(test)]
@@ -154,6 +211,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_top_level_wrapped_kakehashi_settings() {
+        let update = parse_client_configuration(serde_json::json!({
+            "kakehashi": {
+                "autoInstall": false
+            }
+        }))
+        .expect("top-level wrapped settings should parse");
+
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn merges_known_flat_siblings_with_wrapped_settings() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "kakehashi": {
+                    "autoInstall": false
+                }
+            },
+            "autoInstall": true,
+            "diagnosticsDebounceMs": 250,
+            "editorSetting": true
+        }))
+        .expect("mixed wrapped and flat settings should parse");
+
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
+        assert_eq!(
+            update.warnings,
+            vec!["Ignored unknown client configuration key(s): editorSetting"]
+        );
+    }
+
+    #[test]
     fn warns_about_unknown_flat_keys() {
         let update = parse_client_configuration(serde_json::json!({
             "autoInstal": false,
@@ -166,5 +258,29 @@ mod tests {
             update.warnings,
             vec!["Ignored unknown client configuration key(s): autoInstal"]
         );
+    }
+
+    #[test]
+    fn recognizes_empty_client_configuration() {
+        let update = parse_client_configuration(serde_json::json!({
+            "autoInstal": false
+        }))
+        .expect("unknown-only settings should still parse");
+
+        assert!(raw_workspace_settings_is_empty(&update.settings));
+        assert_eq!(
+            update.warnings,
+            vec!["Ignored unknown client configuration key(s): autoInstal"]
+        );
+    }
+
+    #[test]
+    fn language_servers_empty_map_is_effective_configuration() {
+        let update = parse_client_configuration(serde_json::json!({
+            "languageServers": {}
+        }))
+        .expect("empty languageServers should parse");
+
+        assert!(!raw_workspace_settings_is_empty(&update.settings));
     }
 }
