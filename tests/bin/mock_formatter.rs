@@ -755,7 +755,12 @@ fn main() {
                     // Wait for the client's applyEdit response (relayed by the
                     // bridge) before completing executeCommand — real servers
                     // sequence it this way, and it makes the applyEdit reach the
-                    // client strictly before this command's response.
+                    // client strictly before this command's response. During
+                    // executeCommand handling the ONLY inbound message is that
+                    // response (id 4000), so this consumes nothing else; if the
+                    // client never answers, the mock parks here and the e2e
+                    // client's response timeout fails the test (it can't hang the
+                    // suite).
                     while let Some(reply) = read_message(&mut reader) {
                         if reply.get("id").and_then(Value::as_i64) == Some(4000) {
                             break;

@@ -58,8 +58,10 @@ pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Str
 /// name fails soft at the call site.
 pub(crate) fn decode_command(name: &str) -> Option<CommandRoute<'_>> {
     let rest = name.strip_prefix(COMMAND_PREFIX)?.strip_prefix(SEP)?;
-    // Exactly three fields; the command id is the remainder (it may contain
-    // anything except the separator, which the encoder never emits inside it).
+    // Split into exactly three fields: origin, host_uri, and the command as the
+    // REMAINDER. Only the origin/host_uri boundaries need to be separator-free
+    // (they are — a config key and a URL); a separator inside the command id
+    // rejoins into the remainder unharmed.
     let mut parts = rest.splitn(3, SEP);
     let origin = parts.next()?;
     let host_uri = parts.next()?;
