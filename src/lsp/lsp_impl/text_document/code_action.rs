@@ -11,8 +11,8 @@
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionContext, CodeActionParams, CodeActionResponse, MessageType,
-    NumberOrString, Position, Range, Uri,
+    CodeAction, CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
+    MessageType, NumberOrString, Position, Range, Uri,
 };
 use ulid::Ulid;
 use url::Url;
@@ -42,6 +42,27 @@ fn concat_merge(vecs: Vec<Option<CodeActionResponse>>) -> Option<CodeActionRespo
     (!merged.is_empty()).then_some(merged)
 }
 
+/// Collapse the cross-server `isPreferred` collision on a concatenated menu:
+/// the client's auto-fix keybinding picks the FIRST `isPreferred: true`, so once
+/// several servers each mark their action preferred, keep only the first (the
+/// merge is in priority order, so that's the highest-priority server) and drop
+/// the rest to `false` (checklist §4). Per-action `isPreferredSupport` stripping
+/// already happened in `bridge_code_action`; this is the cross-set collapse.
+fn resolve_preferred_collision(actions: &mut CodeActionResponse) {
+    let mut kept = false;
+    for item in actions.iter_mut() {
+        if let CodeActionOrCommand::CodeAction(action) = item
+            && action.is_preferred == Some(true)
+        {
+            if kept {
+                action.is_preferred = Some(false);
+            } else {
+                kept = true;
+            }
+        }
+    }
+}
+
 impl Kakehashi {
     pub(crate) async fn code_action_impl(
         &self,
@@ -57,16 +78,44 @@ impl Kakehashi {
         let virt =
             self.code_action_virt_layer(&lsp_uri, range, context, work_done_token, upstream_caps);
         let host = self.code_action_host_layer(&lsp_uri, raw_params, upstream_caps);
-        self.walk_layer_futures(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            virt,
-            host,
-            std::future::ready(Ok(None)),
-            |actions: &CodeActionResponse| !actions.is_empty(),
-        )
-        .await
+        // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`):
+        // `preferred` returns the highest-priority non-empty layer; `concatenated`
+        // merges every layer's actions in priority order into one menu, then
+        // collapses the cross-server isPreferred collision (#568 PR 7).
+        match self.cross_layer_strategy(&lsp_uri, METHOD) {
+            AggregationStrategy::Preferred => {
+                self.walk_layer_futures(
+                    &lsp_uri,
+                    METHOD,
+                    METHOD,
+                    virt,
+                    host,
+                    std::future::ready(Ok(None)),
+                    |actions: &CodeActionResponse| !actions.is_empty(),
+                )
+                .await
+            }
+            AggregationStrategy::Concatenated => {
+                let merged = self
+                    .walk_layers_concatenated(
+                        &lsp_uri,
+                        METHOD,
+                        METHOD,
+                        virt,
+                        host,
+                        std::future::ready(Ok(None)),
+                        |mut acc: CodeActionResponse, next| {
+                            acc.extend(next);
+                            acc
+                        },
+                    )
+                    .await?;
+                Ok(merged.map(|mut actions| {
+                    resolve_preferred_collision(&mut actions);
+                    actions
+                }))
+            }
+        }
     }
 
     /// The upstream client's codeAction capabilities that gate the bridge
@@ -370,5 +419,81 @@ impl Kakehashi {
             }
             FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp_server::ls_types::Command;
+
+    fn action(title: &str, preferred: Option<bool>) -> CodeActionOrCommand {
+        CodeActionOrCommand::CodeAction(CodeAction {
+            title: title.to_string(),
+            is_preferred: preferred,
+            ..CodeAction::default()
+        })
+    }
+
+    fn command(title: &str) -> CodeActionOrCommand {
+        CodeActionOrCommand::Command(Command {
+            title: title.to_string(),
+            command: "c".to_string(),
+            arguments: None,
+        })
+    }
+
+    #[test]
+    fn concat_merge_flattens_in_order_and_drops_none() {
+        let merged = concat_merge(vec![
+            Some(vec![action("a", None)]),
+            None,
+            Some(vec![action("b", None), action("c", None)]),
+        ])
+        .expect("non-empty");
+        let titles: Vec<_> = merged
+            .iter()
+            .filter_map(|i| match i {
+                CodeActionOrCommand::CodeAction(a) => Some(a.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, ["a", "b", "c"], "priority order preserved");
+    }
+
+    #[test]
+    fn concat_merge_all_empty_is_none() {
+        assert!(concat_merge(vec![None, Some(vec![]), None]).is_none());
+    }
+
+    #[test]
+    fn preferred_collision_keeps_only_the_first() {
+        // Two servers each marked their action preferred; after the collapse
+        // only the FIRST (highest-priority in the merged order) stays true.
+        let mut actions = vec![
+            action("x", Some(true)),
+            command("cmd"),
+            action("y", Some(true)),
+            action("z", None),
+        ];
+        resolve_preferred_collision(&mut actions);
+        let prefs: Vec<Option<bool>> = actions
+            .iter()
+            .filter_map(|i| match i {
+                CodeActionOrCommand::CodeAction(a) => Some(a.is_preferred),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prefs, [Some(true), Some(false), None]);
+    }
+
+    #[test]
+    fn preferred_collision_leaves_a_single_preferred_untouched() {
+        let mut actions = vec![action("x", None), action("y", Some(true))];
+        resolve_preferred_collision(&mut actions);
+        let CodeActionOrCommand::CodeAction(y) = &actions[1] else {
+            unreachable!()
+        };
+        assert_eq!(y.is_preferred, Some(true));
     }
 }
