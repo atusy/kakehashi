@@ -131,6 +131,13 @@ fn build_baseline_capabilities(
             // "extract into function") instead of assuming the client can't
             // apply edits.
             apply_edit: Some(true),
+            // The bridge executes a surfaced command via `workspace/executeCommand`
+            // (#568 PR 6), so advertise the client capability — a spec-compliant
+            // server may withhold command-carrying actions otherwise. No dynamic
+            // registration (the bridge routes by the static command name).
+            execute_command: Some(DynamicRegistrationClientCapabilities {
+                dynamic_registration: Some(false),
+            }),
             diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),

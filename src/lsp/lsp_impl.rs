@@ -25,14 +25,15 @@ use tower_lsp_server::ls_types::{
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
     DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams, DocumentLink,
     DocumentLinkParams, DocumentOnTypeFormattingParams, DocumentRangeFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
-    InitializeResult, InitializedParams, InlayHint, InlayHintParams, LinkedEditingRangeParams,
-    LinkedEditingRanges, Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams,
-    RenameParams, SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
-    TextDocumentPositionParams, TextEdit, Uri, WillSaveTextDocumentParams, WorkspaceEdit,
+    DocumentSymbolParams, DocumentSymbolResponse, ExecuteCommandParams, FoldingRange,
+    FoldingRangeParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams,
+    LinkedEditingRangeParams, LinkedEditingRanges, Location, Moniker, MonikerParams,
+    PrepareRenameResponse, ReferenceParams, RenameParams, SelectionRange, SelectionRangeParams,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, TextDocumentPositionParams, TextEdit, Uri, WillSaveTextDocumentParams,
+    WorkspaceEdit,
 };
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
@@ -736,6 +737,13 @@ impl LanguageServer for Kakehashi {
 
     async fn code_action_resolve(&self, params: CodeAction) -> Result<CodeAction> {
         self.code_action_resolve_impl(params).await
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        self.execute_command_impl(params).await
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
