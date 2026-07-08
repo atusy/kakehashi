@@ -257,7 +257,11 @@ fn diagnostic_drives_a_quickfix_on_the_python_block() {
     );
     let fix = actions
         .iter()
-        .find(|a| a["kind"].as_str().is_some_and(|k| k.starts_with("quickfix")))
+        .find(|a| {
+            a["kind"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("quickfix"))
+        })
         .unwrap_or_else(|| panic!("a quickfix action, got: {actions:#?}"));
 
     let edits = resolved_host_edits(&mut client, fix, &uri);
