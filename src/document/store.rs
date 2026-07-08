@@ -1260,8 +1260,8 @@ mod tests {
     fn set_parse_result_if_text_and_incarnation_unchanged_sets_language_and_tree() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///open_refine.rs").unwrap();
-        // didOpen inserted the document with the path/id language guess ("text");
-        // the open parse refines it to the content-detected "rust" and attaches a tree.
+        // didOpen inserted the document with the client language ID ("text"); the
+        // open parse refines it to the content-detected "rust" and attaches a tree.
         store.insert(
             uri.clone(),
             "fn main() {}".to_string(),
