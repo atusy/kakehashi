@@ -10,14 +10,15 @@ use tower_lsp_server::ls_types::{
     DeclarationCapability, DeclarationOptions, DefinitionOptions, DiagnosticOptions,
     DiagnosticServerCapabilities, DocumentFormattingOptions, DocumentLinkOptions,
     DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions, DocumentSymbolOptions,
-    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, InlayHintOptions,
-    InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions,
-    RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
+    ExecuteCommandOptions, FoldingRangeProviderCapability, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    InlayHintOptions, InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf,
+    ReferenceOptions, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
+    SemanticTokenModifier, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri,
+    WorkDoneProgressOptions,
 };
 use url::Url;
 
@@ -355,6 +356,27 @@ impl Kakehashi {
                 ),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
+                }),
+                // Bridged commands (a `Command` surfaced in a code action) are
+                // executed via `workspace/executeCommand`, routed back to their
+                // origin server by the encoded command name (#568 PR 6). Gated
+                // on the same literal-support condition as `code_action_provider`
+                // — commands only reach the bridge through a bridged code action.
+                // No advertised `commands`: downstream servers connect lazily so
+                // their command names aren't known at initialize (and each routed
+                // name embeds a per-document host_uri, so it could never be a
+                // stable advertised entry anyway). A client that dispatches an
+                // action's command on provider PRESENCE (Neovim's built-in client)
+                // executes it regardless; a client that only dispatches command
+                // ids from the advertised `commands` list (VS Code's
+                // vscode-languageclient) would show the action but not run it —
+                // reaching those needs dynamic registration of real names, the
+                // same deferred follow-up as palette-fired commands.
+                execute_command_provider: client_supports_code_action_literals.then(|| {
+                    ExecuteCommandOptions {
+                        commands: vec![],
+                        work_done_progress_options: Default::default(),
+                    }
                 }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),

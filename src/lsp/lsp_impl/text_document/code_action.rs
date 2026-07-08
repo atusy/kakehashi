@@ -281,6 +281,7 @@ impl Kakehashi {
                         Some(bridge_code_actions(
                             actions,
                             &t.server_name,
+                            t.uri.as_str(),
                             upstream_caps,
                             // Host-layer codeAction/resolve is not bridged, so
                             // host lazy actions are never enveloped/resolved.

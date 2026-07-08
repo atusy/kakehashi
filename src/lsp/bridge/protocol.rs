@@ -6,6 +6,7 @@
 //! ## Module Structure
 //!
 //! - `client_capabilities` - Baseline client capabilities advertised downstream
+//! - `command_routing` - Encode/decode the origin server in a bridged command name
 //! - `jsonrpc` - JSON-RPC message types and error inspection
 //! - `lifecycle` - Initialize/shutdown message builders
 //! - `request_id` - RequestId type for type-safe request ID handling
@@ -16,6 +17,7 @@
 //! - `workspace_edit` - WorkspaceEdit virtual→host transformation
 
 mod client_capabilities;
+mod command_routing;
 mod jsonrpc;
 mod lifecycle;
 mod request;
@@ -26,6 +28,7 @@ mod virtual_uri;
 mod workspace_edit;
 
 // Re-export all public items for external use
+pub(crate) use command_routing::{decode_command, encode_command};
 pub(crate) use jsonrpc::{
     JsonRpcNotification, JsonRpcRequest, jsonrpc_error_summary, response_has_jsonrpc_error,
 };

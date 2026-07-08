@@ -5,6 +5,9 @@ expression: capabilities
 {
   "workspace": {
     "applyEdit": true,
+    "executeCommand": {
+      "dynamicRegistration": false
+    },
     "workspaceFolders": true,
     "configuration": true,
     "diagnostics": {

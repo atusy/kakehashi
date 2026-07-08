@@ -8,8 +8,10 @@
 //! - The request range is translated host→virtual, the returned edit is
 //!   re-keyed to the host URI with host-translated ranges, and the title
 //!   carries the `"{title} — {server}"` suffix.
-//! - A bare Command action surfaces as a disabled placeholder for a client
-//!   with `disabledSupport`, and is dropped for a client without it.
+//! - A bare Command action surfaces as an EXECUTABLE command with a routed
+//!   name (regardless of `disabledSupport`); executing it drives a bridged
+//!   `workspace/executeCommand` back to the origin server, which answers by
+//!   asking the client to apply an edit (PR 5 + PR 6 compose).
 //! - A lazy action is enveloped and resolved via `codeAction/resolve` for a
 //!   resolve-capable client, and eager-resolved downstream (edit inline) for a
 //!   client lacking resolve/data support (PR 4).
@@ -25,6 +27,14 @@ use serde_json::{Value, json};
 
 fn mock_formatter_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mock-lsp-formatter")
+}
+
+/// A bridged command name encodes `kakehashi\u{1f}{origin}\u{1f}{host_uri}\u{1f}{command}`
+/// (see `bridge::protocol::command_routing`). Assert the routing key without
+/// depending on the exact host-URI field.
+fn is_routed_command(name: &str, origin: &str, command: &str) -> bool {
+    name.starts_with(&format!("kakehashi\u{1f}{origin}\u{1f}"))
+        && name.ends_with(&format!("\u{1f}{command}"))
 }
 
 fn init_client(client_capabilities: Value) -> (LspClient, Value, tempfile::TempDir) {
@@ -92,6 +102,15 @@ fn assert_advertised(init_response: &Value) {
         json!(true),
         "codeActionProvider{{resolveProvider}} must be advertised for literal-support clients (#568)"
     );
+    // PR 6: executeCommand must be advertised (empty command list) so a real
+    // client actually fires action-embedded commands — the one thing the mock
+    // harness cannot gate on, since LspClient sends regardless.
+    let execute = &init_response["result"]["capabilities"]["executeCommandProvider"];
+    assert_eq!(
+        execute["commands"],
+        json!([]),
+        "executeCommandProvider must be advertised with an empty command list (#568 PR 6)"
+    );
 }
 
 /// Markdown host: the lua fence content sits on host line 3.
@@ -145,21 +164,20 @@ fn code_action_with_retry(client: &mut LspClient) -> Vec<Value> {
 
 #[test]
 fn code_action_edit_is_host_translated_and_suffixed() {
-    // No disabledSupport: the bare Command action must be dropped entirely.
+    // Even without disabledSupport, the bare Command surfaces (executable, not
+    // disabled): the edit action + the command action both come back.
     let (mut client, init_response, _config_dir) = init_client(literal_support_caps(false));
     assert_advertised(&init_response);
     open_markdown(&mut client);
 
     let actions = code_action_with_retry(&mut client);
 
-    assert_eq!(
-        actions.len(),
-        1,
-        "the Command action must be dropped without disabledSupport, got: {actions:?}"
-    );
-    let action = &actions[0];
+    assert_eq!(actions.len(), 2, "edit + command action, got: {actions:?}");
+    let action = actions
+        .iter()
+        .find(|a| a["kind"] == "quickfix")
+        .expect("the edit-carrying quickfix");
     assert_eq!(action["title"], "Replace with fixed — mock-codeaction");
-    assert_eq!(action["kind"], "quickfix");
     let edits = &action["edit"]["changes"][MARKDOWN_URI];
     assert!(
         edits.is_array(),
@@ -168,6 +186,21 @@ fn code_action_edit_is_host_translated_and_suffixed() {
     // Virtual line 0 = host line 3 (fence content line).
     assert_eq!(edits[0]["range"]["start"]["line"], 3);
     assert_eq!(edits[0]["newText"], "fixed");
+
+    // The bare Command carries a routed name that encodes the origin server.
+    let command = actions
+        .iter()
+        .find(|a| a["command"].is_string())
+        .expect("the executable command action");
+    assert_eq!(command["title"], "Run mock command — mock-codeaction");
+    assert!(
+        is_routed_command(
+            command["command"].as_str().unwrap(),
+            "mock-codeaction",
+            "mock.run"
+        ),
+        "command name must encode the origin server, got: {command:?}"
+    );
 
     shutdown(&mut client);
 }
@@ -225,11 +258,19 @@ fn code_action_not_advertised_without_literal_support() {
         Value::Null,
         "codeActionProvider must be withheld without literal support"
     );
+    // executeCommand is gated on the same condition — commands only reach the
+    // bridge through a bridged code action, so it must be withheld too (pins
+    // the gating expression, not just the capability's presence).
+    assert_eq!(
+        init_response["result"]["capabilities"]["executeCommandProvider"],
+        Value::Null,
+        "executeCommandProvider must be withheld without literal support"
+    );
     shutdown(&mut client);
 }
 
 #[test]
-fn command_action_surfaces_as_disabled_with_disabled_support() {
+fn command_action_surfaces_as_executable_with_a_routed_name() {
     let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
     assert_advertised(&init_response);
     open_markdown(&mut client);
@@ -237,15 +278,74 @@ fn command_action_surfaces_as_disabled_with_disabled_support() {
     let actions = code_action_with_retry(&mut client);
 
     assert_eq!(actions.len(), 2, "got: {actions:?}");
-    let disabled: Vec<&Value> = actions
+    let command = actions
         .iter()
-        .filter(|a| a["disabled"].is_object())
-        .collect();
-    assert_eq!(disabled.len(), 1, "exactly one disabled placeholder");
-    assert_eq!(disabled[0]["title"], "Run mock command — mock-codeaction");
+        .find(|a| a["command"].is_string())
+        .expect("the executable command action");
+    assert_eq!(command["title"], "Run mock command — mock-codeaction");
     assert!(
-        disabled[0]["command"].is_null() && disabled[0]["edit"].is_null(),
-        "a disabled placeholder must not carry an executable payload"
+        command["disabled"].is_null(),
+        "an executable command is not disabled, got: {command:?}"
+    );
+    assert!(
+        is_routed_command(
+            command["command"].as_str().unwrap(),
+            "mock-codeaction",
+            "mock.run"
+        ),
+        "command name must encode the origin server, got: {command:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn executing_a_bridged_command_routes_back_and_relays_the_server_applyedit() {
+    // The full PR 5 + PR 6 composition: the client executes a surfaced command;
+    // the bridge decodes its routed name, forwards executeCommand to the origin
+    // server with the ORIGINAL name; the server answers by asking the client to
+    // apply an edit (host-translated by the bridge) and returns a result the
+    // bridge relays verbatim.
+    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_with_retry(&mut client);
+    let routed = actions
+        .iter()
+        .find(|a| a["command"].is_string())
+        .expect("the executable command action")["command"]
+        .as_str()
+        .expect("command name")
+        .to_string();
+
+    // Fire executeCommand without blocking — the server's applyEdit request
+    // interleaves before the executeCommand response arrives.
+    let exec_id = client.send_request_async(
+        "workspace/executeCommand",
+        json!({ "command": routed, "arguments": [] }),
+    );
+
+    // The server's applyEdit reaches the client, re-keyed to the host URI and
+    // its virtual line 0 translated to host line 3.
+    let (apply_id, apply_params) = client
+        .wait_for_server_request("workspace/applyEdit", Duration::from_secs(5))
+        .expect("the server's applyEdit must reach the client");
+    let edits = &apply_params["edit"]["changes"][MARKDOWN_URI];
+    assert!(
+        edits.is_array(),
+        "applyEdit must be re-keyed to the host URI, got: {apply_params:?}"
+    );
+    assert_eq!(edits[0]["range"]["start"]["line"], 3);
+    assert_eq!(edits[0]["newText"], "executed");
+    client.send_response(apply_id, json!({ "applied": true }));
+
+    // The executeCommand result is relayed verbatim; the server saw its own
+    // ORIGINAL command name (the routing prefix was stripped).
+    let response = client.receive_response_for_id_public(exec_id);
+    assert_eq!(
+        response["result"]["executed"], "mock.run",
+        "the origin server must receive its original command name, got: {response:?}"
     );
 
     shutdown(&mut client);
@@ -559,11 +659,10 @@ fn lazy_action_is_eager_resolved_without_resolve_support() {
 }
 
 #[test]
-fn lazy_action_resolving_to_command_fails_soft() {
-    // A lazy action whose resolve materializes a COMMAND (not an edit) must
-    // not hand that command to the editor — command execution is unbridged.
-    // The bridge fails soft: the resolved action comes back unresolved, with
-    // no command and its routing envelope intact.
+fn lazy_action_resolving_to_command_surfaces_it_routed() {
+    // A lazy action whose resolve materializes a COMMAND (not an edit) is now
+    // executable (#568 PR 6): the resolved action comes back with a routed
+    // command name and no `data` (a command-complete action is not re-resolved).
     let (mut client, init_response, _config_dir) =
         init_client_mode("code-action-lazy-cmd", resolve_support_caps());
     assert_advertised(&init_response);
@@ -577,16 +676,20 @@ fn lazy_action_resolving_to_command_fails_soft() {
     let resolved = client.send_request("codeAction/resolve", lazy.clone());
     let resolved = &resolved["result"];
     assert!(
-        resolved["command"].is_null(),
-        "an unbridged command must never reach the editor, got: {resolved:?}"
+        is_routed_command(
+            resolved["command"]["command"].as_str().unwrap_or_default(),
+            "mock-codeaction",
+            "mock.run"
+        ),
+        "the resolved command must carry a routed name, got: {resolved:?}"
     );
     assert!(
         resolved["edit"].is_null(),
-        "the action stays unresolved (no edit), got: {resolved:?}"
+        "a command-only resolve carries no edit, got: {resolved:?}"
     );
-    assert_eq!(
-        resolved["data"]["kakehashi"]["origin"], "mock-codeaction",
-        "the routing envelope is preserved on the fail-soft path"
+    assert!(
+        resolved["data"].is_null(),
+        "a command-complete action is not re-resolved (data stripped), got: {resolved:?}"
     );
 
     shutdown(&mut client);

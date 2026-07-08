@@ -65,6 +65,7 @@ pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
 pub(crate) use protocol::VirtualDocumentUri;
+pub(crate) use protocol::decode_command;
 pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::transform_workspace_edit_to_host;
 pub(crate) use protocol::translate_virtual_range_to_host;

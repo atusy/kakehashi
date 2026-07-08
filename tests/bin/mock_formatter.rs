@@ -159,6 +159,7 @@ fn main() {
                     }),
                     "code-action" => json!({
                         "codeActionProvider": true,
+                        "executeCommandProvider": { "commands": ["mock.run"] },
                         "textDocumentSync": 1
                     }),
                     // `code-action-lazy`: advertises resolveProvider and
@@ -167,8 +168,8 @@ fn main() {
                     // rust-analyzer shape that motivates PR 4 (#568).
                     // `code-action-lazy-cmd` is like `code-action-lazy` but its
                     // resolve materializes a COMMAND (not an edit) — the bridge
-                    // must fail soft (command execution is unbridged), never
-                    // handing the command to the editor.
+                    // rewrites the command name to route executeCommand back to
+                    // this server (#568 PR 6) and surfaces it executable.
                     // `code-action-lazy-retitle` is like `code-action-lazy` but
                     // its resolve returns a CHANGED title (LSP lets a server
                     // rewrite the title on resolve) — the bridge must surface
@@ -187,6 +188,7 @@ fn main() {
                     | "code-action-lazy-oob" => {
                         json!({
                             "codeActionProvider": { "resolveProvider": true },
+                            "executeCommandProvider": { "commands": ["mock.run"] },
                             "textDocumentSync": 1
                         })
                     }
@@ -514,9 +516,9 @@ fn main() {
                         } else {
                             // `code-action` mode: one edit-carrying quickfix (an
                             // edit on the requested document at virtual line 0)
-                            // plus one bare Command action (not executable until
-                            // executeCommand is bridged — must surface as
-                            // disabled/dropped, never verbatim).
+                            // plus one bare Command action, surfaced executable
+                            // with a routed command name (#568 PR 6). Executing
+                            // it drives executeCommand back to this server.
                             json!([
                                 {
                                     "title": "Replace with fixed",
@@ -562,9 +564,9 @@ fn main() {
                 // the mock received its URI via didOpen (single-doc tests).
                 let target_uri = documents.keys().next().cloned().unwrap_or_default();
                 if mode == "code-action-lazy-cmd" {
-                    // Resolve to a COMMAND instead of an edit: command execution
-                    // is unbridged, so the bridge must fail soft and never hand
-                    // this command to the editor.
+                    // Resolve to a COMMAND instead of an edit: the bridge routes
+                    // it (rewrites the name, strips data) and surfaces it
+                    // executable (#568 PR 6).
                     respond(
                         &mut writer,
                         id,
@@ -719,6 +721,54 @@ fn main() {
                         }
                     }),
                 );
+            }
+            "workspace/executeCommand" => {
+                // The bridge stripped its routing prefix, so we see our OWN
+                // command name (`mock.run`). Prove execute → applyEdit → relay
+                // composes with PR 5: ask the client to apply an edit on our
+                // virtual document (the bridge translates it host-ward), then
+                // answer the executeCommand with a verbatim-relayed result.
+                let command = message
+                    .pointer("/params/command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if command == "mock.run" {
+                    let target_uri = documents.keys().next().cloned().unwrap_or_default();
+                    request_with_params(
+                        &mut writer,
+                        json!(4000),
+                        "workspace/applyEdit",
+                        json!({
+                            "edit": {
+                                "changes": {
+                                    target_uri: [{
+                                        "range": {
+                                            "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 5 }
+                                        },
+                                        "newText": "executed"
+                                    }]
+                                }
+                            }
+                        }),
+                    );
+                    // Wait for the client's applyEdit response (relayed by the
+                    // bridge) before completing executeCommand — real servers
+                    // sequence it this way, and it makes the applyEdit reach the
+                    // client strictly before this command's response. During
+                    // executeCommand handling the applyEdit response (id 4000) is
+                    // the only message the bridge sends back, so read exactly one
+                    // and FAIL FAST on anything else rather than silently
+                    // swallowing an interleaved request/notification.
+                    match read_message(&mut reader) {
+                        Some(reply) if reply.get("id").and_then(Value::as_i64) == Some(4000) => {}
+                        other => panic!(
+                            "mock executeCommand: expected the applyEdit response (id 4000), \
+                             got {other:?}"
+                        ),
+                    }
+                }
+                respond(&mut writer, id, json!({ "executed": command }));
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-fail" {
@@ -932,6 +982,15 @@ fn push_diagnostics(uri: &str, present: bool) -> Value {
 /// no params) to the bridge — e.g. an unsolicited `workspace/diagnostic/refresh`.
 fn request<W: Write>(writer: &mut W, id: Value, method: &str) {
     let body = json!({ "jsonrpc": "2.0", "id": id, "method": method }).to_string();
+    let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
+    let _ = writer.flush();
+}
+
+/// Send a server→client **request** carrying `params` — e.g. a
+/// `workspace/applyEdit` issued while handling an `executeCommand`.
+fn request_with_params<W: Write>(writer: &mut W, id: Value, method: &str, params: Value) {
+    let body =
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
     let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
     let _ = writer.flush();
 }

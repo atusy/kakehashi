@@ -4,9 +4,10 @@
 //! `codeAction/resolve` is routed back to the origin server via the
 //! `CodeActionEnvelope` in `CodeAction.data` (PR 4), or eagerly resolved
 //! downstream when the upstream client lacks `dataSupport`/`resolveSupport`.
-//! Only `Command` execution remains unbridged — command-carrying actions
-//! surface as `disabled: { reason }` when the client supports it and are
-//! dropped otherwise (LSP 3.16 `disabledSupport`).
+//! Command-carrying actions are executable: the command name is rewritten to
+//! encode its origin server + host document, so the bridged
+//! `workspace/executeCommand` routes it back (PR 6, see
+//! [`command_routing`](super::super::protocol)).
 //!
 //! Every bridged action title gets the `"{title} — {server}"` suffix so
 //! users can see which downstream server each action comes from.
@@ -33,10 +34,10 @@ use url::Url;
 
 use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region,
-    response_has_jsonrpc_error, transform_workspace_edit_to_host, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
-    workspace_edit_within_region,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
+    host_position_within_region, response_has_jsonrpc_error, transform_workspace_edit_to_host,
+    translate_host_range_to_virtual, translate_virtual_position_to_host,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 
@@ -333,6 +334,7 @@ impl LanguageServerPool {
         Ok(Some(bridge_code_actions(
             actions,
             server_name,
+            host_uri.as_str(),
             upstream_caps,
             handle.has_capability("codeAction/resolve"),
             Some(&virt),
@@ -535,14 +537,23 @@ impl LanguageServerPool {
             return resolved;
         }
 
-        // A resolve that materializes a `command` (or edit+command) can't be
-        // honored — command execution is unbridged, and applying only the edit
-        // half is worse than none (the initial codeAction path disables such
-        // actions). Fail soft: return the original action unresolved rather
-        // than hand the editor an executable downstream command.
-        if resolved.command.is_some() {
-            re_envelope_action(&mut action, &envelope);
-            return action;
+        // A resolve that materializes a `command` (or edit+command) is now
+        // executable: rewrite the command name to encode the origin server so
+        // the bridged executeCommand routes back to it (mirrors the initial
+        // codeAction path). An edit+command action keeps both — the edit is
+        // translated below, then the client executes the command.
+        // Drop the command if its routing name can't be encoded (unroutable);
+        // an accompanying edit is still applied.
+        if resolved
+            .command
+            .as_mut()
+            .and_then(|command| {
+                encode_command(server_name, &envelope.host_uri, &command.command)
+                    .map(|encoded| command.command = encoded)
+            })
+            .is_none()
+        {
+            resolved.command = None;
         }
 
         // isPreferred is its own client capability (LSP 3.15); the downstream
@@ -603,14 +614,14 @@ impl LanguageServerPool {
         let server_title = std::mem::take(&mut resolved.title);
         resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
 
-        // Once resolve has materialized an edit, the action is complete and
-        // its edit is host-translated. Re-enveloping it would let a second
-        // resolve forward that host-coordinate edit back downstream (no
-        // inverse transform) — so strip the data instead, mirroring the
-        // initial-response policy for edit-carrying actions. Only a still-lazy
-        // resolved action (no edit) keeps a routing envelope for a further
-        // resolve.
-        if resolved.edit.is_some() {
+        // Once resolve has materialized an edit OR a command, the action is
+        // complete (the edit is host-translated; the command name is routed).
+        // Re-enveloping it would let a second resolve forward that host-
+        // coordinate edit back downstream (no inverse transform) — so strip the
+        // data instead, mirroring the initial-response policy. Only a still-lazy
+        // resolved action (no edit, no command) keeps a routing envelope for a
+        // further resolve.
+        if resolved.edit.is_some() || resolved.command.is_some() {
             resolved.data = None;
         } else {
             // Still lazy: a future resolve restores `envelope.original_title`
@@ -881,6 +892,7 @@ impl UpstreamCodeActionCaps {
 pub(crate) fn bridge_code_actions(
     actions: Vec<CodeActionOrCommand>,
     server_name: &str,
+    host_uri: &str,
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
@@ -888,33 +900,42 @@ pub(crate) fn bridge_code_actions(
     actions
         .into_iter()
         .filter_map(|item| {
-            bridge_code_action(item, server_name, upstream_caps, server_resolves, virt)
+            bridge_code_action(
+                item,
+                server_name,
+                host_uri,
+                upstream_caps,
+                server_resolves,
+                virt,
+            )
         })
         .collect()
 }
 
-const REASON_COMMANDS: &str = "kakehashi does not bridge command execution yet";
 const REASON_RESOLVE: &str = "this action could not be resolved to an applicable edit";
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
 
 fn bridge_code_action(
     item: CodeActionOrCommand,
     server_name: &str,
+    host_uri: &str,
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
 ) -> Option<CodeActionOrCommand> {
     let mut action = match item {
-        // A bare Command cannot carry `disabled`; represent it as a disabled
-        // CodeAction so the user still sees it exists (checklist: never
-        // silently drop when the client can render why).
-        CodeActionOrCommand::Command(command) => {
-            return disabled_placeholder(
-                command.title,
-                REASON_COMMANDS,
-                server_name,
-                upstream_caps,
-            );
+        // A bare Command is executable via workspace/executeCommand once its
+        // name encodes the origin server + host document (the client sends only
+        // command+arguments on execute — no data envelope to route by).
+        // Arguments stay verbatim (checklist §10); suffix the title like every
+        // bridged action.
+        CodeActionOrCommand::Command(mut command) => {
+            // Drop a bare command we can't mint an unambiguous routing name for
+            // (pathological: a separator in the server name) — routed back it
+            // would reach the wrong server, and un-routed it executes to nothing.
+            command.command = encode_command(server_name, host_uri, &command.command)?;
+            command.title = suffix_title(command.title, server_name);
+            return Some(CodeActionOrCommand::Command(command));
         }
         CodeActionOrCommand::CodeAction(action) => action,
     };
@@ -954,11 +975,25 @@ fn bridge_code_action(
         action.is_preferred = None;
     }
 
-    // Commands are not executable until executeCommand is bridged; applying
-    // only the edit half of an edit+command action would be worse than
-    // disabling the whole action.
-    if action.command.is_some() {
-        return disable_action(action, REASON_COMMANDS, server_name, upstream_caps);
+    // A command makes the action executable via workspace/executeCommand.
+    // Rewrite the command name to encode its origin server so the bridged
+    // executeCommand routes it back (the client sends only command+arguments on
+    // execute — no data envelope). Arguments pass through verbatim (they are the
+    // downstream's own coordinate system, checklist §10). An edit+command action
+    // keeps BOTH: the client applies the (translated) edit, then executes.
+    let has_command = action
+        .command
+        .as_mut()
+        .and_then(|command| {
+            encode_command(server_name, host_uri, &command.command)
+                .map(|encoded| command.command = encoded)
+        })
+        .is_some();
+    // A command whose name couldn't be encoded (unroutable) is dropped; an
+    // accompanying edit is still applied below, else the action is dropped as a
+    // no-op. Assigning None when there was no command is a harmless no-op.
+    if !has_command {
+        action.command = None;
     }
 
     match &mut action.edit {
@@ -981,6 +1016,14 @@ fn bridge_code_action(
             }
         }
         None => {
+            // Command-only action: executable via the bridged executeCommand
+            // (its name was rewritten above), no edit to translate. Strip the
+            // resolve `data` and surface it suffixed.
+            if has_command {
+                action.data = None;
+                action.title = suffix_title(action.title, server_name);
+                return Some(CodeActionOrCommand::CodeAction(action));
+            }
             // No edit, no command: is this a lazy (resolve-deferred) action?
             //
             // Virt layer: the *bridge* issues the `codeAction/resolve`, so the
@@ -1138,24 +1181,6 @@ fn disable_action(
         reason: reason.to_string(),
     });
     Some(CodeActionOrCommand::CodeAction(action))
-}
-
-fn disabled_placeholder(
-    title: String,
-    reason: &str,
-    server_name: &str,
-    upstream_caps: UpstreamCodeActionCaps,
-) -> Option<CodeActionOrCommand> {
-    if !upstream_caps.disabled_support {
-        return None;
-    }
-    Some(CodeActionOrCommand::CodeAction(CodeAction {
-        title: suffix_title(title, server_name),
-        disabled: Some(CodeActionDisabled {
-            reason: reason.to_string(),
-        }),
-        ..CodeAction::default()
-    }))
 }
 
 #[cfg(test)]
@@ -1460,6 +1485,7 @@ mod tests {
         Some(bridge_code_actions(
             actions,
             "ruff",
+            "file:///test.md",
             upstream_caps,
             server_resolves,
             Some(&virt),
@@ -1551,33 +1577,41 @@ mod tests {
     }
 
     #[test]
-    fn bare_command_becomes_disabled_placeholder() {
+    fn bare_command_is_surfaced_with_a_routed_name() {
+        use crate::lsp::bridge::decode_command;
         let actions = transform(
             json!([{ "title": "Run organize imports", "command": "ruff.organizeImports" }]),
             caps(true),
         )
         .unwrap();
 
-        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
-            panic!("Expected CodeAction placeholder");
+        let CodeActionOrCommand::Command(command) = &actions[0] else {
+            panic!("Expected an executable Command");
         };
-        assert_eq!(action.title, "Run organize imports — ruff");
-        assert_eq!(action.disabled.as_ref().unwrap().reason, REASON_COMMANDS);
-        assert!(action.command.is_none() && action.edit.is_none());
+        assert_eq!(command.title, "Run organize imports — ruff");
+        // The command name encodes the origin server + host document so
+        // executeCommand routes back to it; arguments (none here) stay verbatim.
+        let route = decode_command(&command.command).expect("routed name");
+        assert_eq!(route.origin, "ruff");
+        assert_eq!(route.host_uri, "file:///test.md");
+        assert_eq!(route.command, "ruff.organizeImports");
     }
 
     #[test]
-    fn bare_command_is_dropped_without_disabled_support() {
+    fn bare_command_is_surfaced_even_without_disabled_support() {
+        // A command is executable, not disabled, so disabledSupport is
+        // irrelevant — it must still be surfaced.
         let actions = transform(
             json!([{ "title": "Run organize imports", "command": "ruff.organizeImports" }]),
             caps(false),
         )
         .unwrap();
-        assert!(actions.is_empty());
+        assert!(matches!(actions[0], CodeActionOrCommand::Command(_)));
     }
 
     #[test]
-    fn command_carrying_action_is_disabled_with_payload_stripped() {
+    fn edit_command_action_keeps_both_with_a_routed_command() {
+        use crate::lsp::bridge::decode_command;
         let mut action = edit_carrying_action("Fix all");
         action["command"] = json!({ "title": "post", "command": "ruff.postFix" });
         let actions = transform(json!([action]), caps(true)).unwrap();
@@ -1585,12 +1619,13 @@ mod tests {
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
             panic!("Expected CodeAction");
         };
-        assert_eq!(action.disabled.as_ref().unwrap().reason, REASON_COMMANDS);
-        assert!(
-            action.edit.is_none() && action.command.is_none(),
-            "an edit+command action must not ship a half-appliable payload"
-        );
         assert_eq!(action.title, "Fix all — ruff");
+        // The client applies the (translated) edit, then executes the routed
+        // command — both halves survive.
+        assert!(action.edit.is_some(), "the translated edit is kept");
+        let route = decode_command(&action.command.as_ref().unwrap().command).expect("routed name");
+        assert_eq!(route.origin, "ruff");
+        assert_eq!(route.command, "ruff.postFix");
     }
 
     #[test]
@@ -1789,7 +1824,14 @@ mod tests {
         ]))
         .unwrap();
 
-        let bridged = bridge_code_actions(actions, "marksman", caps(true), false, None);
+        let bridged = bridge_code_actions(
+            actions,
+            "marksman",
+            "file:///test.md",
+            caps(true),
+            false,
+            None,
+        );
         assert_eq!(bridged.len(), 2);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
@@ -1798,13 +1840,15 @@ mod tests {
         let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
         let edits = changes.get(&make_host_uri()).unwrap();
         assert_eq!(edits[0].range.start.line, 50, "host edits stay verbatim");
-        let CodeActionOrCommand::CodeAction(placeholder) = &bridged[1] else {
-            panic!("Expected disabled placeholder");
+        // The bare command is surfaced executable (host layer routes back to
+        // the host server, whose arguments reference the real URI).
+        let CodeActionOrCommand::Command(command) = &bridged[1] else {
+            panic!("Expected an executable Command");
         };
-        assert_eq!(
-            placeholder.disabled.as_ref().unwrap().reason,
-            REASON_COMMANDS
-        );
+        assert_eq!(command.title, "Run linter — marksman");
+        let route = crate::lsp::bridge::decode_command(&command.command).expect("routed name");
+        assert_eq!(route.origin, "marksman");
+        assert_eq!(route.command, "lint.run");
     }
 
     // ==========================================================================
