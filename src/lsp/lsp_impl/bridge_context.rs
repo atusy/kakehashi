@@ -1054,17 +1054,32 @@ impl Kakehashi {
             return Ok(None);
         };
         let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+        self.run_layer_race(race_layers_preferred(
+            &layer_cfg.priorities,
+            virt,
+            host,
+            native,
+            is_nonempty,
+        ))
+        .await
+    }
 
-        // Subscribe for the WHOLE walk before either arm runs: the arms'
-        // own subscribe attempts then find the id taken and proceed without
-        // a local receiver (logged at debug), and this select cancels the
-        // race — dropping both in-flight arms — the moment `$/cancelRequest`
-        // arrives, regardless of which arm would have held the subscription.
-        // Best-effort gap: between the race's completion and the next
-        // request there is no subscriber; a cancel landing there is only
-        // forwarded downstream via the upstream-request registry.
+    /// Run a pre-built layer race under a walk-wide cancel subscription, then
+    /// sweep the upstream registry — shared by [`Self::walk_layer_futures`] and
+    /// [`Self::walk_layers_by_strategy`].
+    ///
+    /// Subscribe for the WHOLE walk before the race runs: the arms' own
+    /// subscribe attempts then find the id taken and proceed without a local
+    /// receiver (logged at debug), and this select cancels the race — dropping
+    /// all in-flight arms — the moment `$/cancelRequest` arrives. Best-effort
+    /// gap: between the race's completion and the next request there is no
+    /// subscriber; a cancel landing there is only forwarded downstream via the
+    /// upstream-request registry.
+    async fn run_layer_race<R>(
+        &self,
+        race: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
-        let race = race_layers_preferred(&layer_cfg.priorities, virt, host, native, is_nonempty);
         let result = match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
@@ -1075,23 +1090,24 @@ impl Kakehashi {
             }
             None => race.await,
         };
-        // Sweep upstream-registry entries a dropped (losing or cancelled)
-        // layer future did not get to unregister itself. Idempotent; a
-        // completed arm already cleaned up its own.
+        // Sweep upstream-registry entries a dropped (losing or cancelled) layer
+        // future did not get to unregister itself. Idempotent; a completed arm
+        // already cleaned up its own.
         self.bridge
             .pool_arc()
             .unregister_all_for_upstream_id(current_upstream_id().as_ref());
         result
     }
 
-    /// Cross-layer CONCATENATED walk: the barrier sibling of
-    /// [`Self::walk_layer_futures`]. Awaits all configured layers and merges
-    /// their non-empty results in priority order via `combine`, with the same
-    /// walk-wide cancel subscription and upstream-registry sweep. Used by
-    /// list-valued methods (codeAction) configured `strategy = concatenated`
-    /// at the `layers.aggregation` level (#568 PR 7).
+    /// Cross-layer walk that picks `preferred` (first-wins) vs `concatenated`
+    /// (barrier merge in priority order) from the SAME resolved layer config, so
+    /// the strategy and priorities can't come from two different settings
+    /// snapshots if a reload interleaves. `is_nonempty` gates the preferred race;
+    /// `combine` merges the concatenated race; whichever strategy is chosen only
+    /// the matching closure is used. Shares the walk-wide cancel subscription +
+    /// registry sweep with [`Self::walk_layer_futures`] (#568 PR 7).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn walk_layers_concatenated<R>(
+    pub(crate) async fn walk_layers_by_strategy<R>(
         &self,
         lsp_uri: &Uri,
         layer_method: &'static str,
@@ -1099,6 +1115,7 @@ impl Kakehashi {
         virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
         host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
         native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
         combine: impl Fn(R, R) -> R,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
         let Ok(uri) = uri_to_url(lsp_uri) else {
@@ -1108,36 +1125,31 @@ impl Kakehashi {
         let Some(host_language) = self.document_language(&uri) else {
             return Ok(None);
         };
+        // ONE resolve for both the strategy decision and the priorities passed
+        // into the race — no torn read across a concurrent settings reload.
         let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
-
-        // Same walk-wide cancel subscription as the preferred walk (see there).
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
-        let race = race_layers_concatenated(&layer_cfg.priorities, virt, host, native, combine);
-        let result = match cancel_rx {
-            Some(mut cancel_rx) => {
-                tokio::select! {
-                    biased;
-                    _ = &mut cancel_rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
-                    result = race => result,
-                }
+        match layer_cfg.strategy {
+            AggregationStrategy::Preferred => {
+                self.run_layer_race(race_layers_preferred(
+                    &layer_cfg.priorities,
+                    virt,
+                    host,
+                    native,
+                    is_nonempty,
+                ))
+                .await
             }
-            None => race.await,
-        };
-        self.bridge
-            .pool_arc()
-            .unregister_all_for_upstream_id(current_upstream_id().as_ref());
-        result
-    }
-
-    /// The cross-layer aggregation strategy configured for `method` on this
-    /// document's host language (`layers.aggregation.<method>.strategy`),
-    /// defaulting to `preferred` when the document language can't be resolved.
-    pub(crate) fn cross_layer_strategy(&self, lsp_uri: &Uri, method: &str) -> AggregationStrategy {
-        uri_to_url(lsp_uri)
-            .ok()
-            .and_then(|uri| self.document_language(&uri))
-            .map(|lang| self.resolve_layer_config(&lang, method).strategy)
-            .unwrap_or(AggregationStrategy::Preferred)
+            AggregationStrategy::Concatenated => {
+                self.run_layer_race(race_layers_concatenated(
+                    &layer_cfg.priorities,
+                    virt,
+                    host,
+                    native,
+                    combine,
+                ))
+                .await
+            }
+        }
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).
