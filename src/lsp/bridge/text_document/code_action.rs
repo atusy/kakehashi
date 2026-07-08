@@ -595,6 +595,30 @@ impl LanguageServerPool {
             resolved.command = None;
         }
 
+        // An empty resolved edit with no command is a no-op — disable it as
+        // unresolvable (`REASON_RESOLVE`) rather than hand the client an enabled
+        // action that applies nothing (mirrors the virt path's empty-edit
+        // policy). Without `disabledSupport`, fail soft to the unresolved action.
+        if resolved.command.is_none() && resolved.edit.as_ref().is_some_and(workspace_edit_is_empty)
+        {
+            if !upstream_caps.disabled_support {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+            resolved.title = resuffix_resolved_title(
+                std::mem::take(&mut resolved.title),
+                suffixed_title,
+                server_name,
+            );
+            resolved.edit = None;
+            resolved.data = None;
+            resolved.is_preferred = None;
+            resolved.disabled = Some(CodeActionDisabled {
+                reason: REASON_RESOLVE.to_string(),
+            });
+            return resolved;
+        }
+
         if !upstream_caps.is_preferred_support {
             resolved.is_preferred = None;
         }
