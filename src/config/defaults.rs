@@ -61,9 +61,11 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
 /// self-documenting — deleting any entry below never changes behavior:
 /// - `layers.aggregation` (cross-layer-aggregation): all three layers in
 ///   `["virt", "host", "native"]` priority, `Preferred` strategy except for
-///   formatting and diagnostics, which combine layers by `Concatenated`.
+///   formatting, diagnostics, and codeAction, which combine layers by
+///   `Concatenated`.
 /// - `bridge` (per-target server aggregation): all bridging enabled, `["*"]`
-///   fan-out, `Preferred` strategy except diagnostics (`Concatenated`).
+///   fan-out, `Preferred` strategy except diagnostics and codeAction
+///   (`Concatenated`).
 fn default_languages() -> HashMap<String, LanguageSettings> {
     HashMap::from([(
         WILDCARD_KEY.to_string(),
@@ -103,6 +105,16 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                             strategy: Some(AggregationStrategy::Concatenated),
                         },
                     ),
+                    (
+                        // codeAction menus merge across layers so every server's
+                        // (and the native layer's) actions show up at once (#568
+                        // PR 7); inherits the wildcard [virt, host, native] order.
+                        "textDocument/codeAction".to_string(),
+                        LayerAggregationConfig {
+                            priorities: None,
+                            strategy: Some(AggregationStrategy::Concatenated),
+                        },
+                    ),
                 ])),
             }),
             bridge: Some(HashMap::from([(
@@ -137,6 +149,17 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                                 // pulled on host events into the proactive cache
                                 // (push-propagation-diagnostic-forwarding).
                                 pull_fallback: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            // Every configured server's code actions are merged
+                            // (in priority order), not just the top server's
+                            // (#568 PR 7). The "{title} — {server}" suffix keeps
+                            // same-named actions distinguishable.
+                            "textDocument/codeAction".to_string(),
+                            AggregationConfig {
+                                strategy: Some(AggregationStrategy::Concatenated),
                                 ..Default::default()
                             },
                         ),
@@ -376,6 +399,7 @@ mod tests {
             "textDocument/formatting",
             "textDocument/diagnostic",
             "textDocument/publishDiagnostics",
+            "textDocument/codeAction",
         ] {
             let entry = agg
                 .get(method)
