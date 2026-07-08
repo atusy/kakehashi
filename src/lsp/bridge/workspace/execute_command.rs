@@ -73,9 +73,19 @@ impl LanguageServerPool {
             merge_bridge_server_configs,
         )?;
 
-        let host_url = Url::parse(&host_uri).ok();
+        // A malformed host_uri must REJECT, not fall through to a client-root
+        // fallback connection (which could execute the command against the
+        // wrong root). The bridge only ever mints a valid `Url::as_str()` here,
+        // so a parse failure means a foreign/corrupt command — fail soft.
+        let Ok(host_url) = Url::parse(&host_uri) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: routed host_uri '{host_uri}' is not a valid URL; ignoring"
+            );
+            return None;
+        };
         let handle = match self
-            .get_or_create_connection(&origin, &config, host_url.as_ref())
+            .get_or_create_connection(&origin, &config, Some(&host_url))
             .await
         {
             Ok(handle) => handle,
