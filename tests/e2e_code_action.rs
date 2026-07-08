@@ -164,7 +164,10 @@ fn open_markdown(client: &mut LspClient) {
             }
         }),
     );
-    std::thread::sleep(Duration::from_millis(1000));
+    // No fixed settle sleep: every caller drives the codeAction request through
+    // a retry loop (`code_action_with_retry` / `code_action_over_fence`, 300 ×
+    // 50ms, waiting for a non-empty result), which already absorbs the cold
+    // downstream handshake — a hard 1s sleep was pure per-test latency.
 }
 
 /// Issue `textDocument/codeAction` over the lua fence line, retrying while
