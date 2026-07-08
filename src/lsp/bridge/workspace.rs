@@ -17,6 +17,10 @@
 pub(in crate::lsp::bridge) mod apply_edit;
 pub(in crate::lsp::bridge) mod configuration;
 pub(in crate::lsp::bridge) mod diagnostic_refresh;
+// The one OUTBOUND method in this namespace (editor → bridge → downstream):
+// routes a bridged command back to its origin server. Kept here so the
+// `workspace/*` surface stays in one directory.
+pub(in crate::lsp::bridge) mod execute_command;
 mod folder_set;
 pub(in crate::lsp::bridge) mod workspace_folders;
 

@@ -610,6 +610,11 @@ impl ConnectionHandle {
                 )
             }
             "textDocument/onTypeFormatting" => caps.document_on_type_formatting_provider.is_some(),
+            // A server handles executeCommand iff it advertises the provider.
+            // The specific command must be one it registered, but the bridge
+            // only forwards commands it surfaced FROM this server's actions, so
+            // provider presence is the right gate (#568 PR 6).
+            "workspace/executeCommand" => caps.execute_command_provider.is_some(),
             // willSave/willSaveWaitUntil live in `textDocumentSync`, and only its
             // `Options` form carries the flags — the bare `Kind` number form
             // advertises neither, so it correctly falls through to false. These
