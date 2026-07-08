@@ -761,8 +761,7 @@ fn main() {
                     // and FAIL FAST on anything else rather than silently
                     // swallowing an interleaved request/notification.
                     match read_message(&mut reader) {
-                        Some(reply)
-                            if reply.get("id").and_then(Value::as_i64) == Some(4000) => {}
+                        Some(reply) if reply.get("id").and_then(Value::as_i64) == Some(4000) => {}
                         other => panic!(
                             "mock executeCommand: expected the applyEdit response (id 4000), \
                              got {other:?}"
