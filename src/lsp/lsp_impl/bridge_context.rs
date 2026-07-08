@@ -289,9 +289,11 @@ pub(crate) async fn race_layers_preferred<R>(
 /// only non-empty ones — it can't test `R` for emptiness generically; the
 /// codeAction layers already collapse empty→`None` before returning, so no
 /// `Some(empty)` reaches the fold.) A layer not in `priorities` is never
-/// awaited, so its future does no work. Errors (e.g. a cancelled layer)
-/// propagate. Ordering is stable by `priorities` regardless of which layer
-/// finishes first, so the merged menu keeps muscle-memory order.
+/// awaited, so its future does no work. The first layer error fails the
+/// aggregation fast, cancelling the other in-flight layers (a whole-request
+/// failure discards their results anyway), matching [`race_layers_preferred`].
+/// Ordering is stable by `priorities` regardless of which layer finishes
+/// first, so the merged menu keeps muscle-memory order.
 pub(crate) async fn race_layers_concatenated<R>(
     priorities: &[LayerSource],
     virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
@@ -301,7 +303,7 @@ pub(crate) async fn race_layers_concatenated<R>(
 ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
     // Only await a layer that's in `priorities`; a lazy future left un-awaited
     // never runs, matching `race_layers_preferred`, which never consults an
-    // excluded layer. All included layers run concurrently under `join!`.
+    // excluded layer. All included layers run concurrently under `try_join!`.
     let virt_arm = async {
         if priorities.contains(&LayerSource::Virt) {
             virt.await
@@ -323,10 +325,7 @@ pub(crate) async fn race_layers_concatenated<R>(
             Ok(None)
         }
     };
-    let (virt_r, host_r, native_r) = tokio::join!(virt_arm, host_arm, native_arm);
-    let mut virt_r = virt_r?;
-    let mut host_r = host_r?;
-    let mut native_r = native_r?;
+    let (mut virt_r, mut host_r, mut native_r) = tokio::try_join!(virt_arm, host_arm, native_arm)?;
 
     // Fold in priority order via `take()` so each layer contributes exactly
     // once even if a (malformed) config lists it twice.
