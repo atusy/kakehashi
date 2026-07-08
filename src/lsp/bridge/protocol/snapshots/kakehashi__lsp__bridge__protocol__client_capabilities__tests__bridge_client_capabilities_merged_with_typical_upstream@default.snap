@@ -4,6 +4,7 @@ expression: merged
 ---
 {
   "workspace": {
+    "applyEdit": true,
     "workspaceFolders": true,
     "configuration": true,
     "diagnostics": {

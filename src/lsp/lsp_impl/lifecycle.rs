@@ -26,8 +26,18 @@ use crate::config::WorkspaceSettings;
 use crate::lsp::client::check_semantic_tokens_refresh_support;
 use crate::lsp::{SettingsSource, load_settings};
 
+use super::apply_edit_translation::ApplyEditTranslator;
 use super::show_document_translation::ShowDocumentTranslator;
 use super::{Kakehashi, uri_to_url};
+
+/// Translators for downstream-initiated request payloads that carry
+/// virtual-document coordinates, bundled so the forwarding loop threads one
+/// handle. Both are built from the same shared (cheaply cloneable) service
+/// handles; `None` for the whole bundle means "forward verbatim" (test loops).
+struct UpstreamRequestTranslators {
+    show_document: ShowDocumentTranslator,
+    apply_edit: ApplyEditTranslator,
+}
 
 fn lsp_legend_types() -> Vec<SemanticTokenType> {
     LEGEND_TYPES
@@ -415,20 +425,29 @@ impl Kakehashi {
         //   window/showMessage, and telemetry/event.
         // - unbounded `upstream_request_rx` (loss-intolerant): downstream
         //   requests forwarded with a response relayed back
-        //   (window/showMessageRequest, window/showDocument).
+        //   (window/showMessageRequest, window/showDocument, workspace/applyEdit).
         if let Some(upstream_rx) = self.bridge.take_upstream_rx()
             && let Some(window_rx) = self.bridge.take_window_rx()
             && let Some(upstream_request_rx) = self.bridge.take_upstream_request_rx()
         {
             let client = self.client.clone();
             let token = self.shutdown_token.clone();
-            // Translates downstream-initiated window/showDocument virtual URIs +
-            // selections back to host coordinates before forwarding (#403).
-            let show_document_translator = Some(Arc::new(ShowDocumentTranslator::new(
-                Arc::clone(&self.documents),
-                Arc::clone(&self.language),
-                Arc::clone(&self.bridge),
-            )));
+            // Translates downstream-initiated payloads carrying virtual-document
+            // coordinates back to the host document before forwarding:
+            // window/showDocument URIs + selections (#403) and
+            // workspace/applyEdit edits (#568).
+            let translators = Some(Arc::new(UpstreamRequestTranslators {
+                show_document: ShowDocumentTranslator::new(
+                    Arc::clone(&self.documents),
+                    Arc::clone(&self.language),
+                    Arc::clone(&self.bridge),
+                ),
+                apply_edit: ApplyEditTranslator::new(
+                    Arc::clone(&self.documents),
+                    Arc::clone(&self.language),
+                    Arc::clone(&self.bridge),
+                ),
+            }));
             let inbound_request_registry = self.bridge.pool().inbound_request_registry();
             // The single proactive diagnostics publisher: region pushes routed up
             // by the reader resolve to a host + region and republish the merged
@@ -440,7 +459,7 @@ impl Kakehashi {
                 upstream_rx,
                 window_rx,
                 upstream_request_rx,
-                show_document_translator,
+                translators,
                 inbound_request_registry,
                 client,
                 diagnostic_publisher,
@@ -661,7 +680,7 @@ async fn upstream_forwarding_loop(
     mut upstream_request_rx: tokio::sync::mpsc::UnboundedReceiver<
         crate::lsp::bridge::UpstreamRequest,
     >,
-    show_document_translator: Option<Arc<ShowDocumentTranslator>>,
+    translators: Option<Arc<UpstreamRequestTranslators>>,
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     client: Client,
     diagnostic_publisher: Option<Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>>,
@@ -747,7 +766,7 @@ async fn upstream_forwarding_loop(
                     Some(request) => {
                         spawn_upstream_request(
                             inbound_request_registry.clone(),
-                            show_document_translator.clone(),
+                            translators.clone(),
                             &client,
                             request,
                         )
@@ -1006,7 +1025,7 @@ async fn forward_with_cancel(
 
 fn spawn_upstream_request(
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
-    show_document_translator: Option<Arc<ShowDocumentTranslator>>,
+    translators: Option<Arc<UpstreamRequestTranslators>>,
     client: &Client,
     request: crate::lsp::bridge::UpstreamRequest,
 ) {
@@ -1059,8 +1078,8 @@ fn spawn_upstream_request(
                 // used (selection translated, or dropped if the offset can't be
                 // rebuilt); only a non-virtual/unresolvable URI is forwarded
                 // unchanged. See `ShowDocumentTranslator::translate`.
-                let params = match &show_document_translator {
-                    Some(translator) => translator.translate(params).await,
+                let params = match &translators {
+                    Some(translators) => translators.show_document.translate(params).await,
                     None => params,
                 };
                 let id = client.next_request_id();
@@ -1077,6 +1096,77 @@ fn spawn_upstream_request(
                     cancel.generation,
                 );
                 let _ = reply.send(success);
+            }
+            UpstreamRequest::ApplyEdit {
+                params,
+                reply,
+                cancel,
+            } => {
+                use tower_lsp_server::ls_types::ApplyWorkspaceEditResponse;
+                // Translate virtual-document edits back to host coordinates
+                // before forwarding (#568). Unlike showDocument there is no
+                // safe degraded forward: an untranslatable edit (unknown/stale
+                // region, virtual-URI file ops, multi-region edit) is answered
+                // `applied: false` locally with a failureReason, never sent to
+                // the editor. See `ApplyEditTranslator::translate`.
+                let params = match &translators {
+                    Some(translators) => translators.apply_edit.translate(params).await,
+                    None => Ok(params),
+                };
+                let response = match params {
+                    Err(failure_reason) => ApplyWorkspaceEditResponse {
+                        applied: false,
+                        failure_reason: Some(failure_reason),
+                        failed_change: None,
+                    },
+                    // Serializing the (typed) translated params ~never fails,
+                    // but forwarding `params: null` on the off chance it did
+                    // would send the editor an invalid request; answer local
+                    // applied:false with a serialization reason instead.
+                    Ok(params) => match serde_json::to_value(params) {
+                        Ok(value) => {
+                            let id = client.next_request_id();
+                            forward_with_cancel(
+                                &client,
+                                id,
+                                "workspace/applyEdit",
+                                value,
+                                &cancel.token,
+                            )
+                            .await
+                            .and_then(|v| {
+                                serde_json::from_value::<ApplyWorkspaceEditResponse>(v).ok()
+                            })
+                            // Editor error/cancel, or a response that didn't
+                            // parse as an ApplyWorkspaceEditResponse: the
+                            // protocol default — the edit was not applied.
+                            .unwrap_or(ApplyWorkspaceEditResponse {
+                                applied: false,
+                                // Covers editor error, cancellation, AND an
+                                // unparseable response — neutral wording (like
+                                // the reader drop-path) so a cancel/transport
+                                // failure isn't misattributed to the editor.
+                                failure_reason: Some(
+                                    "kakehashi: no valid workspace/applyEdit response".to_string(),
+                                ),
+                                failed_change: None,
+                            })
+                        }
+                        Err(e) => ApplyWorkspaceEditResponse {
+                            applied: false,
+                            failure_reason: Some(format!(
+                                "kakehashi: could not serialize the workspace/applyEdit request: {e}"
+                            )),
+                            failed_change: None,
+                        },
+                    },
+                };
+                inbound_request_registry.unregister(
+                    cancel.connection_id,
+                    &cancel.request_id,
+                    cancel.generation,
+                );
+                let _ = reply.send(response);
             }
         }
     });
@@ -2667,6 +2757,146 @@ mod tests {
             .await;
 
         assert!(reply_rx.await.expect("reply delivered"));
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_loop_relays_apply_edit_response() {
+        use crate::lsp::bridge::UpstreamRequest;
+        use futures::{SinkExt, StreamExt};
+        use tower_lsp_server::jsonrpc::Response;
+
+        let (client, mut requests, mut responses) = init_client_and_socket().await;
+
+        // `_upstream_tx`/`_window_tx` kept alive so those channels stay open and
+        // the loop doesn't exit early; this test drives only the request channel.
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ApplyEdit {
+                params: serde_json::from_value(serde_json::json!({
+                    "edit": { "changes": { "file:///x.rs": [] } }
+                }))
+                .unwrap(),
+                reply: reply_tx,
+                cancel: test_forwarded_cancel(),
+            })
+            .unwrap();
+
+        let req = requests.next().await.expect("applyEdit emitted");
+        assert_eq!(req.method(), "workspace/applyEdit");
+        let id = req.id().expect("request has an id").clone();
+        let _ = responses
+            .send(Response::from_ok(
+                id,
+                serde_json::json!({ "applied": true }),
+            ))
+            .await;
+
+        let response = reply_rx.await.expect("reply delivered");
+        assert!(response.applied);
+        assert_eq!(response.failure_reason, None);
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    /// An applyEdit whose edit can't be translated to host coordinates (here: a
+    /// virtual URI no open document maps to) must be answered `applied: false`
+    /// locally — the editor must never see the corrupted edit (#568).
+    #[tokio::test]
+    async fn forwarding_loop_answers_untranslatable_apply_edit_locally() {
+        use crate::lsp::bridge::{BridgeCoordinator, UpstreamRequest, VirtualDocumentUri};
+        use std::str::FromStr;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (client, _requests, _responses) = init_client_and_socket().await;
+
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Real translators over empty stores: the virtual URI resolves to no
+        // open document, so translation rejects the edit.
+        let translators = Some(Arc::new(UpstreamRequestTranslators {
+            show_document: ShowDocumentTranslator::new(
+                Arc::new(crate::document::DocumentStore::new()),
+                Arc::new(crate::language::LanguageCoordinator::new()),
+                Arc::new(BridgeCoordinator::new()),
+            ),
+            apply_edit: ApplyEditTranslator::new(
+                Arc::new(crate::document::DocumentStore::new()),
+                Arc::new(crate::language::LanguageCoordinator::new()),
+                Arc::new(BridgeCoordinator::new()),
+            ),
+        }));
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            translators,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+        ));
+
+        let host = tower_lsp_server::ls_types::Uri::from_str("file:///project/doc.md").unwrap();
+        let virtual_uri =
+            VirtualDocumentUri::new(&host, "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV").to_uri_string();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ApplyEdit {
+                // A NON-empty edit against a virtual URI that resolves to no open
+                // document: the translator can't map it, so the loop must reject
+                // it locally. (An empty edit array would be a no-op forwarded
+                // verbatim — see `collect_virtual_uris`.)
+                params: serde_json::from_value(serde_json::json!({
+                    "edit": { "changes": { virtual_uri: [
+                        { "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 1 }
+                        }, "newText": "x" }
+                    ] } }
+                }))
+                .unwrap(),
+                reply: reply_tx,
+                cancel: test_forwarded_cancel(),
+            })
+            .unwrap();
+
+        // The reply arrives without the editor (`_requests` never serviced)
+        // answering anything — proof the loop answered locally.
+        let response = timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("locally-answered reply must not pend on the editor")
+            .expect("reply delivered");
+        assert!(!response.applied);
+        assert!(
+            response
+                .failure_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("unknown virtual document")),
+            "failureReason should name the failure: {:?}",
+            response.failure_reason
+        );
 
         cancel.cancel();
         let _ = loop_handle.await;

@@ -10,8 +10,9 @@
 //! the right spot.
 //!
 //! The offset is rebuilt from the live parse exactly as the goto path does
-//! (`region_id → node byte range → resolve injection → RegionOffset`), so a
-//! showDocument-to-a-region can't disagree with goto on the same region.
+//! (`region_id → node byte range → resolve injection → RegionOffset`) via the
+//! shared [`resolve_region_offset`](super::region_offset::resolve_region_offset),
+//! so a showDocument-to-a-region can't disagree with goto on the same region.
 //!
 //! Once the URI resolves to a currently-open virtual document, the editor always
 //! gets the **host** document URI. The selection is translated when the region
@@ -34,8 +35,10 @@ use tower_lsp_server::ls_types::ShowDocumentParams;
 use url::Url;
 
 use crate::document::DocumentStore;
-use crate::language::{InjectionResolver, LanguageCoordinator};
+use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, translate_virtual_range_to_host};
+
+use super::region_offset::resolve_region_offset;
 
 /// Translates `window/showDocument` params whose URI is a virtual document back
 /// to the host document + host coordinates. Holds shared (cheaply cloneable)
@@ -112,47 +115,20 @@ impl ShowDocumentTranslator {
         params
     }
 
-    /// Rebuild the region's current host offset from the live parse, keyed by its
-    /// `region_id` (a ULID in production). Mirrors the goto request path's offset
-    /// construction.
+    /// Rebuild the region's current host offset from the live parse via the
+    /// shared [`resolve_region_offset`]. On `None` the caller opens the host
+    /// document without a selection rather than risk a wrong one. showDocument
+    /// only needs the offset (it translates a single selection position, not an
+    /// edit), so the region-end bound is discarded.
     fn region_offset(&self, host_url: &Url, region_id: &str) -> Option<RegionOffset> {
-        let ulid = ulid::Ulid::from_string(region_id).ok()?;
-        let (start_byte, _end, _kind, _layer) =
-            self.bridge.node_tracker().lookup_node(host_url, &ulid)?;
-        // Snapshot is owned, so the document handle (a store lock) is released
-        // before `detect_document_language` reaches back into the store.
-        let snapshot = self.documents.get(host_url)?.snapshot()?;
-        let language_name =
-            super::detect_document_language(&self.language, &self.documents, host_url)?;
-        let injection_query = self.language.injection_query(&language_name)?;
-        let resolved = InjectionResolver::resolve_at_byte_offset(
+        resolve_region_offset(
+            &self.documents,
             &self.language,
-            self.bridge.node_tracker(),
+            &self.bridge,
             host_url,
-            snapshot.tree(),
-            snapshot.text(),
-            injection_query.as_ref(),
-            start_byte,
-        )?;
-        // `region_id`/`start_byte` came from the tracker + node map, but
-        // `resolved` came from a separately-fetched snapshot. If an edit landed
-        // in between, `start_byte` could fall inside a *different* live region —
-        // `resolve_at_byte_offset` returns whichever region contains the byte. A
-        // mismatched `region_id` means we'd translate the selection against the
-        // wrong region, so return `None` (no offset); the caller then opens the
-        // host document without a selection rather than risk a wrong one. (The
-        // goto path can't hit this: there `resolved` and `region_id` come from
-        // one call.)
-        if resolved.region.region_id != region_id {
-            return None;
-        }
-        // `start` is `Copy`; move `line_column_offsets` out (no clone — `resolved`
-        // is dropped after this).
-        let start_line = resolved.region.line_range.start;
-        Some(RegionOffset::with_per_line_offsets(
-            start_line,
-            resolved.line_column_offsets,
-        ))
+            region_id,
+        )
+        .map(|(offset, _region_end)| offset)
     }
 }
 

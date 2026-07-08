@@ -66,7 +66,9 @@ pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
 pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::location_link_to_location;
+pub(crate) use protocol::transform_workspace_edit_to_host;
 pub(crate) use protocol::translate_virtual_range_to_host;
+pub(crate) use protocol::workspace_edit_within_region;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{
     CodeActionEnvelope, CodeLensEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
