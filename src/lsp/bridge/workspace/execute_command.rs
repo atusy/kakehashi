@@ -144,15 +144,41 @@ impl LanguageServerPool {
         let request = JsonRpcRequest::new(request_id.as_i64(), METHOD, &params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        if let Err(e) = handle.send_request(request, request_id) {
-            warn!(
-                target: "kakehashi::bridge",
-                "executeCommand: failed to send request: {e}"
-            );
-            if let Some(ref id) = upstream_id {
-                self.unregister_upstream_request(id, connection_key);
+        // Verify `handle` is still the pool's LIVE connection for its key before
+        // sending, under the `connections` lock: `handle` was fetched earlier
+        // (get_or_create), and a concurrent respawn could have replaced it. Both
+        // the check and the enqueue must hold the lock so the swap can't
+        // interleave — the same guard `execute_bridge_request_with_handle` uses.
+        // Sending on a stale handle would route the request (and its cancel
+        // bookkeeping) to a dead/outdated process. On failure `router_guard`
+        // drops (cleaning the router entry).
+        {
+            let connections = self.connections().await;
+            if !connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, handle))
+            {
+                drop(connections);
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: connection {connection_key} was replaced before send"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
             }
-            return None;
+            if let Err(e) = handle.send_request(request, request_id) {
+                drop(connections);
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: failed to send request: {e}"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
+            }
         }
 
         let response = handle.wait_for_response(request_id, response_rx).await;
