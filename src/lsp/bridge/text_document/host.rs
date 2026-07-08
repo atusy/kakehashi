@@ -292,6 +292,24 @@ impl LanguageServerPool {
         .await?
     }
 
+    /// Whether the host server for `(server_name, uri)` advertises `method`
+    /// (e.g. `codeAction/resolve`). Queried on the cached connection — ~free
+    /// right after a request that already opened it — and fail-closed (`false`)
+    /// when the server can't be reached. Used to decide whether a host lazy
+    /// action can be resolve-routed rather than disabled (#627).
+    pub(crate) async fn host_server_advertises(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        uri: &url::Url,
+        method: &str,
+    ) -> bool {
+        self.get_or_create_connection(server_name, server_config, Some(uri))
+            .await
+            .map(|handle| handle.has_capability(method))
+            .unwrap_or(false)
+    }
+
     /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],
     /// the response keeps formatting's LSP semantics, mirroring
     /// [`Self::send_formatting_request`]: a `null` result from a capable

@@ -1091,3 +1091,117 @@ enabled = true
 
     shutdown(&mut client);
 }
+
+#[test]
+fn e2e_host_bridge_codeaction_resolve_round_trips_verbatim() {
+    // #627: a HOST-layer (bridge._self) lazy code action is enveloped, and its
+    // codeAction/resolve routes back to the host server VERBATIM (no coordinate
+    // translation), materializing the edit on the host document. Guards against
+    // the resolve path being inert (the lsp_impl region-freshness gate must be
+    // skipped for host envelopes, which carry no region).
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("host_ca.toml");
+    std::fs::write(
+        &config_path,
+        "[languages.markdown.bridge._self]\nenabled = true\n",
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf-8 path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": { "codeAction": {
+                    "codeActionLiteralSupport": { "codeActionKind": {
+                        "valueSet": ["quickfix", "source", "source.organizeImports"]
+                    } },
+                    "dataSupport": true,
+                    "resolveSupport": { "properties": ["edit"] },
+                    "disabledSupport": true,
+                    "isPreferredSupport": true
+                } }
+            },
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host": {
+                        "cmd": [mock_bin(), "code-action-lazy"],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": MARKDOWN_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": MARKDOWN
+            }
+        }),
+    );
+
+    // codeAction on the host document -> one lazy action, enveloped (host_layer)
+    // so it can be resolved. Retry while the host connection warms up.
+    let action = (0..300)
+        .find_map(|_| {
+            let resp = client.send_request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": { "uri": MARKDOWN_URI },
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "context": { "diagnostics": [] }
+                }),
+            );
+            let first = resp["result"].as_array().and_then(|a| a.first().cloned());
+            if first.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            first
+        })
+        .expect("host codeAction returns a lazy action");
+
+    assert_eq!(action["title"], "Lazy organize imports — mock-host");
+    assert!(action["edit"].is_null(), "the action is lazy (no edit yet)");
+    assert!(
+        action["data"].is_object(),
+        "a lazy host action carries a routing envelope, got: {action}"
+    );
+
+    // Resolve it -> routes to the host server verbatim; the edit materializes on
+    // the HOST document, and the mock's newText echoes the RESTORED (unsuffixed)
+    // original title.
+    let resolved = client.send_request("codeAction/resolve", action);
+    assert!(
+        resolved.get("error").is_none(),
+        "resolve errored: {resolved}"
+    );
+    let result = &resolved["result"];
+    assert_eq!(
+        result["title"], "Lazy organize imports — mock-host",
+        "resolved title is re-suffixed"
+    );
+    let edits = result["edit"]["changes"][MARKDOWN_URI]
+        .as_array()
+        .unwrap_or_else(|| panic!("resolved edit on the host doc, got: {result}"));
+    assert_eq!(
+        edits[0]["newText"], "organized:Lazy organize imports",
+        "host resolve routed with the original title restored and the edit verbatim"
+    );
+
+    shutdown(&mut client);
+}

@@ -166,13 +166,24 @@ impl Kakehashi {
         // the region's current host-document end, which bounds the resolved
         // edit so a stale/malformed one can't escape the region into unrelated
         // host text (see `translate_edit_host_ward_strict`).
-        let Some(region_end) = self.code_action_region_end_if_fresh(&envelope) else {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "codeAction/resolve: region {} is stale; returning action unresolved",
-                envelope.region_id
-            );
-            return Ok(action);
+        //
+        // Host-layer actions carry no region (verbatim, no translation), so the
+        // gate — which ULID-parses `region_id` and would fail on the empty host
+        // one — is skipped; `region_end` is unused on the host resolve path.
+        let region_end = if envelope.host_layer {
+            Position::default()
+        } else {
+            match self.code_action_region_end_if_fresh(&envelope) {
+                Some(region_end) => region_end,
+                None => {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "codeAction/resolve: region {} is stale; returning action unresolved",
+                        envelope.region_id
+                    );
+                    return Ok(action);
+                }
+            }
         };
 
         let settings = self.settings_manager.load_settings();
@@ -359,19 +370,33 @@ impl Kakehashi {
                         t.upstream_id,
                     )
                     .await?;
-                Ok(raw.and_then(|value| {
-                    let actions = parse_code_actions_leniently(value)?;
-                    Some(bridge_code_actions(
-                        actions,
+                let Some(value) = raw else {
+                    return Ok(None);
+                };
+                let Some(actions) = parse_code_actions_leniently(value) else {
+                    return Ok(None);
+                };
+                // Whether this host server advertises `codeAction/resolve`, so a
+                // host lazy action can be enveloped for resolve-routing back to
+                // it (#627) rather than disabled. Queried on the just-opened
+                // connection.
+                let server_resolves = t
+                    .pool
+                    .host_server_advertises(
                         &t.server_name,
-                        t.uri.as_str(),
-                        upstream_caps,
-                        // Host-layer codeAction/resolve is not bridged, so
-                        // host lazy actions are never enveloped/resolved.
-                        false,
-                        None,
-                    ))
-                }))
+                        &t.server_config,
+                        &t.uri,
+                        "codeAction/resolve",
+                    )
+                    .await;
+                Ok(Some(bridge_code_actions(
+                    actions,
+                    &t.server_name,
+                    t.uri.as_str(),
+                    upstream_caps,
+                    server_resolves,
+                    None,
+                )))
             }
         };
         let result = match ctx.strategy {

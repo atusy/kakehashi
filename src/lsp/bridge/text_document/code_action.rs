@@ -74,6 +74,13 @@ pub(crate) struct CodeActionEnvelope {
     pub(crate) original_title: String,
     /// The downstream server's original `data` value (preserved verbatim).
     pub(crate) inner: Option<Value>,
+    /// Host-layer action (`bridge._self`): its edit/data are already in host
+    /// coordinates, so resolve routes to the host server VERBATIM — no virtual
+    /// URI, region, or offset translation. `region_id`/`injection_language`/
+    /// `offset` are unused for these. Defaults to `false` (virt layer) so
+    /// existing enveloped actions deserialize unchanged.
+    #[serde(default)]
+    pub(crate) host_layer: bool,
 }
 
 /// Everything needed to wrap an action's `data` in a routing envelope.
@@ -97,6 +104,32 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
         offset: EnvelopeOffset::from(ctx.offset),
         original_title: action.title.clone(),
         inner,
+        host_layer: false,
+    };
+    action.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+}
+
+/// Wrap a HOST-layer action's `data` in a routing envelope so a later
+/// `codeAction/resolve` routes back to the host server. The host document is
+/// forwarded verbatim, so no region/offset is captured (`host_layer = true`
+/// tells the resolve path to skip all coordinate translation). Captures the
+/// CURRENT (unsuffixed) title as `original_title`; call before suffixing.
+fn envelope_host_action(action: &mut CodeAction, server_name: &str, host_uri: &str) {
+    let inner = action.data.take();
+    let envelope = CodeActionEnvelope {
+        origin: server_name.to_string(),
+        host_uri: host_uri.to_string(),
+        region_id: String::new(),
+        injection_language: String::new(),
+        // Unused on the host path (resolve forwards verbatim); a zero offset.
+        offset: EnvelopeOffset {
+            line: 0,
+            column: 0,
+            line_column_offsets: None,
+        },
+        original_title: action.title.clone(),
+        inner,
+        host_layer: true,
     };
     action.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
 }
@@ -138,6 +171,7 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
             offset: envelope.offset.clone(),
             original_title: envelope.original_title.clone(),
             inner,
+            host_layer: envelope.host_layer,
         }
     }));
 }
@@ -453,6 +487,20 @@ impl LanguageServerPool {
             return action;
         };
 
+        // Host-layer actions are already in host coordinates — route their
+        // resolve to the host server VERBATIM (no translation, #627).
+        if envelope.host_layer {
+            return self
+                .send_host_code_action_resolve(
+                    &config,
+                    action,
+                    envelope,
+                    upstream_caps,
+                    upstream_id,
+                )
+                .await;
+        }
+
         self.send_code_action_resolve_request(
             &config,
             action,
@@ -462,6 +510,114 @@ impl LanguageServerPool {
             region_end,
         )
         .await
+    }
+
+    /// Route a HOST-layer `codeAction/resolve` back to its host server VERBATIM:
+    /// the action is already in host coordinates, so nothing is translated. Same
+    /// policy as [`Self::send_code_action_resolve_request`] (restore title →
+    /// forward → disable / command-route / isPreferred / suffix / strip-or-
+    /// re-envelope) MINUS coordinate translation and the host-ward edit
+    /// validation (a host edit needs neither). Fails soft (returns the action
+    /// unresolved, envelope restored) at every step.
+    async fn send_host_code_action_resolve(
+        &self,
+        server_config: &BridgeServerConfig,
+        mut action: CodeAction,
+        mut envelope: CodeActionEnvelope,
+        upstream_caps: UpstreamCodeActionCaps,
+        upstream_id: Option<UpstreamId>,
+    ) -> CodeAction {
+        let server_name = &envelope.origin;
+        let host_url = Url::parse(&envelope.host_uri).ok();
+        let handle = match self
+            .get_or_create_connection(server_name, server_config, host_url.as_ref())
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve (host): failed to connect to {server_name}: {e}"
+                );
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+        };
+        if !handle.has_capability("codeAction/resolve") {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+
+        // Forward with the ORIGINAL (unsuffixed) title restored; keep the
+        // suffixed title to re-apply. Host coordinates: no range translation.
+        let mut outgoing = action.clone();
+        let suffixed_title =
+            std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
+
+        let Some(mut resolved) = self
+            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
+            .await
+        else {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        };
+
+        // Disabled resolve → surface disabled (strip payload) with
+        // disabledSupport, else fail soft to the unresolved action.
+        if resolved.disabled.is_some() {
+            if !upstream_caps.disabled_support {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+            resolved.title = resuffix_resolved_title(
+                std::mem::take(&mut resolved.title),
+                suffixed_title,
+                server_name,
+            );
+            resolved.edit = None;
+            resolved.command = None;
+            resolved.data = None;
+            resolved.is_preferred = None;
+            return resolved;
+        }
+
+        // A materialized command must route back to the host server via
+        // executeCommand; drop it if the routing name can't be encoded.
+        if resolved
+            .command
+            .as_mut()
+            .and_then(|command| {
+                encode_command(server_name, &envelope.host_uri, &command.command)
+                    .map(|encoded| command.command = encoded)
+            })
+            .is_none()
+        {
+            resolved.command = None;
+        }
+
+        if !upstream_caps.is_preferred_support {
+            resolved.is_preferred = None;
+        }
+
+        // The resolved edit is already in host coordinates — kept verbatim (no
+        // cross-region / translation concern the virt path guards against).
+        let server_title = std::mem::take(&mut resolved.title);
+        resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
+
+        // Materialized (edit or command) → strip the envelope; still lazy →
+        // re-envelope for a further resolve, syncing a server-changed title.
+        if resolved.edit.is_some() || resolved.command.is_some() {
+            resolved.data = None;
+        } else {
+            if !server_title.is_empty() {
+                envelope.original_title = server_title;
+            }
+            if resolved.data.is_none() {
+                resolved.data = action.data.take();
+            }
+            re_envelope_action(&mut resolved, &envelope);
+        }
+        resolved
     }
 
     /// Reconnect to the origin `(server, root)`, restore the original title,
@@ -1056,27 +1212,32 @@ fn bridge_code_action(
             // disabled placeholder (the PR 3 behavior) rather than dropping it,
             // so `disabledSupport` clients see why it can't run.
             //
-            // Deliberate scope boundary: `data` presence is an intrinsic lazy
-            // signal needing no capability plumbing, so it is the host gate.
-            // Recognizing a TITLE-ONLY host lazy action (LSP 3.18) would require
-            // threading the host server's `resolveProvider` through
-            // `send_host_raw_request` — but the resulting placeholder could
-            // never be resolved (host resolve is unbridged), so it would be pure
-            // menu clutter. This matches PR 3 exactly (its `data.is_some() ||
-            // server_resolves` gate also dropped title-only host lazy actions)
-            // and is deferred alongside host-layer resolve support, not a
-            // regression.
+            // Now that host-layer resolve is bridged (#627), the host gate
+            // mirrors the virt one: a title-only action (LSP 3.18, no `data`)
+            // from a host server advertising `resolveProvider` is a resolvable
+            // lazy action, not clutter — `server_resolves` recognizes it. A
+            // `data`-carrying action stays lazy regardless (an intrinsic lazy
+            // signal), so a resolving server can complete it and a non-resolving
+            // one still surfaces it disabled below (#615 item 2).
             let is_lazy = match virt {
                 Some(_) => server_resolves,
-                None => action.data.is_some(),
+                None => action.data.is_some() || server_resolves,
             };
             if is_lazy {
-                // Envelope it (virt layer) if the client can resolve the edit,
-                // so a later `codeAction/resolve` routes back to the origin;
-                // otherwise it can never be completed — disable it (an
+                // Virt layer: envelope if the client can resolve the edit, so a
+                // later `codeAction/resolve` routes back to the origin (an
                 // eager-resolve pass already ran for non-envelope clients).
                 if let Some(virt) = virt.filter(|_| upstream_caps.can_envelope()) {
                     envelope_action_data(&mut action, &virt.envelope_ctx());
+                    action.title = suffix_title(action.title, server_name);
+                    return Some(CodeActionOrCommand::CodeAction(action));
+                }
+                // Host layer: if the host server advertises `resolveProvider`
+                // and the client can envelope, route resolve back to it VERBATIM
+                // (host coordinates, no translation — #627). Otherwise it can
+                // never be completed here, so disable it.
+                if virt.is_none() && server_resolves && upstream_caps.can_envelope() {
+                    envelope_host_action(&mut action, server_name, host_uri);
                     action.title = suffix_title(action.title, server_name);
                     return Some(CodeActionOrCommand::CodeAction(action));
                 }
@@ -1891,6 +2052,125 @@ mod tests {
         let route = crate::lsp::bridge::decode_command(&command.command).expect("routed name");
         assert_eq!(route.origin, "marksman");
         assert_eq!(route.command, "lint.run");
+    }
+
+    #[test]
+    fn host_lazy_action_is_enveloped_for_host_resolve_when_server_resolves() {
+        // A data-carrying host lazy action + a host server advertising resolve +
+        // an envelope-capable client → enveloped with `host_layer = true` so its
+        // resolve routes back to the host server, NOT disabled (#627).
+        let actions: Vec<CodeActionOrCommand> =
+            serde_json::from_value(json!([{ "title": "Organize imports", "data": { "id": 1 } }]))
+                .unwrap();
+        let bridged = bridge_code_actions(
+            actions,
+            "marksman",
+            "file:///test.md",
+            caps_resolve(),
+            true, // host server advertises codeAction/resolve
+            None, // host layer
+        );
+        assert_eq!(bridged.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert!(
+            action.disabled.is_none(),
+            "a resolvable host lazy action must be enveloped, not disabled"
+        );
+        assert_eq!(action.title, "Organize imports — marksman");
+        let env = extract_code_action_envelope(action).expect("host envelope present");
+        assert!(
+            env.host_layer,
+            "host_layer must be set for host-resolve routing"
+        );
+        assert_eq!(env.origin, "marksman");
+        assert_eq!(env.host_uri, "file:///test.md");
+        assert_eq!(env.original_title, "Organize imports");
+    }
+
+    #[test]
+    fn host_lazy_action_is_disabled_when_host_server_does_not_resolve() {
+        // Same action, but the host server does NOT advertise resolve → the
+        // bridge can't complete it, so it is disabled (pre-#627 behavior).
+        let actions: Vec<CodeActionOrCommand> =
+            serde_json::from_value(json!([{ "title": "Organize imports", "data": { "id": 1 } }]))
+                .unwrap();
+        let bridged = bridge_code_actions(
+            actions,
+            "marksman",
+            "file:///test.md",
+            caps_resolve(),
+            false, // host server does NOT advertise resolve
+            None,
+        );
+        let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(action.disabled.as_ref().unwrap().reason, REASON_RESOLVE);
+        assert!(extract_code_action_envelope(action).is_none());
+    }
+
+    #[test]
+    fn envelope_without_host_layer_field_defaults_to_virt() {
+        // Backward compat: an envelope serialized before the field existed must
+        // deserialize as a virt-layer envelope (host_layer = false).
+        let env: CodeActionEnvelope = serde_json::from_value(json!({
+            "origin": "ruff",
+            "host_uri": "file:///x.md",
+            "region_id": "REGION",
+            "injection_language": "python",
+            "offset": { "line": 0, "column": 0 },
+            "original_title": "t",
+            "inner": null
+        }))
+        .expect("deserializes without host_layer");
+        assert!(!env.host_layer);
+    }
+
+    #[test]
+    fn title_only_host_lazy_action_is_enveloped_when_server_resolves() {
+        // #615 item 2: a TITLE-ONLY host action (no data/edit/command) from a
+        // host server advertising resolve is a resolvable lazy action —
+        // enveloped for host-resolve routing, not dropped as clutter.
+        let actions: Vec<CodeActionOrCommand> =
+            serde_json::from_value(json!([{ "title": "Fix all" }])).unwrap();
+        let bridged = bridge_code_actions(
+            actions,
+            "marksman",
+            "file:///test.md",
+            caps_resolve(),
+            true,
+            None,
+        );
+        assert_eq!(bridged.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert!(action.disabled.is_none(), "must be enveloped, not disabled");
+        let env = extract_code_action_envelope(action).expect("host envelope present");
+        assert!(env.host_layer);
+        assert_eq!(env.original_title, "Fix all");
+    }
+
+    #[test]
+    fn title_only_host_action_is_dropped_when_server_does_not_resolve() {
+        // Without host resolve support a title-only host action can never do
+        // anything, so it is dropped (not surfaced as menu clutter).
+        let actions: Vec<CodeActionOrCommand> =
+            serde_json::from_value(json!([{ "title": "Fix all" }])).unwrap();
+        let bridged = bridge_code_actions(
+            actions,
+            "marksman",
+            "file:///test.md",
+            caps_resolve(),
+            false,
+            None,
+        );
+        assert!(
+            bridged.is_empty(),
+            "a title-only non-resolvable host action is dropped"
+        );
     }
 
     // ==========================================================================
