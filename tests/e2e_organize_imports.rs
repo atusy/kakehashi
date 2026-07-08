@@ -95,11 +95,20 @@ fn apply_edits(text: &str, edits: &[Value]) -> String {
         let mut off = 0usize;
         for (i, l) in text.split_inclusive('\n').enumerate() {
             if i as u64 == line {
-                return off + (character as usize).min(l.len());
+                // Don't clamp: an out-of-line character means the bridge
+                // produced an invalid host range (the very thing under test), so
+                // fail loudly instead of normalizing it into a plausible edit.
+                let content = l.strip_suffix('\n').unwrap_or(l);
+                assert!(
+                    character as usize <= content.len(),
+                    "edit character {character} past end of host line {line} ({:?})",
+                    content
+                );
+                return off + character as usize;
             }
             off += l.len();
         }
-        off
+        panic!("edit line {line} past end of host document");
     };
     let mut spans: Vec<(usize, usize, String)> = edits
         .iter()
@@ -276,9 +285,12 @@ fn diagnostic_drives_a_quickfix_on_the_python_block() {
         applied.contains("import os") && applied.contains("print(os)"),
         "the used import and body must remain, got:\n{applied}"
     );
+    // Both fence markers survive: the opening ```python and the CLOSING ``` (a
+    // bad translation that also ate the closing fence would otherwise slip past
+    // an opening-marker-only check).
     assert!(
-        applied.contains("```python") && applied.contains("# Doc"),
-        "the host markdown structure must remain, got:\n{applied}"
+        applied.contains("```python") && applied.contains("# Doc") && applied.ends_with("```\n"),
+        "the host markdown structure (both fence markers) must remain, got:\n{applied}"
     );
 
     let _ = client.send_request("shutdown", json!(null));
