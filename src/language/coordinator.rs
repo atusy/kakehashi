@@ -1521,6 +1521,80 @@ mod tests {
         );
     }
 
+    /// Two callers racing the SAME cold language must run the load exactly
+    /// once: only the winner's `try_load_language_by_id` runs and returns the
+    /// "no search paths" event; the other caller (parked-then-cached, or
+    /// arrived after the negative-cache entry landed) re-derives its verdict
+    /// and returns an empty `LanguageLoadResult::default()`. Deleting the
+    /// single-flight would let BOTH run the load -> two event-bearing results.
+    /// Also pins the loser-gets-empty-events-on-failure contract.
+    #[tokio::test]
+    async fn two_concurrent_callers_run_the_load_once() {
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let a = Arc::clone(&coordinator);
+        let b = Arc::clone(&coordinator);
+        let (ra, rb) = tokio::join!(
+            async move { a.ensure_language_loaded_async("nosuchlang").await },
+            async move { b.ensure_language_loaded_async("nosuchlang").await },
+        );
+
+        let with_events = [&ra, &rb].iter().filter(|r| !r.events.is_empty()).count();
+        assert_eq!(
+            with_events, 1,
+            "the load must run once, not once per caller"
+        );
+        assert!(!ra.success && !rb.success, "no search paths -> both fail");
+        assert!(
+            coordinator.load_inflight.is_empty(),
+            "the RAII guard must clear the in-flight marker on exit"
+        );
+    }
+
+    /// The 1s [`LANGUAGE_LOAD_WAIT_TIMEOUT`] backstop must free a loser whose
+    /// wakeup was lost. Simulate the lost wakeup by removing the winner's
+    /// marker WITHOUT notifying: only the backstop can now unpark the loser,
+    /// which loops back and (finding no marker) becomes its own winner.
+    /// Deleting the `sleep` arm makes this hang -> test timeout.
+    ///
+    /// NOTE: this pins the backstop's *recovery value*, not the `enable()` +
+    /// `winner_live` recheck of the lost-wakeup fix (b428a1f9c) directly. That
+    /// recheck branch is only reachable under true cross-thread timing — the
+    /// loser prologue from `load_inflight.get()` through the recheck runs in a
+    /// single uninterrupted poll with no `.await` seam, so a current-thread
+    /// runtime cannot place a winner's `remove_if`+`notify_waiters()` at the
+    /// one instant that would diverge the two branches. It is therefore not
+    /// deterministically testable; a timing-based stress test was
+    /// deliberately omitted to keep the suite flake-free.
+    #[tokio::test(start_paused = true)]
+    async fn parked_loser_recovers_via_backstop_when_wake_is_lost() {
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        coordinator
+            .load_inflight
+            .insert("nosuchlang".to_string(), Arc::clone(&notify));
+
+        let loser = Arc::clone(&coordinator);
+        let request =
+            tokio::spawn(async move { loser.ensure_language_loaded_async("nosuchlang").await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "the loser must park while the marker is live"
+        );
+
+        // Remove the marker but never notify: a lost wakeup. Only the backstop
+        // can free the loser now.
+        coordinator.load_inflight.remove("nosuchlang");
+        tokio::time::sleep(LANGUAGE_LOAD_WAIT_TIMEOUT + std::time::Duration::from_millis(1)).await;
+
+        let result = request.await.expect("the loser must not panic");
+        assert!(
+            !result.success,
+            "loops back, becomes winner, fast-fails on no search paths"
+        );
+    }
+
     #[test]
     fn test_injection_direct_identifier_first() {
         let coordinator = LanguageCoordinator::new();
