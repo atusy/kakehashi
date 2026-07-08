@@ -322,7 +322,9 @@ impl LanguageServerPool {
             request_virtual_uri: &virtual_uri_string,
             host_uri: &host_uri_lsp,
             offset: &offset,
-            region_end: region_host_end(virtual_content, &offset),
+            // Reuse the value computed for phase 1 (line ~272): deterministic in
+            // `(virtual_content, offset)`, which are unchanged here.
+            region_end,
             region_id,
             injection_language,
             host_uri_string: host_uri.as_str(),
