@@ -148,12 +148,14 @@ impl LanguageServerPool {
             // The connection that advertised the command is still Ready — route
             // there, preserving its workspace root/context.
             Some(handle) => handle,
-            // Not Ready or gone. A client-root reconnect would run the command
-            // against the WRONG workspace for a marker/shared-rooted server, so
-            // only fall back when the advertising key was ITSELF the client-root
-            // fallback; otherwise fail soft (the user re-fires once the server is
-            // back). Reconstructing the marker root here is a deferred follow-up.
-            None if key.is_client_fallback() => {
+            // Not Ready or gone. Reconnect when routing doesn't depend on a
+            // specific marker root — a client-root fallback or a shared instance
+            // (`preferSharedInstance`) both reconnect correctly with
+            // `document_uri = None`. For a MARKER-rooted server a client-root
+            // reconnect would run the command against the WRONG workspace, so fail
+            // soft (the user re-fires once the server is back); reconstructing the
+            // marker root here is a deferred follow-up.
+            None if key.is_client_fallback() || key.is_shared() => {
                 if !crate::config::is_server_spawnable(&settings.language_servers, origin) {
                     return None;
                 }

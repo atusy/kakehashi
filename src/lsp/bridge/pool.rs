@@ -1717,8 +1717,15 @@ impl LanguageServerPool {
                         // palette lists them. Fire-and-forget; skipped when the
                         // client can't accept a dynamic registration.
                         if !added.is_empty() && supports_dynamic_command_registration {
-                            let _ = upstream_request_tx
-                                .send(UpstreamRequest::RegisterCommands { commands: added });
+                            if let Err(e) = upstream_request_tx
+                                .send(UpstreamRequest::RegisterCommands { commands: added })
+                            {
+                                log::warn!(
+                                    target: "kakehashi::bridge",
+                                    "Failed to queue palette-command registration \
+                                     (forwarding loop gone): {e}"
+                                );
+                            }
                         }
                     }
                     Ok(())

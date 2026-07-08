@@ -1070,11 +1070,23 @@ fn spawn_upstream_request(
                     method: "workspace/executeCommand".to_string(),
                     register_options: Some(serde_json::json!({ "commands": commands })),
                 };
-                if let Err(e) = client.register_capability(vec![registration]).await {
-                    log::warn!(
+                // Bound the await: a non-responsive editor must not leak a task
+                // pending forever on the registration request.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.register_capability(vec![registration]),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::warn!(
                         target: "kakehashi::bridge",
                         "Failed to register palette commands upstream: {e}"
-                    );
+                    ),
+                    Err(_) => log::warn!(
+                        target: "kakehashi::bridge",
+                        "Timed out registering palette commands upstream"
+                    ),
                 }
             }
             UpstreamRequest::ShowMessageRequest {

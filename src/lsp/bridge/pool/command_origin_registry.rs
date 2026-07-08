@@ -27,9 +27,14 @@ pub(crate) struct CommandOriginRegistry {
 
 impl CommandOriginRegistry {
     /// Record `commands` as advertised by the connection `key`, returning the
-    /// subset that was NEWLY added (not already registered under any connection).
-    /// The caller advertises only the new names upstream, so a server respawn or
-    /// a second root re-advertises nothing (dedup by construction).
+    /// subset that is NEWLY seen (never registered before).
+    ///
+    /// The routing target is ALWAYS updated to `key` — a server respawned under a
+    /// different root, or a different server that later advertises the same name,
+    /// must route to the CURRENT live connection, not a stale one. Only the
+    /// genuinely-new names are returned, though: the command NAME is already
+    /// registered with the editor, so re-advertising it would be a duplicate
+    /// registration.
     pub(crate) fn register(&self, key: &ConnectionKey, commands: &[String]) -> Vec<String> {
         let mut origins = self
             .origins
@@ -37,7 +42,11 @@ impl CommandOriginRegistry {
             .recover_poison("CommandOriginRegistry::register");
         let mut added = Vec::new();
         for command in commands {
-            if !origins.contains_key(command) {
+            if let Some(existing) = origins.get_mut(command) {
+                // Re-point routing to the current owner; don't re-advertise (and
+                // don't clone the key string — the entry already exists).
+                *existing = key.clone();
+            } else {
                 origins.insert(command.clone(), key.clone());
                 added.push(command.clone());
             }
@@ -60,27 +69,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn register_dedups_and_reports_only_new_names() {
+    fn register_reports_only_new_names_but_always_updates_routing() {
         let reg = CommandOriginRegistry::default();
-        let ruff = ConnectionKey::new("ruff", Some("/w".to_string()));
-        let pyright = ConnectionKey::new("pyright", Some("/w".to_string()));
+        let ruff_a = ConnectionKey::new("ruff", Some("/w/a".to_string()));
+        let ruff_b = ConnectionKey::new("ruff", Some("/w/b".to_string()));
 
         assert_eq!(
-            reg.register(&ruff, &["ruff.fix".to_string(), "ruff.sort".to_string()]),
+            reg.register(&ruff_a, &["ruff.fix".to_string(), "ruff.sort".to_string()]),
             vec!["ruff.fix".to_string(), "ruff.sort".to_string()]
         );
-        // A respawn / second root re-registers nothing new.
-        assert!(reg.register(&ruff, &["ruff.fix".to_string()]).is_empty());
-        // A different server contributes only its unseen names.
+        assert_eq!(reg.route("ruff.fix").as_ref(), Some(&ruff_a));
+
+        // A respawn under a DIFFERENT root re-advertises nothing new (the name is
+        // already registered with the editor) but RE-POINTS routing to the live
+        // connection, so a palette command reaches the current process.
+        assert!(reg.register(&ruff_b, &["ruff.fix".to_string()]).is_empty());
         assert_eq!(
-            reg.register(
-                &pyright,
-                &["ruff.fix".to_string(), "pyright.org".to_string()]
-            ),
-            vec!["pyright.org".to_string()]
+            reg.route("ruff.fix").as_ref(),
+            Some(&ruff_b),
+            "routing must follow the current owner, not stay on the stale root"
         );
-        assert_eq!(reg.route("ruff.fix").as_ref(), Some(&ruff));
-        assert_eq!(reg.route("pyright.org").as_ref(), Some(&pyright));
+
         assert_eq!(reg.route("unknown.cmd"), None);
     }
 }
