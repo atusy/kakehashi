@@ -99,6 +99,8 @@ fn completion_response_has_result(resp: &CompletionResponse) -> bool {
 }
 
 fn completion_list_has_result(list: &CompletionList) -> bool {
+    // Keep the incomplete-empty rule in sync with `is_empty_layer_value`,
+    // which applies the same LSP CompletionList semantics to raw JSON.
     list.is_incomplete || !list.items.is_empty()
 }
 
