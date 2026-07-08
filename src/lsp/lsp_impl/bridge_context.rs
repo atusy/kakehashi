@@ -201,6 +201,14 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
     if let Some(object) = value.as_object() {
         for key in ["items", "signatures", "ranges"] {
             if let Some(list) = object.get(key).and_then(serde_json::Value::as_array) {
+                if key == "items"
+                    && object
+                        .get("isIncomplete")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    return false;
+                }
                 return list.is_empty();
             }
         }
@@ -2371,5 +2379,25 @@ mod tests {
                 "{method} must be prefiltered"
             );
         }
+    }
+
+    #[test]
+    fn incomplete_empty_completion_list_is_not_empty_layer_value() {
+        let value = serde_json::json!({
+            "isIncomplete": true,
+            "items": []
+        });
+
+        assert!(!is_empty_layer_value(&value));
+    }
+
+    #[test]
+    fn complete_empty_completion_list_is_empty_layer_value() {
+        let value = serde_json::json!({
+            "isIncomplete": false,
+            "items": []
+        });
+
+        assert!(is_empty_layer_value(&value));
     }
 }
