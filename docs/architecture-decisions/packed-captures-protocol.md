@@ -110,14 +110,19 @@ type MetadataTable = {
 };
 type Metadata = { [key: string]: string | true };  // as captures-protocol
 
+type MatchBlock = {
+  matches: MatchColumns;
+  captures: CaptureColumns;
+  metadata?: MetadataTable;
+  // `matchId` values are rebased to 0-based within the block; the client
+  // offsets them by the edit's `start` on splice. All legend indices reference
+  // the result-wide legend.
+};
+
 type PackedDelta = {
   resultId: string;
   edits: { start: number; deleteCount: number; data: MatchBlock }[];
 };
-// A MatchBlock is a self-contained packed chunk for the inserted matches:
-// { matches: MatchColumns, captures: CaptureColumns, metadata?: MetadataTable }
-// referencing the SAME result-wide legend, with matchId rebased to 0-based
-// within the block (client offsets by `start` on splice).
 
 type PackedRangeResult = { legend: Legend; matches: MatchColumns; captures: CaptureColumns; metadata?: MetadataTable; skipped: SkippedPattern[] };
 ```
@@ -140,6 +145,8 @@ Reused from captures-protocol at **match granularity**, unchanged in spirit:
 
 - Positions stay **absolute**, so "equal per-match JSON = identical match" still holds and the prefix/suffix single-edit diff applies over the internal `Vec<Match>` exactly as today. Going relative/delta-encoded (true semanticTokens style) would break that property — an upstream shift changes every downstream relative value — and force the semanticTokens integer-array delta instead. Rejected; positions are an absolute 4-int column.
 - An edit is `{ start, deleteCount, data }` where `data` is a `MatchBlock`. The client splices `matches` columns `[start, start+deleteCount)` with the block's, deletes the **contiguous** capture slice belonging to those matches (the ordering invariant guarantees contiguity), inserts the block's capture columns, and offsets the block's rebased `matchId` by `start`.
+- If the inserted match count differs from `deleteCount`, the client also rebases every surviving capture whose existing `matchId >= start + deleteCount` by `insertedMatchCount - deleteCount`; otherwise those captures point at the wrong trailing match after the splice.
+- Metadata keys are absolute indices and shift with their columns. The client removes `metadata.match` entries in `[start, start+deleteCount)`, shifts later match keys by `insertedMatchCount - deleteCount`, offsets incoming block match metadata keys by `start`, and applies the same remove/shift/offset rule to `metadata.capture` using the deleted capture slice start/count and the inserted capture count.
 - `resultId` lineage, stale-id fallback, both-modes-live → `null`, and `didClose` serialization are identical to captures-protocol §"Delta semantics" — same code, different serializer.
 
 The `legend` is shipped in `full`/`range` and referenced (not re-sent) by deltas; it is stable across a lineage because a config reload that could change it invalidates the lineage (→ new `full`). This is precisely why the encoding must **carry its own legend** rather than assume a fixed one like `textDocument/semanticTokens`: capture legends are query-dependent.
