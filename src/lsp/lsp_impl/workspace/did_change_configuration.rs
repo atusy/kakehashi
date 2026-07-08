@@ -123,20 +123,20 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
     let mut warnings = Vec::new();
     let mut raw_value = inner.clone();
 
-    if let Some(raw_object) = raw_value.as_object_mut() {
-        if let Some(root_object) = value.as_object() {
-            for (key, candidate) in root_object {
-                if key == "settings" || key == "kakehashi" {
-                    continue;
-                }
+    if let Some(raw_object) = raw_value.as_object_mut()
+        && let Some(root_object) = value.as_object()
+    {
+        for (key, candidate) in root_object {
+            if key == "settings" || key == "kakehashi" {
+                continue;
+            }
 
-                if is_known_configuration_key(key) {
-                    raw_object
-                        .entry(key.clone())
-                        .or_insert_with(|| candidate.clone());
-                } else {
-                    warnings.push(key.clone());
-                }
+            if is_known_configuration_key(key) {
+                raw_object
+                    .entry(key.clone())
+                    .or_insert_with(|| candidate.clone());
+            } else {
+                warnings.push(key.clone());
             }
         }
     }
