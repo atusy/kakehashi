@@ -180,7 +180,11 @@ impl LanguageCoordinator {
     /// through `spawn_blocking`, and single-flights concurrent callers for
     /// the same language through [`load_inflight`](Self::load_inflight) so a
     /// request burst against one cold language (or a host document injecting
-    /// it into many regions) loads it exactly once.
+    /// it into many regions) collapses to a single load in the common case.
+    /// Not a hard exactly-once guarantee: the synchronous
+    /// `ensure_language_loaded` path does not participate (see `load_inflight`),
+    /// and a cancelled winner can be briefly double-loaded — both are benign,
+    /// idempotent re-registers.
     ///
     /// Only the winner's [`LanguageLoadResult`] carries the load's events
     /// (log messages, warnings) — a loser that parked and woke re-derives
@@ -226,10 +230,20 @@ impl LanguageCoordinator {
                         let notify = Arc::new(tokio::sync::Notify::new());
                         vacant.insert(Arc::clone(&notify));
                         // RAII: removes the marker and wakes every parked
-                        // loser on ANY exit from here (success, failure, or
-                        // a panic unwinding through `spawn_blocking`'s
-                        // JoinError) — a load that never wakes its losers
-                        // would wedge the language forever under a burst.
+                        // loser on ANY exit from this arm — a normal return
+                        // (load succeeded or failed), a panic INSIDE the
+                        // closure (caught and surfaced as a `JoinError` value
+                        // below, so the fn still returns normally), OR this
+                        // future being dropped mid-`.await` by request
+                        // cancellation. Cancellation is why RAII is required:
+                        // the detached `spawn_blocking` closure runs on to
+                        // completion and registers the language, but the
+                        // marker must be cleared and losers woken NOW, or a
+                        // loser re-parks every backstop interval indefinitely.
+                        // A loser promoted by that cancellation may briefly
+                        // double-load; benign — `immortal_library` caches the
+                        // dlopen and registry/query inserts are idempotent
+                        // overwrites.
                         let _guard = LanguageLoadFlightGuard {
                             map: &self.load_inflight,
                             key: language_id.to_string(),
@@ -267,8 +281,11 @@ impl LanguageCoordinator {
             // first poll, where a winner whose load finishes in that gap
             // (e.g. the `search_paths.is_empty()` fast-fail) removes the
             // marker and calls `notify_waiters()` before we're registered
-            // to receive it, hanging this task forever (no future winner
-            // for this language creates a fresh `Notify` to wake it). The
+            // to receive it. A bare `notify.notified().await` here would then
+            // block on a notification that already fired, resolving only via
+            // the 1s backstop below (and, without it, never — no future
+            // winner for this language creates a fresh `Notify` to wake it).
+            // The
             // re-check after `enable()` catches a winner that already
             // exited before we registered — its `notify_waiters()` preceded
             // our `enable()`, so we skip waiting and loop back immediately
