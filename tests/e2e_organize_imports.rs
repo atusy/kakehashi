@@ -23,8 +23,10 @@ use helpers::lsp_client::LspClient;
 use serde_json::{Value, json};
 
 fn is_ruff_available() -> bool {
+    // Probe the `server` SUBCOMMAND, not just `--version`: an older ruff without
+    // the built-in LSP would otherwise not skip and instead hang the bridge.
     std::process::Command::new("ruff")
-        .arg("--version")
+        .args(["server", "--help"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -32,7 +34,9 @@ fn is_ruff_available() -> bool {
 
 fn resolve_support_caps() -> Value {
     json!({ "textDocument": { "codeAction": {
-        "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [] } },
+        "codeActionLiteralSupport": { "codeActionKind": {
+            "valueSet": ["quickfix", "source", "source.organizeImports"]
+        } },
         "disabledSupport": true,
         "dataSupport": true,
         "resolveSupport": { "properties": ["edit"] },
@@ -121,13 +125,17 @@ fn apply_edits(text: &str, edits: &[Value]) -> String {
                 e["range"]["end"]["line"].as_u64().unwrap(),
                 e["range"]["end"]["character"].as_u64().unwrap(),
             );
+            // A reversed range (end before start) is an invalid host edit, not
+            // a no-op to normalize away — fail loudly (the harness validates the
+            // bridge's host coordinates).
+            assert!(en >= s, "reversed host range in edit: {e:#?}");
             (s, en, e["newText"].as_str().unwrap_or("").to_string())
         })
         .collect();
     spans.sort_by_key(|(s, _, _)| *s);
     let mut out = text.to_string();
     for (s, en, new) in spans.into_iter().rev() {
-        out.replace_range(s..en.max(s), &new);
+        out.replace_range(s..en, &new);
     }
     out
 }
