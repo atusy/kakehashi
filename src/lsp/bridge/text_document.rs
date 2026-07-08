@@ -5,9 +5,13 @@
 //!
 //! The structure mirrors `lsp_impl/text_document/` for consistency.
 
+mod code_action;
 mod code_lens;
 mod color_presentation;
 
+pub(crate) use code_action::{
+    UpstreamCodeActionCaps, bridge_code_actions, parse_code_actions_leniently,
+};
 pub(crate) use code_lens::{CodeLensEnvelope, extract_code_lens_envelope};
 mod completion;
 mod completion_item;

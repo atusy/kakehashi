@@ -35,6 +35,8 @@
 //!   normally, then answers formatting with a JSON-RPC *success* whose
 //!   `result` is not a `TextEdit[]`. Exercises the malformed-payload
 //!   request-failure path.
+//! - `code-action` — advertises `codeActionProvider`; returns one
+//!   edit-carrying quickfix plus one bare Command action (#568).
 //! - `code-lens` — advertises `codeLensProvider` with `resolveProvider`;
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
@@ -153,6 +155,10 @@ fn main() {
                     }),
                     "code-lens" => json!({
                         "codeLensProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "code-action" => json!({
+                        "codeActionProvider": true,
                         "textDocumentSync": 1
                     }),
                     // `diagnostics-push-pullcap` is BOTH: it advertises
@@ -452,6 +458,41 @@ fn main() {
                             },
                             "data": { "mock": "lens-1" }
                         }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/codeAction" => {
+                // `code-action` mode: one edit-carrying quickfix (an edit on
+                // the requested document at virtual line 0) plus one bare
+                // Command action (not executable until executeCommand is
+                // bridged — must surface as disabled/dropped, never verbatim).
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        json!([
+                            {
+                                "title": "Replace with fixed",
+                                "kind": "quickfix",
+                                "edit": {
+                                    "changes": {
+                                        uri: [{
+                                            "range": {
+                                                "start": { "line": 0, "character": 0 },
+                                                "end": { "line": 0, "character": 5 }
+                                            },
+                                            "newText": "fixed"
+                                        }]
+                                    }
+                                }
+                            },
+                            {
+                                "title": "Run mock command",
+                                "command": "mock.run"
+                            }
+                        ])
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);

@@ -6,18 +6,18 @@ use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
-    CodeLensOptions, CompletionOptions, DeclarationCapability, DeclarationOptions,
-    DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentFormattingOptions,
-    DocumentLinkOptions, DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions,
-    DocumentSymbolOptions, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHintOptions, InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf,
-    ReferenceOptions, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri,
-    WorkDoneProgressOptions,
+    CodeActionProviderCapability, CodeLensOptions, CompletionOptions, DeclarationCapability,
+    DeclarationOptions, DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
+    DocumentFormattingOptions, DocumentLinkOptions, DocumentOnTypeFormattingOptions,
+    DocumentRangeFormattingOptions, DocumentSymbolOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InlayHintOptions, InlayHintServerCapabilities,
+    LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions, RenameOptions, SaveOptions,
+    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
 };
 use url::Url;
 
@@ -111,6 +111,17 @@ impl Kakehashi {
         self.bridge
             .pool()
             .set_workspace_folders(workspace_folders_for_bridge);
+        // Clients without codeActionLiteralSupport only understand
+        // `Command[]` responses, and the bridge can only produce CodeAction
+        // literals (commands aren't bridged) — withhold the capability for
+        // them (#568).
+        let client_supports_code_action_literals = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.code_action.as_ref())
+            .and_then(|ca| ca.code_action_literal_support.as_ref())
+            .is_some();
         self.bridge
             .pool()
             .set_client_capabilities(params.capabilities);
@@ -320,6 +331,12 @@ impl Kakehashi {
                 // codeLens/resolve is routed to the origin downstream server
                 // via the envelope in lens.data (#355, see
                 // bridge/text_document/code_lens.rs).
+                // No resolveProvider or codeActionKinds yet: downstream
+                // servers are asked for complete (edit-carrying) actions, and
+                // narrowing kinds would stop clients from asking at all
+                // (#568).
+                code_action_provider: client_supports_code_action_literals
+                    .then_some(CodeActionProviderCapability::Simple(true)),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
                 }),

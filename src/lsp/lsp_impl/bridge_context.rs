@@ -944,15 +944,6 @@ impl Kakehashi {
         host_parse: impl Fn(serde_json::Value) -> Option<R>,
         is_nonempty: impl Fn(&R) -> bool,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
-        let Ok(uri) = uri_to_url(lsp_uri) else {
-            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
-            return Ok(None);
-        };
-        let Some(host_language) = self.document_language(&uri) else {
-            return Ok(None);
-        };
-        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
-
         let host = async {
             match self.resolve_host_bridge_context(lsp_uri, layer_method) {
                 Some(ctx) => Ok(self
@@ -962,6 +953,46 @@ impl Kakehashi {
                 None => Ok(None),
             }
         };
+
+        self.walk_layer_futures(
+            lsp_uri,
+            layer_method,
+            request_method,
+            virt,
+            host,
+            native,
+            is_nonempty,
+        )
+        .await
+    }
+
+    /// Race pre-built virt/host/native layer futures under the resolved
+    /// layer priorities (cross-layer-aggregation, `preferred` semantics),
+    /// with walk-wide cancel subscription and upstream-registry sweep.
+    ///
+    /// This is the walk core behind [`Self::walk_layers_with_native`];
+    /// handlers that need a custom host arm (e.g. codeAction's per-server
+    /// title suffixing, which the verbatim raw-value host arm cannot
+    /// express) build their own host future and call this directly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layer_futures<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return Ok(None);
+        };
+        let Some(host_language) = self.document_language(&uri) else {
+            return Ok(None);
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
 
         // Subscribe for the WHOLE walk before either arm runs: the arms'
         // own subscribe attempts then find the id taken and proceed without
@@ -1041,6 +1072,123 @@ impl Kakehashi {
 
         Some(RangeRequestContext { document, range })
     }
+
+    /// Range-overlap variant of [`Self::resolve_bridge_contexts_for_range`]:
+    /// bridge the FIRST region (document order) that intersects the range
+    /// and resolves to bridge server configs, clamping the request range to
+    /// that region so coordinate translation stays in-region — a range that
+    /// merely starts inside a region can still overshoot its end, and
+    /// save-time flows (`editor.codeActionsOnSave`) request with a
+    /// whole-document range starting at (0,0), outside any injection.
+    /// Unconfigured injections (e.g. `markdown_inline`) never shadow a
+    /// configured region further down. Only one region is bridged
+    /// (preferred semantics; multi-region merging is #568 stage 7).
+    pub(crate) async fn resolve_bridge_contexts_for_range_overlap(
+        &self,
+        lsp_uri: &Uri,
+        range: Range,
+        method_name: &str,
+    ) -> Option<RangeRequestContext> {
+        self.ensure_fresh_tree_for_bridge(lsp_uri).await;
+        self.resolve_first_region_overlapping_range(lsp_uri, range, method_name)
+            .await
+    }
+
+    /// Whole-document region scan behind
+    /// [`Self::resolve_bridge_contexts_for_range_overlap`]; the tree is
+    /// already fresh (the caller awaited it).
+    async fn resolve_first_region_overlapping_range(
+        &self,
+        lsp_uri: &Uri,
+        range: Range,
+        method_name: &str,
+    ) -> Option<RangeRequestContext> {
+        let uri = uri_to_url(lsp_uri).ok()?;
+        let snapshot = self.documents.get(&uri)?.snapshot()?;
+        let language_name = self.document_language(&uri)?;
+        let injection_query = self.language.injection_query(&language_name)?;
+
+        let regions = crate::language::InjectionResolver::resolve_all(
+            &self.language,
+            self.bridge.node_tracker(),
+            &uri,
+            snapshot.tree(),
+            snapshot.text(),
+            injection_query.as_ref(),
+        );
+
+        // First intersecting region that resolves to bridge server configs
+        // wins: unconfigured injections (e.g. markdown_inline) must not
+        // shadow a configured region further down the document.
+        let mapper = PositionMapper::new(snapshot.text());
+        for resolved in regions {
+            // Clamp to the region so the translated range is in-region; skip a
+            // region the range never touches.
+            let Some(clamped) = clamp_range_to_region(&resolved, &range, &mapper) else {
+                continue;
+            };
+
+            let preamble = PreambleResult {
+                uri: uri.clone(),
+                resolved,
+                language_name: language_name.clone(),
+                upstream_request_id: current_upstream_id(),
+            };
+            // An intersecting region that resolves to no bridge config does not
+            // shadow a configured region further down: skip to the next.
+            let Some(document) = self
+                .preamble_to_document_context(preamble, method_name)
+                .await
+            else {
+                continue;
+            };
+            return Some(RangeRequestContext {
+                document,
+                range: clamped,
+            });
+        }
+        None
+    }
+}
+
+/// Clamp `range` to `resolved`'s injection region for an in-region translated
+/// request, or `None` when the region does not intersect the range (or its
+/// byte-precise end is unmappable). Pure geometry — no bridge-config lookup, so
+/// the async region scan stays focused on config resolution.
+fn clamp_range_to_region(
+    resolved: &ResolvedInjection,
+    range: &Range,
+    mapper: &PositionMapper,
+) -> Option<Range> {
+    let region_start = Position {
+        line: resolved.region.line_range.start,
+        character: resolved.region.start_column,
+    };
+    // Byte-precise end: synthesizing (line_range.end, 0) would over-approximate
+    // a same-line inline injection through the end of its line, matching ranges
+    // entirely after the injected content and clamping to columns outside the
+    // virtual document.
+    let region_end = mapper.byte_to_position(resolved.region.byte_range.end)?;
+    if !range_intersects_region(range, region_start, region_end) {
+        return None;
+    }
+    Some(Range {
+        start: range.start.max(region_start),
+        end: range.end.min(region_end),
+    })
+}
+
+/// Position-precise intersection of an LSP request range with an injection
+/// region `[region_start, region_end)`. Line-only comparison would bridge a
+/// region the range never touches — e.g. a range ending exactly AT the
+/// region start, or a same-line range entirely before an inline region's
+/// start column. A zero-length (cursor) request counts as inside when the
+/// position sits within the region, inclusive of its start.
+fn range_intersects_region(range: &Range, region_start: Position, region_end: Position) -> bool {
+    if range.start == range.end {
+        return region_start <= range.start && range.start < region_end;
+    }
+    range.start < region_end && region_start < range.end
 }
 
 #[cfg(test)]
@@ -1049,6 +1197,67 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    #[test]
+    fn range_intersection_is_position_precise() {
+        // Fenced region: content [(3,0), (4,0)).
+        let (rs, re) = (pos(3, 0), pos(4, 0));
+        let range = |s: Position, e: Position| Range { start: s, end: e };
+
+        // Overlapping and containing ranges intersect.
+        assert!(range_intersects_region(
+            &range(pos(0, 0), pos(5, 0)),
+            rs,
+            re
+        ));
+        assert!(range_intersects_region(
+            &range(pos(3, 1), pos(3, 5)),
+            rs,
+            re
+        ));
+        // Ending exactly AT the region start does not touch it.
+        assert!(!range_intersects_region(
+            &range(pos(0, 0), pos(3, 0)),
+            rs,
+            re
+        ));
+        // Starting at the exclusive region end does not touch it.
+        assert!(!range_intersects_region(
+            &range(pos(4, 0), pos(5, 0)),
+            rs,
+            re
+        ));
+
+        // Cursor (zero-length) requests: inclusive start, exclusive end.
+        assert!(range_intersects_region(
+            &range(pos(3, 0), pos(3, 0)),
+            rs,
+            re
+        ));
+        assert!(!range_intersects_region(
+            &range(pos(4, 0), pos(4, 0)),
+            rs,
+            re
+        ));
+
+        // Inline region starting mid-line: a same-line range entirely
+        // before the start column must not match.
+        let (rs, re) = (pos(3, 5), pos(4, 0));
+        assert!(!range_intersects_region(
+            &range(pos(3, 0), pos(3, 2)),
+            rs,
+            re
+        ));
+        assert!(range_intersects_region(
+            &range(pos(3, 0), pos(3, 6)),
+            rs,
+            re
+        ));
+    }
     use std::collections::HashMap;
 
     fn settings_with(languages: HashMap<String, LanguageSettings>) -> WorkspaceSettings {
