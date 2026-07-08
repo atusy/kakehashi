@@ -67,15 +67,13 @@ gates:
   `didClose`). Removing it reopens the stale-base race that pre-clamping panicked
   on in `replace_range`; "mutates inputs and returns" must not be read as
   dropping it.
-- **Language detection is split by layer.** The input `language_id` is the
-  client-declared LSP `languageId` that `didOpen` records and never changes within
-  a lifetime (a genuine relabel is a reopen → new incarnation, which is why the
-  CAS in §2 folds language into incarnation). The *parse* additionally re-runs
-  content-based detection (its `detect_language(path, text, language_id)`) and
-  records the result as the snapshot's own **derived** `language` — which may
-  refine the input guess. Derivation never writes that refinement **back** to the
-  input (the layering violation the model avoids); the snapshot simply carries
-  the more-accurate detected language, and readers use the snapshot's.
+- **Language detection is split by layer.** The input `language_id` starts as the
+  client-declared LSP `languageId` that `didOpen` records. In the current
+  store-backed path, an open parse can still write the detected language back to
+  `Document::language_id`; the snapshot architecture separates that refinement by
+  recording the parse result as the snapshot's own **derived** `language`. The
+  snapshot carries the more-accurate detected language, and readers use the
+  snapshot's value instead of requiring a relabelled input document.
 
 ### 2. Parsing publishes a versioned `ParseSnapshot`
 
@@ -601,9 +599,9 @@ inside the existing safety contracts at each step:
   inline-parse fallbacks — `try_parse_and_update_document`, `selection_range_impl` —
   in place; those are the vector, and they are removed in Stage 2.)
 - Latent language-detection staleness is closed as a side effect:
-  `Document::language_id` remains the client-provided LSP `languageId` for the
-  document's lifetime, while `ParseSnapshot.language` carries the *parse's*
-  detected language, so readers see the refined language without a re-`didOpen`.
+  `ParseSnapshot.language` carries the *parse's* detected language, so readers
+  see the refined language without depending on `Document::language_id` being
+  rewritten or requiring a re-`didOpen`.
 - State and coupling shrink: two `watch` maps collapse to one, six store CAS /
   watermark methods to one publish primitive, and the `pending_seed` invariant
   surface on `Document` is deleted (favorable on the State > Coupling > Complexity
