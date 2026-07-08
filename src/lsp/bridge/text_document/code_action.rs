@@ -4,9 +4,10 @@
 //! `codeAction/resolve` is routed back to the origin server via the
 //! `CodeActionEnvelope` in `CodeAction.data` (PR 4), or eagerly resolved
 //! downstream when the upstream client lacks `dataSupport`/`resolveSupport`.
-//! Only `Command` execution remains unbridged — command-carrying actions
-//! surface as `disabled: { reason }` when the client supports it and are
-//! dropped otherwise (LSP 3.16 `disabledSupport`).
+//! Command-carrying actions are executable: the command name is rewritten to
+//! encode its origin server + host document, so the bridged
+//! `workspace/executeCommand` routes it back (PR 6, see
+//! [`command_routing`](super::super::protocol)).
 //!
 //! Every bridged action title gets the `"{title} — {server}"` suffix so
 //! users can see which downstream server each action comes from.
