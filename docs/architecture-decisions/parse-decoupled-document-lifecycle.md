@@ -22,10 +22,9 @@ tiers by their dependence on kakehashi's own tree-sitter parse:
   language. They need the document **text and a language name only** — never the
   tree. `eager_open_host_document_on_servers` (`src/lsp/bridge/coordinator.rs`)
   takes `(settings, language: &str, uri, text)`; no tree, no loaded parser. The
-  language name it needs is `language_for_path(path).or(language_id)`, a
-  **path-based** resolution computed in `did_open_impl` *before*
-  `ensure_language_loaded` — so it is available ahead of the parser-load attempt,
-  not only ahead of the parse.
+  initial language name it needs is the client-provided LSP `languageId` captured
+  in `did_open_impl` *before* `ensure_language_loaded`; the later parse can refine
+  the stored document language without delaying host attach.
 - **Virt tier** — the same features over *injected* regions. These need the tree
   **only to locate the region** under the cursor
   (`InjectionResolver::resolve_at_byte_offset(..., snapshot.tree(), ...)`); the
@@ -84,8 +83,8 @@ In `did_open_impl`, attach the host document to its external server(s)
 **immediately after the document is registered** — before `ensure_language_loaded`,
 before `parse_document`, before `maybe_auto_install_language`. The attach is
 already fire-and-forget (it spawns per-server tasks); only its *position* moves.
-Because it needs only the path-resolved language name (computed before the
-parser-load attempt) and the text, nothing blocks it.
+Because it needs only the client-provided initial language name and the text,
+nothing blocks it.
 
 Consequence: a document whose parser is missing, installing, or hung still gets
 full host-language-server functionality — attach, diagnostics, hover,
