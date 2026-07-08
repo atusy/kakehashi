@@ -20,8 +20,11 @@
 //!
 //! The separator is the ASCII Unit Separator (`0x1f`). The routing invariant is
 //! that it must not appear in the FIRST two segments — `origin` (a TOML config
-//! key) and `host_uri` (a URL) are both control-char-free, so those boundaries
-//! are unambiguous. The `command` is the final segment and taken as the
+//! key) and `host_uri` (a URL) — so those boundaries are unambiguous. `host_uri`
+//! is control-char-free by construction (a URL), but `origin` is an unvalidated
+//! config key, so [`encode_command`] ENFORCES the invariant: it fails closed
+//! (`None`) rather than mint an ambiguous name, and the caller drops the
+//! unroutable command. The `command` is the final segment and taken as the
 //! `splitn(3)` remainder, so even an (LSP-legal but unheard-of) separator inside
 //! a command id round-trips faithfully. Decoding is total: any name that isn't a
 //! well-formed bridge command yields `None`, and the handler fails that command
@@ -49,8 +52,22 @@ pub(crate) struct CommandRoute<'a> {
 
 /// Encode `command` as a bridge-routed name carrying its `origin` server and
 /// `host_uri`: `"kakehashi\u{1f}{origin}\u{1f}{host_uri}\u{1f}{command}"`.
-pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> String {
-    format!("{COMMAND_PREFIX}{SEP}{origin}{SEP}{host_uri}{SEP}{command}")
+///
+/// Fails closed (`None`) when `origin` or `host_uri` contains the separator: the
+/// `splitn(3)` decode relies on those two segments being separator-free. A
+/// `host_uri` is a URL (control chars are percent-encoded), but `origin` is an
+/// unvalidated TOML config key — a stray separator there would make
+/// [`decode_command`] mis-split and route execution to the WRONG server/root.
+/// Better to drop the (unroutable) command at the call site than to mint an
+/// ambiguous name. `command` may contain the separator freely (it's the
+/// remainder).
+pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Option<String> {
+    if origin.contains(SEP) || host_uri.contains(SEP) {
+        return None;
+    }
+    Some(format!(
+        "{COMMAND_PREFIX}{SEP}{origin}{SEP}{host_uri}{SEP}{command}"
+    ))
 }
 
 /// Decode a bridge-routed command name, or `None` if `name` was not minted by
@@ -79,7 +96,8 @@ mod tests {
 
     #[test]
     fn round_trips_all_three_fields() {
-        let encoded = encode_command("ruff", "file:///w/a.md", "ruff.applyOrganizeImports");
+        let encoded =
+            encode_command("ruff", "file:///w/a.md", "ruff.applyOrganizeImports").expect("valid");
         let route = decode_command(&encoded).expect("well-formed");
         assert_eq!(route.origin, "ruff");
         assert_eq!(route.host_uri, "file:///w/a.md");
@@ -90,7 +108,7 @@ mod tests {
     fn round_trips_a_server_name_with_dots_and_a_command_with_colons() {
         // Config server names are arbitrary TOML keys and command ids often
         // contain colons/dots; the separator must not collide with any of them.
-        let encoded = encode_command("py.ruff-lsp", "file:///x", "cmd:with:colons");
+        let encoded = encode_command("py.ruff-lsp", "file:///x", "cmd:with:colons").expect("valid");
         let route = decode_command(&encoded).expect("well-formed");
         assert_eq!(route.origin, "py.ruff-lsp");
         assert_eq!(route.host_uri, "file:///x");
@@ -102,11 +120,21 @@ mod tests {
         // LSP command ids are arbitrary strings; a (theoretical) separator in
         // the command is harmless because it's the splitn(3) remainder — only
         // the origin/host_uri boundaries must be separator-free.
-        let encoded = encode_command("srv", "file:///x", "weird\u{1f}cmd");
+        let encoded = encode_command("srv", "file:///x", "weird\u{1f}cmd").expect("valid");
         let route = decode_command(&encoded).expect("well-formed");
         assert_eq!(route.origin, "srv");
         assert_eq!(route.host_uri, "file:///x");
         assert_eq!(route.command, "weird\u{1f}cmd");
+    }
+
+    #[test]
+    fn encode_fails_closed_when_origin_or_host_uri_contains_the_separator() {
+        // A separator in `origin` or `host_uri` would make `decode_command`
+        // mis-split and route to the wrong server/root, so refuse to encode.
+        assert!(encode_command("sr\u{1f}v", "file:///x", "cmd").is_none());
+        assert!(encode_command("srv", "file:///x\u{1f}y", "cmd").is_none());
+        // The command segment may contain it freely (it's the remainder).
+        assert!(encode_command("srv", "file:///x", "c\u{1f}md").is_some());
     }
 
     #[test]

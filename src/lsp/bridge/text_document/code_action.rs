@@ -542,8 +542,18 @@ impl LanguageServerPool {
         // the bridged executeCommand routes back to it (mirrors the initial
         // codeAction path). An edit+command action keeps both — the edit is
         // translated below, then the client executes the command.
-        if let Some(command) = &mut resolved.command {
-            command.command = encode_command(server_name, &envelope.host_uri, &command.command);
+        // Drop the command if its routing name can't be encoded (unroutable);
+        // an accompanying edit is still applied.
+        if resolved
+            .command
+            .as_mut()
+            .and_then(|command| {
+                encode_command(server_name, &envelope.host_uri, &command.command)
+                    .map(|encoded| command.command = encoded)
+            })
+            .is_none()
+        {
+            resolved.command = None;
         }
 
         // isPreferred is its own client capability (LSP 3.15); the downstream
@@ -920,7 +930,10 @@ fn bridge_code_action(
         // Arguments stay verbatim (checklist §10); suffix the title like every
         // bridged action.
         CodeActionOrCommand::Command(mut command) => {
-            command.command = encode_command(server_name, host_uri, &command.command);
+            // Drop a bare command we can't mint an unambiguous routing name for
+            // (pathological: a separator in the server name) — routed back it
+            // would reach the wrong server, and un-routed it executes to nothing.
+            command.command = encode_command(server_name, host_uri, &command.command)?;
             command.title = suffix_title(command.title, server_name);
             return Some(CodeActionOrCommand::Command(command));
         }
@@ -968,12 +981,20 @@ fn bridge_code_action(
     // execute — no data envelope). Arguments pass through verbatim (they are the
     // downstream's own coordinate system, checklist §10). An edit+command action
     // keeps BOTH: the client applies the (translated) edit, then executes.
-    let has_command = if let Some(command) = &mut action.command {
-        command.command = encode_command(server_name, host_uri, &command.command);
-        true
-    } else {
-        false
-    };
+    let has_command = action
+        .command
+        .as_mut()
+        .and_then(|command| {
+            encode_command(server_name, host_uri, &command.command)
+                .map(|encoded| command.command = encoded)
+        })
+        .is_some();
+    // A command whose name couldn't be encoded (unroutable) is dropped; an
+    // accompanying edit is still applied below, else the action is dropped as a
+    // no-op. Assigning None when there was no command is a harmless no-op.
+    if !has_command {
+        action.command = None;
+    }
 
     match &mut action.edit {
         Some(edit) => {
