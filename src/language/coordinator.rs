@@ -253,10 +253,27 @@ impl LanguageCoordinator {
                         let coordinator = Arc::clone(self);
                         let owned_id = language_id.to_string();
                         let result = tokio::task::spawn_blocking(move || {
-                            coordinator.try_load_language_by_id(&owned_id)
+                            let result = coordinator.try_load_language_by_id(&owned_id);
+                            // Record the failure INSIDE the blocking task so a
+                            // winner cancelled mid-`.await` (its future dropped)
+                            // still populates the negative cache: the detached
+                            // task runs to completion regardless of the awaiting
+                            // task's fate, so without this the scan+log would
+                            // repeat for every later caller until one survives
+                            // the await. Idempotent with the JoinError branch's
+                            // record below.
+                            if !result.success {
+                                coordinator.record_failed_load(&owned_id, current_generation);
+                            }
+                            result
                         })
                         .await
                         .unwrap_or_else(|join_error| {
+                            // Reached only when the closure PANICKED (the
+                            // awaiting task is alive here, so this is not the
+                            // cancellation path) — the in-closure record never
+                            // ran, so record the synthetic failure here.
+                            self.record_failed_load(language_id, current_generation);
                             LanguageLoadResult::failure_with(LanguageEvent::log(
                                 LanguageLogLevel::Error,
                                 format!(
@@ -265,9 +282,6 @@ impl LanguageCoordinator {
                             ))
                         });
 
-                        if !result.success {
-                            self.record_failed_load(language_id, current_generation);
-                        }
                         return result;
                     }
                 }
