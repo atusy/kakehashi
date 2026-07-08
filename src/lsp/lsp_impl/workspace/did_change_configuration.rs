@@ -9,21 +9,13 @@ use super::super::Kakehashi;
 impl Kakehashi {
     /// Handle workspace/didChangeConfiguration notification.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
-        let parsed = match parse_client_configuration(params.settings) {
-            Ok(update) => update,
-            Err(err) => {
-                self.notifier()
-                    .log_warning(format!("Failed to parse client configuration: {}", err))
-                    .await;
-                return;
-            }
-        };
+        let normalized = normalize_kakehashi_settings(params.settings);
 
         // Nudge users off the deprecated `rootMarkers` key if this push carries
         // it. Detect from the raw value before serde's alias erases which key
         // was used; the claim guard shares the once-per-session slot with the
         // initialize path.
-        if crate::config::deprecation::json_uses_deprecated_root_markers(&parsed.raw_value)
+        if crate::config::deprecation::json_uses_deprecated_root_markers(&normalized.raw_value)
             && self
                 .settings_manager
                 .claim_root_markers_deprecation_warning()
@@ -32,6 +24,16 @@ impl Kakehashi {
                 .show_warning(crate::config::deprecation::ROOT_MARKERS_DEPRECATION_NOTICE)
                 .await;
         }
+
+        let parsed = match parse_normalized_client_configuration(normalized) {
+            Ok(update) => update,
+            Err(err) => {
+                self.notifier()
+                    .log_warning(format!("Failed to parse client configuration: {}", err))
+                    .await;
+                return;
+            }
+        };
 
         for warning in &parsed.warnings {
             self.notifier().log_warning(warning).await;
@@ -79,31 +81,43 @@ impl Kakehashi {
 
 struct ClientConfigurationUpdate {
     settings: RawWorkspaceSettings,
+    warnings: Vec<String>,
+}
+
+struct NormalizedClientConfiguration {
     raw_value: serde_json::Value,
     warnings: Vec<String>,
 }
 
+#[cfg(test)]
 fn parse_client_configuration(
     value: serde_json::Value,
 ) -> Result<ClientConfigurationUpdate, serde_json::Error> {
-    let (raw_value, warnings) = normalize_kakehashi_settings(value);
-    let settings = serde_json::from_value::<RawWorkspaceSettings>(raw_value.clone())?;
+    parse_normalized_client_configuration(normalize_kakehashi_settings(value))
+}
+
+fn parse_normalized_client_configuration(
+    normalized: NormalizedClientConfiguration,
+) -> Result<ClientConfigurationUpdate, serde_json::Error> {
+    let settings = serde_json::from_value::<RawWorkspaceSettings>(normalized.raw_value.clone())?;
 
     Ok(ClientConfigurationUpdate {
         settings,
-        raw_value,
-        warnings,
+        warnings: normalized.warnings,
     })
 }
 
-fn normalize_kakehashi_settings(value: serde_json::Value) -> (serde_json::Value, Vec<String>) {
+fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientConfiguration {
     let Some(inner) = value
         .get("settings")
         .and_then(|settings| settings.get("kakehashi"))
         .or_else(|| value.get("kakehashi"))
     else {
         let warnings = ignored_key_warnings(&value);
-        return (value, warnings);
+        return NormalizedClientConfiguration {
+            raw_value: value,
+            warnings,
+        };
     };
 
     let mut warnings = Vec::new();
@@ -132,15 +146,18 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> (serde_json::Value,
     warnings.dedup();
 
     if warnings.is_empty() {
-        (raw_value, Vec::new())
-    } else {
-        (
+        NormalizedClientConfiguration {
             raw_value,
-            vec![format!(
+            warnings: Vec::new(),
+        }
+    } else {
+        NormalizedClientConfiguration {
+            raw_value,
+            warnings: vec![format!(
                 "Ignored unknown client configuration key(s): {}",
                 warnings.join(", ")
             )],
-        )
+        }
     }
 }
 
@@ -282,5 +299,22 @@ mod tests {
         .expect("empty languageServers should parse");
 
         assert!(!raw_workspace_settings_is_empty(&update.settings));
+    }
+
+    #[test]
+    fn normalization_preserves_deprecated_root_markers_before_parse_error() {
+        let normalized = normalize_kakehashi_settings(serde_json::json!({
+            "languageServers": {
+                "rust-analyzer": {
+                    "rootMarkers": [".git"],
+                    "cmd": "rust-analyzer"
+                }
+            }
+        }));
+
+        assert!(
+            crate::config::deprecation::json_uses_deprecated_root_markers(&normalized.raw_value)
+        );
+        assert!(parse_normalized_client_configuration(normalized).is_err());
     }
 }
