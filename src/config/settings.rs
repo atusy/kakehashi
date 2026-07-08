@@ -2971,13 +2971,22 @@ kind = "locals""#;
     }
 
     #[test]
-    fn default_strategy_is_concatenated_for_diagnostics() {
+    fn default_strategy_is_concatenated_for_diagnostics_and_code_action() {
         assert_eq!(
             default_aggregation_strategy_for_method("textDocument/diagnostic"),
             AggregationStrategy::Concatenated
         );
         assert_eq!(
             default_aggregation_strategy_for_method("textDocument/publishDiagnostics"),
+            AggregationStrategy::Concatenated
+        );
+        // #568 PR 7: codeAction concatenates at both levels by default.
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/codeAction"),
+            AggregationStrategy::Concatenated
+        );
+        assert_eq!(
+            default_layer_strategy_for_method("textDocument/codeAction"),
             AggregationStrategy::Concatenated
         );
     }

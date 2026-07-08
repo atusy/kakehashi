@@ -157,7 +157,7 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
-                    "code-action" => json!({
+                    "code-action" | "code-action-preferred" => json!({
                         "codeActionProvider": true,
                         "executeCommandProvider": { "commands": ["mock.run"] },
                         "textDocumentSync": 1
@@ -512,6 +512,26 @@ fn main() {
                                 "title": "Lazy organize imports",
                                 "kind": "source.organizeImports",
                                 "data": { "mock": "lazy-1" }
+                            }])
+                        } else if mode == "code-action-preferred" {
+                            // One isPreferred quickfix — two of these servers let
+                            // a test prove the cross-source isPreferred collapse
+                            // runs even under cross-layer `preferred` (#568 PR 7).
+                            json!([{
+                                "title": "Preferred fix",
+                                "kind": "quickfix",
+                                "isPreferred": true,
+                                "edit": {
+                                    "changes": {
+                                        _uri: [{
+                                            "range": {
+                                                "start": { "line": 0, "character": 0 },
+                                                "end": { "line": 0, "character": 5 }
+                                            },
+                                            "newText": "fixed"
+                                        }]
+                                    }
+                                }
                             }])
                         } else {
                             // `code-action` mode: one edit-carrying quickfix (an

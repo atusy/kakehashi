@@ -8,6 +8,14 @@
 //! `"{title} — {server}"` suffix, so the host arm cannot use the generic
 //! verbatim raw-value walk — it dispatches typed per server to keep the
 //! server name ([`Kakehashi::walk_layer_futures`]).
+//!
+//! codeAction defaults to `concatenated` at both aggregation levels (#568 PR 7):
+//! within a layer, every server's actions are merged (`concat_merge`); across
+//! layers, [`Kakehashi::walk_layers_concatenated`] merges virt+host+native in
+//! priority order (the native layer is wired but contributes nothing yet — it
+//! resolves to `None`). Whichever cross-layer strategy applies, the final menu has
+//! its cross-source `isPreferred` collision collapsed once
+//! ([`resolve_preferred_collision`]).
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
@@ -80,9 +88,8 @@ impl Kakehashi {
         let host = self.code_action_host_layer(&lsp_uri, raw_params, upstream_caps);
         // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`):
         // `preferred` returns the highest-priority non-empty layer; `concatenated`
-        // merges every layer's actions in priority order into one menu, then
-        // collapses the cross-server isPreferred collision (#568 PR 7).
-        match self.cross_layer_strategy(&lsp_uri, METHOD) {
+        // merges every layer's actions in priority order into one menu (#568 PR 7).
+        let result = match self.cross_layer_strategy(&lsp_uri, METHOD) {
             AggregationStrategy::Preferred => {
                 self.walk_layer_futures(
                     &lsp_uri,
@@ -96,26 +103,32 @@ impl Kakehashi {
                 .await
             }
             AggregationStrategy::Concatenated => {
-                let merged = self
-                    .walk_layers_concatenated(
-                        &lsp_uri,
-                        METHOD,
-                        METHOD,
-                        virt,
-                        host,
-                        std::future::ready(Ok(None)),
-                        |mut acc: CodeActionResponse, next| {
-                            acc.extend(next);
-                            acc
-                        },
-                    )
-                    .await?;
-                Ok(merged.map(|mut actions| {
-                    resolve_preferred_collision(&mut actions);
-                    actions
-                }))
+                self.walk_layers_concatenated(
+                    &lsp_uri,
+                    METHOD,
+                    METHOD,
+                    virt,
+                    host,
+                    std::future::ready(Ok(None)),
+                    |mut acc: CodeActionResponse, next| {
+                        acc.extend(next);
+                        acc
+                    },
+                )
+                .await
             }
-        }
+        };
+        // Collapse the cross-source isPreferred collision on the FINAL menu,
+        // regardless of the cross-layer strategy: WITHIN-layer concatenation can
+        // merge several servers' actions into one layer even when the cross-layer
+        // strategy is `preferred` (that layer still wins as a unit), so several
+        // `isPreferred: true` actions can reach here without a cross-layer merge.
+        result.map(|maybe| {
+            maybe.map(|mut actions| {
+                resolve_preferred_collision(&mut actions);
+                actions
+            })
+        })
     }
 
     /// The upstream client's codeAction capabilities that gate the bridge
