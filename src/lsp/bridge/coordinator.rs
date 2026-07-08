@@ -312,12 +312,6 @@ impl BridgeCoordinator {
     // Config lookup (moved from Kakehashi)
     // ========================================
 
-    /// Resolve `bridge.servers` for `injection_language`, returning the
-    /// `ResolvedServerConfig` (server name for pooling + spawn config) or
-    /// `None` when no server matches, or the host's bridge filter excludes
-    /// this injection. Host lookup uses wildcard resolution (wildcard-config-inheritance):
-    /// undefined hosts inherit `languages._`, letting one default filter apply
-    /// to every host.
     /// Await eager-opening ONLY `server_name`'s virtual documents for `host_uri`,
     /// so a bridged `workspace/executeCommand` routed to a respawned downstream
     /// (whose doc tracker was purged) doesn't compute against missing document
@@ -392,6 +386,12 @@ impl BridgeCoordinator {
         (for_server, config)
     }
 
+    /// Resolve `bridge.servers` for `injection_language`, returning the
+    /// `ResolvedServerConfig` (server name for pooling + spawn config) or
+    /// `None` when no server matches, or the host's bridge filter excludes
+    /// this injection. Host lookup uses wildcard resolution (wildcard-config-inheritance):
+    /// undefined hosts inherit `languages._`, letting one default filter apply
+    /// to every host.
     pub(crate) fn get_config_for_language(
         &self,
         settings: &WorkspaceSettings,
