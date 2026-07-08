@@ -1452,19 +1452,14 @@ mod tests {
                 ..Default::default()
             },
         );
+        // Use a blocking devnull command (not a real binary like `ruff`): if the
+        // filter regressed and DID attempt to spawn, the handshake would hang and
+        // the 2s timeout below would fire — a real binary could instead fail-fast
+        // on a missing runner and let the test pass without proving no-spawn.
         let mut servers = HashMap::new();
         servers.insert(
             "ruff".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["ruff".to_string()],
-                languages: vec!["python".to_string()],
-                initialization_options: None,
-                workspace_markers: None,
-                on_type_formatting_triggers: None,
-                prefer_shared_instance: None,
-                enabled: None,
-                settings: None,
-            },
+            crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("python"),
         );
         let settings = WorkspaceSettings {
             languages,

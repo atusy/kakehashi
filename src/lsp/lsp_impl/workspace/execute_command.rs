@@ -68,7 +68,7 @@ impl Kakehashi {
         // open) returns immediately, and dispatch uses the fail-fast connection
         // variant, so a slow downstream can't block command execution here.
         const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-        let _ = tokio::time::timeout(
+        if tokio::time::timeout(
             SYNC_TIMEOUT,
             self.bridge.ensure_server_documents_open(
                 settings,
@@ -78,6 +78,17 @@ impl Kakehashi {
                 route.origin,
             ),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            // Timed out waiting for the downstream to open its documents; dispatch
+            // anyway (fail-fast connection variant). Logged so an intermittent
+            // "downstream never saw didOpen before the command" is diagnosable.
+            log::debug!(
+                target: "kakehashi::bridge",
+                "executeCommand: pre-sync of origin '{}' documents timed out after {SYNC_TIMEOUT:?}; dispatching anyway",
+                route.origin
+            );
+        }
     }
 }
