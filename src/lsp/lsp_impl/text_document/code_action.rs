@@ -7,19 +7,32 @@
 //! (host-document-bridge) bridges the host document itself. Both apply the
 //! `"{title} — {server}"` suffix, so the host arm cannot use the generic
 //! verbatim raw-value walk — it dispatches typed per server to keep the
-//! server name ([`Kakehashi::walk_layer_futures`]).
+//! server name ([`Kakehashi::walk_layers_by_strategy`], the strategy-aware walk
+//! codeAction uses instead of the generic `walk_layer_futures`).
+//!
+//! codeAction defaults to `concatenated` at both aggregation levels (#568 PR 7):
+//! within a layer, every server's actions are merged (`concat_merge`); across
+//! layers, [`Kakehashi::walk_layers_by_strategy`] merges virt+host+native in
+//! priority order (the native layer is wired but contributes nothing yet — it
+//! resolves to `None`). Whichever cross-layer strategy applies, the final menu has
+//! its cross-source `isPreferred` collision collapsed once
+//! ([`resolve_preferred_collision`]).
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionContext, CodeActionParams, CodeActionResponse, MessageType,
-    NumberOrString, Position, Range, Uri,
+    CodeAction, CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
+    MessageType, NumberOrString, Position, Range, Uri,
 };
 use ulid::Ulid;
 use url::Url;
 
 use super::super::{Kakehashi, detect_document_language};
+use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::server::{FanInResult, dispatch_host_preferred, dispatch_preferred};
+use crate::lsp::aggregation::server::{
+    FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
+    dispatch_host_preferred, dispatch_preferred,
+};
 use crate::lsp::bridge::{
     CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps, bridge_code_actions,
     extract_code_action_envelope, parse_code_actions_leniently,
@@ -27,6 +40,37 @@ use crate::lsp::bridge::{
 use crate::text::PositionMapper;
 
 const METHOD: &str = "textDocument/codeAction";
+
+/// Flatten the per-server results of a `concatenated` dispatch into one response
+/// in priority order (`dispatch_concatenated` yields them ordered). Each server
+/// contributes `Option<CodeActionResponse>`; drop the `None`s, concatenate the
+/// action lists, and collapse an all-empty merge to `None` so the layer counts
+/// as "no result" for cross-layer aggregation (#568 PR 7).
+fn concat_merge(vecs: Vec<Option<CodeActionResponse>>) -> Option<CodeActionResponse> {
+    let merged: CodeActionResponse = vecs.into_iter().flatten().flatten().collect();
+    (!merged.is_empty()).then_some(merged)
+}
+
+/// Collapse the cross-server `isPreferred` collision on a concatenated menu:
+/// the client's auto-fix keybinding picks the FIRST `isPreferred: true`, so once
+/// several servers each mark their action preferred, keep only the first (the
+/// merge is in priority order, so that's the highest-priority server) and drop
+/// the rest to `false` (checklist §4). Per-action `isPreferredSupport` stripping
+/// already happened in `bridge_code_action`; this is the cross-set collapse.
+fn resolve_preferred_collision(actions: &mut CodeActionResponse) {
+    let mut kept = false;
+    for item in actions.iter_mut() {
+        if let CodeActionOrCommand::CodeAction(action) = item
+            && action.is_preferred == Some(true)
+        {
+            if kept {
+                action.is_preferred = Some(false);
+            } else {
+                kept = true;
+            }
+        }
+    }
+}
 
 impl Kakehashi {
     pub(crate) async fn code_action_impl(
@@ -43,16 +87,36 @@ impl Kakehashi {
         let virt =
             self.code_action_virt_layer(&lsp_uri, range, context, work_done_token, upstream_caps);
         let host = self.code_action_host_layer(&lsp_uri, raw_params, upstream_caps);
-        self.walk_layer_futures(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            virt,
-            host,
-            std::future::ready(Ok(None)),
-            |actions: &CodeActionResponse| !actions.is_empty(),
-        )
-        .await
+        // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`),
+        // resolved once inside the walk: `preferred` returns the highest-priority
+        // non-empty layer; `concatenated` merges every layer's actions in priority
+        // order into one menu (#568 PR 7).
+        let result = self
+            .walk_layers_by_strategy(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                virt,
+                host,
+                std::future::ready(Ok(None)),
+                |actions: &CodeActionResponse| !actions.is_empty(),
+                |mut acc: CodeActionResponse, next| {
+                    acc.extend(next);
+                    acc
+                },
+            )
+            .await;
+        // Collapse the cross-source isPreferred collision on the FINAL menu,
+        // regardless of the cross-layer strategy: WITHIN-layer concatenation can
+        // merge several servers' actions into one layer even when the cross-layer
+        // strategy is `preferred` (that layer still wins as a unit), so several
+        // `isPreferred: true` actions can reach here without a cross-layer merge.
+        result.map(|maybe| {
+            maybe.map(|mut actions| {
+                resolve_preferred_collision(&mut actions);
+                actions
+            })
+        })
     }
 
     /// The upstream client's codeAction capabilities that gate the bridge
@@ -207,37 +271,57 @@ impl Kakehashi {
 
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
-        let result = dispatch_preferred(
-            &ctx.document,
-            pool.clone(),
-            |t| {
-                let context = context.clone();
-                async move {
-                    t.pool
-                        .send_code_action_request(
-                            &t.server_name,
-                            &t.server_config,
-                            &t.uri,
-                            range,
-                            context,
-                            &t.injection_language,
-                            &t.region_id,
-                            t.offset,
-                            &t.virtual_content,
-                            t.upstream_id,
-                            t.client_progress_token,
-                            upstream_caps,
-                        )
-                        .await
-                }
-            },
-            |opt| matches!(opt, Some(v) if !v.is_empty()),
-            cancel_rx,
-        )
-        .await;
+        // One fan-out closure, dispatched by the within-layer strategy
+        // (`bridge.<lang>.aggregation.<method>.strategy`): `preferred` returns
+        // the highest-priority non-empty server; `concatenated` merges every
+        // server's actions in priority order (#568 PR 7). The closure moves into
+        // exactly one arm.
+        let f = |t: FanOutTask| {
+            let context = context.clone();
+            async move {
+                t.pool
+                    .send_code_action_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &t.uri,
+                        range,
+                        context,
+                        &t.injection_language,
+                        &t.region_id,
+                        t.offset,
+                        &t.virtual_content,
+                        t.upstream_id,
+                        t.client_progress_token,
+                        upstream_caps,
+                    )
+                    .await
+            }
+        };
+        let result = match ctx.document.strategy {
+            AggregationStrategy::Preferred => {
+                dispatch_preferred(
+                    &ctx.document,
+                    pool.clone(),
+                    f,
+                    |opt| matches!(opt, Some(v) if !v.is_empty()),
+                    cancel_rx,
+                )
+                .await
+                .handle(&self.client, "code action", None, Ok)
+                .await
+            }
+            AggregationStrategy::Concatenated => {
+                dispatch_concatenated(&ctx.document, pool.clone(), f, cancel_rx, None, None)
+                    .await
+                    .handle(&self.client, "code action", None, |vecs| {
+                        Ok(concat_merge(vecs))
+                    })
+                    .await
+            }
+        };
         pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
 
-        result.handle(&self.client, "code action", None, Ok).await
+        result
     }
 
     /// Host layer: forward the params verbatim to the host language's own
@@ -255,51 +339,74 @@ impl Kakehashi {
         };
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
-        let result = dispatch_host_preferred(
-            &ctx,
-            pool.clone(),
-            move |t| {
-                let params = raw_params.clone();
-                async move {
-                    let raw = t
-                        .pool
-                        .send_host_raw_request(
-                            &t.server_name,
-                            &t.server_config,
-                            &HostDocument {
-                                uri: &t.uri,
-                                language_id: &t.language_id,
-                                text: &t.text,
-                            },
-                            METHOD,
-                            params,
-                            t.upstream_id,
-                        )
-                        .await?;
-                    Ok(raw.and_then(|value| {
-                        let actions = parse_code_actions_leniently(value)?;
-                        Some(bridge_code_actions(
-                            actions,
-                            &t.server_name,
-                            t.uri.as_str(),
-                            upstream_caps,
-                            // Host-layer codeAction/resolve is not bridged, so
-                            // host lazy actions are never enveloped/resolved.
-                            false,
-                            None,
-                        ))
-                    }))
-                }
-            },
-            |opt| matches!(opt, Some(v) if !v.is_empty()),
-            cancel_rx,
-        )
-        .await;
+        // One fan-out closure, dispatched by the within-host-layer strategy
+        // (`bridge._self.aggregation.<method>.strategy`); moves into one arm.
+        let f = move |t: HostFanOutTask| {
+            let params = raw_params.clone();
+            async move {
+                let raw = t
+                    .pool
+                    .send_host_raw_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &HostDocument {
+                            uri: &t.uri,
+                            language_id: &t.language_id,
+                            text: &t.text,
+                        },
+                        METHOD,
+                        params,
+                        t.upstream_id,
+                    )
+                    .await?;
+                Ok(raw.and_then(|value| {
+                    let actions = parse_code_actions_leniently(value)?;
+                    Some(bridge_code_actions(
+                        actions,
+                        &t.server_name,
+                        t.uri.as_str(),
+                        upstream_caps,
+                        // Host-layer codeAction/resolve is not bridged, so
+                        // host lazy actions are never enveloped/resolved.
+                        false,
+                        None,
+                    ))
+                }))
+            }
+        };
+        let result = match ctx.strategy {
+            AggregationStrategy::Preferred => {
+                let fan_in = dispatch_host_preferred(
+                    &ctx,
+                    pool.clone(),
+                    f,
+                    |opt| matches!(opt, Some(v) if !v.is_empty()),
+                    cancel_rx,
+                )
+                .await;
+                self.host_code_action_result(fan_in, |v| v).await
+            }
+            AggregationStrategy::Concatenated => {
+                let fan_in =
+                    dispatch_host_concatenated(&ctx, pool.clone(), f, cancel_rx, None, None).await;
+                self.host_code_action_result(fan_in, concat_merge).await
+            }
+        };
         pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
-        // Same quieting as the generic host arm: an all-empty host layer is
-        // the normal outcome whenever virt answers; only real failures log.
+        result
+    }
+
+    /// Fold a host-layer fan-in result into the handler's return, with the
+    /// host-arm quieting: an all-empty host layer is the normal outcome
+    /// whenever virt answers, so it stays SILENT (unlike [`FanInResult::handle`],
+    /// which logs a LOG-level message) and warns only on real failures.
+    async fn host_code_action_result<T>(
+        &self,
+        result: FanInResult<T>,
+        on_done: impl FnOnce(T) -> Option<CodeActionResponse>,
+    ) -> Result<Option<CodeActionResponse>> {
         match result {
-            FanInResult::Done(value) => Ok(value),
+            FanInResult::Done(value) => Ok(on_done(value)),
             FanInResult::NoResult { errors } => {
                 if errors > 0 {
                     self.client
@@ -313,5 +420,81 @@ impl Kakehashi {
             }
             FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp_server::ls_types::Command;
+
+    fn action(title: &str, preferred: Option<bool>) -> CodeActionOrCommand {
+        CodeActionOrCommand::CodeAction(CodeAction {
+            title: title.to_string(),
+            is_preferred: preferred,
+            ..CodeAction::default()
+        })
+    }
+
+    fn command(title: &str) -> CodeActionOrCommand {
+        CodeActionOrCommand::Command(Command {
+            title: title.to_string(),
+            command: "c".to_string(),
+            arguments: None,
+        })
+    }
+
+    #[test]
+    fn concat_merge_flattens_in_order_and_drops_none() {
+        let merged = concat_merge(vec![
+            Some(vec![action("a", None)]),
+            None,
+            Some(vec![action("b", None), action("c", None)]),
+        ])
+        .expect("non-empty");
+        let titles: Vec<_> = merged
+            .iter()
+            .filter_map(|i| match i {
+                CodeActionOrCommand::CodeAction(a) => Some(a.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, ["a", "b", "c"], "priority order preserved");
+    }
+
+    #[test]
+    fn concat_merge_all_empty_is_none() {
+        assert!(concat_merge(vec![None, Some(vec![]), None]).is_none());
+    }
+
+    #[test]
+    fn preferred_collision_keeps_only_the_first() {
+        // Two servers each marked their action preferred; after the collapse
+        // only the FIRST (highest-priority in the merged order) stays true.
+        let mut actions = vec![
+            action("x", Some(true)),
+            command("cmd"),
+            action("y", Some(true)),
+            action("z", None),
+        ];
+        resolve_preferred_collision(&mut actions);
+        let prefs: Vec<Option<bool>> = actions
+            .iter()
+            .filter_map(|i| match i {
+                CodeActionOrCommand::CodeAction(a) => Some(a.is_preferred),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prefs, [Some(true), Some(false), None]);
+    }
+
+    #[test]
+    fn preferred_collision_leaves_a_single_preferred_untouched() {
+        let mut actions = vec![action("x", None), action("y", Some(true))];
+        resolve_preferred_collision(&mut actions);
+        let CodeActionOrCommand::CodeAction(y) = &actions[1] else {
+            unreachable!()
+        };
+        assert_eq!(y.is_preferred, Some(true));
     }
 }

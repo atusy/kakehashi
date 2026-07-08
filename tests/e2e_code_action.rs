@@ -71,6 +71,36 @@ fn init_client_mode(
     (client, init_response, config_dir)
 }
 
+/// Two virt servers (`mock-a`, `mock-b`) both bridging the lua region in
+/// `code-action` mode — for the concatenated-aggregation test.
+fn init_client_two_servers(client_capabilities: Value) -> (LspClient, Value, tempfile::TempDir) {
+    let bin = mock_formatter_bin();
+    let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
+    let config_path = config_dir.path().join("code_action.toml");
+    std::fs::write(&config_path, "").expect("Failed to write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+
+    let init_response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": client_capabilities,
+            "workspaceFolders": null,
+            "initializationOptions": { "languageServers": {
+                "mock-a": { "cmd": [bin, "code-action"], "languages": ["lua"] },
+                "mock-b": { "cmd": [bin, "code-action"], "languages": ["lua"] }
+            }}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, init_response, config_dir)
+}
+
 /// Client capabilities with codeActionLiteralSupport (required for the
 /// bridge to advertise codeActionProvider at all — it can only produce
 /// CodeAction literals), optionally with disabledSupport.
@@ -242,6 +272,102 @@ fn whole_document_range_reaches_the_injection_region() {
     assert_eq!(
         actions[0]["edit"]["changes"][MARKDOWN_URI][0]["range"]["start"]["line"],
         3
+    );
+
+    shutdown(&mut client);
+}
+
+/// Two `code-action-preferred` servers with the CROSS-layer strategy forced to
+/// `preferred` (within-layer stays the default `concatenated`), so the virt
+/// layer concatenates both servers' preferred actions but the cross layer does
+/// not merge — exercising the isPreferred collapse on the preferred cross-layer
+/// path (#568 PR 7, codex finding).
+fn init_client_preferred_crosslayer_two_servers(
+    client_capabilities: Value,
+) -> (LspClient, Value, tempfile::TempDir) {
+    let bin = mock_formatter_bin();
+    let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
+    let config_path = config_dir.path().join("code_action.toml");
+    std::fs::write(
+        &config_path,
+        r#"[languages._.layers.aggregation."textDocument/codeAction"]
+strategy = "preferred"
+"#,
+    )
+    .expect("Failed to write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+
+    let init_response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": client_capabilities,
+            "workspaceFolders": null,
+            "initializationOptions": { "languageServers": {
+                "mock-a": { "cmd": [bin, "code-action-preferred"], "languages": ["lua"] },
+                "mock-b": { "cmd": [bin, "code-action-preferred"], "languages": ["lua"] }
+            }}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, init_response, config_dir)
+}
+
+#[test]
+fn ispreferred_collapse_runs_even_under_crosslayer_preferred() {
+    // Cross-layer `preferred` + within-layer `concatenated`: the virt layer
+    // merges both servers' isPreferred quickfixes (two `isPreferred: true`), and
+    // the cross layer returns that virt result as a unit. The final menu must
+    // still collapse to exactly ONE preferred action — reverting the collapse to
+    // the concatenated-only arm would leave two.
+    // isPreferredSupport is required, else bridge_code_action strips is_preferred
+    // entirely and there's nothing to collapse.
+    let mut caps = literal_support_caps(true);
+    caps["textDocument"]["codeAction"]["isPreferredSupport"] = json!(true);
+    let (mut client, init_response, _config_dir) =
+        init_client_preferred_crosslayer_two_servers(caps);
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_with_retry(&mut client);
+    let preferred_count = actions
+        .iter()
+        .filter(|a| a["isPreferred"] == json!(true))
+        .count();
+    assert_eq!(
+        preferred_count, 1,
+        "exactly one action stays preferred after the collapse, got: {actions:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn concatenated_default_merges_actions_from_both_servers() {
+    // codeAction defaults to `concatenated` at both aggregation levels (#568
+    // PR 7), so BOTH virt servers' actions appear in one menu. Under the old
+    // `preferred` default only the highest-priority server's actions would
+    // survive — so this asserting both is the discriminating test.
+    let (mut client, init_response, _config_dir) =
+        init_client_two_servers(literal_support_caps(true));
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_with_retry(&mut client);
+    let titles: Vec<&str> = actions.iter().filter_map(|a| a["title"].as_str()).collect();
+
+    assert!(
+        titles.iter().any(|t| t.ends_with("— mock-a")),
+        "mock-a's actions must appear, got: {titles:?}"
+    );
+    assert!(
+        titles.iter().any(|t| t.ends_with("— mock-b")),
+        "mock-b's actions must appear (dropped under preferred), got: {titles:?}"
     );
 
     shutdown(&mut client);
