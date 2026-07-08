@@ -17,11 +17,7 @@ impl Kakehashi {
             return;
         };
 
-        // Try to determine the language
-        let language_name = self
-            .language
-            .language_for_path(uri.path())
-            .or_else(|| Some(language_id.clone()));
+        let language_name = Some(language_id.clone());
 
         // Insert document immediately (without tree) so concurrent requests can find it.
         // This handles race conditions where semanticTokens/full arrives before
@@ -32,8 +28,8 @@ impl Kakehashi {
         // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
         // host document to any `_self` host-bridge server *before* the parser load,
         // the parse, and auto-install — none of which the host tier depends on.
-        // `eager_open_host_document_on_servers` needs only the (path-resolved)
-        // language name and text, so a push-only host server (e.g.
+        // `eager_open_host_document_on_servers` needs only the initial language
+        // name and text, so a push-only host server (e.g.
         // lua-language-server) starts analyzing and pushing diagnostics immediately
         // instead of waiting out a ~120-310ms parse or an unbounded install. It
         // spawns fire-and-forget per-server tasks (non-blocking); no-op when host

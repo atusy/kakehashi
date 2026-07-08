@@ -2,7 +2,6 @@ pub(crate) mod config_store;
 pub(crate) mod coordinator;
 pub(crate) mod events;
 pub(crate) mod failed_parsers;
-pub(crate) mod filetypes;
 pub(crate) mod heuristic;
 pub mod injection;
 pub(crate) mod loader;

@@ -468,7 +468,7 @@ impl DocumentStore {
     ///
     /// For the **off-ingress** didOpen parse ([`parse_document`]). Unlike
     /// [`update_tree_if_text_and_language_unchanged`] it **sets** the language rather
-    /// than checking it: the open parse refines `language_for_path`'s initial guess
+    /// than checking it: the open parse refines `didOpen`'s languageId
     /// with content detection (`detect_language`), so it is the writer of the
     /// authoritative language — there is no language to match against. The two axes
     /// it does check, atomically under the same `get_mut` shard lock as the write:

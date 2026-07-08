@@ -1,6 +1,5 @@
 use super::config_store::ConfigStore;
 use super::events::{LanguageEvent, LanguageLoadResult, LanguageLoadSummary, LanguageLogLevel};
-use super::filetypes::FiletypeResolver;
 use super::loader::ParserLoader;
 use super::parser_pool::{DocumentParserPool, ParserFactory};
 use super::query_loader::{ParseFailure, QueryLoader, format_search_paths};
@@ -54,7 +53,6 @@ impl Drop for LanguageLoadFlightGuard<'_> {
 pub(crate) struct LanguageCoordinator {
     query_store: QueryStore,
     config_store: ConfigStore,
-    filetype_resolver: FiletypeResolver,
     language_registry: LanguageRegistry,
     parser_loader: RwLock<ParserLoader>,
     /// Maps derived languageId → base language name.
@@ -104,7 +102,6 @@ impl LanguageCoordinator {
         Self {
             query_store: QueryStore::new(),
             config_store: ConfigStore::new(),
-            filetype_resolver: FiletypeResolver::new(),
             language_registry: LanguageRegistry::new(),
             parser_loader: RwLock::new(ParserLoader::new()),
             base_map: RwLock::new(HashMap::new()),
@@ -1007,14 +1004,6 @@ impl LanguageCoordinator {
         }
     }
 
-    /// Get language for a document path.
-    ///
-    /// Visibility: pub(crate) - called by LSP layer (auto_install, lsp_impl)
-    /// for document language detection.
-    pub(crate) fn language_for_path(&self, path: &str) -> Option<String> {
-        self.filetype_resolver.language_for_path(path)
-    }
-
     /// Path-only language detection for CLI directory walks
     /// (`kakehashi format <dir>`), loading the parser on first sight.
     ///
@@ -1027,13 +1016,12 @@ impl LanguageCoordinator {
     /// loaded" counts as formattable. Auto-install is never triggered:
     /// a language whose parser is not installed is silently skipped.
     pub(crate) fn loadable_language_for_path(&self, path: &str) -> Option<String> {
-        let candidate = self.language_for_path(path).or_else(|| {
-            let token = super::heuristic::extract_token_from_path(path)?;
-            // Normalize via syntect ("md" → "markdown"); fall back to the
-            // raw token for extensions syntect doesn't know but a config
-            // entry (possibly via `base`) might.
-            Some(super::heuristic::detect_from_token(token).unwrap_or_else(|| token.to_string()))
-        })?;
+        let token = super::heuristic::extract_token_from_path(path)?;
+        // Normalize via syntect ("md" → "markdown"); fall back to the
+        // raw token for extensions syntect doesn't know but a config
+        // entry (possibly via `base`) might.
+        let candidate =
+            super::heuristic::detect_from_token(token).unwrap_or_else(|| token.to_string());
 
         self.load_candidate_or_base(candidate)
     }
