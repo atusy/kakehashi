@@ -873,7 +873,7 @@ fn code_action_over_a_multi_fence_range_merges_actions_from_every_region() {
     // bare command → 4 actions. The two edit actions target the two DIFFERENT
     // fences (host lines 3 and 9), proving both regions were bridged and merged.
     let edit_lines: Vec<u64> = actions
-        .iter()
+        .into_iter()
         .filter_map(|a| a["edit"]["changes"][MARKDOWN_URI][0]["range"]["start"]["line"].as_u64())
         .collect();
     assert!(

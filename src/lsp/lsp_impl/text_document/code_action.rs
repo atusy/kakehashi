@@ -315,11 +315,14 @@ impl Kakehashi {
             Ok((!merged.is_empty()).then_some(merged))
         };
 
-        // Cancel aborts the walk (dropping the in-flight region's dispatch).
+        // Cancel aborts the walk (dropping the in-flight region's dispatch) and
+        // surfaces `RequestCancelled` (-32800), matching how the outer
+        // `run_layer_race` reports cancellation — so a client `$/cancelRequest`
+        // is never masked as an empty result.
         let result = match cancel_rx {
             Some(rx) => tokio::select! {
                 r = walk => r,
-                _ = rx => Ok(None),
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
             },
             None => walk.await,
         };
