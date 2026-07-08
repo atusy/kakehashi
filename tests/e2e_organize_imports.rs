@@ -158,17 +158,34 @@ fn code_action_over_block(client: &mut LspClient, uri: &str, context: Value) -> 
 }
 
 /// Resolve `action` if its edit is lazy (ruff advertises resolveProvider),
-/// returning the host-URI `changes` edits.
+/// returning the edits targeting `host_uri` from EITHER `WorkspaceEdit`
+/// representation — `changes` or `documentChanges` — so the test isn't coupled
+/// to ruff's current shape (the bridge translates both).
 fn resolved_host_edits(client: &mut LspClient, action: &Value, host_uri: &str) -> Vec<Value> {
     let resolved = if action["edit"].is_object() {
         action.clone()
     } else {
         client.send_request("codeAction/resolve", action.clone())["result"].clone()
     };
-    resolved["edit"]["changes"][host_uri]
-        .as_array()
-        .cloned()
-        .unwrap_or_else(|| panic!("edit re-keyed to the host URI {host_uri}, got: {resolved:#?}"))
+    let edit = &resolved["edit"];
+    if let Some(edits) = edit["changes"][host_uri].as_array() {
+        return edits.clone();
+    }
+    if let Some(document_changes) = edit["documentChanges"].as_array() {
+        let edits: Vec<Value> = document_changes
+            .iter()
+            .filter(|dc| dc["textDocument"]["uri"] == json!(host_uri))
+            .filter_map(|dc| dc["edits"].as_array())
+            .flatten()
+            .cloned()
+            .collect();
+        if !edits.is_empty() {
+            return edits;
+        }
+    }
+    panic!(
+        "edit re-keyed to the host URI {host_uri} (changes or documentChanges), got: {resolved:#?}"
+    )
 }
 
 #[test]
