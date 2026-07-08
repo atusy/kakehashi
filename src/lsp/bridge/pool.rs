@@ -1622,6 +1622,15 @@ impl LanguageServerPool {
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let command_origins = Arc::clone(&self.command_origins);
+        let upstream_request_tx = self.upstream_request_tx.clone();
+        // The editor accepts a dynamic `workspace/executeCommand` registration
+        // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
+        let supports_dynamic_command_registration = self
+            .client_capabilities()
+            .and_then(|caps| caps.workspace)
+            .and_then(|ws| ws.execute_command)
+            .and_then(|ec| ec.dynamic_registration)
+            .unwrap_or(false);
         let handshake_task = tokio::spawn(async move {
             let init_result = tokio::time::timeout(
                 timeout,
@@ -1652,7 +1661,15 @@ impl LanguageServerPool {
                     // back (#628). Dedup is by name across the whole session, so a
                     // respawn / second root re-registers nothing new.
                     if let Some(options) = capabilities.execute_command_provider.as_ref() {
-                        command_origins.register(&server_name_for_log, &options.commands);
+                        let added =
+                            command_origins.register(&server_name_for_log, &options.commands);
+                        // Advertise the NEWLY-added names upstream so the editor's
+                        // palette lists them (#628). Fire-and-forget; skipped when
+                        // the client can't accept a dynamic registration.
+                        if !added.is_empty() && supports_dynamic_command_registration {
+                            let _ = upstream_request_tx
+                                .send(UpstreamRequest::RegisterCommands { commands: added });
+                        }
                     }
                     handle_for_handshake.set_server_capabilities(capabilities);
                     // Path a: push this server's settings now that `initialized`

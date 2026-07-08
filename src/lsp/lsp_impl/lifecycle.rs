@@ -1058,6 +1058,25 @@ fn spawn_upstream_request(
     let client = client.clone();
     tokio::spawn(async move {
         match request {
+            UpstreamRequest::RegisterCommands { commands } => {
+                use tower_lsp_server::ls_types::Registration;
+                // Fire-and-forget dynamic registration of palette command names.
+                // A unique registration id (we never unregister — a disconnected
+                // server's command simply routes fail-soft). Register-options
+                // carry the `commands` for `workspace/executeCommand`.
+                let id = format!("kakehashi/executeCommand/{}", client.next_request_id());
+                let registration = Registration {
+                    id,
+                    method: "workspace/executeCommand".to_string(),
+                    register_options: Some(serde_json::json!({ "commands": commands })),
+                };
+                if let Err(e) = client.register_capability(vec![registration]).await {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Failed to register palette commands upstream: {e}"
+                    );
+                }
+            }
             UpstreamRequest::ShowMessageRequest {
                 typ,
                 message,
