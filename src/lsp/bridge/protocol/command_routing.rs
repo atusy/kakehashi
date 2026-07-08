@@ -18,9 +18,12 @@
 //! (realistic once concatenated aggregation lands, #568 PR 7) encode to
 //! distinct names and route correctly.
 //!
-//! The separator is the ASCII Unit Separator (`0x1f`), which cannot appear in a
-//! TOML config server name, a `file://` URI, or a real command identifier, so
-//! the split is unambiguous. Decoding is total: any name that isn't a
+//! The separator is the ASCII Unit Separator (`0x1f`). The routing invariant is
+//! that it must not appear in the FIRST two segments — `origin` (a TOML config
+//! key) and `host_uri` (a URL) are both control-char-free, so those boundaries
+//! are unambiguous. The `command` is the final segment and taken as the
+//! `splitn(3)` remainder, so even an (LSP-legal but unheard-of) separator inside
+//! a command id round-trips faithfully. Decoding is total: any name that isn't a
 //! well-formed bridge command yields `None`, and the handler fails that command
 //! soft rather than panicking.
 //!
@@ -31,8 +34,9 @@
 
 /// Marker that identifies a bridge-minted command name.
 const COMMAND_PREFIX: &str = "kakehashi";
-/// ASCII Unit Separator — cannot occur in a config server name, a URI, or a
-/// command id.
+/// ASCII Unit Separator — cannot occur in the `origin` (a config server name)
+/// or `host_uri` segments, which is the only invariant the split needs (the
+/// `command` is the `splitn(3)` remainder, so a separator there is harmless).
 const SEP: char = '\u{1f}';
 
 /// A decoded bridge command name: the origin server, the host document it was
@@ -89,6 +93,18 @@ mod tests {
         assert_eq!(route.origin, "py.ruff-lsp");
         assert_eq!(route.host_uri, "file:///x");
         assert_eq!(route.command, "cmd:with:colons");
+    }
+
+    #[test]
+    fn a_separator_inside_the_command_segment_round_trips() {
+        // LSP command ids are arbitrary strings; a (theoretical) separator in
+        // the command is harmless because it's the splitn(3) remainder — only
+        // the origin/host_uri boundaries must be separator-free.
+        let encoded = encode_command("srv", "file:///x", "weird\u{1f}cmd");
+        let route = decode_command(&encoded).expect("well-formed");
+        assert_eq!(route.origin, "srv");
+        assert_eq!(route.host_uri, "file:///x");
+        assert_eq!(route.command, "weird\u{1f}cmd");
     }
 
     #[test]
