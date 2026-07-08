@@ -102,6 +102,15 @@ fn assert_advertised(init_response: &Value) {
         json!(true),
         "codeActionProvider{{resolveProvider}} must be advertised for literal-support clients (#568)"
     );
+    // PR 6: executeCommand must be advertised (empty command list) so a real
+    // client actually fires action-embedded commands — the one thing the mock
+    // harness cannot gate on, since LspClient sends regardless.
+    let execute = &init_response["result"]["capabilities"]["executeCommandProvider"];
+    assert_eq!(
+        execute["commands"],
+        json!([]),
+        "executeCommandProvider must be advertised with an empty command list (#568 PR 6)"
+    );
 }
 
 /// Markdown host: the lua fence content sits on host line 3.
@@ -244,6 +253,14 @@ fn code_action_not_advertised_without_literal_support() {
         init_response["result"]["capabilities"]["codeActionProvider"],
         Value::Null,
         "codeActionProvider must be withheld without literal support"
+    );
+    // executeCommand is gated on the same condition — commands only reach the
+    // bridge through a bridged code action, so it must be withheld too (pins
+    // the gating expression, not just the capability's presence).
+    assert_eq!(
+        init_response["result"]["capabilities"]["executeCommandProvider"],
+        Value::Null,
+        "executeCommandProvider must be withheld without literal support"
     );
     shutdown(&mut client);
 }
