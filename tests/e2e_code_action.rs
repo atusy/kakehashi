@@ -883,3 +883,34 @@ fn code_action_over_a_multi_fence_range_merges_actions_from_every_region() {
 
     shutdown(&mut client);
 }
+
+#[test]
+fn palette_fired_command_routes_to_its_origin_server() {
+    // #628: a command the client fires WITHOUT an action context — a raw name
+    // from the palette, keyed off the advertised executeCommandProvider.commands
+    // — routes to the server that advertised it (recorded at handshake), not just
+    // commands surfaced through a bridged code action.
+    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+    // Drive a codeAction so mock-codeaction handshakes and registers "mock.run".
+    let _ = code_action_with_retry(&mut client);
+
+    // Fire the RAW command name (palette style): no routing prefix, no action.
+    let exec_id = client.send_request_async(
+        "workspace/executeCommand",
+        json!({ "command": "mock.run", "arguments": [] }),
+    );
+    let (apply_id, _apply_params) = client
+        .wait_for_server_request("workspace/applyEdit", Duration::from_secs(5))
+        .expect("the palette command must reach the origin server (which issues applyEdit)");
+    client.send_response(apply_id, json!({ "applied": true }));
+
+    let response = client.receive_response_for_id_public(exec_id);
+    assert_eq!(
+        response["result"]["executed"], "mock.run",
+        "the palette command must reach its origin with the raw name, got: {response:?}"
+    );
+
+    shutdown(&mut client);
+}

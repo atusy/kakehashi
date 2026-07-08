@@ -53,14 +53,14 @@ impl LanguageServerPool {
                 route.command.to_string(),
             ),
             None => {
-                // Not a bridge-minted command (a client-side or foreign command)
-                // — the bridge has no origin to route it to.
-                warn!(
-                    target: "kakehashi::bridge",
-                    "executeCommand: '{}' is not a bridged command; ignoring",
-                    params.command
-                );
-                return None;
+                // Not an action-encoded command. It may still be a PALETTE
+                // command — a name a downstream advertised via
+                // `executeCommandProvider` that the client fired without an
+                // action context (#628). Route it by the command→origin registry;
+                // otherwise it's foreign and ignored.
+                return self
+                    .dispatch_palette_command(params, settings, upstream_id)
+                    .await;
             }
         };
 
@@ -117,6 +117,53 @@ impl LanguageServerPool {
             work_done_progress_params: params.work_done_progress_params,
         };
         self.send_execute_command_on_handle(&handle, outgoing, upstream_id)
+            .await
+    }
+
+    /// Route a PALETTE-fired command (a raw downstream command name, no action
+    /// envelope) to the server that advertised it, recorded in the
+    /// [`command_origins`](Self::command_origins) registry at handshake (#628).
+    /// No host document context, so it connects at the client root
+    /// (`document_uri = None`) — a multi-root server picks one root. Forwards the
+    /// command + arguments verbatim; fails soft (foreign command, unspawnable /
+    /// unreachable origin) like every other branch.
+    async fn dispatch_palette_command(
+        &self,
+        params: ExecuteCommandParams,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<Value> {
+        let Some(origin) = self.command_origins().origin(&params.command) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: '{}' is neither a bridged nor a registered command; ignoring",
+                params.command
+            );
+            return None;
+        };
+        if !crate::config::is_server_spawnable(&settings.language_servers, &origin) {
+            return None;
+        }
+        let config = resolve_with_wildcard(
+            &settings.language_servers,
+            &origin,
+            merge_bridge_server_configs,
+        )?;
+        let handle = match self.get_or_create_connection(&origin, &config, None).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: failed to connect to {origin} for palette command: {e}"
+                );
+                return None;
+            }
+        };
+        if !handle.has_capability(METHOD) {
+            return None;
+        }
+        // Forward the command name and arguments verbatim.
+        self.send_execute_command_on_handle(&handle, params, upstream_id)
             .await
     }
 

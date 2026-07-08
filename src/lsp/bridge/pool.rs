@@ -9,6 +9,7 @@
 //! [`LanguageServerPool`] manages the connections; [`ConnectionHandle`]
 //! (ls-bridge-async-connection) and [`ConnectionState`] track each connection's lifecycle.
 
+mod command_origin_registry;
 mod connection_action;
 mod connection_handle;
 mod connection_key;
@@ -24,6 +25,7 @@ mod shutdown_timeout;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
+pub(crate) use command_origin_registry::CommandOriginRegistry;
 pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
@@ -286,6 +288,8 @@ pub struct LanguageServerPool {
     /// `upstream_request_registry`, which is the *outbound* (editor → downstream)
     /// cancel direction.
     inbound_request_registry: super::InboundRequestRegistry,
+    /// Palette command name → origin server (#628 palette-fired executeCommand).
+    command_origins: Arc<CommandOriginRegistry>,
 }
 
 impl Default for LanguageServerPool {
@@ -325,7 +329,14 @@ impl LanguageServerPool {
             progress_registry: Arc::new(super::ProgressRegistry::new()),
             client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
+            command_origins: Arc::new(CommandOriginRegistry::default()),
         }
+    }
+
+    /// Registry mapping a downstream server's advertised palette command names to
+    /// their origin server (#628 palette-fired `workspace/executeCommand`).
+    pub(crate) fn command_origins(&self) -> &CommandOriginRegistry {
+        &self.command_origins
     }
 
     /// Shared registry of in-flight forwarded requests, handed to the forwarding
@@ -1610,6 +1621,7 @@ impl LanguageServerPool {
         let advertise_configuration = server_config.settings.is_some();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
+        let command_origins = Arc::clone(&self.command_origins);
         let handshake_task = tokio::spawn(async move {
             let init_result = tokio::time::timeout(
                 timeout,
@@ -1635,6 +1647,13 @@ impl LanguageServerPool {
                         "[{}] LSP handshake completed successfully",
                         server_name_for_log
                     );
+                    // Record this server's advertised palette command names so a
+                    // command fired without an action context (raw name) can route
+                    // back (#628). Dedup is by name across the whole session, so a
+                    // respawn / second root re-registers nothing new.
+                    if let Some(options) = capabilities.execute_command_provider.as_ref() {
+                        command_origins.register(&server_name_for_log, &options.commands);
+                    }
                     handle_for_handshake.set_server_capabilities(capabilities);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
