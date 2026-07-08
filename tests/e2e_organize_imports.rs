@@ -88,7 +88,9 @@ fn open(client: &mut LspClient, uri: &str, text: &str) {
             "uri": uri, "languageId": "markdown", "version": 1, "text": text
         }}),
     );
-    std::thread::sleep(Duration::from_millis(2000));
+    // Brief settle so kakehashi processes didOpen; the request retry loops cover
+    // the rest of ruff's cold start, so no need for a long fixed sleep.
+    std::thread::sleep(Duration::from_millis(200));
 }
 
 /// Apply LSP `TextEdit`s (whole-document `changes` entry) to `text`. The test
@@ -129,7 +131,12 @@ fn apply_edits(text: &str, edits: &[Value]) -> String {
             // a no-op to normalize away — fail loudly (the harness validates the
             // bridge's host coordinates).
             assert!(en >= s, "reversed host range in edit: {e:#?}");
-            (s, en, e["newText"].as_str().unwrap_or("").to_string())
+            // newText is REQUIRED by LSP; a missing one is a malformed edit, so
+            // fail rather than silently apply a deletion.
+            let new = e["newText"]
+                .as_str()
+                .unwrap_or_else(|| panic!("TextEdit.newText missing: {e:#?}"));
+            (s, en, new.to_string())
         })
         .collect();
     spans.sort_by_key(|(s, _, _)| *s);
