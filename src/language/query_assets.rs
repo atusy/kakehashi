@@ -62,14 +62,11 @@ mod tests {
     /// once into a shared library, then load it through the C ABI (which is
     /// version-independent — the whole reason the runtime never hit the pin).
     ///
-    /// The compiled `.so` is cached under the OS temp dir and reused, so
-    /// repeated `cargo test` runs never re-fetch or re-compile; only a cold
-    /// cache (first run, or after the temp dir is cleared) needs the network.
-    /// The revision is whatever nvim-treesitter's metadata pointed to when the
-    /// cache was first populated; a warm cache is then frozen until the temp
-    /// dir is cleared (it does not follow later upstream grammar updates). The
-    /// dockerfile asset targets stable node types, so this is acceptable for a
-    /// fixture; a stricter revision pin would need a pinned-fetch API.
+    /// The compiled `.so` is cached under the project-local test data dir and
+    /// reused, so repeated `cargo test` runs never re-fetch or re-compile; only
+    /// a cold cache needs the network. The fixture seeds the metadata cache with
+    /// a pinned Dockerfile grammar revision so cold-cache runs do not follow
+    /// upstream nvim-treesitter metadata changes.
     ///
     /// A process-wide `OnceLock` memoizes the loaded grammar so the install +
     /// load runs exactly once no matter how many fixture threads race here —
@@ -79,13 +76,27 @@ mod tests {
         use crate::install::parser::{
             InstallOptions, ParserCompile, ParserInstallError, install_parser, parser_file_exists,
         };
+        use crate::install::{test_helpers, test_support};
         use crate::language::loader::ParserLoader;
         use std::sync::OnceLock;
 
         static DOCKERFILE: OnceLock<tree_sitter::Language> = OnceLock::new();
         DOCKERFILE
             .get_or_init(|| {
-                let cache_dir = std::env::temp_dir().join("kakehashi-test-grammars");
+                let cache_dir = test_support::test_data_dir_path().join("query-assets");
+                test_helpers::setup_mock_metadata_cache(
+                    &cache_dir,
+                    r#"
+return {
+  dockerfile = {
+    install_info = {
+      revision = '971acdd908568b4531b0ba28a445bf0bb720aba5',
+      url = 'https://github.com/camdencheek/tree-sitter-dockerfile',
+    },
+  },
+}
+"#,
+                );
                 let library = parser_file_exists("dockerfile", &cache_dir).unwrap_or_else(|| {
                     let options = InstallOptions {
                         data_dir: cache_dir.clone(),
@@ -509,6 +520,17 @@ mod tests {
         }
 
         #[test]
+        fn static_imports_do_not_define_types() {
+            let text = "import static java.lang.Math.PI;\nclass K { double x = PI; }\n";
+            let m = model_for("java", text);
+            assert_eq!(
+                m.definition_range_at(nth(text, "PI", 1)),
+                None,
+                "static imports are values or methods, not type definitions"
+            );
+        }
+
+        #[test]
         fn interface_generics_resolve_in_the_body() {
             let text = "interface I<T> { T get(); }\n";
             let m = model_for("java", text);
@@ -730,6 +752,13 @@ mod tests {
                 None,
                 "->size is member access, not the property"
             );
+        }
+
+        #[test]
+        fn foreach_value_binds_when_iterable_is_not_a_variable() {
+            let text = "<?php\nfunction f() { foreach (items() as $v) { echo $v; } }\n";
+            let m = model_for("php", text);
+            assert_resolves(&m, text, "v", 1, 0);
         }
     }
 

@@ -53,7 +53,7 @@
 
 ; foreach binders: `foreach ($xs as $k => $v)` / `foreach ($xs as $v)`.
 (foreach_statement (pair (variable_name (name) @definition)))
-(foreach_statement (variable_name) (variable_name (name) @definition))
+(foreach_statement . (_) . (variable_name (name) @definition))
 
 ; A closure's `use` clause imports the outer variable as a fresh
 ; function-scoped binding.

@@ -80,7 +80,9 @@
 (lambda_expression parameters: (identifier) @definition.parameter)
 
 ; ── Imports bind the terminal name as a type at the file level ──────────
-((import_declaration (scoped_identifier name: (identifier) @definition.type))
+((import_declaration
+   (scoped_identifier name: (identifier) @definition.type)) @_import
+ (#not-lua-match? @_import "^import%s+static")
  (#set! definition.namespace "type"))
 
 ; ── References ───────────────────────────────────────────────────────────
