@@ -11,7 +11,7 @@
 //!
 //! codeAction defaults to `concatenated` at both aggregation levels (#568 PR 7):
 //! within a layer, every server's actions are merged (`concat_merge`); across
-//! layers, [`Kakehashi::walk_layers_concatenated`] merges virt+host+native in
+//! layers, [`Kakehashi::walk_layers_by_strategy`] merges virt+host+native in
 //! priority order (the native layer is wired but contributes nothing yet — it
 //! resolves to `None`). Whichever cross-layer strategy applies, the final menu has
 //! its cross-source `isPreferred` collision collapsed once
