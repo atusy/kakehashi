@@ -58,7 +58,11 @@ fn init_ruff_client() -> (LspClient, tempfile::TempDir, tempfile::TempDir) {
         .env_remove("KAKEHASHI_EXPERIMENTAL")
         .build();
 
-    let root_uri = format!("file://{}", workspace.path().display());
+    // Canonical directory URI (percent-encoded), reused for both rootUri and
+    // workspaceFolders — see doc_uri for why string-formatting is avoided.
+    let root_uri = url::Url::from_directory_path(workspace.path())
+        .expect("valid directory URI")
+        .to_string();
     client.send_request(
         "initialize",
         json!({
@@ -191,7 +195,13 @@ fn resolved_host_edits(client: &mut LspClient, action: &Value, host_uri: &str) -
     let resolved = if action["edit"].is_object() {
         action.clone()
     } else {
-        client.send_request("codeAction/resolve", action.clone())["result"].clone()
+        let response = client.send_request("codeAction/resolve", action.clone());
+        assert!(
+            response.get("error").is_none(),
+            "codeAction/resolve returned a JSON-RPC error: {}",
+            response["error"]
+        );
+        response["result"].clone()
     };
     let edit = &resolved["edit"];
     if let Some(edits) = edit["changes"][host_uri].as_array() {
