@@ -318,6 +318,48 @@ impl BridgeCoordinator {
     /// this injection. Host lookup uses wildcard resolution (wildcard-config-inheritance):
     /// undefined hosts inherit `languages._`, letting one default filter apply
     /// to every host.
+    /// Await eager-opening ONLY `server_name`'s virtual documents for `host_uri`,
+    /// so a bridged `workspace/executeCommand` routed to a respawned downstream
+    /// (whose doc tracker was purged) doesn't compute against missing document
+    /// state. Unlike the request path, executeCommand has no
+    /// `ensure_document_opened` step; unlike [`Self::eager_spawn_and_open_documents`]
+    /// (fire-and-forget), this is AWAITED so the `didOpen` is enqueued on the
+    /// shared single-writer connection BEFORE the caller sends the command
+    /// (FIFO → didOpen first). A no-op when the docs are already open
+    /// (idempotent claim), and when no injection maps to `server_name`
+    /// (e.g. a host-layer command — host-layer sync is a separate follow-up).
+    pub(crate) async fn ensure_server_documents_open(
+        &self,
+        settings: &WorkspaceSettings,
+        host_language: &str,
+        host_uri: &Url,
+        injections: Vec<BridgeInjection>,
+        server_name: &str,
+    ) {
+        let mut config: Option<Arc<BridgeServerConfig>> = None;
+        let for_server: Vec<BridgeInjection> = injections
+            .into_iter()
+            .filter(|inj| {
+                match self.get_config_for_language(settings, host_language, &inj.language) {
+                    Some(resolved) if resolved.server_name == server_name => {
+                        config.get_or_insert(resolved.config);
+                        true
+                    }
+                    _ => false,
+                }
+            })
+            .collect();
+        let Some(config) = config else {
+            return; // no injected region on this host bridges to `server_name`
+        };
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return;
+        };
+        self.pool
+            .eager_open_virtual_documents(server_name, &config, host_uri, &host_uri_lsp, for_server)
+            .await;
+    }
+
     pub(crate) fn get_config_for_language(
         &self,
         settings: &WorkspaceSettings,
@@ -1285,6 +1327,73 @@ mod tests {
             result.is_none(),
             "rust should be blocked by markdown's bridge filter"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_server_documents_open_short_circuits_for_a_non_matching_server() {
+        // A command whose host injections bridge to another server must not
+        // trigger a connect/spawn for `server_name`: the filter drops every
+        // injection, so the method returns before touching the pool. Asserted
+        // via a timeout — a spawn attempt would block on the init handshake.
+        let coordinator = BridgeCoordinator::new();
+
+        let mut bridge_filter = HashMap::new();
+        bridge_filter.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
+        );
+        let mut servers = HashMap::new();
+        servers.insert(
+            "ruff".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["ruff".to_string()],
+                languages: vec!["python".to_string()],
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                enabled: None,
+                settings: None,
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        let host_uri = Url::parse("file:///doc.md").unwrap();
+        let injections = vec![BridgeInjection {
+            language: "python".to_string(),
+            region_id: "region-0".to_string(),
+            content: "import os\n".to_string(),
+        }];
+
+        // `python` bridges to "ruff", not "other-server" → no match → no-op.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            coordinator.ensure_server_documents_open(
+                &settings,
+                "markdown",
+                &host_uri,
+                injections,
+                "other-server",
+            ),
+        )
+        .await
+        .expect("a non-matching server must short-circuit, not attempt a spawn");
     }
 
     #[test]

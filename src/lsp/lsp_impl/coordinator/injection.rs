@@ -335,6 +335,16 @@ impl InjectionCoordinator {
         detect_document_language(&self.language, &self.documents, uri)
     }
 
+    /// The host language and resolved bridge injections for `uri`, or `None`
+    /// when the document has no detectable language. Lets a caller re-derive the
+    /// injected regions on demand (executeCommand doc-sync), mirroring the
+    /// didOpen/didChange discovery.
+    pub(crate) fn bridge_injections(&self, uri: &Url) -> Option<(String, Vec<BridgeInjection>)> {
+        let host_language = self.get_language_for_document(uri)?;
+        let injections = self.resolve_injection_data(uri, &host_language);
+        Some((host_language, injections))
+    }
+
     fn install_coordinator(&self) -> InstallCoordinator {
         InstallCoordinator::from_parts(InstallCoordinatorDeps {
             client: self.client.clone(),

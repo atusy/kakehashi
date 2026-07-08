@@ -20,9 +20,55 @@ impl Kakehashi {
     ) -> Result<Option<Value>> {
         let settings = self.settings_manager.load_settings();
         let upstream_id = crate::lsp::current_upstream_id();
+
+        // Self-heal document state before routing. A bridged command assumes the
+        // origin server has the (virtual) document open, but a downstream respawn
+        // between the codeAction that surfaced the command and this executeCommand
+        // purges that connection's doc tracker — and, unlike the request path,
+        // executeCommand has no `ensure_document_opened` step. Re-open the origin's
+        // injected docs first (awaited, so the didOpen is enqueued before the
+        // command on the shared connection). Fail-soft: any gap (foreign command,
+        // unparseable host URI, undetectable host language, no matching injection)
+        // just skips the sync and dispatches as before.
+        self.sync_origin_documents_before_execute(&params, &settings)
+            .await;
+
         let pool = self.bridge.pool_arc();
         Ok(pool
             .dispatch_execute_command(params, &settings, upstream_id)
             .await)
+    }
+
+    /// Best-effort re-open of the routed command's origin-server documents (see
+    /// [`Self::execute_command_impl`]). Scoped to virt-layer injected documents;
+    /// a host-layer command resolves to no injection and is left to dispatch.
+    async fn sync_origin_documents_before_execute(
+        &self,
+        params: &ExecuteCommandParams,
+        settings: &crate::config::WorkspaceSettings,
+    ) {
+        let Some(route) = crate::lsp::bridge::decode_command(&params.command) else {
+            return;
+        };
+        let Ok(host_url) = url::Url::parse(route.host_uri) else {
+            return;
+        };
+        let Some((host_language, injections)) =
+            self.injection_coordinator().bridge_injections(&host_url)
+        else {
+            return;
+        };
+        if injections.is_empty() {
+            return;
+        }
+        self.bridge
+            .ensure_server_documents_open(
+                settings,
+                &host_language,
+                &host_url,
+                injections,
+                route.origin,
+            )
+            .await;
     }
 }
