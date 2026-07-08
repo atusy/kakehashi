@@ -677,7 +677,20 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
 
-        parse_code_action_resolve_response(response.ok()?)
+        // Fail soft, but not silently: surface timeouts / channel-closed like the
+        // sibling codeLens/completion resolve paths so resolve-time issues are
+        // debuggable (qodo review finding).
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve failed for {connection_key:?}: {e}"
+                );
+                return None;
+            }
+        };
+        parse_code_action_resolve_response(response)
     }
 }
 
