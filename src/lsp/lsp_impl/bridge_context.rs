@@ -283,6 +283,67 @@ pub(crate) async fn race_layers_preferred<R>(
     }
 }
 
+/// Cross-layer `concatenated`: await ALL layers in `priorities` (a barrier,
+/// unlike [`race_layers_preferred`]'s first-wins) and merge their non-empty
+/// results in priority order via `combine`. A layer not in `priorities` is
+/// never awaited, so its future does no work. Errors (e.g. a cancelled layer)
+/// propagate. Ordering is stable by `priorities` regardless of which layer
+/// finishes first, so the merged menu keeps muscle-memory order.
+pub(crate) async fn race_layers_concatenated<R>(
+    priorities: &[LayerSource],
+    virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+    host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+    native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+    combine: impl Fn(R, R) -> R,
+) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+    // Only await a layer that's in `priorities`; a lazy future left un-awaited
+    // never runs, matching `race_layers_preferred`, which never consults an
+    // excluded layer. All included layers run concurrently under `join!`.
+    let virt_arm = async {
+        if priorities.contains(&LayerSource::Virt) {
+            virt.await
+        } else {
+            Ok(None)
+        }
+    };
+    let host_arm = async {
+        if priorities.contains(&LayerSource::Host) {
+            host.await
+        } else {
+            Ok(None)
+        }
+    };
+    let native_arm = async {
+        if priorities.contains(&LayerSource::Native) {
+            native.await
+        } else {
+            Ok(None)
+        }
+    };
+    let (virt_r, host_r, native_r) = tokio::join!(virt_arm, host_arm, native_arm);
+    let mut virt_r = virt_r?;
+    let mut host_r = host_r?;
+    let mut native_r = native_r?;
+
+    // Fold in priority order via `take()` so each layer contributes exactly
+    // once even if a (malformed) config lists it twice.
+    let mut acc: Option<R> = None;
+    for layer in priorities {
+        let contrib = match layer {
+            LayerSource::Virt => virt_r.take(),
+            LayerSource::Host => host_r.take(),
+            LayerSource::Native => native_r.take(),
+        };
+        if let Some(items) = contrib {
+            acc = Some(match acc {
+                Some(existing) => combine(existing, items),
+                None => items,
+            });
+        }
+    }
+    Ok(acc)
+}
+
 /// Deserialize a verbatim host-layer result into the handler's response
 /// type, logging (not erroring) on shape mismatch.
 pub(crate) fn parse_host_verbatim<R: serde::de::DeserializeOwned>(
@@ -1023,6 +1084,62 @@ impl Kakehashi {
         result
     }
 
+    /// Cross-layer CONCATENATED walk: the barrier sibling of
+    /// [`Self::walk_layer_futures`]. Awaits all configured layers and merges
+    /// their non-empty results in priority order via `combine`, with the same
+    /// walk-wide cancel subscription and upstream-registry sweep. Used by
+    /// list-valued methods (codeAction) configured `strategy = concatenated`
+    /// at the `layers.aggregation` level (#568 PR 7).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layers_concatenated<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        combine: impl Fn(R, R) -> R,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return Ok(None);
+        };
+        let Some(host_language) = self.document_language(&uri) else {
+            return Ok(None);
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+
+        // Same walk-wide cancel subscription as the preferred walk (see there).
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
+        let race = race_layers_concatenated(&layer_cfg.priorities, virt, host, native, combine);
+        let result = match cancel_rx {
+            Some(mut cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                    result = race => result,
+                }
+            }
+            None => race.await,
+        };
+        self.bridge
+            .pool_arc()
+            .unregister_all_for_upstream_id(current_upstream_id().as_ref());
+        result
+    }
+
+    /// The cross-layer aggregation strategy configured for `method` on this
+    /// document's host language (`layers.aggregation.<method>.strategy`),
+    /// defaulting to `preferred` when the document language can't be resolved.
+    pub(crate) fn cross_layer_strategy(&self, lsp_uri: &Uri, method: &str) -> AggregationStrategy {
+        uri_to_url(lsp_uri)
+            .ok()
+            .and_then(|uri| self.document_language(&uri))
+            .map(|lang| self.resolve_layer_config(&lang, method).strategy)
+            .unwrap_or(AggregationStrategy::Preferred)
+    }
+
     /// Resolve injection context for a bridge endpoint request (all matching servers).
     ///
     /// Delegates to the shared preamble, then looks up ALL bridge server configs
@@ -1200,6 +1317,78 @@ mod tests {
 
     fn pos(line: u32, character: u32) -> Position {
         Position { line, character }
+    }
+
+    fn concat_vec(mut a: Vec<i32>, b: Vec<i32>) -> Vec<i32> {
+        a.extend(b);
+        a
+    }
+
+    #[tokio::test]
+    async fn concatenated_merges_all_layers_in_priority_order() {
+        use std::future::ready;
+        let r = race_layers_concatenated(
+            &[LayerSource::Virt, LayerSource::Host, LayerSource::Native],
+            ready(Ok(Some(vec![1]))),
+            ready(Ok(Some(vec![2]))),
+            ready(Ok(None)),
+            concat_vec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r,
+            Some(vec![1, 2]),
+            "both non-empty layers appear, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn concatenated_order_follows_priorities_not_argument_order() {
+        use std::future::ready;
+        // Priorities put host BEFORE virt, so host's items lead even though virt
+        // is the first argument — proves ordering is by priority, not position.
+        let r = race_layers_concatenated(
+            &[LayerSource::Host, LayerSource::Virt],
+            ready(Ok(Some(vec![1]))), // virt
+            ready(Ok(Some(vec![2]))), // host
+            ready(Ok(None)),
+            concat_vec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Some(vec![2, 1]));
+    }
+
+    #[tokio::test]
+    async fn concatenated_drops_a_layer_absent_from_priorities() {
+        use std::future::ready;
+        // Only virt is in priorities; host's non-empty result is excluded.
+        let r = race_layers_concatenated(
+            &[LayerSource::Virt],
+            ready(Ok(Some(vec![1]))),
+            ready(Ok(Some(vec![99]))),
+            ready(Ok(None)),
+            concat_vec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Some(vec![1]));
+    }
+
+    #[tokio::test]
+    async fn concatenated_all_empty_is_none() {
+        use std::future::ready;
+        let r = race_layers_concatenated(
+            &[LayerSource::Virt, LayerSource::Host, LayerSource::Native],
+            ready(Ok(None::<Vec<i32>>)),
+            ready(Ok(None)),
+            ready(Ok(None)),
+            concat_vec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, None);
     }
 
     #[test]
