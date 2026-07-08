@@ -121,19 +121,21 @@ impl LanguageServerPool {
     }
 
     /// Route a PALETTE-fired command (a raw downstream command name, no action
-    /// envelope) to the server that advertised it, recorded in the
-    /// [`command_origins`](Self::command_origins) registry at handshake (#628).
-    /// No host document context, so it connects at the client root
-    /// (`document_uri = None`) — a multi-root server picks one root. Forwards the
-    /// command + arguments verbatim; fails soft (foreign command, unspawnable /
-    /// unreachable origin) like every other branch.
+    /// envelope) to the exact connection that advertised it — recorded in the
+    /// [`command_origins`](Self::command_origins) registry at handshake — so it
+    /// runs in the same `(server, root)` workspace context (#628). Reuses the
+    /// live advertising connection; only if it has since been shut down does it
+    /// fall back to a client-root reconnect (where a multi-root server may land
+    /// on a different root). Forwards the command + arguments verbatim; fails
+    /// soft (foreign command, unspawnable / unreachable origin) like every other
+    /// branch.
     async fn dispatch_palette_command(
         &self,
         params: ExecuteCommandParams,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Value> {
-        let Some(origin) = self.command_origins().origin(&params.command) else {
+        let Some(key) = self.command_origins().route(&params.command) else {
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: '{}' is neither a bridged nor a registered command; ignoring",
@@ -141,20 +143,41 @@ impl LanguageServerPool {
             );
             return None;
         };
-        if !crate::config::is_server_spawnable(&settings.language_servers, &origin) {
-            return None;
-        }
-        let config = resolve_with_wildcard(
-            &settings.language_servers,
-            &origin,
-            merge_bridge_server_configs,
-        )?;
-        let handle = match self.get_or_create_connection(&origin, &config, None).await {
-            Ok(handle) => handle,
-            Err(e) => {
+        let origin = key.server();
+        let handle = match self.ready_connection_by_key(&key).await {
+            // The connection that advertised the command is still Ready — route
+            // there, preserving its workspace root/context.
+            Some(handle) => handle,
+            // Not Ready or gone. A client-root reconnect would run the command
+            // against the WRONG workspace for a marker/shared-rooted server, so
+            // only fall back when the advertising key was ITSELF the client-root
+            // fallback; otherwise fail soft (the user re-fires once the server is
+            // back). Reconstructing the marker root here is a deferred follow-up.
+            None if key.is_client_fallback() => {
+                if !crate::config::is_server_spawnable(&settings.language_servers, origin) {
+                    return None;
+                }
+                let config = resolve_with_wildcard(
+                    &settings.language_servers,
+                    origin,
+                    merge_bridge_server_configs,
+                )?;
+                match self.get_or_create_connection(origin, &config, None).await {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        warn!(
+                            target: "kakehashi::bridge",
+                            "executeCommand: failed to reconnect to {origin} for palette command: {e}"
+                        );
+                        return None;
+                    }
+                }
+            }
+            None => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "executeCommand: failed to connect to {origin} for palette command: {e}"
+                    "executeCommand: origin connection for palette command '{}' ({origin}) is not ready; ignoring",
+                    params.command
                 );
                 return None;
             }

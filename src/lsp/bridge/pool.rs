@@ -334,9 +334,23 @@ impl LanguageServerPool {
     }
 
     /// Registry mapping a downstream server's advertised palette command names to
-    /// their origin server (#628 palette-fired `workspace/executeCommand`).
+    /// the connection that advertised them (#628 palette-fired executeCommand).
     pub(crate) fn command_origins(&self) -> &CommandOriginRegistry {
         &self.command_origins
+    }
+
+    /// The existing `Ready` connection for `key`, if one is live. Used to route a
+    /// palette command back to the exact connection that advertised it (right
+    /// workspace root/context) rather than spawning a fresh client-root one.
+    pub(crate) async fn ready_connection_by_key(
+        &self,
+        key: &ConnectionKey,
+    ) -> Option<Arc<ConnectionHandle>> {
+        let connections = self.connections.lock().await;
+        connections
+            .get(key)
+            .filter(|handle| handle.state() == ConnectionState::Ready)
+            .map(Arc::clone)
     }
 
     /// Shared registry of in-flight forwarded requests, handed to the forwarding
@@ -1622,6 +1636,7 @@ impl LanguageServerPool {
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let command_origins = Arc::clone(&self.command_origins);
+        let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
         // The editor accepts a dynamic `workspace/executeCommand` registration
         // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
@@ -1656,21 +1671,13 @@ impl LanguageServerPool {
                         "[{}] LSP handshake completed successfully",
                         server_name_for_log
                     );
-                    // Record this server's advertised palette command names so a
-                    // command fired without an action context (raw name) can route
-                    // back (#628). Dedup is by name across the whole session, so a
-                    // respawn / second root re-registers nothing new.
-                    if let Some(options) = capabilities.execute_command_provider.as_ref() {
-                        let added =
-                            command_origins.register(&server_name_for_log, &options.commands);
-                        // Advertise the NEWLY-added names upstream so the editor's
-                        // palette lists them (#628). Fire-and-forget; skipped when
-                        // the client can't accept a dynamic registration.
-                        if !added.is_empty() && supports_dynamic_command_registration {
-                            let _ = upstream_request_tx
-                                .send(UpstreamRequest::RegisterCommands { commands: added });
-                        }
-                    }
+                    // Extract this server's advertised palette command names
+                    // before `capabilities` is moved; they're registered AFTER
+                    // the Ready flip below.
+                    let palette_commands = capabilities
+                        .execute_command_provider
+                        .as_ref()
+                        .map(|options| options.commands.clone());
                     handle_for_handshake.set_server_capabilities(capabilities);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
@@ -1699,6 +1706,21 @@ impl LanguageServerPool {
                         );
                     }
                     handle_for_handshake.set_state(ConnectionState::Ready);
+                    // Record advertised palette command names AFTER Ready, so a
+                    // command fired without an action context (raw name) routes
+                    // back to a Ready connection (#628). Dedup is by name across
+                    // the whole session, so a respawn / second root re-registers
+                    // nothing new.
+                    if let Some(commands) = palette_commands {
+                        let added = command_origins.register(&command_registration_key, &commands);
+                        // Advertise the NEWLY-added names upstream so the editor's
+                        // palette lists them. Fire-and-forget; skipped when the
+                        // client can't accept a dynamic registration.
+                        if !added.is_empty() && supports_dynamic_command_registration {
+                            let _ = upstream_request_tx
+                                .send(UpstreamRequest::RegisterCommands { commands: added });
+                        }
+                    }
                     Ok(())
                 }
                 Ok(Err(e)) => {
