@@ -1,24 +1,341 @@
 //! didChangeConfiguration notification handler for Kakehashi.
 
-use std::collections::HashSet;
-use std::sync::OnceLock;
-
+use serde_json::Value;
 use tower_lsp_server::ls_types::DidChangeConfigurationParams;
 
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
 
 use super::super::Kakehashi;
 
+const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
+    "searchPaths",
+    "languages",
+    "captureMappings",
+    "autoInstall",
+    "diagnosticsDebounceMs",
+    "languageServers",
+];
+
+const KNOWN_AGGREGATION_SETTING_KEYS: &[&str] = &[
+    "maxFanOut",
+    "priorities",
+    "pullFallback",
+    "pushFallback",
+    "strategy",
+];
+
+const KNOWN_BRIDGE_LANGUAGE_SETTING_KEYS: &[&str] = &["aggregation", "enabled"];
+
+const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
+    "cmd",
+    "enabled",
+    "initializationOptions",
+    "languages",
+    "onTypeFormattingTriggers",
+    "preferSharedInstance",
+    "rootMarkers",
+    "settings",
+    "workspaceMarkers",
+];
+
+const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["folds", "highlights"];
+
+const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] =
+    &["aliases", "base", "bridge", "layers", "parser", "queries"];
+
+const KNOWN_LAYER_AGGREGATION_SETTING_KEYS: &[&str] = &["priorities", "strategy"];
+
+const KNOWN_LAYERS_SETTING_KEYS: &[&str] = &["aggregation"];
+
+const KNOWN_QUERY_ITEM_SETTING_KEYS: &[&str] = &["kind", "path"];
+
+fn settings_payload(settings: Value) -> (Value, Vec<String>) {
+    let Value::Object(mut object) = settings else {
+        return (settings, Vec::new());
+    };
+
+    if object.contains_key("kakehashi") {
+        let kakehashi = object
+            .remove("kakehashi")
+            .expect("kakehashi key should exist after object lookup");
+        if !kakehashi.is_object() {
+            return (kakehashi, Vec::new());
+        }
+
+        let mut unknown_keys = object
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| is_workspace_setting_key_or_typo(key))
+            .collect::<Vec<_>>();
+        unknown_keys.extend(unknown_workspace_setting_keys(&kakehashi));
+        unknown_keys.sort();
+        return (kakehashi, unknown_keys);
+    }
+
+    let settings = kakehashi_targeted_payload(object);
+    let mut unknown_keys = unknown_workspace_setting_keys(&settings);
+    unknown_keys.sort();
+    (settings, unknown_keys)
+}
+
+fn uses_deprecated_unwrapped_didchange_shape(settings: &Value) -> bool {
+    let Some(object) = settings.as_object() else {
+        return false;
+    };
+    if object.contains_key("kakehashi") {
+        return false;
+    }
+
+    kakehashi_targeted_payload(object.clone())
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+}
+
+fn kakehashi_targeted_payload(object: serde_json::Map<String, Value>) -> serde_json::Value {
+    let object = object
+        .into_iter()
+        .filter(|(key, _)| is_workspace_setting_key_or_typo(key))
+        .collect();
+    Value::Object(object)
+}
+
+fn format_rejected_keys(keys: &[String]) -> String {
+    keys.iter()
+        .map(|key| format!("`{key}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unknown_object_keys(path: &str, value: &Value, known_keys: &[&str]) -> Vec<String> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+
+    object
+        .keys()
+        .filter(|key| !known_keys.contains(&key.as_str()))
+        .map(|key| format!("{path}.{key}"))
+        .collect()
+}
+
+fn is_workspace_setting_key_or_typo(key: &str) -> bool {
+    KNOWN_WORKSPACE_SETTING_KEYS.contains(&key)
+        || KNOWN_WORKSPACE_SETTING_KEYS
+            .iter()
+            .any(|known_key| is_one_edit_apart(key, known_key))
+}
+
+fn is_one_edit_apart(candidate: &str, known: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let known = known.as_bytes();
+    let len_diff = candidate.len().abs_diff(known.len());
+    if len_diff > 1 {
+        return false;
+    }
+
+    if len_diff == 0 {
+        return candidate
+            .iter()
+            .zip(known.iter())
+            .filter(|(candidate, known)| candidate != known)
+            .count()
+            == 1;
+    }
+
+    let (shorter, longer) = if candidate.len() < known.len() {
+        (candidate, known)
+    } else {
+        (known, candidate)
+    };
+    let mut short_index = 0;
+    let mut long_index = 0;
+    let mut edits = 0;
+    while short_index < shorter.len() && long_index < longer.len() {
+        if shorter[short_index] == longer[long_index] {
+            short_index += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+        }
+        long_index += 1;
+    }
+
+    true
+}
+
+fn unknown_workspace_setting_keys(settings: &Value) -> Vec<String> {
+    let Some(object) = settings.as_object() else {
+        return Vec::new();
+    };
+
+    let mut unknown_keys = object
+        .keys()
+        .filter(|key| !KNOWN_WORKSPACE_SETTING_KEYS.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    append_unknown_bridge_server_setting_keys(object, &mut unknown_keys);
+    append_unknown_capture_mappings_setting_keys(object, &mut unknown_keys);
+    append_unknown_language_setting_keys(object, &mut unknown_keys);
+
+    unknown_keys
+}
+
+fn append_unknown_bridge_server_setting_keys(
+    object: &serde_json::Map<String, Value>,
+    unknown_keys: &mut Vec<String>,
+) {
+    let Some(servers) = object.get("languageServers").and_then(Value::as_object) else {
+        return;
+    };
+
+    for (server_name, server) in servers {
+        unknown_keys.extend(unknown_object_keys(
+            &format!("languageServers.{server_name}"),
+            server,
+            KNOWN_BRIDGE_SERVER_SETTING_KEYS,
+        ));
+    }
+}
+
+fn append_unknown_capture_mappings_setting_keys(
+    object: &serde_json::Map<String, Value>,
+    unknown_keys: &mut Vec<String>,
+) {
+    let Some(capture_mappings) = object.get("captureMappings").and_then(Value::as_object) else {
+        return;
+    };
+
+    for (scope, query_type_mappings) in capture_mappings {
+        unknown_keys.extend(unknown_object_keys(
+            &format!("captureMappings.{scope}"),
+            query_type_mappings,
+            KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS,
+        ));
+    }
+}
+
+fn append_unknown_language_setting_keys(
+    object: &serde_json::Map<String, Value>,
+    unknown_keys: &mut Vec<String>,
+) {
+    let Some(languages) = object.get("languages").and_then(Value::as_object) else {
+        return;
+    };
+
+    for (language_name, language) in languages {
+        let language_path = format!("languages.{language_name}");
+        unknown_keys.extend(unknown_object_keys(
+            &language_path,
+            language,
+            KNOWN_LANGUAGE_SETTING_KEYS,
+        ));
+
+        let Some(language) = language.as_object() else {
+            continue;
+        };
+
+        append_unknown_query_item_keys(&language_path, language, unknown_keys);
+        append_unknown_bridge_language_keys(&language_path, language, unknown_keys);
+        append_unknown_layers_keys(&language_path, language, unknown_keys);
+    }
+}
+
+fn append_unknown_query_item_keys(
+    language_path: &str,
+    language: &serde_json::Map<String, Value>,
+    unknown_keys: &mut Vec<String>,
+) {
+    let Some(queries) = language.get("queries").and_then(Value::as_array) else {
+        return;
+    };
+
+    for (query_index, query) in queries.iter().enumerate() {
+        unknown_keys.extend(unknown_object_keys(
+            &format!("{language_path}.queries.{query_index}"),
+            query,
+            KNOWN_QUERY_ITEM_SETTING_KEYS,
+        ));
+    }
+}
+
+fn append_unknown_bridge_language_keys(
+    language_path: &str,
+    language: &serde_json::Map<String, Value>,
+    unknown_keys: &mut Vec<String>,
+) {
+    let Some(bridge) = language.get("bridge").and_then(Value::as_object) else {
+        return;
+    };
+
+    for (bridge_name, bridge) in bridge {
+        let bridge_path = format!("{language_path}.bridge.{bridge_name}");
+        unknown_keys.extend(unknown_object_keys(
+            &bridge_path,
+            bridge,
+            KNOWN_BRIDGE_LANGUAGE_SETTING_KEYS,
+        ));
+
+        let Some(bridge) = bridge.as_object() else {
+            continue;
+        };
+        let Some(aggregation) = bridge.get("aggregation").and_then(Value::as_object) else {
+            continue;
+        };
+
+        for (method, config) in aggregation {
+            unknown_keys.extend(unknown_object_keys(
+                &format!("{bridge_path}.aggregation.{method}"),
+                config,
+                KNOWN_AGGREGATION_SETTING_KEYS,
+            ));
+        }
+    }
+}
+
+fn append_unknown_layers_keys(
+    language_path: &str,
+    language: &serde_json::Map<String, Value>,
+    unknown_keys: &mut Vec<String>,
+) {
+    let Some(layers) = language.get("layers") else {
+        return;
+    };
+
+    let layers_path = format!("{language_path}.layers");
+    unknown_keys.extend(unknown_object_keys(
+        &layers_path,
+        layers,
+        KNOWN_LAYERS_SETTING_KEYS,
+    ));
+
+    let Some(aggregation) = layers.get("aggregation").and_then(Value::as_object) else {
+        return;
+    };
+
+    for (method, config) in aggregation {
+        unknown_keys.extend(unknown_object_keys(
+            &format!("{layers_path}.aggregation.{method}"),
+            config,
+            KNOWN_LAYER_AGGREGATION_SETTING_KEYS,
+        ));
+    }
+}
+
 impl Kakehashi {
     /// Handle workspace/didChangeConfiguration notification.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
-        let normalized = normalize_kakehashi_settings(params.settings);
+        let uses_deprecated_unwrapped_shape =
+            uses_deprecated_unwrapped_didchange_shape(&params.settings);
+        let (settings_value, unknown_keys) = settings_payload(params.settings);
 
         // Nudge users off the deprecated `rootMarkers` key if this push carries
         // it. Detect from the raw value before serde's alias erases which key
         // was used; the claim guard shares the once-per-session slot with the
         // initialize path.
-        if crate::config::deprecation::json_uses_deprecated_root_markers(&normalized.raw_value)
+        if crate::config::deprecation::json_uses_deprecated_root_markers(&settings_value)
             && self
                 .settings_manager
                 .claim_root_markers_deprecation_warning()
@@ -28,7 +345,7 @@ impl Kakehashi {
                 .await;
         }
 
-        if normalized.uses_deprecated_unwrapped_shape
+        if uses_deprecated_unwrapped_shape
             && self
                 .settings_manager
                 .claim_unwrapped_didchange_deprecation_warning()
@@ -38,8 +355,26 @@ impl Kakehashi {
                 .await;
         }
 
-        let parsed = match parse_normalized_client_configuration(normalized) {
-            Ok(update) => update,
+        if !unknown_keys.is_empty() {
+            self.notifier()
+                .log_warning(format!(
+                    "workspace/didChangeConfiguration rejected configuration update containing unknown or mixed-format key(s): {}",
+                    format_rejected_keys(&unknown_keys)
+                ))
+                .await;
+            return;
+        }
+
+        if settings_value
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            return;
+        }
+
+        // Parse the incoming settings.
+        let parsed = match serde_json::from_value::<RawWorkspaceSettings>(settings_value) {
+            Ok(settings) => settings,
             Err(err) => {
                 self.notifier()
                     .log_warning(format!("Failed to parse client configuration: {}", err))
@@ -48,23 +383,13 @@ impl Kakehashi {
             }
         };
 
-        let ClientConfigurationUpdate { settings, warnings } = parsed;
-
-        for warning in warnings {
-            self.notifier().log_warning(warning).await;
-        }
-
-        if raw_workspace_settings_is_empty(&settings) {
-            return;
-        }
-
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
         // so merging preserves languages and other fields set during initialize.
         let current_ts = self.settings_manager.load_raw_settings();
         // SAFETY: merge_workspace_settings(Some, Some) always returns Some, so unwrap_or_return is
         // defensive only — the None branch is unreachable under the current implementation.
-        let Some(merged_ts) = merge_workspace_settings(Some((*current_ts).clone()), Some(settings))
+        let Some(merged_ts) = merge_workspace_settings(Some((*current_ts).clone()), Some(parsed))
         else {
             log::warn!(
                 "merge_workspace_settings returned None despite two Some inputs; skipping configuration update"
@@ -93,629 +418,113 @@ impl Kakehashi {
     }
 }
 
-struct ClientConfigurationUpdate {
-    settings: RawWorkspaceSettings,
-    warnings: Vec<String>,
-}
-
-struct NormalizedClientConfiguration {
-    raw_value: serde_json::Value,
-    warnings: Vec<String>,
-    uses_deprecated_unwrapped_shape: bool,
-}
-
-#[cfg(test)]
-fn parse_client_configuration(
-    value: serde_json::Value,
-) -> Result<ClientConfigurationUpdate, serde_json::Error> {
-    parse_normalized_client_configuration(normalize_kakehashi_settings(value))
-}
-
-fn parse_normalized_client_configuration(
-    normalized: NormalizedClientConfiguration,
-) -> Result<ClientConfigurationUpdate, serde_json::Error> {
-    let settings = serde_json::from_value::<RawWorkspaceSettings>(normalized.raw_value)?;
-
-    Ok(ClientConfigurationUpdate {
-        settings,
-        warnings: normalized.warnings,
-    })
-}
-
-fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientConfiguration {
-    let Some(inner) = value.get("kakehashi").filter(|value| value.is_object()) else {
-        let top_level_flat = flat_configuration_without_wrappers(&value);
-        let top_level_flat_has_signal = has_configuration_signal(&top_level_flat);
-        let (raw_value, has_signal) = if top_level_flat_has_signal {
-            (top_level_flat, true)
-        } else {
-            (serde_json::Value::Object(serde_json::Map::new()), false)
-        };
-        let warnings = if has_signal {
-            ignored_key_warnings_from_keys(ignored_keys(&raw_value))
-        } else {
-            Vec::new()
-        };
-        return NormalizedClientConfiguration {
-            raw_value,
-            warnings,
-            uses_deprecated_unwrapped_shape: has_signal,
-        };
-    };
-
-    let mut warnings = Vec::new();
-    let mut raw_value = inner.clone();
-    let mut uses_deprecated_unwrapped_shape = false;
-
-    if let Some(raw_object) = raw_value.as_object_mut()
-        && let Some(root_object) = value.as_object()
-    {
-        uses_deprecated_unwrapped_shape |=
-            merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
-    }
-
-    warnings.extend(ignored_keys(&raw_value));
-    warnings.sort();
-    warnings.dedup();
-
-    if warnings.is_empty() {
-        NormalizedClientConfiguration {
-            raw_value,
-            warnings: Vec::new(),
-            uses_deprecated_unwrapped_shape,
-        }
-    } else {
-        NormalizedClientConfiguration {
-            raw_value,
-            warnings: vec![format!(
-                "Ignored unknown client configuration key(s): {}",
-                warnings.join(", ")
-            )],
-            uses_deprecated_unwrapped_shape,
-        }
-    }
-}
-
-fn ignored_key_warnings_from_keys(mut ignored: Vec<String>) -> Vec<String> {
-    ignored.sort();
-    ignored.dedup();
-    if ignored.is_empty() {
-        Vec::new()
-    } else {
-        vec![format!(
-            "Ignored unknown client configuration key(s): {}",
-            ignored.join(", ")
-        )]
-    }
-}
-
-fn ignored_keys(value: &serde_json::Value) -> Vec<String> {
-    let Some(object) = value.as_object() else {
-        return Vec::new();
-    };
-
-    let mut ignored: Vec<_> = object
-        .iter()
-        .filter(|(key, value)| should_warn_unknown_key(key, value))
-        .map(|(key, _)| key.clone())
-        .collect();
-    ignored.sort();
-    ignored
-}
-
-fn flat_configuration_without_wrappers(value: &serde_json::Value) -> serde_json::Value {
-    let Some(object) = value.as_object() else {
-        return serde_json::Value::Object(serde_json::Map::new());
-    };
-
-    serde_json::Value::Object(
-        object
-            .iter()
-            .filter(|(key, _)| key.as_str() != "settings" && key.as_str() != "kakehashi")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-    )
-}
-
-fn merge_flat_sibling_settings(
-    raw_object: &mut serde_json::Map<String, serde_json::Value>,
-    warnings: &mut Vec<String>,
-    siblings: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    let mut has_flat_configuration_signal = false;
-
-    for (key, candidate) in siblings {
-        if key == "settings" || key == "kakehashi" {
-            continue;
-        }
-
-        if is_known_configuration_key(key) {
-            has_flat_configuration_signal = true;
-            raw_object
-                .entry(key.clone())
-                .or_insert_with(|| candidate.clone());
-        } else if should_warn_unknown_key(key, candidate) {
-            has_flat_configuration_signal = true;
-            warnings.push(key.clone());
-        }
-    }
-
-    has_flat_configuration_signal
-}
-
-fn has_configuration_signal(value: &serde_json::Value) -> bool {
-    has_known_configuration_key(value) || has_probable_unknown_configuration_key(value)
-}
-
-fn has_known_configuration_key(value: &serde_json::Value) -> bool {
-    value.as_object().is_some_and(|object| {
-        object
-            .keys()
-            .any(|key| is_known_configuration_key(key.as_str()))
-    })
-}
-
-fn has_probable_unknown_configuration_key(value: &serde_json::Value) -> bool {
-    value.as_object().is_some_and(|object| {
-        object
-            .iter()
-            .any(|(key, value)| should_warn_unknown_key(key, value))
-    })
-}
-
-fn should_warn_unknown_key(key: &str, value: &serde_json::Value) -> bool {
-    !is_known_configuration_key(key)
-        && key != "settings"
-        && key != "kakehashi"
-        && !key.contains('.')
-        && if value.is_object() {
-            is_one_edit_from_known_configuration_key(key)
-        } else {
-            key.chars().any(|ch| ch.is_ascii_uppercase())
-                || is_one_edit_from_known_configuration_key(key)
-        }
-}
-
-fn is_known_configuration_key(key: &str) -> bool {
-    known_configuration_keys().contains(key)
-}
-
-fn is_one_edit_from_known_configuration_key(key: &str) -> bool {
-    known_configuration_keys()
-        .iter()
-        .any(|known| is_one_edit_apart(key, known))
-}
-
-fn is_one_edit_apart(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    let len_diff = left.len().abs_diff(right.len());
-    if len_diff > 1 {
-        return false;
-    }
-
-    if len_diff == 0 {
-        return left
-            .iter()
-            .zip(right.iter())
-            .filter(|(left, right)| left != right)
-            .count()
-            == 1;
-    }
-
-    let (shorter, longer) = if left.len() < right.len() {
-        (left, right)
-    } else {
-        (right, left)
-    };
-    let mut short_index = 0;
-    let mut long_index = 0;
-    let mut edits = 0;
-    while short_index < shorter.len() && long_index < longer.len() {
-        if shorter[short_index] == longer[long_index] {
-            short_index += 1;
-        } else {
-            edits += 1;
-            if edits > 1 {
-                return false;
-            }
-        }
-        long_index += 1;
-    }
-
-    true
-}
-
-fn known_configuration_keys() -> &'static HashSet<String> {
-    static KEYS: OnceLock<HashSet<String>> = OnceLock::new();
-
-    KEYS.get_or_init(|| {
-        let schema = serde_json::to_value(crate::config::json_schema()).unwrap_or_else(|err| {
-            log::warn!("failed to serialize RawWorkspaceSettings schema: {err}");
-            serde_json::Value::Null
-        });
-
-        schema
-            .get("properties")
-            .and_then(|properties| properties.as_object())
-            .map(|properties| properties.keys().cloned().collect())
-            .unwrap_or_default()
-    })
-}
-
-fn raw_workspace_settings_is_empty(settings: &RawWorkspaceSettings) -> bool {
-    settings.is_effectively_empty()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::{
+        AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, LanguageSettings,
+        LayerAggregationConfig, LayersConfig, QueryItem, QueryTypeMappings,
+    };
+    use std::collections::BTreeSet;
 
-    #[test]
-    fn parses_wire_wrapped_kakehashi_settings() {
-        let params = serde_json::from_value::<DidChangeConfigurationParams>(serde_json::json!({
-            "settings": {
-                "kakehashi": {
-                    "autoInstall": false
-                }
-            }
-        }))
-        .expect("wire didChangeConfiguration params should deserialize");
-        let update = parse_client_configuration(params.settings)
-            .expect("wire settings.kakehashi payload should parse");
+    fn assert_known_keys_match_schema<T: schemars::JsonSchema>(
+        known_keys: &[&str],
+        aliases: &[&str],
+    ) {
+        let schema = schemars::schema_for!(T);
+        let value = serde_json::to_value(schema).expect("schema should serialize");
+        let properties = value["properties"]
+            .as_object()
+            .expect("schema should have properties");
 
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert!(update.warnings.is_empty());
+        let mut schema_keys = properties.keys().cloned().collect::<BTreeSet<_>>();
+        schema_keys.extend(aliases.iter().map(|alias| (*alias).to_string()));
+        let known_keys = known_keys
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(known_keys, schema_keys);
     }
 
     #[test]
-    fn merges_known_flat_siblings_with_wrapped_settings() {
-        let payload = serde_json::json!({
-            "kakehashi": {
-                "autoInstall": false
-            },
-            "autoInstall": true,
-            "diagnosticsDebounceMs": 250,
-            "editorSetting": true
-        });
-        let update = parse_client_configuration(payload.clone())
-            .expect("mixed wrapped and flat settings should parse");
-
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
-        assert_eq!(
-            update.warnings,
-            vec!["Ignored unknown client configuration key(s): editorSetting"]
-        );
-        assert!(
-            normalize_kakehashi_settings(payload).uses_deprecated_unwrapped_shape,
-            "accepted flat siblings beside wrapped settings should still warn as deprecated"
-        );
-
-        let normalized = normalize_kakehashi_settings(serde_json::json!({
-            "kakehashi": {
-                "autoInstall": false
-            }
-        }));
-        assert!(
-            !normalized.uses_deprecated_unwrapped_shape,
-            "canonical wire settings.kakehashi payloads must not warn as deprecated"
-        );
+    fn known_workspace_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<RawWorkspaceSettings>(KNOWN_WORKSPACE_SETTING_KEYS, &[]);
     }
 
     #[test]
-    fn ignores_nested_settings_flat_siblings_with_wrapped_settings() {
-        let payload = serde_json::json!({
-            "kakehashi": {
-                "autoInstall": false
-            },
-            "settings": {
-                "diagnosticsDebounceMs": 250,
-                "editorSetting": true
-            }
-        });
-        let update = parse_client_configuration(payload.clone())
-            .expect("unsupported nested settings beside wrapped settings should parse");
+    fn section_sibling_filter_matches_workspace_keys_and_typos_only() {
+        assert!(is_workspace_setting_key_or_typo("autoInstall"));
+        assert!(is_workspace_setting_key_or_typo("autoInstal"));
+        assert!(is_workspace_setting_key_or_typo("languageServers"));
+        assert!(!is_workspace_setting_key_or_typo("autXInstal"));
 
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert_eq!(update.settings.diagnostics_debounce_ms, None);
-        assert!(update.warnings.is_empty());
-        assert!(
-            !normalize_kakehashi_settings(payload).uses_deprecated_unwrapped_shape,
-            "unsupported nested settings are ignored rather than treated as accepted flat siblings"
-        );
+        assert!(!is_workspace_setting_key_or_typo("editor"));
+        assert!(!is_workspace_setting_key_or_typo("files"));
+        assert!(!is_workspace_setting_key_or_typo("workbench"));
     }
 
     #[test]
-    fn flat_siblings_do_not_override_wrapped_settings() {
-        let payload = serde_json::json!({
-            "kakehashi": {
-                "autoInstall": false
-            },
-            "autoInstall": true
-        });
-        let update = parse_client_configuration(payload.clone())
-            .expect("conflicting mixed settings should parse");
-
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert!(update.warnings.is_empty());
-        assert!(
-            normalize_kakehashi_settings(payload).uses_deprecated_unwrapped_shape,
-            "accepted conflicting flat siblings beside wrapped settings should warn as deprecated"
-        );
-    }
-
-    #[test]
-    fn ignores_double_wrapped_kakehashi_settings() {
-        let update = parse_client_configuration(serde_json::json!({
-            "settings": {
-                "kakehashi": {
-                    "autoInstall": false
-                },
-                "diagnosticsDebounceMs": 250
-            }
-        }))
-        .expect("unsupported double-wrapped settings should parse as an empty update");
-
-        assert!(raw_workspace_settings_is_empty(&update.settings));
-        assert!(update.warnings.is_empty());
-    }
-
-    #[test]
-    fn warns_about_unknown_wrapped_keys() {
-        let update = parse_client_configuration(serde_json::json!({
-            "kakehashi": {
-                "autoInstal": false,
-                "autoInstall": true
-            }
-        }))
-        .expect("settings with unknown keys should still parse");
-
-        assert_eq!(update.settings.auto_install, Some(true));
-        assert_eq!(
-            update.warnings,
-            vec!["Ignored unknown client configuration key(s): autoInstal"]
-        );
-    }
-
-    #[test]
-    fn recognizes_empty_client_configuration() {
-        let update = parse_client_configuration(serde_json::json!({
-            "autoInstal": false
-        }))
-        .expect("unknown-only settings should still parse");
-
-        assert!(raw_workspace_settings_is_empty(&update.settings));
-        assert_eq!(
-            update.warnings,
-            vec!["Ignored unknown client configuration key(s): autoInstal"]
-        );
-
-        let normalized = normalize_kakehashi_settings(serde_json::json!({
-            "autoInstal": false
-        }));
-        assert!(
-            normalized.uses_deprecated_unwrapped_shape,
-            "typo-like flat didChange payloads should still surface the flat-shape deprecation"
-        );
-    }
-
-    #[test]
-    fn parses_flat_known_keys() {
-        let payload = serde_json::json!({
+    fn non_object_kakehashi_wrapper_reaches_parse_error_path() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "kakehashi": null,
             "autoInstall": false
-        });
-        let update =
-            parse_client_configuration(payload.clone()).expect("flat payload should parse");
-
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert!(update.warnings.is_empty());
-
-        let normalized = normalize_kakehashi_settings(payload);
-        assert!(
-            normalized.uses_deprecated_unwrapped_shape,
-            "flat didChange payloads should be accepted but deprecated"
-        );
-    }
-
-    #[test]
-    fn warns_about_unknown_flat_keys() {
-        let update = parse_client_configuration(serde_json::json!({
-            "autoInstall": false,
-            "autoInstal": true
-        }))
-        .expect("flat payload with typo should parse");
-
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert_eq!(
-            update.warnings,
-            vec!["Ignored unknown client configuration key(s): autoInstal"]
-        );
-    }
-
-    #[test]
-    fn parses_multiple_flat_known_keys() {
-        let update = parse_client_configuration(serde_json::json!({
-            "autoInstall": false,
-            "diagnosticsDebounceMs": 250
-        }))
-        .expect("flat payload with multiple known keys should parse");
-
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
-        assert!(update.warnings.is_empty());
-    }
-
-    #[test]
-    fn parses_top_level_known_keys_when_settings_contains_other_servers() {
-        let update = parse_client_configuration(serde_json::json!({
-            "settings": {
-                "gopls": {
-                    "usePlaceholders": true
-                }
-            },
-            "autoInstall": false
-        }))
-        .expect("top-level known settings should parse beside other server settings");
-
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert!(update.warnings.is_empty());
-    }
-
-    #[test]
-    fn unrelated_settings_do_not_trigger_flat_shape_deprecation() {
-        let normalized = normalize_kakehashi_settings(serde_json::json!({
-            "settings": {
-                "gopls": {
-                    "usePlaceholders": true
-                }
-            }
         }));
 
-        assert!(
-            !normalized.uses_deprecated_unwrapped_shape,
-            "unrelated editor/server settings must not claim the flat-shape deprecation slot"
-        );
-        assert!(raw_workspace_settings_is_empty(
-            &parse_normalized_client_configuration(normalized)
-                .expect("unrelated settings should parse as an empty update")
-                .settings
-        ));
+        assert_eq!(payload, serde_json::Value::Null);
+        assert!(unknown_keys.is_empty());
+        assert!(serde_json::from_value::<RawWorkspaceSettings>(payload).is_err());
     }
 
     #[test]
-    fn ignores_other_servers_settings_without_warning() {
-        let update = parse_client_configuration(serde_json::json!({
-            "settings": {
-                "gopls": {
-                    "usePlaceholders": true
-                }
-            }
-        }))
-        .expect("other servers' settings should parse as an empty update");
-
-        assert!(raw_workspace_settings_is_empty(&update.settings));
-        assert!(update.warnings.is_empty());
-    }
-
-    #[test]
-    fn ignores_dotted_editor_settings_without_warning() {
-        let update = parse_client_configuration(serde_json::json!({
-            "editor.fontSize": 14,
-            "gopls": {
-                "usePlaceholders": true
-            }
-        }))
-        .expect("editor settings should parse as an empty update");
-
-        assert!(raw_workspace_settings_is_empty(&update.settings));
-        assert!(update.warnings.is_empty());
-    }
-
-    #[test]
-    fn warns_about_object_valued_camel_case_typos() {
-        let update = parse_client_configuration(serde_json::json!({
-            "languageServerss": {},
-            "autoInstall": true
-        }))
-        .expect("object-valued config typo should still parse");
-
-        assert_eq!(update.settings.auto_install, Some(true));
-        assert_eq!(
-            update.warnings,
-            vec!["Ignored unknown client configuration key(s): languageServerss"]
+    fn known_bridge_server_setting_keys_match_schema_properties_and_aliases() {
+        assert_known_keys_match_schema::<BridgeServerConfig>(
+            KNOWN_BRIDGE_SERVER_SETTING_KEYS,
+            &["rootMarkers"],
         );
     }
 
     #[test]
-    fn ignores_unrelated_object_sections_beside_wrapped_settings() {
-        let normalized = normalize_kakehashi_settings(serde_json::json!({
-            "kakehashi": {
-                "autoInstall": false
-            },
-            "someServer": {
-                "usePlaceholders": true
-            }
-        }));
-
-        assert!(
-            !normalized.uses_deprecated_unwrapped_shape,
-            "unrelated object sections must not claim the flat-shape deprecation slot"
-        );
-        let update = parse_normalized_client_configuration(normalized)
-            .expect("wrapped settings with unrelated object section should parse");
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert!(update.warnings.is_empty());
-    }
-
-    #[test]
-    fn warns_about_lowercase_object_typos_near_known_keys() {
-        let update = parse_client_configuration(serde_json::json!({
-            "languagess": {}
-        }))
-        .expect("lowercase object-valued config typo should still parse");
-
-        assert!(raw_workspace_settings_is_empty(&update.settings));
-        assert_eq!(
-            update.warnings,
-            vec!["Ignored unknown client configuration key(s): languagess"]
+    fn known_capture_mappings_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<QueryTypeMappings>(
+            KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS,
+            &[],
         );
     }
 
     #[test]
-    fn non_object_kakehashi_settings_are_empty() {
-        let update = parse_client_configuration(serde_json::json!({
-            "settings": {
-                "kakehashi": null
-            }
-        }))
-        .expect("non-object wrapped settings should parse as an empty update");
-
-        assert!(raw_workspace_settings_is_empty(&update.settings));
-        assert!(update.warnings.is_empty());
+    fn known_language_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<LanguageSettings>(KNOWN_LANGUAGE_SETTING_KEYS, &[]);
     }
 
     #[test]
-    fn known_configuration_keys_come_from_schema_properties() {
-        let schema = serde_json::to_value(crate::config::json_schema())
-            .expect("RawWorkspaceSettings schema should serialize");
-        let expected: HashSet<_> = schema
-            .get("properties")
-            .and_then(|properties| properties.as_object())
-            .expect("schema should define top-level properties")
-            .keys()
-            .cloned()
-            .collect();
-
-        assert_eq!(known_configuration_keys(), &expected);
-        assert!(is_known_configuration_key("autoInstall"));
-        assert!(!is_known_configuration_key("autoInstal"));
+    fn known_query_item_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<QueryItem>(KNOWN_QUERY_ITEM_SETTING_KEYS, &[]);
     }
 
     #[test]
-    fn language_servers_empty_map_is_effective_configuration() {
-        let update = parse_client_configuration(serde_json::json!({
-            "languageServers": {}
-        }))
-        .expect("empty languageServers should parse");
-
-        assert!(!raw_workspace_settings_is_empty(&update.settings));
-    }
-
-    #[test]
-    fn normalization_preserves_deprecated_root_markers_before_parse_error() {
-        let normalized = normalize_kakehashi_settings(serde_json::json!({
-            "languageServers": {
-                "rust-analyzer": {
-                    "rootMarkers": [".git"],
-                    "cmd": "rust-analyzer"
-                }
-            }
-        }));
-
-        assert!(
-            crate::config::deprecation::json_uses_deprecated_root_markers(&normalized.raw_value)
+    fn known_bridge_language_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<BridgeLanguageConfig>(
+            KNOWN_BRIDGE_LANGUAGE_SETTING_KEYS,
+            &[],
         );
-        assert!(parse_normalized_client_configuration(normalized).is_err());
+    }
+
+    #[test]
+    fn known_aggregation_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<AggregationConfig>(KNOWN_AGGREGATION_SETTING_KEYS, &[]);
+    }
+
+    #[test]
+    fn known_layers_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<LayersConfig>(KNOWN_LAYERS_SETTING_KEYS, &[]);
+    }
+
+    #[test]
+    fn known_layer_aggregation_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<LayerAggregationConfig>(
+            KNOWN_LAYER_AGGREGATION_SETTING_KEYS,
+            &[],
+        );
     }
 }
