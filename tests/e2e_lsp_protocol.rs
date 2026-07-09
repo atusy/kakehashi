@@ -47,6 +47,35 @@ fn test_initialize_returns_capabilities() {
 }
 
 #[test]
+fn test_initialize_exposes_kakehashi_version_and_wrapped_didchange_capability() {
+    let mut client = LspClient::new();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    let result = response
+        .get("result")
+        .expect("initialize should return a result");
+    assert_eq!(result["serverInfo"]["name"], json!("kakehashi"));
+    assert_eq!(
+        result["serverInfo"]["version"],
+        json!(env!("CARGO_PKG_VERSION")),
+        "clients use serverInfo.version to distinguish old flat-only servers"
+    );
+    assert_eq!(
+        result["capabilities"]["experimental"]["kakehashi"]["wrappedDidChangeConfigurationSettings"],
+        json!(true),
+        "clients should be able to choose wrapped didChangeConfiguration payloads without parsing versions"
+    );
+}
+
+#[test]
 fn test_advertises_work_done_progress_independent_of_window_capability() {
     // Client-initiated progress has NO client capability — the provider's
     // `workDoneProgress` advertisement alone prompts the token. So we advertise it

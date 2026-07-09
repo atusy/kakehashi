@@ -1,5 +1,6 @@
 ---
 source: tests/e2e_lsp_protocol.rs
+assertion_line: 46
 expression: capabilities
 ---
 {
@@ -111,5 +112,10 @@ expression: capabilities
   "diagnosticProvider": {
     "interFileDependencies": false,
     "workspaceDiagnostics": false
+  },
+  "experimental": {
+    "kakehashi": {
+      "wrappedDidChangeConfigurationSettings": true
+    }
   }
 }
