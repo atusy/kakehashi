@@ -68,7 +68,7 @@ impl LanguageServerPool {
             },
             |response, ctx| transform_prepare_rename_response_to_host(response, ctx.offset),
         )
-        .await
+        .await?
     }
 }
 
@@ -103,16 +103,35 @@ fn build_prepare_rename_request(
 fn transform_prepare_rename_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
-) -> Option<PrepareRenameResponse> {
+) -> io::Result<Option<PrepareRenameResponse>> {
     if response_has_jsonrpc_error(&response, "textDocument/prepareRename") {
-        return None;
+        return Ok(None);
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "textDocument/prepareRename response carries neither result nor error (protocol violation)"
+        );
+        return Err(io::Error::other(
+            "textDocument/prepareRename response carries neither result nor error (protocol violation)",
+        ));
+    };
     if result.is_null() {
-        return None;
+        return Ok(None);
     }
 
-    let mut prepare_rename: PrepareRenameResponse = serde_json::from_value(result).ok()?;
+    let mut prepare_rename: PrepareRenameResponse = match serde_json::from_value(result) {
+        Ok(response) => response,
+        Err(err) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "prepareRename response did not match Range | {{ range, placeholder }} | {{ defaultBehavior }}: {err}"
+            );
+            return Err(io::Error::other(format!(
+                "malformed textDocument/prepareRename result from downstream server: {err}"
+            )));
+        }
+    };
 
     // Transform range coordinates for variants that contain a Range
     match &mut prepare_rename {
@@ -127,14 +146,13 @@ fn transform_prepare_rename_response_to_host(
         }
     }
 
-    Some(prepare_rename)
+    Ok(Some(prepare_rename))
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-    use rstest::rstest;
     use serde_json::json;
 
     // ==========================================================================
@@ -184,7 +202,9 @@ mod tests {
 
         let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(10, 0));
 
-        let result = result.expect("Should parse Range variant");
+        let result = result
+            .expect("Should not fail")
+            .expect("Should parse Range variant");
         match result {
             PrepareRenameResponse::Range(range) => {
                 assert_eq!(range.start.line, 12); // 2 + 10
@@ -212,7 +232,9 @@ mod tests {
 
         let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(5, 0));
 
-        let result = result.expect("Should parse RangeWithPlaceholder variant");
+        let result = result
+            .expect("Should not fail")
+            .expect("Should parse RangeWithPlaceholder variant");
         match result {
             PrepareRenameResponse::RangeWithPlaceholder { range, placeholder } => {
                 assert_eq!(range.start.line, 5); // 0 + 5
@@ -237,7 +259,9 @@ mod tests {
 
         let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(5, 0));
 
-        let result = result.expect("Should parse DefaultBehavior variant");
+        let result = result
+            .expect("Should not fail")
+            .expect("Should parse DefaultBehavior variant");
         match result {
             PrepareRenameResponse::DefaultBehavior { default_behavior } => {
                 assert!(default_behavior);
@@ -246,12 +270,36 @@ mod tests {
         }
     }
 
-    #[rstest]
-    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
-    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42}))]
-    fn prepare_rename_response_returns_none_for_invalid(#[case] response: serde_json::Value) {
+    #[test]
+    fn prepare_rename_response_returns_none_for_null_result() {
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": null});
         let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(5, 0));
-        assert!(result.is_none());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn prepare_rename_response_errors_on_missing_result_success() {
+        let response = json!({"jsonrpc": "2.0", "id": 42});
+        let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(5, 0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn prepare_rename_response_errors_on_malformed_success_result() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "range": {
+                    "start": { "line": 0, "character": 6 }
+                },
+                "placeholder": "x"
+            }
+        });
+
+        let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(5, 0));
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -267,7 +315,9 @@ mod tests {
 
         let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(10, 0));
 
-        let result = result.expect("Should parse Range variant");
+        let result = result
+            .expect("Should not fail")
+            .expect("Should parse Range variant");
         match result {
             PrepareRenameResponse::Range(range) => {
                 assert_eq!(range.start.line, u32::MAX, "Should saturate, not panic");
