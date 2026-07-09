@@ -4,6 +4,7 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,6 +19,8 @@ use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 
 /// HTTP timeout for archive downloads.
 const ARCHIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum decompressed tar stream or extracted file bytes for parser archives.
+const MAX_ARCHIVE_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Error types for parser installation.
 #[derive(Debug)]
@@ -465,15 +468,18 @@ fn download_and_extract_archive(
         e => ParserInstallError::ArchiveError(format!("Download failed: {}", e)),
     })?;
 
-    // into_reader() streams without a size limit; parser archives can exceed
-    // ureq's 10MB read_to_* default.
+    // into_reader() streams without ureq's 10MB read_to_* cap, so enforce our
+    // own limit on the decompressed tar stream.
     let decoder = GzDecoder::new(response.into_body().into_reader());
-    let mut archive = Archive::new(decoder);
+    let bounded_decoder =
+        LimitedReader::new(decoder, MAX_ARCHIVE_DECOMPRESSED_BYTES, "decompressed size");
+    let mut archive = Archive::new(bounded_decoder);
 
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
     let expected_prefix = archive_root_dir_name(repo_name, revision);
 
     fs::create_dir_all(dest)?;
+    let mut extracted_bytes = 0u64;
 
     for entry_result in archive.entries().map_err(|e| {
         ParserInstallError::ArchiveError(format!("Failed to read archive entries: {}", e))
@@ -513,6 +519,26 @@ fn download_and_extract_archive(
         if entry.header().entry_type().is_dir() {
             fs::create_dir_all(&target)?;
         } else {
+            let entry_size = entry.header().size().map_err(|e| {
+                ParserInstallError::ArchiveError(format!(
+                    "Invalid size for {}: {}",
+                    relative.display(),
+                    e
+                ))
+            })?;
+            extracted_bytes = extracted_bytes.checked_add(entry_size).ok_or_else(|| {
+                ParserInstallError::ArchiveError(format!(
+                    "Archive decompressed size exceeds {} bytes",
+                    MAX_ARCHIVE_DECOMPRESSED_BYTES
+                ))
+            })?;
+            if extracted_bytes > MAX_ARCHIVE_DECOMPRESSED_BYTES {
+                return Err(ParserInstallError::ArchiveError(format!(
+                    "Archive decompressed size exceeds {} bytes while extracting {}",
+                    MAX_ARCHIVE_DECOMPRESSED_BYTES,
+                    relative.display()
+                )));
+            }
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -527,6 +553,50 @@ fn download_and_extract_archive(
     }
 
     Ok(())
+}
+
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+    limit: u64,
+    label: &'static str,
+}
+
+impl<R> LimitedReader<R> {
+    fn new(inner: R, limit: u64, label: &'static str) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit,
+            label,
+        }
+    }
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0];
+            return match self.inner.read(&mut probe) {
+                Ok(0) => Ok(0),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Archive {} exceeds {} bytes", self.label, self.limit),
+                )),
+                Err(e) => Err(e),
+            };
+        }
+
+        let max_read = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let read = self.inner.read(&mut buf[..max_read])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
 }
 
 /// Derive the expected root directory name inside a GitHub archive tarball.
@@ -1504,6 +1574,96 @@ mod tests {
             dest.join("src").join("parser.c").exists(),
             "Extracted archive should contain src/parser.c"
         );
+    }
+
+    #[test]
+    fn download_and_extract_archive_rejects_oversized_decompressed_archive() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        let archive = oversized_archive("parser-1.0.0", 101 * 1024 * 1024);
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
+
+        match result {
+            Err(ParserInstallError::ArchiveError(message)) => {
+                assert!(
+                    message.contains("Archive decompressed size exceeds"),
+                    "expected archive size limit error, got: {message}"
+                );
+            }
+            other => panic!("expected archive size limit error, got {other:?}"),
+        }
+        assert!(
+            !dest.join("payload.bin").exists(),
+            "oversized archive payload must not be fully extracted"
+        );
+    }
+
+    #[test]
+    fn limited_reader_rejects_reads_past_limit() {
+        use std::io::Read;
+
+        let mut reader = LimitedReader::new(&b"abcdef"[..], 3, "test size");
+        let mut buffer = Vec::new();
+        let error = reader
+            .read_to_end(&mut buffer)
+            .expect_err("reader should reject data past the limit");
+
+        assert_eq!(buffer, b"abc");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("Archive test size exceeds 3 bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn oversized_archive(root: &str, payload_size: u64) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Read;
+        use tar::{Builder, Header};
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        {
+            let mut builder = Builder::new(&mut encoder);
+            let mut header = Header::new_gnu();
+            header.set_size(payload_size);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    format!("{root}/payload.bin"),
+                    std::io::repeat(0).take(payload_size),
+                )
+                .expect("append oversized payload");
+            builder.finish().expect("finish tar");
+        }
+
+        encoder.finish().expect("finish gzip")
+    }
+
+    fn serve_once(body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&body).expect("write response body");
+        });
+        format!("http://{addr}/archive.tar.gz")
     }
 
     /// Test that fetch_source succeeds for a GitHub URL (uses archive download).
