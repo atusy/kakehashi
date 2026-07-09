@@ -2256,8 +2256,9 @@ mod tests {
 
     #[test]
     fn title_only_host_action_is_dropped_when_server_does_not_resolve() {
-        // Without host resolve support a title-only host action can never do
-        // anything, so it is dropped (not surfaced as menu clutter).
+        // When the host server does not advertise `codeAction/resolve`, a
+        // title-only host action can never do anything, so it is dropped (not
+        // surfaced as menu clutter).
         let actions: Vec<CodeActionOrCommand> =
             serde_json::from_value(json!([{ "title": "Fix all" }])).unwrap();
         let bridged = bridge_code_actions(

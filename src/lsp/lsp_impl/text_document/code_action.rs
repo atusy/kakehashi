@@ -170,8 +170,12 @@ impl Kakehashi {
         // A genuine host-layer action carries no region (verbatim, no
         // translation), so the gate — which ULID-parses `region_id` and would
         // fail on the empty host one — is skipped; `region_end` is unused on the
-        // host resolve path. `is_host_layer` requires the empty `region_id`, so a
-        // client can't flip `host_layer` on a virt envelope to skip the gate.
+        // host resolve path. `is_host_layer` additionally requires the empty
+        // `region_id`, so a CONFORMING client can't skip the gate merely by
+        // toggling `host_layer` on a virt envelope. It is not a security boundary
+        // (the envelope round-trips through unprotected client `data`, so a client
+        // could clear `region_id` too) — it guards against accidental bypass, and
+        // the host path fails soft anyway.
         let region_end = if envelope.is_host_layer() {
             Position::default()
         } else {
