@@ -122,6 +122,7 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
         let top_level_flat = flat_configuration_without_wrappers(&value);
         let settings_root_has_signal = has_configuration_signal(settings_root);
         let top_level_flat_has_signal = has_configuration_signal(&top_level_flat);
+        let top_level_flat_ignored = ignored_keys(&top_level_flat);
         let (raw_value, has_signal) = if settings_root_has_signal {
             (settings_root.clone(), true)
         } else if top_level_flat_has_signal {
@@ -130,7 +131,11 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
             (settings_root.clone(), false)
         };
         let warnings = if has_signal {
-            ignored_key_warnings(&raw_value)
+            let mut ignored = ignored_keys(&raw_value);
+            if settings_root_has_signal {
+                ignored.extend(top_level_flat_ignored);
+            }
+            ignored_key_warnings_from_keys(ignored)
         } else {
             Vec::new()
         };
@@ -173,8 +178,9 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
     }
 }
 
-fn ignored_key_warnings(value: &serde_json::Value) -> Vec<String> {
-    let ignored = ignored_keys(value);
+fn ignored_key_warnings_from_keys(mut ignored: Vec<String>) -> Vec<String> {
+    ignored.sort();
+    ignored.dedup();
     if ignored.is_empty() {
         Vec::new()
     } else {
@@ -484,6 +490,23 @@ mod tests {
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_about_unknown_top_level_keys_dropped_for_settings_root() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "autoInstall": false
+            },
+            "autoInstal": true
+        }))
+        .expect("settings-root payload with top-level typo should parse");
+
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert_eq!(
+            update.warnings,
+            vec!["Ignored unknown client configuration key(s): autoInstal"]
+        );
     }
 
     #[test]
