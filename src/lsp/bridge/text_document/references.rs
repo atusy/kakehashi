@@ -149,6 +149,7 @@ fn transform_references_response_to_host(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, Once};
 
     use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -162,18 +163,27 @@ mod tests {
     };
     static INIT_LOGGER: Once = Once::new();
     static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    static CAPTURING: AtomicBool = AtomicBool::new(false);
 
     struct CapturingLogger {
         messages: Mutex<Vec<String>>,
     }
 
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            CAPTURING.store(false, Ordering::Relaxed);
+        }
+    }
+
     impl Log for CapturingLogger {
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.level() <= Level::Warn
+            metadata.level() <= Level::Warn && metadata.target() == "kakehashi::bridge"
         }
 
         fn log(&self, record: &Record<'_>) {
-            if self.enabled(record.metadata()) {
+            if CAPTURING.load(Ordering::Relaxed) && self.enabled(record.metadata()) {
                 self.messages.lock().unwrap().push(format!(
                     "{}:{}:{}",
                     record.level(),
@@ -189,12 +199,16 @@ mod tests {
     fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
         INIT_LOGGER.call_once(|| {
             log::set_logger(&LOGGER).expect("test logger should install once");
-            log::set_max_level(LevelFilter::Warn);
+            log::set_max_level(LevelFilter::Trace);
         });
         let _capture = CAPTURE_LOCK.lock().unwrap();
         LOGGER.messages.lock().unwrap().clear();
+        CAPTURING.store(true, Ordering::Relaxed);
+        let _guard = CaptureGuard;
         f();
-        LOGGER.messages.lock().unwrap().clone()
+        let captured = LOGGER.messages.lock().unwrap().clone();
+        LOGGER.messages.lock().unwrap().clear();
+        captured
     }
 
     // ==========================================================================
