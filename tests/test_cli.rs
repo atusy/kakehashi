@@ -916,6 +916,63 @@ fn test_language_uninstall_all() {
     assert!(queries.is_empty(), "All queries should be removed");
 }
 
+/// Test that language uninstall rejects a language together with --all
+#[test]
+fn test_language_uninstall_rejects_language_with_all() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/testlang"))
+        .expect("Failed to create queries dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(
+        test_dir.path().join(format!("parser/testlang.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join("queries/testlang/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "testlang",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "Uninstall should reject a language with --all"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--all") && stderr.contains("language"),
+        "Stderr should contain clap conflict error message. Got: {stderr}"
+    );
+    assert!(
+        test_dir
+            .path()
+            .join(format!("parser/testlang.{ext}"))
+            .exists(),
+        "Parser should not be removed when arguments are invalid"
+    );
+    assert!(
+        test_dir.path().join("queries/testlang").exists(),
+        "Queries directory should not be removed when arguments are invalid"
+    );
+}
+
 /// Test that --data-dir works as a top-level flag (before subcommand)
 #[test]
 fn test_data_dir_top_level_flag() {

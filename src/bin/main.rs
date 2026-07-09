@@ -159,7 +159,7 @@ enum LanguageAction {
         force: bool,
 
         /// Remove all installed languages
-        #[arg(long)]
+        #[arg(long, conflicts_with = "language")]
         all: bool,
     },
 }
