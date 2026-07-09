@@ -59,23 +59,8 @@ impl SyntheticDiagnosticsManager {
     /// Called opportunistically during registration to prevent memory buildup.
     /// Limited to avoid O(n) scan on every registration.
     fn cleanup_finished_tasks(&self, limit: usize) {
-        let mut cleaned = 0;
-        // Collect keys to remove to avoid holding multiple references during iteration
-        let mut to_remove = Vec::with_capacity(limit);
-
-        for entry in self.active_tasks.iter() {
-            if entry.value().is_finished() {
-                to_remove.push(entry.key().clone());
-                cleaned += 1;
-                if cleaned >= limit {
-                    break;
-                }
-            }
-        }
-
-        for uri in to_remove {
-            self.active_tasks.remove(&uri);
-        }
+        let to_remove = self.finished_task_uris(limit);
+        let cleaned = self.remove_if_still_finished(to_remove);
 
         if cleaned > 0 {
             log::trace!(
@@ -84,6 +69,37 @@ impl SyntheticDiagnosticsManager {
                 cleaned
             );
         }
+    }
+
+    fn finished_task_uris(&self, limit: usize) -> Vec<Url> {
+        // Collect keys to remove to avoid holding multiple references during iteration.
+        let mut uris = Vec::with_capacity(limit);
+        for entry in self.active_tasks.iter() {
+            if entry.value().is_finished() {
+                uris.push(entry.key().clone());
+                if uris.len() >= limit {
+                    break;
+                }
+            }
+        }
+        uris
+    }
+
+    fn remove_if_still_finished(&self, uris: Vec<Url>) -> usize {
+        let mut removed = 0;
+        for uri in uris {
+            // Recheck the current value so a newly registered task for the same
+            // URI cannot be deleted after the scan observed an older finished
+            // handle.
+            if self
+                .active_tasks
+                .remove_if(&uri, |_, handle| handle.is_finished())
+                .is_some()
+            {
+                removed += 1;
+            }
+        }
+        removed
     }
 
     /// Check if there's an active task for a document.
@@ -205,5 +221,98 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(handle1.is_finished());
         assert!(handle2.is_finished());
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_tasks_removes_finished_entries() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///finished.md").unwrap();
+
+        let task = tokio::spawn(async {});
+        let handle = task.abort_handle();
+        task.await.unwrap();
+        assert!(handle.is_finished());
+
+        manager.active_tasks.insert(uri.clone(), handle);
+        manager.cleanup_finished_tasks(5);
+
+        assert!(!manager.has_active_task(&uri));
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_tasks_preserves_unfinished_entries() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///active.md").unwrap();
+
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        let handle = task.abort_handle();
+
+        manager.active_tasks.insert(uri.clone(), handle.clone());
+        manager.cleanup_finished_tasks(5);
+
+        assert!(manager.has_active_task(&uri));
+        assert!(!handle.is_finished());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_tasks_preserves_replacement_after_scan() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///replaced.md").unwrap();
+
+        let finished_task = tokio::spawn(async {});
+        let finished_handle = finished_task.abort_handle();
+        finished_task.await.unwrap();
+        assert!(finished_handle.is_finished());
+
+        manager
+            .active_tasks
+            .insert(uri.clone(), finished_handle.clone());
+        let stale_cleanup_candidates = manager.finished_task_uris(5);
+        assert_eq!(stale_cleanup_candidates, vec![uri.clone()]);
+
+        let replacement_task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        let replacement_handle = replacement_task.abort_handle();
+        manager
+            .active_tasks
+            .insert(uri.clone(), replacement_handle.clone());
+
+        let removed = manager.remove_if_still_finished(stale_cleanup_candidates);
+
+        assert_eq!(removed, 0);
+        assert!(manager.has_active_task(&uri));
+        assert!(!replacement_handle.is_finished());
+        replacement_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn register_task_performs_opportunistic_cleanup() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let finished_uri = Url::parse("file:///finished.md").unwrap();
+        let new_uri = Url::parse("file:///new.md").unwrap();
+
+        let finished_task = tokio::spawn(async {});
+        let finished_handle = finished_task.abort_handle();
+        finished_task.await.unwrap();
+        assert!(finished_handle.is_finished());
+        manager
+            .active_tasks
+            .insert(finished_uri.clone(), finished_handle);
+
+        let new_task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        let new_handle = new_task.abort_handle();
+
+        manager.register_task(new_uri.clone(), new_handle.clone());
+
+        assert!(!manager.has_active_task(&finished_uri));
+        assert!(manager.has_active_task(&new_uri));
+        assert!(!new_handle.is_finished());
+        new_handle.abort();
     }
 }
