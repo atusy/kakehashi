@@ -34,7 +34,8 @@
 //! ```
 //!
 //! Tunables (env): `KAKEHASHI_BENCH_ITERS` (default 80),
-//! `KAKEHASHI_BENCH_WARMUP` (default 10).
+//! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
+//! (optional comma-separated scenario-name substrings).
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -738,6 +739,7 @@ fn main() {
                       regime; validates no latency regression there (slow; use low iters)",
         },
     ];
+    let scenarios = filter_scenarios(scenarios);
 
     println!();
     println!("semantic-tokens benchmark  (iters={iters}, warmup={warmup}, lower is better)");
@@ -763,6 +765,29 @@ fn main() {
         }
     }
     println!();
+}
+
+fn filter_scenarios(scenarios: Vec<Scenario>) -> Vec<Scenario> {
+    let Some(filter) = std::env::var("KAKEHASHI_BENCH_SCENARIOS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return scenarios;
+    };
+    let terms: Vec<String> = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let filtered: Vec<_> = scenarios
+        .into_iter()
+        .filter(|scenario| terms.iter().any(|term| scenario.name.contains(term)))
+        .collect();
+    if filtered.is_empty() {
+        panic!("KAKEHASHI_BENCH_SCENARIOS={filter:?} matched no scenarios");
+    }
+    filtered
 }
 
 // ───────────────────────────── Output formatting ──────────────────────────────
