@@ -1,5 +1,8 @@
 //! didChangeConfiguration notification handler for Kakehashi.
 
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
 use tower_lsp_server::ls_types::DidChangeConfigurationParams;
 
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
@@ -208,15 +211,24 @@ fn has_known_configuration_key(value: &serde_json::Value) -> bool {
 }
 
 fn is_known_configuration_key(key: &str) -> bool {
-    matches!(
-        key,
-        "searchPaths"
-            | "languages"
-            | "captureMappings"
-            | "autoInstall"
-            | "diagnosticsDebounceMs"
-            | "languageServers"
-    )
+    known_configuration_keys().contains(key)
+}
+
+fn known_configuration_keys() -> &'static HashSet<String> {
+    static KEYS: OnceLock<HashSet<String>> = OnceLock::new();
+
+    KEYS.get_or_init(|| {
+        let schema = serde_json::to_value(crate::config::json_schema()).unwrap_or_else(|err| {
+            log::warn!("failed to serialize RawWorkspaceSettings schema: {err}");
+            serde_json::Value::Null
+        });
+
+        schema
+            .get("properties")
+            .and_then(|properties| properties.as_object())
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default()
+    })
 }
 
 fn raw_workspace_settings_is_empty(settings: &RawWorkspaceSettings) -> bool {
@@ -349,6 +361,23 @@ mod tests {
 
         assert!(raw_workspace_settings_is_empty(&update.settings));
         assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn known_configuration_keys_come_from_schema_properties() {
+        let schema = serde_json::to_value(crate::config::json_schema())
+            .expect("RawWorkspaceSettings schema should serialize");
+        let expected: HashSet<_> = schema
+            .get("properties")
+            .and_then(|properties| properties.as_object())
+            .expect("schema should define top-level properties")
+            .keys()
+            .cloned()
+            .collect();
+
+        assert_eq!(known_configuration_keys(), &expected);
+        assert!(is_known_configuration_key("autoInstall"));
+        assert!(!is_known_configuration_key("autoInstal"));
     }
 
     #[test]
