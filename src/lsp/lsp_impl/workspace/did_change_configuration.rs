@@ -114,10 +114,7 @@ fn parse_normalized_client_configuration(
 fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientConfiguration {
     let settings_root = value.get("settings").unwrap_or(&value);
     let Some(inner) = settings_root
-        .get("settings")
-        .and_then(|settings| settings.get("kakehashi"))
-        .filter(|value| value.is_object())
-        .or_else(|| settings_root.get("kakehashi"))
+        .get("kakehashi")
         .filter(|value| value.is_object())
         .or_else(|| value.get("kakehashi"))
         .filter(|value| value.is_object())
@@ -426,6 +423,24 @@ mod tests {
         .expect("conflicting mixed settings should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
+        assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn ignores_double_wrapped_kakehashi_settings() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "settings": {
+                    "kakehashi": {
+                        "autoInstall": false
+                    },
+                    "diagnosticsDebounceMs": 250
+                }
+            }
+        }))
+        .expect("unsupported double-wrapped settings should parse as an empty update");
+
+        assert!(raw_workspace_settings_is_empty(&update.settings));
         assert!(update.warnings.is_empty());
     }
 
