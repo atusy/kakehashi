@@ -78,26 +78,31 @@ mod tests {
     }
 
     #[test]
-    fn canonical_json_key_order_breaks_deep_ties() {
-        let mut first = diag("same");
-        first.data = Some(serde_json::json!({
-            "outer": {
-                "z": 1,
-                "a": 1
+    fn canonical_json_string_ignores_recursive_object_insertion_order() {
+        let nested_data = |keys: [&str; 2]| {
+            let mut outer = serde_json::Map::new();
+            for key in keys {
+                outer.insert(key.to_string(), serde_json::json!(1));
             }
-        }));
+
+            let mut root = serde_json::Map::new();
+            root.insert("outer".to_string(), serde_json::Value::Object(outer));
+            serde_json::Value::Object(root)
+        };
+
+        let mut first = diag("same");
+        first.data = Some(nested_data(["z", "a"]));
 
         let mut second = diag("same");
-        second.data = Some(serde_json::json!({
-            "outer": {
-                "a": 0,
-                "z": 9
-            }
-        }));
+        second.data = Some(nested_data(["a", "z"]));
 
-        let mut diagnostics = vec![first, second];
-        sort_diagnostics_deterministically(&mut diagnostics);
-
-        assert_eq!(diagnostics[0].data.as_ref().unwrap()["outer"]["a"], 0);
+        assert_ne!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        assert_eq!(
+            canonical_json_string(&first),
+            canonical_json_string(&second)
+        );
     }
 }
