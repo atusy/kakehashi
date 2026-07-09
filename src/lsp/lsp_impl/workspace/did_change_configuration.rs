@@ -336,12 +336,7 @@ fn known_configuration_keys() -> &'static HashSet<String> {
 }
 
 fn raw_workspace_settings_is_empty(settings: &RawWorkspaceSettings) -> bool {
-    settings.search_paths.is_none()
-        && settings.languages.is_empty()
-        && settings.capture_mappings.is_empty()
-        && settings.auto_install.is_none()
-        && settings.diagnostics_debounce_ms.is_none()
-        && settings.language_servers.is_none()
+    settings.is_effectively_empty()
 }
 
 #[cfg(test)]
