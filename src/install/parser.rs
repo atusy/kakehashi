@@ -550,6 +550,7 @@ fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ParserInstallError
     for component in path.components() {
         match component {
             std::path::Component::Normal(part) => safe.push(part),
+            std::path::Component::CurDir => {}
             _ => {
                 return Err(ParserInstallError::UnsafeArchive(format!(
                     "Unsafe path detected in archive: {}",
@@ -557,6 +558,12 @@ fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ParserInstallError
                 )));
             }
         }
+    }
+    if safe.as_os_str().is_empty() {
+        return Err(ParserInstallError::UnsafeArchive(format!(
+            "Unsafe path detected in archive: {}",
+            path.display()
+        )));
     }
     Ok(safe)
 }
@@ -1476,11 +1483,15 @@ mod tests {
             safe_archive_relative_path(Path::new("src/parser.c")).expect("safe path"),
             PathBuf::from("src").join("parser.c")
         );
+        assert_eq!(
+            safe_archive_relative_path(Path::new("./payload")).expect("safe current-dir path"),
+            PathBuf::from("payload")
+        );
     }
 
     #[test]
     fn safe_archive_relative_path_rejects_non_normal_components() {
-        for path in [Path::new("../payload"), Path::new("./payload")] {
+        for path in [Path::new("../payload"), Path::new(".")] {
             match safe_archive_relative_path(path) {
                 Err(ParserInstallError::UnsafeArchive(message)) => {
                     assert!(
