@@ -293,10 +293,13 @@ impl LanguageServerPool {
     }
 
     /// Whether the host server for `(server_name, uri)` advertises `method`
-    /// (e.g. `codeAction/resolve`). Queried on the cached connection — ~free
-    /// right after a request that already opened it — and fail-closed (`false`)
-    /// when the server can't be reached. Used to decide whether a host lazy
-    /// action can be resolve-routed rather than disabled (#627).
+    /// (e.g. `codeAction/resolve`). Reuses the existing connection when the
+    /// request that ran just before already opened it, but still goes through
+    /// `get_or_create_connection`, which re-resolves the marker/root and takes
+    /// the pool lock even on a cache hit — cheap, not free, so callers gate the
+    /// call when the answer can't change the outcome. Fail-closed (`false`) when
+    /// the server can't be reached. Used to decide whether a host lazy action can
+    /// be resolve-routed rather than disabled (#627).
     pub(crate) async fn host_server_advertises(
         &self,
         server_name: &str,

@@ -385,20 +385,29 @@ impl Kakehashi {
                 // Whether this host server advertises `codeAction/resolve`, so a
                 // host lazy action can be enveloped for resolve-routing back to
                 // it (#627) rather than disabled. Queried on the just-opened
-                // connection — but only when at least one action could actually
-                // consume the answer. `bridge_code_action` reads `server_resolves`
-                // ONLY for a possibly-lazy action: no edit, no command, and NOT
-                // already disabled (a disabled action returns early, before the
-                // lazy gate). A menu of purely materialized/disabled actions never
-                // looks at it, so the probe (and its lock acquisition) is skippable
-                // on that hot path.
+                // connection — but only when the answer can actually change the
+                // outcome, so the probe (and its marker-root resolution + pool
+                // lock) is skippable on this hot `textDocument/codeAction` path:
+                //
+                // - `server_resolves` is read by `bridge_code_action` ONLY for a
+                //   possibly-lazy action (no edit, no command, and not already
+                //   disabled — a disabled action returns early, before the lazy
+                //   gate). No such action ⇒ never consulted.
+                // - Even with such an action, a HOST lazy action needs the CLIENT
+                //   to either envelope it (`can_envelope`) or show it disabled
+                //   (`disabled_support`); with NEITHER, it is dropped regardless
+                //   of `server_resolves` (envelope path gated on `can_envelope`,
+                //   `disable_action` returns `None` without `disabled_support`).
+                let client_can_use_resolve =
+                    upstream_caps.can_envelope() || upstream_caps.disabled_support;
                 let maybe_lazy = |item: &CodeActionOrCommand| match item {
                     CodeActionOrCommand::CodeAction(a) => {
                         a.edit.is_none() && a.command.is_none() && a.disabled.is_none()
                     }
                     CodeActionOrCommand::Command(_) => false,
                 };
-                let server_resolves = actions.iter().any(maybe_lazy)
+                let server_resolves = client_can_use_resolve
+                    && actions.iter().any(maybe_lazy)
                     && t.pool
                         .host_server_advertises(
                             &t.server_name,

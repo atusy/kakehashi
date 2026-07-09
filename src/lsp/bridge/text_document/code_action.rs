@@ -1152,7 +1152,7 @@ impl UpstreamCodeActionCaps {
     /// our envelope) and `resolveSupport` advertising `"edit"` (the client
     /// will actually resolve the edit). Otherwise the bridge must
     /// eager-resolve downstream instead.
-    fn can_envelope(&self) -> bool {
+    pub(crate) fn can_envelope(&self) -> bool {
         self.data_support && self.resolve_edit_support
     }
 }
