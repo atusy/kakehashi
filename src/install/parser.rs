@@ -19,8 +19,16 @@ use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 
 /// HTTP timeout for archive downloads.
 const ARCHIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-/// Maximum decompressed tar stream or extracted file bytes for parser archives.
-const MAX_ARCHIVE_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024;
+/// Maximum total file bytes extracted from parser archives.
+///
+/// Parser grammars are source archives, not vendored corpora; 100 MiB keeps
+/// normal tree-sitter parsers below the budget while bounding gzip bombs.
+const MAX_ARCHIVE_EXTRACTED_BYTES: u64 = 100 * 1024 * 1024;
+/// Extra tar header/padding budget above extracted payload bytes.
+const ARCHIVE_TAR_METADATA_MARGIN_BYTES: u64 = 10 * 1024 * 1024;
+/// Maximum decompressed tar stream bytes for parser archives.
+const MAX_ARCHIVE_TAR_STREAM_BYTES: u64 =
+    MAX_ARCHIVE_EXTRACTED_BYTES + ARCHIVE_TAR_METADATA_MARGIN_BYTES;
 
 /// Error types for parser installation.
 #[derive(Debug)]
@@ -31,6 +39,8 @@ pub enum ParserInstallError {
     GitError(String),
     /// Archive download or extraction failed.
     ArchiveError(String),
+    /// Archive exceeded the configured extraction size budget.
+    ArchiveSizeLimitExceeded(String),
     /// Compilation failed.
     CompileError(String),
     /// File system operation failed.
@@ -45,6 +55,9 @@ impl std::fmt::Display for ParserInstallError {
             Self::MetadataError(e) => write!(f, "{}", e),
             Self::GitError(msg) => write!(f, "Git error: {}", msg),
             Self::ArchiveError(msg) => write!(f, "Archive error: {}", msg),
+            Self::ArchiveSizeLimitExceeded(msg) => {
+                write!(f, "Archive size limit exceeded: {}", msg)
+            }
             Self::CompileError(msg) => write!(f, "Compilation error: {}", msg),
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::AlreadyExists(path) => {
@@ -427,6 +440,7 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         );
         match download_and_extract_archive(&archive_url, &repo_name, revision, dest) {
             Ok(()) => return Ok(()),
+            Err(e) if !archive_error_allows_git_fallback(&e) => return Err(e),
             Err(e) => {
                 log::warn!(
                     target: "kakehashi::install",
@@ -447,6 +461,10 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         revision
     );
     clone_repo(url, revision, dest)
+}
+
+fn archive_error_allows_git_fallback(error: &ParserInstallError) -> bool {
+    !matches!(error, ParserInstallError::ArchiveSizeLimitExceeded(_))
 }
 
 /// Download a GitHub archive tarball and extract it to the destination directory.
@@ -471,8 +489,7 @@ fn download_and_extract_archive(
     // into_reader() streams without ureq's 10MB read_to_* cap, so enforce our
     // own limit on the decompressed tar stream.
     let decoder = GzDecoder::new(response.into_body().into_reader());
-    let bounded_decoder =
-        LimitedReader::new(decoder, MAX_ARCHIVE_DECOMPRESSED_BYTES, "decompressed size");
+    let bounded_decoder = LimitedReader::new(decoder, MAX_ARCHIVE_TAR_STREAM_BYTES);
     let mut archive = Archive::new(bounded_decoder);
 
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
@@ -481,12 +498,11 @@ fn download_and_extract_archive(
     fs::create_dir_all(dest)?;
     let mut extracted_bytes = 0u64;
 
-    for entry_result in archive.entries().map_err(|e| {
-        ParserInstallError::ArchiveError(format!("Failed to read archive entries: {}", e))
-    })? {
-        let mut entry = entry_result.map_err(|e| {
-            ParserInstallError::ArchiveError(format!("Failed to read entry: {}", e))
-        })?;
+    for entry_result in archive
+        .entries()
+        .map_err(|e| archive_io_error("Failed to read archive entries", e))?
+    {
+        let mut entry = entry_result.map_err(|e| archive_io_error("Failed to read entry", e))?;
 
         let path = entry.path().map_err(|e| {
             ParserInstallError::ArchiveError(format!("Invalid path in archive: {}", e))
@@ -527,48 +543,103 @@ fn download_and_extract_archive(
                 ))
             })?;
             extracted_bytes = extracted_bytes.checked_add(entry_size).ok_or_else(|| {
-                ParserInstallError::ArchiveError(format!(
-                    "Archive decompressed size exceeds {} bytes",
-                    MAX_ARCHIVE_DECOMPRESSED_BYTES
+                ParserInstallError::ArchiveSizeLimitExceeded(format!(
+                    "extracted file bytes exceed {} bytes",
+                    MAX_ARCHIVE_EXTRACTED_BYTES
                 ))
             })?;
-            if extracted_bytes > MAX_ARCHIVE_DECOMPRESSED_BYTES {
-                return Err(ParserInstallError::ArchiveError(format!(
-                    "Archive decompressed size exceeds {} bytes while extracting {}",
-                    MAX_ARCHIVE_DECOMPRESSED_BYTES,
+            if extracted_bytes > MAX_ARCHIVE_EXTRACTED_BYTES {
+                return Err(ParserInstallError::ArchiveSizeLimitExceeded(format!(
+                    "extracted file bytes exceed {} bytes while extracting {}",
+                    MAX_ARCHIVE_EXTRACTED_BYTES,
                     relative.display()
                 )));
             }
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            entry.unpack(&target).map_err(|e| {
-                ParserInstallError::ArchiveError(format!(
-                    "Failed to extract {}: {}",
-                    relative.display(),
-                    e
-                ))
-            })?;
+            unpack_entry_atomically(&mut entry, &target, &relative)?;
         }
     }
 
     Ok(())
 }
 
+fn unpack_entry_atomically<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    target: &Path,
+    relative: &Path,
+) -> Result<(), ParserInstallError> {
+    let parent = target.parent().ok_or_else(|| {
+        ParserInstallError::ArchiveError(format!(
+            "Invalid extraction target for {}",
+            relative.display()
+        ))
+    })?;
+    let temp_file = tempfile::Builder::new()
+        .prefix(".kakehashi-extract-")
+        .tempfile_in(parent)?;
+    let temp_path = temp_file.path().to_path_buf();
+
+    if let Err(error) = entry.unpack(&temp_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(archive_io_error(
+            &format!("Failed to extract {}", relative.display()),
+            error,
+        ));
+    }
+
+    temp_file.persist(target).map_err(|error| {
+        ParserInstallError::ArchiveError(format!(
+            "Failed to move extracted {} into place: {}",
+            relative.display(),
+            error.error
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn archive_io_error(context: &str, error: io::Error) -> ParserInstallError {
+    if let Some(limit_error) = archive_limit_error_source(&error) {
+        return ParserInstallError::ArchiveSizeLimitExceeded(limit_error.to_string());
+    }
+
+    ParserInstallError::ArchiveError(format!("{}: {}", context, error))
+}
+
+fn archive_limit_error_source<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a ArchiveLimitError> {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if let Some(limit_error) = error.downcast_ref::<ArchiveLimitError>() {
+            return Some(limit_error);
+        }
+        if let Some(io_error) = error.downcast_ref::<io::Error>()
+            && let Some(inner) = io_error.get_ref()
+            && let Some(limit_error) = archive_limit_error_source(inner)
+        {
+            return Some(limit_error);
+        }
+        source = error.source();
+    }
+
+    None
+}
+
 struct LimitedReader<R> {
     inner: R,
     remaining: u64,
     limit: u64,
-    label: &'static str,
 }
 
 impl<R> LimitedReader<R> {
-    fn new(inner: R, limit: u64, label: &'static str) -> Self {
+    fn new(inner: R, limit: u64) -> Self {
         Self {
             inner,
             remaining: limit,
             limit,
-            label,
         }
     }
 }
@@ -584,7 +655,7 @@ impl<R: Read> Read for LimitedReader<R> {
                 Ok(0) => Ok(0),
                 Ok(_) => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Archive {} exceeds {} bytes", self.label, self.limit),
+                    ArchiveLimitError { limit: self.limit },
                 )),
                 Err(e) => Err(e),
             };
@@ -598,6 +669,19 @@ impl<R: Read> Read for LimitedReader<R> {
         Ok(read)
     }
 }
+
+#[derive(Debug)]
+struct ArchiveLimitError {
+    limit: u64,
+}
+
+impl std::fmt::Display for ArchiveLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "decompressed tar stream exceeds {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for ArchiveLimitError {}
 
 /// Derive the expected root directory name inside a GitHub archive tarball.
 ///
@@ -1577,18 +1661,19 @@ mod tests {
     }
 
     #[test]
-    fn download_and_extract_archive_rejects_oversized_decompressed_archive() {
+    fn download_and_extract_archive_rejects_oversized_extracted_payload() {
         let temp = tempdir().expect("Failed to create temp dir");
         let dest = temp.path().join("source");
-        let archive = oversized_archive("parser-1.0.0", 101 * 1024 * 1024);
+        let archive =
+            compressed_tar_archive_with_payload("parser-1.0.0", MAX_ARCHIVE_EXTRACTED_BYTES + 1);
         let archive_url = serve_once(archive);
 
         let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
 
         match result {
-            Err(ParserInstallError::ArchiveError(message)) => {
+            Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
                 assert!(
-                    message.contains("Archive decompressed size exceeds"),
+                    message.contains("extracted file bytes exceed"),
                     "expected archive size limit error, got: {message}"
                 );
             }
@@ -1601,10 +1686,76 @@ mod tests {
     }
 
     #[test]
+    fn archive_io_error_maps_limited_reader_archive_failures() {
+        let tar = tar_archive_with_payload("parser-1.0.0", 1);
+        let mut archive = Archive::new(LimitedReader::new(&tar[..], 1));
+        let entry_result = archive
+            .entries()
+            .expect("entry iterator should be created")
+            .next()
+            .expect("archive should have one entry");
+        let error = match entry_result {
+            Ok(_) => panic!("tar stream should exceed the reader limit"),
+            Err(error) => error,
+        };
+
+        match archive_io_error("read entry", error) {
+            ParserInstallError::ArchiveSizeLimitExceeded(message) => {
+                assert!(
+                    message.contains("decompressed tar stream exceeds 1 bytes"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected archive size limit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unpack_entry_atomically_removes_partial_file_on_stream_limit() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let relative = Path::new("payload.bin");
+        let target = temp.path().join(relative);
+        let tar = tar_archive_with_payload("parser-1.0.0", 16);
+        let mut archive = Archive::new(LimitedReader::new(&tar[..], 520));
+        let mut entry = archive
+            .entries()
+            .expect("entry iterator should be created")
+            .next()
+            .expect("archive should have one entry")
+            .expect("entry header should fit within the reader limit");
+
+        let result = unpack_entry_atomically(&mut entry, &target, relative);
+
+        match result {
+            Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
+                assert!(
+                    message.contains("decompressed tar stream exceeds 520 bytes"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected archive size limit error, got {other:?}"),
+        }
+        assert!(
+            !target.exists(),
+            "partial extraction target should be removed"
+        );
+    }
+
+    #[test]
+    fn archive_size_limit_errors_do_not_allow_git_fallback() {
+        assert!(!archive_error_allows_git_fallback(
+            &ParserInstallError::ArchiveSizeLimitExceeded("too large".to_string())
+        ));
+        assert!(archive_error_allows_git_fallback(
+            &ParserInstallError::ArchiveError("network failed".to_string())
+        ));
+    }
+
+    #[test]
     fn limited_reader_rejects_reads_past_limit() {
         use std::io::Read;
 
-        let mut reader = LimitedReader::new(&b"abcdef"[..], 3, "test size");
+        let mut reader = LimitedReader::new(&b"abcdef"[..], 3);
         let mut buffer = Vec::new();
         let error = reader
             .read_to_end(&mut buffer)
@@ -1615,18 +1766,42 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Archive test size exceeds 3 bytes"),
+                .contains("decompressed tar stream exceeds 3 bytes"),
             "unexpected error: {error}"
         );
     }
 
-    fn oversized_archive(root: &str, payload_size: u64) -> Vec<u8> {
+    fn tar_archive_with_payload(root: &str, payload_size: u64) -> Vec<u8> {
+        use std::io::Read;
+        use tar::{Builder, Header};
+
+        let mut archive = Vec::new();
+        {
+            let mut builder = Builder::new(&mut archive);
+            let mut header = Header::new_gnu();
+            header.set_size(payload_size);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    format!("{root}/payload.bin"),
+                    std::io::repeat(0).take(payload_size),
+                )
+                .expect("append payload");
+            builder.finish().expect("finish tar");
+        }
+
+        archive
+    }
+
+    fn compressed_tar_archive_with_payload(root: &str, payload_size: u64) -> Vec<u8> {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         use std::io::Read;
         use tar::{Builder, Header};
 
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         {
             let mut builder = Builder::new(&mut encoder);
             let mut header = Header::new_gnu();
@@ -1639,7 +1814,7 @@ mod tests {
                     format!("{root}/payload.bin"),
                     std::io::repeat(0).take(payload_size),
                 )
-                .expect("append oversized payload");
+                .expect("append payload");
             builder.finish().expect("finish tar");
         }
 
