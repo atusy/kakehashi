@@ -543,9 +543,26 @@ fn download_and_extract_archive(
 
         let target = dest.join(&relative);
 
-        if entry.header().entry_type().is_dir() {
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "Link entry rejected in archive: {}",
+                relative.display()
+            )));
+        }
+        if !entry_type.is_dir() && !entry_type.is_file() {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "Unsupported entry type rejected in archive: {}",
+                relative.display()
+            )));
+        }
+
+        if entry_type.is_dir() {
             fs::create_dir_all(&target)?;
         } else {
+            // Use the declared effective size before unpacking. This may reject a
+            // PAX entry whose payload is shorter than declared, but it keeps the
+            // resource budget conservative before any disk writes begin.
             let entry_size = entry.size();
             extracted_bytes = extracted_bytes.checked_add(entry_size).ok_or_else(|| {
                 ParserInstallError::ArchiveSizeLimitExceeded(format!(
@@ -1669,8 +1686,11 @@ mod tests {
     fn download_and_extract_archive_rejects_oversized_extracted_payload() {
         let temp = tempdir().expect("Failed to create temp dir");
         let dest = temp.path().join("source");
-        let archive =
-            compressed_tar_archive_with_payload("parser-1.0.0", MAX_ARCHIVE_EXTRACTED_BYTES + 1);
+        let archive = gzip_archive(tar_archive_with_declared_payload(
+            "parser-1.0.0",
+            MAX_ARCHIVE_EXTRACTED_BYTES + 1,
+            0,
+        ));
         let archive_url = serve_once(archive);
 
         let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
@@ -1688,6 +1708,26 @@ mod tests {
             !dest.join("payload.bin").exists(),
             "oversized archive payload must not be fully extracted"
         );
+    }
+
+    #[test]
+    fn download_and_extract_archive_rejects_link_entries() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        let archive = gzip_archive(link_archive("parser-1.0.0"));
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
+
+        match result {
+            Err(ParserInstallError::ArchiveError(message)) => {
+                assert!(
+                    message.contains("Link entry rejected"),
+                    "expected link rejection, got: {message}"
+                );
+            }
+            other => panic!("expected link rejection, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1863,6 +1903,42 @@ mod tests {
         archive
     }
 
+    fn tar_archive_with_declared_payload(
+        root: &str,
+        declared_size: u64,
+        data_len: usize,
+    ) -> Vec<u8> {
+        let mut archive = Vec::new();
+        append_tar_entry(
+            &mut archive,
+            &format!("{root}/payload.bin"),
+            tar::EntryType::file(),
+            &vec![0; data_len],
+            declared_size,
+        );
+        archive.extend_from_slice(&[0; 1024]);
+        archive
+    }
+
+    fn link_archive(root: &str) -> Vec<u8> {
+        use tar::{Builder, EntryType, Header};
+
+        let mut archive = Vec::new();
+        {
+            let mut builder = Builder::new(&mut archive);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::symlink());
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, format!("{root}/link"), "../outside")
+                .expect("append symlink");
+            builder.finish().expect("finish tar");
+        }
+        archive
+    }
+
     fn pax_size_override_archive_with_data_len(
         path: &str,
         raw_size: u64,
@@ -1937,33 +2013,6 @@ mod tests {
         std::io::copy(&mut &archive[..], &mut encoder).expect("compress tar");
         encoder.finish().expect("finish gzip")
     }
-
-    fn compressed_tar_archive_with_payload(root: &str, payload_size: u64) -> Vec<u8> {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Read;
-        use tar::{Builder, Header};
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        {
-            let mut builder = Builder::new(&mut encoder);
-            let mut header = Header::new_gnu();
-            header.set_size(payload_size);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(
-                    &mut header,
-                    format!("{root}/payload.bin"),
-                    std::io::repeat(0).take(payload_size),
-                )
-                .expect("append payload");
-            builder.finish().expect("finish tar");
-        }
-
-        encoder.finish().expect("finish gzip")
-    }
-
     fn serve_once(body: Vec<u8>) -> String {
         use std::io::{Read, Write};
 
