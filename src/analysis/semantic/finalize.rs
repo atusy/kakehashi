@@ -35,7 +35,7 @@ fn utf16_width(s: &str) -> usize {
     s.chars().map(|c| c.len_utf16()).sum()
 }
 
-/// Split multiline tokens into per-line tokens.
+/// Split multiline tokens into per-line fragments, skipping empty multiline fragments.
 ///
 /// The sweep line algorithm groups tokens by `token.line` and treats
 /// `[column, column+length)` as a 1D interval on that line. Multiline
@@ -69,7 +69,9 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
             let current_line_width = utf16_width(lines[current_line]);
             let per_line_len = remaining.min(current_line_width.saturating_sub(start_col));
 
-            result.push(token.with_span(current_line, start_col, per_line_len));
+            if per_line_len > 0 {
+                result.push(token.with_span(current_line, start_col, per_line_len));
+            }
 
             // Subtract per_line_len + 1 (the +1 accounts for the newline between lines)
             remaining = remaining.saturating_sub(per_line_len + 1);
@@ -748,6 +750,24 @@ mod tests {
     }
 
     #[test]
+    fn finalize_tokens_skips_zero_length_multiline_fragments() {
+        let lines = &["abc", "de"];
+        let tokens = vec![make_token(0, 3, 3, "string", 0, 0)];
+
+        let SemanticTokensResult::Tokens(semantic_tokens) =
+            finalize_tokens(tokens, &[], lines).expect("should produce tokens")
+        else {
+            panic!("Expected Tokens variant");
+        };
+
+        assert!(semantic_tokens.data.iter().all(|token| token.length > 0));
+        assert_eq!(semantic_tokens.data.len(), 1);
+        assert_eq!(semantic_tokens.data[0].delta_line, 1);
+        assert_eq!(semantic_tokens.data[0].delta_start, 0);
+        assert_eq!(semantic_tokens.data[0].length, 2);
+    }
+
+    #[test]
     fn finalize_tokens_sorts_by_position() {
         let tokens = vec![
             make_token(1, 0, 3, "keyword", 0, 0),  // line 1
@@ -1151,9 +1171,6 @@ mod tests {
     #[test]
     fn split_multiline_three_lines_with_empty_middle() {
         // Line 0: "abc" (width 3), Line 1: "" (width 0), Line 2: "de" (width 2)
-        // Token at (line=0, col=0, length=6): line 0 len=3, newline -1 → remaining=2,
-        // line 1 len=0, newline -1 → remaining=1, line 2 len=1... wait let me recalculate.
-        //
         // Total length encoding: line0_content(3) + newline(1) + line1_content(0) + newline(1) + line2_content(2) = 7
         // But we want length=6 to test partial coverage of last line:
         // line0: 3, newline: 1, line1: 0, newline: 1, line2: 1 → total = 6
@@ -1161,9 +1178,9 @@ mod tests {
         let tokens = vec![make_token(0, 0, 6, "string", 0, 0)];
         let result = extract_split(tokens, lines);
         // line 0: min(6, 3-0)=3, remaining=6-3-1=2
-        // line 1: min(2, 0-0)=0, remaining=2-0-1=1
+        // line 1: min(2, 0-0)=0, skipped, remaining=2-0-1=1
         // line 2: min(1, 2-0)=1, remaining=1-1-1=0 (saturating)
-        assert_eq!(result, vec![(0, 0, 3), (1, 0, 0), (2, 0, 1)]);
+        assert_eq!(result, vec![(0, 0, 3), (2, 0, 1)]);
     }
 
     #[test]
