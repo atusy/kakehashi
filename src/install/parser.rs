@@ -426,6 +426,7 @@ fn clean_url(url: &str) -> &str {
 /// Strategy:
 /// 1. If the URL is a GitHub HTTPS URL, try downloading the archive tarball.
 /// 2. If archive download fails (or URL is not GitHub), fall back to git clone.
+/// 3. If archive extraction exceeds size limits, clean up and fail without fallback.
 fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
     validate_parser_source_metadata(url, revision)?;
 
@@ -440,7 +441,9 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         );
         match download_and_extract_archive(&archive_url, &repo_name, revision, dest) {
             Ok(()) => return Ok(()),
-            Err(e) if !archive_error_allows_git_fallback(&e) => return Err(e),
+            Err(e) if !archive_error_allows_git_fallback(&e) => {
+                return fail_terminal_archive_error(e, dest);
+            }
             Err(e) => {
                 log::warn!(
                     target: "kakehashi::install",
@@ -465,6 +468,14 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
 
 fn archive_error_allows_git_fallback(error: &ParserInstallError) -> bool {
     !matches!(error, ParserInstallError::ArchiveSizeLimitExceeded(_))
+}
+
+fn fail_terminal_archive_error(
+    error: ParserInstallError,
+    dest: &Path,
+) -> Result<(), ParserInstallError> {
+    let _ = fs::remove_dir_all(dest);
+    Err(error)
 }
 
 /// Download a GitHub archive tarball and extract it to the destination directory.
@@ -535,13 +546,7 @@ fn download_and_extract_archive(
         if entry.header().entry_type().is_dir() {
             fs::create_dir_all(&target)?;
         } else {
-            let entry_size = entry.header().size().map_err(|e| {
-                ParserInstallError::ArchiveError(format!(
-                    "Invalid size for {}: {}",
-                    relative.display(),
-                    e
-                ))
-            })?;
+            let entry_size = entry.size();
             extracted_bytes = extracted_bytes.checked_add(entry_size).ok_or_else(|| {
                 ParserInstallError::ArchiveSizeLimitExceeded(format!(
                     "extracted file bytes exceed {} bytes",
@@ -1686,6 +1691,35 @@ mod tests {
     }
 
     #[test]
+    fn download_and_extract_archive_rejects_oversized_pax_effective_size() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        let archive = gzip_archive(pax_size_override_archive_with_data_len(
+            "parser-1.0.0/payload.bin",
+            1,
+            MAX_ARCHIVE_EXTRACTED_BYTES + 1,
+            0,
+        ));
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
+
+        match result {
+            Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
+                assert!(
+                    message.contains("extracted file bytes exceed"),
+                    "expected archive size limit error, got: {message}"
+                );
+            }
+            other => panic!("expected archive size limit error, got {other:?}"),
+        }
+        assert!(
+            !dest.join("payload.bin").exists(),
+            "oversized PAX effective payload must not be extracted"
+        );
+    }
+
+    #[test]
     fn archive_io_error_maps_limited_reader_archive_failures() {
         let tar = tar_archive_with_payload("parser-1.0.0", 1);
         let mut archive = Archive::new(LimitedReader::new(&tar[..], 1));
@@ -1752,6 +1786,40 @@ mod tests {
     }
 
     #[test]
+    fn terminal_archive_errors_remove_partial_destination() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        fs::create_dir_all(&dest).expect("create dest");
+        fs::write(dest.join("already-extracted.c"), "partial").expect("write partial file");
+
+        let result = fail_terminal_archive_error(
+            ParserInstallError::ArchiveSizeLimitExceeded("too large".to_string()),
+            &dest,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ParserInstallError::ArchiveSizeLimitExceeded(_))
+        ));
+        assert!(!dest.exists(), "terminal archive errors should clean dest");
+    }
+
+    #[test]
+    fn extracted_quota_uses_effective_entry_size() {
+        let tar = pax_size_override_archive_with_data_len("parser-1.0.0/payload.bin", 1, 16, 16);
+        let mut archive = Archive::new(&tar[..]);
+        let entry = archive
+            .entries()
+            .expect("entry iterator should be created")
+            .next()
+            .expect("archive should have one entry")
+            .expect("entry should be readable");
+
+        assert_eq!(entry.header().size().expect("raw header size"), 1);
+        assert_eq!(entry.size(), 16);
+    }
+
+    #[test]
     fn limited_reader_rejects_reads_past_limit() {
         use std::io::Read;
 
@@ -1793,6 +1861,81 @@ mod tests {
         }
 
         archive
+    }
+
+    fn pax_size_override_archive_with_data_len(
+        path: &str,
+        raw_size: u64,
+        effective_size: u64,
+        data_len: usize,
+    ) -> Vec<u8> {
+        use tar::EntryType;
+
+        let pax_record = pax_record("size", &effective_size.to_string());
+        let mut archive = Vec::new();
+        append_tar_entry(
+            &mut archive,
+            "pax-size",
+            EntryType::XHeader,
+            pax_record.as_bytes(),
+            pax_record.len() as u64,
+        );
+        append_tar_entry(
+            &mut archive,
+            path,
+            EntryType::file(),
+            &vec![0; data_len],
+            raw_size,
+        );
+        archive.extend_from_slice(&[0; 1024]);
+        archive
+    }
+
+    fn pax_record(key: &str, value: &str) -> String {
+        let body = format!("{key}={value}\n");
+        let mut length = body.len() + 2;
+        loop {
+            let record = format!("{length} {body}");
+            let actual = record.len();
+            if actual == length {
+                return record;
+            }
+            length = actual;
+        }
+    }
+
+    fn append_tar_entry(
+        archive: &mut Vec<u8>,
+        path: &str,
+        entry_type: tar::EntryType,
+        data: &[u8],
+        header_size: u64,
+    ) {
+        use tar::Header;
+
+        let mut header = Header::new_ustar();
+        header.set_path(path).expect("set tar path");
+        header.set_entry_type(entry_type);
+        header.set_size(header_size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.extend_from_slice(header.as_bytes());
+        archive.extend_from_slice(data);
+        pad_tar_entry(archive, data.len() as u64);
+    }
+
+    fn pad_tar_entry(archive: &mut Vec<u8>, size: u64) {
+        let padding = (512 - (size as usize % 512)) % 512;
+        archive.extend(std::iter::repeat_n(0, padding));
+    }
+
+    fn gzip_archive(archive: Vec<u8>) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        std::io::copy(&mut &archive[..], &mut encoder).expect("compress tar");
+        encoder.finish().expect("finish gzip")
     }
 
     fn compressed_tar_archive_with_payload(root: &str, payload_size: u64) -> Vec<u8> {
