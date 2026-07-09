@@ -162,57 +162,8 @@ pub(crate) fn merge_cached_diagnostics(
     // multi-source/multi-server host. This is the `concatenated` strategy (every
     // server's diagnostics are kept); the `preferred` election is deferred (it needs a
     // per-source version baseline, which #422 left unbuilt).
-    sort_diagnostics(&mut merged);
+    crate::lsp::diagnostic_order::sort_diagnostics_deterministically(&mut merged);
     merged
-}
-
-/// Order diagnostics deterministically: by host position (top-to-bottom —
-/// "order cross-region merge by region start position"), then by the cheap
-/// distinguishing fields (message, source, severity).
-///
-/// The final tiebreak is each diagnostic's full serialized form — a **total**
-/// order over every field (code, tags, data, relatedInformation, …), so two
-/// genuinely distinct diagnostics at the same span can never fall back to
-/// input (e.g. `HashMap`-walk or fan-in completion) order. It is evaluated
-/// **lazily** (`then_with`), only when every cheap field above already ties,
-/// so the serialization is off the hot path. Fully-identical diagnostics
-/// serialize equally and keep their (immaterial) relative order.
-///
-/// Shared by the proactive publish merge ([`merge_cached_diagnostics`], #423)
-/// and the client-pull response (`diagnostic_impl`): the pull's `resultId` is
-/// a content hash of the serialized items, so the same logical set must
-/// serialize identically across pulls regardless of fan-in completion order.
-///
-/// The tiebreak's `unwrap_or_default` cannot fire in practice: `ls_types`
-/// values serialize infallibly (string-keyed maps only, no non-UTF-8, no
-/// custom `Serialize`), and the idiom predates this sort's extraction. Were
-/// serialization ever to fail, the cheap keys above still order by
-/// position/message/source/severity — only fully-tied distinct diagnostics
-/// could then keep input order, and the `resultId`'s length suffix plus the
-/// per-item hash of everything that DID serialize bound the unchanged-report
-/// consequence to the same accepted 2^-64 collision class documented at
-/// `diagnostic_result_id`.
-pub(crate) fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
-    diagnostics.sort_by(|a, b| {
-        let key = |d: &Diagnostic| {
-            (
-                d.range.start.line,
-                d.range.start.character,
-                d.range.end.line,
-                d.range.end.character,
-            )
-        };
-        key(a)
-            .cmp(&key(b))
-            .then_with(|| a.message.cmp(&b.message))
-            .then_with(|| a.source.cmp(&b.source))
-            .then_with(|| a.severity.cmp(&b.severity))
-            .then_with(|| {
-                serde_json::to_string(a)
-                    .unwrap_or_default()
-                    .cmp(&serde_json::to_string(b).unwrap_or_default())
-            })
-    });
 }
 
 /// Whether `slots` holds any **non-empty** `Region` push slot — the shared
