@@ -355,7 +355,7 @@ Any reader that must resolve against **live** positions is position-critical
   bail stays narrowed to reclaiming a superseded compute's CPU (§4).
 - **Serve-stale, passively refreshed** — whole-document, no-position reads:
   `documentSymbol`, `documentColor`, `documentLink`, `foldingRange`, `codeLens`
-  (the `whole_document_preferred_fan_out` family), and pull-mode
+  (the `whole_document_fan_out` family), and pull-mode
   `textDocument/diagnostic` (the `virt_enabled` branch that calls
   `ensure_document_parsed`). `did_save`'s synthetic-diagnostic effect is likewise
   passive (a notification, not a request — its *diagnostics* may trail a snapshot,
