@@ -1716,16 +1716,16 @@ impl LanguageServerPool {
                         // Advertise the NEWLY-added names upstream so the editor's
                         // palette lists them. Fire-and-forget; skipped when the
                         // client can't accept a dynamic registration.
-                        if !added.is_empty() && supports_dynamic_command_registration {
-                            if let Err(e) = upstream_request_tx
+                        if !added.is_empty()
+                            && supports_dynamic_command_registration
+                            && let Err(e) = upstream_request_tx
                                 .send(UpstreamRequest::RegisterCommands { commands: added })
-                            {
-                                log::warn!(
-                                    target: "kakehashi::bridge",
-                                    "Failed to queue palette-command registration \
-                                     (forwarding loop gone): {e}"
-                                );
-                            }
+                        {
+                            log::warn!(
+                                target: "kakehashi::bridge",
+                                "Failed to queue palette-command registration \
+                                 (forwarding loop gone): {e}"
+                            );
                         }
                     }
                     Ok(())

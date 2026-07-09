@@ -124,11 +124,10 @@ impl LanguageServerPool {
     /// envelope) to the exact connection that advertised it — recorded in the
     /// [`command_origins`](Self::command_origins) registry at handshake — so it
     /// runs in the same `(server, root)` workspace context (#628). Reuses the
-    /// live advertising connection; only if it has since been shut down does it
-    /// fall back to a client-root reconnect (where a multi-root server may land
-    /// on a different root). Forwards the command + arguments verbatim; fails
-    /// soft (foreign command, unspawnable / unreachable origin) like every other
-    /// branch.
+    /// live advertising connection; only if it has since been shut down AND the
+    /// key is a plain client-root fallback does it reconnect. Forwards the command
+    /// name and arguments verbatim; fails soft (foreign command, unspawnable or
+    /// unreachable origin) like every other branch.
     async fn dispatch_palette_command(
         &self,
         params: ExecuteCommandParams,
@@ -148,14 +147,18 @@ impl LanguageServerPool {
             // The connection that advertised the command is still Ready — route
             // there, preserving its workspace root/context.
             Some(handle) => handle,
-            // Not Ready or gone. Reconnect when routing doesn't depend on a
-            // specific marker root — a client-root fallback or a shared instance
-            // (`preferSharedInstance`) both reconnect correctly with
-            // `document_uri = None`. For a MARKER-rooted server a client-root
-            // reconnect would run the command against the WRONG workspace, so fail
-            // soft (the user re-fires once the server is back); reconstructing the
-            // marker root here is a deferred follow-up.
-            None if key.is_client_fallback() || key.is_shared() => {
+            // Not Ready or gone. Reconnect ONLY for a plain client-root fallback:
+            // `get_or_create_connection(.., None)` resolves back to that exact
+            // ClientFallback key, so the command runs in the same context. A
+            // SHARED key (`preferSharedInstance`) does NOT round-trip through
+            // `None` — `resolve_acquire` returns the client-fallback key for a
+            // marker-less acquisition, so reconnecting with `None` would spawn a
+            // client-root process instead of the shared instance and run the
+            // command in the wrong workspace. A MARKER-rooted key has the same
+            // problem. Both fail soft here (the user re-fires once the origin is
+            // back); reconstructing a shared/marker root without a document is a
+            // deferred follow-up.
+            None if key.is_client_fallback() => {
                 if !crate::config::is_server_spawnable(&settings.language_servers, origin) {
                     return None;
                 }
