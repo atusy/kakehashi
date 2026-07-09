@@ -60,6 +60,16 @@ fn wrapped_didchange_config(auto_install: bool) -> Value {
     json!({ "settings": { "kakehashi": { "autoInstall": auto_install } } })
 }
 
+fn query_effective_settings(client: &mut LspClient) -> Value {
+    client
+        .send_request("kakehashi/internal/effectiveConfiguration", json!({}))
+        .get("result")
+        .expect("should have result")
+        .get("settings")
+        .expect("should have settings")
+        .clone()
+}
+
 #[test]
 fn e2e_root_markers_deprecation_warns_once_across_didchange() {
     let config_dir = tempfile::TempDir::new().expect("temp config dir");
@@ -169,6 +179,11 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
     assert_eq!(
         method, "window/logMessage",
         "wrapped didChange config must not trigger the flat-shape deprecation popup; got: {params:?}"
+    );
+    assert_eq!(
+        query_effective_settings(&mut client)["autoInstall"],
+        json!(false),
+        "wrapped didChange config should update the effective runtime settings"
     );
 
     // The first actual flat kakehashi runtime setting still gets the warning,

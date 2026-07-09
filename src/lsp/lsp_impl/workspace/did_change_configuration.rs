@@ -168,14 +168,17 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
 
     let mut warnings = Vec::new();
     let mut raw_value = inner.clone();
+    let mut uses_deprecated_unwrapped_shape = false;
 
     if let Some(raw_object) = raw_value.as_object_mut() {
         if let Some(settings_object) = value["settings"].as_object() {
-            merge_flat_sibling_settings(raw_object, &mut warnings, settings_object);
+            uses_deprecated_unwrapped_shape |=
+                merge_flat_sibling_settings(raw_object, &mut warnings, settings_object);
         }
 
         if let Some(root_object) = value.as_object() {
-            merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
+            uses_deprecated_unwrapped_shape |=
+                merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
         }
     }
 
@@ -187,7 +190,7 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
         NormalizedClientConfiguration {
             raw_value,
             warnings: Vec::new(),
-            uses_deprecated_unwrapped_shape: false,
+            uses_deprecated_unwrapped_shape,
         }
     } else {
         NormalizedClientConfiguration {
@@ -196,7 +199,7 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
                 "Ignored unknown client configuration key(s): {}",
                 warnings.join(", ")
             )],
-            uses_deprecated_unwrapped_shape: false,
+            uses_deprecated_unwrapped_shape,
         }
     }
 }
@@ -246,20 +249,26 @@ fn merge_flat_sibling_settings(
     raw_object: &mut serde_json::Map<String, serde_json::Value>,
     warnings: &mut Vec<String>,
     siblings: &serde_json::Map<String, serde_json::Value>,
-) {
+) -> bool {
+    let mut has_flat_configuration_signal = false;
+
     for (key, candidate) in siblings {
         if key == "settings" || key == "kakehashi" {
             continue;
         }
 
         if is_known_configuration_key(key) {
+            has_flat_configuration_signal = true;
             raw_object
                 .entry(key.clone())
                 .or_insert_with(|| candidate.clone());
         } else if should_warn_unknown_key(key, candidate) {
+            has_flat_configuration_signal = true;
             warnings.push(key.clone());
         }
     }
+
+    has_flat_configuration_signal
 }
 
 fn has_configuration_signal(value: &serde_json::Value) -> bool {
@@ -397,7 +406,7 @@ mod tests {
 
     #[test]
     fn merges_known_flat_siblings_with_wrapped_settings() {
-        let update = parse_client_configuration(serde_json::json!({
+        let payload = serde_json::json!({
             "settings": {
                 "kakehashi": {
                     "autoInstall": false
@@ -406,14 +415,19 @@ mod tests {
             "autoInstall": true,
             "diagnosticsDebounceMs": 250,
             "editorSetting": true
-        }))
-        .expect("mixed wrapped and flat settings should parse");
+        });
+        let update = parse_client_configuration(payload.clone())
+            .expect("mixed wrapped and flat settings should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
         assert_eq!(
             update.warnings,
             vec!["Ignored unknown client configuration key(s): editorSetting"]
+        );
+        assert!(
+            normalize_kakehashi_settings(payload).uses_deprecated_unwrapped_shape,
+            "accepted flat siblings beside wrapped settings should still warn as deprecated"
         );
 
         let normalized = normalize_kakehashi_settings(serde_json::json!({
@@ -431,7 +445,7 @@ mod tests {
 
     #[test]
     fn merges_settings_root_flat_siblings_with_wrapped_settings() {
-        let update = parse_client_configuration(serde_json::json!({
+        let payload = serde_json::json!({
             "settings": {
                 "kakehashi": {
                     "autoInstall": false
@@ -439,8 +453,9 @@ mod tests {
                 "diagnosticsDebounceMs": 250,
                 "editorSetting": true
             }
-        }))
-        .expect("settings-root mixed wrapped and flat settings should parse");
+        });
+        let update = parse_client_configuration(payload.clone())
+            .expect("settings-root mixed wrapped and flat settings should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
@@ -448,21 +463,30 @@ mod tests {
             update.warnings,
             vec!["Ignored unknown client configuration key(s): editorSetting"]
         );
+        assert!(
+            normalize_kakehashi_settings(payload).uses_deprecated_unwrapped_shape,
+            "accepted settings-root flat siblings beside wrapped settings should warn as deprecated"
+        );
     }
 
     #[test]
     fn settings_root_flat_siblings_precede_top_level_siblings() {
-        let update = parse_client_configuration(serde_json::json!({
+        let payload = serde_json::json!({
             "settings": {
                 "kakehashi": {},
                 "autoInstall": false
             },
             "autoInstall": true
-        }))
-        .expect("conflicting mixed settings should parse");
+        });
+        let update = parse_client_configuration(payload.clone())
+            .expect("conflicting mixed settings should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert!(update.warnings.is_empty());
+        assert!(
+            normalize_kakehashi_settings(payload).uses_deprecated_unwrapped_shape,
+            "accepted conflicting flat siblings beside wrapped settings should warn as deprecated"
+        );
     }
 
     #[test]
