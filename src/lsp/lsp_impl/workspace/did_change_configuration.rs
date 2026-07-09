@@ -28,6 +28,16 @@ impl Kakehashi {
                 .await;
         }
 
+        if normalized.uses_deprecated_unwrapped_shape
+            && self
+                .settings_manager
+                .claim_unwrapped_didchange_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE)
+                .await;
+        }
+
         let parsed = match parse_normalized_client_configuration(normalized) {
             Ok(update) => update,
             Err(err) => {
@@ -91,6 +101,7 @@ struct ClientConfigurationUpdate {
 struct NormalizedClientConfiguration {
     raw_value: serde_json::Value,
     warnings: Vec<String>,
+    uses_deprecated_unwrapped_shape: bool,
 }
 
 #[cfg(test)]
@@ -134,6 +145,7 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
             return NormalizedClientConfiguration {
                 raw_value,
                 warnings,
+                uses_deprecated_unwrapped_shape: true,
             };
         }
 
@@ -150,6 +162,7 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
         return NormalizedClientConfiguration {
             raw_value,
             warnings,
+            uses_deprecated_unwrapped_shape: has_signal,
         };
     };
 
@@ -174,6 +187,7 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
         NormalizedClientConfiguration {
             raw_value,
             warnings: Vec::new(),
+            uses_deprecated_unwrapped_shape: false,
         }
     } else {
         NormalizedClientConfiguration {
@@ -182,6 +196,7 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
                 "Ignored unknown client configuration key(s): {}",
                 warnings.join(", ")
             )],
+            uses_deprecated_unwrapped_shape: false,
         }
     }
 }
@@ -400,6 +415,18 @@ mod tests {
             update.warnings,
             vec!["Ignored unknown client configuration key(s): editorSetting"]
         );
+
+        let normalized = normalize_kakehashi_settings(serde_json::json!({
+            "settings": {
+                "kakehashi": {
+                    "autoInstall": false
+                }
+            }
+        }));
+        assert!(
+            !normalized.uses_deprecated_unwrapped_shape,
+            "canonical settings.kakehashi payloads must not warn as deprecated"
+        );
     }
 
     #[test]
@@ -485,19 +512,34 @@ mod tests {
             update.warnings,
             vec!["Ignored unknown client configuration key(s): autoInstal"]
         );
+
+        let normalized = normalize_kakehashi_settings(serde_json::json!({
+            "autoInstal": false
+        }));
+        assert!(
+            normalized.uses_deprecated_unwrapped_shape,
+            "typo-like flat didChange payloads should still surface the flat-shape deprecation"
+        );
     }
 
     #[test]
     fn parses_settings_root_known_keys() {
-        let update = parse_client_configuration(serde_json::json!({
+        let payload = serde_json::json!({
             "settings": {
                 "autoInstall": false
             }
-        }))
-        .expect("settings-root payload should parse");
+        });
+        let update = parse_client_configuration(payload.clone())
+            .expect("settings-root payload should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert!(update.warnings.is_empty());
+
+        let normalized = normalize_kakehashi_settings(payload);
+        assert!(
+            normalized.uses_deprecated_unwrapped_shape,
+            "settings-root flat didChange payloads should be accepted but deprecated"
+        );
     }
 
     #[test]
@@ -547,6 +589,27 @@ mod tests {
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn unrelated_settings_do_not_trigger_flat_shape_deprecation() {
+        let normalized = normalize_kakehashi_settings(serde_json::json!({
+            "settings": {
+                "gopls": {
+                    "usePlaceholders": true
+                }
+            }
+        }));
+
+        assert!(
+            !normalized.uses_deprecated_unwrapped_shape,
+            "unrelated editor/server settings must not claim the flat-shape deprecation slot"
+        );
+        assert!(raw_workspace_settings_is_empty(
+            &parse_normalized_client_configuration(normalized)
+                .expect("unrelated settings should parse as an empty update")
+                .settings
+        ));
     }
 
     #[test]
