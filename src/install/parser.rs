@@ -820,7 +820,7 @@ fn parser_source_dir(
     location: Option<&str>,
 ) -> Result<PathBuf, ParserInstallError> {
     let Some(location) = location else {
-        return Ok(clone_dir.to_path_buf());
+        return Ok(clone_dir.canonicalize()?);
     };
     if location.is_empty()
         || Path::new(location)
@@ -833,7 +833,16 @@ fn parser_source_dir(
         )));
     }
 
-    Ok(clone_dir.join(location))
+    let clone_dir = clone_dir.canonicalize()?;
+    let source_dir = clone_dir.join(location).canonicalize()?;
+    if !source_dir.starts_with(&clone_dir) {
+        return Err(invalid_metadata(format!(
+            "unsafe parser location '{}'",
+            location.escape_default()
+        )));
+    }
+
+    Ok(source_dir)
 }
 
 fn invalid_metadata(message: String) -> ParserInstallError {
@@ -928,14 +937,38 @@ mod tests {
     #[test]
     fn parser_source_dir_accepts_safe_relative_location() {
         let temp = tempdir().expect("temp dir");
+        fs::create_dir_all(temp.path().join("typescript/common")).expect("create location");
         assert_eq!(
             parser_source_dir(temp.path(), Some("typescript/common")).expect("safe location"),
-            temp.path().join("typescript/common")
+            temp.path()
+                .join("typescript/common")
+                .canonicalize()
+                .unwrap()
         );
         assert_eq!(
             parser_source_dir(temp.path(), None).expect("missing location uses clone dir"),
-            temp.path()
+            temp.path().canonicalize().unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_source_dir_rejects_symlink_location_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let clone_dir = temp.path().join("clone");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&clone_dir).expect("create clone dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        symlink(&outside, clone_dir.join("grammar")).expect("create symlink");
+
+        match parser_source_dir(&clone_dir, Some("grammar")) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
     }
 
     #[test]
