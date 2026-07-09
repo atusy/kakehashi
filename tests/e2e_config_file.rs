@@ -90,7 +90,7 @@ fn contains_unknown_config_key_warning(params: &Value, key: &str) -> bool {
     params["message"].as_str().is_some_and(|m| {
         params["type"].as_i64() == Some(2)
             && m.contains("unknown")
-            && m.contains(key)
+            && m.contains(&format!("`{key}`"))
             && m.contains("workspace/didChangeConfiguration")
     })
 }
@@ -630,6 +630,93 @@ fn test_did_change_configuration_ignores_unrelated_section_siblings() {
         "unrelated section siblings should not block kakehashi section updates",
     );
     assert_eq!(settings["autoInstall"], json!(true));
+}
+
+/// didChangeConfiguration ignores unrelated flat settings while applying kakehashi keys.
+#[test]
+fn test_did_change_configuration_filters_unrelated_flat_settings() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "autoInstall": true,
+                "gopls": {
+                    "staticcheck": true
+                },
+                "editor": {
+                    "tabSize": 2
+                }
+            }
+        }),
+    );
+
+    let settings = poll_effective_settings(
+        &mut client,
+        |s| s["autoInstall"] == json!(true),
+        "unrelated flat settings should not block kakehashi updates",
+    );
+    assert_eq!(settings["autoInstall"], json!(true));
+}
+
+/// didChangeConfiguration ignores unrelated flat settings without reporting success.
+#[test]
+fn test_did_change_configuration_skips_unrelated_flat_settings() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "gopls": {
+                    "staticcheck": true
+                },
+                "editor": {
+                    "tabSize": 2
+                }
+            }
+        }),
+    );
+
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "unrelated flat settings must not log success; got: {unexpected_success:?}"
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(false),
+        "unrelated flat settings should leave kakehashi settings unchanged"
+    );
 }
 
 /// didChangeConfiguration does not report success for empty kakehashi sections.
