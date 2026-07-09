@@ -857,14 +857,14 @@ fn parser_source_dir(
 fn reject_symlinks_under(path: &Path) -> Result<(), ParserInstallError> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
             return Err(invalid_metadata(format!(
                 "unsafe symlink in parser source '{}'",
                 entry.path().display()
             )));
         }
-        if metadata.is_dir() {
+        if file_type.is_dir() {
             reject_symlinks_under(&entry.path())?;
         }
     }
