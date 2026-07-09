@@ -742,8 +742,10 @@ fn kill_process_group(child: &mut std::process::Child) {
 
 /// Clone a git repository at a specific revision.
 fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
+    validate_git_clone_input(url, revision)?;
+
     // First, clone with depth 1 (we'll fetch the specific revision)
-    let mut clone = git_command(&["clone", "--depth", "1", url], None);
+    let mut clone = git_command(&["clone", "--depth", "1", "--", url], None);
     clone.arg(dest);
     let status = run_with_timeout(clone, GIT_COMMAND_TIMEOUT, "git clone")?;
 
@@ -756,7 +758,10 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
 
     // Fetch the specific revision
     let status = run_with_timeout(
-        git_command(&["fetch", "--depth", "1", "origin", revision], Some(dest)),
+        git_command(
+            &["fetch", "--depth", "1", "origin", "--", revision],
+            Some(dest),
+        ),
         GIT_COMMAND_TIMEOUT,
         "git fetch",
     )?;
@@ -790,6 +795,36 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
     Ok(())
 }
 
+fn validate_git_clone_input(url: &str, revision: &str) -> Result<(), ParserInstallError> {
+    if url.starts_with('-') {
+        return Err(invalid_metadata(format!(
+            "unsafe parser repository URL '{}'",
+            url.escape_default()
+        )));
+    }
+    if !url.starts_with("https://") {
+        return Err(invalid_metadata(format!(
+            "parser repository URL must use https://: '{}'",
+            url.escape_default()
+        )));
+    }
+    if revision.starts_with('-') {
+        return Err(invalid_metadata(format!(
+            "unsafe parser revision '{}'",
+            revision.escape_default()
+        )));
+    }
+
+    Ok(())
+}
+
+fn invalid_metadata(message: String) -> ParserInstallError {
+    ParserInstallError::IoError(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,6 +846,19 @@ mod tests {
         // A traversal-capable name must be rejected before any filesystem or
         // network work — `install_parser` is a public entry point.
         match install_parser("../../evil", &options) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_repo_rejects_option_like_url() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        match clone_repo("--upload-pack=sh", "main", &dest) {
             Err(ParserInstallError::IoError(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
             }
