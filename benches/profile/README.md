@@ -18,6 +18,14 @@ benches/profile/profile.sh --lang rust --size 150 --requests 150
 # -> $TMPDIR/kakehashi-profile/flamegraph.svg  (+ a top-functions report on stdout)
 ```
 
+With full Xcode installed, Instruments' Time Profiler can also be used from the
+CLI:
+
+```sh
+benches/profile/xctrace.sh --lang markdown --size 150 --requests 160 --edits 1
+# -> $TMPDIR/kakehashi-xctrace/semantic-time.trace (+ a target-only summary)
+```
+
 The harness drives the server against `deps/test/kakehashi` for parsers/queries.
 If that dir has no installed parsers, the server auto-installs on the first
 request (slow, needs network) and the profile is dominated by install work —
@@ -34,6 +42,10 @@ suite (or `make deps/tree-sitter`) once populates it.
 - **Profile the server, driven by Python.** The semantic-tokens code is
   `pub(crate)`, so it can't be called from a bench/example. samply launches the
   driver and follows its child (the server), capturing the server's stacks.
+- **Record all processes for xctrace.** `xctrace record --launch` follows only
+  the Python driver here, not the child server, so `xctrace.sh` records all
+  processes for a bounded window and filters the export down to
+  `target/profiling/kakehashi`.
 - **Symbolicate offline.** samply only symbolicates when serving a profile in the
   browser; the saved JSON keeps raw module-relative addresses. `analyze.py`
   resolves the kakehashi frames with `atos` against the `.dSYM` (built by the
@@ -50,6 +62,7 @@ the kakehashi/tree-sitter/regex frames for the actual CPU cost.
 | file | role |
 | ---- | ---- |
 | `profile.sh` | end-to-end: build → dSYM → samply record → analyze → SVG |
+| `xctrace.sh` | end-to-end: build → Instruments Time Profiler → XML summary |
 | `drive.py` | synchronous LSP driver (no request coalescing) |
 | `gen_session.py` | document generators + a framed-session emitter |
 | `analyze.py` | atos symbolication, self/inclusive report, collapsed stacks |
