@@ -615,20 +615,19 @@ fn unpack_entry_atomically<R: Read>(
             relative.display()
         ))
     })?;
-    let temp_file = tempfile::Builder::new()
+    let temp_path = tempfile::Builder::new()
         .prefix(".kakehashi-extract-")
-        .tempfile_in(parent)?;
-    let temp_path = temp_file.path().to_path_buf();
+        .tempfile_in(parent)?
+        .into_temp_path();
 
     if let Err(error) = entry.unpack(&temp_path) {
-        let _ = fs::remove_file(&temp_path);
         return Err(archive_io_error(
             &format!("Failed to extract {}", relative.display()),
             error,
         ));
     }
 
-    temp_file.persist(target).map_err(|error| {
+    temp_path.persist(target).map_err(|error| {
         ParserInstallError::ArchiveError(format!(
             "Failed to move extracted {} into place: {}",
             relative.display(),
