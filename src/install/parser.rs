@@ -867,11 +867,12 @@ fn parser_source_dir(
 }
 
 fn reject_symlinks_under(path: &Path) -> Result<(), ParserInstallError> {
-    let mut pending = vec![path.to_path_buf()];
+    let root = path.to_path_buf();
+    let mut pending = vec![root.clone()];
     while let Some(dir) = pending.pop() {
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
-            if entry.file_name() == ".git" {
+            if dir == root && entry.file_name() == ".git" {
                 continue;
             }
             let file_type = entry.file_type()?;
@@ -1095,6 +1096,26 @@ mod tests {
         symlink(&outside, source_dir.join(".git/objects/link")).expect("create git symlink");
 
         reject_symlinks_under(&source_dir).expect(".git contents are not parser source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_symlinks_under_rejects_nested_dot_git_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let source_dir = temp.path().join("grammar");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(source_dir.join("src")).expect("create source src dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        symlink(&outside, source_dir.join("src/.git")).expect("create nested .git symlink");
+
+        match reject_symlinks_under(&source_dir) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
     }
 
     #[test]
