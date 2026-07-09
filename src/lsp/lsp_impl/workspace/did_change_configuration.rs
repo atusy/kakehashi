@@ -263,11 +263,59 @@ fn should_warn_unknown_key(key: &str, value: &serde_json::Value) -> bool {
         && key != "settings"
         && key != "kakehashi"
         && !key.contains('.')
-        && (!value.is_object() || key.chars().any(|ch| ch.is_ascii_uppercase()))
+        && (!value.is_object()
+            || key.chars().any(|ch| ch.is_ascii_uppercase())
+            || is_one_edit_from_known_configuration_key(key))
 }
 
 fn is_known_configuration_key(key: &str) -> bool {
     known_configuration_keys().contains(key)
+}
+
+fn is_one_edit_from_known_configuration_key(key: &str) -> bool {
+    known_configuration_keys()
+        .iter()
+        .any(|known| is_one_edit_apart(key, known))
+}
+
+fn is_one_edit_apart(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let len_diff = left.len().abs_diff(right.len());
+    if len_diff > 1 {
+        return false;
+    }
+
+    if len_diff == 0 {
+        return left
+            .iter()
+            .zip(right.iter())
+            .filter(|(left, right)| left != right)
+            .count()
+            == 1;
+    }
+
+    let (shorter, longer) = if left.len() < right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let mut short_index = 0;
+    let mut long_index = 0;
+    let mut edits = 0;
+    while short_index < shorter.len() && long_index < longer.len() {
+        if shorter[short_index] == longer[long_index] {
+            short_index += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+        }
+        long_index += 1;
+    }
+
+    true
 }
 
 fn known_configuration_keys() -> &'static HashSet<String> {
@@ -472,6 +520,20 @@ mod tests {
         assert_eq!(
             update.warnings,
             vec!["Ignored unknown client configuration key(s): languageServerss"]
+        );
+    }
+
+    #[test]
+    fn warns_about_lowercase_object_typos_near_known_keys() {
+        let update = parse_client_configuration(serde_json::json!({
+            "languagess": {}
+        }))
+        .expect("lowercase object-valued config typo should still parse");
+
+        assert!(raw_workspace_settings_is_empty(&update.settings));
+        assert_eq!(
+            update.warnings,
+            vec!["Ignored unknown client configuration key(s): languagess"]
         );
     }
 
