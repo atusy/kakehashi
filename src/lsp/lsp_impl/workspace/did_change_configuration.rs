@@ -147,11 +147,11 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
     let mut raw_value = inner.clone();
     let mut uses_deprecated_unwrapped_shape = false;
 
-    if let Some(raw_object) = raw_value.as_object_mut() {
-        if let Some(root_object) = value.as_object() {
-            uses_deprecated_unwrapped_shape |=
-                merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
-        }
+    if let Some(raw_object) = raw_value.as_object_mut()
+        && let Some(root_object) = value.as_object()
+    {
+        uses_deprecated_unwrapped_shape |=
+            merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
     }
 
     warnings.extend(ignored_keys(&raw_value));
