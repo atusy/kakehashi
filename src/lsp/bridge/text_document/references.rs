@@ -87,7 +87,7 @@ impl LanguageServerPool {
                 )
             },
         )
-        .await
+        .await?
     }
 }
 
@@ -101,29 +101,33 @@ fn transform_references_response_to_host(
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
-) -> Option<Vec<Location>> {
+) -> io::Result<Option<Vec<Location>>> {
     if response_has_jsonrpc_error(&response, "textDocument/references") {
-        return None;
+        return Ok(None);
     }
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
         log::warn!(
             target: "kakehashi::bridge",
             "textDocument/references response carries neither result nor error (protocol violation)"
         );
-        return None;
+        return Err(io::Error::other(
+            "textDocument/references response carries neither result nor error (protocol violation)",
+        ));
     };
     if result.is_null() {
-        return None;
+        return Ok(None);
     }
 
     // The LSP spec defines ReferenceResponse as: Location[] | null
     // References only returns arrays of Location (simpler than goto endpoints)
 
     if result.is_array() {
-        let arr = result.as_array()?;
+        let arr = result
+            .as_array()
+            .expect("result.is_array() was checked above");
         if arr.is_empty() {
             // Preserve empty arrays (semantic: "searched, found nothing")
-            return Some(vec![]);
+            return Ok(Some(vec![]));
         }
 
         // Location[] → transform each location
@@ -137,14 +141,16 @@ fn transform_references_response_to_host(
                     .collect();
 
                 // Preserve empty array after filtering
-                return Some(transformed);
+                return Ok(Some(transformed));
             }
             Err(err) => {
                 log::warn!(
                     target: "kakehashi::bridge",
                     "references response did not match Location[]: {err}"
                 );
-                return None;
+                return Err(io::Error::other(format!(
+                    "malformed textDocument/references result from downstream server: {err}"
+                )));
             }
         }
     }
@@ -153,7 +159,9 @@ fn transform_references_response_to_host(
         target: "kakehashi::bridge",
         "references response did not match Location[]"
     );
-    None
+    Err(io::Error::other(
+        "malformed textDocument/references result from downstream server",
+    ))
 }
 
 #[cfg(test)]
@@ -254,7 +262,7 @@ mod tests {
             &RegionOffset::new(5, 0),
         );
 
-        assert!(transformed.is_none());
+        assert!(transformed.unwrap().is_none());
     }
 
     #[test]
@@ -272,7 +280,7 @@ mod tests {
                 &RegionOffset::new(5, 0),
             );
 
-            assert!(transformed.is_none());
+            assert!(transformed.is_err());
         });
 
         assert!(
@@ -302,7 +310,7 @@ mod tests {
                 &RegionOffset::new(5, 0),
             );
 
-            assert!(transformed.is_none());
+            assert!(transformed.is_err());
         });
 
         assert!(
@@ -334,7 +342,7 @@ mod tests {
                 &RegionOffset::new(5, 0),
             );
 
-            assert!(transformed.is_none());
+            assert!(transformed.is_err());
         });
 
         assert!(
@@ -362,8 +370,7 @@ mod tests {
             &RegionOffset::new(5, 0),
         );
 
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert!(
             locations.is_empty(),
             "Should preserve empty array from server"
@@ -396,8 +403,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].uri, host_uri);
         assert_eq!(locations[0].range.start.line, 12); // 2 + 10
@@ -433,8 +439,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].uri.as_str(), real_file_uri);
         assert_eq!(locations[0].range.start.line, 10); // Unchanged
@@ -468,8 +473,7 @@ mod tests {
         );
 
         // Should filter out cross-region virtual URI, resulting in empty array
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert!(
             locations.is_empty(),
             "Should have empty array after filtering"
@@ -518,8 +522,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert_eq!(locations.len(), 2); // Cross-region filtered out
         assert_eq!(locations[0].uri, host_uri);
         assert_eq!(locations[0].range.start.line, 3); // Transformed: 0 + 3
