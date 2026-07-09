@@ -224,6 +224,15 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
     false
 }
 
+fn is_empty_host_layer_value(request_method: &str, value: &serde_json::Value) -> bool {
+    if request_method == "textDocument/rename" && value.is_object() {
+        return serde_json::from_value::<WorkspaceEdit>(value.clone())
+            .map(|edit| !workspace_edit_has_effect(&edit))
+            .unwrap_or(false);
+    }
+    is_empty_layer_value(value)
+}
+
 /// Race the virt, host, and native layer futures **concurrently** and decide
 /// by the resolved layer `priorities` (cross-layer-aggregation, `preferred`
 /// semantics) — the layer-level analogue of the stage-1 `preferred` fan-in:
@@ -937,7 +946,7 @@ impl Kakehashi {
                         .await
                 }
             },
-            |opt| matches!(opt, Some(v) if !is_empty_layer_value(v)),
+            |opt| matches!(opt, Some(v) if !is_empty_host_layer_value(request_method, v)),
             cancel_rx,
         )
         .await;
@@ -1686,6 +1695,48 @@ mod tests {
                 "newUri": "file:///new.md"
             }]
         })));
+    }
+
+    #[test]
+    fn host_layer_rename_treats_bare_empty_workspace_edit_as_empty() {
+        assert!(is_empty_host_layer_value(
+            "textDocument/rename",
+            &serde_json::json!({})
+        ));
+        assert!(is_empty_host_layer_value(
+            "textDocument/rename",
+            &serde_json::json!({
+                "changeAnnotations": {
+                    "rename": { "label": "rename symbol" }
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn host_layer_non_rename_keeps_bare_object_as_result() {
+        assert!(!is_empty_host_layer_value(
+            "textDocument/hover",
+            &serde_json::json!({})
+        ));
+    }
+
+    #[test]
+    fn host_layer_rename_treats_workspace_edit_with_effect_as_result() {
+        assert!(!is_empty_host_layer_value(
+            "textDocument/rename",
+            &serde_json::json!({
+                "changes": {
+                    "file:///test.md": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 1 }
+                        },
+                        "newText": "x"
+                    }]
+                }
+            })
+        ));
     }
 
     #[test]
