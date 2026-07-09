@@ -160,8 +160,8 @@ struct Report {
     /// Whether any printed diagnostic should fail the run (an error, or a
     /// warning under `--fail-on-warning`).
     failure: bool,
-    /// Whether any operational error occurred (unreadable file, server
-    /// failure, un-openable path).
+    /// Whether any operational error occurred (unreadable file, path
+    /// open/enumeration failure, server failure).
     operational_error: bool,
 }
 
