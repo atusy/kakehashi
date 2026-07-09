@@ -35,20 +35,21 @@ impl CommandOriginRegistry {
     /// genuinely-new names are returned, though: the command NAME is already
     /// registered with the editor, so re-advertising it would be a duplicate
     /// registration.
-    pub(crate) fn register(&self, key: &ConnectionKey, commands: &[String]) -> Vec<String> {
+    pub(crate) fn register(&self, key: &ConnectionKey, commands: Vec<String>) -> Vec<String> {
         let mut origins = self
             .origins
             .lock()
             .recover_poison("CommandOriginRegistry::register");
         let mut added = Vec::new();
         for command in commands {
-            if let Some(existing) = origins.get_mut(command) {
+            if let Some(existing) = origins.get_mut(&command) {
                 // Re-point routing to the current owner; don't re-advertise (and
                 // don't clone the key string — the entry already exists).
                 *existing = key.clone();
             } else {
+                // Clone only for the map key; move the name itself into `added`.
                 origins.insert(command.clone(), key.clone());
-                added.push(command.clone());
+                added.push(command);
             }
         }
         added
@@ -75,7 +76,10 @@ mod tests {
         let ruff_b = ConnectionKey::new("ruff", Some("/w/b".to_string()));
 
         assert_eq!(
-            reg.register(&ruff_a, &["ruff.fix".to_string(), "ruff.sort".to_string()]),
+            reg.register(
+                &ruff_a,
+                vec!["ruff.fix".to_string(), "ruff.sort".to_string()]
+            ),
             vec!["ruff.fix".to_string(), "ruff.sort".to_string()]
         );
         assert_eq!(reg.route("ruff.fix").as_ref(), Some(&ruff_a));
@@ -83,7 +87,10 @@ mod tests {
         // A respawn under a DIFFERENT root re-advertises nothing new (the name is
         // already registered with the editor) but RE-POINTS routing to the live
         // connection, so a palette command reaches the current process.
-        assert!(reg.register(&ruff_b, &["ruff.fix".to_string()]).is_empty());
+        assert!(
+            reg.register(&ruff_b, vec!["ruff.fix".to_string()])
+                .is_empty()
+        );
         assert_eq!(
             reg.route("ruff.fix").as_ref(),
             Some(&ruff_b),

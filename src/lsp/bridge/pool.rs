@@ -1712,7 +1712,7 @@ impl LanguageServerPool {
                     // the whole session, so a respawn / second root re-registers
                     // nothing new.
                     if let Some(commands) = palette_commands {
-                        let added = command_origins.register(&command_registration_key, &commands);
+                        let added = command_origins.register(&command_registration_key, commands);
                         // Advertise the NEWLY-added names upstream so the editor's
                         // palette lists them. Fire-and-forget; skipped when the
                         // client can't accept a dynamic registration.
