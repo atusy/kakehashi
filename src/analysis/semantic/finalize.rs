@@ -69,7 +69,9 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
             let current_line_width = utf16_width(lines[current_line]);
             let per_line_len = remaining.min(current_line_width.saturating_sub(start_col));
 
-            result.push(token.with_span(current_line, start_col, per_line_len));
+            if per_line_len > 0 {
+                result.push(token.with_span(current_line, start_col, per_line_len));
+            }
 
             // Subtract per_line_len + 1 (the +1 accounts for the newline between lines)
             remaining = remaining.saturating_sub(per_line_len + 1);
@@ -1161,9 +1163,9 @@ mod tests {
         let tokens = vec![make_token(0, 0, 6, "string", 0, 0)];
         let result = extract_split(tokens, lines);
         // line 0: min(6, 3-0)=3, remaining=6-3-1=2
-        // line 1: min(2, 0-0)=0, remaining=2-0-1=1
+        // line 1: min(2, 0-0)=0, skipped, remaining=2-0-1=1
         // line 2: min(1, 2-0)=1, remaining=1-1-1=0 (saturating)
-        assert_eq!(result, vec![(0, 0, 3), (1, 0, 0), (2, 0, 1)]);
+        assert_eq!(result, vec![(0, 0, 3), (2, 0, 1)]);
     }
 
     #[test]
