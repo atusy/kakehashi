@@ -317,11 +317,15 @@ impl BridgeCoordinator {
     /// (whose doc tracker was purged) doesn't compute against missing document
     /// state. Unlike the request path, executeCommand has no
     /// `ensure_document_opened` step; unlike [`Self::eager_spawn_and_open_documents`]
-    /// (fire-and-forget), this is AWAITED so the `didOpen` is enqueued on the
-    /// shared single-writer connection BEFORE the caller sends the command
-    /// (FIFO → didOpen first). A no-op when the docs are already open
-    /// (idempotent claim), and when no injection maps to `server_name`
-    /// (e.g. a host-layer command — host-layer sync is a separate follow-up).
+    /// (fire-and-forget), this is AWAITED so that, WHEN a `didOpen` is enqueued,
+    /// it lands on the shared single-writer connection before the caller sends
+    /// the command (FIFO → didOpen first). The open is best-effort:
+    /// `eager_open_virtual_documents` may skip or return early (downstream not
+    /// ready, outbound queue full), in which case no `didOpen` is queued and the
+    /// command simply proceeds without it (handled fail-soft by dispatch). A
+    /// no-op when the docs are already open (idempotent claim), and when no
+    /// injection maps to `server_name` (e.g. a host-layer command — host-layer
+    /// sync is a separate follow-up).
     ///
     /// This heals MISSING document state (a purged tracker), not stale content —
     /// it never sends `didChange` (that is the edit path's job). And it is
@@ -367,10 +371,19 @@ impl BridgeCoordinator {
         server_name: &str,
     ) -> (Vec<BridgeInjection>, Option<Arc<BridgeServerConfig>>) {
         let mut config: Option<Arc<BridgeServerConfig>> = None;
+        // Injections commonly share an injection language (many fences of the
+        // same kind), so memoize the per-language resolution: `get_all_configs_
+        // for_language` scans/merges/sorts server configs, and this runs on the
+        // user-facing executeCommand path. Cache whether `server_name` bridges
+        // each language once, folding its config in on the first match.
+        let mut matched_by_language: HashMap<String, bool> = HashMap::new();
         let for_server = injections
             .into_iter()
             .filter(|inj| {
-                match self
+                if let Some(&matched) = matched_by_language.get(&inj.language) {
+                    return matched;
+                }
+                let matched = match self
                     .get_all_configs_for_language(settings, host_language, &inj.language)
                     .into_iter()
                     .find(|r| r.server_name == server_name)
@@ -380,7 +393,9 @@ impl BridgeCoordinator {
                         true
                     }
                     None => false,
-                }
+                };
+                matched_by_language.insert(inj.language.clone(), matched);
+                matched
             })
             .collect();
         (for_server, config)

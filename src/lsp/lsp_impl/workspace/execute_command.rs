@@ -26,10 +26,11 @@ impl Kakehashi {
         // between the codeAction that surfaced the command and this executeCommand
         // purges that connection's doc tracker — and, unlike the request path,
         // executeCommand has no `ensure_document_opened` step. Re-open the origin's
-        // injected docs first (awaited, so the didOpen is enqueued before the
-        // command on the shared connection). Fail-soft: any gap (foreign command,
-        // unparseable host URI, undetectable host language, no matching injection)
-        // just skips the sync and dispatches as before.
+        // injected docs first (awaited, so that WHEN a didOpen is queued it
+        // precedes the command on the shared connection; the open is best-effort
+        // and may queue nothing). Fail-soft: any gap (foreign command, unparseable
+        // host URI, undetectable host language, no matching injection) just skips
+        // the sync and dispatches as before.
         self.sync_origin_documents_before_execute(&params, &settings)
             .await;
 
