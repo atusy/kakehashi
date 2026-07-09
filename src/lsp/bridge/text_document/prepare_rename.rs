@@ -278,6 +278,22 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rename_response_returns_none_for_jsonrpc_error() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": {
+                "code": -32000,
+                "message": "not renameable"
+            }
+        });
+
+        let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(5, 0));
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
     fn prepare_rename_response_errors_on_missing_result_success() {
         let response = json!({"jsonrpc": "2.0", "id": 42});
         let result = transform_prepare_rename_response_to_host(response, &RegionOffset::new(5, 0));
