@@ -10,7 +10,7 @@
 mod helpers;
 
 use helpers::lsp_client::LspClient;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -78,6 +78,25 @@ fn poll_effective_settings(
     let settings = query_effective_settings(client);
     assert!(predicate(&settings), "{}", msg);
     settings
+}
+
+fn is_config_updated(params: &Value) -> bool {
+    params["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("Configuration updated"))
+}
+
+fn contains_unknown_config_key_warning(params: &Value, key: &str) -> bool {
+    params["message"].as_str().is_some_and(|m| {
+        params["type"].as_i64() == Some(2)
+            && m.contains("unknown")
+            && m.contains(&format!("`{key}`"))
+            && m.contains("workspace/didChangeConfiguration")
+    })
+}
+
+fn is_unknown_config_key_warning(params: &Value) -> bool {
+    contains_unknown_config_key_warning(params, "autoInstal")
 }
 
 /// --config-file with a single valid file overrides default config locations.
@@ -374,6 +393,532 @@ fn test_did_change_configuration_updates_auto_install() {
         "didChangeConfiguration should update autoInstall to true",
     );
     assert_eq!(settings["autoInstall"], json!(true));
+}
+
+/// didChangeConfiguration accepts section-wrapped kakehashi settings.
+#[test]
+fn test_did_change_configuration_accepts_kakehashi_section() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "kakehashi": { "autoInstall": true } } }),
+    );
+
+    let settings = poll_effective_settings(
+        &mut client,
+        |s| s["autoInstall"] == json!(true),
+        "didChangeConfiguration should accept kakehashi section-wrapped settings",
+    );
+    assert_eq!(settings["autoInstall"], json!(true));
+}
+
+/// didChangeConfiguration warns on unknown keys instead of reporting success.
+#[test]
+fn test_did_change_configuration_warns_on_unknown_keys() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "autoInstal": true } }),
+    );
+
+    let (method, params) = client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(5), |params| {
+            is_unknown_config_key_warning(params) || is_config_updated(params)
+        })
+        .expect("didChangeConfiguration should log a warning or success");
+    assert_eq!(method, "window/logMessage");
+    assert!(
+        is_unknown_config_key_warning(&params),
+        "unknown key should warn instead of reporting success; got: {params:?}"
+    );
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "unknown-key-only update must not also log success; got: {unexpected_success:?}"
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(false),
+        "unknown-key-only update should leave settings unchanged"
+    );
+}
+
+/// didChangeConfiguration warns and does not apply mixed section/root payloads.
+#[test]
+fn test_did_change_configuration_warns_on_section_sibling_keys() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "kakehashi": {
+                    "autoInstall": true
+                },
+                "autoInstal": false
+            }
+        }),
+    );
+
+    let (method, params) = client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(5), |params| {
+            is_unknown_config_key_warning(params) || is_config_updated(params)
+        })
+        .expect("didChangeConfiguration should log a section-sibling warning or success");
+    assert_eq!(method, "window/logMessage");
+    assert!(
+        is_unknown_config_key_warning(&params),
+        "section sibling key should warn instead of reporting success; got: {params:?}"
+    );
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "section-sibling update must not also log success; got: {unexpected_success:?}"
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(false),
+        "section-sibling update should leave settings unchanged"
+    );
+}
+
+/// didChangeConfiguration reports valid kakehashi sibling keys as mixed format.
+#[test]
+fn test_did_change_configuration_warns_on_valid_section_sibling_keys() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "kakehashi": {
+                    "autoInstall": true
+                },
+                "autoInstall": false
+            }
+        }),
+    );
+
+    let (method, params) = client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(5), |params| {
+            contains_unknown_config_key_warning(params, "autoInstall") || is_config_updated(params)
+        })
+        .expect("didChangeConfiguration should log a mixed-format warning or success");
+    assert_eq!(method, "window/logMessage");
+    assert!(
+        contains_unknown_config_key_warning(&params, "autoInstall"),
+        "mixed-format sibling key should warn instead of reporting success; got: {params:?}"
+    );
+    assert!(
+        params["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("mixed-format")),
+        "known sibling key should be described as mixed-format; got: {params:?}"
+    );
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "mixed-format update must not also log success; got: {unexpected_success:?}"
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(false),
+        "mixed-format update should leave settings unchanged"
+    );
+}
+
+/// didChangeConfiguration ignores unrelated editor settings beside kakehashi.
+#[test]
+fn test_did_change_configuration_ignores_unrelated_section_siblings() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "kakehashi": {
+                    "autoInstall": true
+                },
+                "editor": {
+                    "tabSize": 2
+                },
+                "files": {
+                    "trimTrailingWhitespace": true
+                }
+            }
+        }),
+    );
+
+    let settings = poll_effective_settings(
+        &mut client,
+        |s| s["autoInstall"] == json!(true),
+        "unrelated section siblings should not block kakehashi section updates",
+    );
+    assert_eq!(settings["autoInstall"], json!(true));
+}
+
+/// didChangeConfiguration ignores unrelated flat settings while applying kakehashi keys.
+#[test]
+fn test_did_change_configuration_filters_unrelated_flat_settings() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "autoInstall": true,
+                "gopls": {
+                    "staticcheck": true
+                },
+                "editor": {
+                    "tabSize": 2
+                }
+            }
+        }),
+    );
+
+    let settings = poll_effective_settings(
+        &mut client,
+        |s| s["autoInstall"] == json!(true),
+        "unrelated flat settings should not block kakehashi updates",
+    );
+    assert_eq!(settings["autoInstall"], json!(true));
+}
+
+/// didChangeConfiguration ignores unrelated flat settings without reporting success.
+#[test]
+fn test_did_change_configuration_skips_unrelated_flat_settings() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "gopls": {
+                    "staticcheck": true
+                },
+                "editor": {
+                    "tabSize": 2
+                }
+            }
+        }),
+    );
+
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "unrelated flat settings must not log success; got: {unexpected_success:?}"
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(false),
+        "unrelated flat settings should leave kakehashi settings unchanged"
+    );
+}
+
+/// didChangeConfiguration does not report success for empty kakehashi sections.
+#[test]
+fn test_did_change_configuration_skips_empty_kakehashi_section() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = false\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(false), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "kakehashi": {},
+                "editor": {
+                    "tabSize": 2
+                }
+            }
+        }),
+    );
+
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "empty kakehashi section must not log success; got: {unexpected_success:?}"
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(false),
+        "empty kakehashi section should leave settings unchanged"
+    );
+}
+
+/// didChangeConfiguration warns and does not apply nested languageServers typos.
+#[test]
+fn test_did_change_configuration_warns_on_nested_unknown_keys() {
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert!(settings["languageServers"].get("pyright").is_none());
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languageServers": {
+                    "pyright": {
+                        "cmd": ["pyright-langserver", "--stdio"],
+                        "languages": ["python"],
+                        "rootMarker": [".git"]
+                    }
+                }
+            }
+        }),
+    );
+
+    let (method, params) = client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(5), |params| {
+            contains_unknown_config_key_warning(params, "languageServers.pyright.rootMarker")
+                || is_config_updated(params)
+        })
+        .expect("didChangeConfiguration should log a nested-key warning or success");
+    assert_eq!(method, "window/logMessage");
+    assert!(
+        contains_unknown_config_key_warning(&params, "languageServers.pyright.rootMarker"),
+        "nested unknown key should warn instead of reporting success; got: {params:?}"
+    );
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "nested unknown-key update must not also log success; got: {unexpected_success:?}"
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert!(
+        settings["languageServers"].get("pyright").is_none(),
+        "nested unknown-key update should leave languageServers unchanged"
+    );
+}
+
+/// didChangeConfiguration warns and does not apply nested languages typos.
+#[test]
+fn test_did_change_configuration_warns_on_nested_language_unknown_keys() {
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert!(settings["languages"].get("python").is_none());
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languages": {
+                    "python": {
+                        "parseer": "/tmp/parser.so"
+                    }
+                }
+            }
+        }),
+    );
+
+    let (method, params) = client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(5), |params| {
+            contains_unknown_config_key_warning(params, "languages.python.parseer")
+                || is_config_updated(params)
+        })
+        .expect("didChangeConfiguration should log a nested language-key warning or success");
+    assert_eq!(method, "window/logMessage");
+    assert!(
+        contains_unknown_config_key_warning(&params, "languages.python.parseer"),
+        "nested language unknown key should warn instead of reporting success; got: {params:?}"
+    );
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "nested language unknown-key update must not also log success; got: {unexpected_success:?}"
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert!(
+        settings["languages"].get("python").is_none(),
+        "nested language unknown-key update should leave languages unchanged"
+    );
+}
+
+/// didChangeConfiguration warns and does not apply nested captureMappings typos.
+#[test]
+fn test_did_change_configuration_warns_on_nested_capture_mapping_unknown_keys() {
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let initial_capture_mappings = get_effective_settings(&mut client)["captureMappings"].clone();
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "captureMappings": {
+                    "_": {
+                        "highlight": {
+                            "variable.builtin": "keyword"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    let (method, params) = client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(5), |params| {
+            contains_unknown_config_key_warning(params, "captureMappings._.highlight")
+                || is_config_updated(params)
+        })
+        .expect("didChangeConfiguration should log a nested capture mapping warning or success");
+    assert_eq!(method, "window/logMessage");
+    assert!(
+        contains_unknown_config_key_warning(&params, "captureMappings._.highlight"),
+        "nested capture mapping unknown key should warn instead of reporting success; got: {params:?}"
+    );
+    let unexpected_success = client.wait_for_notification_where(
+        &["window/logMessage"],
+        Duration::from_millis(250),
+        is_config_updated,
+    );
+    assert!(
+        unexpected_success.is_none(),
+        "nested capture mapping unknown-key update must not also log success; got: {unexpected_success:?}"
+    );
+
+    let updated_capture_mappings = query_effective_settings(&mut client)["captureMappings"].clone();
+    assert_eq!(
+        updated_capture_mappings, initial_capture_mappings,
+        "nested capture mapping unknown-key update should leave captureMappings unchanged",
+    );
 }
 
 /// didChangeConfiguration preserves config-file settings not mentioned in the update.

@@ -609,7 +609,7 @@ pub(crate) fn infer_query_kind(path: &str) -> Option<QueryKind> {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RawWorkspaceSettings {
     /// Directories to search for Tree-sitter parser libraries and query files.
@@ -629,12 +629,6 @@ pub struct RawWorkspaceSettings {
     /// Language servers for bridging LSP requests to injection regions.
     /// Map of server name to server configuration.
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
-}
-
-impl RawWorkspaceSettings {
-    pub fn is_effectively_empty(&self) -> bool {
-        self == &Self::default()
-    }
 }
 
 /// Generate JSON Schema for the workspace configuration.

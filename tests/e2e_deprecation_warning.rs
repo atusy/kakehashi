@@ -1,10 +1,12 @@
-//! E2E tests for one-per-session deprecation notices.
+//! E2E tests for the one-per-session `rootMarkers` deprecation notice.
 //!
-//! `rootMarkers` shares a session-scoped guard between `initialize` and
-//! `workspace/didChangeConfiguration`; this drives the observable didChange path
-//! to prove the guard suppresses repeats. The unwrapped didChangeConfiguration
-//! notice is didChange-only, and is covered separately below. The guard and
-//! detectors are also covered in isolation by unit tests.
+//! The notice is surfaced by `initialize` and `workspace/didChangeConfiguration`
+//! sharing a single session-scoped claim guard, so it fires at most once even
+//! when config keeps carrying the deprecated key. This drives it through
+//! didChangeConfiguration (whose notifications, unlike a warning emitted during
+//! the `initialize` request, are observable by the test client) to prove the
+//! warn-path works and the guard suppresses the repeat. The guard and detectors
+//! are also covered in isolation by unit tests.
 
 #![cfg(feature = "e2e")]
 
@@ -45,6 +47,18 @@ fn config_with_root_markers() -> Value {
         "settings": {
             "languageServers": {
                 "x": { "cmd": ["true"], "languages": ["lua"], "rootMarkers": [".git"] }
+            }
+        }
+    })
+}
+
+fn section_wrapped_config_with_root_markers() -> Value {
+    json!({
+        "settings": {
+            "kakehashi": {
+                "languageServers": {
+                    "x": { "cmd": ["true"], "languages": ["lua"], "rootMarkers": [".git"] }
+                }
             }
         }
     })
@@ -134,6 +148,51 @@ fn e2e_root_markers_deprecation_warns_once_across_didchange() {
 }
 
 #[test]
+fn e2e_root_markers_deprecation_warns_for_section_wrapped_didchange() {
+    let config_dir = tempfile::TempDir::new().expect("temp config dir");
+    let config_path = config_dir.path().join("kakehashi.toml");
+    std::fs::write(&config_path, "").expect("write empty config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf-8 temp path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        section_wrapped_config_with_root_markers(),
+    );
+
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage"], TIMEOUT, is_deprecation_notice)
+        .expect("section-wrapped rootMarkers config should surface the deprecation popup");
+    assert_eq!(method, "window/showMessage");
+    assert_eq!(
+        params["type"].as_i64(),
+        Some(2),
+        "deprecation notice should be MessageType::WARNING"
+    );
+    client
+        .wait_for_notification_where(&["window/logMessage"], TIMEOUT, is_config_updated)
+        .expect("section-wrapped rootMarkers config should still be applied successfully");
+
+    let _ = client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
 fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings() {
     let config_dir = tempfile::TempDir::new().expect("temp config dir");
     let config_path = config_dir.path().join("kakehashi.toml");
@@ -156,15 +215,11 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
     );
     client.send_notification("initialized", json!({}));
 
-    // Unrelated editor/server settings are ignored as an empty update and must
-    // not claim the flat-shape deprecation slot.
     client.send_notification(
         "workspace/didChangeConfiguration",
         json!({ "settings": { "gopls": { "usePlaceholders": true } } }),
     );
 
-    // Canonical wrapped settings are applied without the flat-shape
-    // deprecation popup.
     client.send_notification(
         "workspace/didChangeConfiguration",
         wrapped_didchange_config(false),
@@ -184,9 +239,6 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
         "wrapped didChange config should update the effective runtime settings"
     );
 
-    // The first actual flat kakehashi runtime setting still gets the warning,
-    // proving the unrelated payload above did not consume the once-per-session
-    // guard and the wrapped payload above did not warn.
     client.send_notification(
         "workspace/didChangeConfiguration",
         flat_didchange_config(true),
@@ -213,8 +265,6 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
         "flat didChange config should still update the effective runtime settings"
     );
 
-    // A second flat payload is still accepted, but the deprecation popup does
-    // not repeat before the successful update log.
     client.send_notification(
         "workspace/didChangeConfiguration",
         flat_didchange_config(false),
