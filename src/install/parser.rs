@@ -1547,6 +1547,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_and_extract_archive_rejects_hardlink_entry() {
+        let temp = tempdir().expect("temp dir");
+        let archive = malicious_hardlink_archive("parser-1.0.0");
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(
+            &archive_url,
+            "parser",
+            "v1.0.0",
+            &temp.path().join("dest"),
+        );
+
+        match result {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
+                assert!(
+                    message.contains("Link entry rejected in archive: out"),
+                    "expected link-entry rejection, got: {message}"
+                );
+            }
+            other => panic!("expected hardlink UnsafeArchive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn download_and_extract_archive_rejects_traversal_path() {
+        let temp = tempdir().expect("temp dir");
+        let outside = temp.path().join("payload");
+        let archive = malicious_traversal_archive("parser-1.0.0");
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(
+            &archive_url,
+            "parser",
+            "v1.0.0",
+            &temp.path().join("dest"),
+        );
+
+        match result {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
+                assert!(
+                    message.contains("Unsafe path detected in archive: ../payload"),
+                    "expected traversal path rejection, got: {message}"
+                );
+            }
+            other => panic!("expected traversal UnsafeArchive, got {other:?}"),
+        }
+        assert!(
+            !outside.exists(),
+            "archive extraction must not write outside dest"
+        );
+    }
+
     #[cfg(unix)]
     fn malicious_symlink_escape_archive(root: &str, outside: &Path) -> Vec<u8> {
         use flate2::Compression;
@@ -1585,6 +1638,82 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar).expect("compress tar");
         encoder.finish().expect("finish gzip")
+    }
+
+    fn malicious_hardlink_archive(root: &str) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tar::{Builder, EntryType, Header};
+
+        let mut tar = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar);
+
+            let mut link_header = Header::new_gnu();
+            link_header.set_entry_type(EntryType::Link);
+            link_header.set_size(0);
+            link_header.set_mode(0o777);
+            link_header.set_cksum();
+            builder
+                .append_link(&mut link_header, format!("{root}/out"), "/tmp/payload")
+                .expect("append hardlink");
+
+            builder.finish().expect("finish tar");
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).expect("compress tar");
+        encoder.finish().expect("finish gzip")
+    }
+
+    fn malicious_traversal_archive(root: &str) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let mut tar = Vec::new();
+        append_raw_tar_file(&mut tar, &format!("{root}/../payload"), b"escaped");
+        tar.extend_from_slice(&[0; 1024]);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).expect("compress tar");
+        encoder.finish().expect("finish gzip")
+    }
+
+    fn append_raw_tar_file(tar: &mut Vec<u8>, path: &str, contents: &[u8]) {
+        let mut header = [0u8; 512];
+        write_tar_field(&mut header[0..100], path.as_bytes());
+        write_tar_octal(&mut header[100..108], 0o644);
+        write_tar_octal(&mut header[108..116], 0);
+        write_tar_octal(&mut header[116..124], 0);
+        write_tar_octal(&mut header[124..136], contents.len() as u64);
+        write_tar_octal(&mut header[136..148], 0);
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        write_tar_field(&mut header[257..263], b"ustar\0");
+        write_tar_field(&mut header[263..265], b"00");
+
+        let checksum = header.iter().map(|byte| u64::from(*byte)).sum();
+        write_tar_checksum(&mut header[148..156], checksum);
+
+        tar.extend_from_slice(&header);
+        tar.extend_from_slice(contents);
+        let padding = (512 - contents.len() % 512) % 512;
+        tar.extend(std::iter::repeat_n(0, padding));
+    }
+
+    fn write_tar_field(field: &mut [u8], value: &[u8]) {
+        assert!(value.len() <= field.len());
+        field[..value.len()].copy_from_slice(value);
+    }
+
+    fn write_tar_octal(field: &mut [u8], value: u64) {
+        let encoded = format!("{:0width$o}\0", value, width = field.len() - 1);
+        field.copy_from_slice(encoded.as_bytes());
+    }
+
+    fn write_tar_checksum(field: &mut [u8], checksum: u64) {
+        let encoded = format!("{:06o}\0 ", checksum);
+        field.copy_from_slice(encoded.as_bytes());
     }
 
     fn serve_once(body: Vec<u8>) -> String {
