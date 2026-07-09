@@ -167,7 +167,21 @@ impl LanguageServerPool {
                     origin,
                     merge_bridge_server_configs,
                 )?;
-                match self.get_or_create_connection(origin, &config, None).await {
+                // Wait through initialization (bounded by the standard init
+                // budget) rather than take a possibly-`Initializing` handle: the
+                // pool returns an existing not-yet-Ready connection here, whose
+                // `has_capability` check below would then spuriously fail-soft to
+                // `null` even though it would be Ready moments later. Fails soft on
+                // timeout/spawn error like every other branch.
+                match self
+                    .get_or_create_connection_wait_ready(
+                        origin,
+                        &config,
+                        None,
+                        std::time::Duration::from_secs(crate::lsp::bridge::pool::INIT_TIMEOUT_SECS),
+                    )
+                    .await
+                {
                     Ok(handle) => handle,
                     Err(e) => {
                         warn!(
