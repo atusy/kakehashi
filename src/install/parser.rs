@@ -766,10 +766,7 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
 
     // Fetch the specific revision
     let status = run_with_timeout(
-        git_command(
-            &["fetch", "--depth", "1", "origin", "--", revision],
-            Some(dest),
-        ),
+        git_fetch_revision_command(revision, dest),
         GIT_COMMAND_TIMEOUT,
         "git fetch",
     )?;
@@ -801,6 +798,10 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
     }
 
     Ok(())
+}
+
+fn git_fetch_revision_command(revision: &str, dest: &Path) -> Command {
+    git_command(&["fetch", "--depth", "1", "origin", revision], Some(dest))
 }
 
 fn validate_parser_source_metadata(url: &str, revision: &str) -> Result<(), ParserInstallError> {
@@ -958,6 +959,33 @@ mod tests {
                 "-c",
                 "protocol.https.allow=always",
                 "clone",
+            ]
+        );
+    }
+
+    #[test]
+    fn git_fetch_revision_command_uses_revision_as_refspec() {
+        let temp = tempdir().expect("temp dir");
+        let cmd = git_fetch_revision_command("v0.24.8", temp.path());
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "http.followRedirects=false",
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                "v0.24.8",
             ]
         );
     }
