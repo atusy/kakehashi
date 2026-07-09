@@ -517,6 +517,12 @@ fn download_and_extract_archive(
                 safe_relative.display()
             )));
         }
+        if !entry_type.is_dir() && !entry_type.is_file() {
+            return Err(ParserInstallError::UnsafeArchive(format!(
+                "Unsupported entry type rejected in archive: {}",
+                safe_relative.display()
+            )));
+        }
 
         let target = dest.join(&safe_relative);
 
@@ -1600,6 +1606,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_and_extract_archive_rejects_special_entry() {
+        let temp = tempdir().expect("temp dir");
+        let archive = malicious_special_entry_archive("parser-1.0.0");
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(
+            &archive_url,
+            "parser",
+            "v1.0.0",
+            &temp.path().join("dest"),
+        );
+
+        match result {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
+                assert!(
+                    message.contains("Unsupported entry type rejected in archive: pipe"),
+                    "expected unsupported entry rejection, got: {message}"
+                );
+            }
+            other => panic!("expected special-entry UnsafeArchive, got {other:?}"),
+        }
+    }
+
     #[cfg(unix)]
     fn malicious_symlink_escape_archive(root: &str, outside: &Path) -> Vec<u8> {
         use flate2::Compression;
@@ -1679,7 +1709,24 @@ mod tests {
         encoder.finish().expect("finish gzip")
     }
 
+    fn malicious_special_entry_archive(root: &str) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let mut tar = Vec::new();
+        append_raw_tar_entry(&mut tar, &format!("{root}/pipe"), b'6', &[]);
+        tar.extend_from_slice(&[0; 1024]);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).expect("compress tar");
+        encoder.finish().expect("finish gzip")
+    }
+
     fn append_raw_tar_file(tar: &mut Vec<u8>, path: &str, contents: &[u8]) {
+        append_raw_tar_entry(tar, path, b'0', contents);
+    }
+
+    fn append_raw_tar_entry(tar: &mut Vec<u8>, path: &str, entry_type: u8, contents: &[u8]) {
         let mut header = [0u8; 512];
         write_tar_field(&mut header[0..100], path.as_bytes());
         write_tar_octal(&mut header[100..108], 0o644);
@@ -1688,7 +1735,7 @@ mod tests {
         write_tar_octal(&mut header[124..136], contents.len() as u64);
         write_tar_octal(&mut header[136..148], 0);
         header[148..156].fill(b' ');
-        header[156] = b'0';
+        header[156] = entry_type;
         write_tar_field(&mut header[257..263], b"ustar\0");
         write_tar_field(&mut header[263..265], b"00");
 
