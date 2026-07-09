@@ -33,6 +33,10 @@ pub(crate) struct SettingsManager {
     /// about, so the notice is shown at most once per session regardless of
     /// which path (initialize or didChangeConfiguration) first sees it.
     root_markers_deprecation_warned: AtomicBool,
+    /// Latches once an unwrapped runtime `workspace/didChangeConfiguration`
+    /// payload has been warned about. Unlike `rootMarkers`, this applies only to
+    /// client-pushed runtime settings, not initializationOptions or TOML files.
+    unwrapped_didchange_deprecation_warned: AtomicBool,
 }
 
 impl std::fmt::Debug for SettingsManager {
@@ -77,6 +81,7 @@ impl SettingsManager {
             })),
             client_capabilities: OnceLock::new(),
             root_markers_deprecation_warned: AtomicBool::new(false),
+            unwrapped_didchange_deprecation_warned: AtomicBool::new(false),
         }
     }
 
@@ -88,6 +93,14 @@ impl SettingsManager {
     pub(crate) fn claim_root_markers_deprecation_warning(&self) -> bool {
         !self
             .root_markers_deprecation_warned
+            .swap(true, Ordering::Relaxed)
+    }
+
+    /// Claim the one-per-session slot for unwrapped/flat
+    /// `workspace/didChangeConfiguration` payloads.
+    pub(crate) fn claim_unwrapped_didchange_deprecation_warning(&self) -> bool {
+        !self
+            .unwrapped_didchange_deprecation_warned
             .swap(true, Ordering::Relaxed)
     }
 
@@ -655,6 +668,20 @@ mod tests {
             "subsequent claims must not re-warn"
         );
         assert!(!manager.claim_root_markers_deprecation_warning());
+    }
+
+    #[test]
+    fn claim_unwrapped_didchange_deprecation_warning_is_true_exactly_once() {
+        let manager = SettingsManager::new();
+        assert!(
+            manager.claim_unwrapped_didchange_deprecation_warning(),
+            "first flat didChange claim should win the once-per-session slot"
+        );
+        assert!(
+            !manager.claim_unwrapped_didchange_deprecation_warning(),
+            "subsequent flat didChange claims must not re-warn"
+        );
+        assert!(!manager.claim_unwrapped_didchange_deprecation_warning());
     }
 
     /// Parameterized tests for supports_*_link() capability checking.

@@ -431,6 +431,11 @@ impl Kakehashi {
                         ..Default::default()
                     },
                 )),
+                experimental: Some(serde_json::json!({
+                    "kakehashi": {
+                        "wrappedDidChangeConfigurationSettings": true,
+                    },
+                })),
                 ..ServerCapabilities::default()
             },
         })

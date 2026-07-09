@@ -17,6 +17,12 @@ pub(crate) const ROOT_MARKERS_DEPRECATION_NOTICE: &str = "kakehashi: the `rootMa
      `workspaceMarkers`. `rootMarkers` still works for now but may be removed \
      in a future release.";
 
+/// User-facing text for runtime client-pushed configuration that still uses the
+/// old unwrapped/flat `workspace/didChangeConfiguration` shape.
+pub(crate) const UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE: &str = "kakehashi: unwrapped `workspace/didChangeConfiguration` settings are deprecated; \
+     send runtime settings in the notification's `settings.kakehashi` object. \
+     Flat didChange settings still work for now but may be removed in a future release.";
+
 /// True if any `[languageServers.*]` entry declares the deprecated `rootMarkers`
 /// key (superseded by `workspaceMarkers`), scanning raw TOML text.
 ///
