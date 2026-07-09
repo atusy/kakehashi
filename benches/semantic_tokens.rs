@@ -399,8 +399,13 @@ fn ms(d: Duration) -> f64 {
 enum Kind {
     /// `semanticTokens/full` on an unchanging document.
     Full,
-    /// `semanticTokens/range` over a representative viewport-sized slice.
-    Range { start_line: u32, end_line: u32 },
+    /// `semanticTokens/range` over representative viewport-sized slices.
+    Range {
+        start_line: u32,
+        end_line: u32,
+        step: u32,
+        variants: u32,
+    },
     /// `semanticTokens/full/delta` with no edit between requests.
     DeltaNoop,
     /// Realistic editing: a toggle `didChange` then `semanticTokens/full/delta`,
@@ -417,11 +422,12 @@ enum Kind {
 
 /// Mutable per-run state for [`Kind::EditDelta`]: the next `didChange` version,
 /// whether the next edit inserts (vs deletes) — flips each iteration to toggle —
-/// and the line edited.
+/// the line edited, and the next range viewport variant.
 struct EditState {
     version: i64,
     insert_next: bool,
     line: u32,
+    range_next: u32,
 }
 
 struct Scenario {
@@ -467,6 +473,7 @@ fn measure(
         // First edit must insert (the document opens with no extra space).
         insert_next: true,
         line: (scn.content.lines().count() / 2) as u32,
+        range_next: 0,
     };
 
     for _ in 0..warmup {
@@ -541,8 +548,12 @@ fn run_once(
         Kind::Range {
             start_line,
             end_line,
+            step,
+            variants,
         } => {
-            let _ = server.semantic_range(scn.uri, start_line, end_line);
+            let offset = (edit.range_next % variants.max(1)) * step;
+            edit.range_next = edit.range_next.wrapping_add(1);
+            let _ = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
         }
         Kind::DeltaNoop => {
             let result = server.semantic_delta(scn.uri, prev_result_id);
@@ -616,8 +627,10 @@ fn main() {
             kind: Kind::Range {
                 start_line: 500,
                 end_line: 560,
+                step: 20,
+                variants: 8,
             },
-            targets: "range request variation; currently full-tokenize then filter",
+            targets: "range request variation with scrolling cache misses; currently full-tokenize then filter",
         },
         Scenario {
             name: "rust_predicate_heavy/full",
@@ -651,8 +664,10 @@ fn main() {
             kind: Kind::Range {
                 start_line: 600,
                 end_line: 680,
+                step: 24,
+                variants: 8,
             },
-            targets: "range request variation across markdown injections; currently full-tokenize then filter",
+            targets: "range request variation across markdown injections with scrolling cache misses; currently full-tokenize then filter",
         },
         Scenario {
             name: "unicode_rust/full",
