@@ -303,14 +303,28 @@ pub(crate) async fn race_layers_preferred<R>(
 
         tokio::select! {
             result = &mut virt_fut, if virt_state.is_none() => {
-                virt_state = Some(result?);
+                virt_state = Some(layer_result_or_empty(LayerSource::Virt, result)?);
             }
             result = &mut host_fut, if host_state.is_none() => {
-                host_state = Some(result?);
+                host_state = Some(layer_result_or_empty(LayerSource::Host, result)?);
             }
             result = &mut native_fut, if native_state.is_none() => {
-                native_state = Some(result?);
+                native_state = Some(layer_result_or_empty(LayerSource::Native, result)?);
             }
+        }
+    }
+}
+
+fn layer_result_or_empty<R>(
+    layer: LayerSource,
+    result: tower_lsp_server::jsonrpc::Result<Option<R>>,
+) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) if err.code == tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled => Err(err),
+        Err(err) => {
+            log::warn!("{layer:?} layer request failed during preferred race: {err}");
+            Ok(None)
         }
     }
 }
@@ -1449,6 +1463,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r, None);
+    }
+
+    #[tokio::test]
+    async fn preferred_higher_priority_error_falls_through_to_lower_priority_result() {
+        use std::future::ready;
+        let r = race_layers_preferred(
+            &[LayerSource::Host, LayerSource::Virt],
+            ready(Ok(Some("virt"))),
+            ready(Err(tower_lsp_server::jsonrpc::Error::invalid_params(
+                "host failed",
+            ))),
+            ready(Ok(None)),
+            |value: &&str| !value.is_empty(),
+        )
+        .await
+        .expect("non-cancellation layer errors should not abort the preferred race");
+
+        assert_eq!(r, Some("virt"));
+    }
+
+    #[tokio::test]
+    async fn preferred_layer_cancellation_remains_fatal() {
+        use std::future::ready;
+        let err = race_layers_preferred(
+            &[LayerSource::Host, LayerSource::Virt],
+            ready(Ok(Some("virt"))),
+            ready(Err(tower_lsp_server::jsonrpc::Error::request_cancelled())),
+            ready(Ok(None)),
+            |value: &&str| !value.is_empty(),
+        )
+        .await
+        .expect_err("cancellation should abort the preferred race");
+
+        assert_eq!(
+            err.code,
+            tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
+        );
     }
 
     #[test]
