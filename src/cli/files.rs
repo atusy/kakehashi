@@ -347,16 +347,34 @@ mod tests {
     fn directory_walk_counts_unreadable_entries() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        struct RestorePermissions<'a> {
+            path: &'a Path,
+            mode: u32,
+        }
+
+        impl Drop for RestorePermissions<'_> {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(self.mode));
+            }
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join("kept.md"), "x");
         let unreadable = tmp.path().join("unreadable");
         write(&unreadable.join("hidden.md"), "x");
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestorePermissions {
+            path: &unreadable,
+            mode: 0o700,
+        };
+
+        if std::fs::read_dir(&unreadable).is_ok() {
+            return;
+        }
 
         let result =
             collect_files(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only).unwrap();
-
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert_eq!(result.files, vec![tmp.path().join("kept.md")]);
         assert!(result.walk_errors > 0);

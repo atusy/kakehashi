@@ -22,9 +22,9 @@
 //!   `--fail-on-warning`. Info/hint never fail. To never fail on diagnostics,
 //!   append `|| true`.
 //! - `2`: an operational error (a file could not be read, a path could not be
-//!   opened, or a configured downstream server failed). Independent of the
-//!   diagnostics — a tool that could not even read a file must not look "clean"
-//!   to CI, so it surfaces as `2` regardless.
+//!   opened or fully enumerated, or a configured downstream server failed).
+//!   Independent of the diagnostics — a tool that could not even read a file
+//!   must not look "clean" to CI, so it surfaces as `2` regardless.
 //!
 //! Diagnostics stream to stdout per file. Every file is always scanned so the
 //! exit code reflects the whole set; if stdout is closed early (e.g. `kakehashi
