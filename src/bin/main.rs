@@ -94,7 +94,8 @@ enum Commands {
     /// Exit codes: 0 = no failing diagnostics; 1 = a failing diagnostic (any
     /// error, plus warnings with --fail-on-warning; info/hint never fail —
     /// append `|| true` to never fail); 2 = an operational error (unreadable
-    /// file, downstream server failure), independent of the diagnostics.
+    /// file, path open/enumeration failure, downstream server failure),
+    /// independent of the diagnostics.
     Diagnose {
         /// Files or directories to diagnose ("-" for stdin with --stdin-filename)
         paths: Vec<PathBuf>,
