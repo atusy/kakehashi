@@ -411,6 +411,8 @@ fn clean_url(url: &str) -> &str {
 /// 1. If the URL is a GitHub HTTPS URL, try downloading the archive tarball.
 /// 2. If archive download fails (or URL is not GitHub), fall back to git clone.
 fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
+    validate_parser_source_metadata(url, revision)?;
+
     // Try archive download for GitHub URLs
     if let Some(archive_url) = github_archive_url(url, revision)
         && let Some(repo_name) = repo_name_from_url(url)
@@ -748,7 +750,7 @@ fn kill_process_group(child: &mut std::process::Child) {
 
 /// Clone a git repository at a specific revision.
 fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
-    validate_git_clone_input(url, revision)?;
+    validate_parser_source_metadata(url, revision)?;
 
     // First, clone with depth 1 (we'll fetch the specific revision)
     let mut clone = git_command(&["clone", "--depth", "1", "--", url], None);
@@ -801,7 +803,7 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
     Ok(())
 }
 
-fn validate_git_clone_input(url: &str, revision: &str) -> Result<(), ParserInstallError> {
+fn validate_parser_source_metadata(url: &str, revision: &str) -> Result<(), ParserInstallError> {
     if url.starts_with('-') {
         return Err(invalid_metadata(format!(
             "unsafe parser repository URL '{}'",
@@ -814,7 +816,7 @@ fn validate_git_clone_input(url: &str, revision: &str) -> Result<(), ParserInsta
             url.escape_default()
         )));
     }
-    if url.chars().any(char::is_control) {
+    if url.chars().any(char::is_control) || url.contains("..") {
         return Err(invalid_metadata(format!(
             "unsafe parser repository URL '{}'",
             url.escape_default()
@@ -826,7 +828,7 @@ fn validate_git_clone_input(url: &str, revision: &str) -> Result<(), ParserInsta
             revision.escape_default()
         )));
     }
-    if revision.chars().any(char::is_control) {
+    if revision.chars().any(char::is_control) || revision.contains("..") {
         return Err(invalid_metadata(format!(
             "unsafe parser revision '{}'",
             revision.escape_default()
@@ -997,6 +999,31 @@ mod tests {
             ("https://example.invalid/parser", "main\u{1b}[31m"),
         ] {
             match clone_repo(url, revision, &dest) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => panic!(
+                    "expected an InvalidInput IoError for {url:?} {revision:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_source_rejects_unsafe_archive_metadata() {
+        let temp = tempdir().expect("temp dir");
+        for (url, revision) in [
+            (
+                "https://github.com/tree-sitter/tree-sitter-json",
+                "main\nnext",
+            ),
+            (
+                "https://github.com/tree-sitter/tree-sitter-json",
+                "../../other/archive/main",
+            ),
+            ("https://github.com/tree-sitter/../other", "main"),
+        ] {
+            match fetch_source(url, revision, &temp.path().join("parser")) {
                 Err(ParserInstallError::IoError(e)) => {
                     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
                 }
