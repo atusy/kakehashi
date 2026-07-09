@@ -801,7 +801,10 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
 }
 
 fn git_fetch_revision_command(revision: &str, dest: &Path) -> Command {
-    git_command(&["fetch", "--depth", "1", "origin", revision], Some(dest))
+    git_command(
+        &["fetch", "--depth", "1", "origin", "--", revision],
+        Some(dest),
+    )
 }
 
 fn validate_parser_source_metadata(url: &str, revision: &str) -> Result<(), ParserInstallError> {
@@ -821,6 +824,12 @@ fn validate_parser_source_metadata(url: &str, revision: &str) -> Result<(), Pars
         return Err(invalid_metadata(format!(
             "unsafe parser repository URL '{}'",
             url.escape_default()
+        )));
+    }
+    if revision.is_empty() || revision.chars().any(char::is_whitespace) {
+        return Err(invalid_metadata(format!(
+            "unsafe parser revision '{}'",
+            revision.escape_default()
         )));
     }
     if revision.starts_with('-') {
@@ -909,7 +918,7 @@ fn reject_parser_source_symlinks(path: &Path) -> Result<(), ParserInstallError> 
                     entry.path().display().to_string().escape_default()
                 )));
             }
-            if file_type.is_dir() {
+            if file_type.is_dir() && entry.file_name() != ".git" {
                 pending.push(entry.path());
             }
         }
@@ -997,6 +1006,7 @@ mod tests {
                 "--depth",
                 "1",
                 "origin",
+                "--",
                 "v0.24.8",
             ]
         );
@@ -1038,6 +1048,23 @@ mod tests {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
             }
             other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_repo_rejects_empty_or_whitespace_revision() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        for revision in ["", " ", "main branch"] {
+            match clone_repo("https://example.invalid/parser", revision, &dest) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => panic!(
+                    "expected an InvalidInput IoError for revision {revision:?}, got {other:?}"
+                ),
+            }
         }
     }
 
@@ -1219,6 +1246,23 @@ mod tests {
             }
             other => panic!("expected an InvalidInput IoError, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_parser_source_symlinks_skips_real_dot_git_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let source_dir = temp.path().join("grammar");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(source_dir.join("src/.git/objects")).expect("create nested .git dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        symlink(&outside, source_dir.join("src/.git/objects/link"))
+            .expect("create ignored git metadata symlink");
+
+        reject_parser_source_symlinks(&source_dir)
+            .expect("real .git directories are ignored after their own type check");
     }
 
     #[test]
