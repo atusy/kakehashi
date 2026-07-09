@@ -454,7 +454,7 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
 }
 
 fn archive_error_allows_clone_fallback(error: &ParserInstallError) -> bool {
-    !matches!(error, ParserInstallError::UnsafeArchive(_))
+    matches!(error, ParserInstallError::ArchiveError(_))
 }
 
 /// Download a GitHub archive tarball and extract it to the destination directory.
@@ -487,10 +487,10 @@ fn download_and_extract_archive(
     fs::create_dir_all(dest)?;
 
     for entry_result in archive.entries().map_err(|e| {
-        ParserInstallError::UnsafeArchive(format!("Failed to read archive entries: {}", e))
+        ParserInstallError::ArchiveError(format!("Failed to read archive entries: {}", e))
     })? {
         let mut entry = entry_result.map_err(|e| {
-            ParserInstallError::UnsafeArchive(format!("Failed to read entry: {}", e))
+            ParserInstallError::ArchiveError(format!("Failed to read entry: {}", e))
         })?;
 
         let path = entry.path().map_err(|e| {
@@ -1474,6 +1474,9 @@ mod tests {
         ));
         assert!(archive_error_allows_clone_fallback(
             &ParserInstallError::ArchiveError("download failed".to_string())
+        ));
+        assert!(!archive_error_allows_clone_fallback(
+            &ParserInstallError::IoError(std::io::Error::other("disk full"))
         ));
     }
 
