@@ -105,7 +105,13 @@ fn transform_references_response_to_host(
     if response_has_jsonrpc_error(&response, "textDocument/references") {
         return None;
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "references response carries neither result nor error"
+        );
+        return None;
+    };
     if result.is_null() {
         return None;
     }
@@ -134,15 +140,62 @@ fn transform_references_response_to_host(
         }
     }
 
-    // Failed to deserialize as Location[]
+    log::warn!(
+        target: "kakehashi::bridge",
+        "references response did not match Location[]"
+    );
     None
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, Once};
+
+    use log::{Level, LevelFilter, Log, Metadata, Record};
+
     use super::super::test_helpers::test_host_uri;
     use super::RegionOffset;
     use super::transform_references_response_to_host;
+
+    static LOGGER: CapturingLogger = CapturingLogger {
+        messages: Mutex::new(Vec::new()),
+    };
+    static INIT_LOGGER: Once = Once::new();
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CapturingLogger {
+        messages: Mutex<Vec<String>>,
+    }
+
+    impl Log for CapturingLogger {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= Level::Warn
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.messages.lock().unwrap().push(format!(
+                    "{}:{}:{}",
+                    record.level(),
+                    record.target(),
+                    record.args()
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
+        INIT_LOGGER.call_once(|| {
+            log::set_logger(&LOGGER).expect("test logger should install once");
+            log::set_max_level(LevelFilter::Warn);
+        });
+        let _capture = CAPTURE_LOCK.lock().unwrap();
+        LOGGER.messages.lock().unwrap().clear();
+        f();
+        LOGGER.messages.lock().unwrap().clone()
+    }
 
     // ==========================================================================
     // References response transformation tests
@@ -164,6 +217,61 @@ mod tests {
         );
 
         assert!(transformed.is_none());
+    }
+
+    #[test]
+    fn references_response_warns_on_missing_result_success() {
+        let warnings = captured_warnings_for(|| {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42
+            });
+
+            let transformed = transform_references_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &test_host_uri(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_none());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains("references response carries neither result nor error")
+            }),
+            "expected missing-result references warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn references_response_warns_on_malformed_success_result() {
+        let warnings = captured_warnings_for(|| {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": "not references"
+            });
+
+            let transformed = transform_references_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &test_host_uri(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_none());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains("references response did not match Location[]")
+            }),
+            "expected malformed references warning, got {warnings:?}"
+        );
     }
 
     #[test]
