@@ -147,14 +147,14 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
     let mut raw_value = inner.clone();
 
     if let Some(raw_object) = raw_value.as_object_mut() {
-        if let Some(root_object) = value.as_object() {
-            merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
-        }
-
         if value.get("settings").is_some()
             && let Some(settings_object) = settings_root.as_object()
         {
             merge_flat_sibling_settings(raw_object, &mut warnings, settings_object);
+        }
+
+        if let Some(root_object) = value.as_object() {
+            merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
         }
     }
 
@@ -417,6 +417,21 @@ mod tests {
             update.warnings,
             vec!["Ignored unknown client configuration key(s): editorSetting"]
         );
+    }
+
+    #[test]
+    fn settings_root_flat_siblings_precede_top_level_siblings() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "kakehashi": {},
+                "autoInstall": false
+            },
+            "autoInstall": true
+        }))
+        .expect("conflicting mixed settings should parse");
+
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert!(update.warnings.is_empty());
     }
 
     #[test]
