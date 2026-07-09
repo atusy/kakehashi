@@ -275,6 +275,38 @@ mod tests {
     }
 
     #[test]
+    fn references_response_warns_on_malformed_location_array() {
+        let warnings = captured_warnings_for(|| {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": [
+                    {
+                        "uri": "file:///project/referenced.lua"
+                    }
+                ]
+            });
+
+            let transformed = transform_references_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &test_host_uri(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_none());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains("references response did not match Location[]")
+            }),
+            "expected malformed references array warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
     fn references_response_with_empty_array_preserves_empty() {
         // Server explicitly returns [] - preserve to distinguish from null
         let response = serde_json::json!({
