@@ -22,9 +22,9 @@
 //!   `--fail-on-warning`. Info/hint never fail. To never fail on diagnostics,
 //!   append `|| true`.
 //! - `2`: an operational error (a file could not be read, a path could not be
-//!   opened, or a configured downstream server failed). Independent of the
-//!   diagnostics — a tool that could not even read a file must not look "clean"
-//!   to CI, so it surfaces as `2` regardless.
+//!   opened or fully enumerated, or a configured downstream server failed).
+//!   Independent of the diagnostics — a tool that could not even read a file
+//!   must not look "clean" to CI, so it surfaces as `2` regardless.
 //!
 //! Diagnostics stream to stdout per file. Every file is always scanned so the
 //! exit code reflects the whole set; if stdout is closed early (e.g. `kakehashi
@@ -98,8 +98,8 @@ pub struct DiagnoseOptions {
 pub const EXIT_OK: u8 = 0;
 /// A failing diagnostic (an error, or a warning under `--fail-on-warning`).
 pub const EXIT_DIAGNOSTICS: u8 = 1;
-/// An operational error (unreadable file, un-openable path, downstream server
-/// failure). Independent of the diagnostics.
+/// An operational error (unreadable file, path open/enumeration failure,
+/// downstream server failure). Independent of the diagnostics.
 pub const EXIT_ERROR: u8 = 2;
 
 /// Per-server bound for waiting on cold downstream language servers, matching
@@ -160,8 +160,8 @@ struct Report {
     /// Whether any printed diagnostic should fail the run (an error, or a
     /// warning under `--fail-on-warning`).
     failure: bool,
-    /// Whether any operational error occurred (unreadable file, server
-    /// failure, un-openable path).
+    /// Whether any operational error occurred (unreadable file, path
+    /// open/enumeration failure, server failure).
     operational_error: bool,
 }
 
@@ -226,17 +226,21 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         return EXIT_ERROR;
     }
 
-    let files = match collect_files(cwd, &options.paths, &options.excludes, &|path| {
+    let collected = match collect_files(cwd, &options.paths, &options.excludes, &|path| {
         server.cli_can_handle_path(path)
     }) {
-        Ok(files) => files,
+        Ok(collected) => collected,
         Err(e) => {
             elnln!("error: {e}");
             return EXIT_ERROR;
         }
     };
+    let files = collected.files;
 
-    let mut report = Report::default();
+    let mut report = Report {
+        operational_error: collected.walk_errors > 0,
+        ..Default::default()
+    };
     // Stream per file: a single reused buffer holds one file's rendered
     // diagnostics, so peak memory is bounded by the noisiest file rather than
     // the whole run. `write_chunk` locks stdout per call, so the lock is never

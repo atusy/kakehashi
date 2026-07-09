@@ -637,11 +637,12 @@ Line and column are 1-based; a diagnostic with no severity is treated as an
 error (so it can never silently slip past the gate). Exit codes: `0` no failing
 diagnostic; `1` a failing diagnostic — any error always, plus warnings with
 `--fail-on-warning` (info/hint never fail); `2` an operational error (a file
-could not be read, a path could not be opened, or a configured downstream
-server failed — including one that answered the `textDocument/diagnostic` pull
-with an error response or a present-but-malformed payload, matching
-`kakehashi format`'s strictness) — independent of the diagnostics, so it
-surfaces a broken run rather than looking clean to CI.
+could not be read, a path could not be opened or fully enumerated, or a
+configured downstream server failed — including one that answered the
+`textDocument/diagnostic` pull with an error response or a
+present-but-malformed payload, matching `kakehashi format`'s strictness) —
+independent of the diagnostics, so it surfaces a broken run rather than
+looking clean to CI.
 
 > Under the non-default `preferred` aggregation strategy, the winning server's
 > result is authoritative, so a *non-winning* server's request-time failure is

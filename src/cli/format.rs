@@ -211,15 +211,17 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         return EXIT_ERROR;
     }
 
-    let files = match collect_files(cwd, &options.paths, &options.excludes, &|path| {
+    let collected = match collect_files(cwd, &options.paths, &options.excludes, &|path| {
         server.cli_can_handle_path(path)
     }) {
-        Ok(files) => files,
+        Ok(collected) => collected,
         Err(e) => {
             eprintln!("error: {e}");
             return EXIT_ERROR;
         }
     };
+    let files = collected.files;
+    let walk_errors = collected.walk_errors;
 
     let mut changed = 0usize;
     let mut unchanged = 0usize;
@@ -279,7 +281,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         }
     }
 
-    let errors = read_errors + write_errors + server_errors;
+    let errors = walk_errors + read_errors + write_errors + server_errors;
     let error_suffix = if errors > 0 {
         format!(", {errors} error(s)")
     } else {
