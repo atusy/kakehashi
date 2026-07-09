@@ -228,7 +228,7 @@ fn is_empty_host_layer_value(request_method: &str, value: &serde_json::Value) ->
     if request_method == "textDocument/rename" && value.is_object() {
         return serde_json::from_value::<WorkspaceEdit>(value.clone())
             .map(|edit| !workspace_edit_has_effect(&edit))
-            .unwrap_or(false);
+            .unwrap_or(true);
     }
     is_empty_layer_value(value)
 }
@@ -1736,6 +1736,14 @@ mod tests {
                     }]
                 }
             })
+        ));
+    }
+
+    #[test]
+    fn host_layer_rename_treats_malformed_workspace_edit_as_empty() {
+        assert!(is_empty_host_layer_value(
+            "textDocument/rename",
+            &serde_json::json!({ "changes": "bad" })
         ));
     }
 
