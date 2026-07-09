@@ -136,8 +136,8 @@ fn is_excluded(
 }
 
 /// Walk `dir` respecting `.gitignore` and `--excludes`, appending every
-/// supported file to `out`. Unreadable entries are warned about and counted
-/// so callers can surface an operational-error exit code after processing the
+/// supported file to `out`. Unreadable entries are reported and counted so
+/// callers can surface an operational-error exit code after processing the
 /// files that were still discoverable.
 fn walk_directory(
     dir: &Path,
