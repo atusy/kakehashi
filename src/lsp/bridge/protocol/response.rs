@@ -202,6 +202,7 @@ mod tests {
         messages: Mutex::new(Vec::new()),
     };
     static INIT_LOGGER: Once = Once::new();
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
     struct CapturingLogger {
         messages: Mutex<Vec<String>>,
@@ -231,6 +232,7 @@ mod tests {
             log::set_logger(&LOGGER).expect("test logger should install once");
             log::set_max_level(LevelFilter::Warn);
         });
+        let _capture = CAPTURE_LOCK.lock().unwrap();
         LOGGER.messages.lock().unwrap().clear();
         f();
         LOGGER.messages.lock().unwrap().clone()
