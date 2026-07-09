@@ -812,7 +812,7 @@ fn validate_parser_source_metadata(url: &str, revision: &str) -> Result<(), Pars
     }
     if !url.starts_with("https://") {
         return Err(invalid_metadata(format!(
-            "parser repository URL must use https://: '{}'",
+            "parser repository URL must use the https:// scheme: '{}'",
             url.escape_default()
         )));
     }
@@ -857,10 +857,22 @@ fn parser_source_dir(
     }
 
     let clone_dir = clone_dir.canonicalize()?;
-    let source_dir = clone_dir.join(location).canonicalize()?;
+    let source_dir = clone_dir.join(location).canonicalize().map_err(|err| {
+        invalid_metadata(format!(
+            "unsafe parser location '{}': {}",
+            location.escape_default(),
+            err
+        ))
+    })?;
     if !source_dir.starts_with(&clone_dir) {
         return Err(invalid_metadata(format!(
             "unsafe parser location '{}'",
+            location.escape_default()
+        )));
+    }
+    if !source_dir.is_dir() {
+        return Err(invalid_metadata(format!(
+            "unsafe parser location '{}' is not a directory",
             location.escape_default()
         )));
     }
@@ -1064,6 +1076,23 @@ mod tests {
             parser_source_dir(temp.path(), None).expect("missing location uses clone dir"),
             temp.path().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn parser_source_dir_rejects_missing_or_file_location() {
+        let temp = tempdir().expect("temp dir");
+        fs::write(temp.path().join("parser.c"), "void parser(void) {}").expect("write file");
+
+        for location in ["missing", "parser.c"] {
+            match parser_source_dir(temp.path(), Some(location)) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => {
+                    panic!("expected InvalidInput for location {location:?}, got {other:?}")
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
