@@ -312,6 +312,90 @@ impl BridgeCoordinator {
     // Config lookup (moved from Kakehashi)
     // ========================================
 
+    /// Await eager-opening ONLY `server_name`'s virtual documents for `host_uri`,
+    /// so a bridged `workspace/executeCommand` routed to a respawned downstream
+    /// (whose doc tracker was purged) doesn't compute against missing document
+    /// state. Unlike the request path, executeCommand has no
+    /// `ensure_document_opened` step; unlike [`Self::eager_spawn_and_open_documents`]
+    /// (fire-and-forget), this is AWAITED so that, WHEN a `didOpen` is enqueued,
+    /// it lands on the shared single-writer connection before the caller sends
+    /// the command (FIFO → didOpen first). The open is best-effort:
+    /// `eager_open_virtual_documents` may skip or return early (downstream not
+    /// ready, outbound queue full), in which case no `didOpen` is queued and the
+    /// command simply proceeds without it (handled fail-soft by dispatch). A
+    /// no-op when the docs are already open (idempotent claim), and when no
+    /// injection maps to `server_name` (e.g. a host-layer command — host-layer
+    /// sync is a separate follow-up).
+    ///
+    /// This heals MISSING document state (a purged tracker), not stale content —
+    /// it never sends `didChange` (that is the edit path's job). And it is
+    /// best-effort against a *concurrent* respawn: if the downstream is replaced
+    /// in the narrow gap between this open and the caller's own connection
+    /// acquisition, the command can still execute against missing state (the
+    /// fresh server may error, no-op, or act on incomplete state); any failure
+    /// is handled fail-soft by the existing dispatch path. Still a far smaller
+    /// window than the codeAction↔executeCommand gap this closes.
+    pub(crate) async fn ensure_server_documents_open(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        host_uri: &Url,
+        injections: Vec<BridgeInjection>,
+        server_name: &str,
+    ) {
+        let (for_server, config) =
+            self.injections_for_server(settings, host_language, injections, server_name);
+        let Some(config) = config else {
+            return; // no injected region on this host bridges to `server_name`
+        };
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return;
+        };
+        self.pool
+            .eager_open_virtual_documents(server_name, &config, host_uri, &host_uri_lsp, for_server)
+            .await;
+    }
+
+    /// The injections whose language bridges to `server_name`, plus that server's
+    /// resolved config. A codeAction fans out to ALL servers bridging an
+    /// injection language, so the command's origin may be ANY of them — match by
+    /// name against the full set ([`Self::get_all_configs_for_language`]), not
+    /// [`Self::get_config_for_language`]'s single first pick (which would miss
+    /// the origin when e.g. both ruff and pyright bridge python and the command
+    /// came from ruff). Pure; the async open is separate so it is unit-testable.
+    fn injections_for_server(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        injections: Vec<BridgeInjection>,
+        server_name: &str,
+    ) -> (Vec<BridgeInjection>, Option<Arc<BridgeServerConfig>>) {
+        let mut config: Option<Arc<BridgeServerConfig>> = None;
+        // Resolve via the per-settings-snapshot memo
+        // ([`Self::cached_configs_for_injection_language`]): several injections
+        // commonly share an injection language, and the cache also spans repeated
+        // executeCommands on the same snapshot, so the scan/merge/sort runs once
+        // per (host, injection) language rather than once per injection — this is
+        // on the user-facing executeCommand path.
+        let for_server = injections
+            .into_iter()
+            .filter(|inj| {
+                match self
+                    .cached_configs_for_injection_language(settings, host_language, &inj.language)
+                    .into_iter()
+                    .find(|r| r.server_name == server_name)
+                {
+                    Some(resolved) => {
+                        config.get_or_insert(resolved.config);
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .collect();
+        (for_server, config)
+    }
+
     /// Resolve `bridge.servers` for `injection_language`, returning the
     /// `ResolvedServerConfig` (server name for pooling + spawn config) or
     /// `None` when no server matches, or the host's bridge filter excludes
@@ -1285,6 +1369,135 @@ mod tests {
             result.is_none(),
             "rust should be blocked by markdown's bridge filter"
         );
+    }
+
+    #[test]
+    fn injections_for_server_matches_any_fan_out_server_not_just_the_first() {
+        // python bridges to BOTH ruff and pyright (codeAction fans out to all).
+        // A command routed to either must still select the python injection —
+        // get_config_for_language's single first pick would miss whichever the
+        // command did NOT come from.
+        let coordinator = BridgeCoordinator::new();
+
+        let mut bridge_filter = HashMap::new();
+        bridge_filter.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
+        );
+        let server = |cmd: &str| BridgeServerConfig {
+            cmd: vec![cmd.to_string()],
+            languages: vec!["python".to_string()],
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            enabled: None,
+            settings: None,
+        };
+        let mut servers = HashMap::new();
+        servers.insert("ruff".to_string(), server("ruff"));
+        servers.insert("pyright".to_string(), server("pyright"));
+        let settings = Arc::new(WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        });
+
+        let injections = vec![BridgeInjection {
+            language: "python".to_string(),
+            region_id: "region-0".to_string(),
+            content: "import os\n".to_string(),
+        }];
+
+        for (name, cmd) in [("ruff", "ruff"), ("pyright", "pyright")] {
+            let (kept, config) =
+                coordinator.injections_for_server(&settings, "markdown", injections.clone(), name);
+            assert_eq!(kept.len(), 1, "{name} must self-heal its python injection");
+            assert_eq!(
+                config.expect("config for matched server").cmd,
+                vec![cmd.to_string()]
+            );
+        }
+
+        // A server that does not bridge python selects nothing.
+        let (kept, config) =
+            coordinator.injections_for_server(&settings, "markdown", injections, "gopls");
+        assert!(kept.is_empty());
+        assert!(config.is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_server_documents_open_short_circuits_for_a_non_matching_server() {
+        // A command whose host injections bridge to another server must not
+        // trigger a connect/spawn for `server_name`: the filter drops every
+        // injection, so the method returns before touching the pool. Asserted
+        // via a timeout — a spawn attempt would block on the init handshake.
+        let coordinator = BridgeCoordinator::new();
+
+        let mut bridge_filter = HashMap::new();
+        bridge_filter.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
+        );
+        // Use a blocking devnull command (not a real binary like `ruff`): if the
+        // filter regressed and DID attempt to spawn, the handshake would hang and
+        // the 2s timeout below would fire — a real binary could instead fail-fast
+        // on a missing runner and let the test pass without proving no-spawn.
+        let mut servers = HashMap::new();
+        servers.insert(
+            "ruff".to_string(),
+            crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("python"),
+        );
+        let settings = Arc::new(WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        });
+
+        let host_uri = Url::parse("file:///doc.md").unwrap();
+        let injections = vec![BridgeInjection {
+            language: "python".to_string(),
+            region_id: "region-0".to_string(),
+            content: "import os\n".to_string(),
+        }];
+
+        // `python` bridges to "ruff", not "other-server" → no match → no-op.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            coordinator.ensure_server_documents_open(
+                &settings,
+                "markdown",
+                &host_uri,
+                injections,
+                "other-server",
+            ),
+        )
+        .await
+        .expect("a non-matching server must short-circuit, not attempt a spawn");
     }
 
     #[test]
