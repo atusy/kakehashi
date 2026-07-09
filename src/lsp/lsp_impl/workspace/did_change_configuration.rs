@@ -38,11 +38,13 @@ impl Kakehashi {
             }
         };
 
-        for warning in &parsed.warnings {
+        let ClientConfigurationUpdate { settings, warnings } = parsed;
+
+        for warning in warnings {
             self.notifier().log_warning(warning).await;
         }
 
-        if raw_workspace_settings_is_empty(&parsed.settings) {
+        if raw_workspace_settings_is_empty(&settings) {
             return;
         }
 
@@ -52,8 +54,7 @@ impl Kakehashi {
         let current_ts = self.settings_manager.load_raw_settings();
         // SAFETY: merge_workspace_settings(Some, Some) always returns Some, so unwrap_or_return is
         // defensive only — the None branch is unreachable under the current implementation.
-        let Some(merged_ts) =
-            merge_workspace_settings(Some((*current_ts).clone()), Some(parsed.settings))
+        let Some(merged_ts) = merge_workspace_settings(Some((*current_ts).clone()), Some(settings))
         else {
             log::warn!(
                 "merge_workspace_settings returned None despite two Some inputs; skipping configuration update"
