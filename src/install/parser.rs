@@ -313,6 +313,7 @@ pub fn install_parser(
 
     // Determine the source directory (handle monorepos)
     let source_dir = parser_source_dir(&clone_dir, metadata.location.as_deref())?;
+    reject_symlinks_under(&source_dir)?;
 
     if options.verbose {
         eprintln!("Building parser in: {}", source_dir.display());
@@ -845,6 +846,24 @@ fn parser_source_dir(
     Ok(source_dir)
 }
 
+fn reject_symlinks_under(path: &Path) -> Result<(), ParserInstallError> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_metadata(format!(
+                "unsafe symlink in parser source '{}'",
+                entry.path().display()
+            )));
+        }
+        if metadata.is_dir() {
+            reject_symlinks_under(&entry.path())?;
+        }
+    }
+
+    Ok(())
+}
+
 fn invalid_metadata(message: String) -> ParserInstallError {
     ParserInstallError::IoError(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -964,6 +983,26 @@ mod tests {
         symlink(&outside, clone_dir.join("grammar")).expect("create symlink");
 
         match parser_source_dir(&clone_dir, Some("grammar")) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_symlinks_under_rejects_nested_source_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let source_dir = temp.path().join("grammar");
+        let outside = temp.path().join("outside.c");
+        fs::create_dir_all(source_dir.join("src")).expect("create source src dir");
+        fs::write(&outside, "void tree_sitter_evil(void) {}").expect("write outside file");
+        symlink(&outside, source_dir.join("src/parser.c")).expect("create nested symlink");
+
+        match reject_symlinks_under(&source_dir) {
             Err(ParserInstallError::IoError(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
             }
