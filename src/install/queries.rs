@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::http::agent_with_timeout;
+#[cfg(test)]
+use super::http::agent_with_timeout_allowing_http;
 
 /// Base URL for nvim-treesitter query files on GitHub (main branch).
 /// Note: In the main branch, queries are under runtime/queries instead of queries.
@@ -118,19 +120,72 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from(NVIM_TREESITTER_QUERIES_URL, language, data_dir, force)
+    install_queries_with_dependencies_from_with_http_policy(
+        NVIM_TREESITTER_QUERIES_URL,
+        language,
+        data_dir,
+        force,
+        QueryHttpPolicy::HttpsOnly,
+    )
 }
 
-/// Like [`install_queries_with_dependencies`] but downloading from `base_url`,
-/// so tests can serve query files from a local HTTP server.
+/// Like [`install_queries_with_dependencies`] but downloading from `base_url`.
 pub(crate) fn install_queries_with_dependencies_from(
     base_url: &str,
     language: &str,
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from_with_http_policy(
+        base_url,
+        language,
+        data_dir,
+        force,
+        QueryHttpPolicy::HttpsOnly,
+    )
+}
+
+/// Like [`install_queries_with_dependencies_from`] but allows tests to serve
+/// fixture query files from a loopback HTTP server.
+#[cfg(test)]
+pub(crate) fn install_queries_with_dependencies_from_allowing_http_for_tests(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from_with_http_policy(
+        base_url,
+        language,
+        data_dir,
+        force,
+        QueryHttpPolicy::AllowHttpForTests,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum QueryHttpPolicy {
+    HttpsOnly,
+    #[cfg(test)]
+    AllowHttpForTests,
+}
+
+fn install_queries_with_dependencies_from_with_http_policy(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+    http_policy: QueryHttpPolicy,
+) -> Result<QueryInstallResult, QueryInstallError> {
     let mut installed = std::collections::HashSet::new();
-    install_queries_recursive(base_url, language, data_dir, force, &mut installed)
+    install_queries_recursive(
+        base_url,
+        language,
+        data_dir,
+        force,
+        &mut installed,
+        http_policy,
+    )
 }
 
 /// Internal recursive helper for installing queries with dependencies.
@@ -140,6 +195,7 @@ fn install_queries_recursive(
     data_dir: &Path,
     force: bool,
     installed: &mut std::collections::HashSet<String>,
+    http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
     // The name becomes a path and URL segment below; reject anything that
     // could escape the data dir (e.g. a caller-provided `../../x`).
@@ -178,7 +234,14 @@ fn install_queries_recursive(
             let parents = parse_inherits_directive(&content);
             for parent in parents {
                 // Install parent dependencies (don't force, just ensure they exist)
-                match install_queries_recursive(base_url, &parent, data_dir, false, installed) {
+                match install_queries_recursive(
+                    base_url,
+                    &parent,
+                    data_dir,
+                    false,
+                    installed,
+                    http_policy,
+                ) {
                     Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
                     Err(e) => {
                         eprintln!(
@@ -203,7 +266,7 @@ fn install_queries_recursive(
     for query_file in QUERY_FILES {
         let url = format!("{}/{}/{}", base_url, language, query_file);
 
-        match download_file(&url) {
+        match download_file(&url, http_policy) {
             Ok(content) => {
                 // Check for inherits directive in highlights.scm
                 if *query_file == "highlights.scm" {
@@ -247,7 +310,8 @@ fn install_queries_recursive(
     for parent in parents_to_install {
         eprintln!("Installing inherited queries: {}", parent);
         // Don't fail if parent already exists
-        match install_queries_recursive(base_url, &parent, data_dir, false, installed) {
+        match install_queries_recursive(base_url, &parent, data_dir, false, installed, http_policy)
+        {
             Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
             Err(e) => {
                 eprintln!(
@@ -266,16 +330,19 @@ fn install_queries_recursive(
 }
 
 /// Download a file from a URL.
-fn download_file(url: &str) -> Result<String, QueryInstallError> {
-    let mut response = agent_with_timeout(QUERY_HTTP_TIMEOUT)
-        .get(url)
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::StatusCode(code) => {
-                QueryInstallError::HttpError(format!("HTTP {} for {}", code, url))
-            }
-            e => QueryInstallError::HttpError(e.to_string()),
-        })?;
+fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, QueryInstallError> {
+    let agent = match http_policy {
+        QueryHttpPolicy::HttpsOnly => agent_with_timeout(QUERY_HTTP_TIMEOUT),
+        #[cfg(test)]
+        QueryHttpPolicy::AllowHttpForTests => agent_with_timeout_allowing_http(QUERY_HTTP_TIMEOUT),
+    };
+
+    let mut response = agent.get(url).call().map_err(|e| match e {
+        ureq::Error::StatusCode(code) => {
+            QueryInstallError::HttpError(format!("HTTP {} for {}", code, url))
+        }
+        e => QueryInstallError::HttpError(e.to_string()),
+    })?;
 
     response
         .body_mut()
