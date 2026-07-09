@@ -98,8 +98,8 @@ pub struct DiagnoseOptions {
 pub const EXIT_OK: u8 = 0;
 /// A failing diagnostic (an error, or a warning under `--fail-on-warning`).
 pub const EXIT_DIAGNOSTICS: u8 = 1;
-/// An operational error (unreadable file, un-openable path, downstream server
-/// failure). Independent of the diagnostics.
+/// An operational error (unreadable file, path open/enumeration failure,
+/// downstream server failure). Independent of the diagnostics.
 pub const EXIT_ERROR: u8 = 2;
 
 /// Per-server bound for waiting on cold downstream language servers, matching
