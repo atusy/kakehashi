@@ -191,7 +191,7 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
     // guard and the wrapped payload above did not warn.
     client.send_notification(
         "workspace/didChangeConfiguration",
-        flat_didchange_config(false),
+        flat_didchange_config(true),
     );
     let (method, params) = client
         .wait_for_notification_where(
@@ -209,12 +209,17 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
     client
         .wait_for_notification_where(&["window/logMessage"], TIMEOUT, is_config_updated)
         .expect("first flat reconfig should log a config-updated message");
+    assert_eq!(
+        query_effective_settings(&mut client)["autoInstall"],
+        json!(true),
+        "flat didChange config should still update the effective runtime settings"
+    );
 
     // A second flat payload is still accepted, but the deprecation popup does
     // not repeat before the successful update log.
     client.send_notification(
         "workspace/didChangeConfiguration",
-        flat_didchange_config(true),
+        flat_didchange_config(false),
     );
     let (method, params) = client
         .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
@@ -224,6 +229,11 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
     assert_eq!(
         method, "window/logMessage",
         "no second flat-shape deprecation popup should fire; got: {params:?}"
+    );
+    assert_eq!(
+        query_effective_settings(&mut client)["autoInstall"],
+        json!(false),
+        "second flat didChange config should still update the effective runtime settings"
     );
 
     let _ = client.send_request("shutdown", json!(null));
