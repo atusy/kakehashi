@@ -32,7 +32,13 @@ pub(crate) fn transform_goto_response_to_host(
     if response_has_jsonrpc_error(&response, "goto request") {
         return None;
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "goto response carries neither result nor error"
+        );
+        return None;
+    };
     if result.is_null() {
         return None;
     }
@@ -257,6 +263,33 @@ mod tests {
                     )
             }),
             "expected malformed goto response warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn goto_response_warns_on_missing_result_success() {
+        let warnings = captured_warnings_for(|| {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": 42
+            });
+
+            let transformed = transform_goto_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &"file:///project/host.lua".parse().unwrap(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_none());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains("goto response carries neither result nor error")
+            }),
+            "expected missing-result goto response warning, got {warnings:?}"
         );
     }
 }
