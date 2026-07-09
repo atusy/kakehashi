@@ -108,10 +108,6 @@ fn transform_prepare_rename_response_to_host(
         return Ok(None);
     }
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
-        log::warn!(
-            target: "kakehashi::bridge",
-            "textDocument/prepareRename response carries neither result nor error (protocol violation)"
-        );
         return Err(io::Error::other(
             "textDocument/prepareRename response carries neither result nor error (protocol violation)",
         ));
@@ -123,10 +119,6 @@ fn transform_prepare_rename_response_to_host(
     let mut prepare_rename: PrepareRenameResponse = match serde_json::from_value(result) {
         Ok(response) => response,
         Err(err) => {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "prepareRename response did not match Range | {{ range, placeholder }} | {{ defaultBehavior }}: {err}"
-            );
             return Err(io::Error::other(format!(
                 "malformed textDocument/prepareRename result from downstream server: {err}"
             )));
