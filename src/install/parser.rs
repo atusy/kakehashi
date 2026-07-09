@@ -867,20 +867,23 @@ fn parser_source_dir(
 }
 
 fn reject_symlinks_under(path: &Path) -> Result<(), ParserInstallError> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_name() == ".git" {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            return Err(invalid_metadata(format!(
-                "unsafe symlink in parser source '{}'",
-                entry.path().display()
-            )));
-        }
-        if file_type.is_dir() {
-            reject_symlinks_under(&entry.path())?;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(invalid_metadata(format!(
+                    "unsafe symlink in parser source '{}'",
+                    entry.path().display().to_string().escape_default()
+                )));
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            }
         }
     }
 
@@ -1065,11 +1068,15 @@ mod tests {
         let outside = temp.path().join("outside.c");
         fs::create_dir_all(source_dir.join("src")).expect("create source src dir");
         fs::write(&outside, "void tree_sitter_evil(void) {}").expect("write outside file");
-        symlink(&outside, source_dir.join("src/parser.c")).expect("create nested symlink");
+        symlink(&outside, source_dir.join("src/parser\n.c")).expect("create nested symlink");
 
         match reject_symlinks_under(&source_dir) {
             Err(ParserInstallError::IoError(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    e.to_string().contains("\\n"),
+                    "symlink path should escape control characters: {e}"
+                );
             }
             other => panic!("expected an InvalidInput IoError, got {other:?}"),
         }
