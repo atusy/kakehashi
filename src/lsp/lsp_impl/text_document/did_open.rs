@@ -20,7 +20,7 @@ impl Kakehashi {
 
         let language_name = if language_id == "plaintext" {
             self.language
-                .loadable_language_for_document(uri.path(), &text)
+                .candidate_language_for_document(uri.path(), &text)
         } else {
             Some(language_id.clone())
         };
@@ -289,7 +289,7 @@ mod tests {
             ..Default::default()
         });
 
-        let uri = Url::parse("file:///test/unknown-buffer.txt").expect("valid test URI");
+        let uri = Url::parse("file:///test/unknown-buffer").expect("valid test URI");
         let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
 
         server
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plaintext_did_open_uses_loadable_path_heuristic() {
+    async fn plaintext_did_open_uses_path_candidate() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         server
@@ -348,7 +348,7 @@ mod tests {
                 .expect("document should be stored")
                 .language_id(),
             Some("rust"),
-            "plaintext should fall back to an installed path-derived language"
+            "plaintext should fall back to a path-derived candidate"
         );
     }
 

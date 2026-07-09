@@ -1044,6 +1044,33 @@ impl LanguageCoordinator {
         self.load_candidate_or_base(candidate)
     }
 
+    /// Candidate-only document detection for unknown LSP language IDs.
+    ///
+    /// Unlike [`Self::loadable_language_for_document`], this does not load
+    /// parsers. It only normalizes path/first-line heuristics and resolves a
+    /// configured base, leaving didOpen's existing async load/auto-install path
+    /// to do any parser work.
+    pub(crate) fn candidate_language_for_document(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Option<String> {
+        if let Some(token) = super::heuristic::extract_token_from_path(path) {
+            if let Some(candidate) = super::heuristic::detect_from_token(token) {
+                return Some(self.resolve_base(&candidate).unwrap_or(candidate));
+            }
+            if let Some(base) = self.resolve_base(token) {
+                return Some(base);
+            }
+        }
+
+        if let Some(candidate) = super::heuristic::detect_from_first_line(content) {
+            return Some(self.resolve_base(&candidate).unwrap_or(candidate));
+        }
+
+        None
+    }
+
     /// Load `candidate` (or its configured base) from the search paths,
     /// returning the name that actually loaded.
     fn load_candidate_or_base(&self, candidate: String) -> Option<String> {
@@ -1835,6 +1862,20 @@ mod tests {
         assert_eq!(result, None);
         assert_eq!(method, "none");
         assert_eq!(last_candidate, Some("python".to_string()));
+    }
+
+    #[test]
+    fn candidate_language_for_document_does_not_require_loaded_parser() {
+        let coordinator = LanguageCoordinator::new();
+
+        assert_eq!(
+            coordinator.candidate_language_for_document("/path/to/file.rs", ""),
+            Some("rust".to_string())
+        );
+        assert_eq!(
+            coordinator.candidate_language_for_document("/script", "#!/usr/bin/env python\n"),
+            Some("python".to_string())
+        );
     }
 
     #[test]

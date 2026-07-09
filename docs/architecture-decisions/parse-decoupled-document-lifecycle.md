@@ -22,9 +22,11 @@ tiers by their dependence on kakehashi's own tree-sitter parse:
   language. They need the document **text and a language name only** — never the
   tree. `eager_open_host_document_on_servers` (`src/lsp/bridge/coordinator.rs`)
   takes `(settings, language: &str, uri, text)`; no tree, no loaded parser. The
-  initial language name it needs is the client-provided LSP `languageId` captured
-  in `did_open_impl` *before* `ensure_language_loaded`; the later parse can refine
-  the stored document language without delaying host attach.
+  initial language name it needs is captured in `did_open_impl` *before*
+  `ensure_language_loaded`: normally the client-provided LSP `languageId`, with
+  `"plaintext"` treated as unknown and resolved through a candidate-only
+  path/first-line heuristic when possible. The later parse can refine the stored
+  document language without delaying host attach.
 - **Virt tier** — the same features over *injected* regions. These need the tree
   **only to locate the region** under the cursor
   (`InjectionResolver::resolve_at_byte_offset(..., snapshot.tree(), ...)`); the
