@@ -658,9 +658,24 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> CodeAction {
         let server_name = &envelope.origin;
-        let host_url = Url::parse(&envelope.host_uri).ok();
+        // `host_uri` comes from client-supplied `data` (the resolve params echo
+        // the action's envelope), so a malformed value must fail soft, NOT fall
+        // through to `get_or_create_connection(.., None)` — a `None` document
+        // hint routes to a rootless client-fallback / shared key that could run
+        // the resolve against the wrong workspace. The bridge only ever mints a
+        // valid `Url::as_str()` here, so a parse failure means a corrupt/foreign
+        // envelope.
+        let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve (host): envelope host_uri '{}' is not a valid URL; ignoring",
+                envelope.host_uri
+            );
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        };
         let handle = match self
-            .get_or_create_connection(server_name, server_config, host_url.as_ref())
+            .get_or_create_connection(server_name, server_config, Some(&host_url))
             .await
         {
             Ok(h) => h,
@@ -709,9 +724,21 @@ impl LanguageServerPool {
         region_end: Position,
     ) -> CodeAction {
         let server_name = &envelope.origin;
-        let host_url = Url::parse(&envelope.host_uri).ok();
+        // Client-supplied `host_uri` (see the host path): a malformed value must
+        // fail soft, not connect with a `None` document hint that routes to a
+        // rootless client-fallback / shared key. The bridge only mints valid
+        // URLs here, so a parse failure means a corrupt/foreign envelope.
+        let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: envelope host_uri '{}' is not a valid URL; ignoring",
+                envelope.host_uri
+            );
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        };
         let handle = match self
-            .get_or_create_connection(server_name, server_config, host_url.as_ref())
+            .get_or_create_connection(server_name, server_config, Some(&host_url))
             .await
         {
             Ok(h) => h,
@@ -730,9 +757,7 @@ impl LanguageServerPool {
         }
 
         let offset = RegionOffset::from(&envelope.offset);
-        let host_uri_lsp = host_url
-            .as_ref()
-            .and_then(|u| crate::lsp::lsp_impl::url_to_uri(u).ok());
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_url).ok();
 
         // Forward with the ORIGINAL (unsuffixed) title restored and any
         // client-supplied ranges translated back to virtual coordinates. Keep

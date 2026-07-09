@@ -381,16 +381,18 @@ impl Kakehashi {
                 // Whether this host server advertises `codeAction/resolve`, so a
                 // host lazy action can be enveloped for resolve-routing back to
                 // it (#627) rather than disabled. Queried on the just-opened
-                // connection.
-                let server_resolves = t
-                    .pool
-                    .host_server_advertises(
-                        &t.server_name,
-                        &t.server_config,
-                        &t.uri,
-                        "codeAction/resolve",
-                    )
-                    .await;
+                // connection — skipped when there are no actions, since
+                // `bridge_code_actions` returns empty regardless (avoids a
+                // redundant lock acquisition on the hot path).
+                let server_resolves = !actions.is_empty()
+                    && t.pool
+                        .host_server_advertises(
+                            &t.server_name,
+                            &t.server_config,
+                            &t.uri,
+                            "codeAction/resolve",
+                        )
+                        .await;
                 Ok(Some(bridge_code_actions(
                     actions,
                     &t.server_name,
