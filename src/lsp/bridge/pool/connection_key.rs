@@ -76,6 +76,11 @@ impl ConnectionKey {
         matches!(self.root, ConnectionRoot::Shared)
     }
 
+    /// Whether this key is the client-root fallback (no resolved marker root).
+    pub(crate) fn is_client_fallback(&self) -> bool {
+        matches!(self.root, ConnectionRoot::ClientFallback)
+    }
+
     /// Build a key with no resolved root (client-root fallback).
     ///
     /// Test-only convenience: production builds keys via [`new`](Self::new) with

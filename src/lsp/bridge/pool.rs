@@ -9,6 +9,7 @@
 //! [`LanguageServerPool`] manages the connections; [`ConnectionHandle`]
 //! (ls-bridge-async-connection) and [`ConnectionState`] track each connection's lifecycle.
 
+mod command_origin_registry;
 mod connection_action;
 mod connection_handle;
 mod connection_key;
@@ -24,6 +25,7 @@ mod shutdown_timeout;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
+pub(crate) use command_origin_registry::CommandOriginRegistry;
 pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
@@ -286,6 +288,8 @@ pub struct LanguageServerPool {
     /// `upstream_request_registry`, which is the *outbound* (editor → downstream)
     /// cancel direction.
     inbound_request_registry: super::InboundRequestRegistry,
+    /// Palette command name → origin server (#628 palette-fired executeCommand).
+    command_origins: Arc<CommandOriginRegistry>,
 }
 
 impl Default for LanguageServerPool {
@@ -325,7 +329,28 @@ impl LanguageServerPool {
             progress_registry: Arc::new(super::ProgressRegistry::new()),
             client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
+            command_origins: Arc::new(CommandOriginRegistry::default()),
         }
+    }
+
+    /// Registry mapping a downstream server's advertised palette command names to
+    /// the connection that advertised them (#628 palette-fired executeCommand).
+    pub(crate) fn command_origins(&self) -> &CommandOriginRegistry {
+        &self.command_origins
+    }
+
+    /// The existing `Ready` connection for `key`, if one is live. Used to route a
+    /// palette command back to the exact connection that advertised it (right
+    /// workspace root/context) rather than spawning a fresh client-root one.
+    pub(crate) async fn ready_connection_by_key(
+        &self,
+        key: &ConnectionKey,
+    ) -> Option<Arc<ConnectionHandle>> {
+        let connections = self.connections.lock().await;
+        connections
+            .get(key)
+            .filter(|handle| handle.state() == ConnectionState::Ready)
+            .map(Arc::clone)
     }
 
     /// Shared registry of in-flight forwarded requests, handed to the forwarding
@@ -1610,6 +1635,17 @@ impl LanguageServerPool {
         let advertise_configuration = server_config.settings.is_some();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
+        let command_origins = Arc::clone(&self.command_origins);
+        let command_registration_key = connection_key.clone();
+        let upstream_request_tx = self.upstream_request_tx.clone();
+        // The editor accepts a dynamic `workspace/executeCommand` registration
+        // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
+        let supports_dynamic_command_registration = self
+            .client_capabilities()
+            .and_then(|caps| caps.workspace)
+            .and_then(|ws| ws.execute_command)
+            .and_then(|ec| ec.dynamic_registration)
+            .unwrap_or(false);
         let handshake_task = tokio::spawn(async move {
             let init_result = tokio::time::timeout(
                 timeout,
@@ -1635,6 +1671,13 @@ impl LanguageServerPool {
                         "[{}] LSP handshake completed successfully",
                         server_name_for_log
                     );
+                    // Extract this server's advertised palette command names
+                    // before `capabilities` is moved; they're registered AFTER
+                    // the Ready flip below.
+                    let palette_commands = capabilities
+                        .execute_command_provider
+                        .as_ref()
+                        .map(|options| options.commands.clone());
                     handle_for_handshake.set_server_capabilities(capabilities);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
@@ -1663,6 +1706,28 @@ impl LanguageServerPool {
                         );
                     }
                     handle_for_handshake.set_state(ConnectionState::Ready);
+                    // Record advertised palette command names AFTER Ready, so a
+                    // command fired without an action context (raw name) routes
+                    // back to a Ready connection (#628). Dedup is by name across
+                    // the whole session, so a respawn / second root re-registers
+                    // nothing new.
+                    if let Some(commands) = palette_commands {
+                        let added = command_origins.register(&command_registration_key, commands);
+                        // Advertise the NEWLY-added names upstream so the editor's
+                        // palette lists them. Fire-and-forget; skipped when the
+                        // client can't accept a dynamic registration.
+                        if !added.is_empty()
+                            && supports_dynamic_command_registration
+                            && let Err(e) = upstream_request_tx
+                                .send(UpstreamRequest::RegisterCommands { commands: added })
+                        {
+                            log::warn!(
+                                target: "kakehashi::bridge",
+                                "Failed to queue palette-command registration \
+                                 (forwarding loop gone): {e}"
+                            );
+                        }
+                    }
                     Ok(())
                 }
                 Ok(Err(e)) => {

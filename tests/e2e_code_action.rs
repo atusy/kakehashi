@@ -883,3 +883,74 @@ fn code_action_over_a_multi_fence_range_merges_actions_from_every_region() {
 
     shutdown(&mut client);
 }
+
+#[test]
+fn palette_fired_command_routes_to_its_origin_server() {
+    // #628: a command the client fires WITHOUT an action context — a raw name
+    // from the palette, keyed off the advertised executeCommandProvider.commands
+    // — routes to the server that advertised it (recorded at handshake), not just
+    // commands surfaced through a bridged code action.
+    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+    // Drive a codeAction so mock-codeaction handshakes and registers "mock.run".
+    let _ = code_action_with_retry(&mut client);
+
+    // Fire the RAW command name (palette style): no routing prefix, no action.
+    let exec_id = client.send_request_async(
+        "workspace/executeCommand",
+        json!({ "command": "mock.run", "arguments": [] }),
+    );
+    let (apply_id, _apply_params) = client
+        .wait_for_server_request("workspace/applyEdit", Duration::from_secs(5))
+        .expect("the palette command must reach the origin server (which issues applyEdit)");
+    client.send_response(apply_id, json!({ "applied": true }));
+
+    let response = client.receive_response_for_id_public(exec_id);
+    assert_eq!(
+        response["result"]["executed"], "mock.run",
+        "the palette command must reach its origin with the raw name, got: {response:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn downstream_command_names_are_registered_upstream_for_the_palette() {
+    // #628: a downstream that advertises `executeCommandProvider.commands` has
+    // those names dynamically registered with the editor via
+    // `client/registerCapability`, so the palette lists them — gated on the
+    // client advertising `workspace.executeCommand.dynamicRegistration`.
+    let caps = json!({
+        "textDocument": { "codeAction": {
+            "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [] } }
+        }},
+        "workspace": { "executeCommand": { "dynamicRegistration": true } }
+    });
+    let (mut client, init_response, _config_dir) = init_client(caps);
+    assert_advertised(&init_response);
+    // Opening the doc eager-spawns mock-codeaction (the lua fence's bridge
+    // server); its handshake advertises `executeCommandProvider.commands`.
+    open_markdown(&mut client);
+
+    let (reg_id, reg_params) = client
+        .wait_for_server_request("client/registerCapability", Duration::from_secs(5))
+        .expect("the bridge must register the downstream's palette commands upstream");
+    let registrations = reg_params["registrations"]
+        .as_array()
+        .expect("registrations array");
+    let exec = registrations
+        .iter()
+        .find(|r| r["method"] == "workspace/executeCommand")
+        .expect("a workspace/executeCommand registration");
+    let commands = exec["registerOptions"]["commands"]
+        .as_array()
+        .expect("registerOptions.commands");
+    assert!(
+        commands.iter().any(|c| c == "mock.run"),
+        "the mock's advertised command must be registered, got: {commands:?}"
+    );
+    client.send_response(reg_id, json!(null));
+
+    shutdown(&mut client);
+}

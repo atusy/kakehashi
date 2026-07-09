@@ -53,14 +53,14 @@ impl LanguageServerPool {
                 route.command.to_string(),
             ),
             None => {
-                // Not a bridge-minted command (a client-side or foreign command)
-                // — the bridge has no origin to route it to.
-                warn!(
-                    target: "kakehashi::bridge",
-                    "executeCommand: '{}' is not a bridged command; ignoring",
-                    params.command
-                );
-                return None;
+                // Not an action-encoded command. It may still be a PALETTE
+                // command — a name a downstream advertised via
+                // `executeCommandProvider` that the client fired without an
+                // action context (#628). Route it by the command→origin registry;
+                // otherwise it's foreign and ignored.
+                return self
+                    .dispatch_palette_command(params, settings, upstream_id)
+                    .await;
             }
         };
 
@@ -117,6 +117,105 @@ impl LanguageServerPool {
             work_done_progress_params: params.work_done_progress_params,
         };
         self.send_execute_command_on_handle(&handle, outgoing, upstream_id)
+            .await
+    }
+
+    /// Route a PALETTE-fired command (a raw downstream command name, no action
+    /// envelope) to the exact connection that advertised it — recorded in the
+    /// [`command_origins`](Self::command_origins) registry at handshake — so it
+    /// runs in the same `(server, root)` workspace context (#628). Reuses the
+    /// live advertising connection; only if it has since been shut down AND the
+    /// key is a plain client-root fallback does it reconnect. Forwards the command
+    /// name and arguments verbatim; fails soft (foreign command, unspawnable or
+    /// unreachable origin) like every other branch.
+    async fn dispatch_palette_command(
+        &self,
+        params: ExecuteCommandParams,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<Value> {
+        let Some(key) = self.command_origins().route(&params.command) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: '{}' is neither a bridged nor a registered command; ignoring",
+                params.command
+            );
+            return None;
+        };
+        let origin = key.server();
+        let handle = match self.ready_connection_by_key(&key).await {
+            // The connection that advertised the command is still Ready — route
+            // there, preserving its workspace root/context.
+            Some(handle) => handle,
+            // Not Ready or gone. Reconnect ONLY for a plain client-root fallback:
+            // `get_or_create_connection(.., None)` resolves back to that exact
+            // ClientFallback key, so the command runs in the same context. A
+            // SHARED key (`preferSharedInstance`) does NOT round-trip through
+            // `None` — `resolve_acquire` returns the client-fallback key for a
+            // marker-less acquisition, so reconnecting with `None` would spawn a
+            // client-root process instead of the shared instance and run the
+            // command in the wrong workspace. A MARKER-rooted key has the same
+            // problem. Both fail soft here (the user re-fires once the origin is
+            // back); reconstructing a shared/marker root without a document is a
+            // deferred follow-up.
+            None if key.is_client_fallback() => {
+                if !crate::config::is_server_spawnable(&settings.language_servers, origin) {
+                    return None;
+                }
+                let config = resolve_with_wildcard(
+                    &settings.language_servers,
+                    origin,
+                    merge_bridge_server_configs,
+                )?;
+                // Wait through initialization (bounded by the standard init
+                // budget) rather than take a possibly-`Initializing` handle: the
+                // pool returns an existing not-yet-Ready connection here, whose
+                // `has_capability` check below would then spuriously fail-soft to
+                // `null` even though it would be Ready moments later. Fails soft on
+                // timeout/spawn error like every other branch.
+                match self
+                    .get_or_create_connection_wait_ready(
+                        origin,
+                        &config,
+                        None,
+                        std::time::Duration::from_secs(crate::lsp::bridge::pool::INIT_TIMEOUT_SECS),
+                    )
+                    .await
+                {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        warn!(
+                            target: "kakehashi::bridge",
+                            "executeCommand: failed to reconnect to {origin} for palette command: {e}"
+                        );
+                        return None;
+                    }
+                }
+            }
+            None => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: origin connection for palette command '{}' ({origin}) is not ready; ignoring",
+                    params.command
+                );
+                return None;
+            }
+        };
+        if !handle.has_capability(METHOD) {
+            // The advertising connection was Ready (capabilities set) when it
+            // registered the command, but the RECONNECT path can hand back a
+            // still-`Initializing` handle whose capabilities aren't set yet, so
+            // this is reachable. Warn rather than drop silently (every other
+            // failure branch warns) so a fail-soft `null` is diagnosable.
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: origin {origin} for palette command '{}' does not (yet) advertise executeCommandProvider; ignoring",
+                params.command
+            );
+            return None;
+        }
+        // Forward the command name and arguments verbatim.
+        self.send_execute_command_on_handle(&handle, params, upstream_id)
             .await
     }
 

@@ -152,9 +152,12 @@ pub(crate) enum UpstreamNotification {
 /// are user-interactive and can pend indefinitely, so awaiting one inline would
 /// freeze forwarding for every bridged server.
 ///
-/// Each variant carries a [`ForwardedRequestCancel`] so the forwarding loop can
-/// observe a downstream `$/cancelRequest` (or connection death) and forward the
-/// cancel to the editor — see [`InboundRequestRegistry`].
+/// Each *reply-bearing* variant carries a [`ForwardedRequestCancel`] so the
+/// forwarding loop can observe a downstream `$/cancelRequest` (or connection
+/// death) and forward the cancel to the editor — see [`InboundRequestRegistry`].
+/// The one exception is [`RegisterCommands`](Self::RegisterCommands), which is
+/// fire-and-forget: it advertises capability names to the editor, expects no
+/// reply, and so carries neither a `reply` sender nor a `cancel`.
 ///
 /// [`InboundRequestRegistry`]: crate::lsp::bridge::InboundRequestRegistry
 pub(crate) enum UpstreamRequest {
@@ -184,6 +187,11 @@ pub(crate) enum UpstreamRequest {
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
         cancel: ForwardedRequestCancel,
     },
+    /// Advertise a downstream server's `workspace/executeCommand` command names
+    /// to the editor via `client/registerCapability`, so its palette lists them
+    /// and fires them by raw name (#628 palette-fired commands). Fire-and-forget:
+    /// no reply/cancel (the editor's ack is ignored; routing fails soft anyway).
+    RegisterCommands { commands: Vec<String> },
 }
 
 /// Cancellation context for a forwarded request: the originating connection and
