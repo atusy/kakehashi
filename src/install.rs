@@ -279,6 +279,13 @@ fn install_language_blocking_with_query_installer(
         return result;
     }
 
+    if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
+        let reason = e.to_string();
+        result.parser_error = Some(reason.clone());
+        result.queries_error = Some(reason);
+        return result;
+    }
+
     // Install parser
     // For async/auto-install, always use cache (background operation)
     let parser_options = parser::InstallOptions {
@@ -632,6 +639,7 @@ mod tests {
         let queries_dir = data_dir.join("queries").join("exists_lang");
         std::fs::create_dir_all(&queries_dir).unwrap();
         std::fs::write(queries_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        queries::write_install_marker_for_tests(&queries_dir).unwrap();
 
         // Everything exists, so no download may happen — point the base URL
         // at a closed port to fail loudly if one is attempted anyway.

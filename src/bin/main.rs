@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use kakehashi::install::{default_data_dir, metadata, parser, queries};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// A Language Server Protocol (LSP) server using Tree-sitter for parsing
@@ -397,6 +397,9 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
+    if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+        eprintln!("Warning: failed to recover interrupted query installs: {e}");
+    }
 
     // Collect all installed languages from both parser and queries directories
     let mut languages = BTreeSet::new();
@@ -418,11 +421,8 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     // Also check queries directory for languages that might only have queries
     if let Ok(entries) = fs::read_dir(&queries_dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir()
-                && let Some(name) = path.file_name()
-            {
-                languages.insert(name.to_string_lossy().to_string());
+            if let Some(name) = installed_query_language_name(&entry.path()) {
+                languages.insert(name);
             }
         }
     }
@@ -437,7 +437,7 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 
     for lang in &languages {
         let parser_path = find_parser_file(&parser_dir, lang);
-        let queries_path = queries_dir.join(lang).join("highlights.scm");
+        let queries_path = queries_dir.join(lang);
 
         let parser_status = if parser_path.is_some() {
             "✓ parser"
@@ -445,7 +445,7 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
             "✗ parser"
         };
 
-        let queries_status = if queries_path.exists() {
+        let queries_status = if queries::query_install_is_complete(&queries_path) {
             "✓ queries"
         } else {
             "✗ queries (missing)"
@@ -457,16 +457,24 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
             if let Some(ref p) = parser_path {
                 println!("               parser: {}", p.display());
             }
-            if queries_path.exists() {
-                println!(
-                    "               queries: {}",
-                    queries_path.parent().unwrap().display()
-                );
+            if queries::query_install_is_complete(&queries_path) {
+                println!("               queries: {}", queries_path.display());
             }
         }
     }
 
     Ok(())
+}
+
+fn installed_query_language_name(path: &Path) -> Option<String> {
+    if !path.is_dir() {
+        return None;
+    }
+    let name = path.file_name()?.to_string_lossy();
+    if name.starts_with('.') {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Run the language uninstall command
@@ -486,6 +494,9 @@ fn run_language_uninstall(
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
+    if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+        eprintln!("Warning: failed to recover interrupted query installs: {e}");
+    }
 
     // Determine which languages to uninstall
     let languages_to_uninstall: Vec<String> = if all {
@@ -507,11 +518,8 @@ fn run_language_uninstall(
 
         if let Ok(entries) = fs::read_dir(&queries_dir) {
             for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir()
-                    && let Some(name) = path.file_name()
-                {
-                    languages.insert(name.to_string_lossy().to_string());
+                if let Some(name) = installed_query_language_name(&entry.path()) {
+                    languages.insert(name);
                 }
             }
         }
@@ -547,6 +555,7 @@ fn run_language_uninstall(
 
     // Uninstall each language
     let mut any_removed = false;
+    let mut any_failed = false;
     for lang in &languages_to_uninstall {
         let mut removed_something = false;
 
@@ -559,25 +568,27 @@ fn run_language_uninstall(
                 }
                 Err(e) => {
                     eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
+                    any_failed = true;
                 }
             }
         }
 
-        // Remove queries directory
-        let queries_path = queries_dir.join(lang);
-        if queries_path.exists() {
-            match fs::remove_dir_all(&queries_path) {
-                Ok(()) => {
-                    eprintln!("✓ Removed queries: {}", queries_path.display());
-                    removed_something = true;
+        // Remove queries directory and any kakehashi-created backups under the
+        // same lock used by install replacement, so uninstall cannot race a
+        // concurrent install into resurrecting queries after reporting success.
+        match queries::remove_query_install_and_backups(&queries_dir, lang) {
+            Ok(removal) => {
+                if removal.removed_queries {
+                    eprintln!("✓ Removed queries: {}", queries_dir.join(lang).display());
                 }
-                Err(e) => {
-                    eprintln!(
-                        "✗ Failed to remove queries {}: {}",
-                        queries_path.display(),
-                        e
-                    );
+                if removal.removed_backups {
+                    eprintln!("✓ Removed query backups for '{}'", lang);
                 }
+                removed_something |= removal.removed_anything();
+            }
+            Err(e) => {
+                eprintln!("✗ Failed to remove queries for '{}': {}", lang, e);
+                any_failed = true;
             }
         }
 
@@ -586,6 +597,10 @@ fn run_language_uninstall(
         } else if !all {
             eprintln!("Language '{}' is not installed.", lang);
         }
+    }
+
+    if any_failed {
+        return Err(ExitCode::FAILURE);
     }
 
     if any_removed {
@@ -683,6 +698,11 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     let mut parser_success = true;
     let mut queries_success = true;
 
+    if let Err(e) = queries::clear_uninstall_tombstone_for_install(&data_dir, language) {
+        eprintln!("✗ Failed to prepare query installation: {}", e);
+        return Err(ExitCode::FAILURE);
+    }
+
     // Install parser
     eprintln!("Installing parser for '{}' to {:?}...", language, data_dir);
 
@@ -712,7 +732,9 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     // Install queries (with inherited dependencies)
     eprintln!("Installing queries for '{}' to {:?}...", language, data_dir);
 
-    match queries::install_queries_with_dependencies(language, &data_dir, force) {
+    match queries::install_queries_with_dependencies_after_install_started(
+        language, &data_dir, force,
+    ) {
         Ok(result) => {
             eprintln!("✓ Queries installed: {}", result.install_path.display());
             if verbose {

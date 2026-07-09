@@ -957,6 +957,7 @@ dependencies = [
  "env_logger",
  "filetime",
  "flate2",
+ "fs4",
  "futures",
  "ignore",
  "indexmap",

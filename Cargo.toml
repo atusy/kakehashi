@@ -77,6 +77,7 @@ serde_json = "1"
 shellexpand = "3"
 similar = "3"
 flate2 = "1"
+fs4 = "0.12"
 # Gitignore-respecting file walker for `kakehashi format <paths...>`; also
 # provides the gitignore-style Override matcher backing --excludes.
 ignore = "0.4"
@@ -136,4 +137,3 @@ rstest = "0.26"
 [[bench]]
 name = "semantic_tokens"
 harness = false
-
