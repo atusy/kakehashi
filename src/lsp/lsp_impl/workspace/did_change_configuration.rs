@@ -68,14 +68,19 @@ fn settings_payload(settings: Value) -> (Value, Vec<String>) {
             .filter(|key| is_workspace_setting_key_or_typo(key))
             .collect::<Vec<_>>();
         unknown_keys.extend(unknown_workspace_setting_keys(&kakehashi));
-        unknown_keys.sort();
+        sort_and_dedup_unknown_keys(&mut unknown_keys);
         return (kakehashi, unknown_keys);
     }
 
     let settings = kakehashi_targeted_payload(object);
     let mut unknown_keys = unknown_workspace_setting_keys(&settings);
-    unknown_keys.sort();
+    sort_and_dedup_unknown_keys(&mut unknown_keys);
     (settings, unknown_keys)
+}
+
+fn sort_and_dedup_unknown_keys(unknown_keys: &mut Vec<String>) {
+    unknown_keys.sort();
+    unknown_keys.dedup();
 }
 
 fn uses_deprecated_unwrapped_didchange_shape(settings: &Value) -> bool {
@@ -474,6 +479,18 @@ mod tests {
         assert_eq!(payload, serde_json::Value::Null);
         assert!(unknown_keys.is_empty());
         assert!(serde_json::from_value::<RawWorkspaceSettings>(payload).is_err());
+    }
+
+    #[test]
+    fn settings_payload_deduplicates_unknown_keys() {
+        let (_payload, unknown_keys) = settings_payload(serde_json::json!({
+            "kakehashi": {
+                "autoInstal": true
+            },
+            "autoInstal": false
+        }));
+
+        assert_eq!(unknown_keys, ["autoInstal"]);
     }
 
     #[test]
