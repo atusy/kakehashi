@@ -166,13 +166,30 @@ impl Kakehashi {
         // the region's current host-document end, which bounds the resolved
         // edit so a stale/malformed one can't escape the region into unrelated
         // host text (see `translate_edit_host_ward_strict`).
-        let Some(region_end) = self.code_action_region_end_if_fresh(&envelope) else {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "codeAction/resolve: region {} is stale; returning action unresolved",
-                envelope.region_id
-            );
-            return Ok(action);
+        //
+        // A genuine host-layer action carries no region (verbatim, no
+        // translation), so the gate — which ULID-parses `region_id` and would
+        // fail on the empty host one — is skipped; `region_end` is unused on the
+        // host resolve path. `is_host_layer` additionally requires the empty
+        // `region_id`, so a CONFORMING client can't skip the gate merely by
+        // toggling `host_layer` on a virt envelope. It is not a security boundary
+        // (the envelope round-trips through unprotected client `data`, so a client
+        // could clear `region_id` too) — it guards against accidental bypass, and
+        // the host path fails soft anyway.
+        let region_end = if envelope.is_host_layer() {
+            Position::default()
+        } else {
+            match self.code_action_region_end_if_fresh(&envelope) {
+                Some(region_end) => region_end,
+                None => {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "codeAction/resolve: region {} is stale; returning action unresolved",
+                        envelope.region_id
+                    );
+                    return Ok(action);
+                }
+            }
         };
 
         let settings = self.settings_manager.load_settings();
@@ -359,19 +376,54 @@ impl Kakehashi {
                         t.upstream_id,
                     )
                     .await?;
-                Ok(raw.and_then(|value| {
-                    let actions = parse_code_actions_leniently(value)?;
-                    Some(bridge_code_actions(
-                        actions,
-                        &t.server_name,
-                        t.uri.as_str(),
-                        upstream_caps,
-                        // Host-layer codeAction/resolve is not bridged, so
-                        // host lazy actions are never enveloped/resolved.
-                        false,
-                        None,
-                    ))
-                }))
+                let Some(value) = raw else {
+                    return Ok(None);
+                };
+                let Some(actions) = parse_code_actions_leniently(value) else {
+                    return Ok(None);
+                };
+                // Whether this host server advertises `codeAction/resolve`, so a
+                // host lazy action can be enveloped for resolve-routing back to
+                // it (#627) rather than disabled. Queried on the just-opened
+                // connection — but only when the answer can actually change the
+                // outcome, so the probe (and its marker-root resolution + pool
+                // lock) is skippable on this hot `textDocument/codeAction` path:
+                //
+                // - `server_resolves` is read by `bridge_code_action` ONLY for a
+                //   possibly-lazy action (no edit, no command, and not already
+                //   disabled — a disabled action returns early, before the lazy
+                //   gate). No such action ⇒ never consulted.
+                // - Even with such an action, a HOST lazy action needs the CLIENT
+                //   to either envelope it (`can_envelope`) or show it disabled
+                //   (`disabled_support`); with NEITHER, it is dropped regardless
+                //   of `server_resolves` (envelope path gated on `can_envelope`,
+                //   `disable_action` returns `None` without `disabled_support`).
+                let client_can_use_resolve =
+                    upstream_caps.can_envelope() || upstream_caps.disabled_support;
+                let maybe_lazy = |item: &CodeActionOrCommand| match item {
+                    CodeActionOrCommand::CodeAction(a) => {
+                        a.edit.is_none() && a.command.is_none() && a.disabled.is_none()
+                    }
+                    CodeActionOrCommand::Command(_) => false,
+                };
+                let server_resolves = client_can_use_resolve
+                    && actions.iter().any(maybe_lazy)
+                    && t.pool
+                        .host_server_advertises(
+                            &t.server_name,
+                            &t.server_config,
+                            &t.uri,
+                            "codeAction/resolve",
+                        )
+                        .await;
+                Ok(Some(bridge_code_actions(
+                    actions,
+                    &t.server_name,
+                    t.uri.as_str(),
+                    upstream_caps,
+                    server_resolves,
+                    None,
+                )))
             }
         };
         let result = match ctx.strategy {
