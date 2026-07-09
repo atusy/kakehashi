@@ -35,7 +35,7 @@ fn utf16_width(s: &str) -> usize {
     s.chars().map(|c| c.len_utf16()).sum()
 }
 
-/// Split multiline tokens into non-empty per-line fragments.
+/// Split multiline tokens into per-line fragments, skipping empty multiline fragments.
 ///
 /// The sweep line algorithm groups tokens by `token.line` and treats
 /// `[column, column+length)` as a 1D interval on that line. Multiline
