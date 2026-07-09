@@ -85,8 +85,8 @@ In `did_open_impl`, attach the host document to its external server(s)
 **immediately after the document is registered** — before `ensure_language_loaded`,
 before `parse_document`, before `maybe_auto_install_language`. The attach is
 already fire-and-forget (it spawns per-server tasks); only its *position* moves.
-Because it needs only the client-provided initial language name and the text,
-nothing blocks it.
+Because it needs only the initial language name (client-provided or derived for
+plaintext buffers) and the text, nothing blocks it.
 
 Consequence: a document whose parser is missing, installing, or hung still gets
 full host-language-server functionality — attach, diagnostics, hover,
