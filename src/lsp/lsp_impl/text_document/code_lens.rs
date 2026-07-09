@@ -17,7 +17,7 @@ impl Kakehashi {
     ) -> Result<Option<Vec<CodeLens>>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let work_done_token = params.work_done_progress_params.work_done_token;
-        self.whole_document_preferred_fan_out(
+        self.whole_document_fan_out(
             &params.text_document.uri,
             "textDocument/codeLens",
             raw_params,
