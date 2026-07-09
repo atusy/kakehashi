@@ -28,6 +28,8 @@ pub enum ParserInstallError {
     GitError(String),
     /// Archive download or extraction failed.
     ArchiveError(String),
+    /// Archive metadata would escape the extraction sandbox.
+    UnsafeArchive(String),
     /// Compilation failed.
     CompileError(String),
     /// File system operation failed.
@@ -42,6 +44,7 @@ impl std::fmt::Display for ParserInstallError {
             Self::MetadataError(e) => write!(f, "{}", e),
             Self::GitError(msg) => write!(f, "Git error: {}", msg),
             Self::ArchiveError(msg) => write!(f, "Archive error: {}", msg),
+            Self::UnsafeArchive(msg) => write!(f, "Unsafe archive: {}", msg),
             Self::CompileError(msg) => write!(f, "Compilation error: {}", msg),
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::AlreadyExists(path) => {
@@ -424,7 +427,7 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         );
         match download_and_extract_archive(&archive_url, &repo_name, revision, dest) {
             Ok(()) => return Ok(()),
-            Err(e) => {
+            Err(e) if archive_error_allows_clone_fallback(&e) => {
                 log::warn!(
                     target: "kakehashi::install",
                     "Archive download failed, falling back to git clone: {}",
@@ -432,6 +435,10 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
                 );
                 // Clean up partial extraction before fallback
                 let _ = fs::remove_dir_all(dest);
+            }
+            Err(e) => {
+                let _ = fs::remove_dir_all(dest);
+                return Err(e);
             }
         }
     }
@@ -444,6 +451,10 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         revision
     );
     clone_repo(url, revision, dest)
+}
+
+fn archive_error_allows_clone_fallback(error: &ParserInstallError) -> bool {
+    !matches!(error, ParserInstallError::UnsafeArchive(_))
 }
 
 /// Download a GitHub archive tarball and extract it to the destination directory.
@@ -501,7 +512,7 @@ fn download_and_extract_archive(
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
-            return Err(ParserInstallError::ArchiveError(format!(
+            return Err(ParserInstallError::UnsafeArchive(format!(
                 "Link entry rejected in archive: {}",
                 safe_relative.display()
             )));
@@ -534,7 +545,7 @@ fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ParserInstallError
         match component {
             std::path::Component::Normal(part) => safe.push(part),
             _ => {
-                return Err(ParserInstallError::ArchiveError(format!(
+                return Err(ParserInstallError::UnsafeArchive(format!(
                     "Unsafe path detected in archive: {}",
                     path.display()
                 )));
@@ -1444,6 +1455,16 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_archive_errors_do_not_allow_clone_fallback() {
+        assert!(!archive_error_allows_clone_fallback(
+            &ParserInstallError::UnsafeArchive("link entry rejected".to_string())
+        ));
+        assert!(archive_error_allows_clone_fallback(
+            &ParserInstallError::ArchiveError("download failed".to_string())
+        ));
+    }
+
+    #[test]
     fn safe_archive_relative_path_accepts_normal_components() {
         assert_eq!(
             safe_archive_relative_path(Path::new("src/parser.c")).expect("safe path"),
@@ -1455,7 +1476,7 @@ mod tests {
     fn safe_archive_relative_path_rejects_non_normal_components() {
         for path in [Path::new("../payload"), Path::new("./payload")] {
             match safe_archive_relative_path(path) {
-                Err(ParserInstallError::ArchiveError(message)) => {
+                Err(ParserInstallError::UnsafeArchive(message)) => {
                     assert!(
                         message.contains("Unsafe path detected"),
                         "expected unsafe path message, got: {message}"
@@ -1470,7 +1491,7 @@ mod tests {
     #[test]
     fn safe_archive_relative_path_rejects_unix_root_dir() {
         match safe_archive_relative_path(Path::new("/tmp/payload")) {
-            Err(ParserInstallError::ArchiveError(message)) => {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
                 assert!(
                     message.contains("Unsafe path detected"),
                     "expected unsafe path message, got: {message}"
@@ -1484,7 +1505,7 @@ mod tests {
     #[test]
     fn safe_archive_relative_path_rejects_windows_prefix() {
         match safe_archive_relative_path(Path::new(r"C:\tmp\payload")) {
-            Err(ParserInstallError::ArchiveError(message)) => {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
                 assert!(
                     message.contains("Unsafe path detected"),
                     "expected unsafe path message, got: {message}"
@@ -1512,13 +1533,13 @@ mod tests {
         );
 
         match result {
-            Err(ParserInstallError::ArchiveError(message)) => {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
                 assert!(
                     message.contains("Link entry rejected in archive: out"),
                     "expected link-entry rejection, got: {message}"
                 );
             }
-            other => panic!("expected link-entry ArchiveError, got {other:?}"),
+            other => panic!("expected link-entry UnsafeArchive, got {other:?}"),
         }
         assert!(
             !payload_path.exists(),
