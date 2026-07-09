@@ -124,13 +124,21 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
         .or_else(|| value.get("kakehashi"))
         .filter(|value| value.is_object())
     else {
-        let warnings = if has_known_configuration_key(&settings_root) {
-            ignored_key_warnings(&settings_root)
+        let top_level_flat = flat_configuration_without_wrappers(&value);
+        let raw_value = if has_configuration_signal(&settings_root) {
+            settings_root
+        } else if has_configuration_signal(&top_level_flat) {
+            top_level_flat
+        } else {
+            settings_root
+        };
+        let warnings = if has_configuration_signal(&raw_value) {
+            ignored_key_warnings(&raw_value)
         } else {
             Vec::new()
         };
         return NormalizedClientConfiguration {
-            raw_value: settings_root,
+            raw_value,
             warnings,
         };
     };
@@ -138,21 +146,15 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
     let mut warnings = Vec::new();
     let mut raw_value = inner.clone();
 
-    if let Some(raw_object) = raw_value.as_object_mut()
-        && let Some(root_object) = value.as_object()
-    {
-        for (key, candidate) in root_object {
-            if key == "settings" || key == "kakehashi" {
-                continue;
-            }
+    if let Some(raw_object) = raw_value.as_object_mut() {
+        if let Some(root_object) = value.as_object() {
+            merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
+        }
 
-            if is_known_configuration_key(key) {
-                raw_object
-                    .entry(key.clone())
-                    .or_insert_with(|| candidate.clone());
-            } else {
-                warnings.push(key.clone());
-            }
+        if value.get("settings").is_some()
+            && let Some(settings_object) = settings_root.as_object()
+        {
+            merge_flat_sibling_settings(raw_object, &mut warnings, settings_object);
         }
     }
 
@@ -194,12 +196,50 @@ fn ignored_keys(value: &serde_json::Value) -> Vec<String> {
     };
 
     let mut ignored: Vec<_> = object
-        .keys()
-        .filter(|key| !is_known_configuration_key(key))
-        .cloned()
+        .iter()
+        .filter(|(key, value)| should_warn_unknown_key(key, value))
+        .map(|(key, _)| key.clone())
         .collect();
     ignored.sort();
     ignored
+}
+
+fn flat_configuration_without_wrappers(value: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = value.as_object() else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+
+    serde_json::Value::Object(
+        object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "settings" && key.as_str() != "kakehashi")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn merge_flat_sibling_settings(
+    raw_object: &mut serde_json::Map<String, serde_json::Value>,
+    warnings: &mut Vec<String>,
+    siblings: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, candidate) in siblings {
+        if key == "settings" || key == "kakehashi" {
+            continue;
+        }
+
+        if is_known_configuration_key(key) {
+            raw_object
+                .entry(key.clone())
+                .or_insert_with(|| candidate.clone());
+        } else if should_warn_unknown_key(key, candidate) {
+            warnings.push(key.clone());
+        }
+    }
+}
+
+fn has_configuration_signal(value: &serde_json::Value) -> bool {
+    has_known_configuration_key(value) || has_probable_unknown_configuration_key(value)
 }
 
 fn has_known_configuration_key(value: &serde_json::Value) -> bool {
@@ -208,6 +248,22 @@ fn has_known_configuration_key(value: &serde_json::Value) -> bool {
             .keys()
             .any(|key| is_known_configuration_key(key.as_str()))
     })
+}
+
+fn has_probable_unknown_configuration_key(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object
+            .iter()
+            .any(|(key, value)| should_warn_unknown_key(key, value))
+    })
+}
+
+fn should_warn_unknown_key(key: &str, value: &serde_json::Value) -> bool {
+    !is_known_configuration_key(key)
+        && key != "settings"
+        && key != "kakehashi"
+        && !key.contains('.')
+        && !value.is_object()
 }
 
 fn is_known_configuration_key(key: &str) -> bool {
@@ -295,6 +351,27 @@ mod tests {
     }
 
     #[test]
+    fn merges_settings_root_flat_siblings_with_wrapped_settings() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "kakehashi": {
+                    "autoInstall": false
+                },
+                "diagnosticsDebounceMs": 250,
+                "editorSetting": true
+            }
+        }))
+        .expect("settings-root mixed wrapped and flat settings should parse");
+
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
+        assert_eq!(
+            update.warnings,
+            vec!["Ignored unknown client configuration key(s): editorSetting"]
+        );
+    }
+
+    #[test]
     fn warns_about_unknown_wrapped_keys() {
         let update = parse_client_configuration(serde_json::json!({
             "kakehashi": {
@@ -319,7 +396,10 @@ mod tests {
         .expect("unknown-only settings should still parse");
 
         assert!(raw_workspace_settings_is_empty(&update.settings));
-        assert!(update.warnings.is_empty());
+        assert_eq!(
+            update.warnings,
+            vec!["Ignored unknown client configuration key(s): autoInstal"]
+        );
     }
 
     #[test]
@@ -336,6 +416,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_top_level_known_keys_when_settings_contains_other_servers() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "gopls": {
+                    "usePlaceholders": true
+                }
+            },
+            "autoInstall": false
+        }))
+        .expect("top-level known settings should parse beside other server settings");
+
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert!(update.warnings.is_empty());
+    }
+
+    #[test]
     fn ignores_other_servers_settings_without_warning() {
         let update = parse_client_configuration(serde_json::json!({
             "settings": {
@@ -345,6 +441,20 @@ mod tests {
             }
         }))
         .expect("other servers' settings should parse as an empty update");
+
+        assert!(raw_workspace_settings_is_empty(&update.settings));
+        assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn ignores_dotted_editor_settings_without_warning() {
+        let update = parse_client_configuration(serde_json::json!({
+            "editor.fontSize": 14,
+            "gopls": {
+                "usePlaceholders": true
+            }
+        }))
+        .expect("editor settings should parse as an empty update");
 
         assert!(raw_workspace_settings_is_empty(&update.settings));
         assert!(update.warnings.is_empty());
