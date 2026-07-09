@@ -5,7 +5,7 @@
 //! of resolving injection context before sending requests. This module extracts
 //! that shared preamble into a reusable method: `resolve_bridge_contexts`.
 
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use tower_lsp_server::ls_types::{Position, Range, Uri, WorkspaceEdit};
 use url::Url;
 
 use crate::config::WorkspaceSettings;
@@ -14,7 +14,7 @@ use crate::config::settings::{
     ResolvedLayerConfig,
 };
 use crate::language::injection::ResolvedInjection;
-use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
+use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId, workspace_edit_has_effect};
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard, current_upstream_id};
 use crate::text::PositionMapper;
 
@@ -213,6 +213,11 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
                 }
                 return list.is_empty();
             }
+        }
+        if object.contains_key("changes") || object.contains_key("documentChanges") {
+            return serde_json::from_value::<WorkspaceEdit>(value.clone())
+                .map(|edit| !workspace_edit_has_effect(&edit))
+                .unwrap_or(false);
         }
     }
     false
@@ -1644,6 +1649,41 @@ mod tests {
         assert!(is_empty_layer_value(&serde_json::json!({ "ranges": [] })));
         assert!(!is_empty_layer_value(&serde_json::json!({
             "isIncomplete": false, "items": [{ "label": "x" }]
+        })));
+    }
+
+    #[test]
+    fn empty_layer_value_recognizes_empty_workspace_edits() {
+        assert!(is_empty_layer_value(&serde_json::json!({ "changes": {} })));
+        assert!(is_empty_layer_value(&serde_json::json!({
+            "changes": {
+                "file:///test.md": []
+            }
+        })));
+        assert!(is_empty_layer_value(&serde_json::json!({
+            "documentChanges": []
+        })));
+    }
+
+    #[test]
+    fn empty_layer_value_treats_workspace_edits_with_effect_as_results() {
+        assert!(!is_empty_layer_value(&serde_json::json!({
+            "changes": {
+                "file:///test.md": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "newText": "x"
+                }]
+            }
+        })));
+        assert!(!is_empty_layer_value(&serde_json::json!({
+            "documentChanges": [{
+                "kind": "rename",
+                "oldUri": "file:///old.md",
+                "newUri": "file:///new.md"
+            }]
         })));
     }
 

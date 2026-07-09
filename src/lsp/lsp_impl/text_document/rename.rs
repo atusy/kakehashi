@@ -11,6 +11,7 @@ use tower_lsp_server::ls_types::{NumberOrString, Position, RenameParams, Uri, Wo
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::bridge::workspace_edit_has_effect;
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 const METHOD: &str = "textDocument/rename";
@@ -35,7 +36,7 @@ impl Kakehashi {
             virt,
             native,
             parse_host_verbatim::<WorkspaceEdit>,
-            |_| true,
+            workspace_edit_has_effect,
         )
         .await
     }
@@ -85,7 +86,7 @@ impl Kakehashi {
                         .await
                 }
             },
-            |opt| opt.is_some(),
+            |opt| opt.as_ref().is_some_and(workspace_edit_has_effect),
             cancel_rx,
         )
         .await;

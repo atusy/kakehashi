@@ -22,7 +22,7 @@ use tower_lsp_server::ls_types::RenameParams;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_text_document_position_params, response_has_jsonrpc_error,
-    transform_workspace_edit_to_host,
+    transform_workspace_edit_to_host, workspace_edit_has_effect,
 };
 
 impl LanguageServerPool {
@@ -136,7 +136,7 @@ fn transform_workspace_edit_response_to_host(
         return None;
     }
 
-    Some(edit)
+    workspace_edit_has_effect(&edit).then_some(edit)
 }
 
 #[cfg(test)]
@@ -697,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_edit_empty_changes_returns_empty() {
+    fn workspace_edit_empty_changes_returns_none() {
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
 
@@ -714,9 +714,47 @@ mod tests {
             &virtual_uri,
             &host_uri,
             &RegionOffset::new(5, 0),
-        )
-        .unwrap();
+        );
 
-        assert!(edit.changes.unwrap().is_empty());
+        assert!(
+            edit.is_none(),
+            "empty WorkspaceEdit must fall through to lower-priority rename contributors"
+        );
+    }
+
+    #[test]
+    fn workspace_edit_cross_region_only_changes_returns_none() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let cross_region_uri =
+            VirtualDocumentUri::new(&host_uri, "lua", "region-1").to_uri_string();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "changes": {
+                    cross_region_uri: [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "filtered"
+                    }]
+                }
+            }
+        });
+
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(5, 0),
+        );
+
+        assert!(
+            edit.is_none(),
+            "filtered-to-empty WorkspaceEdit must not mask another rename result"
+        );
     }
 }
