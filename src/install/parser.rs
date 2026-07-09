@@ -39,6 +39,8 @@ pub enum ParserInstallError {
     GitError(String),
     /// Archive download or extraction failed.
     ArchiveError(String),
+    /// Archive contains unsafe paths or entry types.
+    UnsafeArchive(String),
     /// Archive exceeded the configured extraction size budget.
     ArchiveSizeLimitExceeded(String),
     /// Compilation failed.
@@ -55,6 +57,7 @@ impl std::fmt::Display for ParserInstallError {
             Self::MetadataError(e) => write!(f, "{}", e),
             Self::GitError(msg) => write!(f, "Git error: {}", msg),
             Self::ArchiveError(msg) => write!(f, "Archive error: {}", msg),
+            Self::UnsafeArchive(msg) => write!(f, "Unsafe archive: {}", msg),
             Self::ArchiveSizeLimitExceeded(msg) => {
                 write!(f, "Archive size limit exceeded: {}", msg)
             }
@@ -467,7 +470,10 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
 }
 
 fn archive_error_allows_git_fallback(error: &ParserInstallError) -> bool {
-    !matches!(error, ParserInstallError::ArchiveSizeLimitExceeded(_))
+    !matches!(
+        error,
+        ParserInstallError::ArchiveSizeLimitExceeded(_) | ParserInstallError::UnsafeArchive(_)
+    )
 }
 
 fn fail_terminal_archive_error(
@@ -535,7 +541,7 @@ fn download_and_extract_archive(
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
         {
-            return Err(ParserInstallError::ArchiveError(format!(
+            return Err(ParserInstallError::UnsafeArchive(format!(
                 "Path traversal attempt detected in archive: {}",
                 relative.display()
             )));
@@ -545,13 +551,13 @@ fn download_and_extract_archive(
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
-            return Err(ParserInstallError::ArchiveError(format!(
+            return Err(ParserInstallError::UnsafeArchive(format!(
                 "Link entry rejected in archive: {}",
                 relative.display()
             )));
         }
         if !entry_type.is_dir() && !entry_type.is_file() {
-            return Err(ParserInstallError::ArchiveError(format!(
+            return Err(ParserInstallError::UnsafeArchive(format!(
                 "Unsupported entry type rejected in archive: {}",
                 relative.display()
             )));
@@ -1720,7 +1726,7 @@ mod tests {
         let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
 
         match result {
-            Err(ParserInstallError::ArchiveError(message)) => {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
                 assert!(
                     message.contains("Link entry rejected"),
                     "expected link rejection, got: {message}"
@@ -1822,6 +1828,9 @@ mod tests {
         ));
         assert!(archive_error_allows_git_fallback(
             &ParserInstallError::ArchiveError("network failed".to_string())
+        ));
+        assert!(!archive_error_allows_git_fallback(
+            &ParserInstallError::UnsafeArchive("link entry rejected".to_string())
         ));
     }
 
