@@ -7,9 +7,10 @@ use crate::language::LanguageEvent;
 
 impl Kakehashi {
     pub(crate) async fn did_open_impl(&self, params: DidOpenTextDocumentParams) {
-        let language_id = params.text_document.language_id.clone();
-        let lsp_uri = params.text_document.uri.clone();
-        let text = params.text_document.text.clone();
+        let text_document = params.text_document;
+        let language_id = text_document.language_id;
+        let lsp_uri = text_document.uri;
+        let text = text_document.text;
 
         // Convert ls_types::Uri to url::Url for internal use
         let Ok(uri) = uri_to_url(&lsp_uri) else {
@@ -17,11 +18,12 @@ impl Kakehashi {
             return;
         };
 
-        // Try to determine the language
-        let language_name = self
-            .language
-            .language_for_path(uri.path())
-            .or_else(|| Some(language_id.clone()));
+        let language_name = if language_id == "plaintext" {
+            self.language
+                .candidate_language_for_document(uri.path(), &text)
+        } else {
+            Some(language_id.clone())
+        };
 
         // Insert document immediately (without tree) so concurrent requests can find it.
         // This handles race conditions where semanticTokens/full arrives before
@@ -32,8 +34,8 @@ impl Kakehashi {
         // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
         // host document to any `_self` host-bridge server *before* the parser load,
         // the parse, and auto-install — none of which the host tier depends on.
-        // `eager_open_host_document_on_servers` needs only the (path-resolved)
-        // language name and text, so a push-only host server (e.g.
+        // `eager_open_host_document_on_servers` needs only the initial language
+        // name and text, so a push-only host server (e.g.
         // lua-language-server) starts analyzing and pushing diagnostics immediately
         // instead of waiting out a ~120-310ms parse or an unbounded install. It
         // spawns fire-and-forget per-server tasks (non-blocking); no-op when host
@@ -276,6 +278,78 @@ mod tests {
         })
         .await
         .expect("condition should become true");
+    }
+
+    #[tokio::test]
+    async fn plaintext_did_open_without_heuristic_match_stores_unknown_language() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        });
+
+        let uri = Url::parse("file:///test/unknown-buffer").expect("valid test URI");
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri,
+                    language_id: "plaintext".to_string(),
+                    version: 1,
+                    text: "plain text".to_string(),
+                },
+            })
+            .await;
+
+        assert_eq!(
+            server
+                .documents
+                .get(&uri)
+                .expect("document should be stored")
+                .language_id(),
+            None,
+            "plaintext should not be treated as a parser language"
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_did_open_uses_path_candidate() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        });
+
+        let uri = Url::parse("file:///test/from-path.rs").expect("valid test URI");
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri,
+                    language_id: "plaintext".to_string(),
+                    version: 1,
+                    text: "fn main() {}".to_string(),
+                },
+            })
+            .await;
+
+        assert_eq!(
+            server
+                .documents
+                .get(&uri)
+                .expect("document should be stored")
+                .language_id(),
+            Some("rust"),
+            "plaintext should fall back to a path-derived candidate"
+        );
     }
 
     #[tokio::test]

@@ -468,8 +468,8 @@ impl DocumentStore {
     ///
     /// For the **off-ingress** didOpen parse ([`parse_document`]). Unlike
     /// [`update_tree_if_text_and_language_unchanged`] it **sets** the language rather
-    /// than checking it: the open parse refines `language_for_path`'s initial guess
-    /// with content detection (`detect_language`), so it is the writer of the
+    /// than checking it: the open parse refines the language guess stored during
+    /// `didOpen` with content detection (`detect_language`), so it is the writer of the
     /// authoritative language — there is no language to match against. The two axes
     /// it does check, atomically under the same `get_mut` shard lock as the write:
     /// - **text** rejects a within-lifetime stale parse — a `didChange` landed while
@@ -1260,8 +1260,8 @@ mod tests {
     fn set_parse_result_if_text_and_incarnation_unchanged_sets_language_and_tree() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///open_refine.rs").unwrap();
-        // didOpen inserted the document with the path/id language guess ("text");
-        // the open parse refines it to the content-detected "rust" and attaches a tree.
+        // didOpen inserted the document with the client language ID ("text"); the
+        // open parse refines it to the content-detected "rust" and attaches a tree.
         store.insert(
             uri.clone(),
             "fn main() {}".to_string(),
