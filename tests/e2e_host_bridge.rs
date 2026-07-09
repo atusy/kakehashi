@@ -90,6 +90,106 @@ fn shutdown(client: &mut LspClient) {
 }
 
 #[test]
+fn e2e_whole_document_links_concatenate_virt_and_host_layers() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("whole_doc_links.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/documentLink"]
+strategy = "concatenated"
+priorities = ["virt", "host"]
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-link": {
+                        "cmd": [mock_bin(), "document-link"],
+                        "languages": ["markdown"]
+                    },
+                    "mock-virt-link": {
+                        "cmd": [mock_bin(), "document-link"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_whole_doc_links.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "# Title\n\n```lua\nprint(1)\n```\n"
+            }
+        }),
+    );
+
+    let links = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/documentLink",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            assert!(
+                response.get("error").is_none(),
+                "documentLink must not surface a top-level error; got: {:?}",
+                response.get("error")
+            );
+            let links = response["result"].as_array().cloned().unwrap_or_default();
+            if links.len() >= 2 {
+                Some(links)
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            }
+        })
+        .expect("concatenated whole-document links should include virt and host results");
+
+    let lines = links
+        .iter()
+        .filter(|link| {
+            link["tooltip"]
+                .as_str()
+                .is_some_and(|tooltip| tooltip.starts_with("mock-link:"))
+        })
+        .filter_map(|link| link.pointer("/range/start/line").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
+
+    assert!(
+        lines.contains(&0),
+        "host-layer documentLink should keep the host range: {links:?}"
+    );
+    assert!(
+        lines.contains(&3),
+        "virt-layer documentLink should be translated to the lua fence line: {links:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_host_bridge_definition_uses_real_uri_verbatim() {
     let (mut client, _config_dir) = init_client(
         r#"

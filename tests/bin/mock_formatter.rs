@@ -41,6 +41,9 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e_code_lens_resolve.rs` (#355).
+//! - `document-link` — advertises `documentLinkProvider`; answers
+//!   `textDocument/documentLink` with one link whose tooltip identifies the
+//!   requested URI.
 //! - `diagnostics` — advertises `diagnosticProvider`; answers
 //!   `textDocument/diagnostic` with a full report carrying one diagnostic
 //!   that echoes the requested URI, but only for documents it received via
@@ -155,6 +158,10 @@ fn main() {
                     }),
                     "code-lens" => json!({
                         "codeLensProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "document-link" => json!({
+                        "documentLinkProvider": {},
                         "textDocumentSync": 1
                     }),
                     "code-action" | "code-action-preferred" => json!({
@@ -856,6 +863,24 @@ fn main() {
                         "data": data
                     }),
                 );
+            }
+            "textDocument/documentLink" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        json!([{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 1 }
+                            },
+                            "tooltip": format!("mock-link:{uri}"),
+                            "target": uri
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
             }
             "textDocument/onTypeFormatting" => {
                 // Answer with the whole-document transformation REGARDLESS of
