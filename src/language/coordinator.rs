@@ -1062,6 +1062,9 @@ impl LanguageCoordinator {
             if let Some(base) = self.resolve_base(token) {
                 return Some(base);
             }
+            if Path::new(path).extension().is_some() {
+                return Some(token.to_string());
+            }
         }
 
         if let Some(candidate) = super::heuristic::detect_from_first_line(content) {
@@ -1875,6 +1878,10 @@ mod tests {
         assert_eq!(
             coordinator.candidate_language_for_document("/script", "#!/usr/bin/env python\n"),
             Some("python".to_string())
+        );
+        assert_eq!(
+            coordinator.candidate_language_for_document("/path/to/file.my_lang", ""),
+            Some("my_lang".to_string())
         );
     }
 
