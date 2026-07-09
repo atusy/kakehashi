@@ -487,14 +487,14 @@ fn download_and_extract_archive(
     fs::create_dir_all(dest)?;
 
     for entry_result in archive.entries().map_err(|e| {
-        ParserInstallError::ArchiveError(format!("Failed to read archive entries: {}", e))
+        ParserInstallError::UnsafeArchive(format!("Failed to read archive entries: {}", e))
     })? {
         let mut entry = entry_result.map_err(|e| {
-            ParserInstallError::ArchiveError(format!("Failed to read entry: {}", e))
+            ParserInstallError::UnsafeArchive(format!("Failed to read entry: {}", e))
         })?;
 
         let path = entry.path().map_err(|e| {
-            ParserInstallError::ArchiveError(format!("Invalid path in archive: {}", e))
+            ParserInstallError::UnsafeArchive(format!("Invalid path in archive: {}", e))
         })?;
 
         // Strip the root directory prefix (e.g., "tree-sitter-json-0.24.8/")
