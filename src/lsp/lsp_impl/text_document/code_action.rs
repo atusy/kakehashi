@@ -381,10 +381,18 @@ impl Kakehashi {
                 // Whether this host server advertises `codeAction/resolve`, so a
                 // host lazy action can be enveloped for resolve-routing back to
                 // it (#627) rather than disabled. Queried on the just-opened
-                // connection — skipped when there are no actions, since
-                // `bridge_code_actions` returns empty regardless (avoids a
-                // redundant lock acquisition on the hot path).
-                let server_resolves = !actions.is_empty()
+                // connection — but only when at least one action could actually
+                // consume the answer. `bridge_code_actions` reads `server_resolves`
+                // ONLY for an action with no edit AND no command (a possibly-lazy
+                // action); a menu of purely materialized actions never looks at
+                // it, so the probe (and its lock acquisition) is skippable on that
+                // hot path. Probing whenever such an action exists — regardless of
+                // its `data`/`disabled` — keeps the result byte-identical.
+                let maybe_lazy = |item: &CodeActionOrCommand| match item {
+                    CodeActionOrCommand::CodeAction(a) => a.edit.is_none() && a.command.is_none(),
+                    CodeActionOrCommand::Command(_) => false,
+                };
+                let server_resolves = actions.iter().any(maybe_lazy)
                     && t.pool
                         .host_server_advertises(
                             &t.server_name,

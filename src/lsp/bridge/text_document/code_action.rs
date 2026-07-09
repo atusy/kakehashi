@@ -86,10 +86,14 @@ pub(crate) struct CodeActionEnvelope {
 impl CodeActionEnvelope {
     /// Whether this is a genuine HOST-layer envelope: `host_layer` set AND no
     /// region identity. A host envelope is minted with an empty `region_id`
-    /// ([`envelope_host_action`]), so requiring that here means a client can't
-    /// flip `host_layer = true` on a VIRT envelope (which keeps its `region_id`)
-    /// to route it through the translation-free host path and skip the region
-    /// freshness / coordinate validation.
+    /// ([`envelope_host_action`]), so requiring both here means a CONFORMING
+    /// client that merely flips `host_layer = true` on a VIRT envelope (which
+    /// keeps its `region_id`) still can't route it through the translation-free
+    /// host path and skip the region freshness / coordinate validation. This is
+    /// not a security boundary: the envelope round-trips through client-supplied
+    /// `CodeAction.data` and is not integrity-protected, so a client could clear
+    /// `region_id` too — the check guards against ACCIDENTAL bypass, not a
+    /// malicious one (which the translation-free host path also fails soft on).
     pub(crate) fn is_host_layer(&self) -> bool {
         self.host_layer && self.region_id.is_empty()
     }
@@ -233,20 +237,18 @@ fn finalize_host_resolved_action(
     // A materialized command must route back to the host server via
     // executeCommand; drop it if the routing name can't be encoded. Remember
     // whether a command was actually DROPPED (present but unencodable) — that is
-    // distinct from a resolve that never carried a command.
-    let command_dropped = match resolved.command.as_mut() {
-        Some(command) => match encode_command(&server_name, &envelope.host_uri, &command.command) {
-            Some(encoded) => {
-                command.command = encoded;
-                false
-            }
-            None => {
-                resolved.command = None;
-                true
-            }
-        },
-        None => false,
-    };
+    // distinct from a resolve that never carried a command. Encode under the
+    // mutable borrow, then clear afterwards so the borrow is out of scope.
+    let mut command_dropped = false;
+    if let Some(command) = resolved.command.as_mut() {
+        match encode_command(&server_name, &envelope.host_uri, &command.command) {
+            Some(encoded) => command.command = encoded,
+            None => command_dropped = true,
+        }
+    }
+    if command_dropped {
+        resolved.command = None;
+    }
 
     // A resolved action with no command and no applicable edit is a no-op —
     // disable it as unresolvable (`REASON_RESOLVE`) rather than hand the client
