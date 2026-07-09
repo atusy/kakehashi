@@ -337,7 +337,7 @@ impl BridgeCoordinator {
     /// window than the codeAction↔executeCommand gap this closes.
     pub(crate) async fn ensure_server_documents_open(
         &self,
-        settings: &WorkspaceSettings,
+        settings: &Arc<WorkspaceSettings>,
         host_language: &str,
         host_uri: &Url,
         injections: Vec<BridgeInjection>,
@@ -365,26 +365,23 @@ impl BridgeCoordinator {
     /// came from ruff). Pure; the async open is separate so it is unit-testable.
     fn injections_for_server(
         &self,
-        settings: &WorkspaceSettings,
+        settings: &Arc<WorkspaceSettings>,
         host_language: &str,
         injections: Vec<BridgeInjection>,
         server_name: &str,
     ) -> (Vec<BridgeInjection>, Option<Arc<BridgeServerConfig>>) {
         let mut config: Option<Arc<BridgeServerConfig>> = None;
-        // Injections commonly share an injection language (many fences of the
-        // same kind), so memoize the per-language resolution: `get_all_configs_
-        // for_language` scans/merges/sorts server configs, and this runs on the
-        // user-facing executeCommand path. Cache whether `server_name` bridges
-        // each language once, folding its config in on the first match.
-        let mut matched_by_language: HashMap<String, bool> = HashMap::new();
+        // Resolve via the per-settings-snapshot memo
+        // ([`Self::cached_configs_for_injection_language`]): several injections
+        // commonly share an injection language, and the cache also spans repeated
+        // executeCommands on the same snapshot, so the scan/merge/sort runs once
+        // per (host, injection) language rather than once per injection — this is
+        // on the user-facing executeCommand path.
         let for_server = injections
             .into_iter()
             .filter(|inj| {
-                if let Some(&matched) = matched_by_language.get(&inj.language) {
-                    return matched;
-                }
-                let matched = match self
-                    .get_all_configs_for_language(settings, host_language, &inj.language)
+                match self
+                    .cached_configs_for_injection_language(settings, host_language, &inj.language)
                     .into_iter()
                     .find(|r| r.server_name == server_name)
                 {
@@ -393,9 +390,7 @@ impl BridgeCoordinator {
                         true
                     }
                     None => false,
-                };
-                matched_by_language.insert(inj.language.clone(), matched);
-                matched
+                }
             })
             .collect();
         (for_server, config)
@@ -1413,12 +1408,12 @@ mod tests {
         let mut servers = HashMap::new();
         servers.insert("ruff".to_string(), server("ruff"));
         servers.insert("pyright".to_string(), server("pyright"));
-        let settings = WorkspaceSettings {
+        let settings = Arc::new(WorkspaceSettings {
             languages,
             auto_install: false,
             language_servers: servers,
             ..Default::default()
-        };
+        });
 
         let injections = vec![BridgeInjection {
             language: "python".to_string(),
@@ -1476,12 +1471,12 @@ mod tests {
             "ruff".to_string(),
             crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("python"),
         );
-        let settings = WorkspaceSettings {
+        let settings = Arc::new(WorkspaceSettings {
             languages,
             auto_install: false,
             language_servers: servers,
             ..Default::default()
-        };
+        });
 
         let host_uri = Url::parse("file:///doc.md").unwrap();
         let injections = vec![BridgeInjection {

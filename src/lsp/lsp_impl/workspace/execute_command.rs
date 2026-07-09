@@ -46,7 +46,7 @@ impl Kakehashi {
     async fn sync_origin_documents_before_execute(
         &self,
         params: &ExecuteCommandParams,
-        settings: &crate::config::WorkspaceSettings,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
     ) {
         let Some(route) = crate::lsp::bridge::decode_command(&params.command) else {
             return;
