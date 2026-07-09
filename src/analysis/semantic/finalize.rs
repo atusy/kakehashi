@@ -32,7 +32,22 @@ fn token_priority(t: &RawToken) -> (u32, usize, usize, usize) {
 
 /// Compute the UTF-16 width of a string.
 fn utf16_width(s: &str) -> usize {
+    if s.is_ascii() {
+        return s.len();
+    }
     s.chars().map(|c| c.len_utf16()).sum()
+}
+
+fn cached_utf16_width(
+    cache: &mut Vec<Option<usize>>,
+    lines: &[&str],
+    line: usize,
+) -> Option<usize> {
+    let line_text = lines.get(line)?;
+    if line >= cache.len() {
+        cache.resize(line + 1, None);
+    }
+    Some(*cache[line].get_or_insert_with(|| utf16_width(line_text)))
 }
 
 /// Split multiline tokens into per-line fragments, skipping empty multiline fragments.
@@ -44,15 +59,14 @@ fn utf16_width(s: &str) -> usize {
 /// splits around other tokens on the same start line.
 fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken> {
     let mut result = Vec::with_capacity(tokens.len());
+    let mut line_widths: Vec<Option<usize>> = Vec::new();
     for token in tokens {
         // If the token's line is beyond the lines array, keep as-is (no line
         // info to determine whether it's multiline).
-        let Some(line_text) = lines.get(token.line) else {
+        let Some(line_width) = cached_utf16_width(&mut line_widths, lines, token.line) else {
             result.push(token);
             continue;
         };
-
-        let line_width = utf16_width(line_text);
 
         // Single-line token: column + length fits within the line
         if token.column + token.length <= line_width {
@@ -66,7 +80,8 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
         let mut start_col = token.column;
 
         while remaining > 0 && current_line < lines.len() {
-            let current_line_width = utf16_width(lines[current_line]);
+            let current_line_width =
+                cached_utf16_width(&mut line_widths, lines, current_line).unwrap_or(0);
             let per_line_len = remaining.min(current_line_width.saturating_sub(start_col));
 
             if per_line_len > 0 {
