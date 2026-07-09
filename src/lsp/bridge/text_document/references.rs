@@ -108,7 +108,7 @@ fn transform_references_response_to_host(
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
         log::warn!(
             target: "kakehashi::bridge",
-            "references response carries neither result nor error"
+            "textDocument/references response carries neither result nor error (protocol violation)"
         );
         return None;
     };
@@ -127,16 +127,25 @@ fn transform_references_response_to_host(
         }
 
         // Location[] → transform each location
-        if let Ok(locations) = serde_json::from_value::<Vec<Location>>(result) {
-            let transformed: Vec<Location> = locations
-                .into_iter()
-                .filter_map(|location| {
-                    transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
-                })
-                .collect();
+        match serde_json::from_value::<Vec<Location>>(result) {
+            Ok(locations) => {
+                let transformed: Vec<Location> = locations
+                    .into_iter()
+                    .filter_map(|location| {
+                        transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
+                    })
+                    .collect();
 
-            // Preserve empty array after filtering
-            return Some(transformed);
+                // Preserve empty array after filtering
+                return Some(transformed);
+            }
+            Err(err) => {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "references response did not match Location[]: {err}"
+                );
+                return None;
+            }
         }
     }
 
@@ -179,17 +188,20 @@ mod tests {
 
     impl Log for CapturingLogger {
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.level() <= Level::Warn && metadata.target() == "kakehashi::bridge"
+            metadata.level() == Level::Warn && metadata.target() == "kakehashi::bridge"
         }
 
         fn log(&self, record: &Record<'_>) {
             if CAPTURING.load(Ordering::Relaxed) && self.enabled(record.metadata()) {
-                self.messages.lock().unwrap().push(format!(
-                    "{}:{}:{}",
-                    record.level(),
-                    record.target(),
-                    record.args()
-                ));
+                self.messages
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(format!(
+                        "{}:{}:{}",
+                        record.level(),
+                        record.target(),
+                        record.args()
+                    ));
             }
         }
 
@@ -201,13 +213,25 @@ mod tests {
             log::set_logger(&LOGGER).expect("test logger should install once");
             log::set_max_level(LevelFilter::Trace);
         });
-        let _capture = CAPTURE_LOCK.lock().unwrap();
-        LOGGER.messages.lock().unwrap().clear();
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        LOGGER
+            .messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         CAPTURING.store(true, Ordering::Relaxed);
         let _guard = CaptureGuard;
         f();
-        let captured = LOGGER.messages.lock().unwrap().clone();
-        LOGGER.messages.lock().unwrap().clear();
+        let captured = LOGGER
+            .messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        LOGGER
+            .messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         captured
     }
 
@@ -254,7 +278,9 @@ mod tests {
         assert!(
             warnings.iter().any(|message| {
                 message.contains("kakehashi::bridge")
-                    && message.contains("references response carries neither result nor error")
+                    && message.contains(
+                        "textDocument/references response carries neither result nor error (protocol violation)",
+                    )
             }),
             "expected missing-result references warning, got {warnings:?}"
         );
