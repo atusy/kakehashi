@@ -1453,7 +1453,15 @@ mod tests {
             &temp.path().join("dest"),
         );
 
-        assert!(result.is_err(), "symlink escape archive must be rejected");
+        match result {
+            Err(ParserInstallError::ArchiveError(message)) => {
+                assert!(
+                    message.contains("Link entry rejected in archive: out"),
+                    "expected link-entry rejection, got: {message}"
+                );
+            }
+            other => panic!("expected link-entry ArchiveError, got {other:?}"),
+        }
         assert!(
             !payload_path.exists(),
             "archive extraction must not write through a symlink outside dest"
