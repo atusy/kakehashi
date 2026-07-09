@@ -16,6 +16,8 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{Range, SemanticTokens};
 use url::Url;
 
+const SEMANTIC_BASELINE_HISTORY: usize = 8;
+
 /// Cached semantic tokens for delta calculations.
 #[derive(Clone)]
 pub struct CachedSemanticTokens {
@@ -51,6 +53,8 @@ pub struct CachedSemanticTokens {
 /// Thread-safe semantic token cache.
 pub struct SemanticTokenCache {
     cache: DashMap<Url, CachedSemanticTokens>,
+    baselines: DashMap<(Url, String), Arc<SemanticTokens>>,
+    baseline_order: DashMap<Url, Vec<String>>,
 }
 
 impl SemanticTokenCache {
@@ -58,6 +62,8 @@ impl SemanticTokenCache {
     pub fn new() -> Self {
         Self {
             cache: DashMap::new(),
+            baselines: DashMap::new(),
+            baseline_order: DashMap::new(),
         }
     }
 
@@ -73,16 +79,33 @@ impl SemanticTokenCache {
         parsed_version: u64,
         generation: u64,
     ) {
+        let result_id = tokens.result_id.clone();
+        let tokens = Arc::new(tokens);
         self.cache.insert(
-            uri,
+            uri.clone(),
             CachedSemanticTokens {
-                tokens: Arc::new(tokens),
+                tokens: Arc::clone(&tokens),
                 language,
                 parsed_version,
                 generation,
                 cache_key,
             },
         );
+        if let Some(result_id) = result_id {
+            self.store_baseline(uri, result_id, tokens);
+        }
+    }
+
+    fn store_baseline(&self, uri: Url, result_id: String, tokens: Arc<SemanticTokens>) {
+        self.baselines
+            .insert((uri.clone(), result_id.clone()), tokens);
+        let mut order = self.baseline_order.entry(uri.clone()).or_default();
+        order.retain(|id| id != &result_id);
+        order.push(result_id);
+        while order.len() > SEMANTIC_BASELINE_HISTORY {
+            let evicted = order.remove(0);
+            self.baselines.remove(&(uri.clone(), evicted));
+        }
     }
 
     /// Retrieve semantic tokens for a document.
@@ -139,6 +162,8 @@ impl SemanticTokenCache {
     /// the invalidation race-safe, this just stops the dead entries from leaking.
     pub fn clear(&self) {
         self.cache.clear();
+        self.baselines.clear();
+        self.baseline_order.clear();
     }
 
     /// Get cached tokens if the result_id matches.
@@ -147,18 +172,28 @@ impl SemanticTokenCache {
     /// - No tokens are cached for this URI
     /// - The cached result_id doesn't match the expected one
     pub fn get_if_valid(&self, uri: &Url, expected_result_id: &str) -> Option<Arc<SemanticTokens>> {
-        self.cache.get(uri).and_then(|entry| {
+        if let Some(tokens) = self.cache.get(uri).and_then(|entry| {
             if entry.tokens.result_id.as_deref() == Some(expected_result_id) {
                 Some(Arc::clone(&entry.tokens))
             } else {
                 None
             }
-        })
+        }) {
+            return Some(tokens);
+        }
+        self.baselines
+            .get(&(uri.clone(), expected_result_id.to_string()))
+            .map(|entry| Arc::clone(&entry))
     }
 
     /// Remove cached tokens for a document (e.g., on document close).
     pub fn remove(&self, uri: &Url) {
         self.cache.remove(uri);
+        if let Some((_, order)) = self.baseline_order.remove(uri) {
+            for result_id in order {
+                self.baselines.remove(&(uri.clone(), result_id));
+            }
+        }
     }
 }
 
@@ -727,6 +762,56 @@ mod tests {
         assert!(
             cache.get_if_valid(&other_uri, "42").is_none(),
             "Non-existent URI should return None"
+        );
+    }
+
+    #[test]
+    fn semantic_cache_keeps_previous_delta_baseline() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///test.rs").unwrap();
+
+        cache.store(
+            uri.clone(),
+            SemanticTokens {
+                result_id: Some("old".to_string()),
+                data: vec![SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 1,
+                    token_type: 1,
+                    token_modifiers_bitset: 0,
+                }],
+            },
+            "rust".to_string(),
+            1,
+            1,
+            0,
+        );
+        cache.store(
+            uri.clone(),
+            SemanticTokens {
+                result_id: Some("new".to_string()),
+                data: vec![SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 2,
+                    token_type: 1,
+                    token_modifiers_bitset: 0,
+                }],
+            },
+            "rust".to_string(),
+            2,
+            2,
+            0,
+        );
+
+        assert!(
+            cache.get_if_valid(&uri, "old").is_some(),
+            "a slightly stale client baseline should still be available for delta"
+        );
+        assert!(
+            cache.get_if_valid(&uri, "new").is_some(),
+            "the latest baseline must remain available"
         );
     }
 
