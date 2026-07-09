@@ -231,27 +231,36 @@ fn finalize_host_resolved_action(
     }
 
     // A materialized command must route back to the host server via
-    // executeCommand; drop it if the routing name can't be encoded.
-    if resolved
-        .command
-        .as_mut()
-        .and_then(|command| {
-            encode_command(&server_name, &envelope.host_uri, &command.command)
-                .map(|encoded| command.command = encoded)
-        })
-        .is_none()
-    {
-        resolved.command = None;
-    }
+    // executeCommand; drop it if the routing name can't be encoded. Remember
+    // whether a command was actually DROPPED (present but unencodable) — that is
+    // distinct from a resolve that never carried a command.
+    let command_dropped = match resolved.command.as_mut() {
+        Some(command) => match encode_command(&server_name, &envelope.host_uri, &command.command) {
+            Some(encoded) => {
+                command.command = encoded;
+                false
+            }
+            None => {
+                resolved.command = None;
+                true
+            }
+        },
+        None => false,
+    };
 
     // A resolved action with no command and no applicable edit is a no-op —
     // disable it as unresolvable (`REASON_RESOLVE`) rather than hand the client
     // an enabled action that applies nothing (mirrors the virt path's empty-edit
-    // policy). This also covers a command-only action whose routing name couldn't
-    // be encoded above (command dropped, edit absent): an absent edit is treated
-    // the same as an empty one. Without `disabledSupport`, fail soft to the
-    // unresolved action.
-    if resolved.command.is_none() && resolved.edit.as_ref().is_none_or(workspace_edit_is_empty) {
+    // policy). Two shapes qualify: a `Some`-but-empty edit (the server resolved
+    // to nothing), and a command-only action whose routing name couldn't be
+    // encoded above (command dropped, edit absent). A resolve that NEVER carried
+    // a command and has no edit is NOT a no-op — it is a still-lazy staged
+    // resolve, re-enveloped for a further pass below. Without `disabledSupport`,
+    // fail soft to the unresolved action.
+    if resolved.command.is_none()
+        && (resolved.edit.as_ref().is_some_and(workspace_edit_is_empty)
+            || (command_dropped && resolved.edit.is_none()))
+    {
         if !upstream_caps.disabled_support {
             re_envelope_action(&mut action, &envelope);
             return action;
@@ -2618,6 +2627,47 @@ mod tests {
         let route = crate::lsp::bridge::decode_command(&command.command).expect("routed name");
         assert_eq!(route.origin, "srv");
         assert_eq!(route.command, "server.fix");
+    }
+
+    #[test]
+    fn host_resolve_re_envelopes_still_lazy_result_with_no_command_and_no_edit() {
+        // A resolve that returns NEITHER a command NOR an edit (but never carried
+        // a command to begin with) is a still-lazy staged resolve, NOT a no-op:
+        // it must be re-enveloped for a further resolve pass, not disabled. This
+        // pins the #615 title-only host-lazy path against the dropped-command
+        // no-op guard.
+        let resolved: CodeAction =
+            serde_json::from_value(json!({ "title": "Organize imports" })).unwrap();
+        let action: CodeAction = serde_json::from_value(json!({
+            "title": "Organize imports — srv", "data": { "id": 1 }
+        }))
+        .unwrap();
+        let envelope: CodeActionEnvelope = serde_json::from_value(json!({
+            "origin": "srv",
+            "host_uri": "file:///test.md",
+            "region_id": "",
+            "injection_language": "",
+            "offset": { "line": 0, "column": 0 },
+            "original_title": "Organize imports",
+            "inner": null,
+            "host_layer": true
+        }))
+        .unwrap();
+
+        let out = finalize_host_resolved_action(
+            resolved,
+            action,
+            envelope,
+            "Organize imports — srv".to_string(),
+            caps_resolve(),
+        );
+
+        assert!(
+            out.disabled.is_none(),
+            "a still-lazy (no-command, no-edit) resolve must be re-enveloped, not disabled"
+        );
+        let env = extract_code_action_envelope(&out).expect("re-enveloped for a further resolve");
+        assert!(env.host_layer);
     }
 
     // -- resolve response parsing --------------------------------------------
