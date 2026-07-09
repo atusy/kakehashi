@@ -188,6 +188,113 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
     }));
 }
 
+/// Shape a host server's `codeAction/resolve` RESPONSE for the client (host
+/// layer — coordinates are already host-relative, so no translation). `resolved`
+/// is the downstream's resolved action; `action`/`envelope` are the original
+/// unresolved action + its envelope (for fail-soft and lazy re-envelope);
+/// `suffixed_title` is the "` — {server}`"-suffixed title to re-apply.
+///
+/// Policy (mirrors the virt path): a disabled resolve is surfaced disabled; a
+/// materialized command is name-encoded for `executeCommand` routing (dropped
+/// if unencodable); a result with no command and no applicable edit is a no-op
+/// and is disabled as `REASON_RESOLVE`; a still-lazy result is re-enveloped for
+/// a further resolve. Without `disabledSupport` every disable path fails soft to
+/// the unresolved action instead.
+fn finalize_host_resolved_action(
+    mut resolved: CodeAction,
+    mut action: CodeAction,
+    mut envelope: CodeActionEnvelope,
+    suffixed_title: String,
+    upstream_caps: UpstreamCodeActionCaps,
+) -> CodeAction {
+    // Clone the origin so later `envelope` mutation (lazy re-envelope) doesn't
+    // conflict with the `&str` borrows below; resolve is a cold path.
+    let server_name = envelope.origin.clone();
+
+    // Disabled resolve → surface disabled (strip payload) with disabledSupport,
+    // else fail soft to the unresolved action.
+    if resolved.disabled.is_some() {
+        if !upstream_caps.disabled_support {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+        resolved.title = resuffix_resolved_title(
+            std::mem::take(&mut resolved.title),
+            suffixed_title,
+            &server_name,
+        );
+        resolved.edit = None;
+        resolved.command = None;
+        resolved.data = None;
+        resolved.is_preferred = None;
+        return resolved;
+    }
+
+    // A materialized command must route back to the host server via
+    // executeCommand; drop it if the routing name can't be encoded.
+    if resolved
+        .command
+        .as_mut()
+        .and_then(|command| {
+            encode_command(&server_name, &envelope.host_uri, &command.command)
+                .map(|encoded| command.command = encoded)
+        })
+        .is_none()
+    {
+        resolved.command = None;
+    }
+
+    // A resolved action with no command and no applicable edit is a no-op —
+    // disable it as unresolvable (`REASON_RESOLVE`) rather than hand the client
+    // an enabled action that applies nothing (mirrors the virt path's empty-edit
+    // policy). This also covers a command-only action whose routing name couldn't
+    // be encoded above (command dropped, edit absent): an absent edit is treated
+    // the same as an empty one. Without `disabledSupport`, fail soft to the
+    // unresolved action.
+    if resolved.command.is_none() && resolved.edit.as_ref().is_none_or(workspace_edit_is_empty) {
+        if !upstream_caps.disabled_support {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+        resolved.title = resuffix_resolved_title(
+            std::mem::take(&mut resolved.title),
+            suffixed_title,
+            &server_name,
+        );
+        resolved.edit = None;
+        resolved.data = None;
+        resolved.is_preferred = None;
+        resolved.disabled = Some(CodeActionDisabled {
+            reason: REASON_RESOLVE.to_string(),
+        });
+        return resolved;
+    }
+
+    if !upstream_caps.is_preferred_support {
+        resolved.is_preferred = None;
+    }
+
+    // The resolved edit is already in host coordinates — kept verbatim (no
+    // cross-region / translation concern the virt path guards against).
+    let server_title = std::mem::take(&mut resolved.title);
+    resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, &server_name);
+
+    // Materialized (edit or command) → strip the envelope; still lazy →
+    // re-envelope for a further resolve, syncing a server-changed title.
+    if resolved.edit.is_some() || resolved.command.is_some() {
+        resolved.data = None;
+    } else {
+        if !server_title.is_empty() {
+            envelope.original_title = server_title;
+        }
+        if resolved.data.is_none() {
+            resolved.data = action.data.take();
+        }
+        re_envelope_action(&mut resolved, &envelope);
+    }
+    resolved
+}
+
 /// Whether a `WorkspaceEdit` carries no actual change. Checks the INNER edit
 /// vectors, not just the outer containers: a `changes` map whose every value
 /// is an empty `TextEdit[]`, or `documentChanges` whose every entry has empty
@@ -537,7 +644,7 @@ impl LanguageServerPool {
         &self,
         server_config: &BridgeServerConfig,
         mut action: CodeAction,
-        mut envelope: CodeActionEnvelope,
+        envelope: CodeActionEnvelope,
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
     ) -> CodeAction {
@@ -568,7 +675,7 @@ impl LanguageServerPool {
         let suffixed_title =
             std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
 
-        let Some(mut resolved) = self
+        let Some(resolved) = self
             .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
             .await
         else {
@@ -576,86 +683,7 @@ impl LanguageServerPool {
             return action;
         };
 
-        // Disabled resolve → surface disabled (strip payload) with
-        // disabledSupport, else fail soft to the unresolved action.
-        if resolved.disabled.is_some() {
-            if !upstream_caps.disabled_support {
-                re_envelope_action(&mut action, &envelope);
-                return action;
-            }
-            resolved.title = resuffix_resolved_title(
-                std::mem::take(&mut resolved.title),
-                suffixed_title,
-                server_name,
-            );
-            resolved.edit = None;
-            resolved.command = None;
-            resolved.data = None;
-            resolved.is_preferred = None;
-            return resolved;
-        }
-
-        // A materialized command must route back to the host server via
-        // executeCommand; drop it if the routing name can't be encoded.
-        if resolved
-            .command
-            .as_mut()
-            .and_then(|command| {
-                encode_command(server_name, &envelope.host_uri, &command.command)
-                    .map(|encoded| command.command = encoded)
-            })
-            .is_none()
-        {
-            resolved.command = None;
-        }
-
-        // An empty resolved edit with no command is a no-op — disable it as
-        // unresolvable (`REASON_RESOLVE`) rather than hand the client an enabled
-        // action that applies nothing (mirrors the virt path's empty-edit
-        // policy). Without `disabledSupport`, fail soft to the unresolved action.
-        if resolved.command.is_none() && resolved.edit.as_ref().is_some_and(workspace_edit_is_empty)
-        {
-            if !upstream_caps.disabled_support {
-                re_envelope_action(&mut action, &envelope);
-                return action;
-            }
-            resolved.title = resuffix_resolved_title(
-                std::mem::take(&mut resolved.title),
-                suffixed_title,
-                server_name,
-            );
-            resolved.edit = None;
-            resolved.data = None;
-            resolved.is_preferred = None;
-            resolved.disabled = Some(CodeActionDisabled {
-                reason: REASON_RESOLVE.to_string(),
-            });
-            return resolved;
-        }
-
-        if !upstream_caps.is_preferred_support {
-            resolved.is_preferred = None;
-        }
-
-        // The resolved edit is already in host coordinates — kept verbatim (no
-        // cross-region / translation concern the virt path guards against).
-        let server_title = std::mem::take(&mut resolved.title);
-        resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
-
-        // Materialized (edit or command) → strip the envelope; still lazy →
-        // re-envelope for a further resolve, syncing a server-changed title.
-        if resolved.edit.is_some() || resolved.command.is_some() {
-            resolved.data = None;
-        } else {
-            if !server_title.is_empty() {
-                envelope.original_title = server_title;
-            }
-            if resolved.data.is_none() {
-                resolved.data = action.data.take();
-            }
-            re_envelope_action(&mut resolved, &envelope);
-        }
-        resolved
+        finalize_host_resolved_action(resolved, action, envelope, suffixed_title, upstream_caps)
     }
 
     /// Reconnect to the origin `(server, root)`, restore the original title,
@@ -2499,6 +2527,97 @@ mod tests {
             ..CodeAction::default()
         };
         assert!(extract_code_action_envelope(&action).is_none());
+    }
+
+    // -- host resolve finalization -------------------------------------------
+
+    #[test]
+    fn host_resolve_disables_command_only_action_when_routing_name_unencodable() {
+        // A command-only resolved action whose routing name can't be encoded
+        // (origin contains the routing separator) must NOT surface as an enabled
+        // no-op: the command is dropped and, with no edit, the action is
+        // disabled as REASON_RESOLVE (regression for the dropped-command gap).
+        let resolved: CodeAction = serde_json::from_value(json!({
+            "title": "Run fix",
+            "command": { "title": "Run fix", "command": "server.fix" }
+        }))
+        .unwrap();
+        let action: CodeAction = serde_json::from_value(json!({
+            "title": "Run fix — srv", "data": { "id": 1 }
+        }))
+        .unwrap();
+        let envelope: CodeActionEnvelope = serde_json::from_value(json!({
+            "origin": "sr\u{1f}v", // contains SEP → encode_command fails
+            "host_uri": "file:///test.md",
+            "region_id": "",
+            "injection_language": "",
+            "offset": { "line": 0, "column": 0 },
+            "original_title": "Run fix",
+            "inner": null,
+            "host_layer": true
+        }))
+        .unwrap();
+
+        let out = finalize_host_resolved_action(
+            resolved,
+            action,
+            envelope,
+            "Run fix — sr\u{1f}v".to_string(),
+            caps_resolve(),
+        );
+
+        assert_eq!(
+            out.disabled
+                .as_ref()
+                .expect("must be disabled, not an enabled no-op")
+                .reason,
+            REASON_RESOLVE
+        );
+        assert!(out.command.is_none(), "unencodable command must be dropped");
+        assert!(out.edit.is_none());
+    }
+
+    #[test]
+    fn host_resolve_keeps_command_only_action_when_routing_name_encodable() {
+        // The happy path for the same shape: an encodable origin keeps the
+        // command (name-encoded) and stays enabled.
+        let resolved: CodeAction = serde_json::from_value(json!({
+            "title": "Run fix",
+            "command": { "title": "Run fix", "command": "server.fix" }
+        }))
+        .unwrap();
+        let action: CodeAction = serde_json::from_value(json!({
+            "title": "Run fix — srv", "data": { "id": 1 }
+        }))
+        .unwrap();
+        let envelope: CodeActionEnvelope = serde_json::from_value(json!({
+            "origin": "srv",
+            "host_uri": "file:///test.md",
+            "region_id": "",
+            "injection_language": "",
+            "offset": { "line": 0, "column": 0 },
+            "original_title": "Run fix",
+            "inner": null,
+            "host_layer": true
+        }))
+        .unwrap();
+
+        let out = finalize_host_resolved_action(
+            resolved,
+            action,
+            envelope,
+            "Run fix — srv".to_string(),
+            caps_resolve(),
+        );
+
+        assert!(
+            out.disabled.is_none(),
+            "an encodable command must stay enabled"
+        );
+        let command = out.command.expect("command kept");
+        let route = crate::lsp::bridge::decode_command(&command.command).expect("routed name");
+        assert_eq!(route.origin, "srv");
+        assert_eq!(route.command, "server.fix");
     }
 
     // -- resolve response parsing --------------------------------------------
