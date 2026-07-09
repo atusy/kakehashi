@@ -225,7 +225,7 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
 }
 
 fn is_empty_host_layer_value(request_method: &str, value: &serde_json::Value) -> bool {
-    if request_method == "textDocument/rename" && value.is_object() {
+    if request_method == "textDocument/rename" {
         return serde_json::from_value::<WorkspaceEdit>(value.clone())
             .map(|edit| !workspace_edit_has_effect(&edit))
             .unwrap_or(true);
@@ -1741,10 +1741,18 @@ mod tests {
 
     #[test]
     fn host_layer_rename_treats_malformed_workspace_edit_as_empty() {
-        assert!(is_empty_host_layer_value(
-            "textDocument/rename",
-            &serde_json::json!({ "changes": "bad" })
-        ));
+        for value in [
+            serde_json::json!({ "changes": "bad" }),
+            serde_json::json!("bad"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!([{ "not": "a WorkspaceEdit" }]),
+        ] {
+            assert!(
+                is_empty_host_layer_value("textDocument/rename", &value),
+                "{value:?} must not win host rename fan-in"
+            );
+        }
     }
 
     #[test]
