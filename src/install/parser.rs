@@ -508,9 +508,17 @@ fn download_and_extract_archive(
             )));
         }
 
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "Link entry rejected in archive: {}",
+                relative.display()
+            )));
+        }
+
         let target = dest.join(&relative);
 
-        if entry.header().entry_type().is_dir() {
+        if entry_type.is_dir() {
             fs::create_dir_all(&target)?;
         } else {
             if let Some(parent) = target.parent() {
@@ -937,6 +945,7 @@ fn invalid_metadata(message: String) -> ParserInstallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use tempfile::tempdir;
 
     const TREE_SITTER_JSON_URL: &str =
@@ -1425,6 +1434,87 @@ mod tests {
     fn test_github_archive_url_returns_none_for_ssh() {
         let url = github_archive_url("git@github.com:tree-sitter/tree-sitter-json.git", "v1.0.0");
         assert!(url.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_and_extract_archive_rejects_symlink_escape() {
+        let temp = tempdir().expect("temp dir");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        let payload_path = outside.join("payload");
+        let archive = malicious_symlink_escape_archive("parser-1.0.0", &outside);
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(
+            &archive_url,
+            "parser",
+            "v1.0.0",
+            &temp.path().join("dest"),
+        );
+
+        assert!(result.is_err(), "symlink escape archive must be rejected");
+        assert!(
+            !payload_path.exists(),
+            "archive extraction must not write through a symlink outside dest"
+        );
+    }
+
+    #[cfg(unix)]
+    fn malicious_symlink_escape_archive(root: &str, outside: &Path) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tar::{Builder, EntryType, Header};
+
+        let mut tar = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar);
+
+            let mut link_header = Header::new_gnu();
+            link_header.set_entry_type(EntryType::Symlink);
+            link_header.set_size(0);
+            link_header.set_mode(0o777);
+            link_header.set_cksum();
+            builder
+                .append_link(&mut link_header, format!("{root}/out"), outside)
+                .expect("append symlink");
+
+            let payload = b"escaped";
+            let mut payload_header = Header::new_gnu();
+            payload_header.set_size(payload.len() as u64);
+            payload_header.set_mode(0o644);
+            payload_header.set_cksum();
+            builder
+                .append_data(
+                    &mut payload_header,
+                    format!("{root}/out/payload"),
+                    &payload[..],
+                )
+                .expect("append payload");
+
+            builder.finish().expect("finish tar");
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).expect("compress tar");
+        encoder.finish().expect("finish gzip")
+    }
+
+    fn serve_once(body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("write header");
+            stream.write_all(&body).expect("write body");
+        });
+        format!("http://{addr}/archive.tar.gz")
     }
 
     #[test]
