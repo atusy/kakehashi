@@ -130,13 +130,14 @@ impl Default for SemanticTokenCache {
 
 /// Cached tokens for a `textDocument/semanticTokens/range` request (#535).
 ///
-/// Unlike full/delta, the range path has no short-circuit and re-tokenizes the
-/// visible window on every request. Range is local kakehashi tree-sitter compute
-/// (no downstream fan-out), so the result is a pure function of the document text,
-/// the requested `range`, and the settings generation — keying by all three is
-/// safe. The hit is narrow (only an *identical-viewport* re-request of an unchanged
-/// document under unchanged settings), so a single most-recent entry per URI is
-/// kept rather than a per-range map.
+/// Exact-viewport companion to the full-token cache. Range is local kakehashi
+/// tree-sitter compute (no downstream fan-out), so the result is a pure function
+/// of the document text, the requested `range`, and the settings generation —
+/// keying by all three is safe. The hit is narrow (only an *identical-viewport*
+/// re-request of an unchanged document under unchanged settings), so a single
+/// most-recent entry per URI is kept rather than a per-range map. Different
+/// scrolled viewports miss here but can still filter the full-token cache when
+/// available.
 #[derive(Clone)]
 pub struct CachedRangeTokens {
     pub tokens: Arc<SemanticTokens>,

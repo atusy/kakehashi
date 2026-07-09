@@ -14,6 +14,4 @@ pub(crate) use semantic_cache::{
 };
 
 // Re-export crate-internal functions used by LSP layer
-pub(crate) use semantic::{
-    handle_semantic_tokens_full, handle_semantic_tokens_range_parallel_async,
-};
+pub(crate) use semantic::{filter_semantic_tokens_by_range, handle_semantic_tokens_full};

@@ -4,63 +4,27 @@
 //! which returns semantic tokens for a specific range of the document rather
 //! than the entire document.
 //!
-//! The implementation:
-//! 1. Gets all tokens using full tokenization
-//! 2. Converts delta-encoded tokens to absolute positions
-//! 3. Filters tokens to only those within the requested range
-//! 4. Re-encodes the filtered tokens as deltas
+//! The LSP handler obtains a full-document token set either by reusing the
+//! semantic-token cache or by computing tokens once and storing that full result
+//! for later scrolled viewports. This module owns the pure range projection:
+//! converting delta-encoded tokens to absolute positions, filtering by range,
+//! and re-encoding the filtered tokens as deltas.
 
-use tower_lsp_server::ls_types::{Range, SemanticToken, SemanticTokens, SemanticTokensResult};
-use tree_sitter::{Query, Tree};
+use tower_lsp_server::ls_types::{Range, SemanticToken, SemanticTokens};
 
-use super::handle_semantic_tokens_full;
-
-/// Async variant of `handle_semantic_tokens_range`: runs the CPU-bound path as
-/// a bounded compute-pool work-unit so it doesn't block the runtime. `text`
-/// and `tree` are moved in; `None` on cancellation/failure.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_semantic_tokens_range_parallel_async(
-    pool: &crate::compute_pool::ComputePool,
-    text: std::sync::Arc<str>,
-    tree: Tree,
-    query: std::sync::Arc<Query>,
-    range: Range,
-    filetype: Option<String>,
-    capture_mappings: Option<std::sync::Arc<crate::config::CaptureMappings>>,
-    coordinator: std::sync::Arc<crate::language::LanguageCoordinator>,
-    supports_multiline: bool,
-) -> Option<SemanticTokensResult> {
-    // Get all tokens using the parallel full handler. Range requests don't
-    // populate the injection-token cache (v1 targets the full/delta typing path),
-    // so no cache handle is threaded in.
-    let full_result = handle_semantic_tokens_full(
-        pool,
-        text,
-        tree,
-        query,
-        filetype,
-        capture_mappings,
-        coordinator,
-        supports_multiline,
-        None,
-        // Range requests compute a one-shot slice and aren't part of the
-        // rapid-typing pile-up, so no cancellation token is threaded in.
-        None,
-    )
-    .await?;
-
-    // Extract tokens from result
-    let SemanticTokensResult::Tokens(full_tokens) = full_result else {
-        return Some(full_result);
-    };
-
-    // Filter tokens by range and re-encode as deltas
-    let filtered_data = filter_tokens_by_range(&full_tokens.data, &range);
-
-    Some(SemanticTokensResult::Tokens(SemanticTokens {
+/// Filter full-document semantic tokens to a range result.
+///
+/// The returned tokens intentionally carry no `result_id`: range requests do not
+/// participate in the full/delta lineage, even when the source tokens came from
+/// that cache.
+pub(crate) fn filter_semantic_tokens_by_range(
+    full_tokens: &SemanticTokens,
+    range: &Range,
+) -> SemanticTokens {
+    SemanticTokens {
         result_id: None,
-        data: filtered_data,
-    }))
+        data: filter_tokens_by_range(&full_tokens.data, range),
+    }
 }
 
 /// Filter semantic tokens to only those within the specified range.

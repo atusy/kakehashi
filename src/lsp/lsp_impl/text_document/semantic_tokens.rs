@@ -30,8 +30,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::analysis::{
-    calculate_delta_or_full, handle_semantic_tokens_full,
-    handle_semantic_tokens_range_parallel_async, next_result_id,
+    calculate_delta_or_full, filter_semantic_tokens_by_range, handle_semantic_tokens_full,
+    next_result_id,
 };
 use crate::lsp::current_upstream_id;
 
@@ -1019,6 +1019,25 @@ impl Kakehashi {
             return Ok(Some(SemanticTokensRangeResult::Tokens((*tokens).clone())));
         }
 
+        // A previous full/delta request, or an earlier range miss below, may have
+        // already computed the whole-document token set for this exact snapshot.
+        // Filtering it is much cheaper than re-running the full tree-sitter path
+        // for every scrolled viewport.
+        if let Some(full_tokens) = self
+            .cache
+            .get_current_tokens(&uri, &language_name, cache_key)
+        {
+            let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
+            self.cache.store_range_tokens(
+                uri,
+                domain_range,
+                language_name,
+                range_tokens.clone(),
+                cache_key,
+            );
+            return Ok(Some(SemanticTokensRangeResult::Tokens(range_tokens)));
+        }
+
         // Get capture mappings for token type resolution
         let capture_mappings = self.language.capture_mappings();
 
@@ -1026,37 +1045,47 @@ impl Kakehashi {
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
 
-        let result = handle_semantic_tokens_range_parallel_async(
+        let result = handle_semantic_tokens_full(
             &self.compute_pool,
             text,
             tree,
             query,
-            domain_range,
             Some(language_name.clone()),
             Some(capture_mappings),
             coordinator,
             supports_multiline,
+            None,
+            None,
         )
         .await;
 
-        // Convert to RangeResult. Cache ONLY a clean `Tokens` result (#535); a
-        // `Partial` is passed through to the client as-is but NOT cached (it is a
-        // degraded response), and a `None` becomes an empty `Tokens` and is not
-        // cached either (transient miss/cancel) — caching either could serve a
-        // degraded set on a later identical-viewport re-request.
+        // Convert the computed full result to RangeResult. Cache ONLY a clean
+        // `Tokens` result (#535); a `Partial` is passed through to the client as-is
+        // but NOT cached (it is a degraded response), and a `None` becomes an empty
+        // `Tokens` and is not cached either (transient miss/cancel) — caching
+        // either could serve a degraded set on a later identical-viewport
+        // re-request.
         let domain_range_result = match result {
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens)) => {
-                // `uri` and `language_name` are unused after this arm, so move them
-                // (no clone); `tokens` is cloned because the store and the response
-                // below each need an owned copy.
+            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(mut full_tokens)) => {
+                // Store the full result too: a range miss already paid the whole
+                // full-tokenization cost, and subsequent scrolled viewports can
+                // cheaply filter this cache entry instead of recomputing.
+                full_tokens.result_id = Some(next_result_id());
+                self.cache.store_tokens(
+                    uri.clone(),
+                    full_tokens.clone(),
+                    language_name.clone(),
+                    cache_key,
+                );
+                let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
                 self.cache.store_range_tokens(
                     uri,
                     domain_range,
                     language_name,
-                    tokens.clone(),
+                    range_tokens.clone(),
                     cache_key,
                 );
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(tokens)
+                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(range_tokens)
             }
             Some(tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial)) => {
                 tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial)

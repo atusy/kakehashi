@@ -630,7 +630,7 @@ fn main() {
                 step: 20,
                 variants: 8,
             },
-            targets: "range request variation with scrolling cache misses; currently full-tokenize then filter",
+            targets: "range request variation with scrolling viewports; first miss seeds full-cache filtering",
         },
         Scenario {
             name: "rust_predicate_heavy/full",
@@ -667,7 +667,7 @@ fn main() {
                 step: 24,
                 variants: 8,
             },
-            targets: "range request variation across markdown injections with scrolling cache misses; currently full-tokenize then filter",
+            targets: "range request variation across markdown injections; first miss seeds full-cache filtering",
         },
         Scenario {
             name: "unicode_rust/full",
