@@ -44,6 +44,9 @@
 //! - `document-link` — advertises `documentLinkProvider`; answers
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
 //!   requested URI.
+//! - `document-link-slow-host` / `document-link-slow-virt` — like
+//!   `document-link`, but sleeps before answering and records downstream
+//!   `$/cancelRequest` notifications under `MOCK_LSP_CANCEL_DIR`.
 //! - `diagnostics` — advertises `diagnosticProvider`; answers
 //!   `textDocument/diagnostic` with a full report carrying one diagnostic
 //!   that echoes the requested URI, but only for documents it received via
@@ -112,6 +115,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 
 use serde_json::{Value, json};
 
@@ -160,10 +164,12 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
-                    "document-link" => json!({
-                        "documentLinkProvider": {},
-                        "textDocumentSync": 1
-                    }),
+                    "document-link" | "document-link-slow-host" | "document-link-slow-virt" => {
+                        json!({
+                            "documentLinkProvider": {},
+                            "textDocumentSync": 1
+                        })
+                    }
                     "code-action" | "code-action-preferred" => json!({
                         "codeActionProvider": true,
                         "executeCommandProvider": { "commands": ["mock.run"] },
@@ -406,6 +412,9 @@ fn main() {
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+            }
+            "$/cancelRequest" => {
+                record_cancel(&mode, &message);
             }
             "textDocument/willSaveWaitUntil" => {
                 // `will-save-slow` stalls past kakehashi's 5s save budget so the
@@ -865,6 +874,12 @@ fn main() {
                 );
             }
             "textDocument/documentLink" => {
+                if matches!(
+                    mode.as_str(),
+                    "document-link-slow-host" | "document-link-slow-virt"
+                ) {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -1038,6 +1053,24 @@ fn request_with_params<W: Write>(writer: &mut W, id: Value, method: &str, params
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
     let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
     let _ = writer.flush();
+}
+
+fn record_cancel(mode: &str, message: &Value) {
+    let Ok(dir) = std::env::var("MOCK_LSP_CANCEL_DIR") else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let payload = json!({
+        "mode": mode,
+        "params": message.get("params").cloned().unwrap_or(Value::Null)
+    });
+    let _ = std::fs::write(
+        dir.join(format!("{mode}.json")),
+        serde_json::to_vec(&payload).unwrap_or_default(),
+    );
 }
 
 /// Send a JSON-RPC success response for `id` (no-op for notifications).
