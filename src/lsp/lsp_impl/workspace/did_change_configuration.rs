@@ -99,7 +99,7 @@ fn parse_client_configuration(
 fn parse_normalized_client_configuration(
     normalized: NormalizedClientConfiguration,
 ) -> Result<ClientConfigurationUpdate, serde_json::Error> {
-    let settings = serde_json::from_value::<RawWorkspaceSettings>(normalized.raw_value.clone())?;
+    let settings = serde_json::from_value::<RawWorkspaceSettings>(normalized.raw_value)?;
 
     Ok(ClientConfigurationUpdate {
         settings,
@@ -108,14 +108,26 @@ fn parse_normalized_client_configuration(
 }
 
 fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientConfiguration {
-    let Some(inner) = value
+    let settings_root = value
+        .get("settings")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    let Some(inner) = settings_root
         .get("settings")
         .and_then(|settings| settings.get("kakehashi"))
+        .filter(|value| value.is_object())
+        .or_else(|| settings_root.get("kakehashi"))
+        .filter(|value| value.is_object())
         .or_else(|| value.get("kakehashi"))
+        .filter(|value| value.is_object())
     else {
-        let warnings = ignored_key_warnings(&value);
+        let warnings = if has_known_configuration_key(&settings_root) {
+            ignored_key_warnings(&settings_root)
+        } else {
+            Vec::new()
+        };
         return NormalizedClientConfiguration {
-            raw_value: value,
+            raw_value: settings_root,
             warnings,
         };
     };
@@ -185,6 +197,14 @@ fn ignored_keys(value: &serde_json::Value) -> Vec<String> {
         .collect();
     ignored.sort();
     ignored
+}
+
+fn has_known_configuration_key(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .any(|key| is_known_configuration_key(key.as_str()))
+    })
 }
 
 fn is_known_configuration_key(key: &str) -> bool {
@@ -263,10 +283,12 @@ mod tests {
     }
 
     #[test]
-    fn warns_about_unknown_flat_keys() {
+    fn warns_about_unknown_wrapped_keys() {
         let update = parse_client_configuration(serde_json::json!({
-            "autoInstal": false,
-            "autoInstall": true
+            "kakehashi": {
+                "autoInstal": false,
+                "autoInstall": true
+            }
         }))
         .expect("settings with unknown keys should still parse");
 
@@ -285,10 +307,48 @@ mod tests {
         .expect("unknown-only settings should still parse");
 
         assert!(raw_workspace_settings_is_empty(&update.settings));
-        assert_eq!(
-            update.warnings,
-            vec!["Ignored unknown client configuration key(s): autoInstal"]
-        );
+        assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_settings_root_known_keys() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "autoInstall": false
+            }
+        }))
+        .expect("settings-root payload should parse");
+
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn ignores_other_servers_settings_without_warning() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "gopls": {
+                    "usePlaceholders": true
+                }
+            }
+        }))
+        .expect("other servers' settings should parse as an empty update");
+
+        assert!(raw_workspace_settings_is_empty(&update.settings));
+        assert!(update.warnings.is_empty());
+    }
+
+    #[test]
+    fn non_object_kakehashi_settings_are_empty() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "kakehashi": null
+            }
+        }))
+        .expect("non-object wrapped settings should parse as an empty update");
+
+        assert!(raw_workspace_settings_is_empty(&update.settings));
+        assert!(update.warnings.is_empty());
     }
 
     #[test]
