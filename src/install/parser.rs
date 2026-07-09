@@ -497,26 +497,17 @@ fn download_and_extract_archive(
             continue;
         }
 
-        // Prevent path traversal attacks (zip slip)
-        if relative
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(ParserInstallError::ArchiveError(format!(
-                "Path traversal attempt detected in archive: {}",
-                relative.display()
-            )));
-        }
+        let safe_relative = safe_archive_relative_path(&relative)?;
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(ParserInstallError::ArchiveError(format!(
                 "Link entry rejected in archive: {}",
-                relative.display()
+                safe_relative.display()
             )));
         }
 
-        let target = dest.join(&relative);
+        let target = dest.join(&safe_relative);
 
         if entry_type.is_dir() {
             fs::create_dir_all(&target)?;
@@ -527,7 +518,7 @@ fn download_and_extract_archive(
             entry.unpack(&target).map_err(|e| {
                 ParserInstallError::ArchiveError(format!(
                     "Failed to extract {}: {}",
-                    relative.display(),
+                    safe_relative.display(),
                     e
                 ))
             })?;
@@ -535,6 +526,22 @@ fn download_and_extract_archive(
     }
 
     Ok(())
+}
+
+fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ParserInstallError> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => safe.push(part),
+            _ => {
+                return Err(ParserInstallError::ArchiveError(format!(
+                    "Unsafe path detected in archive: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(safe)
 }
 
 /// Derive the expected root directory name inside a GitHub archive tarball.
@@ -1434,6 +1441,57 @@ mod tests {
     fn test_github_archive_url_returns_none_for_ssh() {
         let url = github_archive_url("git@github.com:tree-sitter/tree-sitter-json.git", "v1.0.0");
         assert!(url.is_none());
+    }
+
+    #[test]
+    fn safe_archive_relative_path_accepts_normal_components() {
+        assert_eq!(
+            safe_archive_relative_path(Path::new("src/parser.c")).expect("safe path"),
+            PathBuf::from("src").join("parser.c")
+        );
+    }
+
+    #[test]
+    fn safe_archive_relative_path_rejects_non_normal_components() {
+        for path in [Path::new("../payload"), Path::new("./payload")] {
+            match safe_archive_relative_path(path) {
+                Err(ParserInstallError::ArchiveError(message)) => {
+                    assert!(
+                        message.contains("Unsafe path detected"),
+                        "expected unsafe path message, got: {message}"
+                    );
+                }
+                other => panic!("expected unsafe archive path error for {path:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_archive_relative_path_rejects_unix_root_dir() {
+        match safe_archive_relative_path(Path::new("/tmp/payload")) {
+            Err(ParserInstallError::ArchiveError(message)) => {
+                assert!(
+                    message.contains("Unsafe path detected"),
+                    "expected unsafe path message, got: {message}"
+                );
+            }
+            other => panic!("expected unsafe archive path error, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_archive_relative_path_rejects_windows_prefix() {
+        match safe_archive_relative_path(Path::new(r"C:\tmp\payload")) {
+            Err(ParserInstallError::ArchiveError(message)) => {
+                assert!(
+                    message.contains("Unsafe path detected"),
+                    "expected unsafe path message, got: {message}"
+                );
+            }
+            other => panic!("expected unsafe archive path error, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
