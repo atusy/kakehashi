@@ -1,4 +1,4 @@
-//! E2E test for the one-per-session `rootMarkers` deprecation notice.
+//! E2E tests for one-per-session deprecation notices.
 //!
 //! The notice is surfaced by `initialize` and `workspace/didChangeConfiguration`
 //! sharing a single session-scoped claim guard, so it fires at most once even
@@ -54,6 +54,10 @@ fn config_with_root_markers() -> Value {
 
 fn flat_didchange_config(auto_install: bool) -> Value {
     json!({ "settings": { "autoInstall": auto_install } })
+}
+
+fn wrapped_didchange_config(auto_install: bool) -> Value {
+    json!({ "settings": { "kakehashi": { "autoInstall": auto_install } } })
 }
 
 #[test]
@@ -151,9 +155,25 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
         json!({ "settings": { "gopls": { "usePlaceholders": true } } }),
     );
 
+    // Canonical wrapped settings are applied without the flat-shape
+    // deprecation popup.
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        wrapped_didchange_config(false),
+    );
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
+            is_unwrapped_didchange_deprecation_notice(p) || is_config_updated(p)
+        })
+        .expect("wrapped reconfig should log a config-updated message");
+    assert_eq!(
+        method, "window/logMessage",
+        "wrapped didChange config must not trigger the flat-shape deprecation popup; got: {params:?}"
+    );
+
     // The first actual flat kakehashi runtime setting still gets the warning,
     // proving the unrelated payload above did not consume the once-per-session
-    // guard.
+    // guard and the wrapped payload above did not warn.
     client.send_notification(
         "workspace/didChangeConfiguration",
         flat_didchange_config(false),
