@@ -123,36 +123,13 @@ fn parse_normalized_client_configuration(
 }
 
 fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientConfiguration {
-    let settings_root = value.get("settings").unwrap_or(&value);
-    let Some(inner) = settings_root
-        .get("kakehashi")
-        .filter(|value| value.is_object())
-        .or_else(|| value.get("kakehashi"))
-        .filter(|value| value.is_object())
-    else {
+    let Some(inner) = value.get("kakehashi").filter(|value| value.is_object()) else {
         let top_level_flat = flat_configuration_without_wrappers(&value);
-        let settings_root_has_signal = has_configuration_signal(settings_root);
         let top_level_flat_has_signal = has_configuration_signal(&top_level_flat);
-        if settings_root_has_signal {
-            let mut ignored = ignored_keys(settings_root);
-            let mut raw_value = settings_root.clone();
-            if let Some(raw_object) = raw_value.as_object_mut()
-                && let Some(top_level_object) = top_level_flat.as_object()
-            {
-                merge_flat_sibling_settings(raw_object, &mut ignored, top_level_object);
-            }
-            let warnings = ignored_key_warnings_from_keys(ignored);
-            return NormalizedClientConfiguration {
-                raw_value,
-                warnings,
-                uses_deprecated_unwrapped_shape: true,
-            };
-        }
-
         let (raw_value, has_signal) = if top_level_flat_has_signal {
             (top_level_flat, true)
         } else {
-            (settings_root.clone(), false)
+            (serde_json::Value::Object(serde_json::Map::new()), false)
         };
         let warnings = if has_signal {
             ignored_key_warnings_from_keys(ignored_keys(&raw_value))
@@ -171,11 +148,6 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
     let mut uses_deprecated_unwrapped_shape = false;
 
     if let Some(raw_object) = raw_value.as_object_mut() {
-        if let Some(settings_object) = value["settings"].as_object() {
-            uses_deprecated_unwrapped_shape |=
-                merge_flat_sibling_settings(raw_object, &mut warnings, settings_object);
-        }
-
         if let Some(root_object) = value.as_object() {
             uses_deprecated_unwrapped_shape |=
                 merge_flat_sibling_settings(raw_object, &mut warnings, root_object);
@@ -379,13 +351,11 @@ mod tests {
     #[test]
     fn parses_section_wrapped_kakehashi_settings() {
         let update = parse_client_configuration(serde_json::json!({
-            "settings": {
-                "kakehashi": {
-                    "autoInstall": false
-                }
+            "kakehashi": {
+                "autoInstall": false
             }
         }))
-        .expect("section-wrapped settings should parse");
+        .expect("wire settings.kakehashi payload should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert!(update.warnings.is_empty());
@@ -407,10 +377,8 @@ mod tests {
     #[test]
     fn merges_known_flat_siblings_with_wrapped_settings() {
         let payload = serde_json::json!({
-            "settings": {
-                "kakehashi": {
-                    "autoInstall": false
-                }
+            "kakehashi": {
+                "autoInstall": false
             },
             "autoInstall": true,
             "diagnosticsDebounceMs": 250,
@@ -431,49 +399,43 @@ mod tests {
         );
 
         let normalized = normalize_kakehashi_settings(serde_json::json!({
-            "settings": {
-                "kakehashi": {
-                    "autoInstall": false
-                }
+            "kakehashi": {
+                "autoInstall": false
             }
         }));
         assert!(
             !normalized.uses_deprecated_unwrapped_shape,
-            "canonical settings.kakehashi payloads must not warn as deprecated"
+            "canonical wire settings.kakehashi payloads must not warn as deprecated"
         );
     }
 
     #[test]
-    fn merges_settings_root_flat_siblings_with_wrapped_settings() {
+    fn ignores_nested_settings_flat_siblings_with_wrapped_settings() {
         let payload = serde_json::json!({
+            "kakehashi": {
+                "autoInstall": false
+            },
             "settings": {
-                "kakehashi": {
-                    "autoInstall": false
-                },
                 "diagnosticsDebounceMs": 250,
                 "editorSetting": true
             }
         });
         let update = parse_client_configuration(payload.clone())
-            .expect("settings-root mixed wrapped and flat settings should parse");
+            .expect("unsupported nested settings beside wrapped settings should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
-        assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
-        assert_eq!(
-            update.warnings,
-            vec!["Ignored unknown client configuration key(s): editorSetting"]
-        );
+        assert_eq!(update.settings.diagnostics_debounce_ms, None);
+        assert!(update.warnings.is_empty());
         assert!(
-            normalize_kakehashi_settings(payload).uses_deprecated_unwrapped_shape,
-            "accepted settings-root flat siblings beside wrapped settings should warn as deprecated"
+            !normalize_kakehashi_settings(payload).uses_deprecated_unwrapped_shape,
+            "unsupported nested settings are ignored rather than treated as accepted flat siblings"
         );
     }
 
     #[test]
-    fn settings_root_flat_siblings_precede_top_level_siblings() {
+    fn flat_siblings_do_not_override_wrapped_settings() {
         let payload = serde_json::json!({
-            "settings": {
-                "kakehashi": {},
+            "kakehashi": {
                 "autoInstall": false
             },
             "autoInstall": true
@@ -493,12 +455,10 @@ mod tests {
     fn ignores_double_wrapped_kakehashi_settings() {
         let update = parse_client_configuration(serde_json::json!({
             "settings": {
-                "settings": {
-                    "kakehashi": {
-                        "autoInstall": false
-                    },
-                    "diagnosticsDebounceMs": 250
-                }
+                "kakehashi": {
+                    "autoInstall": false
+                },
+                "diagnosticsDebounceMs": 250
             }
         }))
         .expect("unsupported double-wrapped settings should parse as an empty update");
@@ -547,14 +507,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_settings_root_known_keys() {
+    fn parses_flat_known_keys() {
         let payload = serde_json::json!({
-            "settings": {
-                "autoInstall": false
-            }
+            "autoInstall": false
         });
-        let update = parse_client_configuration(payload.clone())
-            .expect("settings-root payload should parse");
+        let update =
+            parse_client_configuration(payload.clone()).expect("flat payload should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert!(update.warnings.is_empty());
@@ -562,19 +520,17 @@ mod tests {
         let normalized = normalize_kakehashi_settings(payload);
         assert!(
             normalized.uses_deprecated_unwrapped_shape,
-            "settings-root flat didChange payloads should be accepted but deprecated"
+            "flat didChange payloads should be accepted but deprecated"
         );
     }
 
     #[test]
-    fn warns_about_unknown_top_level_keys_dropped_for_settings_root() {
+    fn warns_about_unknown_flat_keys() {
         let update = parse_client_configuration(serde_json::json!({
-            "settings": {
-                "autoInstall": false
-            },
+            "autoInstall": false,
             "autoInstal": true
         }))
-        .expect("settings-root payload with top-level typo should parse");
+        .expect("flat payload with typo should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert_eq!(
@@ -584,15 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn merges_known_top_level_keys_with_settings_root() {
+    fn parses_multiple_flat_known_keys() {
         let update = parse_client_configuration(serde_json::json!({
-            "settings": {
-                "autoInstall": false
-            },
-            "autoInstall": true,
+            "autoInstall": false,
             "diagnosticsDebounceMs": 250
         }))
-        .expect("settings-root payload with top-level known keys should parse");
+        .expect("flat payload with multiple known keys should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
