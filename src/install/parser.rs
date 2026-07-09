@@ -412,7 +412,8 @@ fn clean_url(url: &str) -> &str {
 ///
 /// Strategy:
 /// 1. If the URL is a GitHub HTTPS URL, try downloading the archive tarball.
-/// 2. If archive download fails (or URL is not GitHub), fall back to git clone.
+/// 2. If ordinary archive download/extraction fails (or URL is not GitHub), fall back to git clone.
+/// 3. If archive metadata is unsafe, fail closed without clone fallback.
 fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
     validate_parser_source_metadata(url, revision)?;
 
