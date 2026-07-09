@@ -137,7 +137,7 @@ impl Kakehashi {
             let pool = self.bridge.pool_arc();
 
             // Outer JoinSet: one task per injection region, all in parallel
-            let mut outer_join_set: JoinSet<Option<Vec<T>>> = JoinSet::new();
+            let mut outer_join_set: JoinSet<(usize, Option<Vec<T>>)> = JoinSet::new();
 
             // Shared client progress across all regions: one aggregator + one
             // teardown guard for the whole request. The winner rule shows the first
@@ -165,7 +165,7 @@ impl Kakehashi {
                 )
                 .await;
 
-            for resolved in all_regions.iter() {
+            for (region_index, resolved) in all_regions.iter().enumerate() {
                 // Get ALL bridge server configs for this injection language
                 let mut configs = self.bridge_configs_for_injection_language(
                     &language_name,
@@ -225,10 +225,11 @@ impl Kakehashi {
                                 .await
                         }
                     };
-                    match result {
+                    let items = match result {
                         FanInResult::Done(items) => items,
                         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
-                    }
+                    };
+                    (region_index, items)
                 });
             }
 
@@ -245,18 +246,19 @@ impl Kakehashi {
             });
 
             // Collect results, aborting early if $/cancelRequest arrives.
-            let all_items = crate::lsp::aggregation::region::collect_region_results_with_cancel(
-                outer_join_set,
-                cancel_rx,
-                |acc, opt: Option<Vec<T>>| {
-                    if let Some(items) = opt {
-                        acc.extend(items);
-                    }
-                },
-            )
-            .await;
+            let ordered_region_items =
+                crate::lsp::aggregation::region::collect_region_results_with_cancel(
+                    outer_join_set,
+                    cancel_rx,
+                    |acc, region_items: (usize, Option<Vec<T>>)| {
+                        acc.push(region_items);
+                    },
+                )
+                .await;
 
-            Ok(nonempty_whole_document_items(all_items?))
+            Ok(nonempty_whole_document_items(flatten_ordered_region_items(
+                ordered_region_items?,
+            )))
         };
 
         let host = async {
@@ -378,5 +380,31 @@ mod tests {
             .expect("layer walk should succeed");
 
         assert_eq!(result, Some(vec!["virt", "host"]));
+    }
+}
+
+fn flatten_ordered_region_items<T>(mut region_items: Vec<(usize, Option<Vec<T>>)>) -> Vec<T> {
+    region_items.sort_by_key(|(region_index, _)| *region_index);
+    region_items
+        .into_iter()
+        .filter_map(|(_, items)| items)
+        .flatten()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flattens_region_results_by_source_order() {
+        let flattened = flatten_ordered_region_items(vec![
+            (2, Some(vec!["late"])),
+            (0, Some(vec!["early"])),
+            (1, None),
+            (3, Some(vec!["last"])),
+        ]);
+
+        assert_eq!(flattened, vec!["early", "late", "last"]);
     }
 }
