@@ -1258,6 +1258,13 @@ impl Kakehashi {
             injection_query.as_ref(),
         );
 
+        // One upstream request ID for the whole scan: every overlapping region's
+        // context shares it, and the virt codeAction path unregisters it ONCE
+        // (`unregister_all_for_upstream_id`) after fanning out to all regions.
+        // Hoisted out of the loop so that shared-ID invariant is explicit and
+        // can't drift if this scan is reused under a different request-id scope.
+        let upstream_request_id = current_upstream_id();
+
         let mapper = PositionMapper::new(snapshot.text());
         let mut contexts = Vec::new();
         for resolved in regions {
@@ -1271,7 +1278,7 @@ impl Kakehashi {
                 uri: uri.clone(),
                 resolved,
                 language_name: language_name.clone(),
-                upstream_request_id: current_upstream_id(),
+                upstream_request_id: upstream_request_id.clone(),
             };
             // A region that resolves to no bridge config contributes nothing.
             let Some(document) = self
