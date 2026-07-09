@@ -268,9 +268,12 @@ fn should_warn_unknown_key(key: &str, value: &serde_json::Value) -> bool {
         && key != "settings"
         && key != "kakehashi"
         && !key.contains('.')
-        && (!value.is_object()
-            || key.chars().any(|ch| ch.is_ascii_uppercase())
-            || is_one_edit_from_known_configuration_key(key))
+        && if value.is_object() {
+            is_one_edit_from_known_configuration_key(key)
+        } else {
+            key.chars().any(|ch| ch.is_ascii_uppercase())
+                || is_one_edit_from_known_configuration_key(key)
+        }
 }
 
 fn is_known_configuration_key(key: &str) -> bool {
@@ -631,6 +634,27 @@ mod tests {
             update.warnings,
             vec!["Ignored unknown client configuration key(s): languageServerss"]
         );
+    }
+
+    #[test]
+    fn ignores_unrelated_object_sections_beside_wrapped_settings() {
+        let normalized = normalize_kakehashi_settings(serde_json::json!({
+            "kakehashi": {
+                "autoInstall": false
+            },
+            "someServer": {
+                "usePlaceholders": true
+            }
+        }));
+
+        assert!(
+            !normalized.uses_deprecated_unwrapped_shape,
+            "unrelated object sections must not claim the flat-shape deprecation slot"
+        );
+        let update = parse_normalized_client_configuration(normalized)
+            .expect("wrapped settings with unrelated object section should parse");
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert!(update.warnings.is_empty());
     }
 
     #[test]
