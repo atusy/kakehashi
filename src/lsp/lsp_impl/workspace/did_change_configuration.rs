@@ -122,20 +122,28 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
         let top_level_flat = flat_configuration_without_wrappers(&value);
         let settings_root_has_signal = has_configuration_signal(settings_root);
         let top_level_flat_has_signal = has_configuration_signal(&top_level_flat);
-        let top_level_flat_ignored = ignored_keys(&top_level_flat);
-        let (raw_value, has_signal) = if settings_root_has_signal {
-            (settings_root.clone(), true)
-        } else if top_level_flat_has_signal {
+        if settings_root_has_signal {
+            let mut ignored = ignored_keys(settings_root);
+            let mut raw_value = settings_root.clone();
+            if let Some(raw_object) = raw_value.as_object_mut()
+                && let Some(top_level_object) = top_level_flat.as_object()
+            {
+                merge_flat_sibling_settings(raw_object, &mut ignored, top_level_object);
+            }
+            let warnings = ignored_key_warnings_from_keys(ignored);
+            return NormalizedClientConfiguration {
+                raw_value,
+                warnings,
+            };
+        }
+
+        let (raw_value, has_signal) = if top_level_flat_has_signal {
             (top_level_flat, true)
         } else {
             (settings_root.clone(), false)
         };
         let warnings = if has_signal {
-            let mut ignored = ignored_keys(&raw_value);
-            if settings_root_has_signal {
-                ignored.extend(top_level_flat_ignored);
-            }
-            ignored_key_warnings_from_keys(ignored)
+            ignored_key_warnings_from_keys(ignored_keys(&raw_value))
         } else {
             Vec::new()
         };
@@ -507,6 +515,22 @@ mod tests {
             update.warnings,
             vec!["Ignored unknown client configuration key(s): autoInstal"]
         );
+    }
+
+    #[test]
+    fn merges_known_top_level_keys_with_settings_root() {
+        let update = parse_client_configuration(serde_json::json!({
+            "settings": {
+                "autoInstall": false
+            },
+            "autoInstall": true,
+            "diagnosticsDebounceMs": 250
+        }))
+        .expect("settings-root payload with top-level known keys should parse");
+
+        assert_eq!(update.settings.auto_install, Some(false));
+        assert_eq!(update.settings.diagnostics_debounce_ms, Some(250));
+        assert!(update.warnings.is_empty());
     }
 
     #[test]
