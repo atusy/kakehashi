@@ -112,10 +112,7 @@ fn parse_normalized_client_configuration(
 }
 
 fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientConfiguration {
-    let settings_root = value
-        .get("settings")
-        .cloned()
-        .unwrap_or_else(|| value.clone());
+    let settings_root = value.get("settings").unwrap_or(&value);
     let Some(inner) = settings_root
         .get("settings")
         .and_then(|settings| settings.get("kakehashi"))
@@ -126,14 +123,16 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
         .filter(|value| value.is_object())
     else {
         let top_level_flat = flat_configuration_without_wrappers(&value);
-        let raw_value = if has_configuration_signal(&settings_root) {
-            settings_root
-        } else if has_configuration_signal(&top_level_flat) {
-            top_level_flat
+        let settings_root_has_signal = has_configuration_signal(settings_root);
+        let top_level_flat_has_signal = has_configuration_signal(&top_level_flat);
+        let (raw_value, has_signal) = if settings_root_has_signal {
+            (settings_root.clone(), true)
+        } else if top_level_flat_has_signal {
+            (top_level_flat, true)
         } else {
-            settings_root
+            (settings_root.clone(), false)
         };
-        let warnings = if has_configuration_signal(&raw_value) {
+        let warnings = if has_signal {
             ignored_key_warnings(&raw_value)
         } else {
             Vec::new()
