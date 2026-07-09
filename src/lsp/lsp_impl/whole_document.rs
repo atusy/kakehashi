@@ -8,8 +8,9 @@
 //!
 //! The fan-out is the virt layer of the resolved layer order
 //! (cross-layer-aggregation); the host layer (host-document-bridge) bridges
-//! the host document itself with the real URI and the response verbatim. The
-//! first layer producing a non-empty result wins (`preferred`).
+//! the host document itself with the real URI and the response verbatim.
+//! `preferred` returns the highest-priority non-empty layer, while
+//! `concatenated` merges every selected layer's list in priority order.
 
 use std::future::Future;
 use std::io;
@@ -260,15 +261,44 @@ impl Kakehashi {
             })
         };
 
-        self.walk_layers(
+        let host = async {
+            match self.resolve_host_bridge_context(lsp_uri, method_name) {
+                Some(ctx) => Ok(self
+                    .host_layer_value_with_ctx(&ctx, method_name, raw_params)
+                    .await?
+                    .and_then(parse_host_verbatim::<Vec<T>>)),
+                None => Ok(None),
+            }
+        };
+
+        self.walk_layers_by_strategy(
             lsp_uri,
             method_name,
             method_name,
-            raw_params,
             virt,
-            parse_host_verbatim::<Vec<T>>,
+            host,
+            std::future::ready(Ok(None)),
             |items: &Vec<T>| !items.is_empty(),
+            concat_whole_document_items,
         )
         .await
+    }
+}
+
+fn concat_whole_document_items<T>(mut acc: Vec<T>, next: Vec<T>) -> Vec<T> {
+    acc.extend(next);
+    acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concatenates_whole_document_layer_items() {
+        assert_eq!(
+            concat_whole_document_items(vec![1, 2], vec![3, 4]),
+            vec![1, 2, 3, 4]
+        );
     }
 }
