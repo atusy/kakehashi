@@ -186,9 +186,11 @@ pub(crate) fn resolve_layer_config_from_settings(
 
 /// Generic emptiness check for raw host-layer results in the `preferred`
 /// fan-in: `null` and `[]` are "no result", as are the object-shaped
-/// "empty but valid" responses whose single canonical list field is empty —
-/// `CompletionList.items`, `SignatureHelp.signatures`,
-/// `LinkedEditingRanges.ranges`. Without the object shapes, a
+/// "empty but valid" responses whose single canonical list field is empty:
+/// `CompletionList.items` when `isIncomplete` is not true,
+/// `SignatureHelp.signatures`, and `LinkedEditingRanges.ranges`. Keep the
+/// completion-list rule in sync with `completion_list_has_result` in the
+/// completion handler. Without the object shapes, a
 /// higher-priority host server's empty list would prematurely win the
 /// fan-in over a lower-priority server with actual results.
 pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
@@ -201,6 +203,14 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
     if let Some(object) = value.as_object() {
         for key in ["items", "signatures", "ranges"] {
             if let Some(list) = object.get(key).and_then(serde_json::Value::as_array) {
+                if key == "items"
+                    && object
+                        .get("isIncomplete")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    return false;
+                }
                 return list.is_empty();
             }
         }
@@ -2371,5 +2381,25 @@ mod tests {
                 "{method} must be prefiltered"
             );
         }
+    }
+
+    #[test]
+    fn incomplete_empty_completion_list_is_not_empty_layer_value() {
+        let value = serde_json::json!({
+            "isIncomplete": true,
+            "items": []
+        });
+
+        assert!(!is_empty_layer_value(&value));
+    }
+
+    #[test]
+    fn complete_empty_completion_list_is_empty_layer_value() {
+        let value = serde_json::json!({
+            "isIncomplete": false,
+            "items": []
+        });
+
+        assert!(is_empty_layer_value(&value));
     }
 }

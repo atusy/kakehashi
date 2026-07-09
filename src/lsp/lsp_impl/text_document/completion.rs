@@ -3,11 +3,14 @@
 //! Walks the resolved layer order (cross-layer-aggregation): the virt layer
 //! bridges the injection region under the cursor, the host layer
 //! (host-document-bridge) bridges the host document itself with the real URI
-//! and the response verbatim. The first layer producing a non-empty result
-//! wins (`preferred`).
+//! and the response verbatim. The first layer producing completion items, or an
+//! incomplete `CompletionList` that asks the client to re-query, wins
+//! (`preferred`).
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{CompletionParams, CompletionResponse, Position, Uri};
+use tower_lsp_server::ls_types::{
+    CompletionList, CompletionParams, CompletionResponse, Position, Uri,
+};
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
@@ -32,10 +35,7 @@ impl Kakehashi {
             raw_params,
             virt,
             parse_host_verbatim::<CompletionResponse>,
-            |resp: &CompletionResponse| match resp {
-                CompletionResponse::Array(items) => !items.is_empty(),
-                CompletionResponse::List(list) => !list.items.is_empty(),
-            },
+            completion_response_has_result,
         )
         .await
     }
@@ -78,7 +78,7 @@ impl Kakehashi {
                     )
                     .await
             },
-            |opt| matches!(opt, Some(list) if !list.items.is_empty()),
+            |opt| opt.as_ref().is_some_and(completion_list_has_result),
             cancel_rx,
         )
         .await;
@@ -89,5 +89,43 @@ impl Kakehashi {
                 Ok(v.map(CompletionResponse::List))
             })
             .await
+    }
+}
+
+fn completion_response_has_result(resp: &CompletionResponse) -> bool {
+    match resp {
+        CompletionResponse::Array(items) => !items.is_empty(),
+        CompletionResponse::List(list) => completion_list_has_result(list),
+    }
+}
+
+fn completion_list_has_result(list: &CompletionList) -> bool {
+    // Keep the incomplete-empty rule in sync with `is_empty_layer_value`,
+    // which applies the same LSP CompletionList semantics to raw JSON.
+    list.is_incomplete || !list.items.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_empty_completion_list_counts_as_result() {
+        let response = CompletionResponse::List(CompletionList {
+            is_incomplete: true,
+            items: vec![],
+        });
+
+        assert!(completion_response_has_result(&response));
+    }
+
+    #[test]
+    fn complete_empty_completion_list_counts_as_empty() {
+        let response = CompletionResponse::List(CompletionList {
+            is_incomplete: false,
+            items: vec![],
+        });
+
+        assert!(!completion_response_has_result(&response));
     }
 }
