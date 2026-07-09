@@ -555,11 +555,18 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// diagnostics go to stderr, which stays inherited for the logs.
 fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(["-c", "http.followRedirects=false"])
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd.args([
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+    ])
+    .args(args)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .env("GIT_TERMINAL_PROMPT", "0");
     // `true` as an askpass helper answers any credential prompt with an empty
     // string immediately. POSIX guarantees the binary; Windows does not ship
     // one (git would fail trying to run it), so gate to unix — Windows relies
@@ -901,14 +908,25 @@ mod tests {
     }
 
     #[test]
-    fn git_command_disables_http_redirects() {
+    fn git_command_pins_https_transport() {
         let cmd = git_command(&["clone", "https://example.invalid/parser"], None);
         let args = cmd
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(&args[..3], ["-c", "http.followRedirects=false", "clone"]);
+        assert_eq!(
+            &args[..7],
+            [
+                "-c",
+                "http.followRedirects=false",
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                "clone",
+            ]
+        );
     }
 
     #[test]
