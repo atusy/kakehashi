@@ -536,16 +536,7 @@ fn download_and_extract_archive(
             continue;
         }
 
-        // Prevent path traversal attacks (zip slip)
-        if relative
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(ParserInstallError::UnsafeArchive(format!(
-                "Path traversal attempt detected in archive: {}",
-                relative.display()
-            )));
-        }
+        reject_unsafe_archive_relative_path(&relative)?;
 
         let target = dest.join(&relative);
 
@@ -588,6 +579,26 @@ fn download_and_extract_archive(
             }
             unpack_entry_atomically(&mut entry, &target, &relative)?;
         }
+    }
+
+    Ok(())
+}
+
+fn reject_unsafe_archive_relative_path(relative: &Path) -> Result<(), ParserInstallError> {
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ParserInstallError::UnsafeArchive(format!(
+            "Path traversal attempt detected in archive: {}",
+            relative.display()
+        )));
     }
 
     Ok(())
@@ -1831,6 +1842,20 @@ mod tests {
         ));
         assert!(!archive_error_allows_git_fallback(
             &ParserInstallError::UnsafeArchive("link entry rejected".to_string())
+        ));
+    }
+
+    #[test]
+    fn archive_relative_path_validation_rejects_escape_components() {
+        reject_unsafe_archive_relative_path(Path::new("src/parser.c")).expect("safe path");
+
+        assert!(matches!(
+            reject_unsafe_archive_relative_path(Path::new("../outside")),
+            Err(ParserInstallError::UnsafeArchive(_))
+        ));
+        assert!(matches!(
+            reject_unsafe_archive_relative_path(Path::new("/absolute")),
+            Err(ParserInstallError::UnsafeArchive(_))
         ));
     }
 
