@@ -60,7 +60,10 @@ impl SyntheticDiagnosticsManager {
     /// Limited to avoid O(n) scan on every registration.
     fn cleanup_finished_tasks(&self, limit: usize) {
         let mut cleaned = 0;
-        // Collect keys to remove to avoid holding multiple references during iteration
+        // Collect keys to remove to avoid holding multiple references during iteration.
+        // Removal rechecks the current value so a newly registered task for the
+        // same URI cannot be deleted after this scan observed an older finished
+        // handle.
         let mut to_remove = Vec::with_capacity(limit);
 
         for entry in self.active_tasks.iter() {
@@ -74,7 +77,8 @@ impl SyntheticDiagnosticsManager {
         }
 
         for uri in to_remove {
-            self.active_tasks.remove(&uri);
+            self.active_tasks
+                .remove_if(&uri, |_, handle| handle.is_finished());
         }
 
         if cleaned > 0 {
@@ -205,5 +209,39 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(handle1.is_finished());
         assert!(handle2.is_finished());
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_tasks_removes_finished_entries() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///finished.md").unwrap();
+
+        let task = tokio::spawn(async {});
+        let handle = task.abort_handle();
+        task.await.unwrap();
+        assert!(handle.is_finished());
+
+        manager.active_tasks.insert(uri.clone(), handle);
+        manager.cleanup_finished_tasks(5);
+
+        assert!(!manager.has_active_task(&uri));
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_tasks_preserves_unfinished_entries() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///active.md").unwrap();
+
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        let handle = task.abort_handle();
+
+        manager.active_tasks.insert(uri.clone(), handle.clone());
+        manager.cleanup_finished_tasks(5);
+
+        assert!(manager.has_active_task(&uri));
+        assert!(!handle.is_finished());
+        handle.abort();
     }
 }
