@@ -370,6 +370,18 @@ impl Kakehashi {
             return Ok(None);
         }
 
+        if let Some(cached) = self.cache.get_current_tokens_for_snapshot(
+            &uri,
+            &language_name,
+            snapshot.parsed_version,
+            token_generation,
+        ) {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensResult::Tokens((*cached).clone())));
+        }
+
         // Validity key for the snapshot's text under the generation captured at
         // the top: keys both the unchanged-document cache short-circuit below
         // and the store of the freshly computed tokens. Keying off the
@@ -517,8 +529,14 @@ impl Kakehashi {
         // Store keyed by result_id (delta baseline) AND cache_key (so an
         // unchanged-document repeat request short-circuits the re-tokenization
         // above). `language_name` is unused after this, so move it in.
-        self.cache
-            .store_tokens(uri.clone(), stored_tokens, language_name, cache_key);
+        self.cache.store_tokens(
+            uri.clone(),
+            stored_tokens,
+            language_name,
+            cache_key,
+            snapshot.parsed_version,
+            token_generation,
+        );
 
         // Finish tracking this request
         self.cache
@@ -697,6 +715,24 @@ impl Kakehashi {
             return Ok(None);
         }
 
+        if let Some(cached) = self.cache.get_current_tokens_for_snapshot(
+            &uri,
+            &language_name,
+            snapshot.parsed_version,
+            token_generation,
+        ) && cached.result_id.as_deref() == Some(previous_result_id.as_str())
+        {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                tower_lsp_server::ls_types::SemanticTokensDelta {
+                    result_id: Some(previous_result_id),
+                    edits: vec![],
+                },
+            )));
+        }
+
         // Validity key for the snapshot's text under the generation captured at
         // the top (see semanticTokens/full for why snapshot-text keying makes
         // a compute racing a fresh edit cache-safe).
@@ -851,6 +887,8 @@ impl Kakehashi {
                 tokens.clone(),
                 language_name.clone(),
                 cache_key,
+                snapshot.parsed_version,
+                token_generation,
             );
             let final_result = SemanticTokensFullDeltaResult::Tokens(tokens);
             self.cache
@@ -877,6 +915,8 @@ impl Kakehashi {
                     tokens.clone(),
                     language_name.clone(),
                     cache_key,
+                    snapshot.parsed_version,
+                    token_generation,
                 );
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
@@ -901,6 +941,8 @@ impl Kakehashi {
                     stored_tokens,
                     language_name.clone(),
                     cache_key,
+                    snapshot.parsed_version,
+                    token_generation,
                 );
                 SemanticTokensFullDeltaResult::TokensDelta(delta)
             }
@@ -920,6 +962,8 @@ impl Kakehashi {
                     tokens.clone(),
                     language_name.clone(),
                     cache_key,
+                    snapshot.parsed_version,
+                    token_generation,
                 );
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
@@ -1076,6 +1120,8 @@ impl Kakehashi {
                     full_tokens.clone(),
                     language_name.clone(),
                     cache_key,
+                    snapshot.parsed_version,
+                    generation,
                 );
                 let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
                 self.cache.store_range_tokens(

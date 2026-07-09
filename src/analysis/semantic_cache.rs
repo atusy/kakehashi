@@ -32,6 +32,12 @@ pub struct CachedSemanticTokens {
     /// so it correctly hits.) Mirrors the range (#535) and injection (#529)
     /// caches, which already fold their language in.
     pub language: String,
+    /// Snapshot version these tokens were computed from. Lets a repeat request
+    /// against the same immutable parse snapshot hit before rebuilding the
+    /// content hash key.
+    pub parsed_version: u64,
+    /// Settings/query generation these tokens were computed under.
+    pub generation: u64,
     /// Opaque validity key these tokens were computed under (built by
     /// `CacheCoordinator::token_cache_key`: the FNV-1a hash of the document text
     /// folded with the settings generation). Lets a repeat request on an
@@ -58,12 +64,22 @@ impl SemanticTokenCache {
     /// Store semantic tokens for a document, tagged with the resolved `language`
     /// and the `cache_key` they were computed under (see
     /// [`get_if_current`](Self::get_if_current)).
-    pub fn store(&self, uri: Url, tokens: SemanticTokens, language: String, cache_key: u64) {
+    pub fn store(
+        &self,
+        uri: Url,
+        tokens: SemanticTokens,
+        language: String,
+        cache_key: u64,
+        parsed_version: u64,
+        generation: u64,
+    ) {
         self.cache.insert(
             uri,
             CachedSemanticTokens {
                 tokens: Arc::new(tokens),
                 language,
+                parsed_version,
+                generation,
                 cache_key,
             },
         );
@@ -87,6 +103,30 @@ impl SemanticTokenCache {
     ) -> Option<Arc<SemanticTokens>> {
         self.cache.get(uri).and_then(|entry| {
             if entry.cache_key == cache_key && entry.language == language {
+                Some(Arc::clone(&entry.tokens))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Get cached tokens for the exact parse snapshot and settings generation.
+    ///
+    /// This is a narrower but cheaper hit path than [`get_if_current`]: it avoids
+    /// rebuilding the full-document content hash when the caller already knows it
+    /// is serving the same immutable parse snapshot.
+    pub fn get_if_same_snapshot(
+        &self,
+        uri: &Url,
+        language: &str,
+        parsed_version: u64,
+        generation: u64,
+    ) -> Option<Arc<SemanticTokens>> {
+        self.cache.get(uri).and_then(|entry| {
+            if entry.parsed_version == parsed_version
+                && entry.generation == generation
+                && entry.language == language
+            {
                 Some(Arc::clone(&entry.tokens))
             } else {
                 None
@@ -524,7 +564,7 @@ mod tests {
         };
 
         // Store tokens
-        cache.store(uri.clone(), tokens.clone(), "rust".to_string(), 0);
+        cache.store(uri.clone(), tokens.clone(), "rust".to_string(), 0, 0, 0);
 
         // Retrieve tokens
         let retrieved = cache.get(&uri);
@@ -566,7 +606,7 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0, 0, 0);
 
         let first = cache.get(&uri).unwrap();
         let second = cache.get(&uri).unwrap();
@@ -599,7 +639,7 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store(uri.clone(), previous, "rust".to_string(), 0);
+        cache.store(uri.clone(), previous, "rust".to_string(), 0, 0, 0);
 
         let cached = cache.get_if_valid(&uri, "1").unwrap();
         let before = Arc::strong_count(&cached);
@@ -665,7 +705,7 @@ mod tests {
             }],
         };
 
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0, 0, 0);
 
         // Matching result_id returns tokens
         let valid = cache.get_if_valid(&uri, "42");
@@ -698,7 +738,7 @@ mod tests {
             result_id: Some("7".to_string()),
             data: vec![],
         };
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0xABCD);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0xABCD, 0, 0);
 
         // Same content hash AND language => the document is unchanged => serve
         // cached tokens.
@@ -718,6 +758,34 @@ mod tests {
     }
 
     #[test]
+    fn get_if_same_snapshot_matches_version_generation_and_language() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///snapshot.rs").unwrap();
+        let tokens = SemanticTokens {
+            result_id: Some("snap".to_string()),
+            data: vec![],
+        };
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0xABCD, 42, 7);
+
+        assert!(
+            cache.get_if_same_snapshot(&uri, "rust", 42, 7).is_some(),
+            "same immutable parse snapshot and generation should hit"
+        );
+        assert!(
+            cache.get_if_same_snapshot(&uri, "rust", 43, 7).is_none(),
+            "different parsed version must miss"
+        );
+        assert!(
+            cache.get_if_same_snapshot(&uri, "rust", 42, 8).is_none(),
+            "different settings generation must miss"
+        );
+        assert!(
+            cache.get_if_same_snapshot(&uri, "python", 42, 7).is_none(),
+            "different language must miss"
+        );
+    }
+
+    #[test]
     fn get_if_current_misses_on_language_switch() {
         // A `didClose`/`didOpen` that re-assigns the same URI to a different
         // language keeps the text (and thus `cache_key`) identical, since the key
@@ -732,7 +800,7 @@ mod tests {
             result_id: Some("1".to_string()),
             data: vec![],
         };
-        cache.store(uri.clone(), tokens, "lua".to_string(), 0xABCD);
+        cache.store(uri.clone(), tokens, "lua".to_string(), 0xABCD, 0, 0);
 
         // Same key, same language => hit.
         assert!(
@@ -756,7 +824,7 @@ mod tests {
             result_id: Some("1".to_string()),
             data: vec![],
         };
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0xAA);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0xAA, 0, 0);
         assert!(cache.get_if_current(&uri, "rust", 0xAA).is_some());
 
         // A config reload changes tokenization for the same text, so the whole
@@ -784,7 +852,7 @@ mod tests {
         };
 
         // Store tokens
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 0, 0, 0);
         assert!(cache.get(&uri).is_some(), "Should have cached tokens");
 
         // Remove on close

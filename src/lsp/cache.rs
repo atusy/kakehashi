@@ -545,8 +545,11 @@ impl CacheCoordinator {
         tokens: SemanticTokens,
         language: String,
         cache_key: u64,
+        parsed_version: u64,
+        generation: u64,
     ) {
-        self.semantic_cache.store(uri, tokens, language, cache_key);
+        self.semantic_cache
+            .store(uri, tokens, language, cache_key, parsed_version, generation);
     }
 
     /// Store the most-recent `semanticTokens/range` result for a document (#535),
@@ -589,6 +592,19 @@ impl CacheCoordinator {
         cache_key: u64,
     ) -> Option<std::sync::Arc<SemanticTokens>> {
         self.semantic_cache.get_if_current(uri, language, cache_key)
+    }
+
+    /// Return cached full tokens for the exact parse snapshot and settings
+    /// generation before rebuilding the full-document content hash key.
+    pub(crate) fn get_current_tokens_for_snapshot(
+        &self,
+        uri: &Url,
+        language: &str,
+        parsed_version: u64,
+        generation: u64,
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
+        self.semantic_cache
+            .get_if_same_snapshot(uri, language, parsed_version, generation)
     }
 
     /// Bump the settings generation on a settings/query reload so every cached
@@ -689,7 +705,7 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0, 0, 0);
 
         // Start a request
         let (_request_id, _token) = cache.start_request(&uri);
@@ -715,7 +731,14 @@ mod tests {
         // A request snapshots the generation, then builds its key (generation 0).
         let gen_before = cache.semantic_token_generation();
         let key_before = cache.cache_key_for(text, gen_before);
-        cache.store_tokens(uri.clone(), tokens.clone(), "rust".to_string(), key_before);
+        cache.store_tokens(
+            uri.clone(),
+            tokens.clone(),
+            "rust".to_string(),
+            key_before,
+            0,
+            gen_before,
+        );
         assert!(cache.get_current_tokens(&uri, "rust", key_before).is_some());
 
         // A settings/query reload bumps the generation (and clears the map).
@@ -723,7 +746,14 @@ mod tests {
 
         // Race: a request that began tokenizing under the OLD queries (it captured
         // `key_before`) stores its now-stale tokens AFTER the reload's clear.
-        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), key_before);
+        cache.store_tokens(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            key_before,
+            0,
+            gen_before,
+        );
 
         // A fresh post-reload request snapshots the new generation and builds its
         // key for the same text. The stale, old-generation tokens must NOT be
@@ -750,7 +780,7 @@ mod tests {
             result_id: Some("test-id".to_string()),
             data: vec![],
         };
-        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0, 0, 0);
 
         // Verify stored
         assert!(cache.get_tokens_if_valid(&uri, "test-id").is_some());
