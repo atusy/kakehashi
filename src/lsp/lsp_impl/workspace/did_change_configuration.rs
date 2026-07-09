@@ -144,9 +144,7 @@ fn normalize_kakehashi_settings(value: serde_json::Value) -> NormalizedClientCon
     let mut raw_value = inner.clone();
 
     if let Some(raw_object) = raw_value.as_object_mut() {
-        if value.get("settings").is_some()
-            && let Some(settings_object) = settings_root.as_object()
-        {
+        if let Some(settings_object) = value["settings"].as_object() {
             merge_flat_sibling_settings(raw_object, &mut warnings, settings_object);
         }
 
