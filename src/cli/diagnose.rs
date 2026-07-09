@@ -226,17 +226,21 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         return EXIT_ERROR;
     }
 
-    let files = match collect_files(cwd, &options.paths, &options.excludes, &|path| {
+    let collected = match collect_files(cwd, &options.paths, &options.excludes, &|path| {
         server.cli_can_handle_path(path)
     }) {
-        Ok(files) => files,
+        Ok(collected) => collected,
         Err(e) => {
             elnln!("error: {e}");
             return EXIT_ERROR;
         }
     };
+    let files = collected.files;
 
-    let mut report = Report::default();
+    let mut report = Report {
+        operational_error: collected.walk_errors > 0,
+        ..Default::default()
+    };
     // Stream per file: a single reused buffer holds one file's rendered
     // diagnostics, so peak memory is bounded by the noisiest file rather than
     // the whole run. `write_chunk` locks stdout per call, so the lock is never

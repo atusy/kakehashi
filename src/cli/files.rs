@@ -16,6 +16,13 @@
 
 use std::path::{Path, PathBuf};
 
+/// Files collected from CLI paths plus any non-fatal directory walk errors
+/// encountered while discovering them.
+pub(crate) struct CollectedFiles {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) walk_errors: usize,
+}
+
 /// Build the `--excludes` matcher: gitignore-style patterns rooted at `base`
 /// (the current directory). [`ignore::overrides::Override`] is
 /// whitelist-oriented, so each user pattern is added negated (`!pattern`) to
@@ -42,17 +49,18 @@ fn build_exclude_matcher(
 ///   are kept.
 /// - A path that does not exist is an error.
 ///
-/// The result is sorted and deduplicated for deterministic processing order.
+/// The files are sorted and deduplicated for deterministic processing order.
 pub(crate) fn collect_files(
     base: &Path,
     paths: &[PathBuf],
     excludes: &[String],
     is_supported: &dyn Fn(&Path) -> bool,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<CollectedFiles, String> {
     let exclude_matcher = build_exclude_matcher(base, excludes)
         .map_err(|e| format!("invalid --excludes pattern: {e}"))?;
 
     let mut files = Vec::new();
+    let mut walk_errors = 0usize;
     for path in paths {
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
@@ -63,7 +71,7 @@ pub(crate) fn collect_files(
             if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;
             }
-            walk_directory(&path, &exclude_matcher, is_supported, &mut files);
+            walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
         } else {
             if is_excluded(&exclude_matcher, base, &path, false) {
                 continue;
@@ -73,7 +81,7 @@ pub(crate) fn collect_files(
     }
     files.sort();
     files.dedup();
-    Ok(files)
+    Ok(CollectedFiles { files, walk_errors })
 }
 
 /// Absolutize `path` against `base` and clean `.`/`..` components, so the
@@ -128,14 +136,15 @@ fn is_excluded(
 }
 
 /// Walk `dir` respecting `.gitignore` and `--excludes`, appending every
-/// supported file to `out`. Unreadable entries are warned about and skipped
-/// rather than failing the whole run.
+/// supported file to `out`. Unreadable entries are warned about and counted
+/// so callers can surface an operational-error exit code after processing the
+/// files that were still discoverable.
 fn walk_directory(
     dir: &Path,
     exclude_matcher: &ignore::overrides::Override,
     is_supported: &dyn Fn(&Path) -> bool,
     out: &mut Vec<PathBuf>,
-) {
+) -> usize {
     let walker = ignore::WalkBuilder::new(dir)
         .overrides(exclude_matcher.clone())
         // Respect .gitignore files even outside a git repository: the
@@ -143,6 +152,7 @@ fn walk_directory(
         // only when git initialized the directory".
         .require_git(false)
         .build();
+    let mut errors = 0usize;
     for entry in walker {
         match entry {
             Ok(entry) => {
@@ -157,9 +167,11 @@ fn walk_directory(
                 // There is nowhere to report a failed warning, so drop it.
                 use std::io::Write as _;
                 let _ = writeln!(std::io::stderr(), "warning: skipping unreadable entry: {e}");
+                errors += 1;
             }
         }
     }
+    errors
 }
 
 #[cfg(test)]
@@ -177,6 +189,17 @@ mod tests {
         path.extension().is_some_and(|e| e == "md")
     }
 
+    fn collect_paths(
+        base: &Path,
+        paths: &[PathBuf],
+        excludes: &[String],
+        is_supported: &dyn Fn(&Path) -> bool,
+    ) -> Vec<PathBuf> {
+        collect_files(base, paths, excludes, is_supported)
+            .unwrap()
+            .files
+    }
+
     #[test]
     fn directory_walk_respects_gitignore_without_git_repo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -184,8 +207,7 @@ mod tests {
         write(&tmp.path().join("ignored.md"), "x");
         write(&tmp.path().join(".gitignore"), "ignored.md\n");
 
-        let files =
-            collect_files(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only).unwrap();
+        let files = collect_paths(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only);
 
         assert_eq!(files, vec![tmp.path().join("kept.md")]);
     }
@@ -196,13 +218,12 @@ mod tests {
         write(&tmp.path().join("ignored.md"), "x");
         write(&tmp.path().join(".gitignore"), "ignored.md\n");
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[tmp.path().join("ignored.md")],
             &[],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![tmp.path().join("ignored.md")]);
     }
@@ -213,13 +234,12 @@ mod tests {
         write(&tmp.path().join("kept.md"), "x");
         write(&tmp.path().join("dropped.md"), "x");
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[tmp.path().to_path_buf()],
             &["dropped.md".to_string()],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![tmp.path().join("kept.md")]);
     }
@@ -229,13 +249,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join("dropped.md"), "x");
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[tmp.path().join("dropped.md")],
             &["dropped.md".to_string()],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert!(files.is_empty());
     }
@@ -247,13 +266,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join("vendor/dep.md"), "x");
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[tmp.path().join("vendor/dep.md")],
             &["vendor/".to_string()],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert!(files.is_empty());
     }
@@ -268,13 +286,12 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         write(&tmp.path().join("outside/doc.md"), "x");
 
-        let files = collect_files(
+        let files = collect_paths(
             &base,
             &[tmp.path().join("outside/doc.md")],
             &["outside/".to_string()],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![tmp.path().join("outside/doc.md")]);
     }
@@ -288,13 +305,12 @@ mod tests {
         let base = tmp.path().join("vendor");
         write(&base.join("kept.md"), "x");
 
-        let files = collect_files(
+        let files = collect_paths(
             &base,
             &[base.join("kept.md")],
             &["vendor/".to_string()],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![base.join("kept.md")]);
     }
@@ -305,13 +321,12 @@ mod tests {
         write(&tmp.path().join("vendor/dep.md"), "x");
         write(&tmp.path().join("kept.md"), "x");
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[tmp.path().to_path_buf()],
             &["vendor/".to_string()],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![tmp.path().join("kept.md")]);
     }
@@ -322,10 +337,29 @@ mod tests {
         write(&tmp.path().join("doc.md"), "x");
         write(&tmp.path().join("notes.txt"), "x");
 
-        let files =
-            collect_files(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only).unwrap();
+        let files = collect_paths(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only);
 
         assert_eq!(files, vec![tmp.path().join("doc.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_walk_counts_unreadable_entries() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("kept.md"), "x");
+        let unreadable = tmp.path().join("unreadable");
+        write(&unreadable.join("hidden.md"), "x");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result =
+            collect_files(tmp.path(), &[tmp.path().to_path_buf()], &[], &markdown_only).unwrap();
+
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(result.files, vec![tmp.path().join("kept.md")]);
+        assert!(result.walk_errors > 0);
     }
 
     #[test]
@@ -335,13 +369,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join("script"), "#!/usr/bin/env lua");
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[tmp.path().join("script")],
             &[],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![tmp.path().join("script")]);
     }
@@ -363,13 +396,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join("doc.md"), "x");
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[tmp.path().join("doc.md"), tmp.path().to_path_buf()],
             &[],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![tmp.path().join("doc.md")]);
     }
@@ -382,7 +414,7 @@ mod tests {
         write(&tmp.path().join("doc.md"), "x");
         std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[
                 tmp.path().join("doc.md"),
@@ -390,8 +422,7 @@ mod tests {
             ],
             &[],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![tmp.path().join("doc.md")]);
     }
@@ -404,13 +435,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join(".hidden/doc.md"), "x");
 
-        let files = collect_files(
+        let files = collect_paths(
             tmp.path(),
             &[tmp.path().join(".hidden")],
             &[],
             &markdown_only,
-        )
-        .unwrap();
+        );
 
         assert_eq!(files, vec![tmp.path().join(".hidden/doc.md")]);
     }
@@ -424,8 +454,7 @@ mod tests {
         write(&tmp.path().join(".gitignore"), "build/\n");
         write(&tmp.path().join("build/out.md"), "x");
 
-        let files =
-            collect_files(tmp.path(), &[tmp.path().join("build")], &[], &markdown_only).unwrap();
+        let files = collect_paths(tmp.path(), &[tmp.path().join("build")], &[], &markdown_only);
 
         assert_eq!(files, vec![tmp.path().join("build/out.md")]);
     }
