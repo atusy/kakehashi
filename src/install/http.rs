@@ -14,6 +14,7 @@ pub(crate) fn agent_with_timeout(timeout: Duration) -> Agent {
     Agent::new_with_config(
         Agent::config_builder()
             .timeout_global(Some(timeout))
+            .https_only(true)
             .tls_config(
                 TlsConfig::builder()
                     .root_certs(RootCerts::PlatformVerifier)

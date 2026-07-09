@@ -4,6 +4,7 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -311,11 +312,7 @@ pub fn install_parser(
     fetch_source(&metadata.url, &metadata.revision, &clone_dir)?;
 
     // Determine the source directory (handle monorepos)
-    let source_dir = if let Some(ref location) = metadata.location {
-        clone_dir.join(location)
-    } else {
-        clone_dir.clone()
-    };
+    let source_dir = parser_source_dir(&clone_dir, metadata.location.as_deref())?;
 
     if options.verbose {
         eprintln!("Building parser in: {}", source_dir.display());
@@ -818,6 +815,27 @@ fn validate_git_clone_input(url: &str, revision: &str) -> Result<(), ParserInsta
     Ok(())
 }
 
+fn parser_source_dir(
+    clone_dir: &Path,
+    location: Option<&str>,
+) -> Result<PathBuf, ParserInstallError> {
+    let Some(location) = location else {
+        return Ok(clone_dir.to_path_buf());
+    };
+    if location.is_empty()
+        || Path::new(location)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid_metadata(format!(
+            "unsafe parser location '{}'",
+            location.escape_default()
+        )));
+    }
+
+    Ok(clone_dir.join(location))
+}
+
 fn invalid_metadata(message: String) -> ParserInstallError {
     ParserInstallError::IoError(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -864,6 +882,60 @@ mod tests {
             }
             other => panic!("expected an InvalidInput IoError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn clone_repo_rejects_non_https_url() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        match clone_repo("file:///tmp/parser", "main", &dest) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_repo_rejects_option_like_revision() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        match clone_repo("https://example.invalid/parser", "--upload-pack=sh", &dest) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_source_dir_rejects_unsafe_location() {
+        let temp = tempdir().expect("temp dir");
+        for location in ["", "/tmp/parser", "../parser", "parser/../other"] {
+            match parser_source_dir(temp.path(), Some(location)) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => {
+                    panic!("expected InvalidInput for location {location:?}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parser_source_dir_accepts_safe_relative_location() {
+        let temp = tempdir().expect("temp dir");
+        assert_eq!(
+            parser_source_dir(temp.path(), Some("typescript/common")).expect("safe location"),
+            temp.path().join("typescript/common")
+        );
+        assert_eq!(
+            parser_source_dir(temp.path(), None).expect("missing location uses clone dir"),
+            temp.path()
+        );
     }
 
     #[test]
