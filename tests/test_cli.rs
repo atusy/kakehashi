@@ -955,6 +955,11 @@ fn test_language_uninstall_rejects_language_with_all() {
         !output.status.success(),
         "Uninstall should reject a language with --all"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--all") && stderr.contains("language"),
+        "Stderr should contain clap conflict error message. Got: {stderr}"
+    );
     assert!(
         test_dir
             .path()
