@@ -90,7 +90,10 @@ pub(crate) fn transform_goto_response_to_host(
         }
     }
 
-    // Failed to deserialize as any known variant
+    log::warn!(
+        target: "kakehashi::bridge",
+        "goto response did not match Location | Location[] | LocationLink[]"
+    );
     None
 }
 
@@ -178,4 +181,82 @@ fn transform_location_link_for_goto(
 
     // Case 3: Different virtual URI (cross-region) → filter out
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, Once};
+
+    use log::{Level, LevelFilter, Log, Metadata, Record};
+    use serde_json::json;
+
+    use super::*;
+
+    static LOGGER: CapturingLogger = CapturingLogger {
+        messages: Mutex::new(Vec::new()),
+    };
+    static INIT_LOGGER: Once = Once::new();
+
+    struct CapturingLogger {
+        messages: Mutex<Vec<String>>,
+    }
+
+    impl Log for CapturingLogger {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= Level::Warn
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.messages.lock().unwrap().push(format!(
+                    "{}:{}:{}",
+                    record.level(),
+                    record.target(),
+                    record.args()
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
+        INIT_LOGGER.call_once(|| {
+            log::set_logger(&LOGGER).expect("test logger should install once");
+            log::set_max_level(LevelFilter::Warn);
+        });
+        LOGGER.messages.lock().unwrap().clear();
+        f();
+        LOGGER.messages.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn goto_response_warns_on_malformed_success_result() {
+        let warnings = captured_warnings_for(|| {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": "not a goto result"
+            });
+
+            let transformed = transform_goto_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &"file:///project/host.lua".parse().unwrap(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_none());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains(
+                        "goto response did not match Location | Location[] | LocationLink[]",
+                    )
+            }),
+            "expected malformed goto response warning, got {warnings:?}"
+        );
+    }
 }
