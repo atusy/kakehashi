@@ -188,6 +188,16 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability(METHOD) {
+            // The advertising connection was Ready (capabilities set) when it
+            // registered the command, but the RECONNECT path can hand back a
+            // still-`Initializing` handle whose capabilities aren't set yet, so
+            // this is reachable. Warn rather than drop silently (every other
+            // failure branch warns) so a fail-soft `null` is diagnosable.
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: origin {origin} for palette command '{}' does not (yet) advertise executeCommandProvider; ignoring",
+                params.command
+            );
             return None;
         }
         // Forward the command name and arguments verbatim.
