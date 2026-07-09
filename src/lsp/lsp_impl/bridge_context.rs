@@ -188,11 +188,12 @@ pub(crate) fn resolve_layer_config_from_settings(
 /// fan-in: `null` and `[]` are "no result", as are the object-shaped
 /// "empty but valid" responses whose single canonical list field is empty:
 /// `CompletionList.items` when `isIncomplete` is not true,
-/// `SignatureHelp.signatures`, and `LinkedEditingRanges.ranges`. Keep the
-/// completion-list rule in sync with `completion_list_has_result` in the
-/// completion handler. Without the object shapes, a
-/// higher-priority host server's empty list would prematurely win the
-/// fan-in over a lower-priority server with actual results.
+/// `SignatureHelp.signatures`, `LinkedEditingRanges.ranges`, and
+/// `WorkspaceEdit` `changes`/`documentChanges` with no effective edits. Keep
+/// the completion-list rule in sync with `completion_list_has_result` in the
+/// completion handler. Without the object shapes, a higher-priority host
+/// server's empty list or edit would prematurely win the fan-in over a
+/// lower-priority server with actual results.
 pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
     if value.is_null() {
         return true;

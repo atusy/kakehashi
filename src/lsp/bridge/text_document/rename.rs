@@ -757,4 +757,70 @@ mod tests {
             "filtered-to-empty WorkspaceEdit must not mask another rename result"
         );
     }
+
+    #[test]
+    fn workspace_edit_cross_region_only_document_changes_returns_none() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let cross_region_uri =
+            VirtualDocumentUri::new(&host_uri, "lua", "region-1").to_uri_string();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "documentChanges": [{
+                    "textDocument": { "uri": cross_region_uri, "version": 1 },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "filtered"
+                    }]
+                }]
+            }
+        });
+
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(5, 0),
+        );
+
+        assert!(
+            edit.is_none(),
+            "documentChanges filtered to empty must not mask another rename result"
+        );
+    }
+
+    #[test]
+    fn workspace_edit_empty_document_changes_returns_none() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "documentChanges": [{
+                    "textDocument": { "uri": virtual_uri, "version": 1 },
+                    "edits": []
+                }]
+            }
+        });
+
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(5, 0),
+        );
+
+        assert!(
+            edit.is_none(),
+            "documentChanges with no edits must fall through to other rename contributors"
+        );
+    }
 }

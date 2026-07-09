@@ -36,7 +36,7 @@ impl Kakehashi {
             virt,
             native,
             parse_host_verbatim::<WorkspaceEdit>,
-            workspace_edit_has_effect,
+            rename_workspace_edit_has_result,
         )
         .await
     }
@@ -86,11 +86,56 @@ impl Kakehashi {
                         .await
                 }
             },
-            |opt| opt.as_ref().is_some_and(workspace_edit_has_effect),
+            rename_option_has_result,
             cancel_rx,
         )
         .await;
         pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
         result.handle(&self.client, "rename", None, Ok).await
+    }
+}
+
+fn rename_workspace_edit_has_result(edit: &WorkspaceEdit) -> bool {
+    workspace_edit_has_effect(edit)
+}
+
+fn rename_option_has_result(edit: &Option<WorkspaceEdit>) -> bool {
+    edit.as_ref().is_some_and(rename_workspace_edit_has_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn workspace_edit(value: serde_json::Value) -> WorkspaceEdit {
+        serde_json::from_value(value).expect("valid WorkspaceEdit")
+    }
+
+    #[test]
+    fn rename_predicates_reject_empty_workspace_edits() {
+        let empty = workspace_edit(json!({ "changes": {} }));
+
+        assert!(!rename_workspace_edit_has_result(&empty));
+        assert!(!rename_option_has_result(&Some(empty)));
+        assert!(!rename_option_has_result(&None));
+    }
+
+    #[test]
+    fn rename_predicates_accept_workspace_edits_with_effect() {
+        let edit = workspace_edit(json!({
+            "changes": {
+                "file:///test.md": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "newText": "x"
+                }]
+            }
+        }));
+
+        assert!(rename_workspace_edit_has_result(&edit));
+        assert!(rename_option_has_result(&Some(edit)));
     }
 }
