@@ -356,6 +356,23 @@ impl BridgeCoordinator {
             .await;
     }
 
+    fn injection_open_on_server(
+        &self,
+        host_uri_lsp: &tower_lsp_server::ls_types::Uri,
+        server_name: &str,
+        injection: &BridgeInjection,
+    ) -> bool {
+        let virtual_uri = super::protocol::VirtualDocumentUri::new(
+            host_uri_lsp,
+            &injection.language,
+            &injection.region_id,
+        );
+        self.pool
+            .get_all_connections_for_virtual_uri(&virtual_uri)
+            .iter()
+            .any(|key| key.server() == server_name)
+    }
+
     /// The injections whose language bridges to `server_name`, plus that server's
     /// resolved config. A codeAction fans out to ALL servers bridging an
     /// injection language, so the command's origin may be ANY of them — match by
@@ -785,6 +802,9 @@ impl BridgeCoordinator {
                     self.get_config_for_language(settings, host_language, &injection.language)
                 });
             if let Some(resolved) = resolved {
+                if self.injection_open_on_server(&host_uri_lsp, &resolved.server_name, &injection) {
+                    continue;
+                }
                 server_groups
                     .entry(resolved.server_name.clone())
                     .or_insert_with(|| (resolved.config.clone(), Vec::new()))
@@ -1498,6 +1518,33 @@ mod tests {
         )
         .await
         .expect("a non-matching server must short-circuit, not attempt a spawn");
+    }
+
+    #[tokio::test]
+    async fn injection_open_on_server_matches_server_name() {
+        let coordinator = BridgeCoordinator::new();
+        let host_uri = Url::parse("file:///doc.md").unwrap();
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
+        let injection = BridgeInjection {
+            language: "lua".to_string(),
+            region_id: "region-0".to_string(),
+            content: "print('hello')".to_string(),
+        };
+        let virtual_uri = crate::lsp::bridge::protocol::VirtualDocumentUri::new(
+            &host_uri_lsp,
+            &injection.language,
+            &injection.region_id,
+        );
+        coordinator
+            .register_opened_document_for_test(
+                &host_uri,
+                &virtual_uri,
+                &crate::lsp::bridge::pool::ConnectionKey::for_server("lua_ls"),
+            )
+            .await;
+
+        assert!(coordinator.injection_open_on_server(&host_uri_lsp, "lua_ls", &injection));
+        assert!(!coordinator.injection_open_on_server(&host_uri_lsp, "ruff", &injection));
     }
 
     #[test]
