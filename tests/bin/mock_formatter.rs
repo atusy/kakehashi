@@ -45,8 +45,8 @@
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
 //!   requested URI.
 //! - `document-link-slow-host` / `document-link-slow-virt` — like
-//!   `document-link`, but sleeps before answering and records downstream
-//!   `$/cancelRequest` notifications under `MOCK_LSP_CANCEL_DIR`.
+//!   `document-link`, but sleeps before answering and records request-start
+//!   and downstream `$/cancelRequest` markers under `MOCK_LSP_CANCEL_DIR`.
 //! - `diagnostics` — advertises `diagnosticProvider`; answers
 //!   `textDocument/diagnostic` with a full report carrying one diagnostic
 //!   that echoes the requested URI, but only for documents it received via
@@ -414,7 +414,7 @@ fn main() {
                     .map(str::to_string);
             }
             "$/cancelRequest" => {
-                record_cancel(&mode, &message);
+                record_mock_event(&mode, "cancel", &message);
             }
             "textDocument/willSaveWaitUntil" => {
                 // `will-save-slow` stalls past kakehashi's 5s save budget so the
@@ -878,6 +878,7 @@ fn main() {
                     mode.as_str(),
                     "document-link-slow-host" | "document-link-slow-virt"
                 ) {
+                    record_mock_event(&mode, "request", &message);
                     std::thread::sleep(std::time::Duration::from_secs(3));
                 }
                 let result = message
@@ -1055,7 +1056,7 @@ fn request_with_params<W: Write>(writer: &mut W, id: Value, method: &str, params
     let _ = writer.flush();
 }
 
-fn record_cancel(mode: &str, message: &Value) {
+fn record_mock_event(mode: &str, event: &str, message: &Value) {
     let Ok(dir) = std::env::var("MOCK_LSP_CANCEL_DIR") else {
         return;
     };
@@ -1065,10 +1066,11 @@ fn record_cancel(mode: &str, message: &Value) {
     }
     let payload = json!({
         "mode": mode,
+        "event": event,
         "params": message.get("params").cloned().unwrap_or(Value::Null)
     });
     let _ = std::fs::write(
-        dir.join(format!("{mode}.json")),
+        dir.join(format!("{mode}.{event}.json")),
         serde_json::to_vec(&payload).unwrap_or_default(),
     );
 }

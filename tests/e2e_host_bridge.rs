@@ -264,11 +264,47 @@ priorities = ["virt", "host"]
         })
         .expect("slow documentLink mocks should warm up with virt and host results");
 
+    let host_request = cancel_dir
+        .path()
+        .join("document-link-slow-host.request.json");
+    let virt_request = cancel_dir
+        .path()
+        .join("document-link-slow-virt.request.json");
+    let host_cancel = cancel_dir
+        .path()
+        .join("document-link-slow-host.cancel.json");
+    let virt_cancel = cancel_dir
+        .path()
+        .join("document-link-slow-virt.cancel.json");
+    for path in [&host_request, &virt_request, &host_cancel, &virt_cancel] {
+        let _ = std::fs::remove_file(path);
+    }
+
     let request_id = client.send_request_async(
         "textDocument/documentLink",
         json!({ "textDocument": { "uri": uri } }),
     );
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let saw_requests = (0..60).any(|_| {
+        if host_request.exists() && virt_request.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            false
+        }
+    });
+    assert!(
+        saw_requests,
+        "both downstream documentLink requests should start before cancellation; files in {:?}: {:?}",
+        cancel_dir.path(),
+        std::fs::read_dir(cancel_dir.path())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    );
     client.send_notification("$/cancelRequest", json!({ "id": request_id }));
 
     let response = client.receive_response_for_id_public(request_id);
@@ -278,8 +314,6 @@ priorities = ["virt", "host"]
         "concatenated documentLink must answer RequestCancelled; got {response:?}"
     );
 
-    let host_cancel = cancel_dir.path().join("document-link-slow-host.json");
-    let virt_cancel = cancel_dir.path().join("document-link-slow-virt.json");
     let saw_both = (0..60).any(|_| {
         if host_cancel.exists() && virt_cancel.exists() {
             true

@@ -255,12 +255,7 @@ impl Kakehashi {
             )
             .await;
 
-            let all_items = all_items?;
-            Ok(if all_items.is_empty() {
-                None
-            } else {
-                Some(all_items)
-            })
+            Ok(nonempty_whole_document_items(all_items?))
         };
 
         let host = async {
@@ -273,23 +268,30 @@ impl Kakehashi {
             }
         };
 
-        self.walk_layers_by_strategy(
-            lsp_uri,
-            method_name,
-            method_name,
-            virt,
-            host,
-            std::future::ready(Ok(None)),
-            |items: &Vec<T>| !items.is_empty(),
-            concat_whole_document_items,
-        )
-        .await
+        let result = self
+            .walk_layers_by_strategy(
+                lsp_uri,
+                method_name,
+                method_name,
+                virt,
+                host,
+                std::future::ready(Ok(None)),
+                |items: &Vec<T>| !items.is_empty(),
+                concat_whole_document_items,
+            )
+            .await?;
+
+        Ok(result.and_then(nonempty_whole_document_items))
     }
 }
 
 fn concat_whole_document_items<T>(mut acc: Vec<T>, next: Vec<T>) -> Vec<T> {
     acc.extend(next);
     acc
+}
+
+fn nonempty_whole_document_items<T>(items: Vec<T>) -> Option<Vec<T>> {
+    if items.is_empty() { None } else { Some(items) }
 }
 
 #[cfg(test)]
@@ -310,6 +312,12 @@ mod tests {
             concat_whole_document_items(vec![1, 2], vec![3, 4]),
             vec![1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn empty_whole_document_layer_items_are_absent() {
+        assert_eq!(nonempty_whole_document_items::<i32>(vec![]), None);
+        assert_eq!(nonempty_whole_document_items(vec![1]), Some(vec![1]));
     }
 
     #[tokio::test]
