@@ -352,26 +352,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_section_wrapped_kakehashi_settings() {
-        let update = parse_client_configuration(serde_json::json!({
-            "kakehashi": {
-                "autoInstall": false
+    fn parses_wire_wrapped_kakehashi_settings() {
+        let params = serde_json::from_value::<DidChangeConfigurationParams>(serde_json::json!({
+            "settings": {
+                "kakehashi": {
+                    "autoInstall": false
+                }
             }
         }))
-        .expect("wire settings.kakehashi payload should parse");
-
-        assert_eq!(update.settings.auto_install, Some(false));
-        assert!(update.warnings.is_empty());
-    }
-
-    #[test]
-    fn parses_top_level_wrapped_kakehashi_settings() {
-        let update = parse_client_configuration(serde_json::json!({
-            "kakehashi": {
-                "autoInstall": false
-            }
-        }))
-        .expect("top-level wrapped settings should parse");
+        .expect("wire didChangeConfiguration params should deserialize");
+        let update = parse_client_configuration(params.settings)
+            .expect("wire settings.kakehashi payload should parse");
 
         assert_eq!(update.settings.auto_install, Some(false));
         assert!(update.warnings.is_empty());

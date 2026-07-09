@@ -1,12 +1,10 @@
 //! E2E tests for one-per-session deprecation notices.
 //!
-//! The notice is surfaced by `initialize` and `workspace/didChangeConfiguration`
-//! sharing a single session-scoped claim guard, so it fires at most once even
-//! when config keeps carrying the deprecated key. This drives it through
-//! didChangeConfiguration (whose notifications, unlike a warning emitted during
-//! the `initialize` request, are observable by the test client) to prove the
-//! warn-path works and the guard suppresses the repeat. The guard and detectors
-//! are also covered in isolation by unit tests.
+//! `rootMarkers` shares a session-scoped guard between `initialize` and
+//! `workspace/didChangeConfiguration`; this drives the observable didChange path
+//! to prove the guard suppresses repeats. The unwrapped didChangeConfiguration
+//! notice is didChange-only, and is covered separately below. The guard and
+//! detectors are also covered in isolation by unit tests.
 
 #![cfg(feature = "e2e")]
 
