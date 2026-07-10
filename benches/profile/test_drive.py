@@ -8,6 +8,7 @@ from drive import (
     RequestSample,
     count_semantic_outcomes,
     next_toggle_change,
+    server_request_result,
     summarize_samples,
 )
 
@@ -55,6 +56,22 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(delete["range"]["end"]["character"], 6)
         self.assertEqual(delete["text"], "")
         self.assertFalse(has_extra)
+
+    def test_server_request_results_match_expected_shapes(self):
+        self.assertEqual(
+            server_request_result({
+                "method": "workspace/configuration",
+                "params": {"items": [{}, {}]},
+            }),
+            [None, None],
+        )
+        self.assertEqual(
+            server_request_result({"method": "workspace/workspaceFolders"}),
+            [],
+        )
+        self.assertIsNone(
+            server_request_result({"method": "client/registerCapability"})
+        )
 
 
 if __name__ == "__main__":

@@ -73,6 +73,17 @@ def response_status(message: dict) -> str:
     return "canceled" if error.get("code") == -32800 else "error"
 
 
+def server_request_result(message: dict):
+    """Return a minimal protocol-valid result for common server requests."""
+    method = message.get("method")
+    if method == "workspace/configuration":
+        items = (message.get("params") or {}).get("items") or []
+        return [None] * len(items)
+    if method == "workspace/workspaceFolders":
+        return []
+    return None
+
+
 def count_semantic_outcomes(
     responses: list[dict], previous_tokens: int
 ) -> tuple[int, int, int, int]:
@@ -203,6 +214,8 @@ def main() -> None:
     request_samples = defaultdict(list)
     notification_counts = Counter()
     notification_bytes = Counter()
+    server_request_counts = Counter()
+    server_request_bytes = Counter()
 
     def send(obj):
         body = json.dumps(obj).encode()
@@ -244,12 +257,27 @@ def main() -> None:
         notification_counts[method] += 1
         notification_bytes[method] += wire_bytes
 
+    def handle_server_method(message, wire_bytes):
+        method = message.get("method")
+        if not method:
+            return False
+        if "id" in message:
+            server_request_counts[method] += 1
+            server_request_bytes[method] += wire_bytes
+            send({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": server_request_result(message),
+            })
+        else:
+            record_notification(message, wire_bytes)
+        return True
+
     def read_until(want_id):
         while True:
             m, wire_bytes = read_message()
-            if m.get("method"):
-                record_notification(m, wire_bytes)
-                continue  # server->client notification/request
+            if handle_server_method(m, wire_bytes):
+                continue
             if m.get("id") == want_id:
                 return m, wire_bytes
 
@@ -272,8 +300,7 @@ def main() -> None:
         responses = {}
         while pending:
             message, wire_bytes = read_message()
-            if message.get("method"):
-                record_notification(message, wire_bytes)
+            if handle_server_method(message, wire_bytes):
                 continue
             request_id = message.get("id")
             if request_id not in pending:
@@ -302,8 +329,7 @@ def main() -> None:
         responses = {}
         while pending:
             message, wire_bytes = read_message()
-            if message.get("method"):
-                record_notification(message, wire_bytes)
+            if handle_server_method(message, wire_bytes):
                 continue
             request_id = message.get("id")
             if request_id not in pending:
@@ -434,6 +460,13 @@ def main() -> None:
         sys.stderr.write(
             f"[drive] notifications count={total_count} wire={total_bytes / 1024:.1f}KiB "
             f"top=[{top}]\n")
+    if server_request_counts:
+        total_count = sum(server_request_counts.values())
+        total_bytes = sum(server_request_bytes.values())
+        sys.stderr.write(
+            f"[drive] server-requests count={total_count} "
+            f"wire={total_bytes / 1024:.1f}KiB methods={dict(server_request_counts)}\n"
+        )
 
 
 if __name__ == "__main__":
