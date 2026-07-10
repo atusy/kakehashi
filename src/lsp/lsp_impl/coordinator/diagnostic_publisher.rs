@@ -590,14 +590,12 @@ impl DiagnosticPublisher {
         // Recompute injection offsets only when there are region push slots to
         // transform. A PullLayer-only snapshot (the common pull-driven case) needs
         // none, so skip the whole-document injection resolution — and shorten the
-        // time this host's republish lock is held. The predicate deliberately
-        // mirrors `DiagnosticAggregator::has_region_slots` (non-empty slots only):
-        // the geometry-unknown deferral below relies on the reparse loop's
-        // post-parse republish, which is gated on exactly that check.
-        let needs_geometry = snapshot.iter().any(|(source, servers)| {
-            matches!(source, DiagnosticSource::Region(_))
-                && servers.values().any(|slot| !slot.diagnostics.is_empty())
-        });
+        // time this host's republish lock is held. The predicate IS
+        // `DiagnosticAggregator::has_region_slots`'s (the shared
+        // `has_live_region_slots`): the geometry-unknown deferral below relies
+        // on the reparse loop's post-parse republish, which is gated on
+        // exactly that check.
+        let needs_geometry = crate::lsp::diagnostic_cache::has_live_region_slots(&snapshot);
         let region_offsets = if needs_geometry {
             match self.current_region_offsets(host) {
                 Some(offsets) => offsets,
@@ -977,10 +975,16 @@ impl DiagnosticPublisher {
         let Some(snapshot) = doc.snapshot() else {
             return None; // open but tree pending: geometry unknown, defer
         };
-        let Some(language_name) =
-            self.language
-                .detect_language(host.path(), snapshot.text(), None, doc.language_id())
-        else {
+        // Trace-level detection: this runs on the republish path whenever
+        // region slots are present (every keystroke settle during a typing
+        // burst) — the debug variant would re-grow the per-event
+        // `language_detection` log volume PR #677 moved off hot paths.
+        let Some(language_name) = self.language.detect_language_hot(
+            host.path(),
+            snapshot.text(),
+            None,
+            doc.language_id(),
+        ) else {
             return Some(offsets);
         };
         let Some(injection_query) = self.language.injection_query(&language_name) else {

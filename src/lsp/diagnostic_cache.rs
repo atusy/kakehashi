@@ -215,6 +215,19 @@ pub(crate) fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
     });
 }
 
+/// Whether `slots` holds any **non-empty** `Region` push slot — the shared
+/// predicate behind both [`DiagnosticAggregator::has_region_slots`] (the
+/// reparse loop's post-parse republish gate, on the raw cache) and
+/// `republish`'s `needs_geometry` (on the filtered publish snapshot). One
+/// implementation on purpose: the geometry-unknown deferral is retried only
+/// while this predicate holds, so the two call sites must never diverge.
+pub(crate) fn has_live_region_slots(slots: &SourceSlots) -> bool {
+    slots.iter().any(|(source, servers)| {
+        matches!(source, DiagnosticSource::Region(_))
+            && servers.values().any(|slot| !slot.diagnostics.is_empty())
+    })
+}
+
 /// Every distinct server name with a **push** slot (`Region`/`Host`, never
 /// `PullLayer`) in `snapshot`. Path B's `pushFallback` fold uses this to
 /// classify which cached pushers are push-driven (#425). Takes the snapshot the
@@ -726,12 +739,7 @@ impl DiagnosticAggregator {
     /// recompute on every edit.
     pub(crate) fn has_region_slots(&self, host: &Url) -> bool {
         let cache = self.lock();
-        cache.get(host).is_some_and(|sources| {
-            sources.iter().any(|(source, servers)| {
-                matches!(source, DiagnosticSource::Region(_))
-                    && servers.values().any(|slot| !slot.diagnostics.is_empty())
-            })
-        })
+        cache.get(host).is_some_and(has_live_region_slots)
     }
 
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
