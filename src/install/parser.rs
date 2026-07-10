@@ -466,6 +466,9 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
             Ok(()) => return Ok(()),
             Err(error) => match error.into_recovery() {
                 ArchiveRecovery::CloneFallback(error) => {
+                    // Git checkout may preserve support-file links, but the
+                    // compile surface is validated by parser_source_dir and
+                    // reject_parser_source_symlinks before loader compilation.
                     log::warn!(
                         target: "kakehashi::install",
                         "Archive fetch failed or was rejected, falling back to git clone: {}",
