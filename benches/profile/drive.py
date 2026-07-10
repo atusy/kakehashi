@@ -346,6 +346,7 @@ def main() -> None:
         request_ids = list(range(rid + 1, rid + count + 1))
         rid += count
         pending = {}
+        pending_lock = threading.Lock()
         responses = {}
         reader_errors = []
 
@@ -356,9 +357,10 @@ def main() -> None:
                     if handle_server_method(message, wire_bytes):
                         continue
                     request_id = message.get("id")
-                    if request_id not in pending:
-                        continue
-                    started = pending.pop(request_id)
+                    with pending_lock:
+                        if request_id not in pending:
+                            continue
+                        started = pending.pop(request_id)
                     completed_at = time.perf_counter()
                     request_samples[method].append(RequestSample(
                         seconds=completed_at - started,
@@ -373,7 +375,8 @@ def main() -> None:
         reader_thread = threading.Thread(target=collect_responses, daemon=True)
         reader_thread.start()
         for index, request_id in enumerate(request_ids):
-            pending[request_id] = time.perf_counter()
+            with pending_lock:
+                pending[request_id] = time.perf_counter()
             send({
                 "jsonrpc": "2.0",
                 "id": request_id,
