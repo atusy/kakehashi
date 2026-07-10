@@ -243,8 +243,7 @@ impl ApplyEditTranslator {
             }
         }
         for (uri, version) in versions_by_uri {
-            let Some(tracked) = self.bridge.virtual_document_version(uri, connection).await
-            else {
+            let Some(tracked) = self.bridge.virtual_document_version(uri, connection).await else {
                 return Err(format!(
                     "kakehashi: the edit is versioned against virtual document {uri}, \
                      which is no longer open on this connection; the content it was \
@@ -329,12 +328,12 @@ fn versioned_virtual_text_document_edits(edit: &WorkspaceEdit) -> Vec<(&str, i32
         match &edit.document_changes {
             None => Box::new(std::iter::empty()),
             Some(DocumentChanges::Edits(edits)) => Box::new(edits.iter()),
-            Some(DocumentChanges::Operations(ops)) => Box::new(ops.iter().filter_map(|op| {
-                match op {
+            Some(DocumentChanges::Operations(ops)) => {
+                Box::new(ops.iter().filter_map(|op| match op {
                     DocumentChangeOperation::Edit(e) => Some(e),
                     DocumentChangeOperation::Op(_) => None,
-                }
-            })),
+                }))
+            }
         };
     for e in doc_edits {
         let uri = e.text_document.uri.as_str();
@@ -592,7 +591,10 @@ mod tests {
                 "edits": [text_edit(1)]
             }]
         }));
-        let reason = translator().translate(original, &test_connection()).await.unwrap_err();
+        let reason = translator()
+            .translate(original, &test_connection())
+            .await
+            .unwrap_err();
         assert!(
             reason.contains("unknown virtual document"),
             "dedup must reach the single-region path, not the multi-region reject: {reason}"
@@ -694,7 +696,9 @@ mod tests {
         let reason = translator_with_bridge(bridge)
             .translate(params, &test_connection())
             .await
-            .expect_err("a versioned edit for a doc this connection no longer has must be rejected");
+            .expect_err(
+                "a versioned edit for a doc this connection no longer has must be rejected",
+            );
         assert!(
             reason.contains("no longer open on this connection"),
             "reason should name the failure: {reason}"
@@ -806,7 +810,10 @@ mod tests {
         match out.edit.document_changes.as_ref().unwrap() {
             DocumentChanges::Edits(edits) => {
                 assert_eq!(edits.len(), 1, "only the real-file edit survives");
-                assert_eq!(edits[0].text_document.uri.as_str(), "file:///project/main.rs");
+                assert_eq!(
+                    edits[0].text_document.uri.as_str(),
+                    "file:///project/main.rs"
+                );
             }
             DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
         }

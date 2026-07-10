@@ -395,10 +395,7 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
     ) -> Option<i32> {
         let versions = self.document_versions.lock().await;
-        let version = versions
-            .get(connection_key)?
-            .get(virtual_uri)
-            .copied()?;
+        let version = versions.get(connection_key)?.get(virtual_uri).copied()?;
         // Membership is checked AFTER the version read, WHILE the version
         // lock is still held, and that order is what makes the gate sound
         // against a concurrent close+reclaim: every remove path (`untrack_

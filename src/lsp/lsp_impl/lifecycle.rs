@@ -1345,18 +1345,20 @@ fn spawn_upstream_request(
                                 // Editor error/cancel, or a response that didn't
                                 // parse as an ApplyWorkspaceEditResponse: the
                                 // protocol default — the edit was not applied.
-                                .unwrap_or(ApplyWorkspaceEditResponse {
-                                    applied: false,
-                                    // Covers editor error, cancellation, AND an
-                                    // unparseable response — neutral wording (like
-                                    // the reader drop-path) so a cancel/transport
-                                    // failure isn't misattributed to the editor.
-                                    failure_reason: Some(
-                                        "kakehashi: no valid workspace/applyEdit response"
-                                            .to_string(),
-                                    ),
-                                    failed_change: None,
-                                });
+                                .unwrap_or(
+                                    ApplyWorkspaceEditResponse {
+                                        applied: false,
+                                        // Covers editor error, cancellation, AND an
+                                        // unparseable response — neutral wording (like
+                                        // the reader drop-path) so a cancel/transport
+                                        // failure isn't misattributed to the editor.
+                                        failure_reason: Some(
+                                            "kakehashi: no valid workspace/applyEdit response"
+                                                .to_string(),
+                                        ),
+                                        failed_change: None,
+                                    },
+                                );
                                 if forwarded_change_count != sent_change_count {
                                     // Index spaces diverged; see above.
                                     response.failed_change = None;
