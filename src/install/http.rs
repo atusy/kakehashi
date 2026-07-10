@@ -11,9 +11,15 @@ use ureq::tls::{RootCerts, TlsConfig};
 /// private root CAs trusted by the OS keep working, where ureq's default
 /// WebPKI roots would reject them.
 pub(crate) fn agent_with_timeout(timeout: Duration) -> Agent {
+    let mut config = Agent::config_builder().timeout_global(Some(timeout));
+    // Unit tests use loopback HTTP fixture servers; production install
+    // downloads stay HTTPS-only.
+    if !cfg!(test) {
+        config = config.https_only(true);
+    }
+
     Agent::new_with_config(
-        Agent::config_builder()
-            .timeout_global(Some(timeout))
+        config
             .tls_config(
                 TlsConfig::builder()
                     .root_certs(RootCerts::PlatformVerifier)

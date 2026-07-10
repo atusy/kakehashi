@@ -4,6 +4,7 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -311,11 +312,8 @@ pub fn install_parser(
     fetch_source(&metadata.url, &metadata.revision, &clone_dir)?;
 
     // Determine the source directory (handle monorepos)
-    let source_dir = if let Some(ref location) = metadata.location {
-        clone_dir.join(location)
-    } else {
-        clone_dir.clone()
-    };
+    let source_dir = parser_source_dir(&clone_dir, metadata.location.as_deref())?;
+    reject_parser_source_symlinks(&source_dir)?;
 
     if options.verbose {
         eprintln!("Building parser in: {}", source_dir.display());
@@ -413,6 +411,8 @@ fn clean_url(url: &str) -> &str {
 /// 1. If the URL is a GitHub HTTPS URL, try downloading the archive tarball.
 /// 2. If archive download fails (or URL is not GitHub), fall back to git clone.
 fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
+    validate_parser_source_metadata(url, revision)?;
+
     // Try archive download for GitHub URLs
     if let Some(archive_url) = github_archive_url(url, revision)
         && let Some(repo_name) = repo_name_from_url(url)
@@ -557,10 +557,18 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// diagnostics go to stderr, which stays inherited for the logs.
 fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd.args([
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+    ])
+    .args(args)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .env("GIT_TERMINAL_PROMPT", "0");
     // `true` as an askpass helper answers any credential prompt with an empty
     // string immediately. POSIX guarantees the binary; Windows does not ship
     // one (git would fail trying to run it), so gate to unix — Windows relies
@@ -742,8 +750,10 @@ fn kill_process_group(child: &mut std::process::Child) {
 
 /// Clone a git repository at a specific revision.
 fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
+    validate_parser_source_metadata(url, revision)?;
+
     // First, clone with depth 1 (we'll fetch the specific revision)
-    let mut clone = git_command(&["clone", "--depth", "1", url], None);
+    let mut clone = git_command(&["clone", "--depth", "1", "--", url], None);
     clone.arg(dest);
     let status = run_with_timeout(clone, GIT_COMMAND_TIMEOUT, "git clone")?;
 
@@ -756,7 +766,7 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
 
     // Fetch the specific revision
     let status = run_with_timeout(
-        git_command(&["fetch", "--depth", "1", "origin", revision], Some(dest)),
+        git_fetch_revision_command(revision, dest),
         GIT_COMMAND_TIMEOUT,
         "git fetch",
     )?;
@@ -790,6 +800,140 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
     Ok(())
 }
 
+fn git_fetch_revision_command(revision: &str, dest: &Path) -> Command {
+    git_command(
+        &["fetch", "--depth", "1", "origin", "--", revision],
+        Some(dest),
+    )
+}
+
+fn validate_parser_source_metadata(url: &str, revision: &str) -> Result<(), ParserInstallError> {
+    if url.starts_with('-') {
+        return Err(invalid_metadata(format!(
+            "unsafe parser repository URL '{}'",
+            url.escape_default()
+        )));
+    }
+    if !url.starts_with("https://") {
+        return Err(invalid_metadata(format!(
+            "parser repository URL must use the https:// scheme: '{}'",
+            url.escape_default()
+        )));
+    }
+    if url.chars().any(char::is_control) || url.contains("..") {
+        return Err(invalid_metadata(format!(
+            "unsafe parser repository URL '{}'",
+            url.escape_default()
+        )));
+    }
+    if revision.is_empty() || revision.chars().any(char::is_whitespace) {
+        return Err(invalid_metadata(format!(
+            "unsafe parser revision '{}'",
+            revision.escape_default()
+        )));
+    }
+    if revision.starts_with('-') {
+        return Err(invalid_metadata(format!(
+            "unsafe parser revision '{}'",
+            revision.escape_default()
+        )));
+    }
+    if revision.chars().any(char::is_control) || revision.contains("..") {
+        return Err(invalid_metadata(format!(
+            "unsafe parser revision '{}'",
+            revision.escape_default()
+        )));
+    }
+
+    Ok(())
+}
+
+fn parser_source_dir(
+    clone_dir: &Path,
+    location: Option<&str>,
+) -> Result<PathBuf, ParserInstallError> {
+    let Some(location) = location else {
+        return Ok(clone_dir.canonicalize()?);
+    };
+    if location.is_empty()
+        || Path::new(location)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid_metadata(format!(
+            "unsafe parser location '{}'",
+            location.escape_default()
+        )));
+    }
+
+    let clone_dir = clone_dir.canonicalize()?;
+    let source_dir = clone_dir.join(location).canonicalize().map_err(|err| {
+        invalid_metadata(format!(
+            "unsafe parser location '{}': {}",
+            location.escape_default(),
+            err
+        ))
+    })?;
+    if !source_dir.starts_with(&clone_dir) {
+        return Err(invalid_metadata(format!(
+            "unsafe parser location '{}'",
+            location.escape_default()
+        )));
+    }
+    if !source_dir.is_dir() {
+        return Err(invalid_metadata(format!(
+            "unsafe parser location '{}' is not a directory",
+            location.escape_default()
+        )));
+    }
+
+    Ok(source_dir)
+}
+
+fn reject_parser_source_symlinks(path: &Path) -> Result<(), ParserInstallError> {
+    let root = path.join("src");
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(ParserInstallError::IoError(err)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(invalid_metadata(format!(
+            "unsafe symlink in parser source '{}'",
+            root.display().to_string().escape_default()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let mut pending = vec![root.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(invalid_metadata(format!(
+                    "unsafe symlink in parser source '{}'",
+                    entry.path().display().to_string().escape_default()
+                )));
+            }
+            if file_type.is_dir() && entry.file_name() != ".git" {
+                pending.push(entry.path());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn invalid_metadata(message: String) -> ParserInstallError {
+    ParserInstallError::IoError(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,6 +960,309 @@ mod tests {
             }
             other => panic!("expected an InvalidInput IoError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn git_command_pins_https_transport() {
+        let cmd = git_command(&["clone", "https://example.invalid/parser"], None);
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            &args[..7],
+            [
+                "-c",
+                "http.followRedirects=false",
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                "clone",
+            ]
+        );
+    }
+
+    #[test]
+    fn git_fetch_revision_command_uses_revision_as_refspec() {
+        let temp = tempdir().expect("temp dir");
+        let cmd = git_fetch_revision_command("v0.24.8", temp.path());
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "http.followRedirects=false",
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                "--",
+                "v0.24.8",
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_repo_rejects_option_like_url() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        match clone_repo("--upload-pack=sh", "main", &dest) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_repo_rejects_non_https_url() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        match clone_repo("file:///tmp/parser", "main", &dest) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_repo_rejects_option_like_revision() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        match clone_repo("https://example.invalid/parser", "--upload-pack=sh", &dest) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_repo_rejects_empty_or_whitespace_revision() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        for revision in ["", " ", "main branch"] {
+            match clone_repo("https://example.invalid/parser", revision, &dest) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => panic!(
+                    "expected an InvalidInput IoError for revision {revision:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn clone_repo_rejects_control_characters() {
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("parser");
+
+        for (url, revision) in [
+            ("https://example.invalid/parser\nnext", "main"),
+            ("https://example.invalid/parser", "main\u{1b}[31m"),
+        ] {
+            match clone_repo(url, revision, &dest) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => panic!(
+                    "expected an InvalidInput IoError for {url:?} {revision:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_source_rejects_unsafe_archive_metadata() {
+        let temp = tempdir().expect("temp dir");
+        for (url, revision) in [
+            (
+                "https://github.com/tree-sitter/tree-sitter-json",
+                "main\nnext",
+            ),
+            (
+                "https://github.com/tree-sitter/tree-sitter-json",
+                "../../other/archive/main",
+            ),
+            ("https://github.com/tree-sitter/../other", "main"),
+        ] {
+            match fetch_source(url, revision, &temp.path().join("parser")) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => panic!(
+                    "expected an InvalidInput IoError for {url:?} {revision:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn parser_source_dir_rejects_unsafe_location() {
+        let temp = tempdir().expect("temp dir");
+        for location in ["", "/tmp/parser", "../parser", "parser/../other"] {
+            match parser_source_dir(temp.path(), Some(location)) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => {
+                    panic!("expected InvalidInput for location {location:?}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parser_source_dir_accepts_safe_relative_location() {
+        let temp = tempdir().expect("temp dir");
+        fs::create_dir_all(temp.path().join("typescript/common")).expect("create location");
+        assert_eq!(
+            parser_source_dir(temp.path(), Some("typescript/common")).expect("safe location"),
+            temp.path()
+                .join("typescript/common")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            parser_source_dir(temp.path(), None).expect("missing location uses clone dir"),
+            temp.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn parser_source_dir_rejects_missing_or_file_location() {
+        let temp = tempdir().expect("temp dir");
+        fs::write(temp.path().join("parser.c"), "void parser(void) {}").expect("write file");
+
+        for location in ["missing", "parser.c"] {
+            match parser_source_dir(temp.path(), Some(location)) {
+                Err(ParserInstallError::IoError(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => {
+                    panic!("expected InvalidInput for location {location:?}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_source_dir_rejects_symlink_location_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let clone_dir = temp.path().join("clone");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&clone_dir).expect("create clone dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        symlink(&outside, clone_dir.join("grammar")).expect("create symlink");
+
+        match parser_source_dir(&clone_dir, Some("grammar")) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_parser_source_symlinks_rejects_nested_source_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let source_dir = temp.path().join("grammar");
+        let outside = temp.path().join("outside.c");
+        fs::create_dir_all(source_dir.join("src")).expect("create source src dir");
+        fs::write(&outside, "void tree_sitter_evil(void) {}").expect("write outside file");
+        symlink(&outside, source_dir.join("src/parser\n.c")).expect("create nested symlink");
+
+        match reject_parser_source_symlinks(&source_dir) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    e.to_string().contains("\\n"),
+                    "symlink path should escape control characters: {e}"
+                );
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_parser_source_symlinks_allows_symlinks_outside_compile_source() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let source_dir = temp.path().join("grammar");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(source_dir.join("bindings/go")).expect("create binding dir");
+        fs::create_dir_all(source_dir.join("scripts/dummy_plugin/queries"))
+            .expect("create script dir");
+        fs::create_dir_all(source_dir.join("src")).expect("create parser src dir");
+        fs::write(&outside, "outside").expect("write outside file");
+        symlink(&outside, source_dir.join("bindings/go/scanner.c"))
+            .expect("create binding symlink");
+        symlink(&outside, source_dir.join("scripts/dummy_plugin/queries/bp"))
+            .expect("create script symlink");
+
+        reject_parser_source_symlinks(&source_dir)
+            .expect("non-compiled support files are not parser source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_parser_source_symlinks_rejects_nested_dot_git_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let source_dir = temp.path().join("grammar");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(source_dir.join("src")).expect("create source src dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        symlink(&outside, source_dir.join("src/.git")).expect("create nested .git symlink");
+
+        match reject_parser_source_symlinks(&source_dir) {
+            Err(ParserInstallError::IoError(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected an InvalidInput IoError, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_parser_source_symlinks_skips_real_dot_git_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let source_dir = temp.path().join("grammar");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(source_dir.join("src/.git/objects")).expect("create nested .git dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        symlink(&outside, source_dir.join("src/.git/objects/link"))
+            .expect("create ignored git metadata symlink");
+
+        reject_parser_source_symlinks(&source_dir)
+            .expect("real .git directories are ignored after their own type check");
     }
 
     #[test]
