@@ -471,6 +471,8 @@ def main() -> None:
                     for method, _ in captures_requests
                 }
             elif args.burst > 1:
+                if args.burst_edits:
+                    send_toggle_edit()
                 semantic_responses = measured_repeated(
                     *semantic_request,
                     count=args.burst,
