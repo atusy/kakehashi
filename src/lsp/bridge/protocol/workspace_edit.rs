@@ -334,7 +334,7 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
         // the previous line's newline and merges the prefixed line upward.
         let spans_prefixed_line =
             end.line > start.line && (start.line.saturating_add(1)..=end.line).any(prefix_at);
-        let inserts_unprefixed_line = e.new_text.contains('\n')
+        let inserts_unprefixed_line = e.new_text.contains(['\n', '\r'])
             && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
         !spans_prefixed_line && !inserts_unprefixed_line
     })
@@ -686,6 +686,24 @@ mod tests {
             "changes": { host_uri.as_str(): [
                 { "range": {"start": {"line": 5, "character": 2}, "end": {"line": 6, "character": 0}},
                   "newText": "" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_lone_cr_newline_insertion() {
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2]);
+        // LSP admits bare `\r` as an EOL: it inserts an unprefixed line just
+        // like `\n` and must be caught by the same guard.
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 4}},
+                  "newText": "a\rb" }
             ] }
         }));
 
