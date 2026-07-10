@@ -351,7 +351,16 @@ impl ConnectionHandle {
     /// Get the current connection state. Uses a `std::sync::RwLock` for fast
     /// synchronous reads and recovers from poisoned locks per project convention.
     pub(crate) fn state(&self) -> ConnectionState {
-        *self.state.read().recover_poison("ConnectionHandle::state")
+        let stored = *self.state.read().recover_poison("ConnectionHandle::state");
+        if matches!(
+            stored,
+            ConnectionState::Initializing | ConnectionState::Ready
+        ) && !self.router.is_accepting()
+        {
+            ConnectionState::Failed
+        } else {
+            stored
+        }
     }
 
     /// Await `Ready` (up to `timeout`) instead of failing fast — used by
@@ -363,7 +372,7 @@ impl ConnectionHandle {
         let wait_future = async {
             loop {
                 // Copy state immediately to avoid holding borrow across await
-                let current_state = *receiver.borrow();
+                let current_state = self.state();
                 match current_state {
                     ConnectionState::Ready => return Ok(()),
                     ConnectionState::Failed => {
@@ -1021,6 +1030,13 @@ mod tests {
             handle.state(),
             ConnectionState::Ready,
             "Initial state should be Ready"
+        );
+
+        handle.router().fail_all("reader exited");
+        assert_eq!(
+            handle.state(),
+            ConnectionState::Failed,
+            "terminal router state must fail the handle without a response waiter"
         );
 
         // Can transition to Failed

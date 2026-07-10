@@ -180,6 +180,13 @@ impl ResponseRouter {
             .liveness_epoch
     }
 
+    pub(crate) fn is_accepting(&self) -> bool {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::is_accepting")
+            .accepting
+    }
+
     /// Look up every in-flight downstream request ID for an upstream request
     /// ID, in registration order (empty when none).
     ///
