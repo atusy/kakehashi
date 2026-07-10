@@ -29,8 +29,9 @@ pub(in crate::lsp::bridge) fn handle(
     //
     // We ack the downstream immediately with Ok(null): this decouples the
     // downstream from editor latency. The editor is NOT asked to create the
-    // token here — announcement is deferred until the token's first titled
-    // `begin` (see `ProgressRegistry` lazy-announcement docs), because some
+    // token here — announcement is deferred until the token's first
+    // renderable `begin` (see `ProgressRegistry` lazy-announcement docs;
+    // renderable = title, message, percentage, or cancellable), because some
     // downstreams declare a token per analysis pass and the resulting
     // create-request storm queues ahead of real responses on the shared
     // stdout sink. The `$/progress` forwarder emits the create (an editor

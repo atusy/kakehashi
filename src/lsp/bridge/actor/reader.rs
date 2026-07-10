@@ -1959,7 +1959,7 @@ mod tests {
     /// A downstream `window/workDoneProgress/create` is acknowledged to the
     /// downstream and registered (so `$/progress` can be translated), but the
     /// editor-facing `CreateWorkDoneProgress` is deferred until the token's
-    /// first titled `begin` (lazy announcement: per-request downstream
+    /// first renderable `begin` (lazy announcement: per-request downstream
     /// progress storms must not reach the editor).
     #[tokio::test]
     async fn handle_message_work_done_progress_create_bridges_upstream() {
