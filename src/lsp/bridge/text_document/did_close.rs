@@ -10,7 +10,8 @@ use ulid::Ulid;
 use url::Url;
 
 use super::super::pool::{
-    ConnectionKey, ConnectionState, LanguageServerPool, NotificationSendResult, OpenedVirtualDoc,
+    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, NotificationSendResult,
+    OpenedVirtualDoc,
 };
 use super::super::protocol::{VirtualDocumentUri, build_didclose_notification};
 
@@ -21,28 +22,35 @@ impl LanguageServerPool {
     /// documents. Uses the channel-based single-writer loop (ls-bridge-message-ordering) for FIFO
     /// ordering. Returns `Ok(())` on success or when no connection exists for the
     /// server (nothing to do).
+    #[cfg(test)]
     pub(crate) async fn send_didclose_notification(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
-        let uri_string = virtual_uri.to_uri_string();
+        let handle = self.connection_for_didclose(connection_key).await;
+        Self::send_didclose_notification_to(handle.as_ref(), virtual_uri)
+    }
 
-        // Get the connection (if it exists and is Ready)
+    async fn connection_for_didclose(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> Option<Arc<ConnectionHandle>> {
         let connections = self.connections().await;
-        let Some(handle) = connections.get(connection_key) else {
-            // No connection for this key - nothing to do
+        connections
+            .get(connection_key)
+            .filter(|handle| handle.state() == ConnectionState::Ready)
+            .cloned()
+    }
+
+    fn send_didclose_notification_to(
+        handle: Option<&Arc<ConnectionHandle>>,
+        virtual_uri: &VirtualDocumentUri,
+    ) -> io::Result<()> {
+        let Some(handle) = handle else {
             return Ok(());
         };
-
-        // Only send if connection is Ready
-        if handle.state() != ConnectionState::Ready {
-            return Ok(());
-        }
-
-        let handle = Arc::clone(handle);
-        drop(connections); // Release lock before I/O
-
+        let uri_string = virtual_uri.to_uri_string();
         // Build and send the didClose notification via single-writer loop (ls-bridge-message-ordering)
         let Some(notification) = build_didclose_notification(&uri_string) else {
             return Ok(());
@@ -98,11 +106,16 @@ impl LanguageServerPool {
         scratch_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
     ) {
+        let handle = self.connection_for_didclose(connection_key).await;
+        let transition = self.open_transition_lock(scratch_uri, connection_key);
+        let transition_guard = transition.lock().await;
         // Idempotent close: if the scratch document is no longer open, a
         // concurrent cleanup (e.g. `close_host_document`) already closed and
         // untracked it, so another `didClose` would be a redundant notification
         // the downstream server may warn about. Nothing left to do.
         if !self.is_document_opened(scratch_uri) {
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
             return;
         }
         // Remove from ALL tracking BEFORE awaiting the didClose send, to narrow
@@ -124,16 +137,15 @@ impl LanguageServerPool {
         // leak on cancel.
         self.unregister_virtual_doc(host_uri, scratch_uri).await;
         self.untrack_document(scratch_uri, connection_key).await;
-        if let Err(e) = self
-            .send_didclose_notification(scratch_uri, connection_key)
-            .await
-        {
+        if let Err(e) = Self::send_didclose_notification_to(handle.as_ref(), scratch_uri) {
             log::warn!(
                 target: "kakehashi::bridge",
                 "Failed to send didClose for scratch document {}: {}",
                 scratch_uri.to_uri_string(), e
             );
         }
+        drop(transition_guard);
+        self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
     }
 
     /// Close a single virtual document: send didClose and remove from tracking.
@@ -141,11 +153,20 @@ impl LanguageServerPool {
     /// This is the core cleanup operation used by both `close_host_document`
     /// and `close_invalidated_docs`. Errors are logged but do not prevent
     /// cleanup of the document_versions tracking.
-    async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
-        if let Err(e) = self
-            .send_didclose_notification(&doc.virtual_uri, &doc.connection_key)
-            .await
-        {
+    pub(crate) async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
+        let handle = self.connection_for_didclose(&doc.connection_key).await;
+        let transition = self.open_transition_lock(&doc.virtual_uri, &doc.connection_key);
+        let transition_guard = transition.lock().await;
+        if self.document_connection_generation(&doc.connection_key) != doc.connection_generation {
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(
+                &doc.virtual_uri,
+                &doc.connection_key,
+                &transition,
+            );
+            return;
+        }
+        if let Err(e) = Self::send_didclose_notification_to(handle.as_ref(), &doc.virtual_uri) {
             log::warn!(
                 target: "kakehashi::bridge",
                 "Failed to send didClose for {}: {}",
@@ -155,6 +176,12 @@ impl LanguageServerPool {
         // Use the connection key from OpenedVirtualDoc for per-connection tracking
         self.untrack_document(&doc.virtual_uri, &doc.connection_key)
             .await;
+        drop(transition_guard);
+        self.remove_open_transition_lock_if_unshared(
+            &doc.virtual_uri,
+            &doc.connection_key,
+            &transition,
+        );
     }
 
     /// Close all virtual documents associated with a host document, returning them.

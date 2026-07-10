@@ -108,6 +108,11 @@ impl Kakehashi {
         // tokens won't be returned for mismatched result_ids.
 
         // lazy-node-identity-tracking: Close invalidated virtual documents.
+        // Stop the previous parse's eager-open batch first. A task still waiting
+        // for downstream readiness has not registered host_to_virtual state yet;
+        // without cancellation it could resume after this close and open an old
+        // ULID that the new parse will never own or invalidate.
+        self.bridge.cancel_eager_open(&uri);
         // Send didClose notifications to downstream LSs for orphaned docs. Stays in
         // the handler (text-derived). It closes the **invalidated** (old) region
         // ulids, whereas the scheduler loop's forward targets the **current** region

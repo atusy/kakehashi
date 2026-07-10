@@ -91,7 +91,11 @@ Each server connection has exactly one writer task consuming from a unified queu
 
 ### 2. Request Forwarding (Thin Bridge)
 
-Requests are forwarded directly to downstream servers without coalescing or superseding.
+Requests are forwarded directly to downstream servers without method/URI
+coalescing or bridge-inferred supersession. One exception honors an explicit
+upstream `$/cancelRequest`: a tracked request still waiting in the writer queue is
+skipped before any bytes are written; a request whose write has started is followed
+by the cancel notification through the same FIFO queue.
 
 **Rationale**:
 - Upstream clients manage stale requests via `$/cancelRequest`
@@ -278,11 +282,20 @@ Client                    Bridge                      Downstream
 ```
 
 **Bridge Behavior:**
-- Forward `$/cancelRequest` notification to downstream server
-- Keep pending request entry (response still expected)
+- Atomically classify each tracked request as `Queued`, `Writing`, or `Sent`
+- For `Queued`, mark it cancelled and let the single writer skip it, answering the
+  local waiter with `REQUEST_CANCELLED`; no downstream cancel is needed because the
+  request never reached the server
+- For `Writing`/`Sent`, enqueue `$/cancelRequest` through the same writer FIFO
+- Keep a sent request's pending entry (response still expected)
 - Forward whatever response the server sends (result or REQUEST_CANCELLED error)
 
-**Rationale**: The bridge doesn't need to intercept cancellation. Downstream servers implement `$/cancelRequest` per LSP spec—they either:
+**Rationale**: An explicit client cancellation is authoritative; forwarding a
+request that is provably still queued wastes downstream CPU and puts its later
+cancel behind the very work it should prevent. The writer-owned atomic claim closes
+that queue race without a priority lane, reordering, method-specific staleness
+heuristics, or generation map. Once writing begins, downstream servers retain the
+standard choice: they either:
 - Complete the request (too late to cancel) → forward result
 - Cancel successfully → forward REQUEST_CANCELLED error
 

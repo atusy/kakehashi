@@ -672,9 +672,10 @@ async fn forward_upstream_request(
 ///   window-work-done-progress), and `PublishDiagnostics`/`EvictConnectionDiagnostics`,
 ///   which may not be lost. Each wake-up drains a capped burst and coalesces
 ///   same-`(connection, uri)` `PublishDiagnostics` to the latest
-///   (`coalesce_upstream_batch`, #426): only superseded earlier pushes are dropped,
-///   and every surviving notification — publishes and barriers alike — keeps its
-///   FIFO order, so `publish`↔`evict` order and create-before-progress hold.
+///   (`coalesce_upstream_batch`, #426), then records every surviving push in a
+///   barrier-delimited run and publishes the final state once per resolved host.
+///   Every region slot is retained and barriers remain FIFO, so
+///   `publish`↔`evict` order and create-before-progress hold.
 /// - `upstream_request_rx` (unbounded): downstream-initiated *requests*
 ///   (`window/showMessageRequest`, `window/showDocument`) forwarded with the
 ///   editor's response relayed back; loss-intolerant (a dropped request hangs
@@ -692,7 +693,7 @@ async fn forward_upstream_request(
 /// upstream channel preserves **barrier** order — every non-publish notification
 /// keeps its position, so create-before-progress holds — while coalescing collapses
 /// superseded same-`(connection, uri)` `PublishDiagnostics` within a drained burst
-/// (`coalesce_upstream_batch`, #426).
+/// and final host aggregates within each barrier-delimited run.
 ///
 /// Exits when:
 /// - Either channel is closed (all senders dropped — both senders live in the
@@ -745,10 +746,10 @@ async fn upstream_forwarding_loop(
                     Some(first) => {
                         // Drain the rest of the currently-queued burst (capped) and
                         // coalesce same-(connection,uri) PublishDiagnostics to the
-                        // latest, so a push-happy downstream can't make the loop
-                        // republish every superseded push off the unbounded channel
-                        // (#426). The common case (nothing else queued) is one extra
-                        // non-blocking try_recv and a single-element passthrough.
+                        // latest, then publish each resolved host once per
+                        // barrier-delimited run (#426). The common case (nothing
+                        // else queued) is one extra non-blocking try_recv and a
+                        // single-element passthrough.
                         let mut batch = vec![first];
                         while batch.len() < UPSTREAM_COALESCE_BATCH_CAP {
                             match upstream_rx.try_recv() {
@@ -756,23 +757,15 @@ async fn upstream_forwarding_loop(
                                 Err(_) => break, // empty or disconnected
                             }
                         }
-                        for notification in coalesce_upstream_batch(batch) {
-                            // Re-check cancellation between deliveries so a shutdown
-                            // during a large batch isn't delayed by up to 256 republish
-                            // awaits (the outer `select!` only re-checks between batches);
-                            // the biased cancel arm then breaks the loop on the next turn.
-                            if cancel_token.is_cancelled() {
-                                break;
-                            }
-                            deliver_upstream_notification(
-                                &client,
-                                notification,
-                                &mut created_tokens,
-                                &mut begun_tokens,
-                                diagnostic_publisher.as_deref(),
-                            )
-                            .await
-                        }
+                        deliver_upstream_batch(
+                            &client,
+                            coalesce_upstream_batch(batch),
+                            &mut created_tokens,
+                            &mut begun_tokens,
+                            diagnostic_publisher.as_deref(),
+                            &cancel_token,
+                        )
+                        .await;
                     }
                     None => break, // Channel closed
                 }
@@ -821,6 +814,76 @@ async fn upstream_forwarding_loop(
     }
 }
 
+/// Deliver one drained upstream batch while collapsing every consecutive run of
+/// diagnostic pushes at the resolved-host boundary. The reader-level coalescer
+/// removes superseded pushes for one downstream URI; this second stage records
+/// all surviving region/host slots first, then publishes each affected host's
+/// final aggregate once. Non-publish notifications remain exact FIFO barriers.
+async fn deliver_upstream_batch(
+    client: &Client,
+    batch: Vec<crate::lsp::bridge::UpstreamNotification>,
+    created_tokens: &mut std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString>,
+    begun_tokens: &mut std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString>,
+    diagnostic_publisher: Option<&crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) {
+    use crate::lsp::bridge::UpstreamNotification;
+    use crate::lsp::lsp_impl::coordinator::DiagnosticPush;
+
+    let mut pushes = Vec::new();
+    for notification in batch {
+        if cancel_token.is_cancelled() {
+            return;
+        }
+        match notification {
+            UpstreamNotification::PublishDiagnostics {
+                uri,
+                server,
+                connection_id,
+                diagnostics,
+            } => pushes.push(DiagnosticPush {
+                uri,
+                server,
+                connection_id,
+                diagnostics,
+            }),
+            barrier => {
+                if !pushes.is_empty() {
+                    if let Some(publisher) = diagnostic_publisher {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_token.cancelled() => return,
+                            _ = publisher.publish_push_batch(std::mem::take(&mut pushes)) => {}
+                        }
+                    } else {
+                        pushes.clear();
+                    }
+                }
+                if cancel_token.is_cancelled() {
+                    return;
+                }
+                deliver_upstream_notification(
+                    client,
+                    barrier,
+                    created_tokens,
+                    begun_tokens,
+                    diagnostic_publisher,
+                )
+                .await;
+            }
+        }
+    }
+    if !pushes.is_empty()
+        && let Some(publisher) = diagnostic_publisher
+    {
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {}
+            _ = publisher.publish_push_batch(pushes) => {}
+        }
+    }
+}
+
 /// Max notifications drained into one coalescing batch per loop wake-up. Bounds the
 /// transient batch while still collapsing a burst; under a continuous flood the loop
 /// processes the channel in capped chunks, so it keeps making publish progress
@@ -832,9 +895,10 @@ const UPSTREAM_COALESCE_BATCH_CAP: usize = 256;
 /// run (not necessarily adjacent — other keys may interleave) down to the latest one
 /// (#426). A push-happy or misbehaving downstream can pile arbitrary-size
 /// `Vec<Diagnostic>` on the unbounded upstream channel faster than the loop
-/// republishes them; since `record` already keeps only the latest per
-/// `(host, source, server)`, the earlier pushes' work is wasted — coalescing skips
-/// it, so the loop does at most one republish per distinct key per batch.
+/// records them; since `record` already keeps only the latest per
+/// `(host, source, server)`, the earlier same-key writes are wasted. This first
+/// stage skips them; [`deliver_upstream_batch`] then collapses distinct surviving
+/// region keys that resolve to the same host into one final aggregate publish.
 ///
 /// Coalescing **drops superseded earlier pushes** and keeps every survivor in its
 /// original FIFO order: a same-key push tombstones its earlier occurrence and lands

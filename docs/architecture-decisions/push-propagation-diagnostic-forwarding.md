@@ -467,11 +467,15 @@ because the #380 benefit now outweighs it:
   the per-URI ordering guarantee.
 - Re-publish is unthrottled by design (the `didChange` debounce is gone): a no-op
   push is suppressed (winner content unchanged), but a chatty linter emitting
-  distinct results in quick succession re-publishes each time. To bound the cost of
-  a push-happy/misbehaving downstream, the forwarding loop coalesces a drained burst
-  of `publishDiagnostics` by `(connection, uri)` to the latest before delivering
-  (`coalesce_upstream_batch`, #426) — at most one republish per distinct key per
-  batch — with every other notification acting as an order-preserving barrier.
+  distinct results across separate loop wakes re-publishes each time. To bound the
+  cost of a push-happy/misbehaving downstream, the forwarding loop first coalesces a
+  drained burst of `publishDiagnostics` by `(connection, uri)` to the latest
+  (`coalesce_upstream_batch`, #426), then records each surviving push in a
+  barrier-delimited run and publishes the final aggregate once per **resolved host**.
+  This second boundary matters for injection-heavy documents: hundreds of distinct
+  virtual URIs can update one host, and no editor needs the multi-megabyte
+  intermediate aggregate after every region. Every non-publish notification remains
+  an order-preserving barrier, so publish/evict and progress ordering stay exact.
 - `pullFallback` (default on) keeps a *scoped* host-event pull trigger alive for
   pull-driven servers — the per-event re-pull is removed only for push-driven
   ones, not universally. Setting it `false` drops those servers from the proactive

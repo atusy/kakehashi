@@ -37,7 +37,12 @@ impl Kakehashi {
             // full again", never to stale data.)
             self.captures_cache.retain(|key, _| key.0 != uri);
             self.captures_walk_cache.retain(|key, _| key.0 != uri);
+            self.cancel_captures_walks_for_document(&uri);
             self.documents.remove(&uri);
+            // Semantic token handlers serialize their final currency check and
+            // cache insert with this lock. A store that won first is cleared;
+            // one that arrives later observes the document gone and refuses.
+            self.cache.remove_document(&uri);
             // AFTER the document removal, deliberately: the match cache's
             // store paths use an insert-then-verify handshake against this
             // ordering — a straggler walk whose post-insert liveness probe
@@ -47,9 +52,6 @@ impl Kakehashi {
             // would reopen the resurrection leak (codex review).
             self.captures_match_cache.clear_document(&uri);
         }
-
-        // Clean up all caches for this document (semantic tokens, injections, requests)
-        self.cache.remove_document(&uri);
 
         // Clean up region ID mappings for this document
         // (lazy-node-identity-tracking). This runs AFTER the removal above

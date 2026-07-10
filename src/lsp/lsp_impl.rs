@@ -242,14 +242,17 @@ pub struct Kakehashi {
     #[allow(clippy::type_complexity)]
     captures_walk_cache:
         dashmap::DashMap<(Url, String, bool), kakehashi::captures::CachedCapturesWalk>,
-    /// Single-flight markers for in-progress captures walks, keyed like the
-    /// walk memo above: concurrent identical requests (a client's `full` +
-    /// `delta`s for one kind) park on the winner's `Notify` and serve the
-    /// memo instead of re-executing the walk. Entries are removed by the
-    /// winner's drop guard; the map only ever holds walks currently running.
+    /// Single-flight state for in-progress captures walks, keyed like the
+    /// walk memo above. Concurrent identical requests (a client's `full` +
+    /// `delta`s for one kind and snapshot) park on the winner; a fresher
+    /// `(incarnation, generation, parsed_version)` atomically replaces and
+    /// cancels obsolete work. Entries are removed by a pointer-checked winner
+    /// guard, so an old winner cannot erase its successor's marker.
     #[allow(clippy::type_complexity)]
-    captures_walk_inflight:
-        dashmap::DashMap<(Url, String, bool), std::sync::Arc<tokio::sync::Notify>>,
+    captures_walk_inflight: dashmap::DashMap<
+        (Url, String, bool),
+        std::sync::Arc<kakehashi::captures::CapturesWalkFlight>,
+    >,
     /// Cross-snapshot, content-addressed cache of per-layer captures query
     /// matches: a layer whose content merely SHIFTED between snapshots (the
     /// per-keystroke common case — an edit above a fence) reuses its cached

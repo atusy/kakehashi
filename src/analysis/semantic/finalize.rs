@@ -16,6 +16,16 @@ use tower_lsp_server::ls_types::{SemanticToken, SemanticTokens, SemanticTokensRe
 
 use super::token_collector::{ActiveInjectionBounds, RawToken, TokenKind};
 
+/// Poll at most once per 64 units of linear work. Expensive library calls such
+/// as sorting are surrounded by direct checkpoints because they cannot be
+/// interrupted internally.
+fn cancellation_requested(
+    cancel: Option<&crate::cancel::CancelToken>,
+    work_items: &mut usize,
+) -> bool {
+    crate::cancel::is_cancelled_periodically(cancel, work_items)
+}
+
 /// Priority key for token comparison. Higher values win.
 ///
 /// Comparison order: `priority` (from `#set! priority N`, default 100),
@@ -32,7 +42,22 @@ fn token_priority(t: &RawToken) -> (u32, usize, usize, usize) {
 
 /// Compute the UTF-16 width of a string.
 fn utf16_width(s: &str) -> usize {
+    if s.is_ascii() {
+        return s.len();
+    }
     s.chars().map(|c| c.len_utf16()).sum()
+}
+
+fn cached_utf16_width(
+    cache: &mut Vec<Option<usize>>,
+    lines: &[&str],
+    line: usize,
+) -> Option<usize> {
+    let line_text = lines.get(line)?;
+    if line >= cache.len() {
+        cache.resize(line + 1, None);
+    }
+    Some(*cache[line].get_or_insert_with(|| utf16_width(line_text)))
 }
 
 /// Split multiline tokens into per-line fragments, skipping empty multiline fragments.
@@ -42,17 +67,34 @@ fn utf16_width(s: &str) -> usize {
 /// tokens encode their total UTF-16 length (including +1 per inter-line
 /// newline) in `length`, producing invalid fragments when the sweep line
 /// splits around other tokens on the same start line.
+#[cfg(test)]
 fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken> {
+    split_multiline_tokens_cancellable(tokens, lines, None)
+        .expect("collection without a cancellation token cannot be cancelled")
+}
+
+fn split_multiline_tokens_cancellable(
+    tokens: Vec<RawToken>,
+    lines: &[&str],
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Vec<RawToken>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
+
     let mut result = Vec::with_capacity(tokens.len());
+    let mut line_widths: Vec<Option<usize>> = Vec::new();
+    let mut work_items = 0usize;
     for token in tokens {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
         // If the token's line is beyond the lines array, keep as-is (no line
         // info to determine whether it's multiline).
-        let Some(line_text) = lines.get(token.line) else {
+        let Some(line_width) = cached_utf16_width(&mut line_widths, lines, token.line) else {
             result.push(token);
             continue;
         };
-
-        let line_width = utf16_width(line_text);
 
         // Single-line token: column + length fits within the line
         if token.column + token.length <= line_width {
@@ -66,7 +108,11 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
         let mut start_col = token.column;
 
         while remaining > 0 && current_line < lines.len() {
-            let current_line_width = utf16_width(lines[current_line]);
+            if cancellation_requested(cancel, &mut work_items) {
+                return None;
+            }
+            let current_line_width =
+                cached_utf16_width(&mut line_widths, lines, current_line).unwrap_or(0);
             let per_line_len = remaining.min(current_line_width.saturating_sub(start_col));
 
             if per_line_len > 0 {
@@ -79,7 +125,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
             start_col = 0; // subsequent lines start at column 0
         }
     }
-    result
+    Some(result)
 }
 
 /// Active-token candidate in the sweep-line heap, ordered by `token_priority`
@@ -132,13 +178,28 @@ impl Ord for HeapEntry {
 /// replaced. This relies on breakpoints already covering every token's start
 /// and end, so within one interval "active" (start <= interval_start < end)
 /// is equivalent to "fully covers the interval".
-fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
+#[cfg(test)]
+fn split_overlapping_tokens(tokens: Vec<RawToken>) -> Vec<RawToken> {
+    split_overlapping_tokens_cancellable(tokens, None)
+        .expect("collection without a cancellation token cannot be cancelled")
+}
+
+fn split_overlapping_tokens_cancellable(
+    mut tokens: Vec<RawToken>,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Vec<RawToken>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
     if tokens.is_empty() {
-        return tokens;
+        return Some(tokens);
     }
 
     // Sort by line first, then by start column for grouping
     tokens.sort_by(|a, b| a.line.cmp(&b.line).then(a.column.cmp(&b.column)));
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
 
     let mut result = Vec::with_capacity(tokens.len());
 
@@ -151,7 +212,11 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
 
     // Group tokens by line and process each line independently
     let mut line_start = 0;
+    let mut work_items = 0usize;
     while line_start < tokens.len() {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
         let current_line = tokens[line_start].line;
         let mut line_end = line_start;
         while line_end < tokens.len() && tokens[line_end].line == current_line {
@@ -164,11 +229,17 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
         breakpoints.clear();
         breakpoints.reserve(line_tokens.len() * 2);
         for t in line_tokens {
+            if cancellation_requested(cancel, &mut work_items) {
+                return None;
+            }
             breakpoints.push(t.column);
             breakpoints.push(t.column + t.length);
         }
         breakpoints.sort_unstable();
         breakpoints.dedup();
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
 
         // 2. Sweep the intervals, maintaining a max-heap of active tokens.
         // Transparent tokens are never pushed — they only contributed
@@ -178,6 +249,9 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
         let mut next_token = 0;
 
         for window in breakpoints.windows(2) {
+            if cancellation_requested(cancel, &mut work_items) {
+                return None;
+            }
             let interval_start = window[0];
             let interval_end = window[1];
 
@@ -220,21 +294,30 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
     }
 
     // Merge adjacent fragments with the same properties to reduce output size
-    merge_adjacent_fragments(&mut result);
+    if !merge_adjacent_fragments(&mut result, cancel) {
+        return None;
+    }
 
-    result
+    Some(result)
 }
 
 /// Merge adjacent fragments on the same line that have the same token type.
 ///
 /// After sweep line splitting, fragments like `keyword[0,3) + keyword[3,5)` can
 /// be merged into a single `keyword[0,5)` to reduce the number of tokens in output.
-fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
+fn merge_adjacent_fragments(
+    tokens: &mut Vec<RawToken>,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> bool {
     if tokens.len() < 2 {
-        return;
+        return !crate::cancel::is_cancelled(cancel);
     }
     let mut write = 0;
+    let mut work_items = 0usize;
     for read in 1..tokens.len() {
+        if cancellation_requested(cancel, &mut work_items) {
+            return false;
+        }
         let can_merge = tokens[write].line == tokens[read].line
             && tokens[write].column + tokens[write].length == tokens[read].column
             && tokens[write].kind == tokens[read].kind
@@ -252,6 +335,7 @@ fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
         }
     }
     tokens.truncate(write + 1);
+    true
 }
 
 /// Check whether a single-line token is fully inside one active injection region.
@@ -330,12 +414,20 @@ fn region_intervals_on_line(
 fn build_region_intervals_map(
     regions: &[ActiveInjectionBounds],
     lines: &[&str],
-) -> HashMap<usize, Vec<(usize, usize)>> {
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<HashMap<usize, Vec<(usize, usize)>>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
     let mut map: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    let mut work_items = 0usize;
     for r in regions {
         for line_idx in r.start_line..=r.end_line {
+            if cancellation_requested(cancel, &mut work_items) {
+                return None;
+            }
             if line_idx >= lines.len() {
-                continue;
+                break;
             }
             let line_width = utf16_width(lines[line_idx]);
             let start_col = if line_idx == r.start_line {
@@ -356,8 +448,11 @@ fn build_region_intervals_map(
     // Sort each line's intervals
     for intervals in map.values_mut() {
         intervals.sort_unstable();
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
     }
-    map
+    Some(map)
 }
 
 /// Split a host token around injection region intervals, keeping only the
@@ -409,18 +504,28 @@ fn split_host_token_around_regions(
 /// `node_byte_len` is strictly larger than the `@none` token (ancestor nodes)
 /// are split around `@none` intervals; child tokens (smaller `node_byte_len`)
 /// are preserved unchanged. `@none` tokens themselves are discarded.
-fn apply_none_preprocessing(tokens: Vec<RawToken>) -> Vec<RawToken> {
+fn apply_none_preprocessing(
+    tokens: Vec<RawToken>,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Vec<RawToken>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
     let (none_tokens, tokens): (Vec<_>, Vec<_>) = tokens
         .into_iter()
         .partition(|t| t.kind == TokenKind::NoneCapture);
 
     if none_tokens.is_empty() {
-        return tokens;
+        return Some(tokens);
     }
 
     // Build per-line @none intervals with their node sizes for O(1) lookup.
     let mut none_intervals: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+    let mut work_items = 0usize;
     for t in &none_tokens {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
         none_intervals.entry(t.line).or_default().push((
             t.column,
             t.column + t.length,
@@ -429,10 +534,16 @@ fn apply_none_preprocessing(tokens: Vec<RawToken>) -> Vec<RawToken> {
     }
     for intervals in none_intervals.values_mut() {
         intervals.sort_unstable();
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
     }
 
     let mut result = Vec::with_capacity(tokens.len());
     for token in tokens {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
         if let Some(line_intervals) = none_intervals.get(&token.line) {
             // Find @none intervals that are within this token AND have
             // smaller node_byte_len (meaning @none is on a child node).
@@ -453,7 +564,7 @@ fn apply_none_preprocessing(tokens: Vec<RawToken>) -> Vec<RawToken> {
         }
         result.push(token);
     }
-    result
+    Some(result)
 }
 
 /// Filter host tokens (depth=0) against active injection regions.
@@ -470,9 +581,13 @@ fn filter_by_injection_regions(
     tokens: Vec<RawToken>,
     regions: &[ActiveInjectionBounds],
     lines: &[&str],
-) -> Vec<RawToken> {
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Vec<RawToken>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
     if regions.is_empty() {
-        return tokens;
+        return Some(tokens);
     }
     // Index regions by every host line they span, so each host token only
     // examines the regions on its own line. Without this index the three
@@ -480,10 +595,14 @@ fn filter_by_injection_regions(
     // O(tokens × regions); when the region count grows with document size
     // (e.g. one injection per comment/macro in Rust), that is quadratic on
     // the hot path — the dominant cost found by profiling.
-    let regions_by_line = build_regions_by_line(regions);
-    let region_map = build_region_intervals_map(regions, lines);
+    let regions_by_line = build_regions_by_line(regions, cancel)?;
+    let region_map = build_region_intervals_map(regions, lines, cancel)?;
     let mut filtered = Vec::with_capacity(tokens.len());
+    let mut work_items = 0usize;
     for token in tokens {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
         if token.depth > 0 {
             filtered.push(token);
             continue;
@@ -533,7 +652,7 @@ fn filter_by_injection_regions(
             filtered.extend(split_host_token_around_regions(&token, intervals));
         }
     }
-    filtered
+    Some(filtered)
 }
 
 /// Index active injection regions by every host line they span.
@@ -550,14 +669,24 @@ fn filter_by_injection_regions(
 // lines that tokens still fall on (a finalize test exercises exactly this with
 // an empty `lines` slice). Active regions are document-bounded in practice, so
 // the range is not actually unbounded.
-fn build_regions_by_line(regions: &[ActiveInjectionBounds]) -> HashMap<usize, Vec<usize>> {
+fn build_regions_by_line(
+    regions: &[ActiveInjectionBounds],
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<HashMap<usize, Vec<usize>>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
     let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut work_items = 0usize;
     for (i, r) in regions.iter().enumerate() {
         for line in r.start_line..=r.end_line {
+            if cancellation_requested(cancel, &mut work_items) {
+                return None;
+            }
             map.entry(line).or_default().push(i);
         }
     }
-    map
+    Some(map)
 }
 
 /// Post-process and delta-encode raw tokens into SemanticTokensResult.
@@ -566,27 +695,42 @@ fn build_regions_by_line(regions: &[ActiveInjectionBounds]) -> HashMap<usize, Ve
 /// 1. Removes host tokens fully inside active injection regions
 /// 2. Splits overlapping tokens via sweep line
 /// 3. Delta-encodes for LSP protocol
+#[cfg(test)]
 pub(super) fn finalize_tokens(
     all_tokens: Vec<RawToken>,
     active_injection_regions: &[ActiveInjectionBounds],
     lines: &[&str],
 ) -> Option<SemanticTokensResult> {
+    finalize_tokens_cancellable(all_tokens, active_injection_regions, lines, None)
+}
+
+pub(super) fn finalize_tokens_cancellable(
+    all_tokens: Vec<RawToken>,
+    active_injection_regions: &[ActiveInjectionBounds],
+    lines: &[&str],
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<SemanticTokensResult> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
+
     // Split multiline tokens into per-line tokens before the sweep line,
     // which treats [column, column+length) as a 1D interval on a single line.
-    let mut all_tokens = split_multiline_tokens(all_tokens, lines);
+    let mut all_tokens = split_multiline_tokens_cancellable(all_tokens, lines, cancel)?;
 
     // Filter out zero-length tokens before the sweep line overlap resolution.
     // Unknown captures are already filtered at collection time (CaptureResult::Suppressed → continue).
     all_tokens.retain(|token| token.length > 0);
 
-    let all_tokens = filter_by_injection_regions(all_tokens, active_injection_regions, lines);
+    let all_tokens =
+        filter_by_injection_regions(all_tokens, active_injection_regions, lines, cancel)?;
 
-    let all_tokens = apply_none_preprocessing(all_tokens);
+    let all_tokens = apply_none_preprocessing(all_tokens, cancel)?;
 
     // Split overlapping tokens using sweep line algorithm.
     // This replaces the old sort + dedup approach, producing non-overlapping
     // fragments that preserve both parent and child semantics.
-    let all_tokens = split_overlapping_tokens(all_tokens);
+    let all_tokens = split_overlapping_tokens_cancellable(all_tokens, cancel)?;
 
     if all_tokens.is_empty() {
         return None;
@@ -596,8 +740,12 @@ pub(super) fn finalize_tokens(
     let mut data = Vec::with_capacity(all_tokens.len());
     let mut last_line = 0usize;
     let mut last_start = 0usize;
+    let mut work_items = 0usize;
 
     for token in all_tokens {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
         let (token_type, token_modifiers_bitset) = match token.kind {
             // Token type/modifiers were resolved to legend indices at collection
             // time, so encoding is just a copy here (no per-token re-parse).
@@ -633,6 +781,10 @@ pub(super) fn finalize_tokens(
 
         last_line = token.line;
         last_start = token.column;
+    }
+
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
     }
 
     Some(SemanticTokensResult::Tokens(SemanticTokens {
@@ -715,6 +867,28 @@ mod tests {
         pattern_index: usize,
     ) -> RawToken {
         make_token_with_priority(line, column, length, name, depth, pattern_index, 100)
+    }
+
+    #[test]
+    fn finalize_tokens_cancellable_stops_when_cancelled() {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+        let tokens = vec![make_token_with_priority(0, 0, 3, "keyword", 0, 0, 100)];
+
+        assert!(finalize_tokens_cancellable(tokens, &[], &[], Some(&cancel)).is_none());
+    }
+
+    #[test]
+    fn finalize_tokens_cancellable_stops_at_periodic_mid_pass_checkpoint() {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(3);
+        let tokens = (0..512)
+            .map(|line| make_token(line, 0, 1, "variable", 0, 0))
+            .collect();
+        let lines = vec!["x"; 512];
+
+        assert!(finalize_tokens_cancellable(tokens, &[], &lines, Some(&cancel)).is_none());
+        assert!(cancel.is_cancelled());
     }
 
     #[test]

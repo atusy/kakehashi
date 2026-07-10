@@ -3,6 +3,7 @@
 //! This module handles the collection of raw tokens from a single document's
 //! highlight query, including multiline token handling and byte-to-UTF16 conversion.
 
+use crate::cancel::is_cancelled_periodically;
 use crate::config::CaptureMappings;
 use crate::text::position::Utf16LineIndex;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
@@ -335,6 +336,9 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
 ///
 /// When `supports_multiline` is false, multiline tokens are split into per-line tokens
 /// for clients that lack `multilineTokenSupport` (LSP 3.16.0+).
+///
+/// Returns `false` when collection observes cancellation. Any tokens already
+/// appended in that case are incomplete and must be discarded by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn collect_host_tokens(
     text: &str,
@@ -350,13 +354,22 @@ pub(super) fn collect_host_tokens(
     supports_multiline: bool,
     exclusion_ranges: &[(usize, usize)],
     prefix_byte_widths: &[usize],
+    cancel: Option<&crate::cancel::CancelToken>,
     all_tokens: &mut Vec<RawToken>,
-) {
+) -> bool {
     // Validate content_start_byte is within bounds to prevent slice panics
     // This can happen during concurrent edits when document text shortens
     if content_start_byte > host_text.len() {
-        return;
+        return false;
     }
+
+    if crate::cancel::is_cancelled(cancel) {
+        return false;
+    }
+
+    // One atomic cancellation load per 64 query/capture/line work items keeps
+    // cancellation latency bounded without putting an atomic on every token.
+    let mut work_items = 0usize;
 
     // Calculate position mapping from content-local to host document.
     // Largest line whose start byte is <= content_start_byte; line_starts[0] == 0,
@@ -382,10 +395,16 @@ pub(super) fn collect_host_tokens(
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
     while let Some(m) = matches.next() {
+        if is_cancelled_periodically(cancel, &mut work_items) {
+            return false;
+        }
         let priority = parse_priority_for_pattern(query, m.pattern_index);
         let filtered_captures = crate::language::filter_captures(query, m, text);
 
         for c in filtered_captures {
+            if is_cancelled_periodically(cancel, &mut work_items) {
+                return false;
+            }
             let node = c.node;
             let start_pos = node.start_position();
             let end_pos = node.end_position();
@@ -471,6 +490,9 @@ pub(super) fn collect_host_tokens(
 
                     let mut total_length_utf16 = 0usize;
                     for row in start_pos.row..=end_pos.row {
+                        if is_cancelled_periodically(cancel, &mut work_items) {
+                            return false;
+                        }
                         let host_row = content_start_line + row;
                         let line_text = host_lines.get(host_row).unwrap_or(&"");
                         let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
@@ -515,6 +537,9 @@ pub(super) fn collect_host_tokens(
                     // Either no multiline support OR prefix widths present:
                     // split into per-line tokens.
                     for row in start_pos.row..=end_pos.row {
+                        if is_cancelled_periodically(cancel, &mut work_items) {
+                            return false;
+                        }
                         let host_row = content_start_line + row;
                         let host_line_text = host_lines.get(host_row).unwrap_or(&"");
                         let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
@@ -549,6 +574,8 @@ pub(super) fn collect_host_tokens(
             }
         }
     }
+
+    true
 }
 
 #[cfg(test)]
@@ -728,6 +755,114 @@ mod tests {
     // ── collect_host_tokens exclusion behavior ───────────────────────
 
     #[test]
+    fn collect_host_tokens_stops_before_work_when_cancelled() {
+        let code = "fn main() {}";
+        let tree = parse_rust_tree(code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @variable").unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+        let mut tokens = Vec::new();
+
+        let completed = collect_host_tokens(
+            code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            code,
+            &lines,
+            &build_line_start_bytes(code),
+            0,
+            0,
+            false,
+            &[],
+            &[],
+            Some(&cancel),
+            &mut tokens,
+        );
+
+        assert!(!completed, "cancelled collection must be incomplete");
+        assert!(
+            tokens.is_empty(),
+            "cancelled collection must not emit tokens"
+        );
+    }
+
+    #[test]
+    fn collect_host_tokens_marks_out_of_bounds_projection_incomplete() {
+        let code = "fn main() {}";
+        let tree = parse_rust_tree(code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @variable").unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let mut tokens = Vec::new();
+
+        let completed = collect_host_tokens(
+            code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            code,
+            &lines,
+            &build_line_start_bytes(code),
+            code.len() + 1,
+            0,
+            false,
+            &[],
+            &[],
+            None,
+            &mut tokens,
+        );
+
+        assert!(!completed);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn collect_host_tokens_stops_after_periodic_mid_walk_cancel() {
+        let declarations = (0..256)
+            .map(|index| format!("let value_{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = format!("fn main() {{\n{declarations}\n}}");
+        let tree = parse_rust_tree(&code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @variable").unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(3);
+        let mut tokens = Vec::new();
+
+        let completed = collect_host_tokens(
+            &code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            &code,
+            &lines,
+            &build_line_start_bytes(&code),
+            0,
+            0,
+            false,
+            &[],
+            &[],
+            Some(&cancel),
+            &mut tokens,
+        );
+
+        assert!(!completed);
+        assert!(cancel.is_cancelled());
+        assert!(
+            !tokens.is_empty(),
+            "cancellation should land after collection began, not at entry"
+        );
+    }
+
+    #[test]
     fn collect_host_tokens_exclusion_suppresses_strictly_contained_tokens() {
         // "fn main() {}" — "main" identifier node is at [3, 7)
         let code = "fn main() {}";
@@ -752,6 +887,7 @@ mod tests {
             false,
             &[],
             &[],
+            None,
             &mut tokens_no_excl,
         );
         assert!(
@@ -775,6 +911,7 @@ mod tests {
             false,
             &[(0, code.len())],
             &[],
+            None,
             &mut tokens_excl,
         );
         assert!(
@@ -810,6 +947,7 @@ mod tests {
             false,
             &[(3, 7)],
             &[],
+            None,
             &mut tokens,
         );
         assert!(
@@ -846,6 +984,7 @@ mod tests {
             false,
             &[],
             &[],
+            None,
             &mut tokens,
         );
 
@@ -894,6 +1033,7 @@ mod tests {
             false,
             &[(0, code.len())],
             &[],
+            None,
             &mut tokens,
         );
 
@@ -920,6 +1060,7 @@ mod tests {
             false,
             &[(2, 8)],
             &[],
+            None,
             &mut tokens2,
         );
 

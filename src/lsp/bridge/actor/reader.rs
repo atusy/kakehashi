@@ -28,7 +28,7 @@ use super::super::connection::BridgeReader;
 use super::super::{client, telemetry, text_document, window};
 use super::OutboundMessage;
 use super::ResponseRouter;
-use super::response_router::RouteResult;
+use super::response_router::{LivenessExpiry, RouteResult};
 use crate::error::LockResultExt;
 use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
 use crate::lsp::bridge::workspace::{self, WorkspaceFolderSet};
@@ -69,10 +69,10 @@ pub(crate) enum UpstreamNotification {
     /// upstream channel. To keep a chatty downstream re-pushing the *same*
     /// `(connection, uri)` from making the loop republish every superseded push, the
     /// forwarding loop coalesces a drained burst by `(connection, uri)` to the latest
-    /// before delivering (`coalesce_upstream_batch`, #426): at most one republish per
-    /// distinct key per batch. This collapses same-key supersession only — a flood of
-    /// *distinct* URIs is not coalesced, and re-publish is otherwise unthrottled by
-    /// design (push-propagation-diagnostic-forwarding § Consequences).
+    /// before delivering (`coalesce_upstream_batch`, #426), then records each
+    /// surviving push in a barrier-delimited run and republishes once per resolved
+    /// host. The latter collapses distinct injection-region URIs that all contribute
+    /// to one host without dropping any region slot.
     PublishDiagnostics {
         /// The URI the downstream published for — a virtual injection URI (region
         /// push) or a real host URI (`_self` host-layer push).
@@ -226,7 +226,7 @@ pub(crate) const WINDOW_NOTIFICATION_QUEUE_CAPACITY: usize = 256;
 /// signaling between the reader task and ConnectionHandle.
 struct LivenessParams {
     timeout: Option<Duration>,
-    start_rx: mpsc::Receiver<()>,
+    start_rx: mpsc::Receiver<u64>,
     stop_rx: mpsc::Receiver<()>,
     failed_tx: oneshot::Sender<()>,
 }
@@ -334,6 +334,7 @@ struct LivenessTimerState {
     timer: Option<LivenessTimer>,
     /// Configured timeout duration, None if liveness is disabled.
     timeout: Option<Duration>,
+    epoch: Option<u64>,
 }
 
 impl LivenessTimerState {
@@ -344,6 +345,7 @@ impl LivenessTimerState {
         Self {
             timer: None,
             timeout,
+            epoch: None,
         }
     }
 
@@ -356,7 +358,7 @@ impl LivenessTimerState {
     ///
     /// Called when pending count transitions 0->1.
     /// No-op if timeout is not configured.
-    fn start(&mut self, server_prefix: &str) {
+    fn start(&mut self, server_prefix: &str, epoch: u64) {
         if let Some(timeout) = self.timeout {
             debug!(
                 target: "kakehashi::bridge::reader",
@@ -365,6 +367,7 @@ impl LivenessTimerState {
                 timeout
             );
             self.timer = Some(new_liveness_timer(timeout));
+            self.epoch = Some(epoch);
         }
     }
 
@@ -398,11 +401,21 @@ impl LivenessTimerState {
                 reason
             );
         }
+        self.epoch = None;
+    }
+
+    fn disable(&mut self, server_prefix: &str, reason: &str) {
+        self.stop(server_prefix, reason);
+        self.timeout = None;
     }
 
     /// Get the configured timeout duration (for logging on expiry).
     fn timeout_duration(&self) -> Duration {
         self.timeout.unwrap_or_default()
+    }
+
+    fn epoch(&self) -> Option<u64> {
+        self.epoch
     }
 
     /// Take a reference to the timer for use in select!.
@@ -432,7 +445,7 @@ pub(crate) struct ReaderTaskHandle {
     _cancel_guard: tokio_util::sync::DropGuard,
 
     /// Notify reader when pending count goes 0→1 so it starts the liveness timer.
-    liveness_start_tx: mpsc::Sender<()>,
+    liveness_start_tx: mpsc::Sender<u64>,
 
     /// Stop the liveness timer at shutdown so Tier 3 (global) overrides Tier 2 (ls-bridge-timeout-hierarchy).
     liveness_stop_tx: mpsc::Sender<()>,
@@ -446,9 +459,9 @@ impl ReaderTaskHandle {
     ///
     /// Called by ConnectionHandle when the first request is registered (pending 0->1).
     /// Non-blocking: if the channel is full, the notification is dropped (timer already running).
-    pub(crate) fn notify_liveness_start(&self) {
+    pub(crate) fn notify_liveness_start(&self, epoch: u64) {
         // Use try_send to avoid blocking. If channel is full, timer is already running.
-        let _ = self.liveness_start_tx.try_send(());
+        let _ = self.liveness_start_tx.try_send(epoch);
     }
 
     /// Stop the liveness timer without canceling the reader task (ls-bridge-timeout-hierarchy Phase 4).
@@ -672,10 +685,11 @@ async fn reader_loop_with_liveness(
 
     // Consolidated liveness timer state (ls-bridge-async-connection)
     let mut liveness = LivenessTimerState::new(liveness_timeout);
+    let mut liveness_failed_tx = Some(liveness_failed_tx);
 
     loop {
         tokio::select! {
-            biased; // Process in order: cancellation, timer, liveness start, liveness stop, read
+            biased; // Process in order: cancellation, shutdown stop, timer, start, read
 
             // Check for cancellation first (highest priority)
             _ = cancel_token.cancelled() => {
@@ -691,12 +705,43 @@ async fn reader_loop_with_liveness(
                 break;
             }
 
+            // Global shutdown overrides Tier-2 liveness, including when its
+            // stop signal and an expired timer become ready together. Disable
+            // future starts too, so a previously queued wake-up cannot re-arm.
+            Some(()) = liveness_stop_rx.recv() => {
+                liveness.disable(&server_prefix, "shutdown began");
+            }
+
             // Check for liveness timeout (if timer is active)
             _ = liveness.wait() => {
+                // A queued request can be cancelled and removed by the writer
+                // without producing downstream stdout. The timer notification
+                // was already enqueued at registration, so re-check the router
+                // at expiry before declaring a healthy idle server hung.
+                let expected_epoch = liveness.epoch().expect("an awaited timer has an epoch");
+                let pending_count = match router.fail_all_if_awaiting_downstream(
+                    expected_epoch,
+                    "bridge: liveness timeout - server unresponsive",
+                    || {
+                        if let Some(tx) = liveness_failed_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    },
+                ) {
+                    LivenessExpiry::Stale { current_epoch } => {
+                        liveness.start(&server_prefix, current_epoch);
+                        continue;
+                    }
+                    LivenessExpiry::Idle => {
+                        liveness.stop(&server_prefix, "no request awaits downstream at expiry");
+                        continue;
+                    }
+                    LivenessExpiry::Failed { pending_count } => pending_count,
+                };
+
                 // Liveness timeout fired - server is unresponsive
                 // This warn! is the primary observability signal for production debugging.
                 // The pending_count is included for debugging stuck request scenarios.
-                let pending_count = router.pending_count();
                 warn!(
                     target: "kakehashi::bridge::reader",
                     "{}Liveness timeout expired after {:?}, server appears hung - failing {} pending request(s)",
@@ -704,20 +749,15 @@ async fn reader_loop_with_liveness(
                     liveness.timeout_duration(),
                     pending_count
                 );
-                router.fail_all("bridge: liveness timeout - server unresponsive");
-                // Signal liveness failure for state transition (ls-bridge-async-connection Phase 3)
-                let _ = liveness_failed_tx.send(());
                 break;
             }
 
             // Check for liveness timer start notification (pending 0->1)
-            Some(()) = liveness_start_rx.recv() => {
-                liveness.start(&server_prefix);
-            }
-
-            // Check for liveness timer stop notification (shutdown began - ls-bridge-timeout-hierarchy Phase 4)
-            Some(()) = liveness_stop_rx.recv() => {
-                liveness.stop(&server_prefix, "shutdown began");
+            Some(_epoch) = liveness_start_rx.recv() => {
+                // The bounded channel may still contain an older wake-up. The
+                // router epoch is authoritative and was advanced atomically
+                // with registration.
+                liveness.start(&server_prefix, router.liveness_epoch());
             }
 
             // Try to read a message (lowest priority)
@@ -730,7 +770,7 @@ async fn reader_loop_with_liveness(
                         handle_message(message, &router, &server_prefix, &server_request_deps).await;
 
                         // Check if pending count returned to 0 - stop timer
-                        if liveness.is_active() && router.pending_count() == 0 {
+                        if liveness.is_active() && router.awaiting_downstream_count() == 0 {
                             liveness.stop(&server_prefix, "pending count is 0");
                         }
                     }
@@ -2903,7 +2943,7 @@ mod tests {
         );
 
         // Notify the reader to start the timer
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
 
         // Wait for timeout to fire
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2956,7 +2996,7 @@ mod tests {
         );
 
         // Notify the reader to start the timer
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
 
         // Yield to let reader task process the buffered response
         // This resets the timer deadline
@@ -3012,7 +3052,7 @@ mod tests {
         );
 
         // Notify the reader to start the timer
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
 
         // Wait for response to be received
         let _received = tokio::time::timeout(Duration::from_secs(1), rx)
@@ -3070,7 +3110,7 @@ mod tests {
         );
 
         // Notify the reader to start the timer
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
 
         // Wait for both receivers to get error responses
         let result1 = tokio::time::timeout(Duration::from_millis(200), rx1)
@@ -3106,6 +3146,92 @@ mod tests {
             0,
             "Pending should be 0 after timeout"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_timeout_ignores_request_cancelled_before_write() {
+        use crate::lsp::bridge::UpstreamId;
+        use crate::lsp::bridge::protocol::RequestId;
+        use std::time::Duration;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+        let (_writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let request_id = RequestId::new(1);
+        let upstream_id = UpstreamId::Number(7);
+        let _rx = router
+            .register_with_upstream(request_id, Some(upstream_id.clone()))
+            .unwrap();
+        assert_eq!(
+            router.prepare_cancel_by_upstream(&upstream_id),
+            (true, vec![])
+        );
+        assert_eq!(router.pending_count(), 1);
+
+        let handle = spawn_reader_task_with_liveness(
+            reader,
+            Arc::clone(&router),
+            Some(Duration::from_millis(100)),
+        );
+        handle.notify_liveness_start(1);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert!(
+            !handle.check_liveness_failed(),
+            "an empty router must not fail an otherwise healthy idle connection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_old_liveness_epoch_does_not_fail_new_request() {
+        use crate::lsp::bridge::UpstreamId;
+        use crate::lsp::bridge::protocol::RequestId;
+        use std::time::Duration;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+        let (_writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let old_upstream = UpstreamId::Number(7);
+        let (_old_rx, old_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(1), Some(old_upstream.clone()))
+            .unwrap();
+        let handle = spawn_reader_task_with_liveness(
+            reader,
+            Arc::clone(&router),
+            Some(Duration::from_millis(100)),
+        );
+        handle.notify_liveness_start(old_epoch.unwrap());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // Make the old deadline ready without letting the reader poll it, then
+        // replace the only progressing request and queue the new epoch wake-up.
+        tokio::time::advance(Duration::from_millis(101)).await;
+        router.prepare_cancel_by_upstream(&old_upstream);
+        let (_new_rx, new_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(2), None)
+            .unwrap();
+        handle.notify_liveness_start(new_epoch.unwrap());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert!(
+            !handle.check_liveness_failed(),
+            "an expired timer from an older request epoch must not fail new work"
+        );
+        assert_eq!(router.awaiting_downstream_count(), 1);
     }
 
     #[tokio::test]

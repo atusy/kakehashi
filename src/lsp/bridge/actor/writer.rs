@@ -149,7 +149,7 @@ async fn writer_loop(
                     );
                     // Drain remaining messages (best-effort write)
                     while let Ok(msg) = rx.try_recv() {
-                        match write_or_cancelled(&mut writer, &msg, &cancel_token).await {
+                        match write_or_cancelled(&mut writer, &msg, &router, &cancel_token).await {
                             None => {
                                 log::debug!(
                                     target: "kakehashi::bridge::writer",
@@ -211,7 +211,14 @@ async fn writer_loop(
             msg = rx.recv() => {
                 match msg {
                     Some(outbound) => {
-                        match write_or_cancelled(&mut writer, &outbound, &cancel_token).await {
+                        match write_or_cancelled(
+                            &mut writer,
+                            &outbound,
+                            &router,
+                            &cancel_token,
+                        )
+                        .await
+                        {
                             None => {
                                 log::debug!(
                                     target: "kakehashi::bridge::writer",
@@ -268,13 +275,30 @@ async fn writer_loop(
 async fn write_or_cancelled(
     writer: &mut SplitConnectionWriter,
     msg: &OutboundMessage,
+    router: &ResponseRouter,
     cancel_token: &CancellationToken,
 ) -> Option<std::io::Result<()>> {
-    tokio::select! {
+    let request_id = match msg {
+        OutboundMessage::Tracked { request_id, .. } => Some(*request_id),
+        OutboundMessage::Untracked(_) => None,
+    };
+    if let Some(request_id) = request_id
+        && !router.claim_for_write(request_id)
+    {
+        return Some(Ok(()));
+    }
+
+    let result = tokio::select! {
         biased;
         _ = cancel_token.cancelled() => None,
         result = write_message(writer, msg) => Some(result),
+    };
+    if matches!(result, Some(Ok(())))
+        && let Some(request_id) = request_id
+    {
+        router.mark_sent(request_id);
     }
+    result
 }
 
 /// Write a single outbound message to the downstream server.

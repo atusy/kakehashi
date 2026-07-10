@@ -1,18 +1,19 @@
 //! Cooperative cancellation for long-running semantic-token computation.
 //!
-//! A full-document semantic-token compute runs on tokio's blocking pool and
-//! fans out across Rayon workers. Dropping its future does **not** stop it — the
-//! blocking task detaches and runs to completion, burning CPU whose result is
+//! A full-document semantic-token compute runs on the bounded `ComputePool` and
+//! fans out across its Rayon workers. Dropping its future does **not** preempt
+//! an already-running work unit, which otherwise runs to completion and burns CPU
+//! whose result is
 //! then discarded (see `analysis::handle_semantic_tokens_full`). Under rapid
 //! typing on a large document that turns into a pile-up: every keystroke
 //! supersedes the previous request, but the superseded compute keeps running.
 //!
-//! [`CancelToken`] is the escape hatch. A compute polls it at coarse boundaries
-//! (between the host pass and the injection pass, and once per injection region
-//! during discovery/tokenization) and bails early once it is set. The token is
-//! flipped when the request is superseded by a newer one for the same document,
-//! when the client sends `$/cancelRequest`, or when the document closes — so an
-//! obsolete compute stops instead of running to completion (see
+//! [`CancelToken`] is the escape hatch. A compute polls it during the host-query
+//! walk, once per injection region during discovery/tokenization, and throughout
+//! final token shaping, then bails early once it is set. The token is flipped when
+//! the request is superseded by a newer one for the same document, when the client
+//! sends `$/cancelRequest`, or when the document closes — so an obsolete compute
+//! stops instead of running to completion (see
 //! `lsp::semantic_request_tracker::SemanticRequestTracker`).
 
 /// A shared cancellation signal: cheap to poll from blocking compute AND
@@ -25,26 +26,59 @@
 /// lets the serve-current parked waits complete promptly when a newer request
 /// supersedes this one — an `AtomicBool` alone made supersession invisible to
 /// a parked future until its next wakeup.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct CancelToken(tokio_util::sync::CancellationToken);
+#[derive(Debug, Clone)]
+pub(crate) struct CancelToken {
+    inner: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    polls_before_cancel: std::sync::Arc<std::sync::atomic::AtomicIsize>,
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self {
+            inner: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            polls_before_cancel: std::sync::Arc::new(std::sync::atomic::AtomicIsize::new(-1)),
+        }
+    }
+}
 
 impl CancelToken {
     /// Signal cancellation to every holder of this token. Idempotent.
     pub(crate) fn cancel(&self) {
-        self.0.cancel();
+        self.inner.cancel();
     }
 
     /// Returns `true` once [`cancel`](Self::cancel) has been called on this
     /// token or any clone of it.
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.0.is_cancelled()
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            if self.polls_before_cancel.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |remaining| (remaining > 0).then_some(remaining - 1),
+            ) == Ok(1)
+            {
+                self.inner.cancel();
+            }
+        }
+        self.inner.is_cancelled()
     }
 
     /// Completes when [`cancel`](Self::cancel) is called on this token or any
     /// clone of it (immediately if it already was). Cancel-safe: dropping the
     /// future loses nothing.
     pub(crate) async fn cancelled(&self) {
-        self.0.cancelled().await;
+        self.inner.cancelled().await;
+    }
+
+    /// Deterministically flip during a later cooperative checkpoint.
+    #[cfg(test)]
+    pub(crate) fn cancel_after_polls(&self, polls: isize) {
+        self.polls_before_cancel
+            .store(polls, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -54,6 +88,17 @@ impl CancelToken {
 /// pre-cancellation behavior.
 pub(crate) fn is_cancelled(token: Option<&CancelToken>) -> bool {
     token.is_some_and(|t| t.is_cancelled())
+}
+
+/// Check one out of every 64 units of linear work. Callers keep the counter
+/// local to a pass and use [`is_cancelled`] for its entry/exit checkpoints.
+#[inline]
+pub(crate) fn is_cancelled_periodically(
+    token: Option<&CancelToken>,
+    work_items: &mut usize,
+) -> bool {
+    *work_items = work_items.wrapping_add(1);
+    *work_items & 63 == 0 && is_cancelled(token)
 }
 
 #[cfg(test)]

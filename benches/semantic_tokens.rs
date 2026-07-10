@@ -34,7 +34,8 @@
 //! ```
 //!
 //! Tunables (env): `KAKEHASHI_BENCH_ITERS` (default 80),
-//! `KAKEHASHI_BENCH_WARMUP` (default 10).
+//! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
+//! (optional comma-separated scenario-name substrings).
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -126,6 +127,20 @@ impl Server {
             json!({
                 "textDocument": { "uri": uri },
                 "previousResultId": previous_result_id,
+            }),
+        )
+    }
+
+    /// `semanticTokens/range` for a whole-line range.
+    fn semantic_range(&mut self, uri: &str, start_line: u32, end_line: u32) -> Value {
+        self.request(
+            "textDocument/semanticTokens/range",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": start_line, "character": 0 },
+                    "end": { "line": end_line, "character": 0 },
+                }
             }),
         )
     }
@@ -385,6 +400,13 @@ fn ms(d: Duration) -> f64 {
 enum Kind {
     /// `semanticTokens/full` on an unchanging document.
     Full,
+    /// `semanticTokens/range` over representative viewport-sized slices.
+    Range {
+        start_line: u32,
+        end_line: u32,
+        step: u32,
+        variants: u32,
+    },
     /// `semanticTokens/full/delta` with no edit between requests.
     DeltaNoop,
     /// Realistic editing: a toggle `didChange` then `semanticTokens/full/delta`,
@@ -401,11 +423,12 @@ enum Kind {
 
 /// Mutable per-run state for [`Kind::EditDelta`]: the next `didChange` version,
 /// whether the next edit inserts (vs deletes) — flips each iteration to toggle —
-/// and the line edited.
+/// the line edited, and the next range viewport variant.
 struct EditState {
     version: i64,
     insert_next: bool,
     line: u32,
+    range_next: u32,
 }
 
 struct Scenario {
@@ -451,6 +474,7 @@ fn measure(
         // First edit must insert (the document opens with no extra space).
         insert_next: true,
         line: (scn.content.lines().count() / 2) as u32,
+        range_next: 0,
     };
 
     for _ in 0..warmup {
@@ -502,7 +526,7 @@ fn measure_open(
 
 fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
     match scn.kind {
-        Kind::Full | Kind::OpenFirstToken => String::new(),
+        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken => String::new(),
         // Both delta-based scenarios need an initial result_id to diff against.
         Kind::DeltaNoop | Kind::EditDelta => {
             result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
@@ -521,6 +545,16 @@ fn run_once(
         Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
         Kind::Full => {
             let _ = server.semantic_full(scn.uri);
+        }
+        Kind::Range {
+            start_line,
+            end_line,
+            step,
+            variants,
+        } => {
+            let offset = (edit.range_next % variants.max(1)) * step;
+            edit.range_next = edit.range_next.wrapping_add(1);
+            let _ = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
         }
         Kind::DeltaNoop => {
             let result = server.semantic_delta(scn.uri, prev_result_id);
@@ -587,6 +621,19 @@ fn main() {
             targets: "per-token String removal, ASCII fast-path, Arc mappings (amplified)",
         },
         Scenario {
+            name: "rust_large/range",
+            language_id: "rust",
+            uri: "file:///bench/large_range.rs",
+            content: gen_rust(150),
+            kind: Kind::Range {
+                start_line: 500,
+                end_line: 560,
+                step: 20,
+                variants: 8,
+            },
+            targets: "range request variation with scrolling viewports; first miss seeds full-cache filtering",
+        },
+        Scenario {
             name: "rust_predicate_heavy/full",
             language_id: "rust",
             uri: "file:///bench/predicates.rs",
@@ -609,6 +656,19 @@ fn main() {
             content: gen_markdown_injections(150),
             kind: Kind::Full,
             targets: "injection pipeline at scale (amplifies region/coord work)",
+        },
+        Scenario {
+            name: "markdown_injections_large/range",
+            language_id: "markdown",
+            uri: "file:///bench/injections_large_range.md",
+            content: gen_markdown_injections(150),
+            kind: Kind::Range {
+                start_line: 600,
+                end_line: 680,
+                step: 24,
+                variants: 8,
+            },
+            targets: "range request variation across markdown injections; first miss seeds full-cache filtering",
         },
         Scenario {
             name: "unicode_rust/full",
@@ -679,6 +739,7 @@ fn main() {
                       regime; validates no latency regression there (slow; use low iters)",
         },
     ];
+    let scenarios = filter_scenarios(scenarios);
 
     println!();
     println!("semantic-tokens benchmark  (iters={iters}, warmup={warmup}, lower is better)");
@@ -704,6 +765,29 @@ fn main() {
         }
     }
     println!();
+}
+
+fn filter_scenarios(scenarios: Vec<Scenario>) -> Vec<Scenario> {
+    let Some(filter) = std::env::var("KAKEHASHI_BENCH_SCENARIOS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return scenarios;
+    };
+    let terms: Vec<String> = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let filtered: Vec<_> = scenarios
+        .into_iter()
+        .filter(|scenario| terms.iter().any(|term| scenario.name.contains(term)))
+        .collect();
+    if filtered.is_empty() {
+        panic!("KAKEHASHI_BENCH_SCENARIOS={filter:?} matched no scenarios");
+    }
+    filtered
 }
 
 // ───────────────────────────── Output formatting ──────────────────────────────

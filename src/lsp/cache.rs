@@ -16,7 +16,8 @@ use tree_sitter::Tree;
 use url::Url;
 
 use crate::analysis::{
-    InjectionMap, InjectionTokenCache, SemanticTokenCache, SemanticTokenRangeCache,
+    InjectionMap, InjectionTokenCache, SemanticSnapshotIdentity, SemanticTokenCache,
+    SemanticTokenRangeCache,
 };
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
@@ -69,7 +70,9 @@ pub(crate) struct PopulatedInjections {
     /// bridge readers then fall back to inline resolution — vs `Some(empty)`
     /// for "ran, nothing matched" (readers skip their work).
     pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
-    pub(crate) resolved_regions: Vec<crate::language::injection::ResolvedInjection>,
+    /// `None` when fully resolved regions were intentionally skipped on the
+    /// parse critical path; readers then fall back to inline resolution.
+    pub(crate) resolved_regions: Option<Vec<crate::language::injection::ResolvedInjection>>,
     /// The settings generation this populate pass ran under — stamped onto
     /// the snapshot's `resolved_regions` so reload-stale resolution is never
     /// served (see `ParseSnapshot::resolved_regions`).
@@ -83,7 +86,7 @@ impl PopulatedInjections {
         Self {
             discovery: None,
             bridge_regions: Some(Vec::new()),
-            resolved_regions: Vec::new(),
+            resolved_regions: Some(Vec::new()),
             generation,
         }
     }
@@ -205,6 +208,7 @@ impl CacheCoordinator {
         tracker: &NodeTracker,
         entry_mint_epoch: (u64, u64),
         build_bridge_regions: bool,
+        build_resolved_regions: bool,
     ) -> Option<PopulatedInjections> {
         // Snapshot the generation FIRST — before reading the injection query or
         // resolving any language below — so the stamp can never be *newer* than
@@ -337,13 +341,14 @@ impl CacheCoordinator {
             // same single query run — and from the SAME per-region ids and
             // content hashes already in `cacheable_regions` (no duplicate
             // mint/hash on this critical path).
-            let resolved_regions =
+            let resolved_regions = build_resolved_regions.then(|| {
                 crate::language::injection::InjectionResolver::resolve_from_prebuilt(
                     language,
                     &regions,
                     &cacheable_regions,
                     text,
-                );
+                )
+            });
 
             // Producer half of the discovery lever: build the owned discovery
             // from the SAME `regions` just collected — the injection query (`Q`)
@@ -545,8 +550,10 @@ impl CacheCoordinator {
         tokens: SemanticTokens,
         language: String,
         cache_key: u64,
+        snapshot: SemanticSnapshotIdentity,
     ) {
-        self.semantic_cache.store(uri, tokens, language, cache_key);
+        self.semantic_cache
+            .store(uri, tokens, language, cache_key, snapshot);
     }
 
     /// Store the most-recent `semanticTokens/range` result for a document (#535),
@@ -589,6 +596,18 @@ impl CacheCoordinator {
         cache_key: u64,
     ) -> Option<std::sync::Arc<SemanticTokens>> {
         self.semantic_cache.get_if_current(uri, language, cache_key)
+    }
+
+    /// Return cached full tokens for the exact parse snapshot and settings
+    /// generation before rebuilding the full-document content hash key.
+    pub(crate) fn get_current_tokens_for_snapshot(
+        &self,
+        uri: &Url,
+        language: &str,
+        snapshot: SemanticSnapshotIdentity,
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
+        self.semantic_cache
+            .get_if_same_snapshot(uri, language, snapshot)
     }
 
     /// Bump the settings generation on a settings/query reload so every cached
@@ -689,7 +708,17 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store_tokens(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: 0,
+            },
+        );
 
         // Start a request
         let (_request_id, _token) = cache.start_request(&uri);
@@ -715,7 +744,17 @@ mod tests {
         // A request snapshots the generation, then builds its key (generation 0).
         let gen_before = cache.semantic_token_generation();
         let key_before = cache.cache_key_for(text, gen_before);
-        cache.store_tokens(uri.clone(), tokens.clone(), "rust".to_string(), key_before);
+        cache.store_tokens(
+            uri.clone(),
+            tokens.clone(),
+            "rust".to_string(),
+            key_before,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: gen_before,
+            },
+        );
         assert!(cache.get_current_tokens(&uri, "rust", key_before).is_some());
 
         // A settings/query reload bumps the generation (and clears the map).
@@ -723,7 +762,17 @@ mod tests {
 
         // Race: a request that began tokenizing under the OLD queries (it captured
         // `key_before`) stores its now-stale tokens AFTER the reload's clear.
-        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), key_before);
+        cache.store_tokens(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            key_before,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: gen_before,
+            },
+        );
 
         // A fresh post-reload request snapshots the new generation and builds its
         // key for the same text. The stale, old-generation tokens must NOT be
@@ -750,7 +799,17 @@ mod tests {
             result_id: Some("test-id".to_string()),
             data: vec![],
         };
-        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store_tokens(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: 0,
+            },
+        );
 
         // Verify stored
         assert!(cache.get_tokens_if_valid(&uri, "test-id").is_some());
@@ -848,6 +907,7 @@ print("hello")
             &tracker,
             tracker.mint_epoch(&uri),
             true,
+            true,
         );
 
         // Verify we have one injection region
@@ -908,6 +968,7 @@ print("hello")
             &coordinator,
             &tracker,
             tracker.mint_epoch(&uri),
+            true,
             true,
         );
 
@@ -984,6 +1045,7 @@ print("hello")
             &tracker,
             tracker.mint_epoch(&uri),
             true,
+            true,
         );
 
         let regions = cache.get_injections(&uri).expect("should have injections");
@@ -1028,6 +1090,7 @@ print("goodbye")
             &coordinator,
             &tracker,
             tracker.mint_epoch(&uri),
+            true,
             true,
         );
 

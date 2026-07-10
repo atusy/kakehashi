@@ -7,6 +7,7 @@
 //! - Opened state (for LSP spec compliance - ls-bridge-message-ordering)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -49,6 +50,8 @@ pub(crate) struct OpenedVirtualDoc {
     /// languages may map to the same server (e.g., ts and tsx -> tsgo), and the
     /// same server may back several connections (one per workspace root, #382).
     pub(crate) connection_key: ConnectionKey,
+    /// Tracker generation for this connection key when didOpen was claimed.
+    pub(crate) connection_generation: u64,
 }
 
 /// Per-connection virtual document state: versions (for `didChange`),
@@ -88,9 +91,9 @@ pub(crate) struct DocumentTracker {
     ///
     /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
     host_to_virtual: Mutex<HashMap<Url, Vec<OpenedVirtualDoc>>>,
-    /// Tracks documents claimed for opening on downstream servers.
-    /// Incremented at claim time (`try_claim_for_open`), before the actual didOpen send.
-    /// Rolled back via `unclaim_document` if the send fails.
+    /// Tracks documents whose didOpen was confirmed enqueued.
+    /// Pre-send ownership lives only in `document_versions` + `open_claims`, so
+    /// didChange/request routing cannot observe a document before didOpen.
     /// Reference-counted: multiple connections may open the same virtual URI.
     /// Uses DashMap for concurrent reads via internal sharded locking (ls-bridge-message-ordering).
     opened_documents: DashMap<String, usize>,
@@ -99,6 +102,11 @@ pub(crate) struct DocumentTracker {
     /// Enables O(1) lookup in `get_all_connections_for_virtual_uri()`, replacing the
     /// previous O(N×M) scan over `host_to_virtual`.
     virtual_to_servers: DashMap<String, Vec<ConnectionKey>>,
+    /// Pre-send claims keyed by exact connection. Waiters park until the owner
+    /// promotes the claim after enqueue or finishes rollback.
+    open_claims: DashMap<(ConnectionKey, String), Arc<tokio::sync::Notify>>,
+    /// Advances whenever a dead connection is purged before respawn.
+    connection_generations: DashMap<ConnectionKey, u64>,
 }
 
 impl DocumentTracker {
@@ -113,10 +121,18 @@ impl DocumentTracker {
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
+            open_claims: DashMap::new(),
+            connection_generations: DashMap::new(),
         }
     }
 
-    /// Check if a virtual document is claimed or opened on a downstream server.
+    pub(super) fn connection_generation(&self, connection_key: &ConnectionKey) -> u64 {
+        self.connection_generations
+            .get(connection_key)
+            .map_or(0, |generation| *generation)
+    }
+
+    /// Check if a virtual document is opened on a downstream server.
     ///
     /// Fast, synchronous check used by request handlers and didChange
     /// forwarding to gate operations on documents not yet known downstream.
@@ -131,9 +147,8 @@ impl DocumentTracker {
     /// Returns `true` if this caller won the claim (URI was newly inserted).
     /// Returns `false` if another caller already claimed it.
     ///
-    /// Initializes the document version BEFORE marking the document as opened
-    /// in opened_documents. This ensures `increment_document_version` never returns
-    /// `None` for a document where `is_document_opened()` returns `true`.
+    /// Initializes the document version and a waiter-visible claim, but does not
+    /// expose the URI as opened until `mark_open_sent` runs after FIFO enqueue.
     ///
     /// On send failure, call `unclaim_document()` to roll back.
     pub(super) async fn try_claim_for_open(
@@ -142,7 +157,6 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
-
         // Step 1: Check-and-initialize version under Mutex (serializes concurrent claims)
         {
             let mut versions = self.document_versions.lock().await;
@@ -155,25 +169,85 @@ impl DocumentTracker {
                     versions.get_mut(connection_key).expect("just inserted")
                 }
             };
-            if docs.contains_key(&uri_string) {
+            let claim_key = (connection_key.clone(), uri_string.clone());
+            if docs.contains_key(&uri_string) || self.open_claims.contains_key(&claim_key) {
                 return false; // Already claimed by another caller
             }
             docs.insert(uri_string.clone(), 1);
+            self.open_claims
+                .insert(claim_key, Arc::new(tokio::sync::Notify::new()));
         }
 
-        // Step 2: Mark as opened — version is already available for concurrent didChange
-        *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
+        true
+    }
 
-        // Step 3: Update reverse index so get_all_connections_for_virtual_uri works immediately.
-        // This closes the TOCTOU gap between claim and register_opened_document.
-        // register_opened_document will perform an idempotent duplicate-check insert.
-        {
-            let mut servers = self.virtual_to_servers.entry(uri_string).or_default();
-            if !servers.contains(connection_key) {
-                servers.push(connection_key.clone());
+    pub(super) fn open_claim_waiter(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> Option<Arc<tokio::sync::Notify>> {
+        self.open_claims
+            .get(&(connection_key.clone(), virtual_uri.to_uri_string()))
+            .map(|entry| Arc::clone(&entry))
+    }
+
+    pub(super) fn is_document_opened_on_connection(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        self.virtual_to_servers
+            .get(&virtual_uri.to_uri_string())
+            .is_some_and(|keys| keys.contains(connection_key))
+    }
+
+    pub(super) fn connections_opening_or_opened(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+    ) -> Vec<ConnectionKey> {
+        let uri = virtual_uri.to_uri_string();
+        let mut connections = self
+            .virtual_to_servers
+            .get(&uri)
+            .map(|keys| keys.clone())
+            .unwrap_or_default();
+        for claim in self.open_claims.iter() {
+            if claim.key().1 == uri && !connections.contains(&claim.key().0) {
+                connections.push(claim.key().0.clone());
             }
         }
+        connections
+    }
 
+    /// Promote a pre-send claim only after didOpen is confirmed enqueued.
+    pub(super) fn mark_open_sent(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        expected_claim: &Arc<tokio::sync::Notify>,
+    ) -> bool {
+        let uri_string = virtual_uri.to_uri_string();
+        let Some((_, notify)) = self
+            .open_claims
+            .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
+                Arc::ptr_eq(claim, expected_claim)
+            })
+        else {
+            return false;
+        };
+        let mut servers = self
+            .virtual_to_servers
+            .entry(uri_string.clone())
+            .or_default();
+        let newly_opened = !servers.contains(connection_key);
+        if newly_opened {
+            servers.push(connection_key.clone());
+        }
+        drop(servers);
+        if newly_opened {
+            *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
+        }
+        notify.notify_waiters();
         true
     }
 
@@ -181,14 +255,14 @@ impl DocumentTracker {
     ///
     /// Called when the didOpen send fails, so the document can be
     /// claimed again on a future attempt. Removes both the version
-    /// entry and the opened_documents entry initialized by `try_claim_for_open()`.
+    /// entry initialized by `try_claim_for_open()`. Pre-send claims are not in
+    /// the opened refcount or reverse index, so rollback must not touch either.
     pub(super) async fn unclaim_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
     ) {
         let uri_string = virtual_uri.to_uri_string();
-
         // Remove version first (mirrors claim order)
         {
             let mut versions = self.document_versions.lock().await;
@@ -207,27 +281,40 @@ impl DocumentTracker {
         {
             docs.remove(&uri_string);
         }
-
-        // Then decrement the opened refcount and clean reverse index
-        self.decrement_opened(&uri_string);
-        self.remove_from_reverse_index(&uri_string, connection_key);
     }
 
-    /// Record the host→virtual mapping, bump opened ref-count, and seed the
-    /// version. Called BEFORE the `didOpen` send in `ensure_document_opened`
-    /// so `close_host_document` can find the doc even if the task is aborted
-    /// in between; callers roll back via `unregister_virtual_doc` on send fail.
+    /// Test helper: record the host→virtual mapping, opened ref-count, and version.
     ///
     /// The version and opened-state `or_insert(1)`s are safety nets:
     /// `try_claim_for_open` already initialises both. They exist so test
     /// helpers can call this directly without going through the claim path.
+    #[cfg(test)]
     pub(super) async fn register_opened_document(
         &self,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
     ) {
+        self.register_pending_document(host_uri, virtual_uri, connection_key)
+            .await;
+        let claim = self
+            .open_claims
+            .entry((connection_key.clone(), virtual_uri.to_uri_string()))
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        assert!(self.mark_open_sent(virtual_uri, connection_key, &claim));
+    }
+
+    /// Register close-cleanup ownership without exposing the document to
+    /// didChange/request routing before didOpen reaches the FIFO.
+    pub(super) async fn register_pending_document(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) {
         let uri_string = virtual_uri.to_uri_string();
+        let connection_generation = self.connection_generation(connection_key);
 
         // Step 1: Update versions (release lock after block)
         {
@@ -253,19 +340,8 @@ impl DocumentTracker {
                 docs.push(OpenedVirtualDoc {
                     virtual_uri: virtual_uri.clone(),
                     connection_key: connection_key.clone(),
+                    connection_generation,
                 });
-            }
-        }
-
-        // Safety-net insert (already incremented by try_claim_for_open in production;
-        // needed for test helpers that call this directly)
-        self.opened_documents.entry(uri_string.clone()).or_insert(1);
-
-        // Update the reverse index for O(1) get_all_connections_for_virtual_uri lookups
-        {
-            let mut servers = self.virtual_to_servers.entry(uri_string).or_default();
-            if !servers.contains(connection_key) {
-                servers.push(connection_key.clone());
             }
         }
     }
@@ -398,6 +474,12 @@ impl DocumentTracker {
 
         self.decrement_opened(&uri_string);
         self.remove_from_reverse_index(&uri_string, connection_key);
+        if let Some((_, notify)) = self
+            .open_claims
+            .remove(&(connection_key.clone(), uri_string))
+        {
+            notify.notify_waiters();
+        }
     }
 
     /// Drop ALL virtual-document tracking for one connection key.
@@ -412,6 +494,12 @@ impl DocumentTracker {
     /// a different root) keep their state; `opened_documents` is decremented
     /// per URI (not cleared), so a URI also open on another connection survives.
     pub(super) async fn purge_connection(&self, connection_key: &ConnectionKey) {
+        let mut generation = self
+            .connection_generations
+            .entry(connection_key.clone())
+            .or_insert(0);
+        *generation = generation.wrapping_add(1);
+        drop(generation);
         // Take this connection's version map; its keys are the virtual URIs it
         // had open. Done first so the per-URI refcount/reverse-index cleanup
         // below mirrors `untrack_document` exactly, once per opened document.
@@ -441,6 +529,14 @@ impl DocumentTracker {
             }
             host_map.retain(|_, docs| !docs.is_empty());
         }
+        self.open_claims.retain(|(key, _), notify| {
+            if key == connection_key {
+                notify.notify_waiters();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Remove a single virtual document from host_to_virtual tracking.
@@ -468,6 +564,54 @@ impl DocumentTracker {
                 self.remove_from_reverse_index(&uri_string, connection_key);
             }
         }
+    }
+
+    /// Roll back one connection's pre-send open claim and host registration.
+    /// Unlike `unregister_virtual_doc`, this preserves the same virtual URI on
+    /// other workspace-root connections.
+    pub(super) async fn rollback_open_claim(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        let Some(claim) = self.open_claim_waiter(virtual_uri, connection_key) else {
+            return false;
+        };
+        self.rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
+            .await
+    }
+
+    pub(super) async fn rollback_open_claim_if(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        expected_claim: &Arc<tokio::sync::Notify>,
+    ) -> bool {
+        let uri_string = virtual_uri.to_uri_string();
+        let Some((_, notify)) = self
+            .open_claims
+            .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
+                Arc::ptr_eq(claim, expected_claim)
+            })
+        else {
+            return false;
+        };
+        self.unclaim_document(virtual_uri, connection_key).await;
+        let mut host_map = self.host_to_virtual.lock().await;
+        if let Some(docs) = host_map.get_mut(host_uri) {
+            docs.retain(|doc| {
+                doc.virtual_uri.to_uri_string() != uri_string
+                    || &doc.connection_key != connection_key
+            });
+            if docs.is_empty() {
+                host_map.remove(host_uri);
+            }
+        }
+        drop(host_map);
+        notify.notify_waiters();
+        true
     }
 
     /// Snapshot (without removing) every virtual document currently open for a
@@ -653,11 +797,13 @@ mod tests {
         let doc = OpenedVirtualDoc {
             virtual_uri: virtual_uri.clone(),
             connection_key: ConnectionKey::for_server("lua"),
+            connection_generation: 0,
         };
 
         assert_eq!(doc.virtual_uri.language(), "lua");
         assert_eq!(doc.virtual_uri.region_id(), "region-0");
         assert_eq!(doc.connection_key, ConnectionKey::for_server("lua"));
+        assert_eq!(doc.connection_generation, 0);
     }
 
     // ========================================
@@ -839,7 +985,7 @@ mod tests {
                 .await
         );
         tracker
-            .unclaim_document(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .rollback_open_claim(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert!(
             tracker
@@ -849,12 +995,9 @@ mod tests {
         );
     }
 
-    /// Test that get_all_connections_for_virtual_uri works immediately after try_claim_for_open.
-    ///
-    /// This verifies the reverse index is updated at claim time, closing the
-    /// TOCTOU gap between try_claim_for_open and register_opened_document.
+    /// A pre-send claim stays invisible to routing until didOpen is enqueued.
     #[tokio::test]
-    async fn reverse_index_available_immediately_after_claim() {
+    async fn reverse_index_exposes_only_sent_open() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
@@ -867,17 +1010,21 @@ mod tests {
             "Should return empty before claim"
         );
 
-        // Claim the document (should update reverse index)
+        // Claim alone must not expose the connection to didChange routing.
         tracker
             .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
-
-        // Reverse index should be available immediately — no need for register_opened_document
-        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
+        assert!(
+            tracker
+                .get_all_connections_for_virtual_uri(&virtual_uri)
+                .is_empty()
+        );
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
         assert_eq!(
-            servers,
-            vec![ConnectionKey::for_server("lua")],
-            "Reverse index should be available immediately after claim"
+            tracker.get_all_connections_for_virtual_uri(&virtual_uri),
+            vec![ConnectionKey::for_server("lua")]
         );
     }
 
@@ -923,7 +1070,7 @@ mod tests {
             .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         tracker
-            .unclaim_document(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .rollback_open_claim(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // Version should no longer exist
@@ -931,6 +1078,29 @@ mod tests {
             .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert!(version.is_none(), "Version should be removed after unclaim");
+    }
+
+    #[tokio::test]
+    async fn rolling_back_pending_connection_preserves_other_open_connection() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/shared.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let opened = ConnectionKey::for_server("opened");
+        let pending = ConnectionKey::for_server("pending");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &opened)
+            .await;
+        assert!(tracker.try_claim_for_open(&virtual_uri, &pending).await);
+
+        tracker
+            .rollback_open_claim(&host_uri, &virtual_uri, &pending)
+            .await;
+
+        assert!(tracker.is_document_opened(&virtual_uri));
+        assert_eq!(
+            tracker.get_all_connections_for_virtual_uri(&virtual_uri),
+            vec![opened]
+        );
     }
 
     // ========================================
@@ -1540,6 +1710,20 @@ mod tests {
                 .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua_ls"))
                 .await
         );
+        tracker
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri,
+                &ConnectionKey::for_server("emmylua"),
+            )
+            .await;
+        tracker
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri,
+                &ConnectionKey::for_server("lua_ls"),
+            )
+            .await;
         assert!(
             tracker.is_document_opened(&virtual_uri),
             "Document should be opened after two claims"
@@ -1585,6 +1769,9 @@ mod tests {
         tracker
             .register_opened_document(&host_uri, &vuri, &dead)
             .await;
+        tracker
+            .register_opened_document(&host_uri, &vuri, &sibling)
+            .await;
         assert!(
             !tracker.try_claim_for_open(&vuri, &dead).await,
             "already claimed on the dead connection before purge"
@@ -1603,6 +1790,9 @@ mod tests {
             tracker.try_claim_for_open(&vuri, &dead).await,
             "purged connection must be able to re-claim (→ re-didOpen)"
         );
+        tracker
+            .register_opened_document(&host_uri, &vuri, &dead)
+            .await;
         let servers = tracker.get_all_connections_for_virtual_uri(&vuri);
         assert!(
             servers.contains(&dead) && servers.contains(&sibling),

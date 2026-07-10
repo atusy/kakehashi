@@ -209,6 +209,86 @@ pub(in crate::lsp::lsp_impl) struct CachedCapturesWalk {
 pub(in crate::lsp::lsp_impl) type WalkArrays =
     (std::sync::Arc<Vec<Value>>, std::sync::Arc<Vec<Value>>);
 
+/// Identity and freshness of one full-mode captures walk. Field order is the
+/// supersession order: a reopened document beats every prior lifetime, a
+/// settings generation beats prior query assets, then a newer parse snapshot
+/// beats an older one within that generation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(in crate::lsp::lsp_impl) struct CapturesWalkTag {
+    incarnation: u64,
+    generation: u64,
+    parsed_version: u64,
+}
+
+/// Shared state for the winner and same-snapshot losers of one captures walk.
+pub(in crate::lsp::lsp_impl) struct CapturesWalkFlight {
+    tag: CapturesWalkTag,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+    cancel: crate::cancel::CancelToken,
+}
+
+impl CapturesWalkFlight {
+    fn new(tag: CapturesWalkTag, cancel: crate::cancel::CancelToken) -> Self {
+        Self {
+            tag,
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            cancel,
+        }
+    }
+
+    pub(in crate::lsp::lsp_impl) fn cancel_and_notify(&self) {
+        self.cancel.cancel();
+        self.notify.notify_waiters();
+    }
+}
+
+enum WalkFlightClaim {
+    Winner(std::sync::Arc<CapturesWalkFlight>),
+    Join(std::sync::Arc<CapturesWalkFlight>),
+    Obsolete,
+}
+
+fn claim_walk_flight(
+    map: &dashmap::DashMap<(Url, String, bool), std::sync::Arc<CapturesWalkFlight>>,
+    key: &(Url, String, bool),
+    tag: CapturesWalkTag,
+    cancel: crate::cancel::CancelToken,
+) -> WalkFlightClaim {
+    // Avoid cloning the owned key on the same-snapshot loser path.
+    if let Some(current) = map.get(key) {
+        match tag.cmp(&current.tag) {
+            std::cmp::Ordering::Equal => {
+                return WalkFlightClaim::Join(std::sync::Arc::clone(&current));
+            }
+            std::cmp::Ordering::Less => return WalkFlightClaim::Obsolete,
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
+    match map.entry(key.clone()) {
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            let flight = std::sync::Arc::new(CapturesWalkFlight::new(tag, cancel));
+            vacant.insert(std::sync::Arc::clone(&flight));
+            WalkFlightClaim::Winner(flight)
+        }
+        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+            match tag.cmp(&occupied.get().tag) {
+                std::cmp::Ordering::Equal => {
+                    WalkFlightClaim::Join(std::sync::Arc::clone(occupied.get()))
+                }
+                std::cmp::Ordering::Less => WalkFlightClaim::Obsolete,
+                std::cmp::Ordering::Greater => {
+                    let previous = std::sync::Arc::clone(occupied.get());
+                    let flight = std::sync::Arc::new(CapturesWalkFlight::new(tag, cancel));
+                    occupied.insert(std::sync::Arc::clone(&flight));
+                    previous.cancel_and_notify();
+                    WalkFlightClaim::Winner(flight)
+                }
+            }
+        }
+    }
+}
+
 /// Winner-side handle of the single-flight captures walk: holds the
 /// in-flight marker for one `(uri, kind, injection)` and, on drop (every
 /// exit path — success, cancel, panic-unwind), removes it and wakes the
@@ -216,17 +296,29 @@ pub(in crate::lsp::lsp_impl) type WalkArrays =
 /// `remove_if` with pointer equality so a slow winner can never evict a
 /// successor's marker.
 struct WalkFlightGuard<'a> {
-    map: &'a dashmap::DashMap<(Url, String, bool), std::sync::Arc<tokio::sync::Notify>>,
+    map: &'a dashmap::DashMap<(Url, String, bool), std::sync::Arc<CapturesWalkFlight>>,
     key: (Url, String, bool),
-    notify: std::sync::Arc<tokio::sync::Notify>,
+    flight: std::sync::Arc<CapturesWalkFlight>,
+    cancel_on_drop: bool,
+}
+
+impl WalkFlightGuard<'_> {
+    fn complete(&mut self) {
+        self.cancel_on_drop = false;
+    }
 }
 
 impl Drop for WalkFlightGuard<'_> {
     fn drop(&mut self) {
+        // Also covers wholesale handler-future drops: a detached compute-pool
+        // unit observes the same token and stops at its next checkpoint.
+        if self.cancel_on_drop {
+            self.flight.cancel.cancel();
+        }
         self.map.remove_if(&self.key, |_, current| {
-            std::sync::Arc::ptr_eq(current, &self.notify)
+            std::sync::Arc::ptr_eq(current, &self.flight)
         });
-        self.notify.notify_waiters();
+        self.flight.notify.notify_waiters();
     }
 }
 
@@ -366,6 +458,9 @@ fn load_kind_query(
 struct ComputedCaptures {
     uri: Url,
     incarnation: u64,
+    /// Settings/query generation used by the walk. A reload can leave the
+    /// document text unchanged while changing capture semantics.
+    generation: u64,
     /// The live `content_version` at snapshot resolution. The resolved
     /// snapshot is current at that instant (serve-current park), but an edit
     /// landing DURING the walk still voids the lineage store: the response
@@ -447,6 +542,37 @@ pub enum CapturesDeltaResponse {
 }
 
 impl Kakehashi {
+    fn captures_snapshot_is_current(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        parsed_version: u64,
+        generation: u64,
+        edit_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
+        let latest = self.documents.latest_snapshot(uri);
+        let current = self.cache.semantic_token_generation() == generation
+            && latest.as_ref().is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == parsed_version
+            });
+        if latest.is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, edit_lock);
+        }
+        current
+    }
+
+    pub(in crate::lsp::lsp_impl) fn cancel_captures_walks_for_document(&self, uri: &Url) {
+        self.captures_walk_inflight.retain(|key, flight| {
+            if key.0 == *uri {
+                flight.cancel_and_notify();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// Handler for `kakehashi/captures/full`.
     pub async fn kakehashi_captures_full(
         &self,
@@ -492,7 +618,8 @@ impl Kakehashi {
     /// (or closed-and-reopened) or its text moved past the computed snapshot
     /// while the request was in flight. Returns whether the lineage landed.
     ///
-    /// Three guards, all under the same per-URI edit lock `didClose` and
+    /// Four guards, with document lifetime/version checks under the same
+    /// per-URI edit lock `didClose` and
     /// `didChange` hold around their mutations:
     /// - liveness: a close that won the lock first leaves the document gone,
     ///   so the check skips the insert; an insert that won first is cleared by
@@ -509,6 +636,8 @@ impl Kakehashi {
     ///   stored and the caller answers `null`. Under serve-current the
     ///   snapshot was current at resolution, so this guard covers exactly the
     ///   resolve→delivery window.
+    /// - generation: a settings/query reload can change captures without an
+    ///   edit, so a lineage computed under the prior generation is rejected.
     async fn store_lineage(
         &self,
         computed: ComputedCaptures,
@@ -524,7 +653,7 @@ impl Kakehashi {
         let still_current = self.documents.get(&uri).is_some_and(|doc| {
             doc.incarnation() == computed.incarnation
                 && doc.content_version() == computed.entry_content_version
-        });
+        }) && self.cache.semantic_token_generation() == computed.generation;
         if still_current {
             let mut entry = self.captures_cache.entry((uri, kind)).or_default();
             entry[usize::from(injection)] = Some((result_id, computed.matches));
@@ -726,10 +855,9 @@ impl Kakehashi {
         // (`layer_trees.get_or_init`) deliberately ignores cancel — its result
         // is shared by every subsequent walk on the snapshot via OnceLock, and
         // a cancelled partial build must never be cached, so it runs at most
-        // once per snapshot to completion; (b) the token's only cancel source
-        // is the select arm below — if this handler future is dropped wholesale
-        // (client disconnect / service teardown) a walk already dequeued runs
-        // to completion once, bounded by the walk itself.
+        // once per snapshot to completion. The token is flipped by an explicit
+        // client cancel, a fresher snapshot replacing this flight, didClose,
+        // or the winner guard dropping with its handler future.
         let upstream_id = crate::lsp::current_upstream_id();
         let (mut cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let cancel_token = crate::cancel::CancelToken::default();
@@ -861,15 +989,39 @@ impl Kakehashi {
         // a `null` outcome as a negative entry — so the no-kind-file case
         // can't convoy the losers into sequential identical walks. The 1s
         // re-loop timeout is a lost-wakeup backstop only — correctness never
-        // depends on it. Accepted dedup gap: each request resolves its
-        // snapshot BEFORE this loop, so a loser whose wake finds the memo
-        // tagged one publish newer than its own snapshot misses and re-walks
-        // — correct (the lineage gate voids nothing), just less deduped
-        // exactly under burst load.
+        // depends on it. A request for a fresher snapshot atomically replaces
+        // the marker and cancels the old winner; same-snapshot full/delta
+        // requests still join it, while an older request that reaches the map
+        // after the replacement answers protocol `null` instead of reviving
+        // obsolete compute. RequestCancelled is reserved for an explicit
+        // client `$/cancelRequest`.
         let mut flight_guard = None;
         let walk_key = if lsp_range.is_none() {
             let key = (uri.clone(), kind.to_string(), injection);
+            let walk_tag = CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: snapshot.parsed_version,
+            };
             loop {
+                // Memo lookup and flight election share didChange/didClose's
+                // per-document edit lock. Without this gate, a delayed loser
+                // could wake after its fresher successor removed the marker,
+                // reclaim the vacant flight with an old tag, and resurrect an
+                // obsolete memo after close or edit.
+                let edit_lock = self.documents.edit_lock(&uri);
+                let edit_guard = edit_lock.lock().await;
+                let current = self.captures_snapshot_is_current(
+                    &uri,
+                    incarnation,
+                    snapshot.parsed_version,
+                    generation,
+                    &edit_lock,
+                );
+                if !current {
+                    drop(edit_guard);
+                    return Ok(None);
+                }
                 if let Some(hit) = self.captures_walk_cache.get(&key)
                     && hit.parsed_version == snapshot.parsed_version
                     && hit.incarnation == incarnation
@@ -884,69 +1036,73 @@ impl Kakehashi {
                         .map(|(matches, skipped)| ComputedCaptures {
                             uri,
                             incarnation,
+                            generation,
                             entry_content_version,
                             matches,
                             skipped,
                         }));
                 }
-                // `get` before `entry`: the loser path (marker present) is
-                // the one taken repeatedly under a burst, and `entry` would
-                // clone the (Url, String) key just to find it occupied. Only
-                // a would-be winner pays the owned-key clone.
-                let notify = if let Some(current) = self.captures_walk_inflight.get(&key) {
-                    std::sync::Arc::clone(&current)
-                } else {
-                    match self.captures_walk_inflight.entry(key.clone()) {
-                        dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                            // Re-check the memo before claiming winnership: a
-                            // concurrent winner may have stored its result and
-                            // dropped its marker between the memo check at the
-                            // top of the loop and this claim — claiming here
-                            // would re-run the identical walk right past its
-                            // fresh result. (Ordering is inflight-shard →
-                            // memo-shard; no path acquires them in reverse.)
-                            if let Some(hit) = self.captures_walk_cache.get(&key)
-                                && hit.parsed_version == snapshot.parsed_version
-                                && hit.incarnation == incarnation
-                                && hit.generation == generation
-                            {
-                                let result = hit.result.clone();
-                                drop(hit);
-                                return Ok(result.map(|(matches, skipped)| ComputedCaptures {
-                                    uri,
-                                    incarnation,
-                                    entry_content_version,
-                                    matches,
-                                    skipped,
-                                }));
-                            }
-                            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-                            vacant.insert(std::sync::Arc::clone(&notify));
-                            flight_guard = Some(WalkFlightGuard {
-                                map: &self.captures_walk_inflight,
-                                key: key.clone(),
-                                notify,
-                            });
-                            break;
+                let claim = claim_walk_flight(
+                    &self.captures_walk_inflight,
+                    &key,
+                    walk_tag,
+                    cancel_token.clone(),
+                );
+                let flight = match claim {
+                    WalkFlightClaim::Winner(flight) => {
+                        flight_guard = Some(WalkFlightGuard {
+                            map: &self.captures_walk_inflight,
+                            key: key.clone(),
+                            flight,
+                            cancel_on_drop: true,
+                        });
+                        // A prior winner can store its memo and remove its
+                        // marker between the loop's memo read and our claim.
+                        // Re-check after claiming so this successor does not
+                        // repeat an already-completed identical walk.
+                        if let Some(hit) = self.captures_walk_cache.get(&key)
+                            && hit.parsed_version == snapshot.parsed_version
+                            && hit.incarnation == incarnation
+                            && hit.generation == generation
+                        {
+                            let result = hit.result.clone();
+                            drop(hit);
+                            flight_guard
+                                .as_mut()
+                                .expect("winner guard was just installed")
+                                .complete();
+                            return Ok(result.map(|(matches, skipped)| ComputedCaptures {
+                                uri,
+                                incarnation,
+                                generation,
+                                entry_content_version,
+                                matches,
+                                skipped,
+                            }));
                         }
-                        // A racing winner claimed the marker between the get
-                        // and the entry: park on it like any loser.
-                        dashmap::mapref::entry::Entry::Occupied(occupied) => {
-                            std::sync::Arc::clone(occupied.get())
-                        }
+                        drop(edit_guard);
+                        break;
+                    }
+                    WalkFlightClaim::Join(flight) => {
+                        drop(edit_guard);
+                        flight
+                    }
+                    WalkFlightClaim::Obsolete => {
+                        drop(edit_guard);
+                        return Ok(None);
                     }
                 };
                 // Register interest BEFORE re-validating the marker: enable()
                 // makes a notify_waiters() between here and the await visible,
                 // and the marker re-check catches a winner that exited before
                 // we registered (its notify_waiters preceded our enable).
-                let notified = notify.notified();
+                let notified = flight.notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 let winner_live = self
                     .captures_walk_inflight
                     .get(&key)
-                    .is_some_and(|current| std::sync::Arc::ptr_eq(&*current, &notify));
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(&*current, &flight));
                 if winner_live {
                     match cancel_rx.as_mut() {
                         Some(rx) => {
@@ -965,6 +1121,10 @@ impl Kakehashi {
                         }
                     }
                 }
+                // A cancelled token belongs to the winner, not to every
+                // same-snapshot joiner. Re-enter the currency/memo/claim loop:
+                // a still-current joiner can elect a replacement, while a
+                // genuinely superseded snapshot fails the currency check.
             }
             Some(key)
         } else {
@@ -973,7 +1133,7 @@ impl Kakehashi {
         // Holds the in-flight marker for the winner until this function
         // returns (its Drop removes the marker and wakes the losers, AFTER
         // the memo store below on the success path).
-        let _flight_guard = flight_guard;
+        let mut flight_guard = flight_guard;
 
         let uri_for_walk = uri.clone();
         let kind = kind.to_string();
@@ -1097,6 +1257,8 @@ impl Kakehashi {
             });
         let walked = if let Some(cancel_rx) = cancel_rx {
             tokio::pin!(cancel_rx);
+            let superseded = walk_cancel.cancelled();
+            tokio::pin!(superseded);
             tokio::select! {
                 biased;
                 // $/cancelRequest while queued/walking: flip the token so a
@@ -1108,27 +1270,27 @@ impl Kakehashi {
                     walk_cancel.cancel();
                     return Err(JsonRpcError::request_cancelled());
                 }
+                _ = &mut superseded => {
+                    return Ok(None);
+                }
                 walked = walk_future => walked,
             }
         } else {
-            walk_future.await
+            tokio::select! {
+                _ = walk_cancel.cancelled() => {
+                    return Ok(None);
+                }
+                walked = walk_future => walked,
+            }
         };
         let Some(walked) = walked else {
             // A pool-skip of an already-cancelled unit (or a work-unit panic).
-            if walk_cancel.is_cancelled() {
-                return Err(JsonRpcError::request_cancelled());
-            }
             return Ok(None);
         };
-        // Forward-looking guard, unreachable today: the only current writer of
-        // this token is the `cancel_rx` select arm above, which returns
-        // instead of falling through. It stays because the token is designed
-        // to gain writers (captures supersession would flip it the way
-        // `SemanticRequestTracker` flips the token handlers'), and a completed
-        // walk raced by its own cancellation must never be cached or served —
-        // the client already discarded this request.
+        // A completed walk can race a fresher flight or didClose after its last
+        // internal checkpoint. Never cache or serve that obsolete result.
         if walk_cancel.is_cancelled() {
-            return Err(JsonRpcError::request_cancelled());
+            return Ok(None);
         }
         // Arc once; the memo and the returned ComputedCaptures share the
         // arrays by refcount instead of deep-cloning ~20k `Value`s. A `None`
@@ -1137,6 +1299,22 @@ impl Kakehashi {
         let result = walked
             .map(|(matches, skipped)| (std::sync::Arc::new(matches), std::sync::Arc::new(skipped)));
         if let Some(key) = walk_key {
+            // Serialize the final currency check and memo installation with
+            // didChange/didClose. This prevents a close from clearing the memo
+            // between our check and insert, then having this old winner recreate
+            // state for the dead document lifetime.
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let current = self.captures_snapshot_is_current(
+                &uri,
+                incarnation,
+                snapshot.parsed_version,
+                generation,
+                &edit_lock,
+            );
+            if !current {
+                return Ok(None);
+            }
             self.captures_walk_cache.insert(
                 key,
                 CachedCapturesWalk {
@@ -1146,10 +1324,14 @@ impl Kakehashi {
                     result: result.clone(),
                 },
             );
+            if let Some(guard) = flight_guard.as_mut() {
+                guard.complete();
+            }
         }
         Ok(result.map(|(matches, skipped)| ComputedCaptures {
             uri,
             incarnation,
+            generation,
             entry_content_version,
             matches,
             skipped,
@@ -1853,11 +2035,24 @@ mod tests {
 
         // Simulate a winner already walking this key.
         let key = (uri.clone(), "highlights".to_string(), false);
-        let winner_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        service
-            .inner()
+        let winner_flight = std::sync::Arc::new(CapturesWalkFlight::new(
+            CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: 0,
+            },
+            crate::cancel::CancelToken::default(),
+        ));
+        let inner = service.inner();
+        inner
             .captures_walk_inflight
-            .insert(key.clone(), std::sync::Arc::clone(&winner_notify));
+            .insert(key.clone(), std::sync::Arc::clone(&winner_flight));
+        let mut winner_guard = WalkFlightGuard {
+            map: &inner.captures_walk_inflight,
+            key: key.clone(),
+            flight: winner_flight,
+            cancel_on_drop: true,
+        };
 
         let request = {
             let service = std::sync::Arc::clone(&service);
@@ -1897,8 +2092,8 @@ mod tests {
                 )),
             },
         );
-        service.inner().captures_walk_inflight.remove(&key);
-        winner_notify.notify_waiters();
+        winner_guard.complete();
+        drop(winner_guard);
 
         let result = request
             .await
@@ -1909,6 +2104,442 @@ mod tests {
             result.matches[0], sentinel,
             "the loser must serve the winner's memo, not run its own walk"
         );
+
+        // A winner-local cancellation must not cancel its unrelated joiner.
+        // Model a replacement winner completing immediately after the old
+        // guard wakes the joiner: the handler must re-loop and consume this
+        // memo. The former early `return Ok(None)` would fail this assertion.
+        service.inner().captures_walk_cache.remove(&key);
+        let cancelled_flight = std::sync::Arc::new(CapturesWalkFlight::new(
+            CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: 0,
+            },
+            crate::cancel::CancelToken::default(),
+        ));
+        service
+            .inner()
+            .captures_walk_inflight
+            .insert(key.clone(), std::sync::Arc::clone(&cancelled_flight));
+        let cancelled_guard = WalkFlightGuard {
+            map: &service.inner().captures_walk_inflight,
+            key: key.clone(),
+            flight: cancelled_flight,
+            cancel_on_drop: true,
+        };
+        let joined_after_cancel = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .kakehashi_captures_full(CapturesFullParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                        },
+                        kind: "highlights".to_string(),
+                        injection: false,
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!joined_after_cancel.is_finished());
+        drop(cancelled_guard);
+        let replacement = json!({"sentinel": "from-replacement-memo"});
+        service.inner().captures_walk_cache.insert(
+            key.clone(),
+            CachedCapturesWalk {
+                parsed_version: 0,
+                incarnation,
+                generation,
+                result: Some((
+                    std::sync::Arc::new(vec![replacement.clone()]),
+                    std::sync::Arc::new(Vec::new()),
+                )),
+            },
+        );
+        let result = joined_after_cancel
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("same-snapshot joiner must retry after winner cancellation");
+        assert_eq!(result.matches[0], replacement);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_captures_loser_does_not_revive_old_memo() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///captures_stale_loser.rs").unwrap();
+        let text = "fn main() {}";
+        service.inner().documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let incarnation = service
+            .inner()
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .current_incarnation;
+        let parse = |source: &str| {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            parser.parse(source, None).unwrap()
+        };
+        let publish = |version, source: &'static str| {
+            service
+                .inner()
+                .documents
+                .get(&uri)
+                .unwrap()
+                .publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(source),
+                        tree: Some(parse(source)),
+                        language: Some("rust".to_string()),
+                        parsed_version: version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+        };
+        assert!(publish(0, text));
+
+        let generation = service.inner().cache.semantic_token_generation();
+        let key = (uri.clone(), "highlights".to_string(), false);
+        let old_flight = std::sync::Arc::new(CapturesWalkFlight::new(
+            CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: 0,
+            },
+            crate::cancel::CancelToken::default(),
+        ));
+        service
+            .inner()
+            .captures_walk_inflight
+            .insert(key.clone(), old_flight);
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .kakehashi_captures_full(CapturesFullParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                        },
+                        kind: "highlights".to_string(),
+                        injection: false,
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!request.is_finished());
+
+        let newer = "fn newer() {}";
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), newer.to_string(), None);
+        assert!(publish(1, newer));
+        let WalkFlightClaim::Winner(new_flight) = claim_walk_flight(
+            &service.inner().captures_walk_inflight,
+            &key,
+            CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: 1,
+            },
+            crate::cancel::CancelToken::default(),
+        ) else {
+            panic!("new snapshot must supersede old flight");
+        };
+        service
+            .inner()
+            .captures_walk_inflight
+            .remove_if(&key, |_, current| {
+                std::sync::Arc::ptr_eq(current, &new_flight)
+            });
+        new_flight.notify.notify_waiters();
+
+        let result = request
+            .await
+            .unwrap()
+            .expect("internal supersession is null");
+        assert!(result.is_none());
+        assert!(
+            service.inner().captures_walk_cache.get(&key).is_none(),
+            "the delayed old loser must not recreate an obsolete memo"
+        );
+    }
+
+    #[tokio::test]
+    async fn captures_lineage_rejects_pre_reload_generation() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///captures_reload.rs").unwrap();
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let view = service.inner().documents.latest_snapshot(&uri).unwrap();
+        let generation = service.inner().cache.semantic_token_generation();
+        service.inner().cache.bump_semantic_token_generation();
+
+        let landed = service
+            .inner()
+            .store_lineage(
+                ComputedCaptures {
+                    uri: uri.clone(),
+                    incarnation: view.slot.current_incarnation,
+                    generation,
+                    entry_content_version: view.content_version,
+                    matches: std::sync::Arc::new(Vec::new()),
+                    skipped: std::sync::Arc::new(Vec::new()),
+                },
+                "highlights".to_string(),
+                false,
+                "old-generation".to_string(),
+            )
+            .await;
+
+        assert!(!landed);
+        assert!(
+            service
+                .inner()
+                .captures_cache
+                .get(&(uri, "highlights".to_string()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn captures_currency_failure_keeps_open_document_edit_lock() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///captures-open-lock.rs").unwrap();
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let view = service.inner().documents.latest_snapshot(&uri).unwrap();
+        let edit_lock = service.inner().documents.edit_lock(&uri);
+
+        assert!(!service.inner().captures_snapshot_is_current(
+            &uri,
+            view.slot.current_incarnation,
+            view.content_version,
+            service.inner().cache.semantic_token_generation() + 1,
+            &edit_lock,
+        ));
+
+        let next = service.inner().documents.edit_lock(&uri);
+        assert!(
+            std::sync::Arc::ptr_eq(&edit_lock, &next),
+            "an open lifetime must keep one stable edit lock"
+        );
+    }
+
+    #[test]
+    fn captures_currency_failure_reclaims_closed_document_edit_lock() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///captures-closed-lock.rs").unwrap();
+        let edit_lock = service.inner().documents.edit_lock(&uri);
+
+        assert!(!service.inner().captures_snapshot_is_current(
+            &uri,
+            1,
+            0,
+            service.inner().cache.semantic_token_generation(),
+            &edit_lock,
+        ));
+
+        let next = service.inner().documents.edit_lock(&uri);
+        assert!(
+            !std::sync::Arc::ptr_eq(&edit_lock, &next),
+            "a closed lifetime must not leave its materialized edit lock registered"
+        );
+    }
+
+    #[test]
+    fn newer_snapshot_cancels_older_captures_flight() {
+        let flights = dashmap::DashMap::new();
+        let uri = Url::parse("file:///captures_supersede.rs").expect("valid test uri");
+        let key = (uri, "highlights".to_string(), false);
+        let old_cancel = crate::cancel::CancelToken::default();
+        let old_flight = std::sync::Arc::new(CapturesWalkFlight::new(
+            CapturesWalkTag {
+                incarnation: 1,
+                generation: 4,
+                parsed_version: 0,
+            },
+            old_cancel.clone(),
+        ));
+        flights.insert(key.clone(), std::sync::Arc::clone(&old_flight));
+        let old_guard = WalkFlightGuard {
+            map: &flights,
+            key: key.clone(),
+            flight: old_flight,
+            cancel_on_drop: true,
+        };
+
+        let new_cancel = crate::cancel::CancelToken::default();
+        let new_tag = CapturesWalkTag {
+            incarnation: 1,
+            generation: 4,
+            parsed_version: 1,
+        };
+        let WalkFlightClaim::Winner(new_flight) =
+            claim_walk_flight(&flights, &key, new_tag, new_cancel.clone())
+        else {
+            panic!("the newer snapshot must become the winner");
+        };
+
+        assert!(
+            old_cancel.is_cancelled(),
+            "a current-snapshot request must stop the obsolete walk"
+        );
+        assert!(!new_cancel.is_cancelled());
+        drop(old_guard);
+        assert!(
+            flights
+                .get(&key)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &new_flight)),
+            "the old guard must not remove the atomically installed successor"
+        );
+
+        let WalkFlightClaim::Join(joined) = claim_walk_flight(
+            &flights,
+            &key,
+            new_tag,
+            crate::cancel::CancelToken::default(),
+        ) else {
+            panic!("an identical snapshot must join the winner");
+        };
+        assert!(std::sync::Arc::ptr_eq(&joined, &new_flight));
+
+        let older = CapturesWalkTag {
+            parsed_version: 0,
+            ..new_tag
+        };
+        assert!(matches!(
+            claim_walk_flight(&flights, &key, older, crate::cancel::CancelToken::default()),
+            WalkFlightClaim::Obsolete
+        ));
+        assert!(
+            !new_cancel.is_cancelled(),
+            "an obsolete requester must not cancel the newer winner"
+        );
+
+        let reopened_cancel = crate::cancel::CancelToken::default();
+        let reopened_tag = CapturesWalkTag {
+            incarnation: 2,
+            generation: 4,
+            parsed_version: 0,
+        };
+        assert!(matches!(
+            claim_walk_flight(&flights, &key, reopened_tag, reopened_cancel.clone()),
+            WalkFlightClaim::Winner(_)
+        ));
+        assert!(
+            new_cancel.is_cancelled(),
+            "a reopened document must supersede the prior lifetime despite version reset"
+        );
+        assert!(!reopened_cancel.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_winner_allows_same_snapshot_replacement() {
+        let flights = dashmap::DashMap::new();
+        let key = (
+            Url::parse("file:///captures_cancelled_winner.rs").unwrap(),
+            "highlights".to_string(),
+            false,
+        );
+        let tag = CapturesWalkTag {
+            incarnation: 1,
+            generation: 2,
+            parsed_version: 3,
+        };
+        let WalkFlightClaim::Winner(first) =
+            claim_walk_flight(&flights, &key, tag, crate::cancel::CancelToken::default())
+        else {
+            panic!("first request must win");
+        };
+        let guard = WalkFlightGuard {
+            map: &flights,
+            key: key.clone(),
+            flight: std::sync::Arc::clone(&first),
+            cancel_on_drop: true,
+        };
+        assert!(matches!(
+            claim_walk_flight(&flights, &key, tag, crate::cancel::CancelToken::default()),
+            WalkFlightClaim::Join(_)
+        ));
+
+        drop(guard);
+        assert!(first.cancel.is_cancelled());
+        assert!(matches!(
+            claim_walk_flight(&flights, &key, tag, crate::cancel::CancelToken::default()),
+            WalkFlightClaim::Winner(_)
+        ));
+    }
+
+    #[test]
+    fn document_close_cancels_only_its_captures_flights() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let closed_uri = Url::parse("file:///captures-close.rs").expect("valid test uri");
+        let live_uri = Url::parse("file:///captures-live.rs").expect("valid test uri");
+        let tag = CapturesWalkTag {
+            incarnation: 1,
+            generation: 0,
+            parsed_version: 0,
+        };
+        let closed_cancel = crate::cancel::CancelToken::default();
+        let live_cancel = crate::cancel::CancelToken::default();
+        service.inner().captures_walk_inflight.insert(
+            (closed_uri.clone(), "highlights".to_string(), false),
+            std::sync::Arc::new(CapturesWalkFlight::new(tag, closed_cancel.clone())),
+        );
+        service.inner().captures_walk_inflight.insert(
+            (live_uri.clone(), "highlights".to_string(), false),
+            std::sync::Arc::new(CapturesWalkFlight::new(tag, live_cancel.clone())),
+        );
+
+        service
+            .inner()
+            .cancel_captures_walks_for_document(&closed_uri);
+
+        assert!(closed_cancel.is_cancelled());
+        assert!(!live_cancel.is_cancelled());
+        assert!(
+            service
+                .inner()
+                .captures_walk_inflight
+                .iter()
+                .all(|entry| entry.key().0 != closed_uri)
+        );
+        assert!(service.inner().captures_walk_inflight.contains_key(&(
+            live_uri,
+            "highlights".to_string(),
+            false
+        )));
     }
 
     /// A `$/cancelRequest` arriving while the handler is parked on a trailing

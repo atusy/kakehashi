@@ -10,10 +10,9 @@ pub(crate) use result_id::next_result_id;
 pub(crate) use selection::handle_selection_range;
 pub(crate) use semantic::{LEGEND_MODIFIERS, LEGEND_TYPES, calculate_delta_or_full};
 pub(crate) use semantic_cache::{
-    InjectionMap, InjectionTokenCache, SemanticTokenCache, SemanticTokenRangeCache,
+    InjectionMap, InjectionTokenCache, SemanticSnapshotIdentity, SemanticTokenCache,
+    SemanticTokenRangeCache,
 };
 
 // Re-export crate-internal functions used by LSP layer
-pub(crate) use semantic::{
-    handle_semantic_tokens_full, handle_semantic_tokens_range_parallel_async,
-};
+pub(crate) use semantic::{filter_semantic_tokens_by_range, handle_semantic_tokens_full};

@@ -36,12 +36,19 @@ pub(crate) struct ResponseRouter {
     /// All router state protected by a single mutex to avoid lock contention
     /// and simplify reasoning about thread safety.
     state: std::sync::Mutex<ResponseRouterState>,
+    /// Wakes connection-state waiters when reader/writer failure closes request
+    /// admission without going through `ConnectionHandle::set_state`.
+    terminal: tokio::sync::Notify,
 }
 
 /// Internal state for ResponseRouter, protected by a single mutex.
 struct ResponseRouterState {
+    /// False once the connection's reader/writer is terminal.
+    accepting: bool,
+    /// Advances whenever downstream-progressing requests transition 0 -> 1.
+    liveness_epoch: u64,
     /// Pending requests waiting for responses.
-    pending: HashMap<RequestId, oneshot::Sender<serde_json::Value>>,
+    pending: HashMap<RequestId, PendingRequest>,
     /// Maps upstream request ID (from client) to downstream request IDs (to LS).
     ///
     /// Used for $/cancelRequest forwarding: when the client cancels request 42,
@@ -63,15 +70,37 @@ struct ResponseRouterState {
     downstream_to_upstream: HashMap<RequestId, UpstreamId>,
 }
 
+struct PendingRequest {
+    response_tx: oneshot::Sender<serde_json::Value>,
+    delivery: RequestDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestDelivery {
+    Queued,
+    Writing,
+    Sent,
+    CancelledQueued,
+}
+
+pub(crate) enum LivenessExpiry {
+    Stale { current_epoch: u64 },
+    Idle,
+    Failed { pending_count: usize },
+}
+
 impl ResponseRouter {
     /// Create a new empty ResponseRouter.
     pub(crate) fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(ResponseRouterState {
+                accepting: true,
+                liveness_epoch: 0,
                 pending: HashMap::new(),
                 upstream_to_downstream: HashMap::new(),
                 downstream_to_upstream: HashMap::new(),
             }),
+            terminal: tokio::sync::Notify::new(),
         }
     }
 
@@ -95,6 +124,17 @@ impl ResponseRouter {
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
     ) -> Option<oneshot::Receiver<serde_json::Value>> {
+        self.register_with_upstream_liveness(downstream_id, upstream_id)
+            .map(|(rx, _)| rx)
+    }
+
+    /// Register and atomically report whether this request transitions the
+    /// set of downstream-progressing requests from empty to non-empty.
+    pub(crate) fn register_with_upstream_liveness(
+        &self,
+        downstream_id: RequestId,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
         let (tx, rx) = oneshot::channel();
         let mut state = self
             .state
@@ -102,11 +142,25 @@ impl ResponseRouter {
             .recover_poison("ResponseRouter::register_with_upstream");
 
         // Prevent duplicate registration
-        if state.pending.contains_key(&downstream_id) {
+        if !state.accepting || state.pending.contains_key(&downstream_id) {
             return None;
         }
+        let starts_liveness = state
+            .pending
+            .values()
+            .all(|pending| pending.delivery == RequestDelivery::CancelledQueued);
+        let liveness_epoch = starts_liveness.then(|| {
+            state.liveness_epoch = state.liveness_epoch.wrapping_add(1);
+            state.liveness_epoch
+        });
 
-        state.pending.insert(downstream_id, tx);
+        state.pending.insert(
+            downstream_id,
+            PendingRequest {
+                response_tx: tx,
+                delivery: RequestDelivery::Queued,
+            },
+        );
 
         // Store bidirectional mapping if upstream_id is provided. Appending
         // (not inserting) keeps every concurrent downstream request for this
@@ -120,7 +174,34 @@ impl ResponseRouter {
             state.downstream_to_upstream.insert(downstream_id, upstream);
         }
 
-        Some(rx)
+        Some((rx, liveness_epoch))
+    }
+
+    pub(crate) fn liveness_epoch(&self) -> u64 {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::liveness_epoch")
+            .liveness_epoch
+    }
+
+    pub(crate) fn is_accepting(&self) -> bool {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::is_accepting")
+            .accepting
+    }
+
+    /// Completes once this router stops accepting requests. Register the
+    /// notification before checking the flag so a concurrent `fail_all` cannot
+    /// be lost between those operations.
+    pub(crate) async fn wait_until_terminal(&self) {
+        loop {
+            let notified = self.terminal.notified();
+            if !self.is_accepting() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Look up every in-flight downstream request ID for an upstream request
@@ -129,6 +210,7 @@ impl ResponseRouter {
     /// Used by `$/cancelRequest` forwarding to translate the client's request ID
     /// to the language server's. Does NOT remove the entries — a cancelled
     /// request must still receive its response.
+    #[cfg(test)]
     pub(crate) fn lookup_downstream_ids(&self, upstream_id: &UpstreamId) -> Vec<RequestId> {
         let state = self
             .state
@@ -141,6 +223,85 @@ impl ResponseRouter {
             .unwrap_or_default()
     }
 
+    /// Mark every queued request for `upstream_id` so the writer skips it, and
+    /// return only IDs whose write already started or completed and therefore
+    /// still require a downstream `$/cancelRequest` notification.
+    pub(crate) fn prepare_cancel_by_upstream(
+        &self,
+        upstream_id: &UpstreamId,
+    ) -> (bool, Vec<RequestId>) {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::prepare_cancel_by_upstream");
+        let Some(ids) = state.upstream_to_downstream.get(upstream_id).cloned() else {
+            return (false, Vec::new());
+        };
+        let mut sent = Vec::new();
+        for id in ids {
+            let Some(pending) = state.pending.get_mut(&id) else {
+                continue;
+            };
+            match pending.delivery {
+                RequestDelivery::Queued => {
+                    pending.delivery = RequestDelivery::CancelledQueued;
+                }
+                RequestDelivery::Writing | RequestDelivery::Sent => sent.push(id),
+                RequestDelivery::CancelledQueued => {}
+            }
+        }
+        (true, sent)
+    }
+
+    /// Atomically claim a tracked request immediately before the writer starts
+    /// its bytes. Returns `false` for a request cancelled or removed while it
+    /// was queued, so no orphan request reaches the downstream server.
+    pub(crate) fn claim_for_write(&self, id: RequestId) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::claim_for_write");
+        let Some(pending) = state.pending.get_mut(&id) else {
+            return false;
+        };
+        match pending.delivery {
+            RequestDelivery::Queued => {
+                pending.delivery = RequestDelivery::Writing;
+                return true;
+            }
+            RequestDelivery::Writing | RequestDelivery::Sent => return false,
+            RequestDelivery::CancelledQueued => {}
+        }
+
+        let pending = state.pending.remove(&id);
+        Self::remove_cancel_mapping_inner(&mut state, id);
+        drop(state);
+        if let Some(pending) = pending {
+            let _ = pending.response_tx.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id.as_i64(),
+                "error": {
+                    "code": -32800,
+                    "message": "bridge: request cancelled before downstream write"
+                }
+            }));
+        }
+        false
+    }
+
+    /// Record successful completion of the writer-side request write.
+    pub(crate) fn mark_sent(&self, id: RequestId) {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::mark_sent");
+        if let Some(pending) = state.pending.get_mut(&id)
+            && pending.delivery == RequestDelivery::Writing
+        {
+            pending.delivery = RequestDelivery::Sent;
+        }
+    }
+
     /// Route a response to its pending request, also cleaning up both cancel-map
     /// directions for this ID in O(1).
     pub(crate) fn route(&self, response: serde_json::Value) -> RouteResult {
@@ -150,14 +311,14 @@ impl ResponseRouter {
         };
 
         let mut state = self.state.lock().recover_poison("ResponseRouter::route");
-        let tx = state.pending.remove(&id);
+        let pending = state.pending.remove(&id);
 
         // Clean up bidirectional cancel map entries in O(1)
         Self::remove_cancel_mapping_inner(&mut state, id);
 
-        match tx {
-            Some(sender) => {
-                if sender.send(response).is_ok() {
+        match pending {
+            Some(pending) => {
+                if pending.response_tx.send(response).is_ok() {
                     RouteResult::Delivered
                 } else {
                     RouteResult::ReceiverDropped
@@ -188,12 +349,27 @@ impl ResponseRouter {
     /// Used for liveness timeout management (ls-bridge-async-connection):
     /// - Timer starts when pending transitions 0 -> 1
     /// - Timer stops when pending transitions to 0
+    #[cfg(test)]
     pub(crate) fn pending_count(&self) -> usize {
         let state = self
             .state
             .lock()
             .recover_poison("ResponseRouter::pending_count");
         state.pending.len()
+    }
+
+    /// Requests that can still make downstream progress. Cancelled queued
+    /// entries remain only until the FIFO writer discards them.
+    pub(crate) fn awaiting_downstream_count(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::awaiting_downstream_count");
+        state
+            .pending
+            .values()
+            .filter(|pending| pending.delivery != RequestDelivery::CancelledQueued)
+            .count()
     }
 
     /// Remove a pending request without sending a response.
@@ -228,7 +404,7 @@ impl ResponseRouter {
             .lock()
             .recover_poison("ResponseRouter::fail_request");
 
-        let tx = state.pending.remove(&id);
+        let pending = state.pending.remove(&id);
 
         // Clean up bidirectional cancel map entries in O(1)
         Self::remove_cancel_mapping_inner(&mut state, id);
@@ -236,8 +412,8 @@ impl ResponseRouter {
         // Release lock before sending to avoid holding it during channel operations
         drop(state);
 
-        match tx {
-            Some(sender) => {
+        match pending {
+            Some(pending) => {
                 let error_response = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id.as_i64(),
@@ -246,7 +422,7 @@ impl ResponseRouter {
                         "message": format!("bridge: {}", reason)
                     }
                 });
-                let _ = sender.send(error_response);
+                let _ = pending.response_tx.send(error_response);
                 true
             }
             None => false,
@@ -263,6 +439,7 @@ impl ResponseRouter {
     /// state and entries get overwritten when the next upstream ID reuses them.
     pub(crate) fn fail_all(&self, error_message: &str) {
         let mut state = self.state.lock().recover_poison("ResponseRouter::fail_all");
+        state.accepting = false;
         let entries: Vec<_> = state.pending.drain().collect();
 
         // Clear both cancel map directions
@@ -271,17 +448,81 @@ impl ResponseRouter {
 
         // Release lock before sending to avoid holding it during channel operations
         drop(state);
+        self.terminal.notify_waiters();
 
-        for (id, tx) in entries {
+        for (id, pending) in entries {
+            let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {
+                (-32800, "bridge: request cancelled before downstream write")
+            } else {
+                (-32603, error_message)
+            };
             let error_response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.as_i64(),
                 "error": {
-                    "code": -32603, // InternalError
-                    "message": error_message
+                    "code": code,
+                    "message": message
                 }
             });
-            let _ = tx.send(error_response);
+            let _ = pending.response_tx.send(error_response);
+        }
+    }
+
+    /// Atomically fail the connection only when at least one request still
+    /// expects downstream progress. A queued request already marked cancelled
+    /// is waiting only for the FIFO writer to discard it, so it must not make a
+    /// healthy idle server fail its liveness check.
+    pub(crate) fn fail_all_if_awaiting_downstream(
+        &self,
+        expected_epoch: u64,
+        error_message: &str,
+        publish_failure: impl FnOnce(),
+    ) -> LivenessExpiry {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::fail_all_if_awaiting_downstream");
+        if state.liveness_epoch != expected_epoch {
+            return LivenessExpiry::Stale {
+                current_epoch: state.liveness_epoch,
+            };
+        }
+        let awaiting = state
+            .pending
+            .values()
+            .filter(|pending| pending.delivery != RequestDelivery::CancelledQueued)
+            .count();
+        if awaiting == 0 {
+            return LivenessExpiry::Idle;
+        }
+        // Close admission under the same lock as the epoch check and drain.
+        // Publish the connection failure before waking any drained waiter.
+        state.accepting = false;
+        let entries: Vec<_> = state.pending.drain().collect();
+        state.upstream_to_downstream.clear();
+        state.downstream_to_upstream.clear();
+        drop(state);
+        publish_failure();
+        self.terminal.notify_waiters();
+
+        for (id, pending) in entries {
+            let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {
+                (-32800, "bridge: request cancelled before downstream write")
+            } else {
+                (-32603, error_message)
+            };
+            let error_response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id.as_i64(),
+                "error": {
+                    "code": code,
+                    "message": message
+                }
+            });
+            let _ = pending.response_tx.send(error_response);
+        }
+        LivenessExpiry::Failed {
+            pending_count: awaiting,
         }
     }
 }
@@ -433,6 +674,11 @@ mod tests {
 
         let rx1 = router.register(RequestId::new(1)).unwrap();
         let rx2 = router.register(RequestId::new(2)).unwrap();
+        let cancelled_upstream = UpstreamId::Number(3);
+        let rx3 = router
+            .register_with_upstream(RequestId::new(3), Some(cancelled_upstream.clone()))
+            .unwrap();
+        router.prepare_cancel_by_upstream(&cancelled_upstream);
 
         router.fail_all("connection lost");
 
@@ -446,6 +692,9 @@ mod tests {
         let response2 = rx2.await.expect("should receive error response");
         assert_eq!(response2["error"]["code"], -32603);
         assert_eq!(response2["id"], 2);
+
+        let response3 = rx3.await.expect("cancelled waiter should receive response");
+        assert_eq!(response3["error"]["code"], -32800);
     }
 
     #[tokio::test]
@@ -496,6 +745,103 @@ mod tests {
     // ========================================
     // CancelMap tests (ls-bridge-message-ordering Cancel Forwarding)
     // ========================================
+
+    #[tokio::test]
+    async fn cancelled_queued_request_is_not_claimed_for_write() {
+        let router = ResponseRouter::new();
+        let downstream_id = RequestId::new(42);
+        let upstream_id = UpstreamId::Number(100);
+        let response = router
+            .register_with_upstream(downstream_id, Some(upstream_id.clone()))
+            .expect("request registration should succeed");
+
+        let (known, sent_ids) = router.prepare_cancel_by_upstream(&upstream_id);
+
+        assert!(known);
+        assert!(
+            sent_ids.is_empty(),
+            "a request still in the writer queue needs no downstream cancel"
+        );
+        assert!(
+            !router.claim_for_write(downstream_id),
+            "the writer must skip a request cancelled before dequeue"
+        );
+        let cancelled = response.await.expect("queued cancellation should answer");
+        assert_eq!(cancelled["error"]["code"], -32800);
+    }
+
+    #[test]
+    fn cancelled_queued_entry_does_not_hide_new_downstream_work() {
+        let router = ResponseRouter::new();
+        let cancelled_id = RequestId::new(1);
+        let upstream_id = UpstreamId::Number(10);
+        let _cancelled_rx = router
+            .register_with_upstream(cancelled_id, Some(upstream_id.clone()))
+            .unwrap();
+        router.prepare_cancel_by_upstream(&upstream_id);
+
+        assert_eq!(router.pending_count(), 1);
+        assert_eq!(router.awaiting_downstream_count(), 0);
+        let (_live_rx, liveness_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(2), None)
+            .unwrap();
+        assert_eq!(liveness_epoch, Some(2));
+        assert_eq!(router.pending_count(), 2);
+        assert_eq!(router.awaiting_downstream_count(), 1);
+    }
+
+    #[test]
+    fn stale_liveness_epoch_cannot_fail_new_requests() {
+        let router = ResponseRouter::new();
+        let old_upstream = UpstreamId::Number(10);
+        let (_old_rx, old_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(1), Some(old_upstream.clone()))
+            .unwrap();
+        router.prepare_cancel_by_upstream(&old_upstream);
+        let (_new_rx, new_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(2), None)
+            .unwrap();
+
+        assert!(matches!(
+            router.fail_all_if_awaiting_downstream(old_epoch.unwrap(), "expired", || {}),
+            LivenessExpiry::Stale { current_epoch } if Some(current_epoch) == new_epoch
+        ));
+        assert_eq!(router.awaiting_downstream_count(), 1);
+    }
+
+    #[test]
+    fn genuine_liveness_expiry_closes_admission_before_waking_waiters() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let router = ResponseRouter::new();
+        let (mut rx, epoch) = router
+            .register_with_upstream_liveness(RequestId::new(1), None)
+            .unwrap();
+        let cancelled_upstream = UpstreamId::Number(2);
+        let mut cancelled_rx = router
+            .register_with_upstream(RequestId::new(2), Some(cancelled_upstream.clone()))
+            .unwrap();
+        router.prepare_cancel_by_upstream(&cancelled_upstream);
+        let published = AtomicBool::new(false);
+        assert!(matches!(
+            router.fail_all_if_awaiting_downstream(epoch.unwrap(), "expired", || {
+                published.store(true, Ordering::Release);
+            }),
+            LivenessExpiry::Failed { pending_count: 1 }
+        ));
+
+        assert!(published.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_ok(),
+            "waiter should be woken after publish"
+        );
+        let cancelled = cancelled_rx.try_recv().unwrap();
+        assert_eq!(cancelled["error"]["code"], -32800);
+        assert!(
+            router.register(RequestId::new(2)).is_none(),
+            "a terminal router must reject new requests"
+        );
+    }
 
     /// Test that register_with_upstream stores upstream->downstream mapping.
     ///

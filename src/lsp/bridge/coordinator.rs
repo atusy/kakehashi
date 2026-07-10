@@ -356,6 +356,22 @@ impl BridgeCoordinator {
             .await;
     }
 
+    fn injection_open_on_connection(
+        &self,
+        host_uri_lsp: &tower_lsp_server::ls_types::Uri,
+        connection_key: &super::pool::ConnectionKey,
+        injection: &BridgeInjection,
+    ) -> bool {
+        let virtual_uri = super::protocol::VirtualDocumentUri::new(
+            host_uri_lsp,
+            &injection.language,
+            &injection.region_id,
+        );
+        self.pool
+            .get_all_connections_for_virtual_uri(&virtual_uri)
+            .contains(connection_key)
+    }
+
     /// The injections whose language bridges to `server_name`, plus that server's
     /// resolved config. A codeAction fans out to ALL servers bridging an
     /// injection language, so the command's origin may be ANY of them — match by
@@ -747,7 +763,7 @@ impl BridgeCoordinator {
     ///
     /// Sending `didOpen` up front (not just a handshake) lets downstream servers
     /// start analyzing immediately, yielding faster diagnostics.
-    pub(crate) fn eager_spawn_and_open_documents(
+    pub(crate) async fn eager_spawn_and_open_documents(
         &self,
         settings: &WorkspaceSettings,
         host_language: &str,
@@ -778,6 +794,8 @@ impl BridgeCoordinator {
         // per-region resolution was a measured tokio-side hotspot (this loop
         // runs on the runtime, and starving it delays every handler).
         let mut config_by_lang: HashMap<String, Option<ResolvedServerConfig>> = HashMap::new();
+        let mut connection_key_by_lang = HashMap::new();
+        let mut any_resolved = false;
         for injection in injections {
             let resolved = config_by_lang
                 .entry(injection.language.clone())
@@ -785,6 +803,27 @@ impl BridgeCoordinator {
                     self.get_config_for_language(settings, host_language, &injection.language)
                 });
             if let Some(resolved) = resolved {
+                any_resolved = true;
+                let connection_key = match connection_key_by_lang.get(&injection.language) {
+                    Some(key) => key,
+                    None => {
+                        let key = self
+                            .pool
+                            .resolved_connection_key(
+                                &resolved.server_name,
+                                &resolved.config,
+                                host_uri,
+                            )
+                            .await;
+                        connection_key_by_lang.insert(injection.language.clone(), key);
+                        connection_key_by_lang
+                            .get(&injection.language)
+                            .expect("just inserted")
+                    }
+                };
+                if self.injection_open_on_connection(&host_uri_lsp, connection_key, &injection) {
+                    continue;
+                }
                 server_groups
                     .entry(resolved.server_name.clone())
                     .or_insert_with(|| (resolved.config.clone(), Vec::new()))
@@ -793,9 +832,13 @@ impl BridgeCoordinator {
             }
         }
 
-        // If no servers match, cancel any previous batch to prevent stale didOpen
+        // Empty means either every resolved injection is already sent/open, or
+        // current settings resolve none. Preserve a batch only in the former
+        // case; in the latter it belongs to removed configuration and must stop.
         if server_groups.is_empty() {
-            self.cancel_eager_open(host_uri);
+            if !any_resolved {
+                self.cancel_eager_open(host_uri);
+            }
             return;
         }
 
@@ -1498,6 +1541,45 @@ mod tests {
         )
         .await
         .expect("a non-matching server must short-circuit, not attempt a spawn");
+    }
+
+    #[tokio::test]
+    async fn injection_open_requires_exact_server_and_root() {
+        let coordinator = BridgeCoordinator::new();
+        let host_uri = Url::parse("file:///doc.md").unwrap();
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
+        let injection = BridgeInjection {
+            language: "lua".to_string(),
+            region_id: "region-0".to_string(),
+            content: "print('hello')".to_string(),
+        };
+        let virtual_uri = crate::lsp::bridge::protocol::VirtualDocumentUri::new(
+            &host_uri_lsp,
+            &injection.language,
+            &injection.region_id,
+        );
+        let root_a = crate::lsp::bridge::pool::ConnectionKey::new(
+            "lua_ls",
+            Some("file:///workspace-a".to_string()),
+        );
+        coordinator
+            .register_opened_document_for_test(&host_uri, &virtual_uri, &root_a)
+            .await;
+
+        assert!(coordinator.injection_open_on_connection(&host_uri_lsp, &root_a, &injection));
+        assert!(!coordinator.injection_open_on_connection(
+            &host_uri_lsp,
+            &crate::lsp::bridge::pool::ConnectionKey::new(
+                "lua_ls",
+                Some("file:///workspace-b".to_string()),
+            ),
+            &injection,
+        ));
+        assert!(!coordinator.injection_open_on_connection(
+            &host_uri_lsp,
+            &crate::lsp::bridge::pool::ConnectionKey::for_server("ruff"),
+            &injection,
+        ));
     }
 
     #[test]

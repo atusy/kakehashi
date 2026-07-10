@@ -16,7 +16,7 @@ pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
 #[cfg(test)]
 pub(crate) use parallel::DISCOVERY_REUSE_HITS;
 pub(crate) use parallel::build_document_discovery;
-pub(crate) use range::handle_semantic_tokens_range_parallel_async;
+pub(crate) use range::filter_semantic_tokens_by_range;
 
 // Re-export for parallel processing
 use parallel::{InjectionCacheCtx, collect_injection_tokens_parallel};
@@ -47,7 +47,7 @@ pub(crate) struct InjectionCacheParams {
 }
 
 // Internal re-exports for production code
-use finalize::finalize_tokens;
+use finalize::finalize_tokens_cancellable;
 use token_collector::{build_line_start_bytes, collect_host_tokens};
 
 // Region-local token type persisted by the injection-token cache (#529). Lives
@@ -72,12 +72,12 @@ use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::Semanti
 /// cancellation/failure. `text` and `tree` are moved into the work-unit.
 ///
 /// `cancel` (when provided) doubles as the work-unit's dequeue hook (a request
-/// superseded while queued never starts) and is polled at coarse boundaries —
-/// after the host pass, after the injection pass, and per region inside the
-/// injection pass — so a superseded/cancelled request stops instead of running
-/// to completion. Returns `None` once cancelled: the caller drops the
-/// (partial) result rather than storing it (see the compute-superseded
-/// checkpoints in the handlers).
+/// superseded while queued never starts) and is polled during the host-query
+/// walk, per region inside the injection pass, and throughout final token
+/// shaping, so a superseded/cancelled request stops instead of running to
+/// completion. Returns `None` once cancelled: the caller drops the (partial)
+/// result rather than storing it (see the compute-superseded checkpoints in the
+/// handlers).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
     pool: &crate::compute_pool::ComputePool,
@@ -100,7 +100,7 @@ pub(crate) async fn handle_semantic_tokens_full(
         let line_starts = build_line_start_bytes(&text);
 
         // Collect host document tokens first (no exclusion — finalize handles it).
-        collect_host_tokens(
+        if !collect_host_tokens(
             &text,
             &tree,
             &query,
@@ -114,13 +114,16 @@ pub(crate) async fn handle_semantic_tokens_full(
             supports_multiline,
             &[],
             &[],
+            cancel.as_ref(),
             &mut all_tokens,
-        );
+        ) {
+            return None;
+        }
 
         let host_elapsed = t_start.elapsed();
 
-        // Bail before the injection pass — the dominant cost on a large document
-        // — if this request has already been superseded.
+        // The host collector polls mid-query; this boundary also catches a
+        // supersede that lands after its last poll and before injection work.
         if is_cancelled() {
             return None;
         }
@@ -166,14 +169,31 @@ pub(crate) async fn handle_semantic_tokens_full(
             return None;
         }
 
-        // Phase timing at debug level: pinpoints where a slow compute spends
-        // its time (host query pass vs injection fan-out) without a profiler
-        // attached — the numbers a user-supplied log needs.
+        let injections_elapsed = t_start.elapsed().saturating_sub(host_elapsed);
+
+        // Merge injection tokens with host tokens
+        all_tokens.extend(injection_tokens);
+
+        let finalize_start = std::time::Instant::now();
+        let result = finalize_tokens_cancellable(
+            all_tokens,
+            &active_injection_regions,
+            &lines,
+            cancel.as_ref(),
+        );
+        let finalize_elapsed = finalize_start.elapsed();
+        if is_cancelled() {
+            return None;
+        }
+
+        // One developer-only event per completed compute keeps the phases
+        // comparable without adding hot-loop logging or operator noise.
         log::debug!(
             target: "kakehashi::semantic",
-            "[SEMANTIC_TOKENS] compute phases: host={}ms injections={}ms regions_reused={}",
+            "[SEMANTIC_TOKENS] compute phases: host={}ms injections={}ms finalize={}ms regions_reused={}",
             host_elapsed.as_millis(),
-            t_start.elapsed().saturating_sub(host_elapsed).as_millis(),
+            injections_elapsed.as_millis(),
+            finalize_elapsed.as_millis(),
             injection_cache
                 .as_ref()
                 // The same generation gate the reuse path applies: a
@@ -188,10 +208,7 @@ pub(crate) async fn handle_semantic_tokens_full(
                 .unwrap_or_else(|| "none".to_string()),
         );
 
-        // Merge injection tokens with host tokens
-        all_tokens.extend(injection_tokens);
-
-        finalize_tokens(all_tokens, &active_injection_regions, &lines)
+        result
     })
     .await
     .flatten()
@@ -419,10 +436,10 @@ mod tests {
         );
     }
 
-    /// When lines are inserted, tokens at the end have the same delta encoding
-    /// but are at different absolute positions, so they must not match as suffix.
+    /// When lines are inserted, unchanged encoded suffix tokens can remain in
+    /// place because semantic-token edits address the flattened wire array.
     #[test]
-    fn test_diff_tokens_line_insertion_no_suffix() {
+    fn test_diff_tokens_line_insertion_retains_encoded_suffix() {
         // Before: 3 tokens on lines 0, 1, 2
         let previous = SemanticTokens {
             result_id: Some("v1".to_string()),
@@ -492,25 +509,22 @@ mod tests {
         let delta = delta.unwrap();
         assert_eq!(delta.edits.len(), 1);
 
-        // The last two tokens in current have SAME delta encoding as last two in previous,
-        // but they're at DIFFERENT absolute positions (line 2,3 vs line 1,2).
-        // Suffix optimization MUST be disabled.
+        // The last two tokens have the same encoded fields, so the wire edit can
+        // retain them even though their decoded absolute lines have shifted.
         let edit = &delta.edits[0];
         // LSP spec: start and deleteCount are integer indices (each token = 5 integers)
         assert_eq!(
             edit.start, 5,
             "Should skip 1 prefix token (line 0) = 5 integers"
         );
-        // Without suffix: delete_count=2 (tokens at line 1,2), data=3 tokens
-        // With incorrect suffix: would wrongly match last token
         assert_eq!(
-            edit.delete_count, 10,
-            "Should delete 2 original tokens after prefix = 10 integers"
+            edit.delete_count, 0,
+            "Should retain both encoded suffix tokens"
         );
         assert_eq!(
             edit.data.as_ref().unwrap().len(),
-            3,
-            "Should include 3 new tokens"
+            1,
+            "Should include only the inserted token"
         );
     }
 
@@ -612,8 +626,8 @@ mod tests {
 
     /// Test async wrapper for parallel injection processing.
     ///
-    /// This verifies the spawn_blocking bridge works correctly when calling
-    /// the Rayon-based parallel injection processing from an async context.
+    /// This verifies the bounded compute-pool bridge works correctly when
+    /// calling Rayon-based injection processing from an async context.
     #[tokio::test]
     async fn test_handle_semantic_tokens_full() {
         use crate::config::WorkspaceSettings;

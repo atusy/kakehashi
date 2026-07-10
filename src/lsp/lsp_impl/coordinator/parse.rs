@@ -332,9 +332,10 @@ impl ParseCoordinator {
             latch
         };
         // Coarse per-parse gate: with no runnable bridge server configured,
-        // the bridge-region build (per-region content copies) is pure waste
-        // on the pre-publish critical path. `None` on the snapshot makes a
-        // bridge configured by a later reload fall back to inline resolution.
+        // the bridge-region build (per-region content copies) and fully
+        // resolved downstream regions are pure waste on the pre-publish
+        // critical path. `None` on the snapshot makes a bridge configured by
+        // a later reload fall back to inline resolution.
         let build_bridge_regions = self
             .settings_manager
             .load_settings()
@@ -356,6 +357,7 @@ impl ParseCoordinator {
                     &tracker,
                     entry_mint_epoch,
                     build_bridge_regions,
+                    build_bridge_regions,
                 ) else {
                     return PopulatedSnapshotRegions::default();
                 };
@@ -364,10 +366,9 @@ impl ParseCoordinator {
                     bridge_regions: populated
                         .bridge_regions
                         .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
-                    resolved_regions: Some((
-                        populated.generation,
-                        std::sync::Arc::new(populated.resolved_regions),
-                    )),
+                    resolved_regions: populated
+                        .resolved_regions
+                        .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
                 }
             })
             .await

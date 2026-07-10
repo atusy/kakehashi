@@ -351,7 +351,16 @@ impl ConnectionHandle {
     /// Get the current connection state. Uses a `std::sync::RwLock` for fast
     /// synchronous reads and recovers from poisoned locks per project convention.
     pub(crate) fn state(&self) -> ConnectionState {
-        *self.state.read().recover_poison("ConnectionHandle::state")
+        let stored = *self.state.read().recover_poison("ConnectionHandle::state");
+        if matches!(
+            stored,
+            ConnectionState::Initializing | ConnectionState::Ready
+        ) && !self.router.is_accepting()
+        {
+            ConnectionState::Failed
+        } else {
+            stored
+        }
     }
 
     /// Await `Ready` (up to `timeout`) instead of failing fast — used by
@@ -363,7 +372,7 @@ impl ConnectionHandle {
         let wait_future = async {
             loop {
                 // Copy state immediately to avoid holding borrow across await
-                let current_state = *receiver.borrow();
+                let current_state = self.state();
                 match current_state {
                     ConnectionState::Ready => return Ok(()),
                     ConnectionState::Failed => {
@@ -375,9 +384,18 @@ impl ConnectionHandle {
                         return Err(io::Error::other("bridge: server shutdown during wait"));
                     }
                     ConnectionState::Initializing => {
-                        // Wait for state change notification
-                        if receiver.changed().await.is_err() {
-                            return Err(io::Error::other("bridge: state channel closed"));
+                        tokio::select! {
+                            biased;
+                            _ = self.router.wait_until_terminal() => {
+                                return Err(io::Error::other(
+                                    "bridge: server failed during initialization",
+                                ));
+                            }
+                            changed = receiver.changed() => {
+                                if changed.is_err() {
+                                    return Err(io::Error::other("bridge: state channel closed"));
+                                }
+                            }
                         }
                     }
                 }
@@ -840,25 +858,17 @@ impl ConnectionHandle {
         &self,
         upstream_id: Option<UpstreamId>,
     ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
-        // Check if this will be the first pending request (0->1 transition)
-        //
-        // SAFETY: This check is not atomic with register(), but the race is benign:
-        // - If two threads both see pending_count()==0 and both call notify_liveness_start(),
-        //   the second notification is dropped (try_send on capacity-1 channel).
-        // - If thread A sees 0, thread B sees A's registration (count=1), only A notifies,
-        //   which is correct behavior.
-        // Either way, the timer starts exactly once when pending goes 0->1.
-        let was_empty = self.router().pending_count() == 0;
-
         let request_id = RequestId::new(self.next_request_id());
-        let response_rx = self
+        let (response_rx, liveness_epoch) = self
             .router()
-            .register_with_upstream(request_id, upstream_id)
+            .register_with_upstream_liveness(request_id, upstream_id)
             .ok_or_else(|| io::Error::other("bridge: duplicate request ID"))?;
 
         // If pending went 0->1 and we're in Ready state, start liveness timer
-        if was_empty && self.state() == ConnectionState::Ready {
-            self.reader_handle.notify_liveness_start();
+        if let Some(epoch) = liveness_epoch
+            && self.state() == ConnectionState::Ready
+        {
+            self.reader_handle.notify_liveness_start(epoch);
         }
 
         Ok((request_id, response_rx))
@@ -1029,6 +1039,13 @@ mod tests {
             handle.state(),
             ConnectionState::Ready,
             "Initial state should be Ready"
+        );
+
+        handle.router().fail_all("reader exited");
+        assert_eq!(
+            handle.state(),
+            ConnectionState::Failed,
+            "terminal router state must fail the handle without a response waiter"
         );
 
         // Can transition to Failed
@@ -1532,6 +1549,53 @@ mod tests {
             "Should succeed after transitioning to Ready"
         );
         assert_eq!(handle.state(), ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_wakes_when_router_becomes_terminal() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle::with_state(
+            writer,
+            Arc::clone(&router),
+            reader_handle,
+            ConnectionState::Initializing,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+        ));
+
+        let waiter = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { handle.wait_for_ready(Duration::from_secs(5)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter should be parked on initialization"
+        );
+
+        router.fail_all("reader exited");
+
+        let result = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("terminal router should wake the waiter promptly")
+            .expect("wait task should not panic");
+        assert!(result.is_err(), "terminal router must fail readiness");
+        assert_ne!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     /// Test that wait_for_ready returns error on Failed state.

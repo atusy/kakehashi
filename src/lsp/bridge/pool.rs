@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -179,6 +180,57 @@ pub(super) struct HostDocSyncState {
     pub(super) fingerprint: u64,
 }
 
+/// Cancellation-safe rollback for the pre-send virtual-document claim.
+/// Eager-open tasks are deliberately aborted when a newer parse supersedes
+/// them; dropping the handler between claim and FIFO enqueue must not leave a
+/// phantom "opened" document that suppresses every later didOpen.
+struct OpenClaimGuard {
+    tracker: Arc<DocumentTracker>,
+    claim: Arc<tokio::sync::Notify>,
+    transition: Arc<tokio::sync::Mutex<()>>,
+    transition_locks: Arc<OpenTransitionLocks>,
+    host_uri: Url,
+    virtual_uri: VirtualDocumentUri,
+    connection_key: ConnectionKey,
+    armed: bool,
+}
+
+type OpenTransitionLocks = DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>;
+
+impl OpenClaimGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpenClaimGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let tracker = Arc::clone(&self.tracker);
+        let claim = Arc::clone(&self.claim);
+        let transition = Arc::clone(&self.transition);
+        let transition_locks = Arc::clone(&self.transition_locks);
+        let host_uri = self.host_uri.clone();
+        let virtual_uri = self.virtual_uri.clone();
+        let connection_key = self.connection_key.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let transition_guard = transition.lock().await;
+                tracker
+                    .rollback_open_claim_if(&host_uri, &virtual_uri, &connection_key, &claim)
+                    .await;
+                drop(transition_guard);
+                let key = (connection_key, virtual_uri.to_uri_string());
+                transition_locks.remove_if(&key, |_, current| {
+                    Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
+                });
+            });
+        }
+    }
+}
+
 pub struct LanguageServerPool {
     /// Map of connection key `(server_name, root)` -> connection handle.
     ///
@@ -205,7 +257,10 @@ pub struct LanguageServerPool {
     /// which already stop most eager spawns before they reach this point.
     shutting_down: AtomicBool,
     /// Document tracking for virtual documents (versions, host mappings, opened state)
-    document_tracker: DocumentTracker,
+    document_tracker: Arc<DocumentTracker>,
+    /// Serializes didOpen enqueue/promotion, rollback, and didClose per exact
+    /// downstream document so wire order matches tracker state transitions.
+    open_transition_locks: Arc<OpenTransitionLocks>,
     /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
@@ -312,7 +367,8 @@ impl LanguageServerPool {
         Self {
             connections: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
-            document_tracker: DocumentTracker::new(),
+            document_tracker: Arc::new(DocumentTracker::new()),
+            open_transition_locks: Arc::new(DashMap::new()),
             host_documents: Mutex::new(HashMap::new()),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
@@ -761,13 +817,25 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Whether a document has been claimed or opened on a downstream server (ls-bridge-message-ordering).
+    /// Whether didOpen has been enqueued on at least one downstream connection.
     ///
     /// Fast synchronous check used to gate operations on documents not yet known
-    /// downstream. True once `try_claim_for_open()` has run — claims happen before
-    /// the didOpen send (with rollback on failure), so this can be true pre-send.
+    /// downstream. Pre-send claims deliberately remain invisible.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
         self.document_tracker.is_document_opened(virtual_uri)
+    }
+
+    pub(super) fn is_document_opened_on_connection(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        self.document_tracker
+            .is_document_opened_on_connection(virtual_uri, connection_key)
+    }
+
+    pub(super) fn document_connection_generation(&self, connection_key: &ConnectionKey) -> u64 {
+        self.document_tracker.connection_generation(connection_key)
     }
 
     /// Whether the host document at `host_uri` has been synced (didOpen sent) to a
@@ -824,6 +892,68 @@ impl LanguageServerPool {
             .get_all_connections_for_virtual_uri(virtual_uri)
     }
 
+    pub(super) fn connections_opening_or_opened(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+    ) -> Vec<ConnectionKey> {
+        self.document_tracker
+            .connections_opening_or_opened(virtual_uri)
+    }
+
+    pub(super) fn open_transition_lock(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            &self
+                .open_transition_locks
+                .entry((connection_key.clone(), virtual_uri.to_uri_string()))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    pub(super) fn remove_open_transition_lock_if_unshared(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        transition: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let key = (connection_key.clone(), virtual_uri.to_uri_string());
+        self.open_transition_locks.remove_if(&key, |_, current| {
+            Arc::ptr_eq(current, transition) && Arc::strong_count(current) == 2
+        });
+    }
+
+    async fn purge_open_transition_locks(&self, connection_key: &ConnectionKey) {
+        let transitions: Vec<_> = self
+            .open_transition_locks
+            .iter()
+            .filter(|entry| &entry.key().0 == connection_key)
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        for (key, transition) in transitions {
+            let guard = transition.lock().await;
+            drop(guard);
+            self.open_transition_locks.remove_if(&key, |_, current| {
+                Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
+            });
+        }
+    }
+
+    /// Resolve the exact `(server, root)` connection a document currently
+    /// routes to, including shared-instance capability fallback.
+    pub(super) async fn resolved_connection_key(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: &Url,
+    ) -> ConnectionKey {
+        self.resolve_acquire(server_name, server_config, Some(document_uri))
+            .await
+            .1
+    }
+
     /// Membership check for the save fan-out liveness recheck (avoids the
     /// reverse-index `Vec<ConnectionKey>` clone): is the virtual document at
     /// `virtual_uri` (its URI string) open on `connection_key`?
@@ -856,10 +986,10 @@ impl LanguageServerPool {
     /// all tracking state on success. Callers handle error cleanup (router entry
     /// and upstream-request registry).
     ///
-    /// Uses `try_claim_for_open()` as a compare-and-swap so concurrent callers
-    /// skip the second didOpen. Registration of `host_to_virtual` happens before
-    /// the send so `close_host_document` can still find the doc if the task is
-    /// aborted between register and send; both are rolled back on send failure.
+    /// Uses `try_claim_for_open()` as a compare-and-swap. Concurrent callers wait
+    /// for the owner to enqueue didOpen or finish rollback, then either reuse the
+    /// sent open or claim and retry. `host_to_virtual` is registered pre-send for
+    /// close cleanup, while routing visibility is promoted only after enqueue.
     ///
     /// Generic over `MessageSender` (channel or `ConnectionHandleSender`) for
     /// the single-writer-loop architecture (ls-bridge-message-ordering).
@@ -871,31 +1001,90 @@ impl LanguageServerPool {
         virtual_content: &str,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
-        if !self
+        let transition = self.open_transition_lock(virtual_uri, connection_key);
+        let transition_guard = transition.lock().await;
+        let claim = if self
             .document_tracker
             .try_claim_for_open(virtual_uri, connection_key)
             .await
         {
-            return Ok(()); // Already claimed by another caller
-        }
+            self.document_tracker
+                .open_claim_waiter(virtual_uri, connection_key)
+                .expect("successful claim must have an identity")
+        } else {
+            if self
+                .document_tracker
+                .is_document_opened_on_connection(virtual_uri, connection_key)
+            {
+                return Ok(());
+            }
+            // We own the transition lock, so a remaining pre-send claim has no
+            // live owner (its task dropped before rollback ran). Finish that
+            // rollback synchronously, then take a fresh claim.
+            self.document_tracker
+                .rollback_open_claim(host_uri, virtual_uri, connection_key)
+                .await;
+            if !self
+                .document_tracker
+                .try_claim_for_open(virtual_uri, connection_key)
+                .await
+            {
+                drop(transition_guard);
+                self.remove_open_transition_lock_if_unshared(
+                    virtual_uri,
+                    connection_key,
+                    &transition,
+                );
+                return Err(io::Error::other(
+                    "bridge: virtual document claim did not settle",
+                ));
+            }
+            self.document_tracker
+                .open_claim_waiter(virtual_uri, connection_key)
+                .expect("successful reclaim must have an identity")
+        };
+        let mut claim_guard = OpenClaimGuard {
+            tracker: Arc::clone(&self.document_tracker),
+            claim: Arc::clone(&claim),
+            transition: Arc::clone(&transition),
+            transition_locks: Arc::clone(&self.open_transition_locks),
+            host_uri: host_uri.clone(),
+            virtual_uri: virtual_uri.clone(),
+            connection_key: connection_key.clone(),
+            armed: true,
+        };
         // Register host_to_virtual BEFORE send so that close_host_document
         // can find this document even if the task is aborted after send.
         // The single-writer loop (ls-bridge-message-ordering) guarantees FIFO ordering, so
         // any subsequent didClose queued by close_host_document will arrive
         // after didOpen on the wire.
         self.document_tracker
-            .register_opened_document(host_uri, virtual_uri, connection_key)
+            .register_pending_document(host_uri, virtual_uri, connection_key)
             .await;
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
-                .unclaim_document(virtual_uri, connection_key)
+                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
                 .await;
-            self.document_tracker
-                .unregister_virtual_doc(host_uri, virtual_uri)
-                .await;
+            claim_guard.disarm();
+            drop(claim_guard);
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(e);
         }
+        if !self
+            .document_tracker
+            .mark_open_sent(virtual_uri, connection_key, &claim)
+        {
+            claim_guard.disarm();
+            drop(claim_guard);
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            return Err(io::Error::other(
+                "bridge: didOpen claim invalidated during enqueue",
+            ));
+        }
+        claim_guard.disarm();
         // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
         // `Ok`), so seed the content fingerprint with the opened content. Without
         // this, the FIRST position-only host edit — which leaves this region's
@@ -1494,7 +1683,6 @@ impl LanguageServerPool {
             ConnectionAction::SpawnNew => {
                 // Remove stale connection if present (Failed or Closed state)
                 if existing_state.is_some() {
-                    connections.remove(&connection_key);
                     // Drop the dead connection's document state with it: the
                     // replacement process has nothing open, so the lazy host
                     // sync must re-send didOpen and the virt tracker must let
@@ -1511,6 +1699,12 @@ impl LanguageServerPool {
                     self.document_tracker
                         .purge_connection(&connection_key)
                         .await;
+                    self.purge_open_transition_locks(&connection_key).await;
+                    // Remove only after every async purge completes. If this
+                    // acquire future is aborted at a cleanup await, the stale
+                    // entry remains and the next acquire retries the idempotent
+                    // purge instead of spawning over partial document state.
+                    connections.remove(&connection_key);
                 }
             }
         }
@@ -1957,13 +2151,14 @@ impl LanguageServerPool {
     /// the downstream ID was already cleaned up, or an individual server send
     /// fails. This avoids racing cancel against handshake completion.
     ///
-    /// Capture-before-notify ordering is load-bearing: `notify` wakes the
+    /// Prepare-before-notify ordering is load-bearing: `notify` wakes the
     /// upstream handler (via `CancelForwarder::notify_cancel`), whose
     /// cancellation path immediately destroys the very state this lookup reads —
     /// `unregister_all_for_upstream_id` empties the registry, and dropping the
-    /// in-flight request futures removes their router cancel mappings. Capturing
-    /// first makes that cleanup harmless; sending a cancel for a request the
-    /// server already answered is a documented no-op.
+    /// in-flight request futures removes their router cancel mappings. Preparing
+    /// first atomically marks queued work for writer-side skipping and captures
+    /// only already-writing/sent IDs that still need a FIFO cancel notification;
+    /// the later cleanup is then harmless.
     pub(crate) async fn forward_cancel_by_upstream_id_with_notify(
         &self,
         upstream_id: UpstreamId,
@@ -1992,10 +2187,11 @@ impl LanguageServerPool {
             }
         };
 
-        // 2. Capture each server's connection handle and in-flight downstream
-        //    ids under a single connections-lock acquisition, so the time until
-        //    `notify` wakes the upstream handler is bounded by one lock wait,
-        //    not one per server (PR #359 review).
+        // 2. Capture each server's connection handle and atomically classify its
+        //    downstream ids under one connections-lock acquisition. Queued requests
+        //    are marked for writer-side skipping before `notify`, and the time to
+        //    wake the handler is bounded by one lock wait rather than one per server
+        //    (PR #359 review).
         let mut targets: Vec<(ConnectionKey, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
         {
             let connections = self.connections().await;
@@ -2007,8 +2203,9 @@ impl LanguageServerPool {
                 ) else {
                     continue;
                 };
-                let downstream_ids = handle.router().lookup_downstream_ids(&upstream_id);
-                if downstream_ids.is_empty() {
+                let (known, downstream_ids) =
+                    handle.router().prepare_cancel_by_upstream(&upstream_id);
+                if !known {
                     // Request already completed or ID never registered.
                     // Silently drop per best-effort semantics.
                     self.cancel_metrics.record_unknown_id();
@@ -2020,7 +2217,9 @@ impl LanguageServerPool {
                     );
                     continue;
                 }
-                targets.push((connection_key, handle, downstream_ids));
+                if !downstream_ids.is_empty() {
+                    targets.push((connection_key, handle, downstream_ids));
+                }
             }
             // Lock dropped here — notify and the sends below run without it.
         }
@@ -3350,6 +3549,234 @@ mod tests {
             !pool.is_document_opened(&virtual_uri),
             "Claim should be rolled back on send failure"
         );
+        assert!(
+            !pool.open_transition_locks.contains_key(&(
+                ConnectionKey::for_server("lua"),
+                virtual_uri.to_uri_string()
+            )),
+            "failed open must reclaim its transition lock entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_purge_reclaims_successful_open_transition_locks() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/purged.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "print('opened')",
+            &connection_key,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_ok());
+        assert!(
+            pool.open_transition_locks
+                .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string()))
+        );
+
+        pool.document_tracker
+            .purge_connection(&connection_key)
+            .await;
+        pool.purge_open_transition_locks(&connection_key).await;
+
+        assert!(
+            !pool
+                .open_transition_locks
+                .iter()
+                .any(|entry| entry.key().0 == connection_key),
+            "respawn cleanup must reclaim document transition locks"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_document_opened_unclaims_when_task_is_aborted_before_enqueue() {
+        struct BlockingSender {
+            entered: Arc<tokio::sync::Notify>,
+        }
+
+        impl message_sender::MessageSender for BlockingSender {
+            async fn send_notification<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/abort.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let connection_key = connection_key.clone();
+            let entered = Arc::clone(&entered);
+            tokio::spawn(async move {
+                let mut sender = BlockingSender { entered };
+                pool.ensure_document_opened(
+                    &mut sender,
+                    &host_uri,
+                    &virtual_uri,
+                    "print('old')",
+                    &connection_key,
+                )
+                .await
+            })
+        };
+
+        entered.notified().await;
+        assert!(!pool.is_document_opened(&virtual_uri));
+        assert!(
+            pool.document_tracker
+                .open_claim_waiter(&virtual_uri, &connection_key)
+                .is_some()
+        );
+        let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        let retry = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let connection_key = connection_key.clone();
+            tokio::spawn(async move {
+                let mut sender = sender;
+                pool.ensure_document_opened(
+                    &mut sender,
+                    &host_uri,
+                    &virtual_uri,
+                    "print('new')",
+                    &connection_key,
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "retry must wait for the first claim"
+        );
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("waiting retry should resume after abort rollback")
+            .expect("retry task should not panic")
+            .expect("retry should enqueue didOpen");
+        assert!(rx.try_recv().is_ok(), "a later didOpen must be retryable");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            pool.document_tracker
+                .is_document_opened_on_connection(&virtual_uri, &connection_key),
+            "the aborted owner's delayed rollback must not erase the successor claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn did_close_waits_for_open_enqueue_then_removes_sent_state() {
+        struct GatedSender {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        impl message_sender::MessageSender for GatedSender {
+            async fn send_notification<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/open-close.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let opening = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let connection_key = connection_key.clone();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                let mut sender = GatedSender { entered, release };
+                pool.ensure_document_opened(
+                    &mut sender,
+                    &host_uri,
+                    &virtual_uri,
+                    "print('hello')",
+                    &connection_key,
+                )
+                .await
+            })
+        };
+        entered.notified().await;
+        let closing = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            tokio::spawn(async move { pool.close_host_document(&host_uri).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !closing.is_finished(),
+            "close must serialize behind didOpen"
+        );
+
+        release.notify_one();
+        opening.await.unwrap().unwrap();
+        let closed = closing.await.unwrap();
+        assert_eq!(closed.len(), 1);
+        assert!(!pool.is_document_opened(&virtual_uri));
+        assert!(
+            pool.get_all_connections_for_virtual_uri(&virtual_uri)
+                .is_empty()
+        );
+        assert!(
+            pool.document_tracker
+                .open_claim_waiter(&virtual_uri, &connection_key)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_connection_generation_close_does_not_untrack_reopened_document() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/reopened.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &connection_key)
+            .await;
+        let stale = pool.document_tracker.host_virtual_docs(&host_uri).await[0].clone();
+
+        pool.document_tracker
+            .purge_connection(&connection_key)
+            .await;
+        pool.register_opened_document(&host_uri, &virtual_uri, &connection_key)
+            .await;
+        assert_ne!(
+            stale.connection_generation,
+            pool.document_connection_generation(&connection_key)
+        );
+
+        pool.close_single_virtual_doc(&stale).await;
+        assert!(
+            pool.document_tracker
+                .is_document_opened_on_connection(&virtual_uri, &connection_key),
+            "a stale close must not erase the replacement generation's open state"
+        );
     }
 
     // ========================================
@@ -4009,6 +4436,8 @@ mod tests {
         let (downstream_id, _response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         // Insert the handle into the pool
         pool.connections
@@ -4205,6 +4634,8 @@ mod tests {
         let (downstream_id, _response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         pool.connections
             .lock()
@@ -4284,9 +4715,11 @@ mod tests {
 
         // Register a request with upstream ID mapping in ResponseRouter
         let upstream_id = UpstreamId::Number(42);
-        let (_downstream_id, _response_rx) = handle
+        let (downstream_id, _response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         // Insert the handle into the pool
         pool.connections
@@ -4343,6 +4776,8 @@ mod tests {
         let (downstream_id, response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         // Insert the handle into the pool
         pool.connections
@@ -4473,9 +4908,11 @@ mod tests {
 
         // Register a request with upstream ID
         let upstream_id = UpstreamId::Number(42);
-        let (_downstream_id, _response_rx) = handle
+        let (downstream_id, _response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         pool.connections
             .lock()
@@ -5052,16 +5489,20 @@ mod tests {
         let handle_lua =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua-ls"))
                 .await;
-        let (_downstream_id_lua, _rx_lua) = handle_lua
+        let (downstream_id_lua, _rx_lua) = handle_lua
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register lua request");
+        assert!(handle_lua.router().claim_for_write(downstream_id_lua));
+        handle_lua.router().mark_sent(downstream_id_lua);
 
         let handle_py =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("pyright"))
                 .await;
-        let (_downstream_id_py, _rx_py) = handle_py
+        let (downstream_id_py, _rx_py) = handle_py
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register py request");
+        assert!(handle_py.router().claim_for_write(downstream_id_py));
+        handle_py.router().mark_sent(downstream_id_py);
 
         // Insert handles
         {
@@ -5121,6 +5562,68 @@ mod tests {
     // ============================================================
     // forward_didchange multi-server tests
     // ============================================================
+
+    #[tokio::test]
+    async fn forward_didchange_waits_for_pending_didopen_then_sends() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/pending-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua_ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, connection_key.clone()).await;
+        pool.connections
+            .lock()
+            .await
+            .insert(connection_key.clone(), handle);
+
+        let transition = pool.open_transition_lock(&virtual_uri, &connection_key);
+        let transition_guard = transition.lock().await;
+        assert!(
+            pool.document_tracker
+                .try_claim_for_open(&virtual_uri, &connection_key)
+                .await
+        );
+        let claim = pool
+            .document_tracker
+            .open_claim_waiter(&virtual_uri, &connection_key)
+            .unwrap();
+        pool.document_tracker
+            .register_pending_document(&host_uri, &virtual_uri, &connection_key)
+            .await;
+
+        let forwarding = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            tokio::spawn(async move {
+                pool.forward_didchange_to_opened_docs(
+                    &host_uri,
+                    &[crate::lsp::bridge::coordinator::BridgeInjection {
+                        language: "lua".to_string(),
+                        region_id: TEST_ULID_LUA_0.to_string(),
+                        content: "print('new')".to_string(),
+                    }],
+                )
+                .await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !forwarding.is_finished(),
+            "didChange must serialize behind the pending didOpen"
+        );
+
+        assert!(
+            pool.document_tracker
+                .mark_open_sent(&virtual_uri, &connection_key, &claim)
+        );
+        drop(transition_guard);
+        forwarding.await.unwrap();
+        assert_eq!(
+            pool.increment_document_version(&virtual_uri, &connection_key)
+                .await,
+            Some(3),
+            "didChange should advance version after didOpen promotion"
+        );
+    }
 
     /// When the same virtual doc is opened on two servers (e.g., emmylua and lua_ls),
     /// didChange must be forwarded to both.

@@ -8,11 +8,10 @@
 //! - The blocking Rayon computation is cancelled *cooperatively*: the handler
 //!   flips a [`CancelToken`](crate::cancel::CancelToken) (also flipped when a
 //!   newer request supersedes this one, or the document closes) and the compute
-//!   polls it at coarse checkpoints — after the host pass, inside the injection
-//!   discovery loop, and at each per-region fan-out entry — bailing early. A region
-//!   already mid-parse runs to completion, but not-yet-started work returns
-//!   immediately, so an obsolete request stops burning CPU instead of computing
-//!   a result that is only discarded.
+//!   polls it throughout host and injected-language query walks, injection
+//!   discovery, nested regions, and final shaping. Parsing itself remains
+//!   non-preemptible, but a region that observes cancellation returns incomplete
+//!   output that is neither served nor cached.
 //!
 //! This is achieved by subscribing to cancel notifications via `CancelForwarder::subscribe()`
 //! and using biased `tokio::select!` to prioritize cancel handling.
@@ -30,8 +29,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::analysis::{
-    calculate_delta_or_full, handle_semantic_tokens_full,
-    handle_semantic_tokens_range_parallel_async, next_result_id,
+    SemanticSnapshotIdentity, calculate_delta_or_full, filter_semantic_tokens_by_range,
+    handle_semantic_tokens_full, next_result_id,
 };
 use crate::lsp::current_upstream_id;
 
@@ -106,6 +105,26 @@ impl CurrentTokens {
 }
 
 impl Kakehashi {
+    fn semantic_snapshot_is_current(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        parsed_version: u64,
+        generation: u64,
+        edit_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
+        let latest = self.documents.latest_snapshot(uri);
+        let current = self.cache.semantic_token_generation() == generation
+            && latest.as_ref().is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == parsed_version
+            });
+        if latest.is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, edit_lock);
+        }
+        current
+    }
+
     /// Latest-completed snapshot resolution (parse-snapshot ADR §3): returns
     /// the newest published snapshot, which may trail the input. The only
     /// wait is the bounded first-parse wait (no snapshot for this lifetime
@@ -250,7 +269,6 @@ impl Kakehashi {
             );
             return Ok(None);
         }
-
         // Serve-current (ADR §3, revised): park until the snapshot matches the
         // live text — see `current_snapshot_for_tokens` for why answering from
         // a trailing snapshot corrupts the editor's existing highlights. The
@@ -370,6 +388,35 @@ impl Kakehashi {
             return Ok(None);
         }
 
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation: token_generation,
+        };
+        if let Some(cached) =
+            self.cache
+                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
+        {
+            let cached = (*cached).clone();
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let still_current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                &edit_lock,
+            );
+            if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(None);
+            }
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensResult::Tokens(cached)));
+        }
+
         // Validity key for the snapshot's text under the generation captured at
         // the top: keys both the unchanged-document cache short-circuit below
         // and the store of the freshly computed tokens. Keying off the
@@ -390,6 +437,20 @@ impl Kakehashi {
                 .cache
                 .get_current_tokens(&uri, &language_name, cache_key)
             {
+                let cached = (*cached).clone();
+                let edit_lock = self.documents.edit_lock(&uri);
+                let _edit_guard = edit_lock.lock().await;
+                let still_current = self.semantic_snapshot_is_current(
+                    &uri,
+                    snapshot.incarnation,
+                    snapshot.parsed_version,
+                    token_generation,
+                    &edit_lock,
+                );
+                if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                    self.cache.finish_request(&uri, request_id);
+                    return Ok(None);
+                }
                 self.cache
                     .record_served_semantic_version(&uri, snapshot.parsed_version);
                 self.cache.finish_request(&uri, request_id);
@@ -397,7 +458,7 @@ impl Kakehashi {
                 // has no borrowing variant), so this is the one legitimate
                 // materialization point — everything upstream (the cache hit
                 // itself) stayed O(1) via the `Arc`.
-                return Ok(Some(SemanticTokensResult::Tokens((*cached).clone())));
+                return Ok(Some(SemanticTokensResult::Tokens(cached)));
             }
 
             // capture_mappings and supports_multiline were read before the await
@@ -493,7 +554,6 @@ impl Kakehashi {
             );
             return Ok(None);
         }
-
         let mut tokens_with_id = match result.unwrap_or_else(|| {
             tower_lsp_server::ls_types::SemanticTokensResult::Tokens(
                 tower_lsp_server::ls_types::SemanticTokens {
@@ -514,11 +574,29 @@ impl Kakehashi {
         tokens_with_id.result_id = Some(next_result_id());
         let stored_tokens = tokens_with_id.clone();
         let lsp_tokens = tokens_with_id;
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+        let still_current = self.semantic_snapshot_is_current(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            token_generation,
+            &edit_lock,
+        );
+        if !still_current || !self.cache.is_request_active(&uri, request_id) {
+            self.cache.finish_request(&uri, request_id);
+            return Ok(None);
+        }
         // Store keyed by result_id (delta baseline) AND cache_key (so an
         // unchanged-document repeat request short-circuits the re-tokenization
         // above). `language_name` is unused after this, so move it in.
-        self.cache
-            .store_tokens(uri.clone(), stored_tokens, language_name, cache_key);
+        self.cache.store_tokens(
+            uri.clone(),
+            stored_tokens,
+            language_name,
+            cache_key,
+            snapshot_identity,
+        );
 
         // Finish tracking this request
         self.cache
@@ -697,6 +775,40 @@ impl Kakehashi {
             return Ok(None);
         }
 
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation: token_generation,
+        };
+        if let Some(cached) =
+            self.cache
+                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
+            && cached.result_id.as_deref() == Some(previous_result_id.as_str())
+        {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let still_current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                &edit_lock,
+            );
+            if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(None);
+            }
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                tower_lsp_server::ls_types::SemanticTokensDelta {
+                    result_id: Some(previous_result_id),
+                    edits: vec![],
+                },
+            )));
+        }
+
         // Validity key for the snapshot's text under the generation captured at
         // the top (see semanticTokens/full for why snapshot-text keying makes
         // a compute racing a fresh edit cache-safe).
@@ -715,6 +827,19 @@ impl Kakehashi {
                 // so the delta is necessarily empty — return it directly and skip
                 // the `previous_tokens` clone + O(N) `calculate_delta` below.
                 if cached.result_id.as_deref() == Some(previous_result_id.as_str()) {
+                    let edit_lock = self.documents.edit_lock(&uri);
+                    let _edit_guard = edit_lock.lock().await;
+                    let still_current = self.semantic_snapshot_is_current(
+                        &uri,
+                        snapshot.incarnation,
+                        snapshot.parsed_version,
+                        token_generation,
+                        &edit_lock,
+                    );
+                    if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                        self.cache.finish_request(&uri, request_id);
+                        return Ok(None);
+                    }
                     self.cache
                         .record_served_semantic_version(&uri, snapshot.parsed_version);
                     self.cache.finish_request(&uri, request_id);
@@ -834,7 +959,6 @@ impl Kakehashi {
             );
             return Ok(None);
         }
-
         // Get previous tokens from cache for delta calculation
         let previous_tokens = self.cache.get_tokens_if_valid(&uri, &previous_result_id);
 
@@ -843,87 +967,73 @@ impl Kakehashi {
         // `try_unwrap` when the Arc is uniquely owned) instead of routing
         // through `delta_result`'s `Tokens` arm, which would clone it once
         // to build the intermediate value and again for the cache store.
-        let Some(prev) = previous_tokens else {
+        let (final_result, tokens_to_store) = if let Some(prev) = previous_tokens {
+            // Calculate delta or return full tokens outside the document edit
+            // lock. Only the final currency check and cache commit need to be
+            // serialized with didChange/didClose.
+            let delta_result =
+                calculate_delta_or_full(&prev, current_tokens.as_ref(), &previous_result_id);
+
+            match delta_result {
+                SemanticTokensFullDeltaResult::Tokens(mut tokens) => {
+                    tokens.result_id = Some(next_result_id());
+                    let stored = tokens.clone();
+                    (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
+                }
+                SemanticTokensFullDeltaResult::TokensDelta(mut delta) if delta.edits.is_empty() => {
+                    delta.result_id = Some(previous_result_id.clone());
+                    (SemanticTokensFullDeltaResult::TokensDelta(delta), None)
+                }
+                SemanticTokensFullDeltaResult::TokensDelta(mut delta) => {
+                    let mut stored = current_tokens.into_owned();
+                    stored.result_id = Some(next_result_id());
+                    delta.result_id = stored.result_id.clone();
+                    (
+                        SemanticTokensFullDeltaResult::TokensDelta(delta),
+                        Some(stored),
+                    )
+                }
+                SemanticTokensFullDeltaResult::PartialTokensDelta { .. } => {
+                    log::warn!(
+                        target: "kakehashi::semantic",
+                        "[SEMANTIC_TOKENS_DELTA] Unexpected PartialTokensDelta variant for uri={}",
+                        uri
+                    );
+                    let mut tokens = current_tokens.into_owned();
+                    tokens.result_id = Some(next_result_id());
+                    let stored = tokens.clone();
+                    (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
+                }
+            }
+        } else {
             let mut tokens = current_tokens.into_owned();
             tokens.result_id = Some(next_result_id());
+            let stored = tokens.clone();
+            (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
+        };
+
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+        let still_current = self.semantic_snapshot_is_current(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            token_generation,
+            &edit_lock,
+        );
+        if !still_current || !self.cache.is_request_active(&uri, request_id) {
+            self.cache.finish_request(&uri, request_id);
+            return Ok(None);
+        }
+        if let Some(tokens) = tokens_to_store {
             self.cache.store_tokens(
                 uri.clone(),
-                tokens.clone(),
-                language_name.clone(),
+                tokens,
+                language_name,
                 cache_key,
+                snapshot_identity,
             );
-            let final_result = SemanticTokensFullDeltaResult::Tokens(tokens);
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
-            log::debug!(
-                target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS_DELTA] DONE uri={} req={}",
-                uri, request_id
-            );
-            return Ok(Some(final_result));
-        };
-
-        // Calculate delta or return full tokens
-        let delta_result =
-            calculate_delta_or_full(&prev, current_tokens.as_ref(), &previous_result_id);
-
-        // Assign new result_id and store in cache
-        let final_result = match delta_result {
-            SemanticTokensFullDeltaResult::Tokens(mut tokens) => {
-                tokens.result_id = Some(next_result_id());
-                self.cache.store_tokens(
-                    uri.clone(),
-                    tokens.clone(),
-                    language_name.clone(),
-                    cache_key,
-                );
-                SemanticTokensFullDeltaResult::Tokens(tokens)
-            }
-            SemanticTokensFullDeltaResult::TokensDelta(mut delta) if delta.edits.is_empty() => {
-                // No-op delta: recomputed tokens are byte-identical to the cached
-                // tokens, which already carry `previous_result_id`. Reuse that id
-                // and skip re-storing — the version token shouldn't advance when
-                // nothing changed, and the cache entry stays valid for the next
-                // request. Saves a clone + cache store + id rotation — and, when
-                // `current_tokens` came from the cache, this arm never pays the
-                // `into_owned` clone at all.
-                delta.result_id = Some(previous_result_id.clone());
-                SemanticTokensFullDeltaResult::TokensDelta(delta)
-            }
-            SemanticTokensFullDeltaResult::TokensDelta(mut delta) => {
-                // For delta, we still need to store the current tokens with new result_id
-                let mut stored_tokens = current_tokens.into_owned();
-                stored_tokens.result_id = Some(next_result_id());
-                delta.result_id = stored_tokens.result_id.clone();
-                self.cache.store_tokens(
-                    uri.clone(),
-                    stored_tokens,
-                    language_name.clone(),
-                    cache_key,
-                );
-                SemanticTokensFullDeltaResult::TokensDelta(delta)
-            }
-            SemanticTokensFullDeltaResult::PartialTokensDelta { .. } => {
-                // PartialTokensDelta is not produced by our delta calculation logic,
-                // but we handle it explicitly to maintain exhaustive matching.
-                // Fall back to full tokens response with proper result_id and cache update.
-                log::warn!(
-                    target: "kakehashi::semantic",
-                    "[SEMANTIC_TOKENS_DELTA] Unexpected PartialTokensDelta variant for uri={}",
-                    uri
-                );
-                let mut tokens = current_tokens.into_owned();
-                tokens.result_id = Some(next_result_id());
-                self.cache.store_tokens(
-                    uri.clone(),
-                    tokens.clone(),
-                    language_name.clone(),
-                    cache_key,
-                );
-                SemanticTokensFullDeltaResult::Tokens(tokens)
-            }
-        };
+        }
 
         // Finish tracking this request
         self.cache
@@ -990,6 +1100,11 @@ impl Kakehashi {
         {
             return Err(crate::error::content_modified_error());
         }
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation,
+        };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
@@ -1016,7 +1131,52 @@ impl Kakehashi {
             self.cache
                 .get_current_range_tokens(&uri, &domain_range, &language_name, cache_key)
         {
-            return Ok(Some(SemanticTokensRangeResult::Tokens((*tokens).clone())));
+            let tokens = (*tokens).clone();
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                generation,
+                &edit_lock,
+            );
+            if !current {
+                return Err(crate::error::content_modified_error());
+            }
+            return Ok(Some(SemanticTokensRangeResult::Tokens(tokens)));
+        }
+
+        // A previous full/delta request, or an earlier range miss below, may have
+        // already computed the whole-document token set for this exact snapshot.
+        // Filtering it is much cheaper than re-running the full tree-sitter path
+        // for every scrolled viewport.
+        if let Some(full_tokens) = self
+            .cache
+            .get_current_tokens(&uri, &language_name, cache_key)
+        {
+            let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
+            let response_tokens = range_tokens.clone();
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                generation,
+                &edit_lock,
+            );
+            if !current {
+                return Err(crate::error::content_modified_error());
+            }
+            self.cache.store_range_tokens(
+                uri,
+                domain_range,
+                language_name,
+                range_tokens,
+                cache_key,
+            );
+            return Ok(Some(SemanticTokensRangeResult::Tokens(response_tokens)));
         }
 
         // Get capture mappings for token type resolution
@@ -1026,48 +1186,80 @@ impl Kakehashi {
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
 
-        let result = handle_semantic_tokens_range_parallel_async(
+        let result = handle_semantic_tokens_full(
             &self.compute_pool,
             text,
             tree,
             query,
-            domain_range,
             Some(language_name.clone()),
             Some(capture_mappings),
             coordinator,
             supports_multiline,
+            None,
+            None,
         )
         .await;
 
-        // Convert to RangeResult. Cache ONLY a clean `Tokens` result (#535); a
-        // `Partial` is passed through to the client as-is but NOT cached (it is a
-        // degraded response), and a `None` becomes an empty `Tokens` and is not
-        // cached either (transient miss/cancel) — caching either could serve a
-        // degraded set on a later identical-viewport re-request.
-        let domain_range_result = match result {
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens)) => {
-                // `uri` and `language_name` are unused after this arm, so move them
-                // (no clone); `tokens` is cloned because the store and the response
-                // below each need an owned copy.
-                self.cache.store_range_tokens(
-                    uri,
-                    domain_range,
-                    language_name,
-                    tokens.clone(),
-                    cache_key,
+        // Shape immutable payloads before taking the edit lock. Only the final
+        // live-snapshot validation and cache commits need to exclude edits.
+        let (domain_range_result, tokens_to_store) = match result {
+            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(mut full_tokens)) => {
+                full_tokens.result_id = Some(next_result_id());
+                let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
+                let response = tower_lsp_server::ls_types::SemanticTokensRangeResult::from(
+                    range_tokens.clone(),
                 );
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(tokens)
+                (response, Some((full_tokens, range_tokens)))
             }
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial)) => {
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial)
-            }
-            None => tower_lsp_server::ls_types::SemanticTokensRangeResult::Tokens(
-                tower_lsp_server::ls_types::SemanticTokens {
-                    result_id: None,
-                    data: Vec::new(),
-                },
+            Some(tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial)) => (
+                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial),
+                None,
+            ),
+            None => (
+                tower_lsp_server::ls_types::SemanticTokensRangeResult::Tokens(
+                    tower_lsp_server::ls_types::SemanticTokens {
+                        result_id: None,
+                        data: Vec::new(),
+                    },
+                ),
+                None,
             ),
         };
+
+        // A range is authored against one live document lifetime. A close,
+        // reopen, or edit during the uncancellable full-document compute makes
+        // both its response coordinates and any cache store obsolete.
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+        let still_current = self.semantic_snapshot_is_current(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            generation,
+            &edit_lock,
+        );
+        if !still_current {
+            return Err(crate::error::content_modified_error());
+        }
+
+        // Cache ONLY a clean `Tokens` result (#535). Partial/None responses are
+        // degraded or transient and must not become reusable cache entries.
+        if let Some((full_tokens, range_tokens)) = tokens_to_store {
+            self.cache.store_tokens(
+                uri.clone(),
+                full_tokens,
+                language_name.clone(),
+                cache_key,
+                snapshot_identity,
+            );
+            self.cache.store_range_tokens(
+                uri,
+                domain_range,
+                language_name,
+                range_tokens,
+                cache_key,
+            );
+        }
 
         Ok(Some(domain_range_result))
     }

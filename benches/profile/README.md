@@ -18,6 +18,42 @@ benches/profile/profile.sh --lang rust --size 150 --requests 150
 # -> $TMPDIR/kakehashi-profile/flamegraph.svg  (+ a top-functions report on stdout)
 ```
 
+For bridge-level latency and output-volume measurements on a real document,
+build a release binary and use the synchronous driver directly:
+
+```sh
+cargo build --release --bin kakehashi
+python3 benches/profile/drive.py \
+  --bin ./target/release/kakehashi \
+  --file path/to/input.md --requests 20 --edits 1
+
+# Queue a captures delta first, then semantic tokens, to reproduce shared-pool and
+# response-output contention from an already-busy highlighter client.
+python3 benches/profile/drive.py \
+  --bin ./target/release/kakehashi \
+  --file path/to/input.md --requests 20 --edits 1 --concurrent-captures
+
+# Send superseding requests in bursts to measure cancellation pressure.
+python3 benches/profile/drive.py \
+  --bin ./target/release/kakehashi \
+  --file path/to/input.md --requests 20 --burst 8 --burst-edits
+```
+
+The driver reports per-method p50/p90/max request-to-response latency both
+overall and split by outcome (`ok`, cancelled, `null`, error), time to the last
+successful semantic response in each cycle, exact JSON response-body bytes,
+and server notifications/requests grouped separately. This keeps completed
+semantic compute latency separate from cheap supersession responses and from
+large captures or diagnostic output that may dominate a cycle.
+
+With full Xcode installed, Instruments' Time Profiler can also be used from the
+CLI:
+
+```sh
+benches/profile/xctrace.sh --lang markdown --size 150 --requests 160 --edits 1
+# -> $TMPDIR/kakehashi-xctrace/semantic-time.trace (+ a target-only summary)
+```
+
 The harness drives the server against `deps/test/kakehashi` for parsers/queries.
 If that dir has no installed parsers, the server auto-installs on the first
 request (slow, needs network) and the profile is dominated by install work —
@@ -26,14 +62,19 @@ suite (or `make deps/tree-sitter`) once populates it.
 
 ## Why it's shaped this way
 
-- **Drive synchronously, don't pipe a static session.** The server coalesces
-  superseded requests: if many `semanticTokens/full` calls are queued at once it
-  answers all but the last with `-32800 Canceled` and does no real work. `drive.py`
-  waits for each response before sending the next, so every request actually
-  computes. (`gen_session.py` can still emit a framed session for other uses.)
+- **Drive synchronously, don't pipe a static session.** The default isolates one
+  request at a time; without `--edits`, requests after warmup intentionally
+  measure unchanged-snapshot cache hits. Add `--edits 1` to measure the
+  edit→reparse→recompute path, or `--burst`/`--burst-edits` to measure
+  supersession pressure with completed, cancelled, and `null` latency reported
+  separately. (`gen_session.py` can still emit a framed session for other uses.)
 - **Profile the server, driven by Python.** The semantic-tokens code is
   `pub(crate)`, so it can't be called from a bench/example. samply launches the
   driver and follows its child (the server), capturing the server's stacks.
+- **Record all processes for xctrace.** `xctrace record --launch` follows only
+  the Python driver here, not the child server, so `xctrace.sh` records all
+  processes for a bounded window and filters the export down to
+  `target/profiling/kakehashi`.
 - **Symbolicate offline.** samply only symbolicates when serving a profile in the
   browser; the saved JSON keeps raw module-relative addresses. `analyze.py`
   resolves the kakehashi frames with `atos` against the `.dSYM` (built by the
@@ -50,6 +91,8 @@ the kakehashi/tree-sitter/regex frames for the actual CPU cost.
 | file | role |
 | ---- | ---- |
 | `profile.sh` | end-to-end: build → dSYM → samply record → analyze → SVG |
-| `drive.py` | synchronous LSP driver (no request coalescing) |
+| `xctrace.sh` | end-to-end: build → Instruments Time Profiler → XML summary |
+| `drive.py` | synchronous/batched LSP driver with per-method latency and wire-volume output |
+| `test_drive.py` | unit tests for driver metric aggregation |
 | `gen_session.py` | document generators + a framed-session emitter |
 | `analyze.py` | atos symbolication, self/inclusive report, collapsed stacks |

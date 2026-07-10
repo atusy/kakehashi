@@ -12,9 +12,26 @@
 use crate::analysis::semantic::RawToken;
 use crate::language::injection::CacheableInjectionRegion;
 use dashmap::DashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{Range, SemanticTokens};
 use url::Url;
+
+const SEMANTIC_BASELINE_HISTORY: usize = 8;
+/// Retain roughly three generations of the 40,480-u32 profiling payload
+/// (~162 KiB each), while small documents may still use the count cap above.
+/// The newest baseline is always kept even when one result alone exceeds this.
+const SEMANTIC_BASELINE_BYTES_PER_DOCUMENT: usize = 512 * 1024;
+
+/// Identity of one immutable parse snapshot under one settings generation.
+/// Parsed versions restart when a URI closes and reopens, so incarnation is
+/// part of the key rather than an optional lifecycle check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SemanticSnapshotIdentity {
+    pub(crate) parsed_version: u64,
+    pub(crate) incarnation: u64,
+    pub(crate) generation: u64,
+}
 
 /// Cached semantic tokens for delta calculations.
 #[derive(Clone)]
@@ -32,6 +49,8 @@ pub struct CachedSemanticTokens {
     /// so it correctly hits.) Mirrors the range (#535) and injection (#529)
     /// caches, which already fold their language in.
     pub language: String,
+    /// Exact parse-snapshot and settings identity used by the hash-free fast path.
+    pub snapshot: SemanticSnapshotIdentity,
     /// Opaque validity key these tokens were computed under (built by
     /// `CacheCoordinator::token_cache_key`: the FNV-1a hash of the document text
     /// folded with the settings generation). Lets a repeat request on an
@@ -44,34 +63,107 @@ pub struct CachedSemanticTokens {
 
 /// Thread-safe semantic token cache.
 pub struct SemanticTokenCache {
-    cache: DashMap<Url, CachedSemanticTokens>,
+    documents: DashMap<Url, SemanticDocumentCache>,
+}
+
+#[derive(Default)]
+struct SemanticDocumentCache {
+    current: Option<CachedSemanticTokens>,
+    baselines: HashMap<String, Arc<SemanticTokens>>,
+    /// Baseline IDs from least to most recently stored or read.
+    baseline_order: VecDeque<String>,
+    baseline_bytes: usize,
 }
 
 impl SemanticTokenCache {
     /// Create a new empty cache.
     pub fn new() -> Self {
         Self {
-            cache: DashMap::new(),
+            documents: DashMap::new(),
         }
     }
 
     /// Store semantic tokens for a document, tagged with the resolved `language`
     /// and the `cache_key` they were computed under (see
     /// [`get_if_current`](Self::get_if_current)).
-    pub fn store(&self, uri: Url, tokens: SemanticTokens, language: String, cache_key: u64) {
-        self.cache.insert(
-            uri,
-            CachedSemanticTokens {
-                tokens: Arc::new(tokens),
-                language,
-                cache_key,
-            },
-        );
+    pub fn store(
+        &self,
+        uri: Url,
+        tokens: SemanticTokens,
+        language: String,
+        cache_key: u64,
+        snapshot: SemanticSnapshotIdentity,
+    ) {
+        let mut document = self.documents.entry(uri).or_default();
+        let result_id = tokens.result_id.clone();
+        let tokens = Arc::new(tokens);
+        document.current = Some(CachedSemanticTokens {
+            tokens: Arc::clone(&tokens),
+            language,
+            snapshot,
+            cache_key,
+        });
+        if let Some(result_id) = result_id {
+            Self::store_baseline(&mut document, result_id, tokens);
+        }
+    }
+
+    fn store_baseline(
+        document: &mut SemanticDocumentCache,
+        result_id: String,
+        tokens: Arc<SemanticTokens>,
+    ) {
+        if let Some(previous) = document.baselines.insert(result_id.clone(), tokens.clone()) {
+            document.baseline_bytes = document
+                .baseline_bytes
+                .saturating_sub(Self::token_bytes(&previous));
+        }
+        document.baseline_bytes += Self::token_bytes(&tokens);
+        document.baseline_order.retain(|id| id != &result_id);
+        document.baseline_order.push_back(result_id);
+        while document.baseline_order.len() > 1
+            && (document.baseline_order.len() > SEMANTIC_BASELINE_HISTORY
+                || document.baseline_bytes > SEMANTIC_BASELINE_BYTES_PER_DOCUMENT)
+        {
+            let evicted = document
+                .baseline_order
+                .pop_front()
+                .expect("length checked above");
+            if let Some(tokens) = document.baselines.remove(&evicted) {
+                document.baseline_bytes = document
+                    .baseline_bytes
+                    .saturating_sub(Self::token_bytes(&tokens));
+            }
+        }
+    }
+
+    fn token_bytes(tokens: &SemanticTokens) -> usize {
+        tokens.data.len() * std::mem::size_of::<tower_lsp_server::ls_types::SemanticToken>()
+    }
+
+    fn touch_baseline(document: &mut SemanticDocumentCache, result_id: &str) {
+        let Some(index) = document
+            .baseline_order
+            .iter()
+            .position(|id| id == result_id)
+        else {
+            return;
+        };
+        if index + 1 == document.baseline_order.len() {
+            return;
+        }
+        let result_id = document
+            .baseline_order
+            .remove(index)
+            .expect("index came from position");
+        document.baseline_order.push_back(result_id);
     }
 
     /// Retrieve semantic tokens for a document.
     pub fn get(&self, uri: &Url) -> Option<CachedSemanticTokens> {
-        self.cache.get(uri).map(|entry| entry.clone())
+        self.documents
+            .get(uri)
+            .and_then(|document| document.current.clone())
     }
 
     /// Get cached tokens if they were computed for this exact `language` under
@@ -85,8 +177,30 @@ impl SemanticTokenCache {
         language: &str,
         cache_key: u64,
     ) -> Option<Arc<SemanticTokens>> {
-        self.cache.get(uri).and_then(|entry| {
+        self.documents.get(uri).and_then(|document| {
+            let entry = document.current.as_ref()?;
             if entry.cache_key == cache_key && entry.language == language {
+                Some(Arc::clone(&entry.tokens))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Get cached tokens for the exact parse snapshot and settings generation.
+    ///
+    /// This is a narrower but cheaper hit path than [`get_if_current`]: it avoids
+    /// rebuilding the full-document content hash when the caller already knows it
+    /// is serving the same immutable parse snapshot.
+    pub fn get_if_same_snapshot(
+        &self,
+        uri: &Url,
+        language: &str,
+        snapshot: SemanticSnapshotIdentity,
+    ) -> Option<Arc<SemanticTokens>> {
+        self.documents.get(uri).and_then(|document| {
+            let entry = document.current.as_ref()?;
+            if entry.snapshot == snapshot && entry.language == language {
                 Some(Arc::clone(&entry.tokens))
             } else {
                 None
@@ -98,7 +212,7 @@ impl SemanticTokenCache {
     /// settings/query reload to reclaim memory; the generation bump is what makes
     /// the invalidation race-safe, this just stops the dead entries from leaking.
     pub fn clear(&self) {
-        self.cache.clear();
+        self.documents.clear();
     }
 
     /// Get cached tokens if the result_id matches.
@@ -107,18 +221,25 @@ impl SemanticTokenCache {
     /// - No tokens are cached for this URI
     /// - The cached result_id doesn't match the expected one
     pub fn get_if_valid(&self, uri: &Url, expected_result_id: &str) -> Option<Arc<SemanticTokens>> {
-        self.cache.get(uri).and_then(|entry| {
-            if entry.tokens.result_id.as_deref() == Some(expected_result_id) {
-                Some(Arc::clone(&entry.tokens))
-            } else {
-                None
-            }
-        })
+        if let Some(document) = self.documents.get(uri)
+            && let Some(tokens) = document.current.as_ref().and_then(|entry| {
+                (entry.tokens.result_id.as_deref() == Some(expected_result_id))
+                    .then(|| Arc::clone(&entry.tokens))
+            })
+        {
+            return Some(tokens);
+        }
+        let mut document = self.documents.get_mut(uri)?;
+        let tokens = document.baselines.get(expected_result_id).map(Arc::clone);
+        if tokens.is_some() {
+            Self::touch_baseline(&mut document, expected_result_id);
+        }
+        tokens
     }
 
     /// Remove cached tokens for a document (e.g., on document close).
     pub fn remove(&self, uri: &Url) {
-        self.cache.remove(uri);
+        self.documents.remove(uri);
     }
 }
 
@@ -130,13 +251,14 @@ impl Default for SemanticTokenCache {
 
 /// Cached tokens for a `textDocument/semanticTokens/range` request (#535).
 ///
-/// Unlike full/delta, the range path has no short-circuit and re-tokenizes the
-/// visible window on every request. Range is local kakehashi tree-sitter compute
-/// (no downstream fan-out), so the result is a pure function of the document text,
-/// the requested `range`, and the settings generation — keying by all three is
-/// safe. The hit is narrow (only an *identical-viewport* re-request of an unchanged
-/// document under unchanged settings), so a single most-recent entry per URI is
-/// kept rather than a per-range map.
+/// Exact-viewport companion to the full-token cache. Range is local kakehashi
+/// tree-sitter compute (no downstream fan-out), so the result is a pure function
+/// of the document text, the requested `range`, and the settings generation —
+/// keying by all three is safe. The hit is narrow (only an *identical-viewport*
+/// re-request of an unchanged document under unchanged settings), so a single
+/// most-recent entry per URI is kept rather than a per-range map. Different
+/// scrolled viewports miss here but can still filter the full-token cache when
+/// available.
 #[derive(Clone)]
 pub struct CachedRangeTokens {
     pub tokens: Arc<SemanticTokens>,
@@ -507,6 +629,18 @@ mod tests {
     use super::*;
     use tower_lsp_server::ls_types::SemanticToken;
 
+    fn snapshot(
+        parsed_version: u64,
+        incarnation: u64,
+        generation: u64,
+    ) -> SemanticSnapshotIdentity {
+        SemanticSnapshotIdentity {
+            parsed_version,
+            incarnation,
+            generation,
+        }
+    }
+
     #[test]
     fn test_semantic_cache_store_retrieve() {
         let cache = SemanticTokenCache::new();
@@ -523,7 +657,13 @@ mod tests {
         };
 
         // Store tokens
-        cache.store(uri.clone(), tokens.clone(), "rust".to_string(), 0);
+        cache.store(
+            uri.clone(),
+            tokens.clone(),
+            "rust".to_string(),
+            0,
+            snapshot(0, 0, 0),
+        );
 
         // Retrieve tokens
         let retrieved = cache.get(&uri);
@@ -565,7 +705,13 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0,
+            snapshot(0, 0, 0),
+        );
 
         let first = cache.get(&uri).unwrap();
         let second = cache.get(&uri).unwrap();
@@ -598,7 +744,13 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store(uri.clone(), previous, "rust".to_string(), 0);
+        cache.store(
+            uri.clone(),
+            previous,
+            "rust".to_string(),
+            0,
+            snapshot(0, 0, 0),
+        );
 
         let cached = cache.get_if_valid(&uri, "1").unwrap();
         let before = Arc::strong_count(&cached);
@@ -664,7 +816,13 @@ mod tests {
             }],
         };
 
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0,
+            snapshot(0, 0, 0),
+        );
 
         // Matching result_id returns tokens
         let valid = cache.get_if_valid(&uri, "42");
@@ -690,6 +848,118 @@ mod tests {
     }
 
     #[test]
+    fn semantic_cache_keeps_previous_delta_baseline() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///test.rs").unwrap();
+
+        cache.store(
+            uri.clone(),
+            SemanticTokens {
+                result_id: Some("old".to_string()),
+                data: vec![SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 1,
+                    token_type: 1,
+                    token_modifiers_bitset: 0,
+                }],
+            },
+            "rust".to_string(),
+            1,
+            snapshot(1, 0, 0),
+        );
+        cache.store(
+            uri.clone(),
+            SemanticTokens {
+                result_id: Some("new".to_string()),
+                data: vec![SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 2,
+                    token_type: 1,
+                    token_modifiers_bitset: 0,
+                }],
+            },
+            "rust".to_string(),
+            2,
+            snapshot(2, 0, 0),
+        );
+
+        assert!(
+            cache.get_if_valid(&uri, "old").is_some(),
+            "a slightly stale client baseline should still be available for delta"
+        );
+        assert!(
+            cache.get_if_valid(&uri, "new").is_some(),
+            "the latest baseline must remain available"
+        );
+    }
+
+    #[test]
+    fn semantic_baselines_obey_per_document_byte_budget() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///large.rs").unwrap();
+        let token = SemanticToken {
+            delta_line: 0,
+            delta_start: 0,
+            length: 1,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        };
+        let tokens_per_result =
+            SEMANTIC_BASELINE_BYTES_PER_DOCUMENT / std::mem::size_of::<SemanticToken>() * 3 / 4;
+        for (version, id) in [(0, "old"), (1, "new")] {
+            cache.store(
+                uri.clone(),
+                SemanticTokens {
+                    result_id: Some(id.to_string()),
+                    data: vec![token; tokens_per_result],
+                },
+                "rust".to_string(),
+                version,
+                snapshot(version, 0, 0),
+            );
+        }
+
+        assert!(cache.get_if_valid(&uri, "old").is_none());
+        assert!(cache.get_if_valid(&uri, "new").is_some());
+    }
+
+    #[test]
+    fn reading_stale_delta_baseline_refreshes_its_eviction_recency() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///baseline-recency.rs").unwrap();
+        let store = |result_id: usize| {
+            cache.store(
+                uri.clone(),
+                SemanticTokens {
+                    result_id: Some(result_id.to_string()),
+                    data: vec![],
+                },
+                "rust".to_string(),
+                result_id as u64,
+                snapshot(result_id as u64, 0, 0),
+            );
+        };
+
+        for result_id in 0..SEMANTIC_BASELINE_HISTORY {
+            store(result_id);
+        }
+        assert!(cache.get_if_valid(&uri, "0").is_some());
+
+        store(SEMANTIC_BASELINE_HISTORY);
+
+        assert!(
+            cache.get_if_valid(&uri, "0").is_some(),
+            "a baseline just reissued to the client must survive the next store"
+        );
+        assert!(
+            cache.get_if_valid(&uri, "1").is_none(),
+            "the least recently used baseline should be evicted instead"
+        );
+    }
+
+    #[test]
     fn get_if_current_matches_on_content_hash() {
         let cache = SemanticTokenCache::new();
         let uri = Url::parse("file:///t.rs").unwrap();
@@ -697,7 +967,13 @@ mod tests {
             result_id: Some("7".to_string()),
             data: vec![],
         };
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0xABCD);
+        cache.store(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0xABCD,
+            snapshot(0, 0, 0),
+        );
 
         // Same content hash AND language => the document is unchanged => serve
         // cached tokens.
@@ -717,6 +993,54 @@ mod tests {
     }
 
     #[test]
+    fn get_if_same_snapshot_matches_version_generation_and_language() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///snapshot.rs").unwrap();
+        let tokens = SemanticTokens {
+            result_id: Some("snap".to_string()),
+            data: vec![],
+        };
+        cache.store(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0xABCD,
+            snapshot(42, 3, 7),
+        );
+
+        assert!(
+            cache
+                .get_if_same_snapshot(&uri, "rust", snapshot(42, 3, 7))
+                .is_some(),
+            "same immutable parse snapshot and generation should hit"
+        );
+        assert!(
+            cache
+                .get_if_same_snapshot(&uri, "rust", snapshot(43, 3, 7))
+                .is_none(),
+            "different parsed version must miss"
+        );
+        assert!(
+            cache
+                .get_if_same_snapshot(&uri, "rust", snapshot(42, 3, 8))
+                .is_none(),
+            "different settings generation must miss"
+        );
+        assert!(
+            cache
+                .get_if_same_snapshot(&uri, "python", snapshot(42, 3, 7))
+                .is_none(),
+            "different language must miss"
+        );
+        assert!(
+            cache
+                .get_if_same_snapshot(&uri, "rust", snapshot(42, 4, 7))
+                .is_none(),
+            "same version in a reopened document lifetime must miss"
+        );
+    }
+
+    #[test]
     fn get_if_current_misses_on_language_switch() {
         // A `didClose`/`didOpen` that re-assigns the same URI to a different
         // language keeps the text (and thus `cache_key`) identical, since the key
@@ -731,7 +1055,13 @@ mod tests {
             result_id: Some("1".to_string()),
             data: vec![],
         };
-        cache.store(uri.clone(), tokens, "lua".to_string(), 0xABCD);
+        cache.store(
+            uri.clone(),
+            tokens,
+            "lua".to_string(),
+            0xABCD,
+            snapshot(0, 0, 0),
+        );
 
         // Same key, same language => hit.
         assert!(
@@ -755,7 +1085,13 @@ mod tests {
             result_id: Some("1".to_string()),
             data: vec![],
         };
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0xAA);
+        cache.store(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0xAA,
+            snapshot(0, 0, 0),
+        );
         assert!(cache.get_if_current(&uri, "rust", 0xAA).is_some());
 
         // A config reload changes tokenization for the same text, so the whole
@@ -783,7 +1119,13 @@ mod tests {
         };
 
         // Store tokens
-        cache.store(uri.clone(), tokens, "rust".to_string(), 0);
+        cache.store(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0,
+            snapshot(0, 0, 0),
+        );
         assert!(cache.get(&uri).is_some(), "Should have cached tokens");
 
         // Remove on close
@@ -793,6 +1135,15 @@ mod tests {
         // Removing non-existent URI is safe
         let other_uri = Url::parse("file:///other.rs").unwrap();
         cache.remove(&other_uri); // Should not panic
+    }
+
+    #[test]
+    fn closed_uri_keys_are_reclaimed() {
+        let cache = SemanticTokenCache::new();
+        for index in 0..128 {
+            cache.remove(&Url::parse(&format!("file:///closed-{index}.rs")).unwrap());
+        }
+        assert!(cache.documents.is_empty());
     }
 
     #[test]

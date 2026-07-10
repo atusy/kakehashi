@@ -60,6 +60,7 @@ impl ComputePool {
         T: Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancel_for_work = cancel.clone();
         // Scheduling-latency instrumentation: a slow response with a fast
         // compute means the time went to the pool QUEUE (enqueue→start: pool
         // threads busy with other work-units) or to the RESUME (work end→
@@ -76,7 +77,7 @@ impl ComputePool {
                     queued_for.as_millis()
                 );
             }
-            if crate::cancel::is_cancelled(cancel.as_ref()) {
+            if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
                 return; // dropping tx resolves the awaiter with None
             }
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
@@ -100,7 +101,16 @@ impl ComputePool {
         // latency half — "work done" to "handler resumed" — cannot be
         // measured from inside this future; the runtime-stall watchdog (see
         // `run_lsp_server`) covers it.
-        rx.await.ok()
+        match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    result = rx => result.ok(),
+                }
+            }
+            None => rx.await.ok(),
+        }
     }
 }
 
@@ -130,6 +140,38 @@ mod tests {
         token.cancel();
         let result = pool.run(Some(token), || 42).await;
         assert_eq!(result, None, "cancelled work-unit must be skipped");
+    }
+
+    #[tokio::test]
+    async fn run_releases_queued_awaiter_when_cancelled() {
+        let pool = std::sync::Arc::new(ComputePool::with_threads(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = {
+            let pool = std::sync::Arc::clone(&pool);
+            tokio::spawn(async move {
+                pool.run(None, move || {
+                    started_tx.send(()).expect("test receiver should wait");
+                    release_rx.recv().expect("test should release blocker");
+                })
+                .await
+            })
+        };
+        started_rx.await.expect("blocker should start");
+
+        let token = CancelToken::default();
+        let queued = pool.run(Some(token.clone()), || 42);
+        token.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), queued)
+            .await
+            .expect("queued awaiter should release on cancellation");
+        assert_eq!(result, None);
+
+        release_tx
+            .send(())
+            .expect("blocker should still be waiting");
+        blocker.await.expect("blocker task should not panic");
     }
 
     #[tokio::test]

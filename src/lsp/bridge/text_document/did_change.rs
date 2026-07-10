@@ -54,42 +54,39 @@ impl LanguageServerPool {
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
 
-            // Check if this virtual doc has been claimed or opened on a downstream server.
-            // The claim happens before the actual didOpen send (see try_claim_for_open),
-            // but FIFO ordering via the single-writer loop ensures didChange arrives
-            // after didOpen on the wire.
-            if !self.is_document_opened(&virtual_uri) {
-                // Not opened yet - didOpen will be sent on first request
-                continue;
-            }
-
-            // Look up ALL connections that have this virtual doc open.
+            // Include pre-send claims, then serialize behind their didOpen
+            // transition. Otherwise an edit in the claim→enqueue window would
+            // be dropped and the downstream document could remain stale.
             // Multiple servers may handle the same language (e.g., emmylua and
             // lua_ls), and one server may back several workspace roots (#382).
-            let connection_keys = self.get_all_connections_for_virtual_uri(&virtual_uri);
+            let connection_keys = self.connections_opening_or_opened(&virtual_uri);
 
             for connection_key in connection_keys {
-                // Check connection state BEFORE incrementing version.
-                // Non-Ready servers shouldn't consume version numbers.
-                //
-                // TOCTOU note: The connection state is checked under the `connections`
-                // lock, but the lock is released before `increment_document_version`
-                // acquires a separate lock. A server could transition away from Ready
-                // between these two operations. This is acceptable: worst case is a
-                // wasted version number and a silently-failed send (the channel write
-                // is non-blocking fire-and-forget).
-                let handle = {
-                    let connections = self.connections().await;
-                    let Some(handle) = connections.get(&connection_key) else {
-                        continue;
-                    };
-
-                    if handle.state() != ConnectionState::Ready {
-                        continue;
-                    }
-
-                    Arc::clone(handle)
+                // Match didOpen's connections→transition order. Hold the map only
+                // until this generation owns the transition: a respawn also waits
+                // on that transition before purging the old generation, so the
+                // cloned handle stays pinned without blocking unrelated map users
+                // during the version/fingerprint awaits below.
+                let connections = self.connections().await;
+                let Some(handle) = connections
+                    .get(&connection_key)
+                    .filter(|handle| handle.state() == ConnectionState::Ready)
+                    .cloned()
+                else {
+                    continue;
                 };
+                let transition = self.open_transition_lock(&virtual_uri, &connection_key);
+                let transition_guard = transition.lock().await;
+                drop(connections);
+                if !self.is_document_opened_on_connection(&virtual_uri, &connection_key) {
+                    drop(transition_guard);
+                    self.remove_open_transition_lock_if_unshared(
+                        &virtual_uri,
+                        &connection_key,
+                        &transition,
+                    );
+                    continue;
+                }
 
                 // Per-connection filter (returns None if this connection hasn't
                 // registered the doc) AND content guard: skip the re-send when this
@@ -126,6 +123,7 @@ impl LanguageServerPool {
                     )
                     .await;
                 }
+                drop(transition_guard);
             }
         }
     }
