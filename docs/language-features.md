@@ -149,8 +149,9 @@ after `(` or `,`). Default combine strategy: `preferred`.
 
 Jumps from a symbol in an embedded block to its definition. The target can be
 **within the same block** or a **real file on disk** (e.g. a library dependency).
-Targets that live in a *different* embedded block of the same document are not
-offered, since blocks are independent snippets. Default combine strategy: `preferred`.
+Targets the server addresses to a *different* block's virtual URI are not
+offered (blocks are independent snippets); host-URI targets are passed
+through without a containment check. Default combine strategy: `preferred`.
 
 ### Find references
 
@@ -185,10 +186,10 @@ Collects clickable links from all embedded blocks.
 [`textDocument/rename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rename)
 and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareRename)
 
-Renames a symbol within its embedded block. Edits the server produces for
-OTHER injection regions are filtered out; edits to real files (e.g. a
-cross-file rename from a project-aware server) pass through. Default combine
-strategy: `preferred`.
+Renames a symbol within its embedded block. Edits the server addresses to
+OTHER regions' virtual URIs are filtered out; edits to real files (e.g. a
+cross-file rename from a project-aware server, or host-URI edits — not
+containment-checked) pass through. Default combine strategy: `preferred`.
 
 ### Formatting
 
@@ -250,7 +251,9 @@ layer is active for the document, cached push slots from pull-capable
 servers are suppressed in favor of pull results (no double-counting; in
 mixed configurations this can suppress a push whose server was not itself
 pulled). When those cached pushes later answer a client PULL
-(`pushFallback`), layer priorities and the cross-layer strategy do apply.
+(`pushFallback`), only push-driven servers' slots fold in, under the
+cross-layer priorities/strategy only — server-level `priorities`/
+`maxFanOut` are not reapplied.
 
 ### Code actions
 
@@ -263,8 +266,14 @@ Quick fixes and refactors from the servers bridging the block (all of them
 by default; `priorities`/`maxFanOut` can restrict the set) — a range
 spanning several blocks merges each region's actions into one menu. Titles
 are suffixed with "— {server}" so same-named actions stay distinguishable.
-Lazy actions resolve back to their origin server (`codeAction/resolve`);
-command-carrying actions execute through the bridged
+Lazy actions resolve back to their origin server (`codeAction/resolve`) —
+client-driven resolve routing additionally requires the client to declare
+`dataSupport` and `resolveSupport` covering `"edit"`; without those,
+injection-layer lazy actions are eagerly resolved by the bridge and
+host-layer ones are disabled or dropped. (Known limitation: lazy actions in
+`#offset!`-adjusted regions such as bundled YAML/TOML frontmatter always
+fail soft — the resolve freshness check cannot match there.)
+Command-carrying actions execute through the bridged
 `workspace/executeCommand`.
 
 Edit safety differs by layer and direction. An INJECTION-layer action edit
@@ -561,6 +570,7 @@ dynamically and depend only on the client's
 `workspace.executeCommand.dynamicRegistration`.)
 
 Bridged features are also limited to **embedded code blocks** in one respect:
-navigation and edits do not cross between blocks (cross-region results are
-filtered out). The surrounding host document can be bridged to the host
+navigation and edits do not cross between blocks (results addressed to
+another block's virtual URI are filtered out; real-file and host-URI results
+pass through). The surrounding host document can be bridged to the host
 language's own servers via `bridge._self` (host-document-bridge).

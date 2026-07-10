@@ -446,10 +446,12 @@ Details:
   priorities/strategy machinery when proactively republished — cached and
   concatenated across servers, except that push slots from pull-capable
   servers are suppressed in favor of pull results while the pull layer is
-  active (host `_self` pushes keep their real host
-  URIs and ranges as-is). When those cached pushes later answer a client
-  pull (`pushFallback`), layer participation, priorities, and the
-  cross-layer strategy do apply.
+  active (in mixed configurations this can suppress a push whose server was
+  not itself pulled; host `_self` pushes keep their real host URIs and
+  ranges as-is). When cached pushes later answer a client pull
+  (`pushFallback`), only push-driven servers' slots fold in (pull-capable
+  servers excluded), under the CROSS-LAYER priorities/strategy only —
+  server-level `priorities`/`maxFanOut` are not reapplied.
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for the bridged
   request methods — including pull/push diagnostics, with the `bridge._self`

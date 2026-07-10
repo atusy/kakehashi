@@ -68,8 +68,12 @@ Phased roadmap:
    `_self` host-layer pushes), but pushes bypass the dispatchers: the cache
    concatenates push-driven slots across servers — though when a pull layer
    exists, cached push slots from pull-capable servers are suppressed in
-   favor of the pull result (no double-counting); preferred-style push
-   election is deferred. Diagnostics are joined rather than raced:
+   favor of the pull result (no double-counting; in mixed configurations
+   this can suppress a push whose server was not itself pulled). When
+   cached pushes answer a client pull (`pushFallback`), only push-driven
+   servers' slots fold in, under cross-layer priorities/strategy only —
+   server-level `priorities`/`maxFanOut` are not reapplied. Preferred-style
+   push election is deferred. Diagnostics are joined rather than raced:
    they are not latency-interactive and `concatenated` needs every layer
    anyway, so one code path with a pure combine function replaces the
    `race_layers_preferred` machinery here.

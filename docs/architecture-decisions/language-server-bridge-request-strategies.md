@@ -123,8 +123,8 @@ Request (cursor in injection) ──▶ Forward to language server
 |--------|----------|
 | Input | Position (host → virtual translation) |
 | Output | Location or Location[] |
-| Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
-| Position mapping | Range start/end virtual → host for same-region targets; real-file ranges untouched |
+| Cross-file | Real-file targets preserved (incl. host-URI targets, not containment-checked); only locations addressed to OTHER regions' virtual URIs filtered |
+| Position mapping | Range start/end: virtual → host |
 
 #### textDocument/references
 
@@ -276,9 +276,11 @@ concatenated-formatting-pipeline.
 Note: spontaneous pushes bypass the aggregation priorities/strategy machinery
 on the proactive republish path — the diagnostic cache concatenates them
 across servers, suppressing push slots from pull-capable servers in favor of
-pull results while the pull layer is active (cached pushes answering a
-client pull via `pushFallback` do pass through layer participation,
-priorities, and strategy). Configured
+pull results while the pull layer is active (in mixed configurations this
+can suppress a push whose server was not itself pulled). Cached pushes
+answering a client pull via `pushFallback` fold in only push-driven servers'
+slots, under cross-layer priorities/strategy only — server-level
+`priorities`/`maxFanOut` are not reapplied. Configured
 `_self` host-server pushes carry the real host URI and host-relative ranges,
 so they are republished as-is (no URI filtering or translation step applies
 to them).
