@@ -193,10 +193,15 @@ impl ApplyEditTranslator {
     /// Unversioned edits (`version: null`) and the `changes` map (which
     /// carries no versions) are not validated — the spec defines a missing
     /// version as "apply without a version check", and the region-freshness +
-    /// region-bounds guards downstream of this still apply. Entries with an
-    /// EMPTY edit vector are no-ops and skipped, mirroring
-    /// [`collect_virtual_uris`]. Real-file versions are out of scope here (see
-    /// the module docs) and are nulled by `strip_bridge_local_versions`.
+    /// region-bounds guards downstream of this still apply. A VERSIONED entry
+    /// is validated even with an EMPTY edit vector: per spec the version is a
+    /// per-document precondition on the whole apply, so a downstream may send
+    /// `edits: []` purely to assert "only apply the rest if this document is
+    /// still at version N" — stripping such an entry's version unvalidated
+    /// would erase that precondition (only [`collect_virtual_uris`] ignores
+    /// empty entries, since a no-op needs no coordinate translation).
+    /// Real-file versions are out of scope here (see the module docs) and are
+    /// nulled by `strip_bridge_local_versions`.
     async fn validate_virtual_document_versions(
         &self,
         edit: &WorkspaceEdit,
@@ -215,13 +220,13 @@ impl ApplyEditTranslator {
                 return Err(if version < tracked {
                     format!(
                         "kakehashi: the edit was computed against version {version} of \
-                         the virtual document, but the bridge has since synced version \
+                         the virtual document, but the bridge's tracked version is now \
                          {tracked}; applying it could misplace the edit"
                     )
                 } else {
                     format!(
                         "kakehashi: the edit claims version {version} of the virtual \
-                         document, but the bridge has only synced up to version \
+                         document, but the bridge has only tracked up to version \
                          {tracked}; the edit cannot be validated"
                     )
                 });
@@ -232,8 +237,9 @@ impl ApplyEditTranslator {
 }
 
 /// The `(virtual URI, version)` of every VERSIONED `TextDocumentEdit` that
-/// targets a virtual document and carries at least one edit (empty edit
-/// vectors are no-ops, mirroring [`collect_virtual_uris`]). Only
+/// targets a virtual document — INCLUDING entries with an empty edit vector,
+/// whose version is still a per-document precondition on the apply (see
+/// [`ApplyEditTranslator::validate_virtual_document_versions`]). Only
 /// `documentChanges` can carry versions; the `changes` map cannot.
 fn versioned_virtual_text_document_edits(edit: &WorkspaceEdit) -> Vec<(&str, i32)> {
     let mut versioned = Vec::new();
@@ -250,7 +256,7 @@ fn versioned_virtual_text_document_edits(edit: &WorkspaceEdit) -> Vec<(&str, i32
         };
     for e in doc_edits {
         let uri = e.text_document.uri.as_str();
-        if e.edits.is_empty() || !VirtualDocumentUri::is_virtual_uri(uri) {
+        if !VirtualDocumentUri::is_virtual_uri(uri) {
             continue;
         }
         if let Some(version) = e.text_document.version {
@@ -555,7 +561,7 @@ mod tests {
             .await
             .expect_err("a stale versioned edit must be rejected");
         assert!(
-            reason.contains("version 2") && reason.contains("since synced version 3"),
+            reason.contains("version 2") && reason.contains("tracked version is now 3"),
             "reason should name both versions: {reason}"
         );
     }
@@ -580,7 +586,7 @@ mod tests {
             .await
             .expect_err("a version ahead of the tracked one must be rejected");
         assert!(
-            reason.contains("version 5") && reason.contains("synced up to version 1"),
+            reason.contains("version 5") && reason.contains("tracked up to version 1"),
             "reason should name both versions: {reason}"
         );
     }
@@ -646,10 +652,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn versioned_empty_virtual_entry_does_not_trip_validation() {
+    async fn versioned_empty_virtual_entry_is_still_a_validated_precondition() {
         // A versioned virtual TextDocumentEdit with an EMPTY edit vector is a
-        // no-op (mirrors collect_virtual_uris): it must not reject an
-        // otherwise valid real-file-only edit, whatever version it claims.
+        // pure precondition per spec ("only apply the rest if this document is
+        // still at version N"): its version must be validated even though it
+        // carries no edits of its own — here the doc is untracked, so the
+        // whole edit (including the real-file part) fails closed.
+        let connection = test_connection();
         let params = params_with_edit(json!({
             "documentChanges": [
                 {
@@ -666,10 +675,42 @@ mod tests {
             ]
         }));
 
+        let reason = translator()
+            .translate(params, &connection)
+            .await
+            .expect_err("a versioned no-op entry is a precondition and must be validated");
+        assert!(
+            reason.contains("no longer open on this connection"),
+            "reason should name the failure: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unversioned_empty_virtual_entry_does_not_trip_validation() {
+        // An UNVERSIONED empty virtual entry asserts nothing (no version, no
+        // edits): the real-file-only edit around it must still pass through,
+        // and the empty entry must not route it down the virtual path either
+        // (collect_virtual_uris ignores empty entries).
+        let params = params_with_edit(json!({
+            "documentChanges": [
+                {
+                    "textDocument": {
+                        "uri": virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                        "version": null
+                    },
+                    "edits": []
+                },
+                {
+                    "textDocument": { "uri": "file:///project/main.rs", "version": null },
+                    "edits": [text_edit(3)]
+                }
+            ]
+        }));
+
         translator()
             .translate(params, &test_connection())
             .await
-            .expect("a no-op versioned virtual entry must not trip validation");
+            .expect("an unversioned no-op virtual entry must not trip anything");
     }
 
     #[test]

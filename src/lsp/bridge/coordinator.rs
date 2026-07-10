@@ -218,12 +218,13 @@ impl BridgeCoordinator {
         self.pool.resolve_virtual_uri(virtual_uri).await
     }
 
-    /// The version currently tracked for a virtual document on one connection —
-    /// the revision of the content the bridge last announced there (didOpen = 1,
-    /// each content-changing didChange bumps it). `None` when the document is
-    /// not tracked for this connection. Used by the inbound
-    /// `workspace/applyEdit` translation to validate downstream-supplied
-    /// `TextDocumentEdit.version`s. Delegates to the pool.
+    /// The version currently tracked for a virtual document on one connection
+    /// (didOpen = 1, each content-changing didChange bumps it; the bridge's
+    /// own revision counter, not a delivery receipt — see
+    /// `DocumentTracker::document_version`). `None` when the document is not
+    /// tracked for this connection. Used by the inbound `workspace/applyEdit`
+    /// translation to validate downstream-supplied `TextDocumentEdit.version`s.
+    /// Delegates to the pool.
     pub(crate) async fn virtual_document_version(
         &self,
         virtual_uri: &str,

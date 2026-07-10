@@ -371,11 +371,13 @@ impl DocumentTracker {
         None
     }
 
-    /// The version currently tracked for a virtual document on one connection —
-    /// the version of the content the bridge last announced to that connection
+    /// The version currently tracked for a virtual document on one connection
     /// (didOpen = 1, each content-changing didChange bumps it). `None` when the
     /// document is not tracked for this connection (never opened here, or
-    /// purged on respawn).
+    /// purged on respawn). This is the bridge's own revision counter, not a
+    /// delivery receipt: the bump happens before the didChange enqueue, so a
+    /// dropped notification (queue full) can leave the downstream one revision
+    /// behind the tracked value until the next content change re-syncs.
     ///
     /// Used by the inbound `workspace/applyEdit` validation: a downstream that
     /// versions a `TextDocumentEdit` pins the edit to the content revision it
