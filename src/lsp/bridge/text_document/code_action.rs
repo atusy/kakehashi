@@ -1176,8 +1176,9 @@ pub(crate) fn bridge_code_actions(
 
 const REASON_RESOLVE: &str = "this action could not be resolved to an applicable edit";
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
-const REASON_PREFIXED_REGION: &str = "the edit would break the host document's line prefixes \
-     (e.g. a blockquote) around the injected region";
+const REASON_PREFIXED_REGION: &str = "the edit would break the host document's structure \
+     around the injected region (its line prefixes, e.g. a blockquote's, or the \
+     closing fence)";
 
 fn bridge_code_action(
     item: CodeActionOrCommand,

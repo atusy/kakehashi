@@ -131,8 +131,9 @@ fn transform_color_presentation_response_to_host(
     };
 
     // Transform textEdit and additionalTextEdits ranges to host coordinates,
-    // then drop any presentation whose edits would break region line prefixes
-    // (e.g. blockquote `> `) if applied verbatim. Unlike completion, the
+    // then drop any presentation whose edits are unsafe for the injection
+    // region (escape it, break line prefixes, or merge content into the
+    // closing fence) if applied verbatim. Unlike completion, the
     // primary textEdit is not separable from the presentation (without it the
     // editor falls back to inserting the label, still at the unguarded
     // range), so an unsafe textEdit drops the whole presentation; unsafe
@@ -171,7 +172,7 @@ fn transform_color_presentation_response_to_host(
             if stripped > 0 {
                 log::warn!(
                     target: "kakehashi::bridge",
-                    "colorPresentation: stripped {stripped} additionalTextEdit(s) unsafe for the injection region (escape it or break line prefixes)"
+                    "colorPresentation: stripped {stripped} additionalTextEdit(s) unsafe for the injection region (escape it, break line prefixes, or merge content into the closing fence)"
                 );
             }
         }

@@ -173,9 +173,9 @@ fn transform_params_to_host(
     // strip the prefixes it overlaps and leave the inserted lines unprefixed.
     if !workspace_edit_preserves_line_prefixes(&params.edit, host_uri, offset, region_end) {
         return Err(
-            "kakehashi: the edit would break the host document's line prefixes around the \
-             injected region (e.g. a blockquote); it cannot be applied without corrupting the \
-             host document"
+            "kakehashi: the edit would break the host document's structure around the \
+             injected region (its line prefixes, e.g. a blockquote's, or the closing \
+             fence); it cannot be applied without corrupting the host document"
                 .to_string(),
         );
     }

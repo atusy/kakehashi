@@ -154,7 +154,7 @@ fn transform_completion_response_to_host(
     if dropped > 0 {
         log::warn!(
             target: "kakehashi::bridge",
-            "completion: dropped {dropped} item(s) whose text edit is unsafe for the injection region (escapes it or breaks line prefixes)"
+            "completion: dropped {dropped} item(s) whose text edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)"
         );
     }
 
@@ -220,8 +220,8 @@ pub(super) fn transform_completion_item(
         }
     }
 
-    // Transform additional_text_edits if present, stripping any that would
-    // break region line prefixes.
+    // Transform additional_text_edits if present, stripping any unsafe for
+    // the injection region.
     if let Some(ref mut additional_edits) = item.additional_text_edits {
         let before = additional_edits.len();
         for edit in additional_edits.iter_mut() {
@@ -232,7 +232,7 @@ pub(super) fn transform_completion_item(
         if dropped > 0 {
             log::warn!(
                 target: "kakehashi::bridge",
-                "completion: stripped {dropped} additionalTextEdit(s) unsafe for the injection region (escape it or break line prefixes)"
+                "completion: stripped {dropped} additionalTextEdit(s) unsafe for the injection region (escape it, break line prefixes, or merge content into the closing fence)"
             );
         }
     }

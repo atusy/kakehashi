@@ -148,9 +148,9 @@ fn transform_inlay_hint_response_to_host(
         // Transform position to host coordinates
         translate_virtual_position_to_host(&mut hint.position, offset);
 
-        // Transform textEdits ranges. If ANY edit would break region line
-        // prefixes (e.g. blockquote `> `) when applied verbatim, strip them
-        // ALL: the client applies the whole array on accept (LSP 3.18), so a
+        // Transform textEdits ranges. If ANY edit is unsafe for the injection
+        // region (escapes it, breaks `> ` prefixes, or merges content into
+        // the closing fence) when applied verbatim, strip them ALL: the client applies the whole array on accept (LSP 3.18), so a
         // partial set could apply half of an interdependent pair. The hint
         // itself stays useful without its accept edits (textEdits optional).
         if let Some(text_edits) = &mut hint.text_edits {
@@ -163,7 +163,7 @@ fn transform_inlay_hint_response_to_host(
             {
                 log::warn!(
                     target: "kakehashi::bridge",
-                    "inlayHint: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it or breaks line prefixes)",
+                    "inlayHint: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
                     text_edits.len()
                 );
                 hint.text_edits = None;
