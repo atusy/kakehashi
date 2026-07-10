@@ -246,7 +246,9 @@ impl Kakehashi {
             });
 
             // Collect results, aborting early if $/cancelRequest arrives.
-            let ordered_region_items =
+            // Completion order, NOT source order — each entry carries its
+            // region index and the flatten below sorts by it.
+            let completion_order_items =
                 crate::lsp::aggregation::region::collect_region_results_with_cancel(
                     outer_join_set,
                     cancel_rx,
@@ -257,7 +259,7 @@ impl Kakehashi {
                 .await;
 
             Ok(nonempty_whole_document_items(flatten_ordered_region_items(
-                ordered_region_items?,
+                completion_order_items?,
             )))
         };
 
