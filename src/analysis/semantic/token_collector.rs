@@ -360,7 +360,7 @@ pub(super) fn collect_host_tokens(
     // Validate content_start_byte is within bounds to prevent slice panics
     // This can happen during concurrent edits when document text shortens
     if content_start_byte > host_text.len() {
-        return true;
+        return false;
     }
 
     if crate::cancel::is_cancelled(cancel) {
@@ -788,6 +788,37 @@ mod tests {
             tokens.is_empty(),
             "cancelled collection must not emit tokens"
         );
+    }
+
+    #[test]
+    fn collect_host_tokens_marks_out_of_bounds_projection_incomplete() {
+        let code = "fn main() {}";
+        let tree = parse_rust_tree(code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @variable").unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let mut tokens = Vec::new();
+
+        let completed = collect_host_tokens(
+            code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            code,
+            &lines,
+            &build_line_start_bytes(code),
+            code.len() + 1,
+            0,
+            false,
+            &[],
+            &[],
+            None,
+            &mut tokens,
+        );
+
+        assert!(!completed);
+        assert!(tokens.is_empty());
     }
 
     #[test]
