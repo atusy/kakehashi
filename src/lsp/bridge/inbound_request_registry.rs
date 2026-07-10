@@ -8,7 +8,9 @@
 //! cancel so a `showMessageRequest` dialog is dismissed. tower-lsp's `Client`
 //! exposes no cancel API for an outgoing request, so the forwarding loop instead
 //! sends the request with an id it minted (see `send_editor_request`) and, on
-//! cancel, sends a correlated `$/cancelRequest` to the editor.
+//! cancel, sends a correlated `$/cancelRequest` to the editor. (A locally
+//! answered request — the capability-gated applyEdit — is unregistered before
+//! its token is ever awaited, so cancellation has nothing to do there.)
 //!
 //! This registry connects the two halves: the per-connection reader (which sees
 //! the downstream `$/cancelRequest` and the connection lifecycle) registers each

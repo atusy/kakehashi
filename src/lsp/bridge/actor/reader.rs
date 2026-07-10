@@ -901,7 +901,8 @@ async fn handle_message(
 }
 
 /// Handle an inbound downstream `$/cancelRequest`: if it targets a forwarded
-/// request still in flight (`window/showMessageRequest` / `window/showDocument`),
+/// request still in flight (`window/showMessageRequest`, `window/showDocument`,
+/// or a supported `workspace/applyEdit`),
 /// cancel the editor-bound request so its dialog is dismissed (#404). The id is
 /// parsed as a [`jsonrpc::Id`] exactly as the original request's id was, so the
 /// registry key matches. Ids that aren't tracked (e.g. the bridge's own outbound
