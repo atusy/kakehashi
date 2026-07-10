@@ -224,14 +224,19 @@ impl Kakehashi {
             upstream_id,
             region_end,
         );
-        match cancel_rx {
+        let result = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
                 resolved = dispatch => Ok(resolved),
             },
             None => Ok(dispatch.await),
-        }
+        };
+        // The cancel arm DROPS the in-flight dispatch, which then never
+        // reaches its own refcounted unregister — sweep the id (idempotent
+        // after normal completion, where the dispatch cleaned up itself).
+        pool.unregister_all_for_upstream_id(crate::lsp::current_upstream_id().as_ref());
+        result
     }
 
     /// The region's current content-precise host-document END position if the

@@ -122,9 +122,11 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability(METHOD) {
-            // Should be unreachable — the bridge only mints commands from servers
-            // it bridged — but if it happens, a log entry beats a silent drop
-            // (every other failure branch here warns).
+            // Nearly unreachable: the bridge only mints commands from servers it
+            // bridged, and the wait-ready acquisition above rules out the
+            // still-Initializing false negative. Reaching it means the server
+            // genuinely dropped the capability across a respawn — a log entry
+            // beats a silent drop (every other failure branch here warns).
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: {origin:?} does not advertise executeCommandProvider; ignoring {command:?}"

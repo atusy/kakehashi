@@ -42,14 +42,19 @@ impl Kakehashi {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let pool = self.bridge.pool_arc();
         let dispatch = pool.dispatch_execute_command(params, &settings, upstream_id);
-        match cancel_rx {
+        let result = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
                 result = dispatch => Ok(result),
             },
             None => Ok(dispatch.await),
-        }
+        };
+        // The cancel arm DROPS the in-flight dispatch, which then never
+        // reaches its own refcounted unregister — sweep the id (idempotent
+        // after normal completion, where the dispatch cleaned up itself).
+        pool.unregister_all_for_upstream_id(crate::lsp::current_upstream_id().as_ref());
+        result
     }
 
     /// Best-effort re-open of the routed command's origin-server documents (see
@@ -82,9 +87,9 @@ impl Kakehashi {
         // Bound the best-effort pre-sync: `eager_open_virtual_documents` can wait
         // up to the init timeout for a cold/stuck downstream to reach Ready, and
         // this sits on the user-facing executeCommand path. If it doesn't finish
-        // quickly, skip it and dispatch anyway — the happy path (doc already
-        // open) returns immediately, and dispatch uses the fail-fast connection
-        // variant, so a slow downstream can't block command execution here.
+        // quickly, stop waiting and dispatch anyway — the happy path (doc
+        // already open) returns immediately. (Dispatch itself waits through
+        // initialization with its own INIT_TIMEOUT bound.)
         const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         // Run the open as a SPAWNED task and bound only the wait: a plain
         // `timeout(fut)` DROPS the future on expiry, and `ensure_document_opened`
@@ -109,10 +114,25 @@ impl Kakehashi {
                 )
                 .await;
         });
-        if tokio::time::timeout(SYNC_TIMEOUT, open_task).await.is_err() {
-            // Timed out waiting for the downstream to open its documents; dispatch
-            // anyway (fail-fast connection variant). Logged so an intermittent
-            // "downstream never saw didOpen before the command" is diagnosable.
+        match tokio::time::timeout(SYNC_TIMEOUT, open_task).await {
+            Ok(Ok(())) => return,
+            // The spawned open PANICKED (or was aborted): surface it — a
+            // swallowed JoinError would hide a real bug behind "the heal
+            // just didn't help".
+            Ok(Err(join_error)) => {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: pre-sync of origin '{}' documents failed: {join_error}",
+                    route.origin
+                );
+                return;
+            }
+            Err(_) => {}
+        }
+        {
+            // Timed out waiting for the downstream to open its documents;
+            // dispatch anyway. Logged so an intermittent "downstream never saw
+            // didOpen before the command" is diagnosable.
             log::debug!(
                 target: "kakehashi::bridge",
                 "executeCommand: pre-sync of origin '{}' documents timed out after {SYNC_TIMEOUT:?}; dispatching anyway",
