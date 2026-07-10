@@ -780,37 +780,57 @@ impl InjectionResolver {
         prebuilt: Option<&[CacheableInjectionRegion]>,
         text: &str,
     ) -> Vec<ResolvedInjection> {
-        let mut resolved = Vec::new();
-        let mut seen_combined = std::collections::HashSet::new();
+        enum Slot {
+            Single(usize),
+            Combined(Vec<usize>),
+        }
+
+        // Partition once in document order. A per-group scan makes dynamic
+        // language captures quadratic when nearly every region is its own
+        // (language, pattern) group.
+        let mut slots = Vec::new();
+        let mut combined_slots: std::collections::HashMap<(&str, usize), usize> =
+            std::collections::HashMap::new();
         for (index, region) in regions.iter().enumerate() {
             if region.combined {
-                let key = (region.language.clone(), region.pattern_index);
-                if !seen_combined.insert(key) {
+                let key = (region.language.as_str(), region.pattern_index);
+                if let Some(&slot_index) = combined_slots.get(&key) {
+                    let Slot::Combined(indices) = &mut slots[slot_index] else {
+                        unreachable!("combined slot index must identify a combined slot")
+                    };
+                    indices.push(index);
+                } else {
+                    combined_slots.insert(key, slots.len());
+                    slots.push(Slot::Combined(vec![index]));
+                }
+            } else {
+                slots.push(Slot::Single(index));
+            }
+        }
+
+        let mut resolved = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let index = match slot {
+                Slot::Combined(indices) => {
+                    let group: Vec<_> = indices.iter().map(|&i| &regions[i]).collect();
+                    let prebuilt_group = prebuilt.map(|cacheable| {
+                        indices.iter().map(|&i| &cacheable[i]).collect::<Vec<_>>()
+                    });
+                    if let Some(combined) = Self::build_combined_injection(
+                        coordinator,
+                        identity,
+                        &group,
+                        prebuilt_group.as_deref(),
+                        text,
+                    ) {
+                        resolved.push(combined);
+                    }
                     continue;
                 }
-                let indices: Vec<_> = regions
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(candidate_index, candidate)| {
-                        (candidate.combined
-                            && candidate.pattern_index == region.pattern_index
-                            && candidate.language == region.language)
-                            .then_some(candidate_index)
-                    })
-                    .collect();
-                let group: Vec<_> = indices.iter().map(|&i| &regions[i]).collect();
-                let prebuilt_group = prebuilt
-                    .map(|cacheable| indices.iter().map(|&i| &cacheable[i]).collect::<Vec<_>>());
-                if let Some(combined) = Self::build_combined_injection(
-                    coordinator,
-                    identity,
-                    &group,
-                    prebuilt_group.as_deref(),
-                    text,
-                ) {
-                    resolved.push(combined);
-                }
-            } else if let Some(cacheable) = prebuilt {
+                Slot::Single(index) => index,
+            };
+            let region = &regions[index];
+            if let Some(cacheable) = prebuilt {
                 let (virtual_content, line_column_offsets) =
                     extract_virtual_content_and_offsets(region, &cacheable[index], text);
                 let resolved_language =
