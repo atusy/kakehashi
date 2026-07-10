@@ -21,7 +21,7 @@ use tower_lsp_server::ls_types::RenameParams;
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_text_document_position_params, response_has_jsonrpc_error,
+    build_text_document_position_params, response_has_jsonrpc_error, strip_bridge_local_versions,
     transform_workspace_edit_to_host, workspace_edit_has_effect,
 };
 
@@ -138,7 +138,7 @@ fn transform_workspace_edit_response_to_host(
     // A multi-file rename's OTHER real files can carry versioned entries;
     // those versions are bridge-local (the downstream's own counters) and
     // would read as stale to version-checking editors.
-    crate::lsp::bridge::strip_bridge_local_versions(&mut edit);
+    strip_bridge_local_versions(&mut edit);
 
     workspace_edit_has_effect(&edit).then_some(edit)
 }

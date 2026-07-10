@@ -12,6 +12,7 @@ use tower_lsp_server::ls_types::{NumberOrString, Position, RenameParams, Uri, Wo
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::bridge::strip_bridge_local_versions;
 use crate::lsp::bridge::workspace_edit_has_effect;
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
@@ -41,7 +42,7 @@ impl Kakehashi {
             // version-checking editors.
             |value| {
                 let mut edit = parse_host_verbatim::<WorkspaceEdit>(value)?;
-                crate::lsp::bridge::strip_bridge_local_versions(&mut edit);
+                strip_bridge_local_versions(&mut edit);
                 Some(edit)
             },
             rename_workspace_edit_has_result,
