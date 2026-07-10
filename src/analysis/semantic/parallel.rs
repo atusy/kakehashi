@@ -861,9 +861,13 @@ fn rebuild_context<'a>(
         // the single display line it covers. Containers keep their newlines:
         // their host tokens must not leak into code content. Known edge: a
         // container left unterminated at EOF in a file without a trailing
-        // newline ends flush and classifies prose until the fence closes — a
-        // transient, self-healing mis-render accepted over a per-language
-        // node-kind discriminator.
+        // newline ends flush and classifies prose until the fence closes.
+        // At EOF the two shapes are indistinguishable from the ranges alone,
+        // so one of them must misclassify; resolving toward container instead
+        // (e.g. by requiring a newline byte after the flush end) would
+        // reinstate the per-line highlight asymmetry for a paragraph ending
+        // the file without a trailing newline — the worse artifact, since the
+        // fence case renders uniformly and self-heals on close.
         // `get` instead of indexing: like the content re-slice above, a
         // corrupt reuse-path entry must degrade (here: to the untrimmed
         // container classification), not panic.
