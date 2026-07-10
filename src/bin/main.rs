@@ -799,9 +799,12 @@ fn run_diagnose(options: kakehashi::cli::diagnose::DiagnoseOptions) -> Result<()
 async fn run_lsp_server() {
     use env_logger::Builder;
     use kakehashi::lsp::{
-        CancelForwarder, IngressOrderGate, Kakehashi, LanguageServerPool, RequestIdCapture,
+        CancelForwarder, IngressOrderGate, Kakehashi, LanguageServerPool, MeasuredStdout,
+        RequestIdCapture, ResponseReadyService, StdoutMetrics,
     };
+    use std::io;
     use std::sync::Arc;
+    use std::time::Instant;
     use tokio::io::{stdin, stdout};
     use tower_lsp_server::{LspService, Server};
 
@@ -1034,8 +1037,23 @@ async fn run_lsp_server() {
     // burst (≈10 concurrent reader parks per document) across several
     // documents, with headroom.
     const INGRESS_CONCURRENCY: usize = 64;
-    Server::new(stdin, stdout, socket)
+    if std::env::var_os("KAKEHASHI_STDOUT_METRICS").is_some() {
+        let metrics = Arc::new(StdoutMetrics::new(Instant::now()));
+        Server::new(
+            stdin,
+            MeasuredStdout::new(stdout, Arc::clone(&metrics)),
+            socket,
+        )
         .concurrency_level(INGRESS_CONCURRENCY)
-        .serve(service)
+        .serve(ResponseReadyService::new(service, Arc::clone(&metrics)))
         .await;
+        if let Err(error) = metrics.write_jsonl(io::stderr().lock()) {
+            eprintln!("failed to write stdout metrics: {error}");
+        }
+    } else {
+        Server::new(stdin, stdout, socket)
+            .concurrency_level(INGRESS_CONCURRENCY)
+            .serve(service)
+            .await;
+    }
 }
