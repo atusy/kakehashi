@@ -906,7 +906,9 @@ impl DiagnosticPublisher {
         // `false` here means either one is already outstanding (recorded as `pending`,
         // so the outstanding task's loop fires the trailing) or — for a non-`forced`
         // request — nothing is dirty (the editor already has the current set). A
-        // `forced` downstream-forwarded refresh (#521) bypasses the coverage gate.
+        // `forced` request bypasses the coverage gate: the downstream-forwarded
+        // refresh (#521) and the degraded-pull recovery (whose per-host debt
+        // proves a non-covering answer no coverage version represents).
         if !self.aggregator.try_begin_refresh(forced) {
             return;
         }

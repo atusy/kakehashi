@@ -359,11 +359,12 @@ impl Kakehashi {
         // skipped every cached `Region` slot, so this answer is missing whole
         // servers' diagnostics. A pull must respond (there is no "defer" for a
         // request), so serve the degraded set — but do NOT mark it served, and
-        // record the per-host debt: the reparse loop's post-parse pass
-        // consumes it and requests the recovery refresh (coverage-gated) that
-        // brings the client back to a full view, instead of the gap being
-        // masked until the next edit. The predicate mirrors `republish`'s
-        // `needs_geometry` (non-empty region slots only).
+        // record the per-host debt: the reparse loop's post-parse pass (or the
+        // TOCTOU guard below) consumes it and requests the recovery refresh
+        // (single-flighted, forced past the coverage gate) that brings the
+        // client back to a full view, instead of the gap being masked until
+        // the next edit. The predicate mirrors `republish`'s `needs_geometry`
+        // (non-empty region slots only).
         let degraded_virt =
             virt_enabled && snapshot.is_none() && self.diagnostics.has_region_slots(&uri);
 
