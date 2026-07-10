@@ -1201,8 +1201,8 @@ mod tests {
                       { "range": { "start": { "line": 0, "character": 0 },
                                    "end": { "line": 0, "character": 0 } },
                         "newText": "import x\n" },
-                      { "range": { "start": { "line": 0, "character": 0 },
-                                   "end": { "line": 0, "character": 2 } },
+                      { "range": { "start": { "line": 0, "character": 3 },
+                                   "end": { "line": 0, "character": 5 } },
                         "newText": "ok" }
                   ] }
             ]
