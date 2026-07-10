@@ -389,23 +389,23 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut reader = BufReader::new(&mut stream);
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line);
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) if line == "\r\n" || line == "\n" => break,
-                        Ok(_) => {}
-                    }
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if line == "\r\n" || line == "\n" => break,
+                    Ok(_) => {}
                 }
-                let response =
-                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                let _ = stream.write_all(response.as_bytes());
             }
+            let response =
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
         });
         base_url
     }
