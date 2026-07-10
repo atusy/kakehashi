@@ -241,8 +241,10 @@ The default combine strategy here is **`concatenated`** (shared with code
 actions) — when multiple servers are configured for a block, all of their
 diagnostics are shown. The strategy is resolved per language, so different
 embedded languages can behave differently. Spontaneous pushes a server sends
-on its own bypass the strategy machinery entirely: they are cached and always
-concatenated across servers.
+on its own bypass the strategy machinery when proactively republished: they
+are cached and concatenated across servers. (When those cached pushes later
+answer a client PULL — `pushFallback` — layer priorities and the cross-layer
+strategy do apply.)
 
 ### Code actions
 
