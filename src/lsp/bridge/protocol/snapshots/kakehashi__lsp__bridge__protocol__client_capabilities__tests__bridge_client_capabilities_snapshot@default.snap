@@ -4,7 +4,6 @@ expression: capabilities
 ---
 {
   "workspace": {
-    "applyEdit": true,
     "executeCommand": {
       "dynamicRegistration": false
     },

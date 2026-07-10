@@ -482,6 +482,16 @@ impl Kakehashi {
             let diagnostic_publisher = Some(Arc::new(
                 crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(self),
             ));
+            // LSP conditions workspace/applyEdit on the client capability;
+            // resolved once here — client capabilities are fixed after
+            // initialize.
+            let editor_supports_apply_edit = self
+                .settings_manager
+                .client_capabilities_lock()
+                .get()
+                .and_then(|caps| caps.workspace.as_ref())
+                .and_then(|w| w.apply_edit)
+                .unwrap_or(false);
             tokio::spawn(upstream_forwarding_loop(
                 upstream_rx,
                 window_rx,
@@ -491,6 +501,7 @@ impl Kakehashi {
                 client,
                 diagnostic_publisher,
                 token,
+                editor_supports_apply_edit,
             ));
         }
     }
@@ -713,6 +724,7 @@ async fn upstream_forwarding_loop(
     client: Client,
     diagnostic_publisher: Option<Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>>,
     cancel_token: tokio_util::sync::CancellationToken,
+    editor_supports_apply_edit: bool,
 ) {
     // Tokens the editor successfully created. `$/progress` is forwarded only for
     // these: if a create timed out or was rejected, the editor never created the
@@ -789,6 +801,7 @@ async fn upstream_forwarding_loop(
                             translators.clone(),
                             &client,
                             request,
+                            editor_supports_apply_edit,
                         )
                     }
                     None => break, // Channel closed
@@ -1119,6 +1132,7 @@ fn spawn_upstream_request(
     translators: Option<Arc<UpstreamRequestTranslators>>,
     client: &Client,
     request: crate::lsp::bridge::UpstreamRequest,
+    editor_supports_apply_edit: bool,
 ) {
     use crate::lsp::bridge::UpstreamRequest;
     use tower_lsp_server::ls_types::{
@@ -1225,6 +1239,27 @@ fn spawn_upstream_request(
                 cancel,
             } => {
                 use tower_lsp_server::ls_types::ApplyWorkspaceEditResponse;
+                // LSP makes workspace/applyEdit conditional on the CLIENT
+                // capability: an editor that did not declare
+                // `workspace.applyEdit` must not receive the request (the
+                // bridge also stops advertising it downstream in that case,
+                // so this is the fail-soft for servers that send one anyway).
+                if !editor_supports_apply_edit {
+                    inbound_request_registry.unregister(
+                        cancel.connection_id,
+                        &cancel.request_id,
+                        cancel.generation,
+                    );
+                    let _ = reply.send(ApplyWorkspaceEditResponse {
+                        applied: false,
+                        failure_reason: Some(
+                            "kakehashi: the editor does not support workspace/applyEdit"
+                                .to_string(),
+                        ),
+                        failed_change: None,
+                    });
+                    return;
+                }
                 // Translate virtual-document edits back to host coordinates
                 // before forwarding (#568). Unlike showDocument there is no
                 // safe degraded forward: an untranslatable edit (unknown/stale
@@ -1802,6 +1837,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
@@ -1922,6 +1958,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         // The loop delivers the first create (a request that awaits the editor).
@@ -2013,6 +2050,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
@@ -2130,6 +2168,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
@@ -2248,6 +2287,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
@@ -2368,6 +2408,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
@@ -2491,6 +2532,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let stale = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
@@ -2659,6 +2701,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         // No create was ever sent for this token, yet ClientProgress must be
@@ -2810,6 +2853,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2866,6 +2910,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2895,6 +2940,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_edit_answers_applied_false_when_editor_lacks_capability() {
+        use crate::lsp::bridge::UpstreamRequest;
+
+        let (client, _requests, _responses) = init_client_and_socket().await;
+
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+            // The editor did NOT declare workspace.applyEdit: the request
+            // must be answered applied:false locally, never forwarded.
+            false,
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ApplyEdit {
+                params: serde_json::from_value(serde_json::json!({
+                    "edit": { "changes": { "file:///x.rs": [] } }
+                }))
+                .unwrap(),
+                reply: reply_tx,
+                cancel: test_forwarded_cancel(),
+            })
+            .unwrap();
+
+        // The reply arrives WITHOUT any editor round-trip (no response is ever
+        // fed to `_responses`), proving the request was answered locally.
+        let response = reply_rx.await.expect("reply delivered");
+        assert!(!response.applied);
+        assert!(
+            response
+                .failure_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("does not support workspace/applyEdit")),
+            "failureReason should name the missing capability: {:?}",
+            response.failure_reason
+        );
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    #[tokio::test]
     async fn forwarding_loop_relays_apply_edit_response() {
         use crate::lsp::bridge::UpstreamRequest;
         use futures::{SinkExt, StreamExt};
@@ -2917,6 +3015,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2988,6 +3087,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let host = tower_lsp_server::ls_types::Uri::from_str("file:///project/doc.md").unwrap();
@@ -3060,6 +3160,7 @@ mod tests {
             client,
             None,
             loop_cancel.clone(),
+            true,
         ));
 
         // The per-request cancel token the reader would have registered.
@@ -3137,6 +3238,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         // An object payload passes through unchanged.

@@ -11,7 +11,6 @@ expression: request
     "rootUri": null,
     "capabilities": {
       "workspace": {
-        "applyEdit": true,
         "executeCommand": {
           "dynamicRegistration": false
         },

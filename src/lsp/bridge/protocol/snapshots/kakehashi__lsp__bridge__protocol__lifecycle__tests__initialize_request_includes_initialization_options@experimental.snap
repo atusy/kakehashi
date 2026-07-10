@@ -22,7 +22,6 @@ expression: request
     },
     "capabilities": {
       "workspace": {
-        "applyEdit": true,
         "executeCommand": {
           "dynamicRegistration": false
         },
