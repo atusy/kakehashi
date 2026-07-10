@@ -5,12 +5,6 @@
 > ls-bridge-message-ordering and
 > ls-bridge-server-pool-coordination.
 
-## Decision–Implementation Gap
-
-8 of the 11 per-method strategies described below are implemented (definition,
-hover, signatureHelp, completion, references, rename, codeAction, formatting).
-The remaining three are not yet implemented.
-
 ## Context
 
 When bridging LSP requests for injection regions (see language-server-bridge), different LSP methods have different characteristics:
