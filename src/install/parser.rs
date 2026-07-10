@@ -523,6 +523,12 @@ fn extract_archive<R: std::io::Read>(
                 relative.display()
             )));
         }
+        if !entry_type.is_dir() && !entry_type.is_file() {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "Unsupported entry type rejected in archive: {}",
+                relative.display()
+            )));
+        }
 
         let target = dest.join(&relative);
 
@@ -1526,6 +1532,39 @@ mod tests {
                 "expected link-entry rejection, got: {message}"
             ),
             other => panic!("expected link-entry ArchiveError, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_archive_rejects_special_entries() {
+        use std::io::Cursor;
+        use tar::{Builder, EntryType, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Fifo);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "parser-1.0.0/special", &[][..])
+                .expect("append synthetic special entry");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(Cursor::new(bytes));
+        let result = extract_archive(&mut archive, "parser-1.0.0", temp.path());
+
+        match result {
+            Err(ParserInstallError::ArchiveError(message)) => assert!(
+                message.contains("Unsupported entry type rejected in archive: special"),
+                "expected special-entry rejection, got: {message}"
+            ),
+            other => panic!("expected special-entry ArchiveError, got {other:?}"),
         }
     }
 
