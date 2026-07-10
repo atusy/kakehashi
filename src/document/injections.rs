@@ -113,8 +113,9 @@ pub(crate) struct DiscoveredBridgeRegion {
     /// Position-stable tracker ULID, byte-identical to the one minted for the
     /// `InjectionMap` (same `get_or_create` on the same node).
     pub region_id: String,
-    /// The region's clean content (gap ranges removed), the exact virtual-
-    /// document text the bridge opens downstream.
+    /// The exact virtual-document text the bridge opens downstream: excluded
+    /// prefixes are removed for a single region, while host-only gaps in an
+    /// `injection.combined` group are masked with coordinate-preserving spaces.
     pub content: String,
 }
 
