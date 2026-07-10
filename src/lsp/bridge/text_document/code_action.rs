@@ -753,7 +753,7 @@ impl LanguageServerPool {
         &self,
         server_config: &BridgeServerConfig,
         mut action: CodeAction,
-        mut envelope: CodeActionEnvelope,
+        envelope: CodeActionEnvelope,
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
         region_end: Position,
@@ -810,7 +810,7 @@ impl LanguageServerPool {
             std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
         translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
 
-        let Some(mut resolved) = self
+        let Some(resolved) = self
             .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
             .await
         else {
@@ -824,12 +824,42 @@ impl LanguageServerPool {
             return action;
         };
 
+        finalize_virt_resolved_action(
+            resolved,
+            action,
+            envelope,
+            &offset,
+            region_end,
+            host_uri_lsp.as_ref(),
+            suffixed_title,
+            upstream_caps,
+        )
+    }
+}
+
+/// Post-response policy of the virt `codeAction/resolve` path, split from the
+/// transport so it is unit-testable: translate the resolved payload host-ward,
+/// route/drop the command, and decide materialized vs still-lazy vs disabled.
+/// Mirrors [`finalize_host_resolved_action`] for the virt layer.
+#[allow(clippy::too_many_arguments)]
+fn finalize_virt_resolved_action(
+    mut resolved: CodeAction,
+    mut action: CodeAction,
+    mut envelope: CodeActionEnvelope,
+    offset: &RegionOffset,
+    region_end: Position,
+    host_uri_lsp: Option<&Uri>,
+    suffixed_title: String,
+    upstream_caps: UpstreamCodeActionCaps,
+) -> CodeAction {
+    let server_name = &envelope.origin.clone();
+    {
         // Translate the resolved action's own diagnostics host-ward first, so
         // every surfaced action — including a disabled one returned below —
         // carries host coordinates (mirrors the initial-path order).
         if let Some(diagnostics) = &mut resolved.diagnostics {
             for diagnostic in diagnostics {
-                translate_virtual_range_to_host(&mut diagnostic.range, &offset);
+                translate_virtual_range_to_host(&mut diagnostic.range, offset);
             }
         }
 
@@ -904,7 +934,7 @@ impl LanguageServerPool {
                     edit,
                     &virtual_uri,
                     host_uri_lsp,
-                    &offset,
+                    offset,
                     region_end,
                 )
                 .err()
@@ -961,7 +991,9 @@ impl LanguageServerPool {
         }
         resolved
     }
+}
 
+impl LanguageServerPool {
     /// Send a `codeAction/resolve` request on an already-connected handle and
     /// parse the response into a resolved `CodeAction`. Returns `None` on any
     /// failure (register/send/wait/parse) so callers can fail soft.
