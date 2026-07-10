@@ -28,7 +28,7 @@ use super::super::connection::BridgeReader;
 use super::super::{client, telemetry, text_document, window};
 use super::OutboundMessage;
 use super::ResponseRouter;
-use super::response_router::RouteResult;
+use super::response_router::{LivenessExpiry, RouteResult};
 use crate::error::LockResultExt;
 use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
 use crate::lsp::bridge::workspace::{self, WorkspaceFolderSet};
@@ -701,20 +701,24 @@ async fn reader_loop_with_liveness(
 
             // Check for liveness timeout (if timer is active)
             _ = liveness.wait() => {
-                let current_epoch = router.liveness_epoch();
-                if liveness.epoch() != Some(current_epoch) {
-                    liveness.start(&server_prefix, current_epoch);
-                    continue;
-                }
                 // A queued request can be cancelled and removed by the writer
                 // without producing downstream stdout. The timer notification
                 // was already enqueued at registration, so re-check the router
                 // at expiry before declaring a healthy idle server hung.
-                let Some(pending_count) = router.fail_all_if_awaiting_downstream(
-                    "bridge: liveness timeout - server unresponsive"
-                ) else {
-                    liveness.stop(&server_prefix, "no request awaits downstream at expiry");
-                    continue;
+                let expected_epoch = liveness.epoch().expect("an awaited timer has an epoch");
+                let pending_count = match router.fail_all_if_awaiting_downstream(
+                    expected_epoch,
+                    "bridge: liveness timeout - server unresponsive",
+                ) {
+                    LivenessExpiry::Stale { current_epoch } => {
+                        liveness.start(&server_prefix, current_epoch);
+                        continue;
+                    }
+                    LivenessExpiry::Idle => {
+                        liveness.stop(&server_prefix, "no request awaits downstream at expiry");
+                        continue;
+                    }
+                    LivenessExpiry::Failed { pending_count } => pending_count,
                 };
 
                 // Liveness timeout fired - server is unresponsive

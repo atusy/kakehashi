@@ -78,6 +78,12 @@ enum RequestDelivery {
     CancelledQueued,
 }
 
+pub(crate) enum LivenessExpiry {
+    Stale { current_epoch: u64 },
+    Idle,
+    Failed { pending_count: usize },
+}
+
 impl ResponseRouter {
     /// Create a new empty ResponseRouter.
     pub(crate) fn new() -> Self {
@@ -432,18 +438,27 @@ impl ResponseRouter {
     /// expects downstream progress. A queued request already marked cancelled
     /// is waiting only for the FIFO writer to discard it, so it must not make a
     /// healthy idle server fail its liveness check.
-    pub(crate) fn fail_all_if_awaiting_downstream(&self, error_message: &str) -> Option<usize> {
+    pub(crate) fn fail_all_if_awaiting_downstream(
+        &self,
+        expected_epoch: u64,
+        error_message: &str,
+    ) -> LivenessExpiry {
         let mut state = self
             .state
             .lock()
             .recover_poison("ResponseRouter::fail_all_if_awaiting_downstream");
+        if state.liveness_epoch != expected_epoch {
+            return LivenessExpiry::Stale {
+                current_epoch: state.liveness_epoch,
+            };
+        }
         let awaiting = state
             .pending
             .values()
             .filter(|pending| pending.delivery != RequestDelivery::CancelledQueued)
             .count();
         if awaiting == 0 {
-            return None;
+            return LivenessExpiry::Idle;
         }
         let entries: Vec<_> = state.pending.drain().collect();
         state.upstream_to_downstream.clear();
@@ -461,7 +476,9 @@ impl ResponseRouter {
             });
             let _ = pending.response_tx.send(error_response);
         }
-        Some(awaiting)
+        LivenessExpiry::Failed {
+            pending_count: awaiting,
+        }
     }
 }
 
@@ -717,6 +734,25 @@ mod tests {
             .unwrap();
         assert_eq!(liveness_epoch, Some(2));
         assert_eq!(router.pending_count(), 2);
+        assert_eq!(router.awaiting_downstream_count(), 1);
+    }
+
+    #[test]
+    fn stale_liveness_epoch_cannot_fail_new_requests() {
+        let router = ResponseRouter::new();
+        let old_upstream = UpstreamId::Number(10);
+        let (_old_rx, old_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(1), Some(old_upstream.clone()))
+            .unwrap();
+        router.prepare_cancel_by_upstream(&old_upstream);
+        let (_new_rx, new_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(2), None)
+            .unwrap();
+
+        assert!(matches!(
+            router.fail_all_if_awaiting_downstream(old_epoch.unwrap(), "expired"),
+            LivenessExpiry::Stale { current_epoch } if Some(current_epoch) == new_epoch
+        ));
         assert_eq!(router.awaiting_downstream_count(), 1);
     }
 
