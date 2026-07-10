@@ -38,8 +38,8 @@ use tower_lsp_server::ls_types::{
 use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{
-    BridgeCoordinator, RegionOffset, VirtualDocumentUri, transform_workspace_edit_to_host,
-    workspace_edit_within_region,
+    BridgeCoordinator, RegionOffset, VirtualDocumentUri, strip_bridge_local_versions,
+    transform_workspace_edit_to_host, workspace_edit_within_region,
 };
 
 use super::region_offset::resolve_region_offset;
@@ -77,6 +77,9 @@ impl ApplyEditTranslator {
         &self,
         mut params: ApplyWorkspaceEditParams,
     ) -> Result<ApplyWorkspaceEditParams, String> {
+        // Downstream document versions live in the bridge's version space,
+        // never the editor's — null them on every forward (see the helper).
+        strip_bridge_local_versions(&mut params.edit);
         let virtual_uris = collect_virtual_uris(&params.edit);
         let virtual_uri = match virtual_uris.as_slice() {
             // No virtual URIs: a host-layer connection's edit (real URIs
@@ -267,6 +270,35 @@ mod tests {
             .await
             .expect("real-file edit must pass through");
         assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn strips_bridge_local_versions_from_forwarded_real_file_edits() {
+        // A host-layer downstream's document versions live in the BRIDGE's
+        // version space (didOpen starts its own counter at 1), not the
+        // editor's. Relaying a versioned documentChanges edit verbatim makes
+        // version-checking editors (Neovim) skip it as stale — the version
+        // must be nulled ("apply without check") on the editor-ward relay.
+        let original: ApplyWorkspaceEditParams = serde_json::from_value(json!({
+            "edit": { "documentChanges": [{
+                "textDocument": { "uri": "file:///project/doc.md", "version": 2 },
+                "edits": [text_edit(3)]
+            }] }
+        }))
+        .unwrap();
+        let out = translator()
+            .translate(original)
+            .await
+            .expect("real-file edit must pass through");
+        match out.edit.document_changes.as_ref().unwrap() {
+            DocumentChanges::Edits(edits) => {
+                assert_eq!(
+                    edits[0].text_document.version, None,
+                    "bridge-local version must not reach the editor"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
+        }
     }
 
     #[tokio::test]

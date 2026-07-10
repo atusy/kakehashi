@@ -39,5 +39,6 @@ pub(crate) use response::*;
 pub(crate) use translation::*;
 pub(crate) use virtual_uri::VirtualDocumentUri;
 pub(crate) use workspace_edit::{
-    transform_workspace_edit_to_host, workspace_edit_has_effect, workspace_edit_within_region,
+    strip_bridge_local_versions, transform_workspace_edit_to_host, workspace_edit_has_effect,
+    workspace_edit_within_region,
 };

@@ -35,7 +35,14 @@ impl Kakehashi {
             raw_params,
             virt,
             native,
-            parse_host_verbatim::<WorkspaceEdit>,
+            // Host-layer edits are verbatim except versions: a downstream's
+            // document versions are bridge-local and would read as stale to
+            // version-checking editors.
+            |value| {
+                let mut edit = parse_host_verbatim::<WorkspaceEdit>(value)?;
+                crate::lsp::bridge::strip_bridge_local_versions(&mut edit);
+                Some(edit)
+            },
             rename_workspace_edit_has_result,
         )
         .await
