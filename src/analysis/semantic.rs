@@ -47,7 +47,7 @@ pub(crate) struct InjectionCacheParams {
 }
 
 // Internal re-exports for production code
-use finalize::finalize_tokens;
+use finalize::finalize_tokens_cancellable;
 use token_collector::{build_line_start_bytes, collect_host_tokens};
 
 // Region-local token type persisted by the injection-token cache (#529). Lives
@@ -73,10 +73,11 @@ use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::Semanti
 ///
 /// `cancel` (when provided) doubles as the work-unit's dequeue hook (a request
 /// superseded while queued never starts) and is polled during the host-query
-/// walk, after each major pass, and per region inside the injection pass, so a
-/// superseded/cancelled request stops instead of running to completion. Returns
-/// `None` once cancelled: the caller drops the (partial) result rather than
-/// storing it (see the compute-superseded checkpoints in the handlers).
+/// walk, per region inside the injection pass, and throughout final token
+/// shaping, so a superseded/cancelled request stops instead of running to
+/// completion. Returns `None` once cancelled: the caller drops the (partial)
+/// result rather than storing it (see the compute-superseded checkpoints in the
+/// handlers).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
     pool: &crate::compute_pool::ComputePool,
@@ -168,14 +169,31 @@ pub(crate) async fn handle_semantic_tokens_full(
             return None;
         }
 
-        // Phase timing at debug level: pinpoints where a slow compute spends
-        // its time (host query pass vs injection fan-out) without a profiler
-        // attached — the numbers a user-supplied log needs.
+        let injections_elapsed = t_start.elapsed().saturating_sub(host_elapsed);
+
+        // Merge injection tokens with host tokens
+        all_tokens.extend(injection_tokens);
+
+        let finalize_start = std::time::Instant::now();
+        let result = finalize_tokens_cancellable(
+            all_tokens,
+            &active_injection_regions,
+            &lines,
+            cancel.as_ref(),
+        );
+        let finalize_elapsed = finalize_start.elapsed();
+        if is_cancelled() {
+            return None;
+        }
+
+        // One developer-only event per completed compute keeps the phases
+        // comparable without adding hot-loop logging or operator noise.
         log::debug!(
             target: "kakehashi::semantic",
-            "[SEMANTIC_TOKENS] compute phases: host={}ms injections={}ms regions_reused={}",
+            "[SEMANTIC_TOKENS] compute phases: host={}ms injections={}ms finalize={}ms regions_reused={}",
             host_elapsed.as_millis(),
-            t_start.elapsed().saturating_sub(host_elapsed).as_millis(),
+            injections_elapsed.as_millis(),
+            finalize_elapsed.as_millis(),
             injection_cache
                 .as_ref()
                 // The same generation gate the reuse path applies: a
@@ -190,10 +208,7 @@ pub(crate) async fn handle_semantic_tokens_full(
                 .unwrap_or_else(|| "none".to_string()),
         );
 
-        // Merge injection tokens with host tokens
-        all_tokens.extend(injection_tokens);
-
-        finalize_tokens(all_tokens, &active_injection_regions, &lines)
+        result
     })
     .await
     .flatten()

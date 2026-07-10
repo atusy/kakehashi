@@ -464,10 +464,11 @@ now scarcer than the process-global Rayon pool it replaces. The merged `CancelTo
 full/delta attach it to the single-flight marker tagged by
 `(incarnation, generation, parsed_version)`, join identical work, and atomically
 replace + cancel only an older tag (also cancelling on `$/cancelRequest`, handler
-drop, or `didClose`). Semantic host-query collection polls at bounded intervals
-inside the match/capture walk (in addition to pass boundaries); injection and
-captures work polls at its existing region/walk checkpoints. Every path bails
-without caching a partial or obsolete result. It **composes with** this design
+drop, or `didClose`). Semantic host-query collection and final token shaping poll
+at bounded intervals inside their linear walks (with direct checkpoints around
+non-interruptible sorts); injection and captures work polls at its existing
+region/walk checkpoints. Every path bails without caching a partial or obsolete
+result. It **composes with** this design
 rather than competing, so
 it is carried forward, not re-derived: the token is an architecture-independent
 primitive, **re-homed at Stage 1 as a cancellation hook on the bounded-pool work-unit (the `oneshot` bridge) contract**. Keep the split explicit — §2's terminal
