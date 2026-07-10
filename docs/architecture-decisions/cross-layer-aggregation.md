@@ -271,10 +271,12 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   methods that default to `concatenated` (formatting, diagnostics) already
   combine every layer. Code actions default to `concatenated` too — being
   range-based they CAN span regions of several injection languages in one
-  request, but every overlapped region's actions land in the same merged
-  menu, so ordering against the host is again moot. The practical need is
-  unproven; if it materializes, a host-relative weight on `bridge.<inj>` is
-  the extension point — not entries in `priorities`.
+  request, and concatenation preserves layer order (which also decides the
+  surviving `isPreferred`), so host-relative ordering genuinely matters
+  there and "Python virt above host, SQL virt below host" remains
+  inexpressible. The practical need is still unproven; if it materializes,
+  a host-relative weight on `bridge.<inj>` is the extension point — not
+  entries in `priorities`.
 - **Semantic tokens**: the progressive-refinement strategy
   (language-server-bridge-request-strategies Strategy 1) is a *temporal*
   merge — native immediately, bridged tokens replacing them later — not an
