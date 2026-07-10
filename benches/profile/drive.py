@@ -10,8 +10,9 @@ the sampled process actually spends its time in the semantic-tokens hot path.
 Usage:
     drive.py --bin ./target/profiling/kakehashi --lang rust --size 150 --requests 300
 """
+
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 import json
 import math
@@ -46,13 +47,117 @@ class RequestSummary:
     wire_bytes: int
 
 
+@dataclass(frozen=True)
+class TransportFrame:
+    method: str | None
+    request_id: int | str | None
+    frame_bytes: int
+    ready_us: int | None
+    write_start_us: int
+    last_byte_us: int
+    flush_complete_us: int | None
+
+
+@dataclass(frozen=True)
+class TransportSummary:
+    count: int
+    censored_flushes: int
+    p50_ready_to_write_complete_ms: float
+    p90_ready_to_write_complete_ms: float
+    p50_ready_to_flush_complete_ms: float | None
+    p90_ready_to_flush_complete_ms: float | None
+    max_frame_bytes: int
+
+
+def parse_stdout_metric_line(line: str) -> TransportFrame | None:
+    try:
+        metric = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(metric, dict) or metric.get("event") != "stdout_frame":
+        return None
+    frame = metric.get("frame")
+    if not isinstance(frame, dict):
+        return None
+    return TransportFrame(
+        method=frame.get("method"),
+        request_id=frame.get("id"),
+        frame_bytes=frame["frame_bytes"],
+        ready_us=frame.get("ready_us"),
+        write_start_us=frame["write_start_us"],
+        last_byte_us=frame["last_byte_us"],
+        flush_complete_us=frame.get("flush_complete_us"),
+    )
+
+
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        raise ValueError("cannot calculate percentile of empty values")
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+
+
+def summarize_transport_frames(frames: list[TransportFrame]) -> TransportSummary:
+    if not frames:
+        raise ValueError("cannot summarize empty transport frames")
+    if any(frame.ready_us is None for frame in frames):
+        raise ValueError("transport response frames must have ready timestamps")
+    write_complete = [(frame.last_byte_us - frame.ready_us) / 1000 for frame in frames]
+    flush_complete = [
+        (frame.flush_complete_us - frame.ready_us) / 1000
+        for frame in frames
+        if frame.flush_complete_us is not None
+    ]
+    return TransportSummary(
+        count=len(frames),
+        censored_flushes=len(frames) - len(flush_complete),
+        p50_ready_to_write_complete_ms=percentile(write_complete, 0.5),
+        p90_ready_to_write_complete_ms=percentile(write_complete, 0.9),
+        p50_ready_to_flush_complete_ms=(
+            percentile(flush_complete, 0.5) if flush_complete else None
+        ),
+        p90_ready_to_flush_complete_ms=(
+            percentile(flush_complete, 0.9) if flush_complete else None
+        ),
+        max_frame_bytes=max(frame.frame_bytes for frame in frames),
+    )
+
+
+def classify_semantic_blocking(
+    frames: list[TransportFrame], large_frame_bytes: int
+) -> tuple[int, int]:
+    """Return (schedulable-before-start, already-writing) semantic blockers."""
+    schedulable = 0
+    already_writing = 0
+    semantics = [
+        frame
+        for frame in frames
+        if frame.ready_us is not None
+        and (frame.method or "").startswith("textDocument/semanticTokens/")
+    ]
+    for semantic in semantics:
+        blockers = [
+            frame
+            for frame in frames
+            if frame is not semantic
+            and frame.frame_bytes >= large_frame_bytes
+            and frame.write_start_us < semantic.write_start_us
+            and frame.last_byte_us >= semantic.ready_us
+        ]
+        if not blockers:
+            continue
+        blocker = max(blockers, key=lambda frame: frame.last_byte_us)
+        if semantic.ready_us <= blocker.write_start_us:
+            schedulable += 1
+        else:
+            already_writing += 1
+    return schedulable, already_writing
+
+
 def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
     if not samples:
         raise ValueError("cannot summarize an empty request sample")
     latencies = sorted(sample.seconds * 1000 for sample in samples)
-
-    def percentile(q: float) -> float:
-        return latencies[max(0, math.ceil(q * len(latencies)) - 1)]
 
     statuses = Counter(sample.status for sample in samples)
     return RequestSummary(
@@ -61,8 +166,8 @@ def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
         canceled=statuses["canceled"],
         null=statuses["null"],
         errors=statuses["error"],
-        p50_ms=percentile(0.5),
-        p90_ms=percentile(0.9),
+        p50_ms=percentile(latencies, 0.5),
+        p90_ms=percentile(latencies, 0.9),
         max_ms=latencies[-1],
         wire_bytes=sum(sample.wire_bytes for sample in samples),
     )
@@ -126,9 +231,7 @@ def count_semantic_outcomes(
     return ok, canceled, superseded, tokens
 
 
-def next_toggle_change(
-    first_line_len: int, line_has_extra: bool
-) -> tuple[dict, bool]:
+def next_toggle_change(first_line_len: int, line_has_extra: bool) -> tuple[dict, bool]:
     grow = not line_has_extra
     if grow:
         change = {
@@ -152,51 +255,105 @@ def next_toggle_change(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
-    ap.add_argument("--server-arg", action="append", default=[],
-                    help="extra argument passed to the server (repeatable), e.g. "
-                         "--server-arg=--config-file --server-arg=/path/lsp.toml "
-                         "to reproduce a real user configuration")
+    ap.add_argument(
+        "--server-arg",
+        action="append",
+        default=[],
+        help="extra argument passed to the server (repeatable), e.g. "
+        "--server-arg=--config-file --server-arg=/path/lsp.toml "
+        "to reproduce a real user configuration",
+    )
     ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
     ap.add_argument(
-        "--burst", type=int, default=1,
+        "--burst",
+        type=int,
+        default=1,
         help="send this many semantic-token requests back-to-back per cycle; "
-             "reproduces supersession/cancellation pressure")
+        "reproduces supersession/cancellation pressure",
+    )
     ap.add_argument(
-        "--burst-edits", action="store_true",
+        "--burst-edits",
+        action="store_true",
         help="toggle a real edit between requests in each burst so every request "
-             "targets a newer snapshot")
+        "targets a newer snapshot",
+    )
     ap.add_argument(
-        "--burst-delay-ms", type=float, default=1.0,
-        help="typing interval between a burst request and the next edit")
-    ap.add_argument("--file", help="drive with this file's content instead of a "
-                                   "generated document (language inferred from the "
-                                   "extension, falling back to --lang)")
+        "--burst-delay-ms",
+        type=float,
+        default=1.0,
+        help="typing interval between a burst request and the next edit",
+    )
     ap.add_argument(
-        "--captures", action="store_true",
+        "--file",
+        help="drive with this file's content instead of a "
+        "generated document (language inferred from the "
+        "extension, falling back to --lang)",
+    )
+    ap.add_argument(
+        "--captures",
+        action="store_true",
         help="warm kakehashi/captures/full once, then send a real injection-mode "
-             "captures delta per cycle")
+        "captures delta per cycle",
+    )
     ap.add_argument(
-        "--concurrent-captures", action="store_true",
+        "--concurrent-captures",
+        action="store_true",
         help="send semantic tokens and the captures delta as one concurrent "
-             "batch; implies --captures and exposes shared-pool/output contention")
+        "batch; implies --captures and exposes shared-pool/output contention",
+    )
     ap.add_argument(
-        "--settle", type=float, default=0.3,
+        "--scenario",
+        choices=(
+            "semantic-only",
+            "captures-delta",
+            "captures-full",
+            "diagnostics-burst",
+        ),
+        help="run one of issue #665's stdout head-of-line scenarios",
+    )
+    ap.add_argument(
+        "--diagnostics-burst-size",
+        type=int,
+        default=4,
+        help="diagnostic requests queued before semantic tokens in the diagnostics-burst scenario",
+    )
+    ap.add_argument(
+        "--settle",
+        type=float,
+        default=0.3,
         help="seconds to wait after didOpen before the first request "
-             "(0 reproduces a client that requests immediately)")
+        "(0 reproduces a client that requests immediately)",
+    )
     ap.add_argument(
-        "--edits", type=int, default=0,
+        "--edits",
+        type=int,
+        default=0,
         help="simulate typing: before each request, send this many incremental "
-             "didChange edits (appending/removing a char at the end of the first "
-             "line), then request tokens. Exercises the edit->reparse->recompute "
-             "cycle instead of the unchanged-document cache hit; the request "
-             "parks until the matching parse snapshot is current.")
+        "didChange edits (appending/removing a char at the end of the first "
+        "line), then request tokens. Exercises the edit->reparse->recompute "
+        "cycle instead of the unchanged-document cache hit; the request "
+        "parks until the matching parse snapshot is current.",
+    )
     ap.add_argument(
-        "--data-dir", default=os.path.join(os.getcwd(), "deps/test/kakehashi"),
+        "--data-dir",
+        default=os.path.join(os.getcwd(), "deps/test/kakehashi"),
         help="parser/query data dir; must already contain installed parsers "
-             "(populated by `cargo test --features e2e` or `make deps/tree-sitter`), "
-             "else the server auto-installs on first request")
+        "(populated by `cargo test --features e2e` or `make deps/tree-sitter`), "
+        "else the server auto-installs on first request",
+    )
+    ap.add_argument(
+        "--stdout-metrics",
+        action="store_true",
+        help="enable and summarize response-ready to stdout-write transport metrics",
+    )
+    ap.add_argument(
+        "--large-frame-kib",
+        type=float,
+        default=64,
+        help="minimum competing frame size for scheduler-opportunity classification",
+    )
     args = ap.parse_args()
     if args.requests <= 0:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
@@ -206,6 +363,17 @@ def main() -> None:
         ap.error("--burst-edits requires --burst greater than 1")
     if args.burst_delay_ms < 0:
         ap.error("--burst-delay-ms must be non-negative")
+    if args.diagnostics_burst_size <= 0:
+        ap.error("--diagnostics-burst-size must be positive")
+    if args.large_frame_kib <= 0:
+        ap.error("--large-frame-kib must be positive")
+    if args.scenario and (args.captures or args.concurrent_captures):
+        ap.error("--scenario cannot be combined with legacy captures flags")
+    captures_full_fallback = args.scenario == "captures-full"
+    diagnostics_burst = args.scenario == "diagnostics-burst"
+    if args.scenario in ("captures-delta", "captures-full"):
+        args.captures = True
+        args.concurrent_captures = True
     if args.burst > 1 and (args.captures or args.concurrent_captures):
         ap.error("--burst cannot be combined with captures modes")
     if args.concurrent_captures:
@@ -224,13 +392,22 @@ def main() -> None:
     elif args.lang == "rust":
         uri, lang, text = "file:///profile/large.rs", "rust", gen_rust(args.size)
     else:
-        uri, lang, text = "file:///profile/inj.md", "markdown", gen_markdown_injections(args.size)
+        uri, lang, text = (
+            "file:///profile/inj.md",
+            "markdown",
+            gen_markdown_injections(args.size),
+        )
 
     env = dict(os.environ, KAKEHASHI_DATA_DIR=args.data_dir)
-    # Let the server's stderr through (it's silent unless RUST_LOG is set) so a
-    # crash or panic is visible instead of being swallowed during profiling.
-    srv = subprocess.Popen([args.bin, *args.server_arg], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                           env=env)
+    if args.stdout_metrics:
+        env["KAKEHASHI_STDOUT_METRICS"] = "1"
+    srv = subprocess.Popen(
+        [args.bin, *args.server_arg],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
     rid = 0
     request_samples = defaultdict(list)
     notification_counts = Counter()
@@ -238,6 +415,11 @@ def main() -> None:
     server_request_counts = Counter()
     server_request_bytes = Counter()
     send_lock = threading.Lock()
+    response_condition = threading.Condition()
+    received_responses = defaultdict(deque)
+    reader_errors = []
+    reader_done = False
+    transport_frames = []
 
     def send(obj):
         body = json.dumps(obj).encode()
@@ -263,7 +445,7 @@ def main() -> None:
         while True:
             line = srv.stdout.readline()
             if not line:
-                raise RuntimeError("server closed stdout")
+                raise EOFError("server closed stdout")
             line = line.strip()
             if not line:
                 break
@@ -287,58 +469,96 @@ def main() -> None:
         if "id" in message:
             server_request_counts[method] += 1
             server_request_bytes[method] += wire_bytes
-            send({
-                "jsonrpc": "2.0",
-                "id": message["id"],
-                "result": server_request_result(message),
-            })
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": server_request_result(message),
+                }
+            )
         else:
             record_notification(message, wire_bytes)
         return True
 
+    def collect_stdout():
+        nonlocal reader_done
+        try:
+            while True:
+                message, wire_bytes = read_message()
+                if handle_server_method(message, wire_bytes):
+                    continue
+                with response_condition:
+                    received_responses[message.get("id")].append(
+                        (message, wire_bytes, time.perf_counter())
+                    )
+                    response_condition.notify_all()
+        except EOFError:
+            pass
+        except BaseException as error:
+            reader_errors.append(error)
+        finally:
+            with response_condition:
+                reader_done = True
+                response_condition.notify_all()
+
+    def collect_stderr():
+        for raw_line in srv.stderr:
+            line = raw_line.decode(errors="replace").rstrip("\n")
+            frame = parse_stdout_metric_line(line)
+            if frame is not None:
+                transport_frames.append(frame)
+            else:
+                sys.stderr.write(line + "\n")
+
+    def wait_response(want_id):
+        with response_condition:
+            while not received_responses[want_id]:
+                if reader_errors:
+                    raise reader_errors[0]
+                if reader_done:
+                    raise RuntimeError(
+                        f"server closed stdout before response id={want_id}"
+                    )
+                response_condition.wait()
+            return received_responses[want_id].popleft()
+
     def read_until(want_id):
-        while True:
-            m, wire_bytes = read_message()
-            if handle_server_method(m, wire_bytes):
-                continue
-            if m.get("id") == want_id:
-                return m, wire_bytes
+        message, wire_bytes, _ = wait_response(want_id)
+        return message, wire_bytes
 
     def measured_request(method, params):
         started = time.perf_counter()
-        response, wire_bytes = request(method, params)
-        completed_at = time.perf_counter()
-        request_samples[method].append(RequestSample(
-            seconds=completed_at - started,
-            wire_bytes=wire_bytes,
-            status=response_status(response),
-            completed_at=completed_at,
-        ))
+        request_id = send_request(method, params)
+        response, wire_bytes, completed_at = wait_response(request_id)
+        request_samples[method].append(
+            RequestSample(
+                seconds=completed_at - started,
+                wire_bytes=wire_bytes,
+                status=response_status(response),
+                completed_at=completed_at,
+            )
+        )
         return response
 
     def measured_batch(requests):
         pending = {}
         for method, params in requests:
+            started = time.perf_counter()
             request_id = send_request(method, params)
-            pending[request_id] = (method, time.perf_counter())
+            pending[request_id] = (method, started)
 
-        responses = {}
-        while pending:
-            message, wire_bytes = read_message()
-            if handle_server_method(message, wire_bytes):
-                continue
-            request_id = message.get("id")
-            if request_id not in pending:
-                continue
-            method, started = pending.pop(request_id)
-            completed_at = time.perf_counter()
-            request_samples[method].append(RequestSample(
-                seconds=completed_at - started,
-                wire_bytes=wire_bytes,
-                status=response_status(message),
-                completed_at=completed_at,
-            ))
-            responses[method] = message
+        responses = []
+        for request_id, (method, started) in pending.items():
+            message, wire_bytes, completed_at = wait_response(request_id)
+            request_samples[method].append(
+                RequestSample(
+                    seconds=completed_at - started,
+                    wire_bytes=wire_bytes,
+                    status=response_status(message),
+                    completed_at=completed_at,
+                )
+            )
+            responses.append(message)
         return responses
 
     def measured_repeated(method, params, count, before_next=None, delay_seconds=0):
@@ -346,63 +566,72 @@ def main() -> None:
         request_ids = list(range(rid + 1, rid + count + 1))
         rid += count
         pending = {}
-        pending_lock = threading.Lock()
         responses = {}
-        reader_errors = []
-
-        def collect_responses():
-            try:
-                while len(responses) < count:
-                    message, wire_bytes = read_message()
-                    if handle_server_method(message, wire_bytes):
-                        continue
-                    request_id = message.get("id")
-                    with pending_lock:
-                        if request_id not in pending:
-                            continue
-                        started = pending.pop(request_id)
-                    completed_at = time.perf_counter()
-                    request_samples[method].append(RequestSample(
-                        seconds=completed_at - started,
-                        wire_bytes=wire_bytes,
-                        status=response_status(message),
-                        completed_at=completed_at,
-                    ))
-                    responses[request_id] = message
-            except BaseException as error:
-                reader_errors.append(error)
-
-        reader_thread = threading.Thread(target=collect_responses, daemon=True)
-        reader_thread.start()
         for index, request_id in enumerate(request_ids):
-            with pending_lock:
-                pending[request_id] = time.perf_counter()
-            send({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            })
+            pending[request_id] = time.perf_counter()
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+            )
             if index + 1 < count and before_next is not None:
                 if delay_seconds > 0:
                     time.sleep(delay_seconds)
                 before_next()
-        reader_thread.join()
-        if reader_errors:
-            raise reader_errors[0]
+        for request_id in request_ids:
+            message, wire_bytes, completed_at = wait_response(request_id)
+            request_samples[method].append(
+                RequestSample(
+                    seconds=completed_at - pending[request_id],
+                    wire_bytes=wire_bytes,
+                    status=response_status(message),
+                    completed_at=completed_at,
+                )
+            )
+            responses[request_id] = message
         return [responses[request_id] for request_id in request_ids]
+
+    stdout_reader = threading.Thread(target=collect_stdout, daemon=True)
+    stderr_reader = threading.Thread(target=collect_stderr, daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
 
     # Drive inside try/finally so any error (e.g. a server error raised in the
     # loop, or a shutdown timeout) still reaps the server instead of leaving a
     # stray process behind.
     try:
-        request("initialize", {"processId": None, "rootUri": None, "capabilities": {
-            "textDocument": {"semanticTokens": {"requests": {"full": {"delta": True}},
-                                                "tokenTypes": [], "tokenModifiers": [],
-                                                "formats": ["relative"]}}}})
+        request(
+            "initialize",
+            {
+                "processId": None,
+                "rootUri": None,
+                "capabilities": {
+                    "textDocument": {
+                        "semanticTokens": {
+                            "requests": {"full": {"delta": True}},
+                            "tokenTypes": [],
+                            "tokenModifiers": [],
+                            "formats": ["relative"],
+                        }
+                    }
+                },
+            },
+        )
         notify("initialized", {})
-        notify("textDocument/didOpen", {"textDocument": {
-            "uri": uri, "languageId": lang, "version": 1, "text": text}})
+        notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": lang,
+                    "version": 1,
+                    "text": text,
+                }
+            },
+        )
         if args.settle > 0:
             time.sleep(args.settle)  # let the initial parse settle
 
@@ -435,14 +664,15 @@ def main() -> None:
 
         def send_toggle_edit():
             nonlocal version, line_has_extra
-            change, line_has_extra = next_toggle_change(
-                first_line_len, line_has_extra
-            )
+            change, line_has_extra = next_toggle_change(first_line_len, line_has_extra)
             version += 1
-            notify("textDocument/didChange", {
-                "textDocument": {"uri": uri, "version": version},
-                "contentChanges": [change],
-            })
+            notify(
+                "textDocument/didChange",
+                {
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [change],
+                },
+            )
 
         for i in range(args.requests):
             for j in range(args.edits):
@@ -459,20 +689,53 @@ def main() -> None:
                 {"textDocument": {"uri": uri}},
             )
             captures_requests = [
-                ("kakehashi/captures/full/delta",
-                 {"textDocument": {"uri": uri}, "kind": "highlights",
-                  "previousResultId": captures_result_id}),
+                (
+                    "kakehashi/captures/full/delta",
+                    {
+                        "textDocument": {"uri": uri},
+                        "kind": "highlights",
+                        "previousResultId": (
+                            "stale-profile-lineage"
+                            if captures_full_fallback
+                            else captures_result_id
+                        ),
+                    },
+                ),
             ]
             captures_responses = {}
             if args.concurrent_captures:
                 # Queue captures first to model an editor whose highlighting work
                 # is already in flight when semantic tokens arrive.
                 responses = measured_batch([*captures_requests, semantic_request])
-                semantic_responses = [responses[semantic_request[0]]]
+                semantic_responses = [responses[-1]]
                 captures_responses = {
-                    method: responses[method]
-                    for method, _ in captures_requests
+                    method: response
+                    for (method, _), response in zip(
+                        captures_requests, responses[:-1], strict=True
+                    )
                 }
+                captures_result = (
+                    captures_responses["kakehashi/captures/full/delta"].get("result")
+                    or {}
+                )
+                expected_field = "matches" if captures_full_fallback else "edits"
+                if expected_field not in captures_result:
+                    raise RuntimeError(
+                        f"captures scenario expected {expected_field}, got "
+                        f"{captures_result.keys()}"
+                    )
+            elif diagnostics_burst:
+                diagnostic_request = (
+                    "textDocument/diagnostic",
+                    {"textDocument": {"uri": uri}},
+                )
+                responses = measured_batch(
+                    [
+                        *([diagnostic_request] * args.diagnostics_burst_size),
+                        semantic_request,
+                    ]
+                )
+                semantic_responses = [responses[-1]]
             elif args.burst > 1:
                 if args.burst_edits:
                     send_toggle_edit()
@@ -490,9 +753,7 @@ def main() -> None:
                             *captures_request
                         )
             for method, _ in reversed(captures_requests):
-                next_result_id = response_result_id(
-                    captures_responses.get(method, {})
-                )
+                next_result_id = response_result_id(captures_responses.get(method, {}))
                 if next_result_id is not None:
                     captures_result_id = next_result_id
                     break
@@ -507,8 +768,8 @@ def main() -> None:
             ]
             if successes:
                 cycle_success_times.append(max(successes))
-            cycle_ok, cycle_canceled, cycle_superseded, tokens = count_semantic_outcomes(
-                semantic_responses, tokens
+            cycle_ok, cycle_canceled, cycle_superseded, tokens = (
+                count_semantic_outcomes(semantic_responses, tokens)
             )
             ok += cycle_ok
             canceled += cycle_canceled
@@ -518,34 +779,44 @@ def main() -> None:
         request("shutdown", None)
         notify("exit", {})
         srv.wait(timeout=5)
+        stdout_reader.join(timeout=5)
+        stderr_reader.join(timeout=5)
     except subprocess.TimeoutExpired:
         pass  # graceful shutdown didn't land in time; the finally kills it
     finally:
         if srv.poll() is None:
             srv.kill()
             srv.wait()
+        stdout_reader.join(timeout=5)
+        stderr_reader.join(timeout=5)
 
     n_bytes = len(text.encode("utf-8"))
     n_lines = len(text.splitlines())
-    source = (f"file={args.file} ({n_bytes}B/{n_lines}L)"
-              if args.file else f"size={args.size}")
-    firsts = " ".join(f"{t*1000:.0f}" for t in req_times[:5])
+    source = (
+        f"file={args.file} ({n_bytes}B/{n_lines}L)"
+        if args.file
+        else f"size={args.size}"
+    )
+    firsts = " ".join(f"{t * 1000:.0f}" for t in req_times[:5])
     measured_responses = sum(len(samples) for samples in request_samples.values())
     sys.stderr.write(f"[drive] first-cycle ms: {firsts}\n")
     sys.stderr.write(
-        f"[drive] lang={lang} {source} cycles={args.requests} burst={args.burst} "
+        f"[drive] scenario={args.scenario or 'custom'} lang={lang} {source} "
+        f"cycles={args.requests} burst={args.burst} "
         f"responses={measured_responses} "
         f"ok={ok} canceled={canceled} superseded={superseded} tokens/req={tokens} "
-        f"wall={elapsed*1000:.0f}ms "
-        f"({elapsed/args.requests*1000:.2f}ms/cycle, "
-        f"{elapsed/measured_responses*1000:.2f}ms/measured-response)\n")
+        f"wall={elapsed * 1000:.0f}ms "
+        f"({elapsed / args.requests * 1000:.2f}ms/cycle, "
+        f"{elapsed / measured_responses * 1000:.2f}ms/measured-response)\n"
+    )
     for method, samples in request_samples.items():
         summary = summarize_samples(samples)
         sys.stderr.write(
             f"[drive] method={method} count={summary.count} ok={summary.ok} "
             f"canceled={summary.canceled} null={summary.null} errors={summary.errors} "
             f"p50={summary.p50_ms:.1f}ms p90={summary.p90_ms:.1f}ms "
-            f"max={summary.max_ms:.1f}ms wire={summary.wire_bytes / 1024:.1f}KiB\n")
+            f"max={summary.max_ms:.1f}ms wire={summary.wire_bytes / 1024:.1f}KiB\n"
+        )
         for status, status_summary in summarize_samples_by_status(samples).items():
             sys.stderr.write(
                 f"[drive] method={method} status={status} "
@@ -573,13 +844,44 @@ def main() -> None:
         )
         sys.stderr.write(
             f"[drive] notifications count={total_count} wire={total_bytes / 1024:.1f}KiB "
-            f"top=[{top}]\n")
+            f"top=[{top}]\n"
+        )
     if server_request_counts:
         total_count = sum(server_request_counts.values())
         total_bytes = sum(server_request_bytes.values())
         sys.stderr.write(
             f"[drive] server-requests count={total_count} "
             f"wire={total_bytes / 1024:.1f}KiB methods={dict(server_request_counts)}\n"
+        )
+    transport_by_method = defaultdict(list)
+    for frame in transport_frames:
+        if frame.ready_us is not None and frame.method is not None:
+            transport_by_method[frame.method].append(frame)
+    for method, frames in transport_by_method.items():
+        summary = summarize_transport_frames(frames)
+        flush_p90 = (
+            f"{summary.p90_ready_to_flush_complete_ms:.1f}ms"
+            if summary.p90_ready_to_flush_complete_ms is not None
+            else "n/a"
+        )
+        sys.stderr.write(
+            f"[stdout] method={method} count={summary.count} "
+            f"ready-to-write-complete-p50="
+            f"{summary.p50_ready_to_write_complete_ms:.1f}ms "
+            f"p90={summary.p90_ready_to_write_complete_ms:.1f}ms "
+            f"ready-to-flush-p90={flush_p90} "
+            f"censored={summary.censored_flushes} "
+            f"max-frame={summary.max_frame_bytes / 1024:.1f}KiB\n"
+        )
+    if args.stdout_metrics:
+        schedulable, already_writing = classify_semantic_blocking(
+            transport_frames, int(args.large_frame_kib * 1024)
+        )
+        sys.stderr.write(
+            f"[stdout] semantic-large-frame-overlap "
+            f"threshold={args.large_frame_kib:g}KiB "
+            f"schedulable-before-write={schedulable} "
+            f"already-writing={already_writing}\n"
         )
 
 
