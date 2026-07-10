@@ -1066,6 +1066,16 @@ impl Kakehashi {
             self.cache
                 .get_current_range_tokens(&uri, &domain_range, &language_name, cache_key)
         {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let current = self.cache.semantic_token_generation() == generation
+                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                    view.slot.current_incarnation == snapshot.incarnation
+                        && view.content_version == snapshot.parsed_version
+                });
+            if !current {
+                return Err(crate::error::content_modified_error());
+            }
             return Ok(Some(SemanticTokensRangeResult::Tokens((*tokens).clone())));
         }
 
@@ -1078,6 +1088,16 @@ impl Kakehashi {
             .get_current_tokens(&uri, &language_name, cache_key)
         {
             let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let current = self.cache.semantic_token_generation() == generation
+                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                    view.slot.current_incarnation == snapshot.incarnation
+                        && view.content_version == snapshot.parsed_version
+                });
+            if !current {
+                return Err(crate::error::content_modified_error());
+            }
             self.cache.store_range_tokens(
                 uri,
                 domain_range,
@@ -1112,6 +1132,8 @@ impl Kakehashi {
         // A range is authored against one live document lifetime. A close,
         // reopen, or edit during the uncancellable full-document compute makes
         // both its response coordinates and any cache store obsolete.
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
         let still_current = self.cache.semantic_token_generation() == generation
             && self.documents.latest_snapshot(&uri).is_some_and(|view| {
                 view.slot.current_incarnation == snapshot.incarnation
