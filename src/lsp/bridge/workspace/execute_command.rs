@@ -64,14 +64,29 @@ impl LanguageServerPool {
             }
         };
 
+        // executeCommand is USER-invoked (they picked the action/palette
+        // entry): failing soft is right, failing silently is not. The encoded
+        // command outlives config edits, so a server removed/renamed since the
+        // action was minted lands here.
         if !crate::config::is_server_spawnable(&settings.language_servers, &origin) {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: origin '{origin}' is not spawnable (removed or \
+                 misconfigured since the action was produced); dropping '{command}'"
+            );
             return None;
         }
-        let config = resolve_with_wildcard(
+        let Some(config) = resolve_with_wildcard(
             &settings.language_servers,
             &origin,
             merge_bridge_server_configs,
-        )?;
+        ) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: origin '{origin}' has no resolvable config; dropping '{command}'"
+            );
+            return None;
+        };
 
         // A malformed host_uri must REJECT, not fall through to a client-root
         // fallback connection (which could execute the command against the
@@ -238,7 +253,9 @@ impl LanguageServerPool {
                 Err(e) => {
                     warn!(
                         target: "kakehashi::bridge",
-                        "executeCommand: failed to register request: {e}"
+                        "executeCommand: failed to register request on {connection_key:?} \
+                         for '{}': {e}",
+                        params.command
                     );
                     if let Some(ref id) = upstream_id {
                         self.unregister_upstream_request(id, connection_key);
@@ -278,7 +295,8 @@ impl LanguageServerPool {
                 drop(connections);
                 warn!(
                     target: "kakehashi::bridge",
-                    "executeCommand: failed to send request: {e}"
+                    "executeCommand: failed to send '{}' on {connection_key:?}: {e}",
+                    params.command
                 );
                 if let Some(ref id) = upstream_id {
                     self.unregister_upstream_request(id, connection_key);

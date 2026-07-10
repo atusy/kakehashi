@@ -63,6 +63,16 @@ pub(crate) struct CommandRoute<'a> {
 /// remainder).
 pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Option<String> {
     if origin.contains(SEP) || host_uri.contains(SEP) {
+        // Not a transient: the origin is a TOML config key, so an affected
+        // config drops this server's commands on EVERY request. One warn here
+        // covers all four call sites (initial bare/embedded command, virt and
+        // host resolve), which fail closed on the `None`.
+        log::warn!(
+            target: "kakehashi::bridge",
+            "cannot mint a routing name for command '{command}': the server name \
+             ('{origin}') or host URI contains the reserved separator; the command \
+             is dropped — rename the server in languageServers to fix this"
+        );
         return None;
     }
     Some(format!(

@@ -185,8 +185,11 @@ impl Kakehashi {
                 None => {
                     log::debug!(
                         target: "kakehashi::bridge",
-                        "codeAction/resolve: region {} is stale; returning action unresolved",
-                        envelope.region_id
+                        "codeAction/resolve: region {} of {} (origin {}) is stale or \
+                         unresolvable; returning action unresolved",
+                        envelope.region_id,
+                        envelope.host_uri,
+                        envelope.origin
                     );
                     return Ok(action);
                 }
@@ -224,8 +227,25 @@ impl Kakehashi {
     /// in the safe direction (the action stays unresolved) and frontmatter code
     /// actions have no known real-world producer; revisit if one appears.
     fn code_action_region_end_if_fresh(&self, envelope: &CodeActionEnvelope) -> Option<Position> {
-        let host_url = Url::parse(&envelope.host_uri).ok()?;
-        let ulid = envelope.region_id.parse::<Ulid>().ok()?;
+        // A malformed envelope is NOT staleness — the bridge only mints valid
+        // URLs/ULIDs, so warn (mirroring the bridge-side host_uri warn) rather
+        // than letting it hide under the "stale region" debug line.
+        let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: envelope host_uri '{}' is not a valid URL",
+                envelope.host_uri
+            );
+            return None;
+        };
+        let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: envelope region_id '{}' is not a valid ULID",
+                envelope.region_id
+            );
+            return None;
+        };
         // Re-resolve the region from the LIVE parse (same construction as the
         // goto/showDocument offset path), yielding the current per-line offset
         // AND the content-precise host byte range.

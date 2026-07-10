@@ -592,7 +592,16 @@ impl LanguageServerPool {
             return action;
         };
 
+        // resolve is USER-initiated (they selected the action): fail soft,
+        // but never silently — a server removed/renamed since the action was
+        // minted lands here.
         if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: origin '{}' is not spawnable (removed or \
+                 misconfigured since the action was produced); returning unresolved",
+                envelope.origin
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         }
@@ -601,6 +610,11 @@ impl LanguageServerPool {
             &envelope.origin,
             merge_bridge_server_configs,
         ) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: origin '{}' has no resolvable config; returning unresolved",
+                envelope.origin
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         };
@@ -679,6 +693,14 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("codeAction/resolve") {
+            // Anomalous: the envelope was only minted because the origin
+            // advertised resolve, so reaching here means a respawn changed
+            // capabilities (or the handle is still initializing).
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {} no longer advertises resolveProvider; returning unresolved",
+                envelope.origin
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         }
@@ -742,6 +764,14 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("codeAction/resolve") {
+            // Anomalous: the envelope was only minted because the origin
+            // advertised resolve, so reaching here means a respawn changed
+            // capabilities (or the handle is still initializing).
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {} no longer advertises resolveProvider; returning unresolved",
+                envelope.origin
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         }
@@ -922,7 +952,7 @@ impl LanguageServerPool {
                 Err(e) => {
                     warn!(
                         target: "kakehashi::bridge",
-                        "codeAction/resolve: failed to register request: {e}"
+                        "codeAction/resolve: failed to register request on {connection_key:?}: {e}"
                     );
                     if let Some(ref id) = upstream_id {
                         self.unregister_upstream_request(id, connection_key);
@@ -937,7 +967,7 @@ impl LanguageServerPool {
         if let Err(e) = handle.send_request(request, request_id) {
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: failed to send request: {e}"
+                "codeAction/resolve: failed to send request on {connection_key:?}: {e}"
             );
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);
@@ -990,7 +1020,19 @@ fn parse_code_action_resolve_response(mut response: serde_json::Value) -> Option
     if result.is_null() {
         return None;
     }
-    serde_json::from_value(result).ok()
+    match serde_json::from_value(result) {
+        Ok(resolved) => Some(resolved),
+        // A present, non-null result that doesn't parse: without a log this
+        // is undebuggable in the field (the action just stays unresolved).
+        // Mirrors parse_code_actions_leniently's per-item warn.
+        Err(e) => {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: malformed resolve result: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Build a JSON-RPC code action request for a downstream language server.
@@ -1441,8 +1483,21 @@ fn disable_action(
     upstream_caps: UpstreamCodeActionCaps,
 ) -> Option<CodeActionOrCommand> {
     if !upstream_caps.disabled_support {
+        // Without disabledSupport the action vanishes from the menu — the
+        // only trace of a server bug (e.g. an out-of-region edit) is this log.
+        log::debug!(
+            target: "kakehashi::bridge",
+            "codeAction '{}' from {server_name} dropped ({reason}); the client \
+             lacks disabledSupport to show it disabled",
+            action.title
+        );
         return None;
     }
+    log::debug!(
+        target: "kakehashi::bridge",
+        "codeAction '{}' from {server_name} disabled: {reason}",
+        action.title
+    );
     action.title = suffix_title(action.title, server_name);
     action.edit = None;
     action.command = None;
