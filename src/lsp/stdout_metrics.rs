@@ -195,6 +195,8 @@ struct FrameObserver {
     decode: DecodeState,
     awaiting_flush: Vec<(FrameMetric, Option<Id>)>,
     offered: VecDeque<OfferedSegment>,
+    offered_ptr: Option<usize>,
+    offered_prefix: Vec<u8>,
 }
 
 struct OfferedSegment {
@@ -285,7 +287,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MeasuredStdout<W> {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         if !bytes.is_empty() {
-            self.observer.offered(bytes.len(), Instant::now());
+            self.observer.offered(bytes, Instant::now());
         }
         let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
         if let Poll::Ready(Ok(accepted)) = result
@@ -299,6 +301,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MeasuredStdout<W> {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let result = Pin::new(&mut self.inner).poll_flush(cx);
         if matches!(result, Poll::Ready(Ok(()))) {
+            self.observer.abandon_unaccepted_offer();
             self.observer.flushed(Instant::now());
         }
         result
@@ -307,6 +310,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MeasuredStdout<W> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let result = Pin::new(&mut self.inner).poll_shutdown(cx);
         if matches!(result, Poll::Ready(Ok(()))) {
+            self.observer.abandon_unaccepted_offer();
             self.observer.flushed(Instant::now());
         }
         result
@@ -342,12 +346,28 @@ impl FrameObserver {
             },
             awaiting_flush: Vec::new(),
             offered: VecDeque::new(),
+            offered_ptr: None,
+            offered_prefix: Vec::new(),
         }
     }
 
-    fn offered(&mut self, bytes: usize, at: Instant) {
+    fn offered(&mut self, bytes: &[u8], at: Instant) {
         let covered: usize = self.offered.iter().map(|segment| segment.remaining).sum();
-        if bytes <= covered {
+        let pointer = bytes.as_ptr() as usize;
+        let same_offer = self.offered_ptr == Some(pointer)
+            && covered <= bytes.len()
+            && (self.offered_prefix.is_empty() || bytes.starts_with(&self.offered_prefix));
+        let covered = if same_offer {
+            covered
+        } else {
+            self.abandon_unaccepted_offer();
+            0
+        };
+        self.offered_ptr = Some(pointer);
+        self.offered_prefix.clear();
+        self.offered_prefix
+            .extend_from_slice(&bytes[..bytes.len().min(64)]);
+        if bytes.len() <= covered {
             return;
         }
         let attempt = WriteAttempt {
@@ -355,7 +375,7 @@ impl FrameObserver {
             sequence: self.metrics.next_event_sequence(),
         };
         self.offered.push_back(OfferedSegment {
-            remaining: bytes - covered,
+            remaining: bytes.len() - covered,
             attempt,
         });
         if covered == 0
@@ -367,11 +387,12 @@ impl FrameObserver {
 
     fn accepted(&mut self, mut bytes: &[u8], at: Instant) {
         if self.offered.is_empty() {
-            self.offered(bytes.len(), at);
+            self.offered(bytes, at);
         }
+        let accepted_len = bytes.len();
         while !bytes.is_empty() {
             let Some(mut segment) = self.offered.pop_front() else {
-                self.offered(bytes.len(), at);
+                self.offered(bytes, at);
                 continue;
             };
             let take = segment.remaining.min(bytes.len());
@@ -381,6 +402,33 @@ impl FrameObserver {
             if segment.remaining > 0 {
                 self.offered.push_front(segment);
             }
+        }
+        if self.offered.is_empty() {
+            self.offered_ptr = None;
+            self.offered_prefix.clear();
+        } else if let Some(pointer) = self.offered_ptr.as_mut() {
+            *pointer = pointer.saturating_add(accepted_len);
+            if accepted_len < self.offered_prefix.len() {
+                self.offered_prefix.drain(..accepted_len);
+            } else {
+                self.offered_prefix.clear();
+            }
+        }
+    }
+
+    fn abandon_unaccepted_offer(&mut self) {
+        self.offered.clear();
+        self.offered_ptr = None;
+        self.offered_prefix.clear();
+        if let DecodeState::Header {
+            bytes,
+            write_start,
+            last_byte,
+        } = &mut self.decode
+            && bytes.is_empty()
+        {
+            *write_start = None;
+            *last_byte = None;
         }
     }
 
@@ -786,7 +834,7 @@ mod tests {
         let batch = [frame.clone(), frame].concat();
         let mut observer = FrameObserver::new(Arc::clone(&metrics));
 
-        observer.offered(batch.len(), origin + Duration::from_micros(10));
+        observer.offered(&batch, origin + Duration::from_micros(10));
         observer.accepted(&batch, origin + Duration::from_micros(20));
         observer.flushed(origin + Duration::from_micros(30));
 
@@ -821,9 +869,9 @@ mod tests {
         let batch = [frame.clone(), frame.clone()].concat();
         let mut observer = FrameObserver::new(Arc::clone(&metrics));
 
-        observer.offered(batch.len(), origin + Duration::from_micros(10));
+        observer.offered(&batch, origin + Duration::from_micros(10));
         observer.accepted(&batch[..frame.len()], origin + Duration::from_micros(20));
-        observer.offered(frame.len(), origin + Duration::from_micros(30));
+        observer.offered(&batch[frame.len()..], origin + Duration::from_micros(30));
         observer.accepted(&batch[frame.len()..], origin + Duration::from_micros(40));
         observer.flushed(origin + Duration::from_micros(50));
 
@@ -835,6 +883,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 10), (0, 10)]
         );
+    }
+
+    #[test]
+    fn abandoned_pending_buffer_does_not_lend_its_attempt_to_new_bytes() {
+        let origin = Instant::now();
+        let metrics = Arc::new(StdoutMetrics::new(origin));
+        let body = br#"{"jsonrpc":"2.0","method":"window/logMessage"}"#;
+        let frame = [
+            format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes(),
+            body.to_vec(),
+        ]
+        .concat();
+        let abandoned = vec![b'x'; frame.len()];
+        let mut observer = FrameObserver::new(Arc::clone(&metrics));
+
+        observer.offered(&abandoned, origin + Duration::from_micros(10));
+        observer.offered(&frame, origin + Duration::from_micros(20));
+        observer.accepted(&frame, origin + Duration::from_micros(30));
+        observer.flushed(origin + Duration::from_micros(40));
+
+        assert_eq!(metrics.frames()[0].write_start_us, 20);
+        assert_eq!(metrics.frames()[0].write_sequence, 1);
     }
 
     #[tokio::test]
@@ -939,7 +1009,8 @@ mod tests {
 
         {
             let mut observer = FrameObserver::new(Arc::clone(&metrics));
-            observer.offered(header.len() + 5, origin + Duration::from_micros(5));
+            let offered = [header.as_bytes(), &body[..5]].concat();
+            observer.offered(&offered, origin + Duration::from_micros(5));
             observer.accepted(header.as_bytes(), origin + Duration::from_micros(10));
             observer.accepted(&body[..5], origin + Duration::from_micros(15));
         }
@@ -962,7 +1033,7 @@ mod tests {
         let metrics = Arc::new(StdoutMetrics::new(origin));
         {
             let mut observer = FrameObserver::new(Arc::clone(&metrics));
-            observer.offered(10, origin + Duration::from_micros(5));
+            observer.offered(&[0; 10], origin + Duration::from_micros(5));
         }
 
         assert_eq!(
