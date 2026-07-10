@@ -48,6 +48,23 @@ fn capability_prefilter_applies(method: &str) -> bool {
     )
 }
 
+/// Whether a bridge response can directly mutate the editor document.
+///
+/// Non-contiguous `injection.combined` documents mask host-only gaps inside
+/// their outer range. Until edit translation carries those allowed spans,
+/// forwarding these methods could apply virtual whitespace over real host text.
+fn method_requires_contiguous_injection(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/codeAction"
+            | "textDocument/colorPresentation"
+            | "textDocument/completion"
+            | "textDocument/inlayHint"
+            | "textDocument/onTypeFormatting"
+            | "textDocument/rename"
+    )
+}
+
 /// RAII sweep of the upstream-request registry for one request id: on drop,
 /// removes every entry a dropped/aborted layer future did not get to
 /// unregister itself. Idempotent with the arms' own refcounted unregisters.
@@ -732,6 +749,10 @@ impl Kakehashi {
             return None;
         };
 
+        if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+            return None;
+        }
+
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = current_upstream_id();
 
@@ -1359,6 +1380,9 @@ impl Kakehashi {
         let mapper = PositionMapper::new(snapshot.text());
         let mut contexts = Vec::new();
         for resolved in regions {
+            if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+                continue;
+            }
             // Clamp to the region so the translated range is in-region; skip a
             // region the range never touches.
             let Some(clamped) = clamp_range_to_region(&resolved, &range, &mapper) else {
@@ -2641,6 +2665,28 @@ mod tests {
                 capability_prefilter_applies(method),
                 "{method} must be prefiltered"
             );
+        }
+    }
+
+    #[test]
+    fn edit_producing_methods_require_contiguous_injections() {
+        for method in [
+            "textDocument/codeAction",
+            "textDocument/colorPresentation",
+            "textDocument/completion",
+            "textDocument/inlayHint",
+            "textDocument/onTypeFormatting",
+            "textDocument/rename",
+        ] {
+            assert!(method_requires_contiguous_injection(method), "{method}");
+        }
+        for method in [
+            "textDocument/definition",
+            "textDocument/hover",
+            "textDocument/references",
+            "textDocument/signatureHelp",
+        ] {
+            assert!(!method_requires_contiguous_injection(method), "{method}");
         }
     }
 
