@@ -921,6 +921,24 @@ fn test_blockquote_shortcut_link_uniform_highlight() {
         );
     }
 
+    // The markdown_inline injection must actually tokenize the shortcut
+    // link: its label `foo` (cols 3..6) maps to `keyword` via
+    // markup.link.label. Without this, the string-coverage assertions above
+    // could pass on a host-only markup.quote token while the injection is
+    // silently broken.
+    let keyword_type = 1u32; // server legend index (see token_type_name)
+    for line in [3u32, 4, 6] {
+        assert!(
+            tokens.iter().any(|t| t.line == line
+                && t.token_type == keyword_type
+                && t.start <= 3
+                && t.start + t.length >= 6),
+            "Line {} should carry a `keyword` (markup.link.label) token over the link label `foo`. Tokens: {:?}",
+            line,
+            signature(line)
+        );
+    }
+
     // The plain `> foo` lines keep their full-line string coverage.
     for line in [2u32, 5] {
         assert!(
