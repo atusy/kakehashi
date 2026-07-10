@@ -1102,7 +1102,8 @@ impl LanguageCoordinator {
     /// token (`"py"`, `"js"`), path token via `extract_token_from_path`, then
     /// first-line content (shebang, mode line, Emacs markers).
     /// Host call: `detect_language(path, content, None, language_id)`;
-    /// injection call: `detect_language(token, content, Some(token), Some(token))`.
+    /// injection call: `detect_language_hot(token, content, Some(token),
+    /// Some(token))` — the per-region hot path logs at TRACE.
     pub(crate) fn detect_language(
         &self,
         path: &str,
@@ -1110,13 +1111,42 @@ impl LanguageCoordinator {
         token: Option<&str>,
         language_id: Option<&str>,
     ) -> Option<String> {
+        self.detect_language_logged(path, content, token, language_id, log::Level::Debug)
+    }
+
+    /// Hot-path variant of [`Self::detect_language`] that logs at TRACE.
+    ///
+    /// Per-injection-region resolution runs this once per region per walk —
+    /// thousands of calls per second during a typing storm — and per-call
+    /// DEBUG formatting/writes flood stderr (measured ~16k lines/sec, dwarfing
+    /// the detection chain itself). The chain is identical; only the log level
+    /// differs, matching `resolve_injection_language`'s TRACE convention.
+    pub(crate) fn detect_language_hot(
+        &self,
+        path: &str,
+        content: &str,
+        token: Option<&str>,
+        language_id: Option<&str>,
+    ) -> Option<String> {
+        self.detect_language_logged(path, content, token, language_id, log::Level::Trace)
+    }
+
+    fn detect_language_logged(
+        &self,
+        path: &str,
+        content: &str,
+        token: Option<&str>,
+        language_id: Option<&str>,
+        level: log::Level,
+    ) -> Option<String> {
         let (result, method, candidate) =
             self.detect_language_with_method(path, content, token, language_id);
 
         match result {
             Some(ref lang) => {
-                log::debug!(
+                log::log!(
                     target: "kakehashi::language_detection",
+                    level,
                     "Detected '{}' via {} for path='{}'",
                     lang,
                     method,
@@ -1125,15 +1155,17 @@ impl LanguageCoordinator {
             }
             None => {
                 if let Some(detected) = candidate {
-                    log::debug!(
+                    log::log!(
                         target: "kakehashi::language_detection",
+                        level,
                         "Detected '{}' but no parser available for path='{}'",
                         detected,
                         path
                     );
                 } else {
-                    log::debug!(
+                    log::log!(
                         target: "kakehashi::language_detection",
+                        level,
                         "No language detected for path='{}'",
                         path
                     );

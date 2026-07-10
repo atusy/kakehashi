@@ -525,7 +525,7 @@ impl InjectionResolver {
         content: &str,
     ) -> String {
         coordinator
-            .detect_language(
+            .detect_language_hot(
                 raw_identifier, // Use identifier as path for token extraction
                 content,
                 Some(raw_identifier), // Explicit token

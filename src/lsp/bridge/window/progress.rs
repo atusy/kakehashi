@@ -12,6 +12,7 @@ use serde::Deserialize;
 use tower_lsp_server::ls_types::{ProgressParams, ProgressParamsValue, WorkDoneProgress};
 
 use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
+use crate::lsp::bridge::progress_registry::{ProgressAdmission, ProgressSignal};
 
 /// Translate and forward a downstream `$/progress` notification to the editor.
 ///
@@ -21,6 +22,13 @@ use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
 /// any other token (e.g. a client-provided `workDoneToken`) is **dropped** — it
 /// is out of scope for token remapping (see [`ProgressRegistry`] module docs),
 /// and forwarding it verbatim risks duplicates under request fan-out.
+///
+/// Announcement is lazy: the editor-facing `window/workDoneProgress/create` is
+/// enqueued here, immediately before the first renderable `begin` (same FIFO
+/// channel, so create-before-progress ordering holds), while blank progress
+/// lifecycles are swallowed (a later renderable `begin` reusing the token
+/// still upgrades it) — see [`ProgressRegistry`] module docs for why
+/// (per-request downstream progress storms).
 ///
 /// A terminating `WorkDoneProgress::End` clears the mapping after forwarding.
 ///
@@ -59,10 +67,38 @@ pub(in crate::lsp::bridge) fn forward(
         return;
     }
 
-    let Some(upstream_token) = deps
-        .progress_registry
-        .translate(deps.progress_connection_id, &params.token)
-    else {
+    let signal = match &params.value {
+        ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(begin)) => {
+            // A begin is renderable when ANY of title/message/percentage/
+            // cancellable gives the editor something to show — an empty title
+            // alone is legal (title is a required field, "" a legal value)
+            // and clients render message/percentage/a cancel button without
+            // one. Only a fully blank begin (the per-analysis-pass storm
+            // shape, `{"kind":"begin","title":""}`) is swallowed.
+            let renderable = !begin.title.is_empty()
+                || begin
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| !message.is_empty())
+                || begin.percentage.is_some()
+                || begin.cancellable == Some(true);
+            if renderable {
+                ProgressSignal::RenderableBegin
+            } else {
+                ProgressSignal::BlankBegin
+            }
+        }
+        _ => ProgressSignal::Other,
+    };
+    let is_end = matches!(
+        &params.value,
+        ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+    );
+
+    let admission =
+        deps.progress_registry
+            .admit(deps.progress_connection_id, &params.token, signal);
+    let Some(admission) = admission else {
         // Unknown token: not a downstream-declared progress we remapped.
         debug!(
             target: "kakehashi::bridge::reader",
@@ -72,18 +108,46 @@ pub(in crate::lsp::bridge) fn forward(
         return;
     };
 
-    let is_end = matches!(
-        &params.value,
-        ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
-    );
-
-    let downstream_token = std::mem::replace(&mut params.token, upstream_token);
-    let _ = deps
-        .upstream_tx
-        .send(UpstreamNotification::Progress { params });
-
-    if is_end {
-        deps.progress_registry
-            .complete(deps.progress_connection_id, &downstream_token);
+    match admission {
+        ProgressAdmission::Announce(upstream_token) => {
+            // First renderable begin: ask the editor to create the token, then
+            // forward the begin. Same FIFO channel, and the forwarding loop
+            // awaits the create inline, so ordering holds.
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::CreateWorkDoneProgress {
+                    token: upstream_token.clone(),
+                });
+            params.token = upstream_token;
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::Progress { params });
+        }
+        ProgressAdmission::Forward(upstream_token) => {
+            let downstream_token = std::mem::replace(&mut params.token, upstream_token);
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::Progress { params });
+            if is_end {
+                deps.progress_registry
+                    .complete(deps.progress_connection_id, &downstream_token);
+            }
+        }
+        ProgressAdmission::Drop => {
+            // Swallowed lifecycle (blank begin) or report/end without a begin:
+            // nothing reaches the editor. An End still clears the mapping.
+            //
+            // Deliberately, a renderable REPORT does not upgrade a swallowed
+            // lifecycle: only the begin classifies. In the production storm
+            // this gate exists for, 8,288 of 8,351 reports carried a message
+            // ("analyzing 1 file" per pass) under blank begins — upgrading on
+            // renderable reports would re-admit essentially the whole flood.
+            // A downstream that wants its progress rendered must say so at
+            // begin time (title/message/percentage/cancellable).
+            if is_end {
+                deps.progress_registry
+                    .complete(deps.progress_connection_id, &params.token);
+            }
+        }
     }
 }
