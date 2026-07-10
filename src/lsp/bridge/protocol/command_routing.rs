@@ -73,8 +73,10 @@ pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Opt
         let first_for_origin = WARNED_ORIGINS
             .lock()
             .map(|mut set| {
-                set.get_or_insert_with(Default::default)
-                    .insert(origin.to_string())
+                let set = set.get_or_insert_with(Default::default);
+                // Check before allocating: after the first warn, the hot
+                // per-action path pays only a lookup.
+                !set.contains(origin) && set.insert(origin.to_string())
             })
             .unwrap_or(true);
         if first_for_origin {
