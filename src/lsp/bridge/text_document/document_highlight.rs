@@ -62,7 +62,7 @@ impl LanguageServerPool {
             },
             |response, ctx| transform_document_highlight_response_to_host(response, ctx.offset),
         )
-        .await
+        .await?
     }
 }
 
@@ -92,32 +92,43 @@ fn build_document_highlight_request(
 fn transform_document_highlight_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
-) -> Option<Vec<DocumentHighlight>> {
+) -> io::Result<Option<Vec<DocumentHighlight>>> {
     if response_has_jsonrpc_error(&response, "textDocument/documentHighlight") {
-        return None;
+        return Ok(None);
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        return Err(io::Error::other(
+            "textDocument/documentHighlight response carries neither result nor error (protocol violation)",
+        ));
+    };
 
     if result.is_null() {
-        return None;
+        return Ok(None);
     }
 
     // Parse into typed Vec<DocumentHighlight>
-    let mut highlights: Vec<DocumentHighlight> = serde_json::from_value(result).ok()?;
+    let mut highlights: Vec<DocumentHighlight> = serde_json::from_value(result).map_err(|err| {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "malformed textDocument/documentHighlight result from downstream server: {err}"
+        );
+        io::Error::other(format!(
+            "malformed textDocument/documentHighlight result from downstream server: {err}"
+        ))
+    })?;
 
     // Transform ranges to host coordinates
     for highlight in &mut highlights {
         translate_virtual_range_to_host(&mut highlight.range, offset);
     }
 
-    Some(highlights)
+    Ok(Some(highlights))
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-    use rstest::rstest;
     use serde_json::json;
 
     #[test]
@@ -182,8 +193,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let highlights = transformed.unwrap();
+        let highlights = transformed.unwrap().unwrap();
         assert_eq!(highlights.len(), 3);
         assert_eq!(highlights[0].range.start.line, 3);
         assert_eq!(highlights[0].range.end.line, 3);
@@ -194,16 +204,40 @@ mod tests {
         assert_eq!(highlights[2].range.start.line, 7);
     }
 
-    #[rstest]
-    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
-    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
-    #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
-    fn document_highlight_response_returns_none_for_invalid_response(
-        #[case] response: serde_json::Value,
-    ) {
+    #[test]
+    fn document_highlight_response_returns_none_for_null_result() {
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": null});
         let transformed =
             transform_document_highlight_response_to_host(response, &RegionOffset::new(5, 0));
-        assert!(transformed.is_none());
+        assert!(transformed.unwrap().is_none());
+    }
+
+    #[test]
+    fn document_highlight_response_returns_none_for_jsonrpc_error() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": {"code": -32600, "message": "Invalid Request"}
+        });
+        let transformed =
+            transform_document_highlight_response_to_host(response, &RegionOffset::new(5, 0));
+        assert!(transformed.unwrap().is_none());
+    }
+
+    #[test]
+    fn document_highlight_response_errors_on_missing_result_success() {
+        let response = json!({"jsonrpc": "2.0", "id": 42});
+        let transformed =
+            transform_document_highlight_response_to_host(response, &RegionOffset::new(5, 0));
+        assert!(transformed.is_err());
+    }
+
+    #[test]
+    fn document_highlight_response_errors_on_malformed_success_result() {
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"});
+        let transformed =
+            transform_document_highlight_response_to_host(response, &RegionOffset::new(5, 0));
+        assert!(transformed.is_err());
     }
 
     #[test]
@@ -212,8 +246,7 @@ mod tests {
 
         let transformed =
             transform_document_highlight_response_to_host(response, &RegionOffset::new(5, 0));
-        assert!(transformed.is_some());
-        let highlights = transformed.unwrap();
+        let highlights = transformed.unwrap().unwrap();
         assert!(highlights.is_empty());
     }
 
@@ -240,8 +273,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let highlights = transformed.unwrap();
+        let highlights = transformed.unwrap().unwrap();
         assert_eq!(highlights.len(), 1);
         assert_eq!(
             highlights[0].range.start.line,
@@ -277,8 +309,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let highlights = transformed.unwrap();
+        let highlights = transformed.unwrap().unwrap();
         assert_eq!(highlights.len(), 1);
         assert_eq!(highlights[0].range.start.line, 10); // 0 + 10
         assert_eq!(highlights[0].range.start.character, 15); // Preserved
