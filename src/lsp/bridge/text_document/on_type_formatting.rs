@@ -25,7 +25,7 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_text_document_position_params,
+    build_text_document_position_params, region_host_end,
 };
 use super::formatting::{count_lines, transform_formatting_response_to_host};
 
@@ -81,6 +81,7 @@ impl LanguageServerPool {
             return Ok(None);
         }
         let virtual_line_count = count_lines(virtual_content);
+        let region_end = region_host_end(virtual_content, &offset);
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -105,8 +106,13 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // capability/trigger early returns above yield `Ok(None)`.
             |response, ctx| {
-                transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
-                    .map(Some)
+                transform_formatting_response_to_host(
+                    response,
+                    ctx.offset,
+                    virtual_line_count,
+                    region_end,
+                )
+                .map(Some)
             },
         )
         .await?
