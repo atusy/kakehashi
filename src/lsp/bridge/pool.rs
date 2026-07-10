@@ -908,6 +908,22 @@ impl LanguageServerPool {
         });
     }
 
+    async fn purge_open_transition_locks(&self, connection_key: &ConnectionKey) {
+        let transitions: Vec<_> = self
+            .open_transition_locks
+            .iter()
+            .filter(|entry| &entry.key().0 == connection_key)
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        for (key, transition) in transitions {
+            let guard = transition.lock().await;
+            drop(guard);
+            self.open_transition_locks.remove_if(&key, |_, current| {
+                Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
+            });
+        }
+    }
+
     /// Resolve the exact `(server, root)` connection a document currently
     /// routes to, including shared-instance capability fallback.
     pub(super) async fn resolved_connection_key(
@@ -1666,6 +1682,7 @@ impl LanguageServerPool {
                     self.document_tracker
                         .purge_connection(&connection_key)
                         .await;
+                    self.purge_open_transition_locks(&connection_key).await;
                     // Remove only after every async purge completes. If this
                     // acquire future is aborted at a cleanup await, the stale
                     // entry remains and the next acquire retries the idempotent
@@ -3521,6 +3538,42 @@ mod tests {
                 virtual_uri.to_uri_string()
             )),
             "failed open must reclaim its transition lock entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_purge_reclaims_successful_open_transition_locks() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/purged.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "print('opened')",
+            &connection_key,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_ok());
+        assert!(
+            pool.open_transition_locks
+                .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string()))
+        );
+
+        pool.document_tracker
+            .purge_connection(&connection_key)
+            .await;
+        pool.purge_open_transition_locks(&connection_key).await;
+
+        assert!(
+            !pool
+                .open_transition_locks
+                .iter()
+                .any(|entry| entry.key().0 == connection_key),
+            "respawn cleanup must reclaim document transition locks"
         );
     }
 
