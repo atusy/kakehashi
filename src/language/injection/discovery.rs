@@ -297,7 +297,8 @@ pub(crate) fn collect_all_injections<'a>(
                 // `or_insert_with` so the per-pattern predicate scans
                 // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
                 // are skipped when this content-node range was already inserted by
-                // an earlier matching pattern. Same resulting map, fewer scans.
+                // an earlier matching pattern for the same language. Same
+                // resulting language layers, fewer scans.
                 injections_map.entry(key).or_insert_with(|| {
                     let offset = effective_offset_for_pattern(query, match_.pattern_index);
                     InjectionRegionInfo {
@@ -407,8 +408,8 @@ fn collect_injection_regions<'a>(
                 language.clone(),
             );
 
-            // Only keep the first injection for each unique range
-            // This handles cases where multiple patterns match the same node
+            // Keep the first match for each range/language pair; distinct
+            // languages on the same range remain separate layers.
             injections_map.entry(key).or_insert(RawInjectionRegion {
                 start_byte: content_node.start_byte(),
                 end_byte: content_node.end_byte(),
@@ -459,6 +460,10 @@ fn extract_content_and_language<'a>(
 }
 
 /// Find the injection region containing the given byte offset.
+///
+/// Regions are sorted by query pattern index, so same-range alternate
+/// languages use explicit query-order priority for single-result bridge APIs.
+/// Whole-document and hierarchy discovery still retain every language layer.
 ///
 /// Returns `(index, region)` for use with `calculate_region_id`, or `None` when the
 /// position is not within any injection region.
@@ -1311,6 +1316,43 @@ mod tests {
             vec!["rust", "doc", "comment"],
             "distinct language layers on the same node must survive discovery"
         );
+    }
+
+    #[test]
+    fn same_range_bridge_resolution_uses_query_pattern_priority() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { /* comment */ }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((block_comment) @injection.content
+                 (#set! injection.language "doc"))
+                ((block_comment) @injection.content
+                 (#set! injection.language "comment"))
+            "#,
+        )
+        .expect("valid query");
+
+        let all = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "both same-range languages remain discoverable"
+        );
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("same_range_priority"),
+            &tree,
+            text,
+            &query,
+            15,
+        )
+        .expect("comment position resolves");
+
+        assert_eq!(resolved.region.language, "doc");
     }
 
     #[test]
