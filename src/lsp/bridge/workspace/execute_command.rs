@@ -71,8 +71,8 @@ impl LanguageServerPool {
         if !crate::config::is_server_spawnable(&settings.language_servers, &origin) {
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: origin '{origin}' is not spawnable (removed or \
-                 misconfigured since the action was produced); dropping '{command}'"
+                "executeCommand: origin {origin:?} is not spawnable (removed or \
+                 misconfigured since the action was produced); dropping {command:?}"
             );
             return None;
         }
@@ -83,7 +83,7 @@ impl LanguageServerPool {
         ) else {
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: origin '{origin}' has no resolvable config; dropping '{command}'"
+                "executeCommand: origin {origin:?} has no resolvable config; dropping {command:?}"
             );
             return None;
         };
@@ -118,7 +118,7 @@ impl LanguageServerPool {
             // (every other failure branch here warns).
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: {origin} does not advertise executeCommandProvider; ignoring '{command}'"
+                "executeCommand: {origin:?} does not advertise executeCommandProvider; ignoring {command:?}"
             );
             return None;
         }
@@ -152,7 +152,7 @@ impl LanguageServerPool {
         let Some(key) = self.command_origins().route(&params.command) else {
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: '{}' is neither a bridged nor a registered command; ignoring",
+                "executeCommand: {:?} is neither a bridged nor a registered command; ignoring",
                 params.command
             );
             return None;
@@ -180,8 +180,8 @@ impl LanguageServerPool {
                 if !crate::config::is_server_spawnable(&settings.language_servers, origin) {
                     warn!(
                         target: "kakehashi::bridge",
-                        "executeCommand: palette origin '{origin}' is no longer spawnable; \
-                         dropping '{}'",
+                        "executeCommand: palette origin {origin:?} is no longer spawnable; \
+                         dropping {:?}",
                         params.command
                     );
                     return None;
@@ -193,8 +193,8 @@ impl LanguageServerPool {
                 ) else {
                     warn!(
                         target: "kakehashi::bridge",
-                        "executeCommand: palette origin '{origin}' has no resolvable config; \
-                         dropping '{}'",
+                        "executeCommand: palette origin {origin:?} has no resolvable config; \
+                         dropping {:?}",
                         params.command
                     );
                     return None;
@@ -227,7 +227,7 @@ impl LanguageServerPool {
             None => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "executeCommand: origin connection for palette command '{}' ({origin}) is not ready; ignoring",
+                    "executeCommand: origin connection for palette command {:?} ({origin:?}) is not ready; ignoring",
                     params.command
                 );
                 return None;
@@ -241,7 +241,7 @@ impl LanguageServerPool {
             // failure branch warns) so a fail-soft `null` is diagnosable.
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: origin {origin} for palette command '{}' does not (yet) advertise executeCommandProvider; ignoring",
+                "executeCommand: origin {origin:?} for palette command {:?} does not (yet) advertise executeCommandProvider; ignoring",
                 params.command
             );
             return None;
@@ -271,7 +271,7 @@ impl LanguageServerPool {
                     warn!(
                         target: "kakehashi::bridge",
                         "executeCommand: failed to register request on {connection_key:?} \
-                         for '{}': {e}",
+                         for {:?}: {e}",
                         params.command
                     );
                     if let Some(ref id) = upstream_id {
@@ -312,7 +312,7 @@ impl LanguageServerPool {
                 drop(connections);
                 warn!(
                     target: "kakehashi::bridge",
-                    "executeCommand: failed to send '{}' on {connection_key:?}: {e}",
+                    "executeCommand: failed to send {:?} on {connection_key:?}: {e}",
                     params.command
                 );
                 if let Some(ref id) = upstream_id {

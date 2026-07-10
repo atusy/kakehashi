@@ -81,7 +81,11 @@ pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Opt
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Check before allocating: after the first warn, the hot per-action
         // path pays only a lookup.
-        let first_for_origin = !warned.contains(origin) && warned.insert(origin.to_string());
+        let first_for_origin = if warned.contains(origin) {
+            false
+        } else {
+            warned.insert(origin.to_string())
+        };
         drop(warned);
         if first_for_origin {
             // {:?} escapes the very control character that triggered this

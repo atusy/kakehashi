@@ -614,7 +614,7 @@ impl LanguageServerPool {
         if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: origin '{}' is not spawnable (removed or \
+                "codeAction/resolve: origin {:?} is not spawnable (removed or \
                  misconfigured since the action was produced); returning unresolved",
                 envelope.origin
             );
@@ -628,7 +628,7 @@ impl LanguageServerPool {
         ) else {
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: origin '{}' has no resolvable config; returning unresolved",
+                "codeAction/resolve: origin {:?} has no resolvable config; returning unresolved",
                 envelope.origin
             );
             re_envelope_action(&mut action, &envelope);
@@ -714,7 +714,7 @@ impl LanguageServerPool {
             // capabilities (or the handle is still initializing).
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {} no longer advertises resolveProvider; returning unresolved",
+                "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
                 envelope.origin
             );
             re_envelope_action(&mut action, &envelope);
@@ -736,7 +736,7 @@ impl LanguageServerPool {
             // carry the detail); the action goes back unresolved.
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: no usable response from {server_name}; returning unresolved"
+                "codeAction/resolve: no usable response from {server_name:?}; returning unresolved"
             );
             re_envelope_action(&mut action, &envelope);
             return action;
@@ -792,7 +792,7 @@ impl LanguageServerPool {
             // capabilities (or the handle is still initializing).
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {} no longer advertises resolveProvider; returning unresolved",
+                "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
                 envelope.origin
             );
             re_envelope_action(&mut action, &envelope);
@@ -818,7 +818,7 @@ impl LanguageServerPool {
             // helper's transport failures log at debug and defer to callers.
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: no usable response from {server_name}; returning unresolved"
+                "codeAction/resolve: no usable response from {server_name:?}; returning unresolved"
             );
             re_envelope_action(&mut action, &envelope);
             return action;

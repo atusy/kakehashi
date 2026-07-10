@@ -197,7 +197,7 @@ impl Kakehashi {
                 Err(RegionEndUnavailable::Stale) => {
                     log::debug!(
                         target: "kakehashi::bridge",
-                        "codeAction/resolve: region {} of {} (origin {}) is stale; \
+                        "codeAction/resolve: region {} of {} (origin {:?}) is stale; \
                          returning action unresolved",
                         envelope.region_id,
                         envelope.host_uri,
