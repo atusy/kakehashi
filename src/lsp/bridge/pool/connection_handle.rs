@@ -841,14 +841,16 @@ impl ConnectionHandle {
         upstream_id: Option<UpstreamId>,
     ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
         let request_id = RequestId::new(self.next_request_id());
-        let (response_rx, starts_liveness) = self
+        let (response_rx, liveness_epoch) = self
             .router()
             .register_with_upstream_liveness(request_id, upstream_id)
             .ok_or_else(|| io::Error::other("bridge: duplicate request ID"))?;
 
         // If pending went 0->1 and we're in Ready state, start liveness timer
-        if starts_liveness && self.state() == ConnectionState::Ready {
-            self.reader_handle.notify_liveness_start();
+        if let Some(epoch) = liveness_epoch
+            && self.state() == ConnectionState::Ready
+        {
+            self.reader_handle.notify_liveness_start(epoch);
         }
 
         Ok((request_id, response_rx))

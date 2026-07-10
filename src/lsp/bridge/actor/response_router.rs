@@ -40,6 +40,8 @@ pub(crate) struct ResponseRouter {
 
 /// Internal state for ResponseRouter, protected by a single mutex.
 struct ResponseRouterState {
+    /// Advances whenever downstream-progressing requests transition 0 -> 1.
+    liveness_epoch: u64,
     /// Pending requests waiting for responses.
     pending: HashMap<RequestId, PendingRequest>,
     /// Maps upstream request ID (from client) to downstream request IDs (to LS).
@@ -81,6 +83,7 @@ impl ResponseRouter {
     pub(crate) fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(ResponseRouterState {
+                liveness_epoch: 0,
                 pending: HashMap::new(),
                 upstream_to_downstream: HashMap::new(),
                 downstream_to_upstream: HashMap::new(),
@@ -118,7 +121,7 @@ impl ResponseRouter {
         &self,
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
-    ) -> Option<(oneshot::Receiver<serde_json::Value>, bool)> {
+    ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
         let (tx, rx) = oneshot::channel();
         let mut state = self
             .state
@@ -133,6 +136,10 @@ impl ResponseRouter {
             .pending
             .values()
             .all(|pending| pending.delivery == RequestDelivery::CancelledQueued);
+        let liveness_epoch = starts_liveness.then(|| {
+            state.liveness_epoch = state.liveness_epoch.wrapping_add(1);
+            state.liveness_epoch
+        });
 
         state.pending.insert(
             downstream_id,
@@ -154,7 +161,14 @@ impl ResponseRouter {
             state.downstream_to_upstream.insert(downstream_id, upstream);
         }
 
-        Some((rx, starts_liveness))
+        Some((rx, liveness_epoch))
+    }
+
+    pub(crate) fn liveness_epoch(&self) -> u64 {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::liveness_epoch")
+            .liveness_epoch
     }
 
     /// Look up every in-flight downstream request ID for an upstream request
@@ -698,10 +712,10 @@ mod tests {
 
         assert_eq!(router.pending_count(), 1);
         assert_eq!(router.awaiting_downstream_count(), 0);
-        let (_live_rx, starts_liveness) = router
+        let (_live_rx, liveness_epoch) = router
             .register_with_upstream_liveness(RequestId::new(2), None)
             .unwrap();
-        assert!(starts_liveness);
+        assert_eq!(liveness_epoch, Some(2));
         assert_eq!(router.pending_count(), 2);
         assert_eq!(router.awaiting_downstream_count(), 1);
     }

@@ -226,7 +226,7 @@ pub(crate) const WINDOW_NOTIFICATION_QUEUE_CAPACITY: usize = 256;
 /// signaling between the reader task and ConnectionHandle.
 struct LivenessParams {
     timeout: Option<Duration>,
-    start_rx: mpsc::Receiver<()>,
+    start_rx: mpsc::Receiver<u64>,
     stop_rx: mpsc::Receiver<()>,
     failed_tx: oneshot::Sender<()>,
 }
@@ -334,6 +334,7 @@ struct LivenessTimerState {
     timer: Option<LivenessTimer>,
     /// Configured timeout duration, None if liveness is disabled.
     timeout: Option<Duration>,
+    epoch: Option<u64>,
 }
 
 impl LivenessTimerState {
@@ -344,6 +345,7 @@ impl LivenessTimerState {
         Self {
             timer: None,
             timeout,
+            epoch: None,
         }
     }
 
@@ -356,7 +358,7 @@ impl LivenessTimerState {
     ///
     /// Called when pending count transitions 0->1.
     /// No-op if timeout is not configured.
-    fn start(&mut self, server_prefix: &str) {
+    fn start(&mut self, server_prefix: &str, epoch: u64) {
         if let Some(timeout) = self.timeout {
             debug!(
                 target: "kakehashi::bridge::reader",
@@ -365,6 +367,7 @@ impl LivenessTimerState {
                 timeout
             );
             self.timer = Some(new_liveness_timer(timeout));
+            self.epoch = Some(epoch);
         }
     }
 
@@ -398,11 +401,16 @@ impl LivenessTimerState {
                 reason
             );
         }
+        self.epoch = None;
     }
 
     /// Get the configured timeout duration (for logging on expiry).
     fn timeout_duration(&self) -> Duration {
         self.timeout.unwrap_or_default()
+    }
+
+    fn epoch(&self) -> Option<u64> {
+        self.epoch
     }
 
     /// Take a reference to the timer for use in select!.
@@ -432,7 +440,7 @@ pub(crate) struct ReaderTaskHandle {
     _cancel_guard: tokio_util::sync::DropGuard,
 
     /// Notify reader when pending count goes 0→1 so it starts the liveness timer.
-    liveness_start_tx: mpsc::Sender<()>,
+    liveness_start_tx: mpsc::Sender<u64>,
 
     /// Stop the liveness timer at shutdown so Tier 3 (global) overrides Tier 2 (ls-bridge-timeout-hierarchy).
     liveness_stop_tx: mpsc::Sender<()>,
@@ -446,9 +454,9 @@ impl ReaderTaskHandle {
     ///
     /// Called by ConnectionHandle when the first request is registered (pending 0->1).
     /// Non-blocking: if the channel is full, the notification is dropped (timer already running).
-    pub(crate) fn notify_liveness_start(&self) {
+    pub(crate) fn notify_liveness_start(&self, epoch: u64) {
         // Use try_send to avoid blocking. If channel is full, timer is already running.
-        let _ = self.liveness_start_tx.try_send(());
+        let _ = self.liveness_start_tx.try_send(epoch);
     }
 
     /// Stop the liveness timer without canceling the reader task (ls-bridge-timeout-hierarchy Phase 4).
@@ -693,6 +701,11 @@ async fn reader_loop_with_liveness(
 
             // Check for liveness timeout (if timer is active)
             _ = liveness.wait() => {
+                let current_epoch = router.liveness_epoch();
+                if liveness.epoch() != Some(current_epoch) {
+                    liveness.start(&server_prefix, current_epoch);
+                    continue;
+                }
                 // A queued request can be cancelled and removed by the writer
                 // without producing downstream stdout. The timer notification
                 // was already enqueued at registration, so re-check the router
@@ -720,8 +733,11 @@ async fn reader_loop_with_liveness(
             }
 
             // Check for liveness timer start notification (pending 0->1)
-            Some(()) = liveness_start_rx.recv() => {
-                liveness.start(&server_prefix);
+            Some(_epoch) = liveness_start_rx.recv() => {
+                // The bounded channel may still contain an older wake-up. The
+                // router epoch is authoritative and was advanced atomically
+                // with registration.
+                liveness.start(&server_prefix, router.liveness_epoch());
             }
 
             // Check for liveness timer stop notification (shutdown began - ls-bridge-timeout-hierarchy Phase 4)
@@ -2912,7 +2928,7 @@ mod tests {
         );
 
         // Notify the reader to start the timer
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
 
         // Wait for timeout to fire
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2965,7 +2981,7 @@ mod tests {
         );
 
         // Notify the reader to start the timer
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
 
         // Yield to let reader task process the buffered response
         // This resets the timer deadline
@@ -3021,7 +3037,7 @@ mod tests {
         );
 
         // Notify the reader to start the timer
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
 
         // Wait for response to be received
         let _received = tokio::time::timeout(Duration::from_secs(1), rx)
@@ -3079,7 +3095,7 @@ mod tests {
         );
 
         // Notify the reader to start the timer
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
 
         // Wait for both receivers to get error responses
         let result1 = tokio::time::timeout(Duration::from_millis(200), rx1)
@@ -3148,7 +3164,7 @@ mod tests {
             Arc::clone(&router),
             Some(Duration::from_millis(100)),
         );
-        handle.notify_liveness_start();
+        handle.notify_liveness_start(1);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(101)).await;
         tokio::task::yield_now().await;
@@ -3157,6 +3173,50 @@ mod tests {
             !handle.check_liveness_failed(),
             "an empty router must not fail an otherwise healthy idle connection"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_old_liveness_epoch_does_not_fail_new_request() {
+        use crate::lsp::bridge::UpstreamId;
+        use crate::lsp::bridge::protocol::RequestId;
+        use std::time::Duration;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+        let (_writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let old_upstream = UpstreamId::Number(7);
+        let (_old_rx, old_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(1), Some(old_upstream.clone()))
+            .unwrap();
+        let handle = spawn_reader_task_with_liveness(
+            reader,
+            Arc::clone(&router),
+            Some(Duration::from_millis(100)),
+        );
+        handle.notify_liveness_start(old_epoch.unwrap());
+        tokio::task::yield_now().await;
+
+        // Make the old deadline ready without letting the reader poll it, then
+        // replace the only progressing request and queue the new epoch wake-up.
+        tokio::time::advance(Duration::from_millis(101)).await;
+        router.prepare_cancel_by_upstream(&old_upstream);
+        let (_new_rx, new_epoch) = router
+            .register_with_upstream_liveness(RequestId::new(2), None)
+            .unwrap();
+        handle.notify_liveness_start(new_epoch.unwrap());
+        tokio::task::yield_now().await;
+
+        assert!(
+            !handle.check_liveness_failed(),
+            "an expired timer from an older request epoch must not fail new work"
+        );
+        assert_eq!(router.awaiting_downstream_count(), 1);
     }
 
     #[tokio::test]
