@@ -483,6 +483,9 @@ pub(crate) struct ResolvedInjection {
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.
     pub line_column_offsets: Vec<u32>,
+    /// Whether `virtual_content` maps to one contiguous host byte range.
+    /// `false` for `injection.combined`, whose host-only gaps are masked.
+    pub contiguous: bool,
 }
 
 /// Central service for resolving injection regions at LSP positions
@@ -606,6 +609,7 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
+            contiguous: true,
         })
     }
 
@@ -690,6 +694,7 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets: vec![first_cacheable.start_column],
+            contiguous: false,
         })
     }
 
@@ -799,6 +804,7 @@ impl InjectionResolver {
                     injection_language: resolved_language,
                     virtual_content,
                     line_column_offsets,
+                    contiguous: true,
                 });
             } else {
                 let (tracker, uri, incarnation) =
@@ -1182,6 +1188,7 @@ mod tests {
         assert!(resolved[0].virtual_content.contains("<div>"));
         assert!(resolved[0].virtual_content.contains("</div>"));
         assert!(!resolved[0].virtual_content.contains("let close"));
+        assert!(!resolved[0].contiguous);
     }
 
     #[test]

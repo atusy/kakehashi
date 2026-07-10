@@ -302,6 +302,12 @@ impl Kakehashi {
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
         for resolved in all_regions.iter() {
+            // Combined injections mask host-only gaps with whitespace. A formatter
+            // returns a contiguous whole-document replacement, which would replace
+            // those real host gaps as well and corrupt the document.
+            if !resolved.contiguous {
+                continue;
+            }
             let configs = self
                 .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
             if configs.is_empty() {

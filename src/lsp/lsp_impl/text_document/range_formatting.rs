@@ -178,6 +178,12 @@ impl Kakehashi {
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
             for resolved in all_regions.iter() {
+                // Combined injections are non-contiguous in the host. Even a
+                // covering range may fall back to full formatting, whose single
+                // replacement would overwrite the masked host-only gaps.
+                if !resolved.contiguous {
+                    continue;
+                }
                 // A covering request (its byte span encloses the whole region)
                 // prefers full formatting; a partial request range-formats the
                 // clipped span. Either way we compute the clipped+content-clamped
