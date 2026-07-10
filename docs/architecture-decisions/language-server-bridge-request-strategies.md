@@ -337,7 +337,12 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 
 ## Implementation Status
 
-The following table shows the current implementation status of bridged LSP methods:
+The following table shows the implementation status of the bridged LSP
+methods this ADR's strategies cover (many more pass-through/position-mapped
+methods — declaration, typeDefinition, implementation, documentLink,
+documentSymbol, prepareRename, documentColor, moniker, codeLens/resolve,
+foldingRange, linkedEditingRange, … — are implemented and documented in
+`docs/language-features.md`):
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -345,7 +350,7 @@ The following table shows the current implementation status of bridged LSP metho
 | hover | ✅ Implemented | Pass-through with position translation |
 | signatureHelp | ✅ Implemented | Pass-through |
 | completion | ✅ Implemented | Fail-closed edit guards; atomic additionalTextEdits drop |
-| completionItem/resolve | ✅ Implemented | Envelope-routed; unsafe resolved responses serve the unresolved item |
+| completionItem/resolve | ✅ Implemented | Envelope-routed; an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set |
 | references | ✅ Implemented | With cross-file filtering |
 | rename | ✅ Implemented | With workspace edit validation |
 | codeAction | ✅ Implemented | With edit filtering (incl. resolve + executeCommand routing) |
