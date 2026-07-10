@@ -479,7 +479,14 @@ fn fail_terminal_archive_error(
     error: ParserInstallError,
     dest: &Path,
 ) -> Result<(), ParserInstallError> {
-    let _ = fs::remove_dir_all(dest);
+    if let Err(cleanup_error) = fs::remove_dir_all(dest) {
+        return Err(ParserInstallError::ArchiveError(format!(
+            "{}; failed to remove partial destination {}: {}",
+            error,
+            dest.display(),
+            cleanup_error
+        )));
+    }
     Err(error)
 }
 
@@ -1970,6 +1977,27 @@ mod tests {
             Err(ParserInstallError::ArchiveSizeLimitExceeded(_))
         ));
         assert!(!dest.exists(), "terminal archive errors should clean dest");
+    }
+
+    #[test]
+    fn terminal_archive_errors_report_cleanup_failure() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        fs::write(&dest, "not a directory").expect("create non-directory destination");
+
+        let result = fail_terminal_archive_error(
+            ParserInstallError::ArchiveSizeLimitExceeded("too large".to_string()),
+            &dest,
+        );
+
+        match result {
+            Err(ParserInstallError::ArchiveError(message)) => {
+                assert!(message.contains("Archive size limit exceeded: too large"));
+                assert!(message.contains("failed to remove partial destination"));
+                assert!(message.contains(&dest.display().to_string()));
+            }
+            other => panic!("expected combined archive cleanup error, got {other:?}"),
+        }
     }
 
     #[test]
