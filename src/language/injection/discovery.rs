@@ -11,7 +11,8 @@ use super::content::{compute_line_column_offsets, extract_clean_content};
 use super::language::extract_injection_language;
 use super::offset::{InjectionOffset, effective_offset_for_pattern};
 use super::ranges::{
-    compute_included_ranges, compute_included_ranges_clipped, has_include_children_for_pattern,
+    compute_included_ranges, compute_included_ranges_clipped, has_combined_for_pattern,
+    has_include_children_for_pattern,
 };
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
@@ -54,6 +55,8 @@ pub(crate) struct InjectionRegionInfo<'a> {
     /// `CacheableInjectionRegion::from_region_info` run). `None` when the
     /// pattern has no directive.
     pub offset: Option<InjectionOffset>,
+    /// Whether this pattern's captures form one virtual document.
+    pub combined: bool,
 }
 
 /// Owned injection region for caching (no lifetime dependency on parse tree)
@@ -273,7 +276,7 @@ pub(crate) fn collect_all_injections<'a>(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, *root, text.as_bytes());
 
-    // Use a map to deduplicate by content node range
+    // Use a map to deduplicate by content node range.
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
@@ -301,6 +304,7 @@ pub(crate) fn collect_all_injections<'a>(
                             match_.pattern_index,
                         ),
                         offset: effective_offset_for_pattern(query, match_.pattern_index),
+                        combined: has_combined_for_pattern(query, match_.pattern_index),
                     });
             }
         }
@@ -308,7 +312,14 @@ pub(crate) fn collect_all_injections<'a>(
 
     // Sort by start_byte (primary) and end_byte (secondary) to ensure deterministic ordering
     let mut injections: Vec<_> = injections_map.into_values().collect();
-    injections.sort_by_key(|r| (r.content_node.start_byte(), r.content_node.end_byte()));
+    injections.sort_by_key(|r| {
+        (
+            r.content_node.start_byte(),
+            r.content_node.end_byte(),
+            r.pattern_index,
+            r.language.clone(),
+        )
+    });
     Some(injections)
 }
 
@@ -477,7 +488,34 @@ impl InjectionResolver {
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
         let (_region_index, region) = find_injection_at_position(&injections, byte_offset)?;
-        Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+        if region.combined {
+            let group: Vec<_> = injections
+                .iter()
+                .filter(|candidate| {
+                    candidate.combined
+                        && candidate.pattern_index == region.pattern_index
+                        && candidate.language == region.language
+                })
+                .collect();
+            Self::build_combined_injection(
+                coordinator,
+                tracker,
+                uri,
+                &group,
+                None,
+                text,
+                Some(incarnation),
+            )
+        } else {
+            Some(Self::build_resolved_injection(
+                coordinator,
+                tracker,
+                uri,
+                region,
+                text,
+                incarnation,
+            ))
+        }
     }
 
     /// Calculate a stable ULID-based region_id for an injection.
@@ -553,6 +591,90 @@ impl InjectionResolver {
         })
     }
 
+    /// Build one bridge virtual document for all captures of an
+    /// `injection.combined` pattern. Non-content bytes between captures are
+    /// replaced with coordinate-preserving whitespace: the downstream parser
+    /// sees one document and retains cross-block context, while every virtual
+    /// line/column still maps directly back to the host document.
+    fn build_combined_injection(
+        coordinator: &LanguageCoordinator,
+        tracker: &NodeTracker,
+        uri: &Url,
+        regions: &[&InjectionRegionInfo<'_>],
+        prebuilt: Option<&[&CacheableInjectionRegion]>,
+        text: &str,
+        incarnation: Option<u64>,
+    ) -> Option<ResolvedInjection> {
+        debug_assert!(!regions.is_empty());
+        let owned_cacheable;
+        let cacheable: Vec<&CacheableInjectionRegion> = match prebuilt {
+            Some(cacheable) => cacheable.to_vec(),
+            None => {
+                let incarnation = incarnation?;
+                owned_cacheable = regions
+                    .iter()
+                    .map(|region| {
+                        let id = Self::calculate_region_id(tracker, uri, region, incarnation)?;
+                        Some(CacheableInjectionRegion::from_region_info(
+                            region,
+                            &id.to_string(),
+                            text,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                owned_cacheable.iter().collect()
+            }
+        };
+        let first = regions[0];
+        let first_cacheable = cacheable[0];
+        let group_start = first_cacheable.byte_range.start;
+        let group_end = cacheable
+            .iter()
+            .map(|region| region.byte_range.end)
+            .max()
+            .unwrap_or(group_start);
+
+        let mut included = Vec::new();
+        for (region, cacheable) in regions.iter().zip(&cacheable) {
+            let ranges = if region.offset.is_some() {
+                compute_included_ranges_clipped(
+                    &region.content_node,
+                    region.include_children,
+                    text,
+                    cacheable.byte_range.clone(),
+                )
+            } else {
+                compute_included_ranges(&region.content_node, region.include_children)
+            };
+            match ranges {
+                Some(ranges) => included.extend(ranges.into_iter().map(|range| {
+                    cacheable.byte_range.start + range.start_byte
+                        ..cacheable.byte_range.start + range.end_byte
+                })),
+                None => included.push(cacheable.byte_range.clone()),
+            }
+        }
+        included.sort_by_key(|range| (range.start, range.end));
+        let virtual_content = mask_outside_ranges(text, group_start..group_end, &included);
+
+        let mut combined_region = first_cacheable.clone();
+        combined_region.byte_range.end = group_end;
+        combined_region.line_range.end = cacheable
+            .iter()
+            .map(|region| region.line_range.end)
+            .max()
+            .unwrap_or(combined_region.line_range.end);
+        combined_region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
+        let resolved_language =
+            Self::resolve_language(coordinator, &first.language, &virtual_content);
+        Some(ResolvedInjection {
+            region: combined_region,
+            injection_language: resolved_language,
+            virtual_content,
+            line_column_offsets: vec![first_cacheable.start_column],
+        })
+    }
+
     /// Resolve every injection region in the document (whole-doc operations
     /// like `documentLink` use this rather than a position lookup). Holds no
     /// Document lock — `tree`/`text` must already be cloned, typically via
@@ -586,12 +708,15 @@ impl InjectionResolver {
         text: &str,
         incarnation: u64,
     ) -> Vec<ResolvedInjection> {
-        regions
-            .iter()
-            .filter_map(|region| {
-                Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
-            })
-            .collect()
+        Self::resolve_grouped(
+            coordinator,
+            tracker,
+            uri,
+            regions,
+            None,
+            text,
+            Some(incarnation),
+        )
     }
 
     /// [`resolve_from_regions`](Self::resolve_from_regions) fed with the
@@ -607,22 +732,109 @@ impl InjectionResolver {
         cacheable: &[CacheableInjectionRegion],
         text: &str,
     ) -> Vec<ResolvedInjection> {
-        regions
-            .iter()
-            .zip(cacheable.iter())
-            .map(|(region, cacheable_region)| {
+        Self::resolve_grouped(
+            coordinator,
+            &NodeTracker::new(),
+            &Url::parse("file:///prebuilt").unwrap(),
+            regions,
+            Some(cacheable),
+            text,
+            None,
+        )
+    }
+
+    fn resolve_grouped(
+        coordinator: &LanguageCoordinator,
+        tracker: &NodeTracker,
+        uri: &Url,
+        regions: &[InjectionRegionInfo<'_>],
+        prebuilt: Option<&[CacheableInjectionRegion]>,
+        text: &str,
+        incarnation: Option<u64>,
+    ) -> Vec<ResolvedInjection> {
+        let mut resolved = Vec::new();
+        let mut seen_combined = std::collections::HashSet::new();
+        for (index, region) in regions.iter().enumerate() {
+            if region.combined {
+                let key = (region.language.clone(), region.pattern_index);
+                if !seen_combined.insert(key) {
+                    continue;
+                }
+                let indices: Vec<_> = regions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(candidate_index, candidate)| {
+                        (candidate.combined
+                            && candidate.pattern_index == region.pattern_index
+                            && candidate.language == region.language)
+                            .then_some(candidate_index)
+                    })
+                    .collect();
+                let group: Vec<_> = indices.iter().map(|&i| &regions[i]).collect();
+                let prebuilt_group = prebuilt
+                    .map(|cacheable| indices.iter().map(|&i| &cacheable[i]).collect::<Vec<_>>());
+                if let Some(combined) = Self::build_combined_injection(
+                    coordinator,
+                    tracker,
+                    uri,
+                    &group,
+                    prebuilt_group.as_deref(),
+                    text,
+                    incarnation,
+                ) {
+                    resolved.push(combined);
+                }
+            } else if let Some(cacheable) = prebuilt {
                 let (virtual_content, line_column_offsets) =
-                    extract_virtual_content_and_offsets(region, cacheable_region, text);
+                    extract_virtual_content_and_offsets(region, &cacheable[index], text);
                 let resolved_language =
                     Self::resolve_language(coordinator, &region.language, &virtual_content);
-                ResolvedInjection {
-                    region: cacheable_region.clone(),
+                resolved.push(ResolvedInjection {
+                    region: cacheable[index].clone(),
                     injection_language: resolved_language,
                     virtual_content,
                     line_column_offsets,
+                });
+            } else {
+                if let Some(incarnation) = incarnation
+                    && let Some(single) = Self::build_resolved_injection(
+                        coordinator,
+                        tracker,
+                        uri,
+                        region,
+                        text,
+                        incarnation,
+                    )
+                {
+                    resolved.push(single);
                 }
-            })
-            .collect()
+            }
+        }
+        resolved
+    }
+}
+
+fn mask_outside_ranges(text: &str, span: Range<usize>, included: &[Range<usize>]) -> String {
+    let mut output = String::new();
+    let mut cursor = span.start;
+    for range in included {
+        let start = range.start.clamp(cursor, span.end);
+        let end = range.end.clamp(start, span.end);
+        push_coordinate_whitespace(&mut output, clamped_slice(text, cursor..start));
+        output.push_str(clamped_slice(text, start..end));
+        cursor = end;
+    }
+    push_coordinate_whitespace(&mut output, clamped_slice(text, cursor..span.end));
+    output
+}
+
+fn push_coordinate_whitespace(output: &mut String, text: &str) {
+    for character in text.chars() {
+        if matches!(character, '\n' | '\r') {
+            output.push(character);
+        } else {
+            output.extend(std::iter::repeat_n(' ', character.len_utf16()));
+        }
     }
 }
 
@@ -936,6 +1148,35 @@ mod tests {
 
         // The actual deep recursion is tested through integration with refactor.rs
         // where handle_nested_injection recursively processes injections
+    }
+
+    #[test]
+    fn resolve_all_combines_regions_marked_combined() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let open = "<div>"; let close = "</div>"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((string_literal
+                   (string_content) @injection.content)
+                 (#set! injection.language "html")
+                 (#set! injection.combined))
+            "#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("combined");
+
+        let resolved =
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query);
+
+        assert_eq!(resolved.len(), 1, "combined captures form one document");
+        assert!(resolved[0].virtual_content.contains("<div>"));
+        assert!(resolved[0].virtual_content.contains("</div>"));
+        assert!(!resolved[0].virtual_content.contains("let close"));
     }
 
     #[test]
@@ -1343,6 +1584,7 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
@@ -1350,6 +1592,7 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
@@ -1357,6 +1600,7 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
             },
         ];
 
@@ -1428,6 +1672,7 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
@@ -1435,6 +1680,7 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
@@ -1442,6 +1688,7 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
             },
         ];
 
