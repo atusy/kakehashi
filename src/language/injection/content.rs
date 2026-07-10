@@ -397,6 +397,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compute_line_column_offsets_converts_non_ascii_prefix_to_utf16() {
+        // The offsets contract is UTF-16 code units. A fullwidth prefix
+        // "\u{ff1e} " is 4 UTF-8 bytes but 2 UTF-16 units — a byte-derived
+        // width would mint 4 here and shift every translated column. Ranges
+        // carry raw BYTE columns (tree_sitter::Point), so this pins the
+        // byte→UTF-16 conversion at the mint site.
+        //
+        // Text: "\u{ff1e} let x = 1;\n\u{ff1e} let y = 2;\n"
+        //   line 0: bytes  0..15 (prefix 0..4,  code 4..14,  \n at 14)
+        //   line 1: bytes 15..30 (prefix 15..19, code 19..29, \n at 29)
+        let text = "\u{ff1e} let x = 1;\n\u{ff1e} let y = 2;\n";
+        assert_eq!(&text[15..19], "\u{ff1e} ");
+        let included_ranges = vec![
+            tree_sitter::Range {
+                start_byte: 4,
+                end_byte: 15,
+                start_point: tree_sitter::Point { row: 0, column: 4 },
+                end_point: tree_sitter::Point { row: 0, column: 15 },
+            },
+            tree_sitter::Range {
+                start_byte: 19,
+                end_byte: 30,
+                start_point: tree_sitter::Point { row: 1, column: 4 },
+                end_point: tree_sitter::Point { row: 1, column: 15 },
+            },
+        ];
+
+        // start_column mirrors production (already UTF-16, content.rs mints it
+        // via encode_utf16 from the line-0 prefix).
+        let offsets = compute_line_column_offsets(text, 0..30, 2, Some(&included_ranges));
+
+        assert_eq!(
+            offsets,
+            vec![2, 2],
+            "line 1 must mint the UTF-16 width (2), not the 4-byte width"
+        );
+    }
+
     /// Tree-sitter assigns column positions from Range.start_point, not byte offset.
     ///
     /// When `set_included_ranges` is called with ranges whose `start_point.column = 2`,

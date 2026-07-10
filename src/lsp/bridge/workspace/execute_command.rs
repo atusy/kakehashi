@@ -322,3 +322,40 @@ fn parse_execute_command_response(mut response: Value) -> Option<Value> {
     }
     Some(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_relays_a_real_result_verbatim() {
+        let response = json!({
+            "jsonrpc": "2.0", "id": 7,
+            "result": { "applied": true, "custom": [1, 2, 3] }
+        });
+        assert_eq!(
+            parse_execute_command_response(response),
+            Some(json!({ "applied": true, "custom": [1, 2, 3] }))
+        );
+    }
+
+    #[test]
+    fn parse_collapses_a_jsonrpc_error_to_none() {
+        // Fail-soft contract: a downstream error becomes a null result
+        // upstream (warn-logged elsewhere), never an upstream error.
+        let response = json!({
+            "jsonrpc": "2.0", "id": 7,
+            "error": { "code": -32603, "message": "boom" }
+        });
+        assert_eq!(parse_execute_command_response(response), None);
+    }
+
+    #[test]
+    fn parse_collapses_a_null_result_to_none() {
+        // Many servers legitimately answer null (they applied their effect
+        // via applyEdit); None keeps the upstream response null.
+        let response = json!({ "jsonrpc": "2.0", "id": 7, "result": null });
+        assert_eq!(parse_execute_command_response(response), None);
+    }
+}

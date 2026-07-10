@@ -1115,27 +1115,9 @@ mod tests {
     ///
     /// Returns the deps along with the receivers (stored in a tuple) to keep them alive.
     fn dummy_server_request_deps() -> (ServerRequestDeps, impl std::any::Any) {
-        let (tx, rx) = mpsc::channel(16);
-        let caps = Arc::new(DynamicCapabilityRegistry::new());
-        let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
-        let (window_tx, window_rx) = mpsc::channel(16);
-        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
-        let progress_connection_id = progress_registry.new_connection_id();
-        let deps = ServerRequestDeps {
-            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
-            server_name: None,
-            response_tx: tx,
-            dynamic_capabilities: caps,
-            upstream_tx,
-            workspace_folders: WorkspaceFolderSet::new(None),
-            window_tx,
-            upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
-            progress_registry,
-            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
-            progress_connection_id,
-        };
-        (deps, (rx, upstream_rx, window_rx))
+        // Same construction as the typed builder; callers here only need the
+        // receivers kept alive, not read.
+        dummy_server_request_deps_with_rx()
     }
 
     #[tokio::test]
@@ -3585,5 +3567,156 @@ mod tests {
         );
         // No request should have been forwarded to the editor.
         assert!(request_rx.try_recv().is_err());
+    }
+
+    // ---- workspace/applyEdit reader handler ---------------------------------
+
+    #[tokio::test]
+    async fn apply_edit_rejects_unparseable_params_with_invalid_params() {
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let message = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "workspace/applyEdit",
+            "params": { "edit": "not-an-object" }
+        });
+
+        crate::lsp::bridge::workspace::apply_edit::handle(
+            &message,
+            jsonrpc::Id::Number(9),
+            "[test] ",
+            &deps,
+        );
+
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
+            .await
+            .expect("a response must be produced")
+            .expect("channel open");
+        let OutboundMessage::Untracked(value) = sent else {
+            panic!("expected an untracked server-request response");
+        };
+        assert_eq!(
+            value["error"]["code"], -32602,
+            "unparseable params must answer InvalidParams: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_edit_answers_applied_false_when_the_reply_channel_drops() {
+        // The forwarding loop dying mid-flight (or losing the editor response)
+        // drops the reply sender; the downstream must still get a response —
+        // applied:false with the neutral reason — never a hang.
+        let (mut deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        deps.upstream_request_tx = request_tx;
+        let message = json!({
+            "jsonrpc": "2.0", "id": 10, "method": "workspace/applyEdit",
+            "params": { "edit": { "changes": { "file:///x.rs": [] } } }
+        });
+
+        crate::lsp::bridge::workspace::apply_edit::handle(
+            &message,
+            jsonrpc::Id::Number(10),
+            "[test] ",
+            &deps,
+        );
+
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the request must be enqueued")
+            .expect("channel open");
+        let UpstreamRequest::ApplyEdit { reply, .. } = forwarded else {
+            panic!("expected an ApplyEdit upstream request");
+        };
+        drop(reply);
+
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
+            .await
+            .expect("a response must be produced")
+            .expect("channel open");
+        let OutboundMessage::Untracked(value) = sent else {
+            panic!("expected an untracked server-request response");
+        };
+        assert_eq!(value["result"]["applied"], false, "got: {value}");
+        assert!(
+            value["result"]["failureReason"]
+                .as_str()
+                .is_some_and(|r| r.contains("no workspace/applyEdit response")),
+            "the drop path's neutral reason must be relayed: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_edit_still_answers_when_the_forwarding_loop_is_gone() {
+        // Enqueue failure (receiver dropped — shutdown): the handler
+        // unregisters its just-made registry entry and the responder still
+        // answers applied:false via the dropped reply channel — the
+        // downstream never hangs and the registry entry doesn't leak into
+        // the #404 cancel path.
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        // dummy deps' upstream_request_tx receiver is already dropped.
+        let message = json!({
+            "jsonrpc": "2.0", "id": 11, "method": "workspace/applyEdit",
+            "params": { "edit": { "changes": {} } }
+        });
+
+        crate::lsp::bridge::workspace::apply_edit::handle(
+            &message,
+            jsonrpc::Id::Number(11),
+            "[test] ",
+            &deps,
+        );
+
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
+            .await
+            .expect("a response must be produced")
+            .expect("channel open");
+        let OutboundMessage::Untracked(value) = sent else {
+            panic!("expected an untracked server-request response");
+        };
+        assert_eq!(value["result"]["applied"], false, "got: {value}");
+        // The failed-enqueue path must also unregister its just-made registry
+        // entry, or it would leak into the #404 cancel path.
+        assert!(
+            !deps
+                .inbound_request_registry
+                .is_registered(deps.progress_connection_id, &jsonrpc::Id::Number(11)),
+            "the registry entry must not leak after a failed enqueue"
+        );
+    }
+
+    /// Like `dummy_server_request_deps` but hands back the typed receiver
+    /// tuple so tests can read the produced responses.
+    #[allow(clippy::type_complexity)]
+    fn dummy_server_request_deps_with_rx() -> (
+        ServerRequestDeps,
+        (
+            mpsc::Receiver<OutboundMessage>,
+            mpsc::UnboundedReceiver<UpstreamNotification>,
+            mpsc::Receiver<UpstreamNotification>,
+        ),
+    ) {
+        let (tx, rx) = mpsc::channel(16);
+        let caps = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, window_rx) = mpsc::channel(16);
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+        let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            response_tx: tx,
+            dynamic_capabilities: caps,
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id,
+        };
+        (deps, (rx, upstream_rx, window_rx))
     }
 }
