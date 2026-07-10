@@ -697,11 +697,12 @@ async fn reader_loop_with_liveness(
                 // without producing downstream stdout. The timer notification
                 // was already enqueued at registration, so re-check the router
                 // at expiry before declaring a healthy idle server hung.
-                let pending_count = router.pending_count();
-                if pending_count == 0 {
-                    liveness.stop(&server_prefix, "pending count is 0 at expiry");
+                let Some(pending_count) = router.fail_all_if_awaiting_downstream(
+                    "bridge: liveness timeout - server unresponsive"
+                ) else {
+                    liveness.stop(&server_prefix, "no request awaits downstream at expiry");
                     continue;
-                }
+                };
 
                 // Liveness timeout fired - server is unresponsive
                 // This warn! is the primary observability signal for production debugging.
@@ -713,7 +714,6 @@ async fn reader_loop_with_liveness(
                     liveness.timeout_duration(),
                     pending_count
                 );
-                router.fail_all("bridge: liveness timeout - server unresponsive");
                 // Signal liveness failure for state transition (ls-bridge-async-connection Phase 3)
                 let _ = liveness_failed_tx.send(());
                 break;
@@ -3141,8 +3141,7 @@ mod tests {
             router.prepare_cancel_by_upstream(&upstream_id),
             (true, vec![])
         );
-        assert!(!router.claim_for_write(request_id));
-        assert_eq!(router.pending_count(), 0);
+        assert_eq!(router.pending_count(), 1);
 
         let handle = spawn_reader_task_with_liveness(
             reader,

@@ -383,6 +383,42 @@ impl ResponseRouter {
             let _ = pending.response_tx.send(error_response);
         }
     }
+
+    /// Atomically fail the connection only when at least one request still
+    /// expects downstream progress. A queued request already marked cancelled
+    /// is waiting only for the FIFO writer to discard it, so it must not make a
+    /// healthy idle server fail its liveness check.
+    pub(crate) fn fail_all_if_awaiting_downstream(&self, error_message: &str) -> Option<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::fail_all_if_awaiting_downstream");
+        let awaiting = state
+            .pending
+            .values()
+            .filter(|pending| pending.delivery != RequestDelivery::CancelledQueued)
+            .count();
+        if awaiting == 0 {
+            return None;
+        }
+        let entries: Vec<_> = state.pending.drain().collect();
+        state.upstream_to_downstream.clear();
+        state.downstream_to_upstream.clear();
+        drop(state);
+
+        for (id, pending) in entries {
+            let error_response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id.as_i64(),
+                "error": {
+                    "code": -32603,
+                    "message": error_message
+                }
+            });
+            let _ = pending.response_tx.send(error_response);
+        }
+        Some(awaiting)
+    }
 }
 
 /// RAII guard that removes a pending ResponseRouter entry on drop.
