@@ -35,10 +35,10 @@ use url::Url;
 use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
-    host_position_within_region, response_has_jsonrpc_error, transform_workspace_edit_to_host,
-    translate_host_range_to_virtual, translate_virtual_position_to_host,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
-    workspace_edit_within_region,
+    host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
+    transform_workspace_edit_to_host, translate_host_range_to_virtual,
+    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    workspace_edit_has_effect, workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 
@@ -287,7 +287,11 @@ fn finalize_host_resolved_action(
     }
 
     // The resolved edit is already in host coordinates — kept verbatim (no
-    // cross-region / translation concern the virt path guards against).
+    // cross-region / translation concern the virt path guards against),
+    // except versions, which are bridge-local and must not reach the editor.
+    if let Some(edit) = &mut resolved.edit {
+        strip_bridge_local_versions(edit);
+    }
     let server_title = std::mem::take(&mut resolved.title);
     resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, &server_name);
 
@@ -345,6 +349,10 @@ fn translate_edit_host_ward_strict(
     if !transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset) {
         return Err(REASON_CROSS_REGION);
     }
+    // Reached directly by the client-driven resolve path (which bypasses
+    // bridge_code_action's own strip): versions on OTHER real files are
+    // bridge-local too and must not reach the editor.
+    strip_bridge_local_versions(edit);
     if workspace_edit_is_empty(edit) {
         return Err(REASON_RESOLVE);
     }
@@ -1262,6 +1270,10 @@ fn bridge_code_action(
 
     match &mut action.edit {
         Some(edit) => {
+            // Versions in a downstream's edit are bridge-local (its own didOpen
+            // counter) and would read as stale to version-checking editors —
+            // null them on every layer before the edit can reach the client.
+            strip_bridge_local_versions(edit);
             // Virt layer: translate host-ward with resolve-grade validation
             // (the same check the client-driven resolve path uses), so an
             // edit touching another region — including an eager-resolved lazy
@@ -2095,9 +2107,10 @@ mod tests {
     }
 
     #[test]
-    fn host_layer_policy_keeps_edit_verbatim() {
+    fn host_layer_policy_keeps_edit_uris_and_ranges_untranslated() {
         // Host layer (virt = None): real URIs/coordinates, no translation —
-        // but the suffix and command policy still apply.
+        // but the suffix and command policy still apply (and versions are
+        // nulled, pinned separately by host_layer_edit_versions_are_stripped).
         let actions: Vec<CodeActionOrCommand> = serde_json::from_value(json!([
             {
                 "title": "Sort imports",
@@ -2556,6 +2569,161 @@ mod tests {
     }
 
     // -- host resolve finalization -------------------------------------------
+
+    #[test]
+    fn host_layer_edit_versions_are_stripped() {
+        // Host-layer edits are verbatim EXCEPT versions: the downstream's
+        // document versions live in the bridge's version space (its own
+        // didOpen counter), so relaying them verbatim makes version-checking
+        // editors (Neovim) skip the edit as stale.
+        let actions: Vec<CodeActionOrCommand> = serde_json::from_value(json!([
+            {
+                "title": "Sort imports",
+                "edit": {
+                    "documentChanges": [{
+                        "textDocument": { "uri": "file:///test.md", "version": 2 },
+                        "edits": [{
+                            "range": {
+                                "start": { "line": 50, "character": 0 },
+                                "end": { "line": 50, "character": 5 }
+                            },
+                            "newText": "sorted"
+                        }]
+                    }]
+                }
+            }
+        ]))
+        .unwrap();
+
+        let bridged = bridge_code_actions(
+            actions,
+            "marksman",
+            "file:///test.md",
+            caps(true),
+            false,
+            None,
+        );
+        let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
+            panic!("Expected CodeAction");
+        };
+        match action.edit.as_ref().unwrap().document_changes.as_ref() {
+            Some(DocumentChanges::Edits(edits)) => {
+                assert_eq!(
+                    edits[0].text_document.version, None,
+                    "bridge-local version must not reach the editor"
+                );
+            }
+            other => panic!("Expected Edits variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_translate_strips_bridge_local_versions_on_real_files() {
+        // The client-driven virt resolve path reaches the shared strict
+        // translate directly (not via bridge_code_action), so the strip must
+        // live inside it too: a resolved multi-file edit's OTHER real files
+        // carry bridge-local versions that would read as stale to the editor.
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit: WorkspaceEdit = serde_json::from_value(json!({
+            "documentChanges": [
+                {
+                    "textDocument": { "uri": virtual_uri, "version": 3 },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "x"
+                    }]
+                },
+                {
+                    "textDocument": { "uri": "file:///other.lua", "version": 7 },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 1, "character": 0 },
+                            "end": { "line": 1, "character": 5 }
+                        },
+                        "newText": "x"
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+
+        translate_edit_host_ward_strict(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+            Position {
+                line: u32::MAX,
+                character: u32::MAX,
+            },
+        )
+        .expect("edit must translate");
+
+        match edit.document_changes.unwrap() {
+            DocumentChanges::Edits(edits) => {
+                assert!(
+                    edits.iter().all(|e| e.text_document.version.is_none()),
+                    "no bridge-local version may reach the editor"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
+        }
+    }
+
+    #[test]
+    fn host_resolve_strips_bridge_local_edit_versions() {
+        let resolved: CodeAction = serde_json::from_value(json!({
+            "title": "Sort imports",
+            "edit": { "documentChanges": [{
+                "textDocument": { "uri": "file:///test.md", "version": 3 },
+                "edits": [{
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end": { "line": 1, "character": 5 }
+                    },
+                    "newText": "sorted"
+                }]
+            }] }
+        }))
+        .unwrap();
+        let action: CodeAction = serde_json::from_value(json!({
+            "title": "Sort imports — srv", "data": { "id": 1 }
+        }))
+        .unwrap();
+        let envelope: CodeActionEnvelope = serde_json::from_value(json!({
+            "origin": "srv",
+            "host_uri": "file:///test.md",
+            "region_id": "",
+            "injection_language": "",
+            "offset": { "line": 0, "column": 0 },
+            "original_title": "Sort imports",
+            "inner": null,
+            "host_layer": true
+        }))
+        .unwrap();
+
+        let out = finalize_host_resolved_action(
+            resolved,
+            action,
+            envelope,
+            "Sort imports — srv".to_string(),
+            caps_resolve(),
+        );
+
+        match out.edit.as_ref().unwrap().document_changes.as_ref() {
+            Some(DocumentChanges::Edits(edits)) => {
+                assert_eq!(
+                    edits[0].text_document.version, None,
+                    "bridge-local version must not reach the editor"
+                );
+            }
+            other => panic!("Expected Edits variant, got {other:?}"),
+        }
+    }
 
     #[test]
     fn host_resolve_disables_command_only_action_when_routing_name_unencodable() {

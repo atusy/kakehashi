@@ -3,14 +3,16 @@
 //! Walks the resolved layer order (cross-layer-aggregation): the virt layer
 //! bridges the injection region under the cursor, the host layer
 //! (host-document-bridge) bridges the host document itself with the real URI
-//! and the response verbatim. The first layer producing a non-empty result
-//! wins (`preferred`).
+//! and the response as-is except that bridge-local
+//! `TextDocumentEdit.version`s are nulled. The first layer producing a
+//! non-empty result wins (`preferred`).
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{NumberOrString, Position, RenameParams, Uri, WorkspaceEdit};
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::bridge::strip_bridge_local_versions;
 use crate::lsp::bridge::workspace_edit_has_effect;
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
@@ -35,7 +37,14 @@ impl Kakehashi {
             raw_params,
             virt,
             native,
-            parse_host_verbatim::<WorkspaceEdit>,
+            // Host-layer edits are verbatim except versions: a downstream's
+            // document versions are bridge-local and would read as stale to
+            // version-checking editors.
+            |value| {
+                let mut edit = parse_host_verbatim::<WorkspaceEdit>(value)?;
+                strip_bridge_local_versions(&mut edit);
+                Some(edit)
+            },
             rename_workspace_edit_has_result,
         )
         .await

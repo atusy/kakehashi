@@ -11,7 +11,9 @@
 //! The host/virt distinction is made from the edit itself, not the connection:
 //! an edit that touches **no** virtual URIs (every edit from a host-layer
 //! connection, and real-file-only edits from virt connections) is forwarded
-//! verbatim. An edit that touches exactly one virtual document is translated
+//! as-is except that every `TextDocumentEdit.version` is nulled — downstream
+//! versions are bridge-local and would read as stale to the editor. An edit
+//! that touches exactly one virtual document is translated
 //! against that region's live offset (rebuilt exactly as goto/showDocument do,
 //! via [`resolve_region_offset`](super::region_offset::resolve_region_offset)).
 //!
@@ -26,6 +28,12 @@
 //! `label` and `changeAnnotations` pass through untouched (the transform only
 //! rewrites URIs/ranges/versions).
 //!
+//! Known degenerate edge: the transform drops a foreign-virtual entry with an
+//! EMPTY edit vector (a no-op), so an editor `failedChange` index can be
+//! skewed by one relative to what the downstream sent. A real (non-empty)
+//! foreign entry rejects the whole edit instead, so indexes never skew for
+//! edits that actually apply anything.
+//!
 //! [`transform_workspace_edit_to_host`]: crate::lsp::bridge::transform_workspace_edit_to_host
 
 use std::sync::Arc;
@@ -38,8 +46,8 @@ use tower_lsp_server::ls_types::{
 use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{
-    BridgeCoordinator, RegionOffset, VirtualDocumentUri, transform_workspace_edit_to_host,
-    workspace_edit_within_region,
+    BridgeCoordinator, RegionOffset, VirtualDocumentUri, strip_bridge_local_versions,
+    transform_workspace_edit_to_host, workspace_edit_within_region,
 };
 
 use super::region_offset::resolve_region_offset;
@@ -69,14 +77,18 @@ impl ApplyEditTranslator {
         }
     }
 
-    /// Translate a virtual-document applyEdit to host coordinates; forward
-    /// `params` unchanged when the edit touches no virtual URIs. `Err` carries
-    /// the `failureReason` for a local `applied: false` answer — the edit must
+    /// Translate a virtual-document applyEdit to host coordinates; when the
+    /// edit touches no virtual URIs, forward `params` with only the
+    /// bridge-local `TextDocumentEdit.version`s nulled. `Err` carries the
+    /// `failureReason` for a local `applied: false` answer — the edit must
     /// not reach the editor. See the module docs for the exact behavior.
     pub(super) async fn translate(
         &self,
         mut params: ApplyWorkspaceEditParams,
     ) -> Result<ApplyWorkspaceEditParams, String> {
+        // Downstream document versions live in the bridge's version space,
+        // never the editor's — null them on every forward (see the helper).
+        strip_bridge_local_versions(&mut params.edit);
         let virtual_uris = collect_virtual_uris(&params.edit);
         let virtual_uri = match virtual_uris.as_slice() {
             // No virtual URIs: a host-layer connection's edit (real URIs
@@ -166,9 +178,10 @@ fn transform_params_to_host(
 /// A text-edit entry (`changes` value or a `TextDocumentEdit`) with an EMPTY
 /// edit vector is a no-op and does NOT count as touching its URI: an edit that
 /// is real-file-only but carries a stray empty virtual entry must forward
-/// verbatim, not be routed down the virtual-translation path (and then fail
-/// `applied: false`). File operations always count — a create/rename/delete is
-/// a real change even with no accompanying text edits.
+/// as-is (modulo the version nulling every forward gets), not be routed down
+/// the virtual-translation path (and then fail `applied: false`). File
+/// operations always count — a create/rename/delete is a real change even
+/// with no accompanying text edits.
 fn collect_virtual_uris(edit: &WorkspaceEdit) -> Vec<String> {
     let mut uris: Vec<String> = Vec::new();
     let mut push = |uri: &str| {
@@ -267,6 +280,35 @@ mod tests {
             .await
             .expect("real-file edit must pass through");
         assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn strips_bridge_local_versions_from_forwarded_real_file_edits() {
+        // A host-layer downstream's document versions live in the BRIDGE's
+        // version space (didOpen starts its own counter at 1), not the
+        // editor's. Relaying a versioned documentChanges edit verbatim makes
+        // version-checking editors (Neovim) skip it as stale — the version
+        // must be nulled ("apply without check") on the editor-ward relay.
+        let original: ApplyWorkspaceEditParams = serde_json::from_value(json!({
+            "edit": { "documentChanges": [{
+                "textDocument": { "uri": "file:///project/doc.md", "version": 2 },
+                "edits": [text_edit(3)]
+            }] }
+        }))
+        .unwrap();
+        let out = translator()
+            .translate(original)
+            .await
+            .expect("real-file edit must pass through");
+        match out.edit.document_changes.as_ref().unwrap() {
+            DocumentChanges::Edits(edits) => {
+                assert_eq!(
+                    edits[0].text_document.version, None,
+                    "bridge-local version must not reach the editor"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
+        }
     }
 
     #[tokio::test]

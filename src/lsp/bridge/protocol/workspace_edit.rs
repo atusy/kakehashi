@@ -198,6 +198,43 @@ fn transform_text_document_edit(
     false
 }
 
+/// Null every `TextDocumentEdit.version` in an editor-ward `WorkspaceEdit`.
+///
+/// A bridged downstream's document versions live in the BRIDGE's version
+/// space (each connection's didOpen starts its own counter at 1), not the
+/// editor's. Relaying a versioned `documentChanges` edit verbatim makes
+/// version-checking editors (e.g. Neovim's `apply_text_document_edit`) skip
+/// the edit as stale. `version: null` means "apply without a version check"
+/// per spec — the same treatment the virtual→host transform gives the
+/// request's own document. Call at every editor-ward relay boundary
+/// (applyEdit forward, host-layer rename/codeAction results).
+///
+/// Deliberately erase-without-validate: the version was never a working
+/// cross-boundary protection (the spaces differ, so pre-strip it rejected
+/// EVERYTHING), and the majority shape (`changes` map) carries no version at
+/// all. What remains is COORDINATE validity on virtual paths (region
+/// freshness + region bounds) — not general content freshness, and nothing
+/// on host paths: an action whose edit aged in the editor's menu while the
+/// user kept typing applies unconditionally, versioned shape or not. Mapping
+/// downstream versions to editor versions (instead of erasing) is follow-up
+/// hardening.
+pub(crate) fn strip_bridge_local_versions(edit: &mut WorkspaceEdit) {
+    let Some(doc_changes) = &mut edit.document_changes else {
+        return;
+    };
+    let strip = |e: &mut TextDocumentEdit| e.text_document.version = None;
+    match doc_changes {
+        DocumentChanges::Edits(edits) => edits.iter_mut().for_each(strip),
+        DocumentChanges::Operations(ops) => ops
+            .iter_mut()
+            .filter_map(|op| match op {
+                DocumentChangeOperation::Edit(e) => Some(e),
+                DocumentChangeOperation::Op(_) => None,
+            })
+            .for_each(strip),
+    }
+}
+
 /// Whether every text edit targeting `host_uri` in a HOST-coordinate
 /// `WorkspaceEdit` is CONTAINED in the injection region — bounded above by
 /// `region_end` and below, PER LINE, by the region's line offset (`offset`).
