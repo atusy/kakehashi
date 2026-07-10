@@ -822,11 +822,15 @@ fn diagnostic_result_id(items: &[Diagnostic]) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     let mut writer = FnvWriter(FNV_OFFSET);
     // Serialization of ls_types values cannot realistically fail (no non-string
-    // map keys) and `FnvWriter` never errors; were it ever to fail anyway, the
-    // partial-stream hash still differs per content and the `-len` suffix
-    // still discriminates by count, so a false "unchanged" additionally needs
-    // a hash collision — the accepted 2^-64 trade above.
-    let _ = serde_json::to_writer(&mut writer, items);
+    // map keys, and JSON numbers cannot be non-finite) and `FnvWriter` never
+    // errors; if it ever fails anyway, FAIL OPEN with an id that can never
+    // match a previous one — two differing sets could share a partial-stream
+    // prefix hash, and a false "unchanged" must stay impossible.
+    if serde_json::to_writer(&mut writer, items).is_err() {
+        static UNHASHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = UNHASHABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return format!("unhashable-{nonce}-{}", items.len());
+    }
     format!("{:016x}-{}", writer.0, items.len())
 }
 
