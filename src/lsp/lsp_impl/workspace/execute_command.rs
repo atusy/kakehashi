@@ -37,6 +37,7 @@ impl Kakehashi {
         // drop a cancel fired while it runs. Subscribed here, such a cancel is
         // latched in the receiver and the select below sees it immediately.
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
 
         self.sync_origin_documents_before_execute(&params, &settings)
             .await;
@@ -59,7 +60,9 @@ impl Kakehashi {
         // The cancel arm DROPS the in-flight dispatch, which then never
         // reaches its own refcounted unregister — sweep the id (idempotent
         // after normal completion, where the dispatch cleaned up itself).
-        pool.unregister_all_for_upstream_id(crate::lsp::current_upstream_id().as_ref());
+        // The CAPTURED id, not a re-read of the task-local: the sweep must
+        // target exactly the id the dispatch registered under.
+        pool.unregister_all_for_upstream_id(sweep_id.as_ref());
         result
     }
 
@@ -120,7 +123,11 @@ impl Kakehashi {
                 )
                 .await;
         });
-        match tokio::time::timeout(SYNC_TIMEOUT, open_task).await {
+        // Bound only the WAIT: on timeout the task keeps running detached (see
+        // above), but a watcher still awaits the handle so a background panic
+        // surfaces instead of vanishing with the dropped JoinHandle.
+        let mut open_task = open_task;
+        match tokio::time::timeout(SYNC_TIMEOUT, &mut open_task).await {
             Ok(Ok(())) => return,
             // The spawned open PANICKED (or was aborted): surface it — a
             // swallowed JoinError would hide a real bug behind "the heal
@@ -144,6 +151,15 @@ impl Kakehashi {
                 "executeCommand: pre-sync of origin '{}' documents timed out after {SYNC_TIMEOUT:?}; dispatching anyway",
                 route.origin
             );
+            let origin = route.origin.to_string();
+            tokio::spawn(async move {
+                if let Err(join_error) = open_task.await {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: background pre-sync of origin {origin:?} documents failed: {join_error}"
+                    );
+                }
+            });
         }
     }
 }

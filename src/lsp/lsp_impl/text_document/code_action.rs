@@ -216,6 +216,7 @@ impl Kakehashi {
         // downstream; the -32800 answer would otherwise be collapsed by the
         // fail-soft parsing) — mirrors the multi-region codeAction walk.
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
         let pool = self.bridge.pool_arc();
         let dispatch = pool.dispatch_code_action_resolve(
             action,
@@ -235,7 +236,9 @@ impl Kakehashi {
         // The cancel arm DROPS the in-flight dispatch, which then never
         // reaches its own refcounted unregister — sweep the id (idempotent
         // after normal completion, where the dispatch cleaned up itself).
-        pool.unregister_all_for_upstream_id(crate::lsp::current_upstream_id().as_ref());
+        // The CAPTURED id, not a re-read of the task-local: the sweep must
+        // target exactly the id the dispatch registered under.
+        pool.unregister_all_for_upstream_id(sweep_id.as_ref());
         result
     }
 
