@@ -676,7 +676,7 @@ mod tests {
         // The served item is host-translated (region at host line 5); the
         // outgoing resolve must restore virtual coordinates or a downstream
         // echoing the ranges verbatim gets them double-shifted on return.
-        let mut item = CompletionItem {
+        let item = CompletionItem {
             label: "print".to_string(),
             text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
                 tower_lsp_server::ls_types::TextEdit {
@@ -698,13 +698,25 @@ mod tests {
         let envelope = test_envelope();
         let offset = RegionOffset::from(&envelope.offset);
 
-        translate_item_ranges_host_to_virtual(&mut item, &offset);
+        // Reproduce the production wiring: clone, untranslate, build the
+        // outgoing request — and assert on the SERIALIZED request, so
+        // removing the untranslation step in send_completion_resolve_request
+        // has a matching failure here.
+        let mut outgoing = item.clone();
+        translate_item_ranges_host_to_virtual(&mut outgoing, &offset);
+        let request = build_completion_resolve_request(&outgoing, RequestId::new(7));
+        let wire = serde_json::to_value(&request).unwrap();
 
+        assert_eq!(
+            wire["params"]["textEdit"]["range"]["start"]["line"], 0,
+            "the resolve request must carry VIRTUAL coordinates (host 5 → virtual 0): {wire}"
+        );
+        assert_eq!(wire["params"]["textEdit"]["range"]["end"]["line"], 0);
+        // The served item stays host-translated for the fail-soft returns.
         let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &item.text_edit
         else {
             panic!("edit variant preserved");
         };
-        assert_eq!(edit.range.start.line, 0, "host line 5 → virtual line 0");
-        assert_eq!(edit.range.end.line, 0);
+        assert_eq!(edit.range.start.line, 5);
     }
 }

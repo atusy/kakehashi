@@ -118,10 +118,10 @@ the isolated snippet, any edits it returns — including auto-import edits — a
 placed relative to the embedded block, so file-level imports may not land where they
 would in a standalone file. Edits that would corrupt the host document around the
 embedded block (escape the region, break blockquote `> ` prefixes, or merge content
-into the closing fence) are dropped fail-closed: at completion time an unsafe
-primary edit drops the item and an unsafe auto-import set is dropped whole while
-the completion itself still applies; at resolve time an unsafe resolved response
-is discarded and the unresolved item is served instead. Default combine strategy: `preferred`.
+into the closing fence) are dropped fail-closed: an unsafe primary edit drops
+the item (at resolve time, the unsafe resolved response is discarded and the
+unresolved item is served instead), while an unsafe auto-import set — at either
+stage — is dropped whole and the completion itself still applies. Default combine strategy: `preferred`.
 
 ### Signature help
 
@@ -238,8 +238,10 @@ differently.
 and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
 Shows color swatches and color picker presentations for embedded blocks.
-Presentations whose edits (explicit, or the implicit label replacement) would
-corrupt the host document around the embedded block are dropped fail-closed.
+Presentations whose primary edit (explicit, or the implicit label replacement)
+would corrupt the host document around the embedded block are dropped
+fail-closed; unsafe additional edits are dropped as one atomic set while the
+presentation itself survives.
 **Only available with the `KAKEHASHI_EXPERIMENTAL=true` environment variable** —
 without the opt-in the server does not advertise color support.
 
