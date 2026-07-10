@@ -71,6 +71,7 @@ pub(crate) use protocol::strip_bridge_local_versions;
 pub(crate) use protocol::transform_workspace_edit_to_host;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
+pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
 pub(crate) use protocol::workspace_edit_within_region;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{

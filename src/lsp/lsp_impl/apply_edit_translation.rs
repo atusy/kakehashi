@@ -47,7 +47,8 @@ use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{
     BridgeCoordinator, RegionOffset, VirtualDocumentUri, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, workspace_edit_within_region,
+    transform_workspace_edit_to_host, workspace_edit_preserves_line_prefixes,
+    workspace_edit_within_region,
 };
 
 use super::region_offset::resolve_region_offset;
@@ -164,6 +165,17 @@ fn transform_params_to_host(
         return Err(
             "kakehashi: the edit extends outside the injected region; it cannot be applied to the \
              host document without corrupting surrounding text"
+                .to_string(),
+        );
+    }
+    // The transform translates ranges but emits newText verbatim: an edit that
+    // spans or inserts lines in a line-prefixed (e.g. blockquote) region would
+    // strip the prefixes it overlaps and leave the inserted lines unprefixed.
+    if !workspace_edit_preserves_line_prefixes(&params.edit, host_uri, offset) {
+        return Err(
+            "kakehashi: the edit would break the host document's line prefixes around the \
+             injected region (e.g. a blockquote); it cannot be applied without corrupting the \
+             host document"
                 .to_string(),
         );
     }
@@ -490,6 +502,38 @@ mod tests {
         .expect_err("a host edit before the region start must reject the whole edit");
         assert!(
             reason.contains("outside the injected region"),
+            "reason should name the failure: {reason}"
+        );
+    }
+
+    #[test]
+    fn transform_params_to_host_rejects_prefix_breaking_edit() {
+        // A blockquote region (per-line `> ` prefixes, width 2): a downstream
+        // multi-line replacement translates to a host range containing the
+        // interior lines' prefixes, but its newText carries none — applying it
+        // would strip the prefixes and break the blockquote. Reject with
+        // applied:false, never corrupt.
+        let uri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut params = params_with_edit(json!({
+            "changes": { uri.clone(): [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 1, "character": 4 }
+                },
+                "newText": "import a\nimport b"
+            }] }
+        }));
+
+        let reason = transform_params_to_host(
+            &mut params,
+            &uri,
+            &host_uri(),
+            &RegionOffset::with_per_line_offsets(10, vec![2, 2]),
+            Position::new(11, 6),
+        )
+        .expect_err("a prefix-breaking edit must reject the whole edit");
+        assert!(
+            reason.contains("line prefixes"),
             "reason should name the failure: {reason}"
         );
     }

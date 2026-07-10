@@ -40,5 +40,5 @@ pub(crate) use translation::*;
 pub(crate) use virtual_uri::VirtualDocumentUri;
 pub(crate) use workspace_edit::{
     strip_bridge_local_versions, transform_workspace_edit_to_host, workspace_edit_has_effect,
-    workspace_edit_within_region,
+    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
