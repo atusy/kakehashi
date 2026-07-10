@@ -108,6 +108,17 @@ impl ResponseRouter {
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
     ) -> Option<oneshot::Receiver<serde_json::Value>> {
+        self.register_with_upstream_liveness(downstream_id, upstream_id)
+            .map(|(rx, _)| rx)
+    }
+
+    /// Register and atomically report whether this request transitions the
+    /// set of downstream-progressing requests from empty to non-empty.
+    pub(crate) fn register_with_upstream_liveness(
+        &self,
+        downstream_id: RequestId,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<(oneshot::Receiver<serde_json::Value>, bool)> {
         let (tx, rx) = oneshot::channel();
         let mut state = self
             .state
@@ -118,6 +129,10 @@ impl ResponseRouter {
         if state.pending.contains_key(&downstream_id) {
             return None;
         }
+        let starts_liveness = state
+            .pending
+            .values()
+            .all(|pending| pending.delivery == RequestDelivery::CancelledQueued);
 
         state.pending.insert(
             downstream_id,
@@ -139,7 +154,7 @@ impl ResponseRouter {
             state.downstream_to_upstream.insert(downstream_id, upstream);
         }
 
-        Some(rx)
+        Some((rx, starts_liveness))
     }
 
     /// Look up every in-flight downstream request ID for an upstream request
@@ -683,7 +698,10 @@ mod tests {
 
         assert_eq!(router.pending_count(), 1);
         assert_eq!(router.awaiting_downstream_count(), 0);
-        let _live_rx = router.register(RequestId::new(2)).unwrap();
+        let (_live_rx, starts_liveness) = router
+            .register_with_upstream_liveness(RequestId::new(2), None)
+            .unwrap();
+        assert!(starts_liveness);
         assert_eq!(router.pending_count(), 2);
         assert_eq!(router.awaiting_downstream_count(), 1);
     }

@@ -840,24 +840,14 @@ impl ConnectionHandle {
         &self,
         upstream_id: Option<UpstreamId>,
     ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
-        // Check if this will be the first pending request (0->1 transition)
-        //
-        // SAFETY: This check is not atomic with register(), but the race is benign:
-        // - If two threads both see pending_count()==0 and both call notify_liveness_start(),
-        //   the second notification is dropped (try_send on capacity-1 channel).
-        // - If thread A sees 0, thread B sees A's registration (count=1), only A notifies,
-        //   which is correct behavior.
-        // Either way, the timer starts exactly once when pending goes 0->1.
-        let was_empty = self.router().awaiting_downstream_count() == 0;
-
         let request_id = RequestId::new(self.next_request_id());
-        let response_rx = self
+        let (response_rx, starts_liveness) = self
             .router()
-            .register_with_upstream(request_id, upstream_id)
+            .register_with_upstream_liveness(request_id, upstream_id)
             .ok_or_else(|| io::Error::other("bridge: duplicate request ID"))?;
 
         // If pending went 0->1 and we're in Ready state, start liveness timer
-        if was_empty && self.state() == ConnectionState::Ready {
+        if starts_liveness && self.state() == ConnectionState::Ready {
             self.reader_handle.notify_liveness_start();
         }
 
