@@ -670,6 +670,7 @@ struct LimitedReader<R> {
     inner: R,
     remaining: u64,
     limit: u64,
+    limit_exceeded: bool,
 }
 
 impl<R> LimitedReader<R> {
@@ -678,6 +679,7 @@ impl<R> LimitedReader<R> {
             inner,
             remaining: limit,
             limit,
+            limit_exceeded: false,
         }
     }
 }
@@ -688,13 +690,22 @@ impl<R: Read> Read for LimitedReader<R> {
             return Ok(0);
         }
         if self.remaining == 0 {
+            if self.limit_exceeded {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    ArchiveLimitError { limit: self.limit },
+                ));
+            }
             let mut probe = [0];
             return match self.inner.read(&mut probe) {
                 Ok(0) => Ok(0),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    ArchiveLimitError { limit: self.limit },
-                )),
+                Ok(_) => {
+                    self.limit_exceeded = true;
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        ArchiveLimitError { limit: self.limit },
+                    ))
+                }
                 Err(e) => Err(e),
             };
         }
@@ -1802,11 +1813,13 @@ mod tests {
 
     #[test]
     fn unpack_entry_atomically_removes_partial_file_on_stream_limit() {
+        const STREAM_LIMIT_BYTES: u64 = 520;
+
         let temp = tempdir().expect("Failed to create temp dir");
         let relative = Path::new("payload.bin");
         let target = temp.path().join(relative);
         let tar = tar_archive_with_payload("parser-1.0.0", 16);
-        let mut archive = Archive::new(LimitedReader::new(&tar[..], 520));
+        let mut archive = Archive::new(LimitedReader::new(&tar[..], STREAM_LIMIT_BYTES));
         let mut entry = archive
             .entries()
             .expect("entry iterator should be created")
@@ -1819,7 +1832,9 @@ mod tests {
         match result {
             Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
                 assert!(
-                    message.contains("decompressed tar stream exceeds 520 bytes"),
+                    message.contains(&format!(
+                        "decompressed tar stream exceeds {STREAM_LIMIT_BYTES} bytes"
+                    )),
                     "unexpected message: {message}"
                 );
             }
@@ -1909,6 +1924,33 @@ mod tests {
                 .to_string()
                 .contains("decompressed tar stream exceeds 3 bytes"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn limited_reader_does_not_consume_more_after_limit_error() {
+        use std::io::Read;
+
+        let inner = std::io::Cursor::new(b"abcdef".to_vec());
+        let mut reader = LimitedReader::new(inner, 3);
+        let mut buffer = [0; 3];
+
+        assert_eq!(reader.read(&mut buffer).unwrap(), 3);
+        assert_eq!(buffer, *b"abc");
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let position_after_first_error = reader.inner.position();
+
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            reader.inner.position(),
+            position_after_first_error,
+            "retries after the first limit error must not advance the inner reader"
         );
     }
 
@@ -2018,18 +2060,20 @@ mod tests {
         path: &str,
         entry_type: tar::EntryType,
         data: &[u8],
-        header_size: u64,
+        declared_size: u64,
     ) {
         use tar::Header;
 
         let mut header = Header::new_ustar();
         header.set_path(path).expect("set tar path");
         header.set_entry_type(entry_type);
-        header.set_size(header_size);
+        header.set_size(declared_size);
         header.set_mode(0o644);
         header.set_cksum();
         archive.extend_from_slice(header.as_bytes());
         archive.extend_from_slice(data);
+        // Fixtures may declare more bytes than they write so size-limit tests
+        // stay small. Padding follows the bytes actually written.
         pad_tar_entry(archive, data.len() as u64);
     }
 
