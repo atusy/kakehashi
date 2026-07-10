@@ -28,6 +28,7 @@ struct ReadyEvent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct FrameMetric {
     ready_sequence: Option<u64>,
+    write_sequence: u64,
     method: Option<String>,
     id: Option<Id>,
     body_bytes: usize,
@@ -46,6 +47,12 @@ struct PartialFrameMetric {
     accepted_frame_bytes: usize,
     write_start_us: u64,
     last_byte_us: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WriteAttempt {
+    at: Instant,
+    sequence: u64,
 }
 
 #[derive(Default)]
@@ -141,6 +148,16 @@ impl StdoutMetrics {
         at.saturating_duration_since(self.origin).as_micros() as u64
     }
 
+    fn next_event_sequence(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("StdoutMetrics::next_event_sequence");
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.wrapping_add(1);
+        sequence
+    }
+
     fn record_partial_frame(&self, frame: PartialFrameMetric) {
         self.state
             .lock()
@@ -176,7 +193,7 @@ struct FrameObserver {
     metrics: Arc<StdoutMetrics>,
     decode: DecodeState,
     awaiting_flush: Vec<(FrameMetric, Option<Id>)>,
-    poll_write_attempt: Option<Instant>,
+    poll_write_attempt: Option<WriteAttempt>,
 }
 
 #[doc(hidden)]
@@ -293,7 +310,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MeasuredStdout<W> {
 enum DecodeState {
     Header {
         bytes: Vec<u8>,
-        write_start: Option<Instant>,
+        write_start: Option<WriteAttempt>,
         last_byte: Option<Instant>,
     },
     Body {
@@ -302,7 +319,7 @@ enum DecodeState {
         seen: usize,
         prefix: Vec<u8>,
         tail: Vec<u8>,
-        write_start: Instant,
+        write_start: WriteAttempt,
         last_byte: Instant,
     },
     Disabled,
@@ -323,14 +340,24 @@ impl FrameObserver {
     }
 
     fn write_attempt(&mut self, at: Instant) {
-        self.poll_write_attempt = Some(at);
+        let attempt = WriteAttempt {
+            at,
+            sequence: self.metrics.next_event_sequence(),
+        };
+        self.poll_write_attempt = Some(attempt);
         if let DecodeState::Header { write_start, .. } = &mut self.decode {
-            write_start.get_or_insert(at);
+            write_start.get_or_insert(attempt);
         }
     }
 
     fn accepted(&mut self, mut bytes: &[u8], at: Instant) {
-        let poll_write_attempt = self.poll_write_attempt.take().unwrap_or(at);
+        let poll_write_attempt = self
+            .poll_write_attempt
+            .take()
+            .unwrap_or_else(|| WriteAttempt {
+                at,
+                sequence: self.metrics.next_event_sequence(),
+            });
         while !bytes.is_empty() {
             match &mut self.decode {
                 DecodeState::Header {
@@ -338,7 +365,7 @@ impl FrameObserver {
                     write_start,
                     last_byte,
                 } => {
-                    write_start.get_or_insert(at);
+                    write_start.get_or_insert(poll_write_attempt);
                     *last_byte = Some(at);
                     let byte = bytes[0];
                     bytes = &bytes[1..];
@@ -397,12 +424,13 @@ impl FrameObserver {
                         self.awaiting_flush.push((
                             FrameMetric {
                                 ready_sequence: None,
+                                write_sequence: write_start.sequence,
                                 method,
                                 id: id.clone(),
                                 body_bytes: *content_length,
                                 frame_bytes: *header_bytes + *content_length,
                                 ready_us: None,
-                                write_start_us: self.metrics.timestamp_us(*write_start),
+                                write_start_us: self.metrics.timestamp_us(write_start.at),
                                 last_byte_us: self.metrics.timestamp_us(at),
                                 flush_complete_us: None,
                                 id_unattributed,
@@ -444,8 +472,10 @@ impl Drop for FrameObserver {
                 phase: "header",
                 expected_frame_bytes: None,
                 accepted_frame_bytes: bytes.len(),
-                write_start_us: self.metrics.timestamp_us(*write_start),
-                last_byte_us: self.metrics.timestamp_us(last_byte.unwrap_or(*write_start)),
+                write_start_us: self.metrics.timestamp_us(write_start.at),
+                last_byte_us: self
+                    .metrics
+                    .timestamp_us(last_byte.unwrap_or(write_start.at)),
             }),
             DecodeState::Body {
                 header_bytes,
@@ -458,7 +488,7 @@ impl Drop for FrameObserver {
                 phase: "body",
                 expected_frame_bytes: Some(*header_bytes + *content_length),
                 accepted_frame_bytes: *header_bytes + *seen,
-                write_start_us: self.metrics.timestamp_us(*write_start),
+                write_start_us: self.metrics.timestamp_us(write_start.at),
                 last_byte_us: self.metrics.timestamp_us(*last_byte),
             }),
             _ => None,
@@ -592,6 +622,7 @@ mod tests {
         metrics.finish_frame(
             FrameMetric {
                 ready_sequence: None,
+                write_sequence: 0,
                 method: None,
                 id: Some(response.id().clone()),
                 body_bytes: 0,
@@ -665,6 +696,7 @@ mod tests {
             metrics.frames(),
             vec![FrameMetric {
                 ready_sequence: Some(0),
+                write_sequence: 1,
                 method: Some("textDocument/semanticTokens/full".to_string()),
                 id: Some(Id::Number(7)),
                 body_bytes: body.len(),
@@ -728,6 +760,14 @@ mod tests {
                 .map(|frame| frame.write_start_us)
                 .collect::<Vec<_>>(),
             vec![10, 10]
+        );
+        assert_eq!(
+            metrics
+                .frames()
+                .iter()
+                .map(|frame| frame.write_sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 0]
         );
     }
 
