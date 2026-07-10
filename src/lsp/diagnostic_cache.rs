@@ -770,7 +770,12 @@ impl DiagnosticAggregator {
         // Single lookup via `get_mut`: update in place when the host is already
         // present (the common path), cloning the `host` key only on first insert.
         if let Some(prev) = last.get_mut(host) {
-            if same_diagnostic_multiset(prev, diagnostics) {
+            // Fast path: `merge_cached_diagnostics` output is deterministically
+            // sorted (#423 / `sort_diagnostics`, a total order), so equal sets
+            // arrive slice-equal — the O(n²) multiset walk below is only the
+            // fallback for order variation a future unsorted caller could
+            // introduce.
+            if prev.as_slice() == diagnostics || same_diagnostic_multiset(prev, diagnostics) {
                 return false;
             }
             *prev = diagnostics.to_vec();
