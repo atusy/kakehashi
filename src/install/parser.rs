@@ -29,6 +29,9 @@ const ARCHIVE_TAR_METADATA_MARGIN_BYTES: u64 = 10 * 1024 * 1024;
 /// Maximum decompressed tar stream bytes for parser archives.
 const MAX_ARCHIVE_TAR_STREAM_BYTES: u64 =
     MAX_ARCHIVE_EXTRACTED_BYTES + ARCHIVE_TAR_METADATA_MARGIN_BYTES;
+/// Maximum compressed bytes downloaded for a parser archive.
+const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 =
+    MAX_ARCHIVE_TAR_STREAM_BYTES + ARCHIVE_TAR_METADATA_MARGIN_BYTES;
 
 /// Error types for parser installation.
 #[derive(Debug)]
@@ -497,9 +500,30 @@ fn download_and_extract_archive(
         e => ParserInstallError::ArchiveError(format!("Download failed: {}", e)),
     })?;
 
-    // into_reader() streams without ureq's 10MB read_to_* cap, so enforce our
-    // own limit on the decompressed tar stream.
-    let decoder = GzDecoder::new(response.into_body().into_reader());
+    // into_reader() streams without ureq's 10MB read_to_* cap, so bound the
+    // compressed response here; extract_archive separately bounds output.
+    extract_downloaded_archive(
+        response.into_body().into_reader(),
+        repo_name,
+        revision,
+        dest,
+        MAX_ARCHIVE_DOWNLOAD_BYTES,
+    )
+}
+
+fn extract_downloaded_archive<R: Read>(
+    compressed_reader: R,
+    repo_name: &str,
+    revision: &str,
+    dest: &Path,
+    compressed_limit: u64,
+) -> Result<(), ParserInstallError> {
+    let bounded_compressed = LimitedReader::with_resource(
+        compressed_reader,
+        compressed_limit,
+        "compressed archive download",
+    );
+    let decoder = GzDecoder::new(bounded_compressed);
     extract_archive(decoder, repo_name, revision, dest)
 }
 
@@ -645,15 +669,21 @@ struct LimitedReader<R> {
     inner: R,
     remaining: u64,
     limit: u64,
+    resource: &'static str,
     limit_exceeded: bool,
 }
 
 impl<R> LimitedReader<R> {
     fn new(inner: R, limit: u64) -> Self {
+        Self::with_resource(inner, limit, "decompressed tar stream")
+    }
+
+    fn with_resource(inner: R, limit: u64, resource: &'static str) -> Self {
         Self {
             inner,
             remaining: limit,
             limit,
+            resource,
             limit_exceeded: false,
         }
     }
@@ -668,7 +698,10 @@ impl<R: Read> Read for LimitedReader<R> {
             if self.limit_exceeded {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    ArchiveLimitError { limit: self.limit },
+                    ArchiveLimitError {
+                        resource: self.resource,
+                        limit: self.limit,
+                    },
                 ));
             }
             let mut probe = [0];
@@ -678,7 +711,10 @@ impl<R: Read> Read for LimitedReader<R> {
                     self.limit_exceeded = true;
                     Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        ArchiveLimitError { limit: self.limit },
+                        ArchiveLimitError {
+                            resource: self.resource,
+                            limit: self.limit,
+                        },
                     ))
                 }
                 Err(e) => Err(e),
@@ -696,12 +732,13 @@ impl<R: Read> Read for LimitedReader<R> {
 
 #[derive(Debug)]
 struct ArchiveLimitError {
+    resource: &'static str,
     limit: u64,
 }
 
 impl std::fmt::Display for ArchiveLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "decompressed tar stream exceeds {} bytes", self.limit)
+        write!(f, "{} exceeds {} bytes", self.resource, self.limit)
     }
 }
 
@@ -1735,6 +1772,25 @@ mod tests {
     }
 
     #[test]
+    fn extract_downloaded_archive_rejects_oversized_compressed_stream() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        let archive = gzip_with_empty_deflate_blocks(4);
+
+        let result = extract_downloaded_archive(&archive[..], "parser", "v1.0.0", &dest, 15);
+
+        match result {
+            Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
+                assert!(
+                    message.contains("compressed archive download exceeds 15 bytes"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected compressed archive size limit error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn archive_io_error_maps_limited_reader_archive_failures() {
         let tar = tar_archive_with_payload("parser-1.0.0", 1);
         let mut archive = Archive::new(LimitedReader::new(&tar[..], 1));
@@ -1984,6 +2040,16 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         std::io::copy(&mut &archive[..], &mut encoder).expect("compress tar");
         encoder.finish().expect("finish gzip")
+    }
+
+    fn gzip_with_empty_deflate_blocks(block_count: usize) -> Vec<u8> {
+        let mut gzip = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff];
+        for _ in 0..block_count {
+            gzip.extend_from_slice(&[0, 0, 0, 0xff, 0xff]);
+        }
+        gzip.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+        gzip.extend_from_slice(&[0; 8]);
+        gzip
     }
 
     fn compressed_tar_archive_with_payload(root: &str, payload_size: u64) -> Vec<u8> {
