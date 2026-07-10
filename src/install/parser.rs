@@ -593,6 +593,12 @@ fn unpack_archive_file_entry<R: Read>(
                 escaped_path(safe_relative)
             )));
         }
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive file conflicts with existing directory: {}",
+                escaped_path(safe_relative)
+            )));
+        }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(ArchiveFetchError::Io(e)),
@@ -634,7 +640,13 @@ fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ArchiveFe
                 escaped_path(safe_relative)
             )));
         }
-        Ok(_) => {}
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive directory conflicts with existing non-directory: {}",
+                escaped_path(safe_relative)
+            )));
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(ArchiveFetchError::Io(error)),
     }
@@ -660,7 +672,13 @@ fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, A
                     escaped_path(safe_relative)
                 )));
             }
-            Ok(_) => {}
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(ArchiveFetchError::Unsafe(format!(
+                    "Archive path has a non-directory ancestor: {}",
+                    escaped_path(safe_relative)
+                )));
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
             Err(e) => return Err(ArchiveFetchError::Io(e)),
         }
@@ -1781,6 +1799,39 @@ mod tests {
                 "expected source-read context, got: {message}"
             ),
             other => panic!("expected archive content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_archive_classifies_non_directory_parent_as_unsafe_content() {
+        use std::io::Cursor;
+        use tar::{Builder, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            for path in ["parser-1.0.0/src", "parser-1.0.0/src/parser.c"] {
+                let body = b"parser source";
+                let mut header = Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, &body[..])
+                    .expect("append synthetic regular file");
+            }
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(Cursor::new(bytes));
+
+        match extract_archive(&mut archive, "parser-1.0.0", temp.path()) {
+            Err(ArchiveFetchError::Unsafe(message)) => assert!(
+                message.contains("non-directory ancestor"),
+                "expected topology-conflict context, got: {message}"
+            ),
+            other => panic!("expected unsafe archive content error, got {other:?}"),
         }
     }
 
