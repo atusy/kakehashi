@@ -60,6 +60,7 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
             | "textDocument/colorPresentation"
             | "textDocument/completion"
             | "textDocument/inlayHint"
+            | "textDocument/linkedEditingRange"
             | "textDocument/onTypeFormatting"
             | "textDocument/rename"
     )
@@ -2675,6 +2676,7 @@ mod tests {
             "textDocument/colorPresentation",
             "textDocument/completion",
             "textDocument/inlayHint",
+            "textDocument/linkedEditingRange",
             "textDocument/onTypeFormatting",
             "textDocument/rename",
         ] {
