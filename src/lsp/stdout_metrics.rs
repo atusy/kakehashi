@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -105,6 +106,17 @@ impl StdoutMetrics {
             .clone()
     }
 
+    #[cfg(test)]
+    fn ready_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("stdout metrics lock poisoned")
+            .response_ready
+            .values()
+            .map(VecDeque::len)
+            .sum()
+    }
+
     fn finish_frame(&self, mut frame: FrameMetric, id: Option<Id>) {
         let mut state = self
             .state
@@ -164,6 +176,7 @@ struct FrameObserver {
     metrics: Arc<StdoutMetrics>,
     decode: DecodeState,
     awaiting_flush: Vec<(FrameMetric, Option<Id>)>,
+    poll_write_attempt: Option<Instant>,
 }
 
 #[doc(hidden)]
@@ -178,6 +191,24 @@ pub struct ResponseReadyService<S> {
     metrics: Arc<StdoutMetrics>,
 }
 
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum ResponseReadyError<E> {
+    Inner(E),
+    Task(tokio::task::JoinError),
+}
+
+impl<E: fmt::Display> fmt::Display for ResponseReadyError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inner(error) => error.fmt(formatter),
+            Self::Task(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ResponseReadyError<E> {}
+
 impl<S> ResponseReadyService<S> {
     pub fn new(inner: S, metrics: Arc<StdoutMetrics>) -> Self {
         Self { inner, metrics }
@@ -188,27 +219,28 @@ impl<S> Service<Request> for ResponseReadyService<S>
 where
     S: Service<Request, Response = Option<Response>>,
     S::Future: Send + 'static,
-    S::Error: Send + 'static,
+    S::Error: std::error::Error + Send + Sync + 'static,
 {
     type Response = S::Response;
-    type Error = S::Error;
+    type Error = ResponseReadyError<S::Error>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
+        self.inner.poll_ready(cx).map_err(ResponseReadyError::Inner)
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
         let method = request.method().to_string();
         let future = self.inner.call(request);
         let metrics = Arc::clone(&self.metrics);
-        Box::pin(async move {
-            let response = future.await?;
+        let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let response = future.await.map_err(ResponseReadyError::Inner)?;
             if let Some(response) = response.as_ref() {
                 metrics.record_response_ready(response.id().clone(), method, Instant::now());
             }
             Ok(response)
-        })
+        }));
+        Box::pin(async move { task.await.map_err(ResponseReadyError::Task)? })
     }
 }
 
@@ -284,16 +316,19 @@ impl FrameObserver {
                 last_byte: None,
             },
             awaiting_flush: Vec::new(),
+            poll_write_attempt: None,
         }
     }
 
     fn write_attempt(&mut self, at: Instant) {
+        self.poll_write_attempt = Some(at);
         if let DecodeState::Header { write_start, .. } = &mut self.decode {
             write_start.get_or_insert(at);
         }
     }
 
     fn accepted(&mut self, mut bytes: &[u8], at: Instant) {
+        let poll_write_attempt = self.poll_write_attempt.take().unwrap_or(at);
         while !bytes.is_empty() {
             match &mut self.decode {
                 DecodeState::Header {
@@ -374,7 +409,7 @@ impl FrameObserver {
                         ));
                         self.decode = DecodeState::Header {
                             bytes: Vec::new(),
-                            write_start: None,
+                            write_start: (!bytes.is_empty()).then_some(poll_write_attempt),
                             last_byte: None,
                         };
                     }
@@ -577,6 +612,23 @@ mod tests {
         assert!(frame.ready_us.is_some());
     }
 
+    #[tokio::test]
+    async fn service_records_completion_before_its_response_is_consumed() {
+        let metrics = Arc::new(StdoutMetrics::new(Instant::now()));
+        let mut service = ResponseReadyService::new(EchoService, Arc::clone(&metrics));
+        let response_future = tower::Service::call(
+            &mut service,
+            Request::build("textDocument/semanticTokens/full")
+                .id(7i64)
+                .finish(),
+        );
+
+        tokio::task::yield_now().await;
+
+        assert_eq!(metrics.ready_count(), 1);
+        assert!(response_future.await.unwrap().is_some());
+    }
+
     #[test]
     fn split_response_is_reported_only_after_flush() {
         let origin = Instant::now();
@@ -643,6 +695,33 @@ mod tests {
         assert_eq!(
             metrics.frames()[0].method.as_deref(),
             Some("textDocument/semanticTokens/full")
+        );
+    }
+
+    #[test]
+    fn batched_frames_share_the_poll_write_attempt_timestamp() {
+        let origin = Instant::now();
+        let metrics = Arc::new(StdoutMetrics::new(origin));
+        let body = br#"{"jsonrpc":"2.0","method":"window/logMessage"}"#;
+        let frame = [
+            format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes(),
+            body.to_vec(),
+        ]
+        .concat();
+        let batch = [frame.clone(), frame].concat();
+        let mut observer = FrameObserver::new(Arc::clone(&metrics));
+
+        observer.write_attempt(origin + Duration::from_micros(10));
+        observer.accepted(&batch, origin + Duration::from_micros(20));
+        observer.flushed(origin + Duration::from_micros(30));
+
+        assert_eq!(
+            metrics
+                .frames()
+                .iter()
+                .map(|frame| frame.write_start_us)
+                .collect::<Vec<_>>(),
+            vec![10, 10]
         );
     }
 

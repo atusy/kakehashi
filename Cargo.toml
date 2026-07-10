@@ -86,7 +86,7 @@ tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "process", "fs", "signal"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 toml = "1"
 tower = { version = "0.5", default-features = false }
 tower-lsp-server = "0.23"
@@ -136,4 +136,3 @@ rstest = "0.26"
 [[bench]]
 name = "semantic_tokens"
 harness = false
-
