@@ -1467,4 +1467,42 @@ mod tests {
             "either prefixed start line must reject the snippet variable"
         );
     }
+
+    #[test]
+    fn mixed_offset_boundary_rows_reject_multiline_fallbacks() {
+        // Mixed per-line offsets [2,0,0] (a blockquote with a lazy
+        // continuation line): the trailing recorded zeros are BOUNDARY rows
+        // whose real prefix is unrecorded. A multi-line fallback insertion on
+        // the last content row (host 4 — its following row is the boundary)
+        // must reject; the same shape in an all-zero region has no boundary
+        // semantics and passes.
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [ { "label": "multiline", "insertText": "a\nb" } ]
+        });
+
+        let mixed = RegionOffset::with_per_line_offsets(3, vec![2, 0, 0]);
+        let list = transform_completion_response_to_host(
+            response.clone(),
+            &mixed,
+            region_end,
+            Some(4),
+            None,
+        )
+        .unwrap();
+        assert!(
+            list.items.is_empty(),
+            "boundary-adjacent insertion in a prefixed region must drop"
+        );
+
+        let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let list =
+            transform_completion_response_to_host(response, &plain, region_end, Some(4), None)
+                .unwrap();
+        assert_eq!(list.items.len(), 1, "all-zero regions keep no boundary");
+    }
 }

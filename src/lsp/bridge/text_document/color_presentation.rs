@@ -663,6 +663,9 @@ mod tests {
                                            "end": { "line": 0, "character": 4 } },
                                 "newText": "#fff" },
                   "additionalTextEdits": [
+                      { "range": { "start": { "line": 0, "character": 0 },
+                                   "end": { "line": 0, "character": 2 } },
+                        "newText": "safe-sibling" },
                       { "range": { "start": { "line": 1, "character": 0 },
                                    "end": { "line": 1, "character": 0 } },
                         "newText": "x\n" }
