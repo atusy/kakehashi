@@ -25,10 +25,14 @@ extra setup:
 
 **Bridged features** cover the rest of kakehashi's supported features (hover,
 completion, go-to-definition, diagnostics, …) — not every LSP method
-(see [Not currently provided](#not-currently-provided)). kakehashi cannot compute
-these itself; instead it forwards your request to a real language server that you
-configure for the embedded language. If no server is configured, these features
-simply return nothing.
+(see [Not currently provided](#not-currently-provided)). kakehashi mostly
+forwards these requests to a real language server — one you configure for
+the embedded language, or (for the surrounding document) a `bridge._self`
+host server. Without a server they generally return nothing, though under
+`KAKEHASHI_EXPERIMENTAL=true` a native Tree-sitter layer answers
+definition/references/document highlight/rename lexically — for languages
+that ship a `bindings.scm`, and not in `#offset!`-shifted regions (e.g.
+frontmatter).
 
 ### Embedded code blocks
 
@@ -38,13 +42,16 @@ embedded block as a **standalone snippet** and hands it to the matching language
 server. Two consequences follow from this, and they shape what you can expect:
 
 - **Each block is analyzed on its own.** Two Python blocks can each define
-  `main()` without conflicting. But features that need to see across blocks do not
-  work between them — for example, you cannot go to a definition that lives in a
-  *different* block.
-- **Only embedded content is bridged.** The surrounding document itself (the
-  Markdown prose, the host file as a whole) currently receives only the built-in
-  features. Wiring a whole-document language server to the host file is not yet
-  available.
+  `main()` without conflicting. But features that need to see across blocks do
+  not work between them — a definition target addressed through a *different*
+  block's virtual document is filtered out (a server pointing at the host
+  file's own URI can still land anywhere in it).
+- **Embedded content is bridged per block; the host document is opt-in.** The
+  surrounding document itself (the Markdown prose, the host file as a whole)
+  receives the built-in features by default, and can additionally be bridged
+  to the host language's own servers via `bridge._self`
+  (host-document-bridge) — e.g. marksman answering on the Markdown file
+  itself.
 
 When you trigger a bridged feature, kakehashi uses the embedded block under your
 cursor (for position-based features like hover) or gathers results from **all**
@@ -54,13 +61,15 @@ diagnostics).
 ### When several servers handle one language
 
 If you configure more than one language server for the same embedded language,
-kakehashi combines their responses using one of two strategies, configurable per
-method (`strategy` in the bridge configuration):
+kakehashi combines their responses using one of two strategies (`strategy` in
+the bridge configuration). Only diagnostics, code actions, and full formatting
+consume `concatenated`; every other method combines with `preferred`
+regardless of the setting:
 
 | Strategy | Behavior |
 |----------|----------|
-| `preferred` | Uses the first non-empty response, in your configured `priorities` order. **Default for every feature except diagnostics.** |
-| `concatenated` | Merges the responses from all servers. **Default for diagnostics.** For full formatting it instead runs a sequential formatter pipeline over `priorities` (see [Formatting](#formatting)). |
+| `preferred` | Uses the first non-empty response, in your configured `priorities` order. **Default for every feature except diagnostics and code actions.** |
+| `concatenated` | Merges the responses from all servers. **Default for diagnostics and code actions.** For full formatting it instead runs a sequential formatter pipeline over `priorities` (see [Formatting](#formatting)). |
 
 `priorities` is an ordered **allowlist**: servers absent from the list do not
 run, and a `"*"` element stands for the unlisted rest (see the
@@ -95,9 +104,13 @@ embedded blocks. Works for any grammar, no setup required.
 
 ## Bridged features
 
-All features below require a language server configured for the embedded language.
-Where the request must be inside an embedded code block, placing the cursor outside
-one yields no result.
+The features below are served by a language server configured for the
+embedded language — most of them also on the surrounding document itself,
+by a `bridge._self` host server (exceptions: document color stays
+injection-only, and host completion-item and code-lens resolves pass
+through unrouted). Placing the cursor outside an embedded
+code block yields no result from the injection bridges; with `bridge._self`
+configured, the host language's own servers still answer there.
 
 ### Hover
 
@@ -139,16 +152,18 @@ after `(` or `,`). Default combine strategy: `preferred`.
 
 Jumps from a symbol in an embedded block to its definition. The target can be
 **within the same block** or a **real file on disk** (e.g. a library dependency).
-Targets that live in a *different* embedded block of the same document are not
-offered, since blocks are independent snippets. Default combine strategy: `preferred`.
+Targets that the server addresses to a *different* block's virtual URI are
+not offered (blocks are independent snippets); host-URI targets are passed
+through without a containment check. Default combine strategy: `preferred`.
 
 ### Find references
 
 [`textDocument/references`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_references)
 
-Lists references to the symbol under the cursor. Like go-to-definition, results are
-limited to the same block and real files on disk; references in other embedded
-blocks are not included. Default combine strategy: `preferred`.
+Lists references to the symbol under the cursor. Like go-to-definition,
+results addressed to another block's virtual URI are not included; real-file
+and host-URI results pass through (not containment-checked). Default combine
+strategy: `preferred`.
 
 ### Document highlight
 
@@ -175,8 +190,10 @@ Collects clickable links from all embedded blocks.
 [`textDocument/rename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rename)
 and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareRename)
 
-Renames a symbol within its embedded block. Because each block is a standalone
-snippet, renames are confined to that block. Default combine strategy: `preferred`.
+Renames a symbol within its embedded block. Edits that the server addresses
+to OTHER regions' virtual URIs are filtered out; edits to real files (e.g. a
+cross-file rename from a project-aware server, or host-URI edits — not
+containment-checked) pass through. Default combine strategy: `preferred`.
 
 ### Formatting
 
@@ -201,8 +218,9 @@ The same rule covers range and on-type formatting.
 
 [`textDocument/rangeFormatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rangeFormatting)
 
-Formats the embedded content overlapping the selected range. Behaves like
-formatting, scoped to the selection.
+Formats the embedded content overlapping the selected range. Scoped to the
+selection, and always combined with `preferred` — the sequential
+`concatenated` pipeline applies to full formatting only.
 
 ### Inlay hints
 
@@ -227,10 +245,66 @@ Returns monikers for the symbol under the cursor. Default combine strategy: `pre
 (push)
 
 Reports errors and warnings from every embedded block, merged into the document.
-This is the one feature whose default combine strategy is **`concatenated`** — when
-multiple servers are configured for a block, all of their diagnostics are shown.
-The strategy is resolved per language, so different embedded languages can behave
-differently.
+The default combine strategy here is **`concatenated`** (shared with code
+actions) — when multiple servers are configured for a block, all of their
+diagnostics are shown. The strategy is resolved per language, so different
+embedded languages can behave differently. Spontaneous pushes a server sends
+on its own bypass the strategy machinery when proactively republished: they
+are cached and concatenated across servers — except that whenever the pull
+layer is active for the document, cached push slots from pull-capable
+servers are suppressed in favor of pull results (no double-counting; in
+mixed configurations this can suppress a push whose server was not itself
+pulled). When those cached pushes later answer a client PULL
+(`pushFallback`), only push-driven servers' slots fold in, under the
+cross-layer priorities/strategy only — server-level `priorities`/
+`maxFanOut` are not reapplied.
+
+### Code actions
+
+[`textDocument/codeAction`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_codeAction),
+[`codeAction/resolve`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#codeAction_resolve),
+[`workspace/executeCommand`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_executeCommand),
+and [`workspace/applyEdit`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_applyEdit) (relay)
+
+Quick fixes and refactors from the servers bridging the block (all of them
+by default; `priorities`/`maxFanOut` can restrict the set) — a range
+spanning several blocks merges each region's actions into one menu. Titles
+are suffixed with "— {server}", exposing provenance and distinguishing
+same-titled actions from *different* servers (identically titled actions
+from one server — e.g. across two fences — keep identical titles).
+Lazy actions resolve back to their origin server (`codeAction/resolve`) —
+client-driven resolve routing additionally requires the client to declare
+`dataSupport` and `resolveSupport` covering `"edit"`; without those,
+injection-layer lazy actions are eagerly resolved by the bridge and
+host-layer ones are disabled or dropped. (Known limitation: CLIENT-driven
+resolve of lazy actions in `#offset!`-adjusted regions such as bundled
+YAML/TOML frontmatter always fails soft — the resolve freshness check cannot
+match there; the eager-resolve path taken for non-envelope clients bypasses
+that check.)
+Command-carrying actions execute through the bridged
+`workspace/executeCommand`.
+
+Edit safety differs by layer and direction. An INJECTION-layer action edit
+that cannot be represented in the host document (touching another injection
+region, virtual-document file operations, or escaping the block) is
+rejected: in the initial response it surfaces as a disabled action where the
+client declares `disabledSupport` and is dropped otherwise; during `codeAction/resolve`
+(where a response cannot be dropped) the unsafe payload is removed and the
+action comes back disabled — or, for clients without `disabledSupport`,
+unresolved. HOST-layer (`bridge._self`) action edits already target the
+real document and pass through as-is. A downstream server's own
+`workspace/applyEdit` request has its own policy built on the same
+underlying transform: virtual-document edits are translated (real-file-only
+requests pass through verbatim), and an untranslatable one — e.g. an unknown
+or stale region, a multi-region edit, a virtual-URI file operation, or a
+translated edit escaping the region or its per-line prefix floor — is
+answered `applied: false` locally; it never reaches the editor and no action
+is involved.
+
+Default combine strategy: `concatenated`, across servers and across the
+virt/host layers. Advertised only to clients with
+`codeActionLiteralSupport`; see the README's bridged-requests list for the
+palette/registered-list caveats.
 
 ### Document color (experimental)
 
@@ -495,15 +569,32 @@ type CapturesDelta = {
 
 kakehashi does not yet provide these LSP features:
 
-- Code actions / quick fixes (`textDocument/codeAction`)
-- Code lens (`textDocument/codeLens`)
-- Folding ranges (`textDocument/foldingRange`)
-- On-type formatting (`textDocument/onTypeFormatting`)
-- Linked editing (`textDocument/linkedEditingRange`)
 - Call hierarchy / type hierarchy
-- Workspace symbol search (`workspace/symbol`) and command execution
-  (`workspace/executeCommand`)
+- Workspace symbol search (`workspace/symbol`)
 
-Bridged features are also limited to **embedded code blocks**: navigation and edits
-do not cross between blocks, and the surrounding host document has no bridged
-language support yet (only built-in highlighting and selection range).
+(The static code-action and execute-command providers are advertised only to
+clients with `codeActionLiteralSupport`. Palette command names are registered
+dynamically when the client declares
+`workspace.executeCommand.dynamicRegistration` — covering the commands a
+downstream server advertised in its initialize result once it reaches Ready;
+commands a downstream registers dynamically afterwards are not routed.)
+
+Bridged features are also limited to **embedded code blocks** in one respect:
+navigation and edits do not cross between blocks — on the
+goto/references/rename transforms, results addressed to another block's
+virtual URI are filtered out (document-link targets are the exception and
+pass through untouched), and a code action touching another region stays
+visible as a disabled entry for `disabledSupport` clients (without that
+capability: dropped from the initial response, returned unresolved on
+`codeAction/resolve`). One `applyEdit` nuance: the translator picks its
+target region from the edit itself, so a request touching exactly one live
+virtual URI is translated against that region even if it differs from the
+block that prompted the server's request (edits spanning multiple virtual
+URIs are rejected on cardinality grounds; single-target requests can still
+be rejected on the usual grounds — unknown/stale URI, virtual-URI file
+operation, region escape). Real-file and — for navigation/references/rename — host-URI
+results pass through, while injection-layer code actions (and applyEdit
+requests that also touch a virtual document) constrain host-URI edits to
+the region.
+The surrounding host document can be bridged to the host language's own
+servers via `bridge._self` (host-document-bridge).

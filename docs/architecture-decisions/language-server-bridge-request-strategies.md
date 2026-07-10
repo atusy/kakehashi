@@ -5,6 +5,14 @@
 > ls-bridge-message-ordering and
 > ls-bridge-server-pool-coordination.
 
+## Decision–Implementation Gap
+
+10 of the 11 per-method strategies described below are implemented
+(definition, hover, signatureHelp, completion, references, rename,
+codeAction, formatting, documentHighlight, diagnostics). Bridged semantic
+tokens remain unimplemented (native tree-sitter tokens are served, but
+downstream-server tokens are not fetched or merged).
+
 ## Context
 
 When bridging LSP requests for injection regions (see language-server-bridge), different LSP methods have different characteristics:
@@ -115,9 +123,9 @@ Request (cursor in injection) ──▶ Forward to language server
 | Aspect | Handling |
 |--------|----------|
 | Input | Position (host → virtual translation) |
-| Output | Location or Location[] |
-| Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
-| Position mapping | Range start/end virtual → host for same-region targets; real-file ranges untouched |
+| Output | Location[] (a scalar downstream Location is normalized to a vector) or LocationLink[] (for link-capable clients) |
+| Cross-file | Real-file targets preserved (incl. host-URI targets, not containment-checked); only locations addressed to OTHER regions' virtual URIs filtered |
+| Position mapping | Range start/end: virtual → host. Known gap: a LocationLink whose target is a real/host URI passes through whole, leaving its `originSelectionRange` (a source-document range) in virtual coordinates |
 
 #### textDocument/references
 
@@ -125,12 +133,12 @@ Request (cursor in injection) ──▶ Forward to language server
 |--------|----------|
 | Input | Position + includeDeclaration flag |
 | Output | Location[] |
-| Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
-| Position mapping | Each same-region location's range virtual → host; real-file ranges untouched |
+| Cross-file | Real-file locations preserved (incl. host-URI, not containment-checked); only locations addressed to OTHER regions' virtual URIs filtered |
+| Position mapping | Own-virtual-URI locations' ranges: virtual → host; real/host-URI locations keep their ranges unchanged |
 
-**Important**: Real-file locations (e.g. library sources on disk) are kept —
-they are valid navigation targets. Only locations in OTHER virtual regions are
-dropped, since their URIs are meaningless to the editor.
+**Important**: References may return many locations. Real-file locations pass
+through as-is; locations in OTHER injection regions of the host document are
+filtered (their virtual URIs would be meaningless to the editor).
 
 #### textDocument/hover
 
@@ -172,10 +180,12 @@ These methods return edits that must be carefully validated.
 │                                                                 │
 │  CompletionItem {                                               │
 │    label: "HashMap",                                            │
-│    textEdit: { range: ..., newText: "HashMap" },  ──▶ TRANSLATE │
+│    textEdit: { range: ..., newText: "HashMap" },                │
+│      ──▶ VALIDATE (region-safety), then TRANSLATE               │
 │    additionalTextEdits: [                                       │
 │      { range: {0,0}-{0,0}, newText: "use std::...\n" }          │
-│    ]  ──────────────────────────────────────────────▶ VALIDATE  │
+│    ]  ──▶ VALIDATE as one atomic set: TRANSLATE all, or         │
+│        DROP the whole array if any member is unsafe             │
 │  }                                                              │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -193,7 +203,9 @@ fn main() {
 }
 ```
 
-But line 0 of the virtual document maps to the injection start line in the host—**inside the code fence**, not at the file top where imports belong.
+Line 0 of the virtual document maps to the injection start line in the host —
+**inside the code fence**. For a standalone snippet that IS the right spot;
+whether it is what the user wants depends on the injection.
 
 **Implemented policy** (fail-closed, atomic):
 
@@ -220,8 +232,8 @@ But line 0 of the virtual document maps to the injection start line in the host�
 |--------|----------|
 | Input | Position + newName |
 | Output | WorkspaceEdit (changes across files) |
-| Cross-file | Real-file edits pass through; same-region virtual edits translate; foreign virtual-region entries filtered (siblings survive); structurally unsafe edits or virtual-URI file operations reject the result |
-| Position mapping | Same-region TextEdit ranges (real-file ranges untouched) |
+| Cross-file | Real-file edits preserved (shared WorkspaceEdit transform, incl. host-URI edits — not containment-checked on this path); edits keyed to OTHER regions' virtual URIs filtered |
+| Position mapping | Own-virtual-URI TextEdit ranges: virtual → host; real/host-URI edits keep their ranges unchanged |
 
 Rename can affect multiple files. Real-file edits (a project-aware server's
 cross-file rename) are preserved — content and ranges untouched, though
@@ -229,16 +241,18 @@ bridge-local `TextDocumentEdit.version` values are cleared before relaying —
 while entries addressed to other regions' virtual URIs (meaningless to the
 editor) are FILTERED out with usable siblings surviving. The whole result is
 rejected only when an edit fails the region-safety guards or the edit carries
-a file operation (create/rename/delete) targeting a virtual URI.
+a create/rename/delete file operation referencing ANY virtual URI (including
+the request's own) — dropping just the op would misdirect the ordered
+`documentChanges` that follow it.
 
 #### textDocument/codeAction
 
 | Aspect | Handling |
 |--------|----------|
-| Input | Range + context (diagnostics) |
-| Output | CodeAction[] (each may contain WorkspaceEdit) |
-| Cross-file | Real-file edits/resource ops pass through; actions with foreign virtual-region or unsafe edits are disabled/dropped |
-| Position mapping | Same-region ranges in remaining actions |
+| Input | Range + context (in-region diagnostics, translated) |
+| Output | (CodeAction \| Command)[] — bare Commands are bridged too, their names encoded for executeCommand routing |
+| Cross-file | Real-file edits and file operations are PRESERVED; rejected are: edits touching a foreign injection region, virtual-URI file operations, and host-document edits escaping the source region — surfaced as a disabled action for `disabledSupport` clients; without that capability, dropped in the initial response, and returned unresolved (re-enveloped) on `codeAction/resolve` |
+| Position mapping | Action edit ranges (shared WorkspaceEdit transform: own virtual URI translated, real URIs pass unchanged, foreign virtual entries filtered/rejected) and diagnostics' primary ranges — diagnostic `relatedInformation` locations are NOT translated (known gap) |
 
 #### textDocument/formatting / rangeFormatting / onTypeFormatting
 
@@ -266,6 +280,18 @@ concatenated-formatting-pipeline.
 
 **Applies to**: `textDocument/publishDiagnostics`
 
+Note: spontaneous pushes bypass the aggregation priorities/strategy machinery
+on the proactive republish path — the diagnostic cache concatenates them
+across servers, suppressing push slots from pull-capable servers in favor of
+pull results while the pull layer is active (in mixed configurations this
+can suppress a push whose server was not itself pulled). Cached pushes
+answering a client pull via `pushFallback` fold in only push-driven servers'
+slots, under cross-layer priorities/strategy only — server-level
+`priorities`/`maxFanOut` are not reapplied. Configured
+`_self` host-server pushes carry the real host URI and host-relative ranges,
+so they are republished as-is (no URI filtering or translation step applies
+to them).
+
 ```
                     ┌─────────────────────────────┐
  (No request)       │      kakehashi          │
@@ -282,43 +308,50 @@ concatenated-formatting-pipeline.
                     │  ┌─────────────────────┐    │
                     │  │ Filter by URI       │    │
                     │  │ Translate ranges    │────│───▶ publishDiagnostics
-                    │  │ Merge & dedupe      │    │     to editor
+                    │  │ Merge (concatenate) │    │     to editor
                     │  └─────────────────────┘    │
                     └─────────────────────────────┘
 ```
 
 **Behavior**:
 - Language servers push diagnostics asynchronously
-- kakehashi filters to virtual document URI only
-- Translate all diagnostic ranges to host coordinates
-- Merge and deduplicate diagnostics from multiple servers
+- VIRTUAL-region pushes: filtered to the virtual document URI; primary
+  diagnostic ranges translated to host coordinates (`relatedInformation`:
+  virtual-URI entries dropped, same-host entries translated, other real-file
+  entries unchanged)
+- `_self` HOST pushes: real host URI and host-relative ranges, republished
+  as-is (no filtering or translation step)
+- Concatenate diagnostics from multiple servers (multiplicity preserved — no
+  deduplication)
 - Forward combined diagnostics to the editor with host document URI
 
 ### Position Mapping Summary
 
 | Response Type | Fields to Map |
 |---------------|---------------|
-| Location | same-region virtual targets: uri rewritten to host + range translated; real-file targets: untouched |
-| Location[] | Each location, same rule |
+| Location | uri (the request's own virtual URI rewrites to host; real/host URIs pass unchanged), range |
+| Location[] | Each location |
+| LocationLink[] | Links targeting the request's own virtual URI: target ranges + originSelectionRange translated; links targeting real/host URIs pass through WHOLE — originSelectionRange stays virtual (known gap) |
 | Hover | range (if present) |
-| CompletionItem | textEdit.range, additionalTextEdits[].range |
+| CompletionItem | textEdit.range (or InsertReplaceEdit's insert + replace), additionalTextEdits[].range |
 | TextEdit | range |
-| WorkspaceEdit | Same-region virtual entries translated; real-file ranges untouched; foreign virtual entries filtered (or the action rejected) |
-| Diagnostic | range, relatedInformation[].location |
+| WorkspaceEdit | The request's own virtual-URI entries (re-keyed + translated); real-URI entries pass unchanged; foreign virtual entries filtered or reject the edit |
+| Diagnostic | range; relatedInformation[].location: virtual-URI entries dropped, same-host entries translated, other real files unchanged |
 | CodeAction | Contained edits, same conditional rule |
 
 ### Multi-Server Merging Rules
 
 When multiple servers are configured for a language:
 
-| Method | Merging Strategy |
+| Method | Merging Strategy (as implemented; rows marked *aspirational* never shipped) |
 |--------|------------------|
-| Semantic Tokens | Later server wins for overlapping ranges |
-| Go-to-Definition | Return first non-empty result (query in order) |
-| Find References | Concatenate all results, dedupe by location |
-| Completion | Merge completion lists from all servers |
-| Hover | Concatenate hover content with separator |
-| Diagnostics | Merge all, dedupe by range + message |
+| Semantic Tokens | *Aspirational* — bridged semantic tokens are unimplemented |
+| Go-to-Definition | `preferred`: first non-empty result (query in `priorities` order) |
+| Find References | `preferred` by default (first non-empty); *concatenate + dedupe is aspirational* |
+| Completion | `preferred` by default (first non-empty); *list merging is aspirational* |
+| Hover | `preferred` by default (first non-empty); *content concatenation is aspirational* |
+| Diagnostics | `concatenated` by default — multiplicity preserved, no dedup |
+| Code Actions | `concatenated` by default: every server's actions in one menu, titles suffixed with "— {server}", no dedup of same-named actions (deliberate), at most one `isPreferred` kept |
 | Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (which is also the membership allowlist — servers not listed do not run) — full formatting only. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
 
 `priorities` lists follow the ordered-allowlist semantics of
@@ -332,7 +365,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 - **Optimized UX per feature**: Each method gets the strategy that best fits its characteristics
 - **Fast visual feedback**: Semantic tokens appear instantly via parallel fetch
 - **Accurate navigation**: Go-to-definition uses authoritative language server
-- **Safe editing**: real-file edits/resource operations are retained; foreign virtual-region or structurally unsafe edits are filtered/rejected to prevent corruption
+- **Safe editing**: Unrepresentable edits (foreign injection regions, virtual-URI file operations, region-escaping host edits) are rejected to prevent corruption; real cross-file edits pass through
 - **Comprehensive diagnostics**: Aggregated from multiple sources
 
 ### Negative
@@ -344,7 +377,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 
 ### Neutral
 
-- **Per-method configuration possible**: Future enhancement could allow users to override strategies
+- **Per-method configuration**: shipped — `bridge.<lang>.aggregation` overrides priorities/maxFanOut per LSP method, and strategy for the methods that consume it (diagnostics, code actions, full formatting; every other method dispatches `preferred` regardless — see aggregation-priorities-wildcard)
 - **Server capability detection**: Some servers may not support all methods; need graceful degradation
 
 ## Implementation Status
@@ -365,7 +398,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | completionItem/resolve | ✅ Implemented | Envelope-routed; an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set |
 | references | ✅ Implemented | Real-file URIs kept, cross-region virtual URIs dropped |
 | rename | ✅ Implemented | With workspace edit validation |
-| codeAction | ✅ Implemented | With edit filtering (incl. resolve + executeCommand routing) |
+| codeAction | ✅ Implemented | Edit-carrying, lazy (`codeAction/resolve` routed to the origin server), command-carrying (`workspace/executeCommand` name-routing + palette dispatch), host layer, multi-region menu merge; strict edit validation (cross-region / region bounds incl. per-line prefix floor) |
 | formatting | ✅ Implemented | Whole-response atomic drop on unsafe edits |
 | rangeFormatting | ✅ Implemented | Shares the formatting guards |
 | onTypeFormatting | ✅ Implemented | Shares the formatting guards |
@@ -373,7 +406,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
-| semanticTokens | ✅ Implemented | Cross-layer merge (see semantic-token merge ADR) |
+| semanticTokens | ❌ Not bridged | Native tree-sitter tokens ARE served (semantic-token-overlap-resolution); downstream-server tokens are not fetched or merged — doing so would enable the parallel fetch strategy |
 
 ### Original Implementation Priority
 

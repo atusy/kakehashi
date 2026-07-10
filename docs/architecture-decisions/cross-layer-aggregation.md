@@ -20,7 +20,9 @@ Phased roadmap:
    `resolve_layer_config_from_settings` directly (it already holds a loaded
    settings arc), keyed `textDocument/publishDiagnostics` to match its
    aggregation config. With host bridging (host-document-bridge)
-   implemented for every bridged request method, handlers run the real
+   implemented for the bridged request methods (documented exceptions:
+   document color is virt-only; host completion-item/code-lens resolves
+   pass through unrouted), handlers run the real
    stage-2 `preferred` walk (`Kakehashi::walk_layers` →
    `race_layers_preferred`): the virt and host layers fan out
    **concurrently** — the layer-level analogue of the stage-1 `preferred`
@@ -58,14 +60,31 @@ Phased roadmap:
    both layers fan out concurrently, and `combine_layer_diagnostics`
    applies the resolved strategy — `concatenated` (the default) appends
    items in `priorities` order, `preferred` returns the first non-empty
-   layer. The host layer is a `textDocument/diagnostic` pull with the real
-   URI — push-propagation-diagnostic-forwarding plans to drive host diagnostics by
-   push too, but that is not yet implemented — combined within the layer per
-   `bridge._self.aggregation` via `dispatch_host_concatenated` /
-   `dispatch_host_preferred`. Diagnostics are joined rather than raced:
+   layer. The host layer's PULL is a `textDocument/diagnostic` with the real
+   URI, combined within the layer per `bridge._self.aggregation` via
+   `dispatch_host_concatenated` / `dispatch_host_preferred`. Host-server
+   `publishDiagnostics` PUSHES are also accepted and republished
+   (`DiagnosticPublisher::publish_push` classifies non-virtual URIs as
+   `_self` host-layer pushes), but pushes bypass the dispatchers: the cache
+   concatenates push-driven slots across servers — though when a pull layer
+   exists, cached push slots from pull-capable servers are suppressed in
+   favor of the pull result (no double-counting; in mixed configurations
+   this can suppress a push whose server was not itself pulled). When
+   cached pushes answer a client pull (`pushFallback`), only push-driven
+   servers' slots fold in, under cross-layer priorities/strategy only —
+   server-level `priorities`/`maxFanOut` are not reapplied. Preferred-style
+   push election is deferred. Diagnostics are joined rather than raced:
    they are not latency-interactive and `concatenated` needs every layer
    anyway, so one code path with a pure combine function replaces the
    `race_layers_preferred` machinery here.
+5. **Layer-level `concatenated` for `textDocument/codeAction`** — ✅
+   implemented (and the DEFAULT for the method): the virt layer's actions
+   (merged across every injection region the request range overlaps) and the
+   host layer's actions appear in one menu via `race_layers_concatenated`,
+   folded in `priorities` order. `isPreferred` collisions on the final menu
+   are collapsed to the first occurrence
+   (`resolve_preferred_collision`); `preferred` returns the first non-empty
+   layer instead.
 
 ## Context
 
@@ -201,8 +220,13 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 
 - **`priorities` is an ordered allowlist.** Layers omitted from the list do
   not participate for that method — `priorities = ["virt", "host"]`
-  suppresses native; `priorities = []` disables the method across all layers
-  (mirroring the stage-1 `priorities = []`). No `"*"` element is supported:
+  suppresses native; `priorities = []` disables the method's REQUEST
+  dispatch across all layers (mirroring the stage-1 `priorities = []`).
+  Exception: spontaneous diagnostic pushes bypass layer priorities on the
+  proactive republish path and are still accepted and cache-concatenated
+  (cached pushes answering a client pull via `pushFallback` fold in only
+  push-driven servers' slots, under cross-layer priorities/strategy only —
+  see item 4's pull/push split). No `"*"` element is supported:
   with a closed three-value set, "the rest" is always expressible by explicit
   enumeration, so the enum stays pure.
 - **`priorities` ranks; `enabled` gates.** Host participation is additionally
@@ -222,10 +246,11 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   field: a method-specific `priorities` replaces the wildcard's list
   wholesale, it does not merge element-wise.
 - **Strategy is phased.** Phase 2 implements `preferred` only; with
-  layer-level `concatenated` landed for formatting (phase 3) and
-  diagnostics (phase 4), the layer defaults come from
-  `default_layer_strategy_for_method`: `concatenated` for diagnostics
-  *and* `textDocument/formatting`, `preferred` otherwise. The formatting
+  layer-level `concatenated` landed for formatting (phase 3), diagnostics
+  (phase 4), and codeAction (item 5), the layer defaults come from
+  `default_layer_strategy_for_method`: `concatenated` for diagnostics,
+  `textDocument/codeAction`, *and* `textDocument/formatting`, `preferred`
+  otherwise. The formatting
   default diverges from the bridge level deliberately — the cross-layer
   pipeline composes disjoint work (virt formats injection regions, host
   formats the resulting text), whereas multiple servers of one bridge
@@ -242,10 +267,16 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 - **Per-virt-language ordering relative to host**: `priorities` ranks the
   three layer kinds, not individual injection languages ("python virt above
   host, sql virt below host" is not expressible). For position-based requests
-  the virt layer is effectively single-language, and document-wide methods
-  default to `concatenated`, so the practical need is unproven. If it
-  materializes, a host-relative weight on `bridge.<inj>` is the extension
-  point — not entries in `priorities`.
+  the virt layer is effectively single-language, and the document-wide
+  methods that default to `concatenated` (formatting, diagnostics) already
+  combine every layer. Code actions default to `concatenated` too — being
+  range-based they CAN span regions of several injection languages in one
+  request, and concatenation preserves layer order (which also decides the
+  surviving `isPreferred`), so host-relative ordering genuinely matters
+  there and "Python virt above host, SQL virt below host" remains
+  inexpressible. The practical need is still unproven; if it materializes,
+  a host-relative weight on `bridge.<inj>` is the extension point — not
+  entries in `priorities`.
 - **Semantic tokens**: the progressive-refinement strategy
   (language-server-bridge-request-strategies Strategy 1) is a *temporal*
   merge — native immediately, bridged tokens replacing them later — not an
@@ -264,7 +295,10 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   `AggregationConfig` or `BridgeLanguageConfig`; existing bridge configs
   resolve as before.
 - **Defaults preserve behavior**: `["virt", "host", "native"]` with host
-  inert (opt-in off) and `preferred` reproduces today's routing exactly.
+  inert (opt-in off) and `preferred` reproduced the routing at decision
+  time exactly. (Since then the per-method defaults moved to
+  `concatenated` for formatting, diagnostics, and codeAction — see the
+  implementation ledger above.)
 - **Per-method layer suppression for free**: omitting a layer from
   `priorities` (e.g. dropping native for hover) needs no dedicated disable
   switch — a direct payoff of the allowlist semantics.

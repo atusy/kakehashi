@@ -15,8 +15,8 @@
 //!
 //! Encoding is stateless (no cross-request registry to populate/evict) and
 //! therefore collision-safe: two servers advertising the same command name
-//! (realistic once concatenated aggregation lands, #568 PR 7) encode to
-//! distinct names and route correctly.
+//! (realistic under concatenated aggregation, the codeAction default) encode
+//! to distinct names and route correctly.
 //!
 //! The separator is the ASCII Unit Separator (`0x1f`). The routing invariant is
 //! that it must not appear in the FIRST two segments — `origin` (a TOML config
@@ -27,13 +27,16 @@
 //! unroutable command. The `command` is the final segment and taken as the
 //! `splitn(3)` remainder, so even an (LSP-legal but unheard-of) separator inside
 //! a command id round-trips faithfully. Decoding is total: any name that isn't a
-//! well-formed bridge command yields `None`, and the handler fails that command
-//! soft rather than panicking.
+//! well-formed bridge command yields `None` — the handler then tries the raw
+//! palette-command registry, and only a command matching neither route fails
+//! soft (never a panic).
 //!
-//! NOTE: this reaches only commands surfaced through a bridged action. Commands
-//! the client fires WITHOUT an action context (from a palette, keyed off the
-//! advertised `executeCommandProvider.commands` list) need real advertised
-//! names + dynamic registration and are a deliberate follow-up (see #568 PR 6).
+//! NOTE: this encoding covers commands surfaced through a bridged action.
+//! Commands the client fires WITHOUT an action context (from a palette) route
+//! by their RAW advertised names instead, via the pool's command-origin
+//! registry + dynamic `workspace/executeCommand` registration (see
+//! `dispatch_palette_command` in
+//! `src/lsp/bridge/workspace/execute_command.rs`).
 
 /// Marker that identifies a bridge-minted command name.
 const COMMAND_PREFIX: &str = "kakehashi";

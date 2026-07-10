@@ -29,14 +29,15 @@ Current bridge-backed requests include:
 - Rename / Prepare Rename
 - Document Highlight / Document Symbol / Document Link
 - Moniker / Inlay Hint
-- Code Lens (incl. `codeLens/resolve` routed back to the origin server; resolution fails soft when the region was edited since the lens was produced)
+- Code Lens (incl. `codeLens/resolve` routed back to the origin server for injection-layer lenses — host-layer lenses pass through unrouted; resolution fails soft when the region was moved or invalidated since the lens was produced, and always in `#offset!`-adjusted regions such as frontmatter)
+- Code Action (incl. `codeAction/resolve` routed back to the origin server, host-layer actions via `bridge._self`, and a merged menu across every injection region a multi-fence range overlaps; advertised only to clients with `codeActionLiteralSupport`)
+- `workspace/executeCommand` (commands surfaced through bridged actions route back to their origin server by name; palette-fired commands — those that a downstream advertised in its initialize result — route via dynamically registered names when the client supports dynamic registration (a downstream's own later dynamic command registrations are not routed). Known limitations: action-embedded command names are per-document encoded and never registered, so clients that only dispatch command ids from registered lists — VS Code's vscode-languageclient — show such actions without running their command; and the palette registry is session-global by raw command id, so a name advertised by several servers routes to the latest advertiser)
+- `workspace/applyEdit` from downstream servers (virtual-document edits are translated to the host document and relayed to the editor; untranslatable edits answer `applied: false`)
 - Pull Diagnostics
 - On Type Formatting (config-driven; see `onTypeFormattingTriggers`)
 
-The server does not currently advertise `textDocument/codeAction`.
-
 **Limitations:**
-- **Same-region navigation only**: Cross-region jumps/edits (e.g., go to Definition, rename, ...) are not supported—these results are filtered out.
+- **No cross-region results within the host document**: on the goto/references/rename transforms, a result addressed to a *different* region's virtual URI is filtered out (that URI would be meaningless to the editor; document-link targets are the exception — they pass through untouched). A code action touching another region keeps a visible-but-disabled entry for `disabledSupport` clients (payload stripped); without that capability it is dropped from the initial response, or returned unresolved on `codeAction/resolve` (a response cannot be dropped). Results in real files — an external definition, a cross-file rename edit — pass through unchanged; for navigation/references/rename, host-URI results are not containment-checked (injection-layer code actions, and applyEdit requests that also touch a virtual document, constrain host-URI edits to the region).
 
 See [Bridge Configuration](#bridge-configuration) for setup instructions.
 
@@ -345,10 +346,14 @@ Each entry in the `bridge` map configures bridging for one injection language:
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` contains the **host** language, with the real URI and no
-coordinate translation. All bridged request methods are wired (semantic
-tokens excepted); by default the host layer is tried after
-`virt` (see `layers` above), so injections keep winning inside code fences
-while the host server answers everywhere else. For formatting, combine
+coordinate translation. All bridged request methods are wired (exceptions:
+semantic tokens; document color stays injection-only; host completion-item
+and code-lens resolves pass through unrouted); by default the host layer is
+tried after
+`virt` (see `layers` above), so for `preferred` methods injections keep
+winning inside code fences while the host server answers everywhere else —
+diagnostics/code actions (`concatenated` default) and the formatting
+pipeline combine BOTH layers instead. For formatting, combine
 fence formatters with a whole-document formatter via
 `layers.aggregation."textDocument/formatting".strategy = "concatenated"`.
 
@@ -373,7 +378,7 @@ When multiple language servers can handle the same injection language, `aggregat
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered **allowlist** of server names: listed servers are queried in this order, and servers absent from the list do not run. A `"*"` element stands for every configured-but-unlisted server (first-win among themselves), so `["pyright", "*"]` means "prefer pyright, fall back to the rest" and `["*", "pylsp"]` demotes pylsp below everyone else. Omitted = `["*"]` (all servers, first-win). An explicit `[]` disables the method for this bridge entry. Note: the sequential `concatenated` formatting pipeline requires explicit names and ignores `"*"`. |
-| `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for `textDocument/diagnostic`, `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. |
+| `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for the diagnostics methods (`textDocument/diagnostic`, `textDocument/publishDiagnostics`) and `textDocument/codeAction` (every server's actions appear in one menu), `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. Note: only the diagnostics methods, `textDocument/codeAction`, and full `textDocument/formatting` (sequential pipeline) consume `"concatenated"` — every other method dispatches `"preferred"` regardless of this field. |
 | `maxFanOut` | Maximum number of servers to query. `null` or omitted = no limit (default). `0` = disable fan-out entirely. Positive integer = cap at N servers. Priority servers are selected first when limiting. Negative values are treated as no limit. |
 
 > **Migration note**: `priorities` used to be a preference order only — unlisted
@@ -423,7 +428,7 @@ the `bridge.<lang>.aggregation` nesting:
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered allowlist of layers, highest priority first (same allowlist rule as the server-name `priorities` above, but over the closed set `virt`/`host`/`native` — no `"*"`). Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
-| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit), by diagnostics and code actions (default `"concatenated"`: layer lists merge), and by list-shaped whole-document methods such as `textDocument/documentLink`, `textDocument/foldingRange`, and `textDocument/codeLens` when explicitly configured. Other methods combine with `"preferred"` regardless of this field. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit), by the diagnostics methods (default `"concatenated"`: the `virt` regions' diagnostics and the host servers' diagnostics for the real document merge into one report/publish; `"preferred"` returns the first non-empty layer instead), by `textDocument/codeAction` (default `"concatenated"`: the injection region's actions and the host servers' actions appear in one menu, with at most one `isPreferred` action kept), and by list-shaped whole-document methods such as `textDocument/documentLink`, `textDocument/foldingRange`, and `textDocument/codeLens` when explicitly configured. Every other method combines with `"preferred"` regardless of this field. |
 
 Details:
 
@@ -436,14 +441,27 @@ Details:
   `textDocument/publishDiagnostics`. Each layer is gated independently by
   `priorities` membership (host additionally by `bridge._self.enabled`);
   omit both layers (or use `_` with `priorities = []`) to fully turn
-  bridge diagnostics off. With host bridging opted in, host servers are
-  pulled with the real document URI and their diagnostics merge with the
-  injection regions' per the layer `strategy`.
+  bridge-driven diagnostics off. With host bridging opted in, host servers
+  are pulled with the real document URI and their diagnostics merge with
+  the injection regions' per the layer `strategy`. Caveat: SPONTANEOUS
+  pushes a downstream server sends on its own bypass the
+  priorities/strategy machinery when proactively republished — cached and
+  concatenated across servers, except that push slots from pull-capable
+  servers are suppressed in favor of pull results while the pull layer is
+  active (in mixed configurations this can suppress a push whose server was
+  not itself pulled; host `_self` pushes keep their real host URIs and
+  ranges as-is). When cached pushes later answer a client pull
+  (`pushFallback`), only push-driven servers' slots fold in (pull-capable
+  servers excluded), under the CROSS-LAYER priorities/strategy only —
+  server-level `priorities`/`maxFanOut` are not reapplied.
 - **Current effect**: the `virt` layer answers inside injection regions, and
-  the `host` layer answers on the host document itself for every bridged
-  request method — including pull/push diagnostics — when host bridging is
-  opted in (see `bridge._self` above). Bridged methods have no `native`
-  counterpart yet. Semantic tokens stay native-only for now.
+  the `host` layer answers on the host document itself for the bridged
+  request methods — including pull/push diagnostics, with the `bridge._self`
+  exceptions noted above — when host bridging is opted in. The `native`
+  layer additionally computes definition/references/document highlight/
+  rename from Tree-sitter bindings under `KAKEHASHI_EXPERIMENTAL=true` (for
+  languages shipping a `bindings.scm`; `#offset!`-shifted regions declined).
+  Semantic tokens stay native-only for now.
 
 > **Migration note**: the layer list was renamed `order` →
 > `priorities` (and, one change earlier, the method map moved under
