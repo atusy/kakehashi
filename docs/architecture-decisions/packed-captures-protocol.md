@@ -54,9 +54,13 @@ The method family:
 
 | Method | Input | Output |
 |---|---|---|
-| `kakehashi/captures/packed/full` | `{ textDocument, kind, injection? }` | `PackedResult \| null` |
-| `kakehashi/captures/packed/full/delta` | `{ textDocument, kind, previousResultId }` | `PackedResult \| PackedDelta \| null` |
-| `kakehashi/captures/packed/range` | `{ textDocument, kind, range, injection? }` | `PackedRangeResult \| null` |
+| `kakehashi/captures/packed/full` | `{ textDocument, kind, injection?, nodes?: false }` | `PackedResult \| null` |
+| `kakehashi/captures/packed/full/delta` | `{ textDocument, kind, previousResultId, nodes?: false }` | `PackedResult \| PackedDelta \| null` |
+| `kakehashi/captures/packed/range` | `{ textDocument, kind, range, injection?, nodes?: false }` | `PackedRangeResult \| null` |
+
+`nodes` is a reserved request flag in this ADR, but only `false`/omitted is
+accepted in the initial version. A future `nodes: true` extension is described
+below and lives in a separate lineage slot.
 
 The namespace lives **under `captures/`** to signal that it shares all semantics (kind resolution, `injection` mode, `#set!` metadata, null-vs-error) with the verbose triple — only the wire encoding differs. Only `compute_captures`'s **wire shaping** and the **lineage slot** are new; the compute pipeline is shared verbatim.
 
