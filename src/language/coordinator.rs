@@ -1102,7 +1102,8 @@ impl LanguageCoordinator {
     /// token (`"py"`, `"js"`), path token via `extract_token_from_path`, then
     /// first-line content (shebang, mode line, Emacs markers).
     /// Host call: `detect_language(path, content, None, language_id)`;
-    /// injection call: `detect_language(token, content, Some(token), Some(token))`.
+    /// injection call: `detect_language_hot(token, content, Some(token),
+    /// Some(token))` — the per-region hot path logs at TRACE.
     pub(crate) fn detect_language(
         &self,
         path: &str,
