@@ -392,15 +392,26 @@ impl DocumentTracker {
         virtual_uri: &str,
         connection_key: &ConnectionKey,
     ) -> Option<i32> {
+        let versions = self.document_versions.lock().await;
+        let version = versions
+            .get(connection_key)?
+            .get(virtual_uri)
+            .copied()?;
+        // Membership is checked AFTER the version read, WHILE the version
+        // lock is still held, and that order is what makes the gate sound
+        // against a concurrent close+reclaim: every remove path (`untrack_
+        // document`, `purge_connection`) deletes the version entry under
+        // this lock BEFORE touching the reverse index, and `mark_open_sent`
+        // only ADDS membership (turning the claim-seeded version into the
+        // confirmed didOpen version). So membership observed here proves the
+        // version read above belongs to a confirmed-open lifetime — checking
+        // membership first (or outside the lock) would let a close+reclaim
+        // slip a fresh pre-send claim's version past an opened-state check
+        // made against the previous lifetime.
         if !self.is_virtual_doc_open_on_connection(virtual_uri, connection_key) {
             return None;
         }
-        self.document_versions
-            .lock()
-            .await
-            .get(connection_key)?
-            .get(virtual_uri)
-            .copied()
+        Some(version)
     }
 
     /// Like [`Self::increment_document_version`], but a no-op (`None`) when
