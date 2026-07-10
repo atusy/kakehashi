@@ -214,8 +214,11 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   not participate for that method — `priorities = ["virt", "host"]`
   suppresses native; `priorities = []` disables the method's REQUEST
   dispatch across all layers (mirroring the stage-1 `priorities = []`).
-  Exception: spontaneous diagnostic pushes bypass layer priorities and are
-  still accepted and cache-concatenated (see item 4's pull/push split). No `"*"` element is supported:
+  Exception: spontaneous diagnostic pushes bypass layer priorities on the
+  proactive republish path and are still accepted and cache-concatenated
+  (cached pushes answering a client pull via `pushFallback` DO pass through
+  layer participation, priorities, and strategy — see item 4's pull/push
+  split). No `"*"` element is supported:
   with a closed three-value set, "the rest" is always expressible by explicit
   enumeration, so the enum stays pure.
 - **`priorities` ranks; `enabled` gates.** Host participation is additionally

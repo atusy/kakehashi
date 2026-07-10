@@ -274,7 +274,9 @@ concatenated-formatting-pipeline.
 **Applies to**: `textDocument/publishDiagnostics`
 
 Note: spontaneous pushes bypass the aggregation priorities/strategy machinery
-— the diagnostic cache always concatenates them across servers. Configured
+on the proactive republish path — the diagnostic cache concatenates them
+across servers (cached pushes answering a client pull via `pushFallback` do
+pass through layer participation, priorities, and strategy). Configured
 `_self` host-server pushes carry the real host URI and host-relative ranges,
 so they are republished as-is (no URI filtering or translation step applies
 to them).

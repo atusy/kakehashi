@@ -441,9 +441,11 @@ Details:
   are pulled with the real document URI and their diagnostics merge with
   the injection regions' per the layer `strategy`. Caveat: SPONTANEOUS
   pushes a downstream server sends on its own bypass the
-  priorities/strategy machinery — they are cached and always concatenated
-  across servers (host `_self` pushes keep their real host URIs and
-  ranges as-is).
+  priorities/strategy machinery when proactively republished — cached and
+  concatenated across servers (host `_self` pushes keep their real host
+  URIs and ranges as-is). When those cached pushes later answer a client
+  pull (`pushFallback`), layer participation, priorities, and the
+  cross-layer strategy do apply.
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for every bridged
   request method — including pull/push diagnostics — when host bridging is
