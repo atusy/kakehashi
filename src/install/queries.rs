@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::http::agent_with_timeout;
+#[cfg(test)]
+use super::http::agent_with_timeout_allowing_http;
 
 /// Base URL for nvim-treesitter query files on GitHub (main branch).
 /// Note: In the main branch, queries are under runtime/queries instead of queries.
@@ -26,6 +28,10 @@ pub enum QueryInstallError {
     LanguageNotSupported(String),
     /// HTTP request failed.
     HttpError(String),
+    /// HTTP response returned a structured non-success status code.
+    HttpStatus { code: u16, url: String },
+    /// Plain HTTP was rejected by the production HTTPS-only policy.
+    HttpsOnly { url: String },
     /// File system operation failed.
     IoError(std::io::Error),
     /// Queries already exist and --force not specified.
@@ -43,6 +49,8 @@ impl std::fmt::Display for QueryInstallError {
                 )
             }
             Self::HttpError(msg) => write!(f, "HTTP error: {}", msg),
+            Self::HttpStatus { code, url } => write!(f, "HTTP {} for {}", code, url),
+            Self::HttpsOnly { url } => write!(f, "HTTPS-only policy rejected {}", url),
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::AlreadyExists(path) => {
                 write!(
@@ -118,19 +126,86 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from(NVIM_TREESITTER_QUERIES_URL, language, data_dir, force)
+    install_queries_with_dependencies_from_with_http_policy(
+        NVIM_TREESITTER_QUERIES_URL,
+        language,
+        data_dir,
+        force,
+        QueryHttpPolicy::HttpsOnly,
+    )
 }
 
-/// Like [`install_queries_with_dependencies`] but downloading from `base_url`,
-/// so tests can serve query files from a local HTTP server.
+/// Like [`install_queries_with_dependencies`] but downloading from `base_url`.
 pub(crate) fn install_queries_with_dependencies_from(
     base_url: &str,
     language: &str,
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from_with_http_policy(
+        base_url,
+        language,
+        data_dir,
+        force,
+        QueryHttpPolicy::HttpsOnly,
+    )
+}
+
+/// Like [`install_queries_with_dependencies_from`] but disables the HTTPS-only
+/// policy for tests that serve fixture query files over local plain HTTP.
+#[cfg(test)]
+pub(crate) fn install_queries_with_dependencies_from_allowing_http_for_tests(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from_with_http_policy(
+        base_url,
+        language,
+        data_dir,
+        force,
+        QueryHttpPolicy::AllowHttpForTests,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum QueryHttpPolicy {
+    HttpsOnly,
+    #[cfg(test)]
+    AllowHttpForTests,
+}
+
+fn install_queries_with_dependencies_from_with_http_policy(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+    http_policy: QueryHttpPolicy,
+) -> Result<QueryInstallResult, QueryInstallError> {
     let mut installed = std::collections::HashSet::new();
-    install_queries_recursive(base_url, language, data_dir, force, &mut installed)
+    install_queries_recursive(
+        base_url,
+        language,
+        data_dir,
+        force,
+        &mut installed,
+        http_policy,
+    )
+}
+
+fn validate_url_http_policy(
+    url: &str,
+    http_policy: QueryHttpPolicy,
+) -> Result<(), QueryInstallError> {
+    match http_policy {
+        QueryHttpPolicy::HttpsOnly if url.starts_with("http://") => {
+            Err(QueryInstallError::HttpsOnly {
+                url: url.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Internal recursive helper for installing queries with dependencies.
@@ -140,6 +215,7 @@ fn install_queries_recursive(
     data_dir: &Path,
     force: bool,
     installed: &mut std::collections::HashSet<String>,
+    http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
     // The name becomes a path and URL segment below; reject anything that
     // could escape the data dir (e.g. a caller-provided `../../x`).
@@ -178,7 +254,14 @@ fn install_queries_recursive(
             let parents = parse_inherits_directive(&content);
             for parent in parents {
                 // Install parent dependencies (don't force, just ensure they exist)
-                match install_queries_recursive(base_url, &parent, data_dir, false, installed) {
+                match install_queries_recursive(
+                    base_url,
+                    &parent,
+                    data_dir,
+                    false,
+                    installed,
+                    http_policy,
+                ) {
                     Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
                     Err(e) => {
                         eprintln!(
@@ -203,7 +286,7 @@ fn install_queries_recursive(
     for query_file in QUERY_FILES {
         let url = format!("{}/{}/{}", base_url, language, query_file);
 
-        match download_file(&url) {
+        match download_file(&url, http_policy) {
             Ok(content) => {
                 // Check for inherits directive in highlights.scm
                 if *query_file == "highlights.scm" {
@@ -221,9 +304,12 @@ fn install_queries_recursive(
                 if *query_file == "highlights.scm" {
                     // Clean up the directory we created
                     let _ = fs::remove_dir_all(&queries_dir);
-                    return Err(QueryInstallError::LanguageNotSupported(
-                        language.to_string(),
-                    ));
+                    return match e {
+                        QueryInstallError::HttpStatus { code: 404, .. } => Err(
+                            QueryInstallError::LanguageNotSupported(language.to_string()),
+                        ),
+                        other => Err(other),
+                    };
                 }
                 // Log but continue for optional files
                 eprintln!(
@@ -247,7 +333,8 @@ fn install_queries_recursive(
     for parent in parents_to_install {
         eprintln!("Installing inherited queries: {}", parent);
         // Don't fail if parent already exists
-        match install_queries_recursive(base_url, &parent, data_dir, false, installed) {
+        match install_queries_recursive(base_url, &parent, data_dir, false, installed, http_policy)
+        {
             Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
             Err(e) => {
                 eprintln!(
@@ -266,16 +353,24 @@ fn install_queries_recursive(
 }
 
 /// Download a file from a URL.
-fn download_file(url: &str) -> Result<String, QueryInstallError> {
-    let mut response = agent_with_timeout(QUERY_HTTP_TIMEOUT)
-        .get(url)
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::StatusCode(code) => {
-                QueryInstallError::HttpError(format!("HTTP {} for {}", code, url))
-            }
-            e => QueryInstallError::HttpError(e.to_string()),
-        })?;
+fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, QueryInstallError> {
+    validate_url_http_policy(url, http_policy)?;
+    let agent = match http_policy {
+        QueryHttpPolicy::HttpsOnly => agent_with_timeout(QUERY_HTTP_TIMEOUT),
+        #[cfg(test)]
+        QueryHttpPolicy::AllowHttpForTests => agent_with_timeout_allowing_http(QUERY_HTTP_TIMEOUT),
+    };
+
+    let mut response = agent.get(url).call().map_err(|e| match e {
+        ureq::Error::StatusCode(code) => QueryInstallError::HttpStatus {
+            code,
+            url: url.to_string(),
+        },
+        ureq::Error::RequireHttpsOnly(_) => QueryInstallError::HttpsOnly {
+            url: url.to_string(),
+        },
+        e => QueryInstallError::HttpError(e.to_string()),
+    })?;
 
     response
         .body_mut()
@@ -287,6 +382,33 @@ fn download_file(url: &str) -> Result<String, QueryInstallError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn spawn_404_server() -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if line == "\r\n" || line == "\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            let response =
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+        });
+        base_url
+    }
 
     /// The rejected name flows into the error's `Display` (printed raw by
     /// the CLI), so control characters in an untrusted name must be escaped
@@ -310,6 +432,66 @@ mod tests {
             }
             other => panic!("expected LanguageNotSupported, got {:?}", other.err()),
         }
+    }
+
+    #[test]
+    fn production_query_install_rejects_plain_http_base_url() {
+        let temp = TempDir::new().unwrap();
+        let result =
+            install_queries_with_dependencies_from("http://127.0.0.1:1", "lua", temp.path(), false);
+
+        assert!(
+            matches!(result, Err(QueryInstallError::HttpsOnly { url }) if url == "http://127.0.0.1:1/lua/highlights.scm"),
+            "plain HTTP downloads should fail before being reported as missing queries"
+        );
+    }
+
+    #[test]
+    fn installed_queries_skip_plain_http_sentinel_base_url() {
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries").join("lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+
+        let result =
+            install_queries_with_dependencies_from("http://127.0.0.1:1", "lua", temp.path(), false);
+
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(path)) if path == queries_dir),
+            "already-installed queries must not validate an unused HTTP sentinel URL"
+        );
+    }
+
+    #[test]
+    fn missing_required_highlights_remains_language_not_supported() {
+        let temp = TempDir::new().unwrap();
+        let base_url = spawn_404_server();
+
+        let result = install_queries_with_dependencies_from_allowing_http_for_tests(
+            &base_url,
+            "missing_lang",
+            temp.path(),
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(QueryInstallError::LanguageNotSupported(lang)) if lang == "missing_lang"),
+            "404 for required highlights.scm still means the language has no query support"
+        );
+    }
+
+    #[test]
+    fn download_file_preserves_http_status_code() {
+        let base_url = spawn_404_server();
+        let result = download_file(
+            &format!("{base_url}/missing_lang/highlights.scm"),
+            QueryHttpPolicy::AllowHttpForTests,
+        );
+
+        assert!(
+            matches!(result, Err(QueryInstallError::HttpStatus { code: 404, .. })),
+            "download errors should preserve structured status codes"
+        );
     }
 
     /// Inherited language names become path segments (`queries/<name>/`) and

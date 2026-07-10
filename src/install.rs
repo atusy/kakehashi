@@ -229,15 +229,38 @@ impl InstallResult {
 
 /// Install a language synchronously (both parser and queries).
 ///
-/// `queries_base_url` is injected so tests can serve query files from a
-/// local HTTP server; production callers pass
-/// [`queries::NVIM_TREESITTER_QUERIES_URL`].
+/// Production callers pass [`queries::NVIM_TREESITTER_QUERIES_URL`]. Tests
+/// can inject other HTTPS endpoints; local HTTP fixtures use a test-only
+/// wrapper below so production downloads stay HTTPS-only.
 fn install_language_blocking(
     language: &str,
     data_dir: &std::path::Path,
     force: bool,
     queries_base_url: &str,
     compile: parser::ParserCompile,
+) -> InstallResult {
+    install_language_blocking_with_query_installer(
+        language,
+        data_dir,
+        force,
+        queries_base_url,
+        compile,
+        queries::install_queries_with_dependencies_from,
+    )
+}
+
+fn install_language_blocking_with_query_installer(
+    language: &str,
+    data_dir: &std::path::Path,
+    force: bool,
+    queries_base_url: &str,
+    compile: parser::ParserCompile,
+    install_queries: fn(
+        &str,
+        &str,
+        &std::path::Path,
+        bool,
+    ) -> Result<queries::QueryInstallResult, queries::QueryInstallError>,
 ) -> InstallResult {
     let mut result = InstallResult {
         parser_path: None,
@@ -287,12 +310,7 @@ fn install_language_blocking(
 
     // Install queries, following `; inherits:` so languages like html
     // (which keeps its @comment capture in html_tags) highlight correctly.
-    match queries::install_queries_with_dependencies_from(
-        queries_base_url,
-        language,
-        data_dir,
-        force,
-    ) {
+    match install_queries(queries_base_url, language, data_dir, force) {
         Ok(query_result) => {
             result.queries_path = Some(query_result.install_path);
         }
@@ -334,6 +352,24 @@ pub(crate) async fn install_language_async(
         parser_error: Some(format!("Task panicked: {}", e)),
         queries_error: None,
     })
+}
+
+#[cfg(test)]
+fn install_language_blocking_allowing_http_queries_for_tests(
+    language: &str,
+    data_dir: &std::path::Path,
+    force: bool,
+    queries_base_url: &str,
+    compile: parser::ParserCompile,
+) -> InstallResult {
+    install_language_blocking_with_query_installer(
+        language,
+        data_dir,
+        force,
+        queries_base_url,
+        compile,
+        queries::install_queries_with_dependencies_from_allowing_http_for_tests,
+    )
 }
 
 #[cfg(test)]
@@ -465,7 +501,7 @@ mod tests {
             ("/parent_lang/highlights.scm", "(comment) @comment\n"),
         ]);
 
-        let result = install_language_blocking(
+        let result = install_language_blocking_allowing_http_queries_for_tests(
             "child_lang",
             data_dir,
             false,
