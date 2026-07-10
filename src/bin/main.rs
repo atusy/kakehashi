@@ -560,6 +560,16 @@ fn run_language_uninstall(
     let mut any_removed = false;
     let mut any_failed = false;
     for lang in &languages_to_uninstall {
+        // Reject unsafe names before building any path from them: `lang` is
+        // user input and feeds fs::remove_file via find_parser_file, so a
+        // separator-carrying name must not escape the data dir.
+        if !queries::is_safe_language_name(lang) {
+            // Debug-format: untrusted input could smuggle ANSI escapes.
+            eprintln!("✗ Invalid language name {:?}", lang);
+            any_failed = true;
+            continue;
+        }
+
         let mut removed_something = false;
 
         // Remove parser file

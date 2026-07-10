@@ -472,13 +472,20 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
         Err(e) => return Err(QueryInstallError::IoError(e)),
     };
 
+    // Recover at most once per language: a single recovery pass already
+    // considers every backup for that language (newest_complete_backup_dir
+    // rescans the parent), so running it per backup directory would redo the
+    // same scan and lock acquisition for each stranded backup.
+    let mut recovered_languages = std::collections::HashSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
         if let Some(language) = backup_language_name(&path) {
-            recover_interrupted_query_install(queries_parent, &language)?;
+            if recovered_languages.insert(language.clone()) {
+                recover_interrupted_query_install(queries_parent, &language)?;
+            }
         } else if let Some((language, _)) = temp_language_name_and_pid(&path) {
             remove_interrupted_temp_query_install(queries_parent, &language, &path)?;
         }
