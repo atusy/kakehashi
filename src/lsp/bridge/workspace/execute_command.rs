@@ -64,14 +64,29 @@ impl LanguageServerPool {
             }
         };
 
+        // executeCommand is USER-invoked (they picked the action/palette
+        // entry): failing soft is right, failing silently is not. The encoded
+        // command outlives config edits, so a server removed/renamed since the
+        // action was minted lands here.
         if !crate::config::is_server_spawnable(&settings.language_servers, &origin) {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: origin {origin:?} is not spawnable (removed or \
+                 misconfigured since the action was produced); dropping {command:?}"
+            );
             return None;
         }
-        let config = resolve_with_wildcard(
+        let Some(config) = resolve_with_wildcard(
             &settings.language_servers,
             &origin,
             merge_bridge_server_configs,
-        )?;
+        ) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: origin {origin:?} has no resolvable config; dropping {command:?}"
+            );
+            return None;
+        };
 
         // A malformed host_uri must REJECT, not fall through to a client-root
         // fallback connection (which could execute the command against the
@@ -103,7 +118,7 @@ impl LanguageServerPool {
             // (every other failure branch here warns).
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: {origin} does not advertise executeCommandProvider; ignoring '{command}'"
+                "executeCommand: {origin:?} does not advertise executeCommandProvider; ignoring {command:?}"
             );
             return None;
         }
@@ -137,7 +152,7 @@ impl LanguageServerPool {
         let Some(key) = self.command_origins().route(&params.command) else {
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: '{}' is neither a bridged nor a registered command; ignoring",
+                "executeCommand: {:?} is neither a bridged nor a registered command; ignoring",
                 params.command
             );
             return None;
@@ -159,14 +174,31 @@ impl LanguageServerPool {
             // back); reconstructing a shared/marker root without a document is a
             // deferred follow-up.
             None if key.is_client_fallback() => {
+                // The palette registry is session-persistent, so an origin
+                // removed/disabled from config after registration lands here —
+                // warn like the encoded-command path (user-invoked).
                 if !crate::config::is_server_spawnable(&settings.language_servers, origin) {
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: palette origin {origin:?} is no longer spawnable; \
+                         dropping {:?}",
+                        params.command
+                    );
                     return None;
                 }
-                let config = resolve_with_wildcard(
+                let Some(config) = resolve_with_wildcard(
                     &settings.language_servers,
                     origin,
                     merge_bridge_server_configs,
-                )?;
+                ) else {
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: palette origin {origin:?} has no resolvable config; \
+                         dropping {:?}",
+                        params.command
+                    );
+                    return None;
+                };
                 // Wait through initialization (bounded by the standard init
                 // budget) rather than take a possibly-`Initializing` handle: the
                 // pool returns an existing not-yet-Ready connection here, whose
@@ -195,7 +227,7 @@ impl LanguageServerPool {
             None => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "executeCommand: origin connection for palette command '{}' ({origin}) is not ready; ignoring",
+                    "executeCommand: origin connection for palette command {:?} ({origin:?}) is not ready; ignoring",
                     params.command
                 );
                 return None;
@@ -209,7 +241,7 @@ impl LanguageServerPool {
             // failure branch warns) so a fail-soft `null` is diagnosable.
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: origin {origin} for palette command '{}' does not (yet) advertise executeCommandProvider; ignoring",
+                "executeCommand: origin {origin:?} for palette command {:?} does not (yet) advertise executeCommandProvider; ignoring",
                 params.command
             );
             return None;
@@ -238,7 +270,9 @@ impl LanguageServerPool {
                 Err(e) => {
                     warn!(
                         target: "kakehashi::bridge",
-                        "executeCommand: failed to register request: {e}"
+                        "executeCommand: failed to register request on {connection_key:?} \
+                         for {:?}: {e}",
+                        params.command
                     );
                     if let Some(ref id) = upstream_id {
                         self.unregister_upstream_request(id, connection_key);
@@ -278,7 +312,8 @@ impl LanguageServerPool {
                 drop(connections);
                 warn!(
                     target: "kakehashi::bridge",
-                    "executeCommand: failed to send request: {e}"
+                    "executeCommand: failed to send {:?} on {connection_key:?}: {e}",
+                    params.command
                 );
                 if let Some(ref id) = upstream_id {
                     self.unregister_upstream_request(id, connection_key);

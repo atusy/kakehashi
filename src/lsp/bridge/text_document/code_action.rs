@@ -566,12 +566,28 @@ impl LanguageServerPool {
             .buffer_unordered(MAX_CONCURRENT_EAGER_RESOLVES)
             .collect()
             .await;
+        let mut failed = 0usize;
+        let total = resolved.len();
         for (idx, outcome) in resolved {
-            if let Some(materialized) = outcome
-                && let CodeActionOrCommand::CodeAction(slot) = &mut actions[idx]
-            {
-                *slot = materialized;
+            match outcome {
+                Some(materialized) => {
+                    if let CodeActionOrCommand::CodeAction(slot) = &mut actions[idx] {
+                        *slot = materialized;
+                    }
+                }
+                None => failed += 1,
             }
+        }
+        // ONE aggregated warn per request, however many lazy actions the
+        // server returned (per-result warns would be unbounded).
+        if failed > 0 {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction: {failed} of {total} eager resolves failed on {:?} \
+                 (transport error or malformed result; see debug logs); those \
+                 actions stay lazy",
+                handle.key()
+            );
         }
     }
 
@@ -592,7 +608,16 @@ impl LanguageServerPool {
             return action;
         };
 
+        // resolve is USER-initiated (they selected the action): fail soft,
+        // but never silently — a server removed/renamed since the action was
+        // minted lands here.
         if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: origin {:?} is not spawnable (removed or \
+                 misconfigured since the action was produced); returning unresolved",
+                envelope.origin
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         }
@@ -601,6 +626,11 @@ impl LanguageServerPool {
             &envelope.origin,
             merge_bridge_server_configs,
         ) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: origin {:?} has no resolvable config; returning unresolved",
+                envelope.origin
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         };
@@ -679,6 +709,14 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("codeAction/resolve") {
+            // Anomalous: the envelope was only minted because the origin
+            // advertised resolve, so reaching here means a respawn changed
+            // capabilities (or the handle is still initializing).
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
+                envelope.origin
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         }
@@ -693,6 +731,13 @@ impl LanguageServerPool {
             .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
             .await
         else {
+            // Client-driven (one per user selection, so bounded): the resolve
+            // failed in transport or returned a malformed result (debug logs
+            // carry the detail); the action goes back unresolved.
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: no usable response from {server_name:?}; returning unresolved"
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         };
@@ -742,6 +787,14 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("codeAction/resolve") {
+            // Anomalous: the envelope was only minted because the origin
+            // advertised resolve, so reaching here means a respawn changed
+            // capabilities (or the handle is still initializing).
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
+                envelope.origin
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         }
@@ -761,6 +814,12 @@ impl LanguageServerPool {
             .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
             .await
         else {
+            // Per-selection warn (bounded: one per user-selected action) — the
+            // helper's transport failures log at debug and defer to callers.
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: no usable response from {server_name:?}; returning unresolved"
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         };
@@ -920,9 +979,12 @@ impl LanguageServerPool {
             match handle.register_request_with_upstream(upstream_id.clone()) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    warn!(
+                    // DEBUG: this helper runs once per action on the eager
+                    // fan-out (unbounded by a hostile lazy-action list); the
+                    // callers own the bounded warn (aggregate / per-selection).
+                    log::debug!(
                         target: "kakehashi::bridge",
-                        "codeAction/resolve: failed to register request: {e}"
+                        "codeAction/resolve: failed to register request on {connection_key:?}: {e}"
                     );
                     if let Some(ref id) = upstream_id {
                         self.unregister_upstream_request(id, connection_key);
@@ -935,9 +997,10 @@ impl LanguageServerPool {
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
         if let Err(e) = handle.send_request(request, request_id) {
-            warn!(
+            // DEBUG: see the register-failure note above.
+            log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: failed to send request: {e}"
+                "codeAction/resolve: failed to send request on {connection_key:?}: {e}"
             );
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);
@@ -951,13 +1014,13 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
 
-        // Fail soft, but not silently: surface timeouts / channel-closed like the
-        // sibling codeLens/completion resolve paths so resolve-time issues are
-        // debuggable (qodo review finding).
+        // Fail soft, but not silently. DEBUG here: this helper runs once per
+        // action on the eager fan-out (unbounded by a hostile lazy-action
+        // list); the callers own the bounded warn (aggregate / per-selection).
         let response = match response {
             Ok(r) => r,
             Err(e) => {
-                warn!(
+                log::debug!(
                     target: "kakehashi::bridge",
                     "codeAction/resolve failed for {connection_key:?}: {e}"
                 );
@@ -990,7 +1053,26 @@ fn parse_code_action_resolve_response(mut response: serde_json::Value) -> Option
     if result.is_null() {
         return None;
     }
-    serde_json::from_value(result).ok()
+    match serde_json::from_value(result) {
+        Ok(resolved) => Some(resolved),
+        // A present, non-null result that doesn't parse: without a log this
+        // is undebuggable in the field (the action just stays unresolved).
+        // Mirrors parse_code_actions_leniently's per-item warn.
+        Err(e) => {
+            // DEBUG and payload-free: serde's Display embeds downstream
+            // payload snippets, and `from_value` reports a meaningless
+            // line 0 column 0 — only the error class is trustworthy. The
+            // call sites aggregate the user-facing warn (a hostile server
+            // could return arbitrarily many lazy actions, so a per-result
+            // warn here would be unbounded per request).
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: malformed resolve result: {:?}",
+                e.classify()
+            );
+            None
+        }
+    }
 }
 
 /// Build a JSON-RPC code action request for a downstream language server.
@@ -1441,8 +1523,20 @@ fn disable_action(
     upstream_caps: UpstreamCodeActionCaps,
 ) -> Option<CodeActionOrCommand> {
     if !upstream_caps.disabled_support {
+        // Without disabledSupport the action vanishes from the menu — the
+        // only trace of a server bug (e.g. an out-of-region edit) is this log.
+        // No title in the log: titles are downstream-controlled free text.
+        log::debug!(
+            target: "kakehashi::bridge",
+            "codeAction from {server_name:?} dropped ({reason}); the client \
+             lacks disabledSupport to show it disabled"
+        );
         return None;
     }
+    log::debug!(
+        target: "kakehashi::bridge",
+        "codeAction from {server_name:?} disabled: {reason}"
+    );
     action.title = suffix_title(action.title, server_name);
     action.edit = None;
     action.command = None;

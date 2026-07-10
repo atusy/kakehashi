@@ -1236,11 +1236,21 @@ fn spawn_upstream_request(
                     None => Ok(params),
                 };
                 let response = match params {
-                    Err(failure_reason) => ApplyWorkspaceEditResponse {
-                        applied: false,
-                        failure_reason: Some(failure_reason),
-                        failed_change: None,
-                    },
+                    Err(failure_reason) => {
+                        // The reason is otherwise write-only: it goes to the
+                        // DOWNSTREAM (which typically ignores failureReason),
+                        // so without this log a rejected server-driven edit is
+                        // invisible on the kakehashi side.
+                        log::warn!(
+                            target: "kakehashi::bridge",
+                            "workspace/applyEdit rejected locally: {failure_reason:?}"
+                        );
+                        ApplyWorkspaceEditResponse {
+                            applied: false,
+                            failure_reason: Some(failure_reason),
+                            failed_change: None,
+                        }
+                    }
                     // Serializing the (typed) translated params ~never fails,
                     // but forwarding `params: null` on the off chance it did
                     // would send the editor an invalid request; answer local

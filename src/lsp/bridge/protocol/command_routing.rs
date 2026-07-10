@@ -63,6 +63,42 @@ pub(crate) struct CommandRoute<'a> {
 /// remainder).
 pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Option<String> {
     if origin.contains(SEP) || host_uri.contains(SEP) {
+        // Not a transient: the origin is a TOML config key, so an affected
+        // config drops this server's commands on EVERY request. One warn here
+        // covers all four call sites (initial bare/embedded command, virt and
+        // host resolve), which fail closed on the `None` — deduplicated per
+        // distinct origin so per-action shaping loops don't spam the log.
+        // (Not `Mutex::new(HashSet::new())` in a plain static: `HashSet::new`
+        // is not const — it builds a RandomState. LazyLock defers it.)
+        static WARNED_ORIGINS: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashSet<String>>,
+        > = std::sync::LazyLock::new(Default::default);
+        // Recover a poisoned mutex (the set is always in a valid state) so
+        // the dedup invariant survives a panic elsewhere — falling back to
+        // "first" would re-open the warn spam this exists to prevent.
+        let mut warned = WARNED_ORIGINS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Check before allocating: after the first warn, the hot per-action
+        // path pays only a lookup.
+        let first_for_origin = if warned.contains(origin) {
+            false
+        } else {
+            warned.insert(origin.to_string())
+        };
+        drop(warned);
+        if first_for_origin {
+            // {:?} escapes the very control character that triggered this
+            // branch, keeping the log line consumable.
+            log::warn!(
+                target: "kakehashi::bridge",
+                "cannot mint routing names for server {origin:?} (first affected \
+                 command: {command:?}): the server name or the host URI contains \
+                 the reserved 0x1f separator, so its routed commands are dropped. \
+                 If the server name is the culprit, rename it in languageServers; \
+                 a separator in a document URI has no config fix"
+            );
+        }
         return None;
     }
     Some(format!(
