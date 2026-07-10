@@ -393,7 +393,7 @@ fn flatten_ordered_region_items<T>(mut region_items: Vec<(usize, Option<Vec<T>>)
 }
 
 #[cfg(test)]
-mod tests {
+mod ordered_region_tests {
     use super::*;
 
     #[test]
