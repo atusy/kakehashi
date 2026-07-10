@@ -356,7 +356,9 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     if columns.iter().all(|&column| column == 0) {
         return true;
     }
-    let content_prefixed = columns.len() > 1 && columns.iter().any(|&column| column > 0);
+    // The all-zero fast path above guarantees SOME column is non-zero here,
+    // so only the shape distinction remains.
+    let content_prefixed = columns.len() > 1;
     let boundary_at = |host_line: u32| {
         content_prefixed && region_end.character == 0 && host_line >= region_end.line
     };
