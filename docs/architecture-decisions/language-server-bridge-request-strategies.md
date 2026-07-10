@@ -85,7 +85,9 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 
 ### Strategy 2: Full Delegation with Response Filtering
 
-**Applies to**: `textDocument/definition`, `textDocument/references`, `textDocument/hover`, `textDocument/signatureHelp`
+**Applies to**: `textDocument/definition`, `textDocument/declaration`,
+`textDocument/typeDefinition`, `textDocument/implementation`,
+`textDocument/references`, `textDocument/hover`, `textDocument/signatureHelp`
 
 ```
 Request (cursor in injection) ──▶ Forward to language server
@@ -93,8 +95,8 @@ Request (cursor in injection) ──▶ Forward to language server
                                          ▼
                                   Filter response
                                   (translate same-region virtual URIs,
-                                   keep real-file URIs, drop other
-                                   virtual-region URIs)
+                                   keep real-file URIs untranslated, drop
+                                   other virtual-region URIs)
                                          │
                                          ▼
                                   Translate positions
@@ -103,7 +105,7 @@ Request (cursor in injection) ──▶ Forward to language server
 
 **Per-Method Details**:
 
-#### textDocument/definition (PoC implemented)
+#### textDocument/definition (and declaration / typeDefinition / implementation, via the shared goto transformer)
 
 | Aspect | Handling |
 |--------|----------|
