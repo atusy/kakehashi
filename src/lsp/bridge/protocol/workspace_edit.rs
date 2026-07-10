@@ -316,6 +316,7 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     edit: &WorkspaceEdit,
     host_uri: &Uri,
     offset: &RegionOffset,
+    region_end: Position,
 ) -> bool {
     let columns = offset.columns();
     // Per-line arrays (the blockquote shape from `compute_line_column_offsets`)
@@ -327,6 +328,12 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     // as the prefixed BOUNDARY. Single-element arrays are the non-blockquote
     // fallback whose later lines are designed unprefixed (see `RegionOffset`),
     // so they get no boundary semantics.
+    //
+    // A trailing zero can also be the EOF row of an UNCLOSED blockquote fence
+    // (no closing line exists); `columns` alone cannot distinguish that from
+    // the closed-fence row, so the guard stays fail-closed there — rejecting a
+    // boundary-touching edit in a transient malformed construct is acceptable,
+    // corrupting a well-formed one is not.
     let content_prefixed = columns.len() > 1 && columns.iter().any(|&column| column > 0);
     let boundary_at = |host_line: u32| {
         content_prefixed
@@ -352,7 +359,15 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
         // the previous line's newline and merges the prefixed line upward.
         let spans_prefixed_line =
             end.line > start.line && (start.line.saturating_add(1)..=end.line).any(prefix_at);
-        let inserts_unprefixed_line = e.new_text.contains(['\n', '\r'])
+        // Single-element MULTI-LINE regions are exempt from the newline check:
+        // later lines are designed unprefixed and line 0's region content runs
+        // to end-of-line, so an inserted newline splits nothing. For a
+        // SINGLE-LINE region (region end on the start line — e.g. inline code)
+        // the host line continues past the region and a newline would split
+        // it, so line 0's offset still rejects there.
+        let newline_splits_nothing = columns.len() == 1 && region_end.line > offset.line();
+        let inserts_unprefixed_line = !newline_splits_nothing
+            && e.new_text.contains(['\n', '\r'])
             && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
         !touches_boundary && !spans_prefixed_line && !inserts_unprefixed_line
     })
@@ -665,7 +680,13 @@ mod tests {
         }));
 
         assert!(!workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 5,
+                character: 8,
+            },
         ));
     }
 
@@ -683,8 +704,15 @@ mod tests {
             ] }
         }));
 
+        // Single-LINE region: the region end sits on the start line.
         assert!(!workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 3,
+                character: 6,
+            },
         ));
     }
 
@@ -717,7 +745,13 @@ mod tests {
         }));
 
         assert!(!workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: fence_line,
+                character: 0,
+            },
         ));
     }
 
@@ -738,7 +772,38 @@ mod tests {
         }));
 
         assert!(!workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 5,
+                character: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_allows_newline_insertion_in_multi_line_single_element_region() {
+        let host_uri = make_host_uri();
+        // Production single-element shape over a MULTI-LINE region: later
+        // lines are designed unprefixed, and line 0's region content runs to
+        // end-of-line (the region continues on the next host line), so a
+        // newline-bearing replacement starting on line 0 splits nothing and
+        // its continuation lines correctly land at column 0.
+        let offset = RegionOffset::new(3, 4);
+        let region_end = Position {
+            line: 5,
+            character: 2,
+        };
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 6}},
+                  "newText": "x\ny" }
+            ] }
+        }));
+
+        assert!(workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset, region_end
         ));
     }
 
@@ -755,8 +820,15 @@ mod tests {
             ] }
         }));
 
+        // Single-LINE region, like the \n sibling above.
         assert!(!workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 3,
+                character: 6,
+            },
         ));
     }
 
@@ -775,7 +847,13 @@ mod tests {
         }));
 
         assert!(workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 6,
+                character: 0,
+            },
         ));
     }
 
@@ -793,7 +871,13 @@ mod tests {
         }));
 
         assert!(workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 4,
+                character: 9,
+            },
         ));
     }
 
@@ -815,7 +899,13 @@ mod tests {
         }));
 
         assert!(workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 5,
+                character: 2,
+            },
         ));
     }
 
@@ -835,7 +925,13 @@ mod tests {
         }));
 
         assert!(!workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 4,
+                character: 9,
+            },
         ));
     }
 
@@ -855,7 +951,13 @@ mod tests {
         }));
 
         assert!(!workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 5,
+                character: 9,
+            },
         ));
     }
 
@@ -900,7 +1002,13 @@ mod tests {
         };
 
         assert!(!workspace_edit_preserves_line_prefixes(
-            &edit, &host_uri, &offset
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 4,
+                character: 9,
+            },
         ));
     }
 

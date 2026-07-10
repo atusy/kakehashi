@@ -363,7 +363,7 @@ fn translate_edit_host_ward_strict(
     if !workspace_edit_within_region(edit, host_uri, offset, region_end) {
         return Err(REASON_CROSS_REGION);
     }
-    if !workspace_edit_preserves_line_prefixes(edit, host_uri, offset) {
+    if !workspace_edit_preserves_line_prefixes(edit, host_uri, offset, region_end) {
         return Err(REASON_PREFIXED_REGION);
     }
     Ok(())
