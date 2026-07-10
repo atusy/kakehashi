@@ -107,8 +107,8 @@ embedded blocks. Works for any grammar, no setup required.
 The features below are served by a language server configured for the
 embedded language — most of them also on the surrounding document itself,
 by a `bridge._self` host server (exceptions: document color stays
-injection-only, and host completion items are passed through without
-`completionItem/resolve` routing). Placing the cursor outside an embedded
+injection-only, and host completion-item and code-lens resolves pass
+through unrouted). Placing the cursor outside an embedded
 code block yields no result from the injection bridges; with `bridge._self`
 configured, the host language's own servers still answer there.
 
@@ -152,8 +152,8 @@ after `(` or `,`). Default combine strategy: `preferred`.
 
 Jumps from a symbol in an embedded block to its definition. The target can be
 **within the same block** or a **real file on disk** (e.g. a library dependency).
-Targets the server addresses to a *different* block's virtual URI are not
-offered (blocks are independent snippets); host-URI targets are passed
+Targets that the server addresses to a *different* block's virtual URI are
+not offered (blocks are independent snippets); host-URI targets are passed
 through without a containment check. Default combine strategy: `preferred`.
 
 ### Find references
@@ -190,8 +190,8 @@ Collects clickable links from all embedded blocks.
 [`textDocument/rename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rename)
 and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareRename)
 
-Renames a symbol within its embedded block. Edits the server addresses to
-OTHER regions' virtual URIs are filtered out; edits to real files (e.g. a
+Renames a symbol within its embedded block. Edits that the server addresses
+to OTHER regions' virtual URIs are filtered out; edits to real files (e.g. a
 cross-file rename from a project-aware server, or host-URI edits — not
 containment-checked) pass through. Default combine strategy: `preferred`.
 
@@ -594,7 +594,7 @@ URIs are rejected on cardinality grounds; single-target requests can still
 be rejected on the usual grounds — unknown/stale URI, virtual-URI file
 operation, region escape). Real-file and — for navigation/references/rename — host-URI
 results pass through, while injection-layer code actions (and applyEdit
-requests that also touch a virtual document) bound host-URI edits to the
-region.
+requests that also touch a virtual document) constrain host-URI edits to
+the region.
 The surrounding host document can be bridged to the host language's own
 servers via `bridge._self` (host-document-bridge).
