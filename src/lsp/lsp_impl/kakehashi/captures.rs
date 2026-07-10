@@ -542,6 +542,26 @@ pub enum CapturesDeltaResponse {
 }
 
 impl Kakehashi {
+    fn captures_snapshot_is_current(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        parsed_version: u64,
+        generation: u64,
+        edit_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
+        let latest = self.documents.latest_snapshot(uri);
+        let current = self.cache.semantic_token_generation() == generation
+            && latest.as_ref().is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == parsed_version
+            });
+        if latest.is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, edit_lock);
+        }
+        current
+    }
+
     pub(in crate::lsp::lsp_impl) fn cancel_captures_walks_for_document(&self, uri: &Url) {
         self.captures_walk_inflight.retain(|key, flight| {
             if key.0 == *uri {
@@ -991,15 +1011,15 @@ impl Kakehashi {
                 // obsolete memo after close or edit.
                 let edit_lock = self.documents.edit_lock(&uri);
                 let edit_guard = edit_lock.lock().await;
-                let current = self.cache.semantic_token_generation() == generation
-                    && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                        view.slot.current_incarnation == incarnation
-                            && view.content_version == snapshot.parsed_version
-                    });
+                let current = self.captures_snapshot_is_current(
+                    &uri,
+                    incarnation,
+                    snapshot.parsed_version,
+                    generation,
+                    &edit_lock,
+                );
                 if !current {
                     drop(edit_guard);
-                    self.documents
-                        .remove_edit_lock_if_unshared(&uri, &edit_lock);
                     return Ok(None);
                 }
                 if let Some(hit) = self.captures_walk_cache.get(&key)
@@ -1285,11 +1305,13 @@ impl Kakehashi {
             // state for the dead document lifetime.
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
-            let current = self.cache.semantic_token_generation() == generation
-                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                    view.slot.current_incarnation == incarnation
-                        && view.content_version == snapshot.parsed_version
-                });
+            let current = self.captures_snapshot_is_current(
+                &uri,
+                incarnation,
+                snapshot.parsed_version,
+                generation,
+                &edit_lock,
+            );
             if !current {
                 return Ok(None);
             }
@@ -2303,6 +2325,55 @@ mod tests {
                 .captures_cache
                 .get(&(uri, "highlights".to_string()))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn captures_currency_failure_keeps_open_document_edit_lock() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///captures-open-lock.rs").unwrap();
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let view = service.inner().documents.latest_snapshot(&uri).unwrap();
+        let edit_lock = service.inner().documents.edit_lock(&uri);
+
+        assert!(!service.inner().captures_snapshot_is_current(
+            &uri,
+            view.slot.current_incarnation,
+            view.content_version,
+            service.inner().cache.semantic_token_generation() + 1,
+            &edit_lock,
+        ));
+
+        let next = service.inner().documents.edit_lock(&uri);
+        assert!(
+            std::sync::Arc::ptr_eq(&edit_lock, &next),
+            "an open lifetime must keep one stable edit lock"
+        );
+    }
+
+    #[test]
+    fn captures_currency_failure_reclaims_closed_document_edit_lock() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///captures-closed-lock.rs").unwrap();
+        let edit_lock = service.inner().documents.edit_lock(&uri);
+
+        assert!(!service.inner().captures_snapshot_is_current(
+            &uri,
+            1,
+            0,
+            service.inner().cache.semantic_token_generation(),
+            &edit_lock,
+        ));
+
+        let next = service.inner().documents.edit_lock(&uri);
+        assert!(
+            !std::sync::Arc::ptr_eq(&edit_lock, &next),
+            "a closed lifetime must not leave its materialized edit lock registered"
         );
     }
 
