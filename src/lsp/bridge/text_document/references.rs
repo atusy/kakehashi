@@ -95,7 +95,9 @@ impl LanguageServerPool {
 /// applying the same URI filter as goto: keep real-file URIs, translate matches
 /// on the request's virtual URI, drop other virtual URIs (cross-region offsets
 /// are unsafe). An empty filtered vec is preserved (not `None`) so callers can
-/// tell "no results" from "search failed".
+/// tell "no results" from a downstream error response (`None`). Malformed
+/// success responses are protocol violations and return `Err` so callers can
+/// surface a warning.
 fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
@@ -196,7 +198,9 @@ mod tests {
 
     impl Log for CapturingLogger {
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.level() == Level::Warn && metadata.target() == "kakehashi::bridge"
+            CAPTURING.load(Ordering::Relaxed)
+                && metadata.level() == Level::Warn
+                && metadata.target() == "kakehashi::bridge"
         }
 
         fn log(&self, record: &Record<'_>) {
@@ -219,7 +223,7 @@ mod tests {
     fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
         INIT_LOGGER.call_once(|| {
             log::set_logger(&LOGGER).expect("test logger should install once");
-            log::set_max_level(LevelFilter::Trace);
+            log::set_max_level(LevelFilter::Warn);
         });
         let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         LOGGER
@@ -228,8 +232,9 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .clear();
         CAPTURING.store(true, Ordering::Relaxed);
-        let _guard = CaptureGuard;
+        let guard = CaptureGuard;
         f();
+        drop(guard);
         let captured = LOGGER
             .messages
             .lock()
