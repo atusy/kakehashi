@@ -72,6 +72,7 @@ impl LanguageServerPool {
                     response,
                     ctx.offset,
                     region_end,
+                    Some(host_position.line),
                     Some(EnvelopeContext {
                         server_name,
                         host_uri: host_uri.as_str(),
@@ -111,6 +112,7 @@ fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     region_end: Position,
+    request_host_line: Option<u32>,
     envelope_ctx: Option<EnvelopeContext<'_>>,
 ) -> Option<CompletionList> {
     if response_has_jsonrpc_error(&response, "textDocument/completion") {
@@ -144,7 +146,7 @@ fn transform_completion_response_to_host(
     // routing
     let before = list.items.len();
     list.items.retain_mut(|item| {
-        if !transform_completion_item(item, offset, region_end) {
+        if !transform_completion_item(item, offset, region_end, request_host_line) {
             return false;
         }
         if let Some(ref ctx) = envelope_ctx {
@@ -178,16 +180,33 @@ pub(super) fn transform_completion_item(
     item: &mut CompletionItem,
     offset: &RegionOffset,
     region_end: Position,
+    request_host_line: Option<u32>,
 ) -> bool {
-    let region_prefixed = offset.columns().iter().any(|&column| column != 0);
+    // A multi-line insertion is unsafe only where its INSERTION POINT's
+    // neighborhood is prefixed — a mixed region (single-element `[n]` offsets:
+    // line 0 starts mid-host-line, later lines are whole and unprefixed)
+    // safely takes it on a later line. Checking the following line too covers
+    // the inserted-lines-land-below shape, mirroring the shared predicate.
+    // `None` (the resolve path, which has no position snapshot) falls back to
+    // region-wide any-prefix: fail-closed.
+    let prefixed_at_insertion = |host_line: Option<u32>| match host_line {
+        Some(line) => {
+            insertion_point_prefixed(offset, line)
+                || insertion_point_prefixed(offset, line.saturating_add(1))
+        }
+        None => offset.columns().iter().any(|&column| column != 0),
+    };
     // The literal newline scans below can't see what a SNIPPET expands to at
     // the client: runtime variables (`${CLIPBOARD}`, `$TM_SELECTED_TEXT`) may
-    // be multiline. In a prefixed region, fail closed on any snippet variable
-    // in the primary insert text (tabstops/placeholders expand from literal
-    // text the scans already cover; additionalTextEdits are never snippets).
+    // be multiline. At a prefixed insertion point, fail closed on any snippet
+    // variable in the primary insert text (tabstops/placeholders expand from
+    // literal text the scans already cover; additionalTextEdits are never
+    // snippets).
     let snippet =
         item.insert_text_format == Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET);
-    let snippet_unsafe = |text: &str| region_prefixed && snippet && snippet_contains_variable(text);
+    let snippet_unsafe = |text: &str, host_line: Option<u32>| {
+        snippet && prefixed_at_insertion(host_line) && snippet_contains_variable(text)
+    };
 
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
@@ -195,7 +214,7 @@ pub(super) fn transform_completion_item(
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
                 translate_virtual_range_to_host(&mut edit.range, offset);
                 if !text_edit_safe_in_region(edit, offset, region_end)
-                    || snippet_unsafe(&edit.new_text)
+                    || snippet_unsafe(&edit.new_text, Some(edit.range.start.line))
                 {
                     return false;
                 }
@@ -213,7 +232,13 @@ pub(super) fn transform_completion_item(
                 probe.range = edit.replace;
                 let replace_ok = text_edit_safe_in_region(&probe, offset, region_end);
                 edit.new_text = probe.new_text;
-                if !insert_ok || !replace_ok || snippet_unsafe(&edit.new_text) {
+                if !insert_ok
+                    || !replace_ok
+                    || snippet_unsafe(
+                        &edit.new_text,
+                        Some(edit.insert.start.line.min(edit.replace.start.line)),
+                    )
+                {
                     return false;
                 }
             }
@@ -229,10 +254,12 @@ pub(super) fn transform_completion_item(
     // insertions safely and stay exempt.
     if item.text_edit.is_none() {
         let effective = item.insert_text.as_deref().unwrap_or(&item.label);
-        if region_prefixed && (effective.contains('\n') || effective.contains('\r')) {
+        if (effective.contains('\n') || effective.contains('\r'))
+            && prefixed_at_insertion(request_host_line)
+        {
             return false;
         }
-        if snippet_unsafe(effective) {
+        if snippet_unsafe(effective, request_host_line) {
             return false;
         }
     }
@@ -254,6 +281,23 @@ pub(super) fn transform_completion_item(
         }
     }
     true
+}
+
+/// Whether the host line carries a region prefix an unprefixed insertion
+/// would break. Lines before the region are fail-closed `true`. Lines past
+/// the recorded per-line array are the BOUNDARY in per-line (blockquote)
+/// regions — fail-closed `true` (their real prefix is unrecorded) — but in
+/// the single-element fallback shape (`[start_column]`: only line 0 starts
+/// mid-host-line) later lines are whole and unprefixed: `false`.
+fn insertion_point_prefixed(offset: &RegionOffset, host_line: u32) -> bool {
+    let columns = offset.columns();
+    match host_line.checked_sub(offset.line()) {
+        None => true,
+        Some(virtual_line) => match columns.get(virtual_line as usize) {
+            Some(&column) => column != 0,
+            None => columns.len() > 1,
+        },
+    }
 }
 
 /// Whether snippet-syntax text references a snippet VARIABLE — `$name` or
@@ -484,6 +528,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
             None,
+            None,
         );
 
         assert!(transformed.is_some());
@@ -517,6 +562,7 @@ mod tests {
             &RegionOffset::new(3, 0),
             TEST_REGION_END,
             None,
+            None,
         );
         assert!(transformed.is_none());
     }
@@ -543,6 +589,7 @@ mod tests {
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
+            None,
             None,
         );
 
@@ -593,6 +640,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
             None,
+            None,
         );
 
         assert!(transformed.is_some());
@@ -639,6 +687,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
             None,
+            None,
         );
 
         assert!(transformed.is_some());
@@ -681,6 +730,7 @@ mod tests {
             &RegionOffset::new(10, 4),
             TEST_REGION_END,
             None,
+            None,
         );
 
         let list = transformed.unwrap();
@@ -721,6 +771,7 @@ mod tests {
             response,
             &RegionOffset::new(10, 4),
             TEST_REGION_END,
+            None,
             None,
         );
 
@@ -766,6 +817,7 @@ mod tests {
             response,
             &RegionOffset::new(5, 7),
             TEST_REGION_END,
+            None,
             None,
         );
 
@@ -813,6 +865,7 @@ mod tests {
             response,
             &RegionOffset::new(5, 3),
             TEST_REGION_END,
+            None,
             None,
         );
 
@@ -887,6 +940,7 @@ mod tests {
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
+            None,
             None,
         );
 
@@ -1086,8 +1140,8 @@ mod tests {
             ]
         });
 
-        let list =
-            transform_completion_response_to_host(response, &offset, region_end, None).unwrap();
+        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
+            .unwrap();
 
         assert_eq!(list.items.len(), 1, "prefix-breaking item must be dropped");
         assert_eq!(list.items[0].label, "safe");
@@ -1121,8 +1175,8 @@ mod tests {
             ]
         });
 
-        let list =
-            transform_completion_response_to_host(response, &offset, region_end, None).unwrap();
+        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
+            .unwrap();
 
         assert_eq!(list.items.len(), 1, "item with safe primary edit is kept");
         let additional = list.items[0].additional_text_edits.as_ref().unwrap();
@@ -1150,8 +1204,8 @@ mod tests {
             ]
         });
 
-        let list =
-            transform_completion_response_to_host(response, &offset, region_end, None).unwrap();
+        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
+            .unwrap();
 
         assert!(
             list.items.is_empty(),
@@ -1183,8 +1237,8 @@ mod tests {
             ]
         });
 
-        let list =
-            transform_completion_response_to_host(response, &offset, region_end, None).unwrap();
+        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
+            .unwrap();
 
         assert_eq!(list.items.len(), 1, "region-escaping item must drop");
         assert_eq!(list.items[0].label, "contained");
@@ -1209,16 +1263,21 @@ mod tests {
             ]
         });
 
-        let list =
-            transform_completion_response_to_host(response.clone(), &offset, region_end, None)
-                .unwrap();
+        let list = transform_completion_response_to_host(
+            response.clone(),
+            &offset,
+            region_end,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(list.items.len(), 1, "multiline fallback must drop");
         assert_eq!(list.items[0].label, "single");
 
         // Same response in a plain fenced region: both survive.
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
-        let list =
-            transform_completion_response_to_host(response, &plain, region_end, None).unwrap();
+        let list = transform_completion_response_to_host(response, &plain, region_end, None, None)
+            .unwrap();
         assert_eq!(list.items.len(), 2, "plain regions take multiline inserts");
     }
 
@@ -1249,9 +1308,14 @@ mod tests {
             ]
         });
 
-        let list =
-            transform_completion_response_to_host(response.clone(), &offset, region_end, None)
-                .unwrap();
+        let list = transform_completion_response_to_host(
+            response.clone(),
+            &offset,
+            region_end,
+            None,
+            None,
+        )
+        .unwrap();
         let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -1261,8 +1325,8 @@ mod tests {
 
         // Plain (all-zero) region: everything survives.
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
-        let list =
-            transform_completion_response_to_host(response, &plain, region_end, None).unwrap();
+        let list = transform_completion_response_to_host(response, &plain, region_end, None, None)
+            .unwrap();
         assert_eq!(list.items.len(), 3, "plain regions are exempt");
     }
 
@@ -1278,6 +1342,44 @@ mod tests {
         assert!(
             !snippet_contains_variable("\\$CLIPBOARD"),
             "escaped dollar is literal per the snippet grammar"
+        );
+    }
+
+    #[test]
+    fn mixed_region_allows_multiline_fallback_on_unprefixed_later_lines() {
+        // Single-element offsets `[7]`: only line 0 starts mid-host-line;
+        // later lines are whole and unprefixed. A multi-line no-textEdit
+        // insertion is unsafe at line 0 (it would split the host line) but
+        // safe on a later line — the region-wide any-prefix shortcut used to
+        // drop both.
+        let offset = RegionOffset::new(3, 7);
+        let region_end = Position {
+            line: 9,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [ { "label": "multiline", "insertText": "a\nb" } ]
+        });
+
+        // Requested on host line 5 (virtual line 2, unprefixed): kept.
+        let list = transform_completion_response_to_host(
+            response.clone(),
+            &offset,
+            region_end,
+            Some(5),
+            None,
+        )
+        .unwrap();
+        assert_eq!(list.items.len(), 1, "later-line insertion is safe");
+
+        // Requested on host line 3 (virtual line 0, mid-host-line): dropped.
+        let list =
+            transform_completion_response_to_host(response, &offset, region_end, Some(3), None)
+                .unwrap();
+        assert!(
+            list.items.is_empty(),
+            "line-0 insertion would split the host line"
         );
     }
 }

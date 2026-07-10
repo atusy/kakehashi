@@ -186,7 +186,7 @@ impl LanguageServerPool {
             Some(mut resolved) => {
                 let offset = RegionOffset::from(&envelope.offset);
                 let region_end = resolve_guard_region_end(&envelope, &offset);
-                if transform_completion_item(&mut resolved, &offset, region_end) {
+                if transform_completion_item(&mut resolved, &offset, region_end, None) {
                     re_envelope_item(&mut resolved, &envelope);
                     resolved
                 } else {
@@ -360,7 +360,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !transform_completion_item(&mut resolved, &offset, region_end),
+            !transform_completion_item(&mut resolved, &offset, region_end, None),
             "prefixed-region edits must be rejected under the legacy fallback"
         );
     }
