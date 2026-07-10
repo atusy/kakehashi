@@ -345,8 +345,8 @@ fn layer_result_or_empty<R>(
 /// `Some(empty)` reaches the fold.) A layer not in `priorities` is never
 /// awaited, so its future does no work. Unlike preferred-mode fallthrough,
 /// the first layer error fails the aggregation fast, cancelling the other
-/// in-flight layers because a concatenated result requires every successful
-/// contributor.
+/// in-flight layers because a concatenated result requires every prioritized
+/// layer to succeed.
 /// Ordering is stable by `priorities` regardless of which layer finishes
 /// first, so the merged menu keeps muscle-memory order.
 pub(crate) async fn race_layers_concatenated<R>(
@@ -1474,64 +1474,6 @@ mod tests {
         assert_eq!(r, None);
     }
 
-    #[tokio::test]
-    async fn preferred_higher_priority_error_falls_through_to_lower_priority_result() {
-        use std::future::ready;
-        let r = race_layers_preferred(
-            &[LayerSource::Host, LayerSource::Virt],
-            ready(Ok(Some("virt"))),
-            ready(Err(tower_lsp_server::jsonrpc::Error::invalid_params(
-                "host failed",
-            ))),
-            ready(Ok(None)),
-            |value: &&str| !value.is_empty(),
-        )
-        .await
-        .expect("non-cancellation layer errors should not abort the preferred race");
-
-        assert_eq!(r, Some("virt"));
-    }
-
-    #[tokio::test]
-    async fn preferred_error_surfaces_when_no_layer_answers() {
-        use std::future::ready;
-        let err = race_layers_preferred(
-            &[LayerSource::Host, LayerSource::Virt],
-            ready(Ok(None::<&str>)),
-            ready(Err(tower_lsp_server::jsonrpc::Error::invalid_params(
-                "host failed",
-            ))),
-            ready(Ok(None)),
-            |value: &&str| !value.is_empty(),
-        )
-        .await
-        .expect_err("the stored layer error should surface when no layer answers");
-
-        assert_eq!(
-            err.code,
-            tower_lsp_server::jsonrpc::ErrorCode::InvalidParams
-        );
-    }
-
-    #[tokio::test]
-    async fn preferred_layer_cancellation_remains_fatal() {
-        use std::future::ready;
-        let err = race_layers_preferred(
-            &[LayerSource::Host, LayerSource::Virt],
-            ready(Ok(Some("virt"))),
-            ready(Err(tower_lsp_server::jsonrpc::Error::request_cancelled())),
-            ready(Ok(None)),
-            |value: &&str| !value.is_empty(),
-        )
-        .await
-        .expect_err("cancellation should abort the preferred race");
-
-        assert_eq!(
-            err.code,
-            tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
-        );
-    }
-
     #[test]
     fn range_intersection_is_position_precise() {
         // Fenced region: content [(3,0), (4,0)).
@@ -1994,6 +1936,88 @@ mod tests {
         let host = async { ok(Some("host")) };
         let result = race_layers_preferred(VHN, virt, host, async { ok(None) }, |_| true).await;
         assert!(result.is_err(), "client cancellation must propagate");
+    }
+
+    #[tokio::test]
+    async fn preferred_higher_priority_error_falls_through_to_lower_priority_result() {
+        use std::future::ready;
+        let r = race_layers_preferred(
+            &[LayerSource::Host, LayerSource::Virt],
+            ready(Ok(Some("virt"))),
+            ready(Err(tower_lsp_server::jsonrpc::Error::invalid_params(
+                "host failed",
+            ))),
+            ready(Ok(None)),
+            |value: &&str| !value.is_empty(),
+        )
+        .await
+        .expect("non-cancellation layer errors should not abort the preferred race");
+
+        assert_eq!(r, Some("virt"));
+    }
+
+    #[tokio::test]
+    async fn preferred_lower_priority_error_waits_for_higher_priority_result() {
+        let virt = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            ok(Some("virt"))
+        };
+        let host = async {
+            Err::<Option<&str>, _>(tower_lsp_server::jsonrpc::Error::invalid_params(
+                "host failed",
+            ))
+        };
+        let r = race_layers_preferred(
+            &[LayerSource::Virt, LayerSource::Host],
+            virt,
+            host,
+            async { ok(None) },
+            |value: &&str| !value.is_empty(),
+        )
+        .await
+        .expect("a lower-priority layer error must not abort before a higher layer answers");
+
+        assert_eq!(r, Some("virt"));
+    }
+
+    #[tokio::test]
+    async fn preferred_error_surfaces_when_no_layer_answers() {
+        use std::future::ready;
+        let err = race_layers_preferred(
+            &[LayerSource::Host, LayerSource::Virt],
+            ready(Ok(None::<&str>)),
+            ready(Err(tower_lsp_server::jsonrpc::Error::invalid_params(
+                "host failed",
+            ))),
+            ready(Ok(None)),
+            |value: &&str| !value.is_empty(),
+        )
+        .await
+        .expect_err("the stored layer error should surface when no layer answers");
+
+        assert_eq!(
+            err.code,
+            tower_lsp_server::jsonrpc::ErrorCode::InvalidParams
+        );
+    }
+
+    #[tokio::test]
+    async fn preferred_layer_cancellation_remains_fatal() {
+        use std::future::ready;
+        let err = race_layers_preferred(
+            &[LayerSource::Host, LayerSource::Virt],
+            ready(Ok(Some("virt"))),
+            ready(Err(tower_lsp_server::jsonrpc::Error::request_cancelled())),
+            ready(Ok(None)),
+            |value: &&str| !value.is_empty(),
+        )
+        .await
+        .expect_err("cancellation should abort the preferred race");
+
+        assert_eq!(
+            err.code,
+            tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
+        );
     }
 
     // ==========================================================================
