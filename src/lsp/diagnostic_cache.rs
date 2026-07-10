@@ -47,7 +47,7 @@
 //! version gate was evaluated and rejected (it converts a self-healing stale-overwrite
 //! into a reopen-resurrection hide); the stale-overwrite is left self-healing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -403,6 +403,17 @@ pub(crate) struct DiagnosticAggregator {
     /// `served`) sends no redundant nudge. Drives [`Self::bump_current`],
     /// [`Self::mark_served`], [`Self::is_dirty`]; forgotten on `didClose`.
     coverage: Mutex<HashMap<Url, HostCoverage>>,
+    /// Hosts whose LAST pull was answered degraded — the bounded parse wait
+    /// lapsed while the aggregator held live region pushes, so the response
+    /// was missing the region fold and deliberately did not `mark_served`.
+    /// The reparse loop's post-parse backstop consumes an entry
+    /// ([`Self::take_degraded_pull`]) to request the recovery
+    /// `workspace/diagnostic/refresh` for exactly the hosts that owe one —
+    /// keying the recovery on this instead of the workspace-wide coverage
+    /// dirtiness keeps unrelated stale hosts from turning every edit's parse
+    /// pass into a refresh trigger. A later non-degraded pull clears the debt
+    /// (it marks served); `didClose` forgets it.
+    degraded_pulls: Mutex<HashSet<Url>>,
     /// Per-host coalescing state for the editor-facing `publishDiagnostics`
     /// wire sends (the quiet window): see [`WireGate`] and
     /// [`Self::wire_gate_admit`]. Mutated under the host's republish lock
@@ -911,6 +922,37 @@ impl DiagnosticAggregator {
         self.coverage
             .lock()
             .recover_poison("DiagnosticAggregator::coverage")
+            .remove(host);
+    }
+
+    /// Record that a pull for `host` was answered degraded (see the
+    /// `degraded_pulls` field doc). Clones the key only on first insert.
+    pub(crate) fn record_degraded_pull(&self, host: &Url) {
+        let mut degraded = self
+            .degraded_pulls
+            .lock()
+            .recover_poison("DiagnosticAggregator::degraded_pulls");
+        if !degraded.contains(host) {
+            degraded.insert(host.clone());
+        }
+    }
+
+    /// Consume `host`'s degraded-pull debt, returning whether one existed —
+    /// the post-parse backstop's trigger for the recovery refresh.
+    pub(crate) fn take_degraded_pull(&self, host: &Url) -> bool {
+        self.degraded_pulls
+            .lock()
+            .recover_poison("DiagnosticAggregator::degraded_pulls")
+            .remove(host)
+    }
+
+    /// Forget `host`'s degraded-pull debt without acting on it: a later
+    /// non-degraded pull covered the host (it marked served), or the host
+    /// closed.
+    pub(crate) fn forget_degraded_pull(&self, host: &Url) {
+        self.degraded_pulls
+            .lock()
+            .recover_poison("DiagnosticAggregator::degraded_pulls")
             .remove(host);
     }
 

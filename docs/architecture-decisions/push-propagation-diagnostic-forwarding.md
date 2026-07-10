@@ -306,8 +306,11 @@ policy clean:
   is the retry that publishes with real offsets, doubly backstopped by the
   pass's debounced pull. A deferral still nudges pull-mode clients: the
   push-origin callers treat it like a change for the coverage bump and
-  `workspace/diagnostic/refresh` (the retry is edit-origin and never nudges,
-  and the cache did change). Accepted caveat: a parse give-up (timeout,
+  `workspace/diagnostic/refresh` (the cache did change; the retry itself
+  nudges only as degraded-pull recovery — a per-host debt recorded by a pull
+  the parse wait failed, consumed by the post-parse pass, gated by coverage
+  and the single-flight like every refresh). Accepted caveat: a parse
+  give-up (timeout,
   parser gone) leaves the tree absent and both retries deferred until the
   next edit — where the pre-deferral behavior published a region-LESS set,
   which was worse.

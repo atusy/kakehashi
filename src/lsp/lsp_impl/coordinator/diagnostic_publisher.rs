@@ -54,8 +54,9 @@ pub(crate) enum RepublishOutcome {
     /// or sent; the reparse loop's post-parse republish is the retry. The
     /// CACHE did just change for a push-origin caller — that's why it asked to
     /// republish — so push-origin callers treat this like `Changed` for the
-    /// coverage bump + `workspace/diagnostic/refresh` nudge: the retry is
-    /// edit-origin (it never nudges), and a pull-mode client whose own re-pull
+    /// coverage bump + `workspace/diagnostic/refresh` nudge: the retry nudges
+    /// only as degraded-pull recovery (per-host debt — see the reparse loop),
+    /// and a pull-mode client whose own re-pull
     /// raced ahead of the push would otherwise rot on a stale set until the
     /// next edit (the #496 symptom). The nudged re-pull is safe mid-window —
     /// the pull path waits for the tree and folds cached pushes with fresh
@@ -532,6 +533,8 @@ impl DiagnosticPublisher {
         // 0. (`clear_host` is editor-originated, so its republish doesn't bump
         // `current`; this just drops any prior push-origin coverage state.)
         self.aggregator.forget_coverage(host);
+        // And any degraded-pull debt — a closed doc owes no recovery refresh.
+        self.aggregator.forget_degraded_pull(host);
         // And the wire-gate entry the clearing republish itself just stamped.
         self.aggregator.forget_wire_gate(host);
         // didClose is off the hot path: reclaim republish-lock entries whose lock

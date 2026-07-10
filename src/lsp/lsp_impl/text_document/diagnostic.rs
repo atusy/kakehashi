@@ -370,8 +370,14 @@ impl Kakehashi {
         // the version captured at entry, so the refresh gate stops treating those
         // changes as dirty (#497). Pure bookkeeping — never republishes — so this
         // can't beget a refresh.
-        if !degraded_virt {
+        if degraded_virt {
+            // The debt drives the post-parse recovery refresh (see
+            // `DiagnosticAggregator::degraded_pulls`).
+            self.diagnostics.record_degraded_pull(&uri);
+        } else {
             self.diagnostics.mark_served(&uri, served_version);
+            // A covering pull supersedes any earlier degraded answer.
+            self.diagnostics.forget_degraded_pull(&uri);
         }
 
         let items = combine_layer_diagnostics(&layer_cfg, virt_items, host_items);
@@ -1017,6 +1023,10 @@ mod tests {
         assert!(
             server.diagnostics.is_dirty(),
             "a degraded answer must not advance `served` — the gap would be masked"
+        );
+        assert!(
+            server.diagnostics.take_degraded_pull(&uri),
+            "the degraded answer records the per-host debt that keys the post-parse recovery refresh"
         );
     }
 
