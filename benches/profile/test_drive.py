@@ -8,6 +8,7 @@ from drive import (
     RequestSample,
     count_semantic_outcomes,
     next_toggle_change,
+    response_result_id,
     server_request_result,
     summarize_samples,
     summarize_samples_by_status,
@@ -80,6 +81,14 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertIsNone(
             server_request_result({"method": "client/registerCapability"})
         )
+
+    def test_response_result_id_accepts_full_or_delta_result(self):
+        self.assertEqual(
+            response_result_id({"result": {"resultId": "42", "edits": []}}),
+            "42",
+        )
+        self.assertIsNone(response_result_id({"result": None}))
+        self.assertIsNone(response_result_id({"error": {"code": -32800}}))
 
 
 if __name__ == "__main__":

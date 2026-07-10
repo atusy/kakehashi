@@ -96,6 +96,11 @@ def server_request_result(message: dict):
     return None
 
 
+def response_result_id(message: dict):
+    result = message.get("result")
+    return result.get("resultId") if isinstance(result, dict) else None
+
+
 def count_semantic_outcomes(
     responses: list[dict], previous_tokens: int
 ) -> tuple[int, int, int, int]:
@@ -201,6 +206,8 @@ def main() -> None:
         ap.error("--burst-delay-ms must be non-negative")
     if args.burst > 1 and (args.captures or args.concurrent_captures):
         ap.error("--burst cannot be combined with captures modes")
+    if args.concurrent_captures:
+        args.captures = True
 
     if args.file:
         if args.file.endswith(".md"):
@@ -369,6 +376,23 @@ def main() -> None:
         if args.settle > 0:
             time.sleep(args.settle)  # let the initial parse settle
 
+        captures_result_id = None
+        if args.captures:
+            seed, _ = request(
+                "kakehashi/captures/full",
+                {
+                    "textDocument": {"uri": uri},
+                    "kind": "highlights",
+                    "injection": True,
+                },
+            )
+            captures_result_id = response_result_id(seed)
+            if captures_result_id is None:
+                raise RuntimeError(
+                    "captures warmup did not return a resultId; "
+                    "cannot measure a real delta lineage"
+                )
+
         ok, canceled, superseded, tokens = 0, 0, 0, 0
         version = 1
         # LSP `character` offsets are UTF-16 code units, not Unicode code
@@ -409,13 +433,18 @@ def main() -> None:
                  {"textDocument": {"uri": uri}, "kind": "highlights", "injection": True}),
                 ("kakehashi/captures/full/delta",
                  {"textDocument": {"uri": uri}, "kind": "highlights",
-                  "previousResultId": "warm-miss"}),
+                  "previousResultId": captures_result_id}),
             ]
+            captures_responses = {}
             if args.concurrent_captures:
                 # Queue captures first to model an editor whose highlighting work
                 # is already in flight when semantic tokens arrive.
                 responses = measured_batch([*captures_requests, semantic_request])
                 semantic_responses = [responses[semantic_request[0]]]
+                captures_responses = {
+                    method: responses[method]
+                    for method, _ in captures_requests
+                }
             elif args.burst > 1:
                 semantic_responses = measured_repeated(
                     *semantic_request,
@@ -427,7 +456,16 @@ def main() -> None:
                 semantic_responses = [measured_request(*semantic_request)]
                 if args.captures:
                     for captures_request in captures_requests:
-                        measured_request(*captures_request)
+                        captures_responses[captures_request[0]] = measured_request(
+                            *captures_request
+                        )
+            for method, _ in reversed(captures_requests):
+                next_result_id = response_result_id(
+                    captures_responses.get(method, {})
+                )
+                if next_result_id is not None:
+                    captures_result_id = next_result_id
+                    break
             req_times.append(time.perf_counter() - t_req)
             cycle_semantic_samples = request_samples[
                 "textDocument/semanticTokens/full"
