@@ -608,6 +608,8 @@ fn unpack_archive_file_entry<R: Read>(
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(ArchiveFetchError::Io(e)),
     }
+    // Parser compilation consumes source files directly; do not restore
+    // untrusted archive mode bits or make extracted support files executable.
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
