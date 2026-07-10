@@ -29,8 +29,6 @@ pub enum ParserInstallError {
     GitError(String),
     /// Archive download or extraction failed.
     ArchiveError(String),
-    /// Archive metadata violates the extraction boundary.
-    UnsafeArchive(String),
     /// Compilation failed.
     CompileError(String),
     /// File system operation failed.
@@ -45,7 +43,6 @@ impl std::fmt::Display for ParserInstallError {
             Self::MetadataError(e) => write!(f, "{}", e),
             Self::GitError(msg) => write!(f, "Git error: {}", msg),
             Self::ArchiveError(msg) => write!(f, "Archive error: {}", msg),
-            Self::UnsafeArchive(msg) => write!(f, "Unsafe archive: {}", msg),
             Self::CompileError(msg) => write!(f, "Compilation error: {}", msg),
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::AlreadyExists(path) => {
@@ -70,6 +67,29 @@ impl From<std::io::Error> for ParserInstallError {
 impl From<MetadataError> for ParserInstallError {
     fn from(e: MetadataError) -> Self {
         Self::MetadataError(e)
+    }
+}
+
+#[derive(Debug)]
+enum ArchiveFetchError {
+    Content(String),
+    Unsafe(String),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for ArchiveFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Content(message) => write!(f, "Archive error: {message}"),
+            Self::Unsafe(message) => write!(f, "Unsafe archive: {message}"),
+            Self::Io(error) => write!(f, "IO error: {error}"),
+        }
+    }
+}
+
+impl From<io::Error> for ArchiveFetchError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -428,7 +448,7 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         );
         match download_and_extract_archive(&archive_url, &repo_name, revision, dest) {
             Ok(()) => return Ok(()),
-            Err(e) if archive_error_allows_clone_fallback(&e) => {
+            Err(e @ (ArchiveFetchError::Content(_) | ArchiveFetchError::Unsafe(_))) => {
                 log::warn!(
                     target: "kakehashi::install",
                     "Archive download failed, falling back to git clone: {}",
@@ -437,9 +457,9 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
                 // Clean up partial extraction before fallback
                 let _ = fs::remove_dir_all(dest);
             }
-            Err(e) => {
+            Err(ArchiveFetchError::Io(e)) => {
                 let _ = fs::remove_dir_all(dest);
-                return Err(e);
+                return Err(ParserInstallError::IoError(e));
             }
         }
     }
@@ -454,13 +474,6 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
     clone_repo(url, revision, dest)
 }
 
-fn archive_error_allows_clone_fallback(error: &ParserInstallError) -> bool {
-    matches!(
-        error,
-        ParserInstallError::ArchiveError(_) | ParserInstallError::UnsafeArchive(_)
-    )
-}
-
 /// Download a GitHub archive tarball and extract it to the destination directory.
 ///
 /// The tarball's root directory (e.g., `tree-sitter-json-0.24.8/`) is stripped,
@@ -470,14 +483,14 @@ fn download_and_extract_archive(
     repo_name: &str,
     revision: &str,
     dest: &Path,
-) -> Result<(), ParserInstallError> {
+) -> Result<(), ArchiveFetchError> {
     let agent = agent_with_timeout(ARCHIVE_HTTP_TIMEOUT);
 
     let response = agent.get(archive_url).call().map_err(|e| match e {
         ureq::Error::StatusCode(code) => {
-            ParserInstallError::ArchiveError(format!("HTTP {} downloading {}", code, archive_url))
+            ArchiveFetchError::Content(format!("HTTP {} downloading {}", code, archive_url))
         }
-        e => ParserInstallError::ArchiveError(format!("Download failed: {}", e)),
+        e => ArchiveFetchError::Content(format!("Download failed: {}", e)),
     })?;
 
     // into_reader() streams without a size limit; parser archives can exceed
@@ -495,19 +508,19 @@ fn extract_archive<R: Read>(
     archive: &mut Archive<R>,
     expected_prefix: &str,
     dest: &Path,
-) -> Result<(), ParserInstallError> {
+) -> Result<(), ArchiveFetchError> {
     fs::create_dir_all(dest)?;
 
-    for entry_result in archive.entries().map_err(|e| {
-        ParserInstallError::ArchiveError(format!("Failed to read archive entries: {}", e))
-    })? {
-        let mut entry = entry_result.map_err(|e| {
-            ParserInstallError::ArchiveError(format!("Failed to read entry: {}", e))
-        })?;
+    for entry_result in archive
+        .entries()
+        .map_err(|e| ArchiveFetchError::Content(format!("Failed to read archive entries: {}", e)))?
+    {
+        let mut entry = entry_result
+            .map_err(|e| ArchiveFetchError::Content(format!("Failed to read entry: {}", e)))?;
 
-        let path = entry.path().map_err(|e| {
-            ParserInstallError::UnsafeArchive(format!("Invalid path in archive: {}", e))
-        })?;
+        let path = entry
+            .path()
+            .map_err(|e| ArchiveFetchError::Unsafe(format!("Invalid path in archive: {}", e)))?;
 
         // Strip the root directory prefix (e.g., "tree-sitter-json-0.24.8/")
         let relative = match path.strip_prefix(expected_prefix) {
@@ -527,13 +540,13 @@ fn extract_archive<R: Read>(
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
-            return Err(ParserInstallError::UnsafeArchive(format!(
+            return Err(ArchiveFetchError::Unsafe(format!(
                 "Link entry rejected in archive: {}",
                 escaped_path(&safe_relative)
             )));
         }
         if !entry_type.is_dir() && !entry_type.is_file() {
-            return Err(ParserInstallError::UnsafeArchive(format!(
+            return Err(ArchiveFetchError::Unsafe(format!(
                 "Unsupported entry type rejected in archive: {}",
                 escaped_path(&safe_relative)
             )));
@@ -553,27 +566,27 @@ fn unpack_archive_file_entry<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     dest: &Path,
     safe_relative: &Path,
-) -> Result<(), ParserInstallError> {
+) -> Result<(), ArchiveFetchError> {
     let target = ensure_archive_parent(dest, safe_relative)?;
     match fs::symlink_metadata(&target) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(ParserInstallError::UnsafeArchive(format!(
+            return Err(ArchiveFetchError::Unsafe(format!(
                 "Archive path crosses symlink: {}",
                 escaped_path(safe_relative)
             )));
         }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(ParserInstallError::IoError(e)),
+        Err(e) => return Err(ArchiveFetchError::Io(e)),
     }
     let mut output = fs::File::create(&target).map_err(|e| {
-        ParserInstallError::IoError(io::Error::new(
+        ArchiveFetchError::Io(io::Error::new(
             e.kind(),
             format!("Failed to create {}: {}", escaped_path(safe_relative), e),
         ))
     })?;
     io::copy(entry, &mut output).map_err(|e| {
-        ParserInstallError::IoError(io::Error::new(
+        ArchiveFetchError::Io(io::Error::new(
             e.kind(),
             format!("Failed to extract {}: {}", escaped_path(safe_relative), e),
         ))
@@ -581,13 +594,13 @@ fn unpack_archive_file_entry<R: Read>(
     Ok(())
 }
 
-fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ParserInstallError> {
+fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ArchiveFetchError> {
     let target = ensure_archive_parent(dest, safe_relative)?;
     if fs::symlink_metadata(&target)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
     {
-        return Err(ParserInstallError::UnsafeArchive(format!(
+        return Err(ArchiveFetchError::Unsafe(format!(
             "Archive path crosses symlink: {}",
             escaped_path(safe_relative)
         )));
@@ -596,7 +609,7 @@ fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ParserIns
     Ok(())
 }
 
-fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, ParserInstallError> {
+fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, ArchiveFetchError> {
     let target = dest.join(safe_relative);
     let Some(parent_relative) = safe_relative.parent() else {
         return Ok(target);
@@ -609,27 +622,27 @@ fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, P
         current.push(part);
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(ParserInstallError::UnsafeArchive(format!(
+                return Err(ArchiveFetchError::Unsafe(format!(
                     "Archive path crosses symlink: {}",
                     escaped_path(safe_relative)
                 )));
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
-            Err(e) => return Err(ParserInstallError::IoError(e)),
+            Err(e) => return Err(ArchiveFetchError::Io(e)),
         }
     }
     Ok(target)
 }
 
-fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ParserInstallError> {
+fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ArchiveFetchError> {
     let mut safe = PathBuf::new();
     for component in path.components() {
         match component {
             Component::Normal(part) => safe.push(part),
             Component::CurDir => {}
             _ => {
-                return Err(ParserInstallError::UnsafeArchive(format!(
+                return Err(ArchiveFetchError::Unsafe(format!(
                     "Unsafe path detected in archive: {}",
                     escaped_path(path)
                 )));
@@ -1596,14 +1609,18 @@ mod tests {
 
     #[test]
     fn archive_content_errors_allow_clone_fallback() {
-        assert!(archive_error_allows_clone_fallback(
-            &ParserInstallError::UnsafeArchive("unsafe metadata".to_string())
-        ));
-        assert!(archive_error_allows_clone_fallback(
-            &ParserInstallError::ArchiveError("download failed".to_string())
-        ));
-        assert!(!archive_error_allows_clone_fallback(
-            &ParserInstallError::IoError(io::Error::other("disk full"))
+        for error in [
+            ArchiveFetchError::Unsafe("unsafe metadata".to_string()),
+            ArchiveFetchError::Content("download failed".to_string()),
+        ] {
+            assert!(matches!(
+                error,
+                ArchiveFetchError::Content(_) | ArchiveFetchError::Unsafe(_)
+            ));
+        }
+        assert!(matches!(
+            ArchiveFetchError::Io(io::Error::other("disk full")),
+            ArchiveFetchError::Io(_)
         ));
     }
 
@@ -1618,7 +1635,7 @@ mod tests {
             assert!(
                 matches!(
                     safe_archive_relative_path(path),
-                    Err(ParserInstallError::UnsafeArchive(_))
+                    Err(ArchiveFetchError::Unsafe(_))
                 ),
                 "non-local archive path must be rejected: {}",
                 path.display()
@@ -1681,7 +1698,7 @@ mod tests {
         let result = extract_archive(&mut archive, "parser-1.0.0", temp.path());
 
         match result {
-            Err(ParserInstallError::UnsafeArchive(message)) => assert!(
+            Err(ArchiveFetchError::Unsafe(message)) => assert!(
                 message.contains("Link entry rejected in archive: link"),
                 "expected link-entry rejection, got: {message}"
             ),
@@ -1714,7 +1731,7 @@ mod tests {
         let result = extract_archive(&mut archive, "parser-1.0.0", temp.path());
 
         match result {
-            Err(ParserInstallError::UnsafeArchive(message)) => assert!(
+            Err(ArchiveFetchError::Unsafe(message)) => assert!(
                 message.contains("Unsupported entry type rejected in archive: special"),
                 "expected special-entry rejection, got: {message}"
             ),
@@ -1754,7 +1771,7 @@ mod tests {
         let result = extract_archive(&mut archive, "parser-1.0.0", &dest);
 
         match result {
-            Err(ParserInstallError::UnsafeArchive(message)) => assert!(
+            Err(ArchiveFetchError::Unsafe(message)) => assert!(
                 message.contains("Archive path crosses symlink: link/parser.c"),
                 "expected symlink-parent rejection, got: {message}"
             ),
