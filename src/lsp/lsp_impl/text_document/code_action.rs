@@ -337,14 +337,17 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // All overlapping regions share THIS request's upstream id. Hold the
-        // pool registration cleanup ONCE for the whole walk (single
-        // `unregister_all` after the loop) rather than per region. The cancel
-        // subscription here is usually a redundant duplicate — the caller
-        // (`walk_layers_by_strategy` → `run_layer_race`) already subscribes the
-        // same id across the whole virt future, so this returns `None` and the
-        // outer race's `select!` cancels the loop. Keeping it makes the walk
-        // self-cancelling even if ever driven outside that race.
+        // All overlapping regions share THIS request's upstream id. Pool
+        // registration cleanup is NOT done here: the host layer runs
+        // concurrently under the same upstream id (`race_layers_concatenated`
+        // is codeAction's default), so a walk-level `unregister_all` would
+        // wipe the sibling layer's live cancel registrations the moment this
+        // layer finishes. Completed dispatches unregister themselves
+        // (refcounted), and the caller (`walk_layers_by_strategy` →
+        // `run_layer_race`) sweeps whatever a dropped arm left behind after
+        // the WHOLE race. The cancel subscription here is usually a redundant
+        // duplicate of that caller's — kept so the walk stays self-cancelling
+        // even if ever driven outside the race.
         let upstream_id = contexts[0].document.upstream_request_id.clone();
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
 
@@ -368,17 +371,13 @@ impl Kakehashi {
         // surfaces `RequestCancelled` (-32800), matching how the outer
         // `run_layer_race` reports cancellation — so a client `$/cancelRequest`
         // is never masked as an empty result.
-        let result = match cancel_rx {
+        match cancel_rx {
             Some(rx) => tokio::select! {
                 r = walk => r,
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
             },
             None => walk.await,
-        };
-        self.bridge
-            .pool_arc()
-            .unregister_all_for_upstream_id(upstream_id.as_ref());
-        result
+        }
     }
 
     /// Fan out `textDocument/codeAction` across the servers bridging ONE
@@ -529,7 +528,12 @@ impl Kakehashi {
                 )))
             }
         };
-        let result = match ctx.strategy {
+        // No layer-level `unregister_all` here: the virt layer runs
+        // concurrently under the SAME upstream id, so wiping the registry on
+        // this layer's completion would drop the sibling's live cancel
+        // registrations. Completed dispatches unregister themselves
+        // (refcounted); `run_layer_race` sweeps after the whole race.
+        match ctx.strategy {
             AggregationStrategy::Preferred => {
                 let fan_in = dispatch_host_preferred(
                     &ctx,
@@ -546,9 +550,7 @@ impl Kakehashi {
                     dispatch_host_concatenated(&ctx, pool.clone(), f, cancel_rx, None, None).await;
                 self.host_code_action_result(fan_in, concat_merge).await
             }
-        };
-        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
-        result
+        }
     }
 
     /// Fold a host-layer fan-in result into the handler's return, with the
