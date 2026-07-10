@@ -35,7 +35,7 @@ pub(crate) fn transform_goto_response_to_host(
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
         log::warn!(
             target: "kakehashi::bridge",
-            "goto response is missing result and has no non-null error"
+            "goto response is missing result without a JSON-RPC error (protocol violation)"
         );
         return None;
     };
@@ -220,7 +220,7 @@ mod tests {
 
     impl Log for CapturingLogger {
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.level() <= Level::Warn && metadata.target() == "kakehashi::bridge"
+            metadata.level() <= Level::Warn
         }
 
         fn log(&self, record: &Record<'_>) {
@@ -228,7 +228,7 @@ mod tests {
                 return;
             }
             let message = format!("{}:{}:{}", record.level(), record.target(), record.args());
-            if CAPTURING.load(Ordering::Relaxed) {
+            if CAPTURING.load(Ordering::Relaxed) && record.target() == "kakehashi::bridge" {
                 self.messages.lock().unwrap().push(message);
             } else {
                 eprintln!("{message}");
@@ -305,7 +305,9 @@ mod tests {
         assert!(
             warnings.iter().any(|message| {
                 message.contains("kakehashi::bridge")
-                    && message.contains("goto response is missing result and has no non-null error")
+                    && message.contains(
+                        "goto response is missing result without a JSON-RPC error (protocol violation)",
+                    )
             }),
             "expected missing-result goto response warning, got {warnings:?}"
         );
