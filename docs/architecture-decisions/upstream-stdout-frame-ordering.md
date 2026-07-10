@@ -61,10 +61,11 @@ done
 
 The full captures fallback produced a 4,408.4 KiB frame. Its own
 ready-to-last-byte p90 was 14.2 / 15.8 / 14.3 ms and ready-to-flush
-p90 was 14.3 / 15.9 / 14.4 ms,
-but semantic responses were ready before that frame started in 0 of 60 cycles.
-They completed first, so a pre-write scheduler had no opportunity to improve
-semantic latency. The diagnostic responses in this configuration were valid
+p90 was 14.3 / 15.9 / 14.4 ms, but 0 of 60 semantic responses were queued
+behind an attributed large frame whose first write had not started. The
+semantic responses instead completed first, so a pre-write scheduler had no
+opportunity to improve semantic latency. The diagnostic responses in this
+configuration were valid
 full reports but only about 0.1 KiB. They exercise burst ordering and metric
 attribution, not the large diagnostic payload from the captured editor log. The
 scheduling defer is therefore supported by the representative captures-full
@@ -95,8 +96,8 @@ driver so future reports can be evaluated with the same metrics.
 
 Reconsider scheduling only if a representative trace shows both:
 
-1. semantic responses repeatedly become ready before a competing large response
-   frame starts writing; and
+1. semantic responses repeatedly become ready while an earlier competing large
+   response is queued but has not started writing; and
 2. ready-to-last-byte semantic p90 has at least 1 ms of avoidable delay beyond
    A/A variation.
 
@@ -113,10 +114,11 @@ large-frame overlap occurred, giving a very low current improvement ceiling.
 
 ### Add a bounded pre-write priority scheduler
 
-Deferred. It could help only when semantic work is ready before another frame's
-first byte. The measured workload produced no such cases, while the scheduler
-would add queueing state, starvation policy, cancellation behavior, and a local
-replacement or upstream change for tower-lsp-server's private transport loop.
+Deferred. It could help only when semantic work is ready while an earlier large
+frame is queued but has not written its first byte. The measured workload
+produced no such cases, while the scheduler would add queueing state, starvation
+policy, cancellation behavior, and a local replacement or upstream change for
+tower-lsp-server's private transport loop.
 
 ### Interrupt or interleave a large frame already being written
 
