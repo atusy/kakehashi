@@ -77,6 +77,7 @@ impl LanguageServerPool {
                     Some(EnvelopeContext {
                         server_name,
                         host_uri: host_uri.as_str(),
+                        region_id,
                         offset: ctx.offset,
                         region_end: Some(region_end),
                     }),
@@ -392,6 +393,10 @@ pub(crate) struct KakehashiEnvelope {
     /// routing, matching the old behavior.
     #[serde(default)]
     pub host_uri: String,
+    /// Stable injection region identity for live resolve-time geometry checks.
+    /// Empty for envelopes minted before this field existed.
+    #[serde(default)]
+    pub region_id: String,
     /// The downstream server's original `data` value (preserved verbatim).
     pub inner: Option<Value>,
     /// Region offset snapshot for coordinate transformation of the resolved response.
@@ -446,6 +451,7 @@ pub(crate) struct EnvelopeContext<'a> {
     /// Host document URI the completion ran on, stored in the envelope so
     /// `completionItem/resolve` can route back to the originating connection.
     pub host_uri: &'a str,
+    pub region_id: &'a str,
     pub offset: &'a RegionOffset,
     /// Region end (host coords) snapshot for the resolve-path safety guard;
     /// `None` only when re-enveloping a legacy envelope that never carried it.
@@ -461,6 +467,7 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
     let envelope = KakehashiEnvelope {
         origin: ctx.server_name.to_string(),
         host_uri: ctx.host_uri.to_string(),
+        region_id: ctx.region_id.to_string(),
         inner,
         offset: EnvelopeOffset::from(ctx.offset),
         region_end: ctx.region_end.map(|end| (end.line, end.character)),
@@ -1005,6 +1012,7 @@ mod tests {
         let ctx = EnvelopeContext {
             server_name: "lua-ls",
             host_uri: "file:///test/doc.md",
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
             region_end: Some(TEST_REGION_END),
         };
@@ -1063,6 +1071,7 @@ mod tests {
         let ctx = EnvelopeContext {
             server_name: "lua-ls",
             host_uri: "file:///test/doc.md",
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
             region_end: Some(TEST_REGION_END),
         };
