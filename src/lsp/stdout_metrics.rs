@@ -194,7 +194,12 @@ struct FrameObserver {
     metrics: Arc<StdoutMetrics>,
     decode: DecodeState,
     awaiting_flush: Vec<(FrameMetric, Option<Id>)>,
-    poll_write_attempt: Option<WriteAttempt>,
+    offered: VecDeque<OfferedSegment>,
+}
+
+struct OfferedSegment {
+    remaining: usize,
+    attempt: WriteAttempt,
 }
 
 #[doc(hidden)]
@@ -280,7 +285,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MeasuredStdout<W> {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         if !bytes.is_empty() {
-            self.observer.write_attempt(Instant::now());
+            self.observer.offered(bytes.len(), Instant::now());
         }
         let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
         if let Poll::Ready(Ok(accepted)) = result
@@ -336,29 +341,55 @@ impl FrameObserver {
                 last_byte: None,
             },
             awaiting_flush: Vec::new(),
-            poll_write_attempt: None,
+            offered: VecDeque::new(),
         }
     }
 
-    fn write_attempt(&mut self, at: Instant) {
+    fn offered(&mut self, bytes: usize, at: Instant) {
+        let covered: usize = self.offered.iter().map(|segment| segment.remaining).sum();
+        if bytes <= covered {
+            return;
+        }
         let attempt = WriteAttempt {
             at,
             sequence: self.metrics.next_event_sequence(),
         };
-        self.poll_write_attempt = Some(attempt);
-        if let DecodeState::Header { write_start, .. } = &mut self.decode {
+        self.offered.push_back(OfferedSegment {
+            remaining: bytes - covered,
+            attempt,
+        });
+        if covered == 0
+            && let DecodeState::Header { write_start, .. } = &mut self.decode
+        {
             write_start.get_or_insert(attempt);
         }
     }
 
     fn accepted(&mut self, mut bytes: &[u8], at: Instant) {
-        let poll_write_attempt = self
-            .poll_write_attempt
-            .take()
-            .unwrap_or_else(|| WriteAttempt {
-                at,
-                sequence: self.metrics.next_event_sequence(),
-            });
+        if self.offered.is_empty() {
+            self.offered(bytes.len(), at);
+        }
+        while !bytes.is_empty() {
+            let Some(mut segment) = self.offered.pop_front() else {
+                self.offered(bytes.len(), at);
+                continue;
+            };
+            let take = segment.remaining.min(bytes.len());
+            self.accepted_segment(&bytes[..take], at, segment.attempt);
+            bytes = &bytes[take..];
+            segment.remaining -= take;
+            if segment.remaining > 0 {
+                self.offered.push_front(segment);
+            }
+        }
+    }
+
+    fn accepted_segment(
+        &mut self,
+        mut bytes: &[u8],
+        at: Instant,
+        poll_write_attempt: WriteAttempt,
+    ) {
         while !bytes.is_empty() {
             match &mut self.decode {
                 DecodeState::Header {
@@ -755,7 +786,7 @@ mod tests {
         let batch = [frame.clone(), frame].concat();
         let mut observer = FrameObserver::new(Arc::clone(&metrics));
 
-        observer.write_attempt(origin + Duration::from_micros(10));
+        observer.offered(batch.len(), origin + Duration::from_micros(10));
         observer.accepted(&batch, origin + Duration::from_micros(20));
         observer.flushed(origin + Duration::from_micros(30));
 
@@ -774,6 +805,35 @@ mod tests {
                 .map(|frame| frame.write_sequence)
                 .collect::<Vec<_>>(),
             vec![0, 0]
+        );
+    }
+
+    #[test]
+    fn partial_write_preserves_the_attempt_for_the_unaccepted_frame() {
+        let origin = Instant::now();
+        let metrics = Arc::new(StdoutMetrics::new(origin));
+        let body = br#"{"jsonrpc":"2.0","method":"window/logMessage"}"#;
+        let frame = [
+            format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes(),
+            body.to_vec(),
+        ]
+        .concat();
+        let batch = [frame.clone(), frame.clone()].concat();
+        let mut observer = FrameObserver::new(Arc::clone(&metrics));
+
+        observer.offered(batch.len(), origin + Duration::from_micros(10));
+        observer.accepted(&batch[..frame.len()], origin + Duration::from_micros(20));
+        observer.offered(frame.len(), origin + Duration::from_micros(30));
+        observer.accepted(&batch[frame.len()..], origin + Duration::from_micros(40));
+        observer.flushed(origin + Duration::from_micros(50));
+
+        assert_eq!(
+            metrics
+                .frames()
+                .iter()
+                .map(|frame| (frame.write_sequence, frame.write_start_us))
+                .collect::<Vec<_>>(),
+            vec![(0, 10), (0, 10)]
         );
     }
 
@@ -879,7 +939,7 @@ mod tests {
 
         {
             let mut observer = FrameObserver::new(Arc::clone(&metrics));
-            observer.write_attempt(origin + Duration::from_micros(5));
+            observer.offered(header.len() + 5, origin + Duration::from_micros(5));
             observer.accepted(header.as_bytes(), origin + Duration::from_micros(10));
             observer.accepted(&body[..5], origin + Duration::from_micros(15));
         }
@@ -902,7 +962,7 @@ mod tests {
         let metrics = Arc::new(StdoutMetrics::new(origin));
         {
             let mut observer = FrameObserver::new(Arc::clone(&metrics));
-            observer.write_attempt(origin + Duration::from_micros(5));
+            observer.offered(10, origin + Duration::from_micros(5));
         }
 
         assert_eq!(
