@@ -384,11 +384,14 @@ impl DocumentTracker {
     /// computed against, and the bridge rejects the edit when that revision is
     /// no longer the tracked one.
     ///
-    /// Gated on CONFIRMED opened state (the reverse index, promoted only after
-    /// the didOpen is enqueued), not just the version map: `try_claim_for_open`
-    /// seeds the version at claim time, BEFORE the didOpen reaches the FIFO,
-    /// so reading the bare map would let a versioned edit validate against a
-    /// revision the downstream was never actually given.
+    /// Gated on CONFIRMED opened state, not just the version map:
+    /// `try_claim_for_open` seeds the version at claim time, BEFORE the
+    /// didOpen reaches the FIFO, so reading the bare map would let a versioned
+    /// edit validate against a revision the downstream was never actually
+    /// given. The primary gate is the ABSENCE of a pending pre-send claim
+    /// (checked under the version lock — sound even against the close+reclaim
+    /// interleaving where the prior lifetime's reverse-index membership is
+    /// still visible); the reverse-index check on top is defense in depth.
     pub(super) async fn document_version(
         &self,
         virtual_uri: &str,
@@ -396,17 +399,28 @@ impl DocumentTracker {
     ) -> Option<i32> {
         let versions = self.document_versions.lock().await;
         let version = versions.get(connection_key)?.get(virtual_uri).copied()?;
-        // Membership is checked AFTER the version read, WHILE the version
-        // lock is still held, and that order is what makes the gate sound
-        // against a concurrent close+reclaim: every remove path (`untrack_
-        // document`, `purge_connection`) deletes the version entry under
-        // this lock BEFORE touching the reverse index, and `mark_open_sent`
-        // only ADDS membership (turning the claim-seeded version into the
-        // confirmed didOpen version). So membership observed here proves the
-        // version read above belongs to a confirmed-open lifetime — checking
-        // membership first (or outside the lock) would let a close+reclaim
-        // slip a fresh pre-send claim's version past an opened-state check
-        // made against the previous lifetime.
+        // A pending pre-send claim means the version just read was seeded by
+        // `try_claim_for_open` and its didOpen is NOT yet confirmed enqueued —
+        // fail closed. This gate (not the reverse index) is what defeats the
+        // close+reclaim interleaving: the remove paths (`untrack_document`,
+        // `purge_connection`) delete the version entry under this lock and
+        // clean the reverse index only AFTERWARDS, so a reclaim landing in
+        // that gap seeds a fresh version while the PRIOR lifetime's stale
+        // membership is still visible — but the reclaim's claim entry is
+        // visible too (inserted under this same lock, removed by
+        // `mark_open_sent` only once the didOpen is confirmed enqueued, at
+        // which point the seeded version IS the confirmed one), so the read
+        // still answers None.
+        if self
+            .open_claims
+            .contains_key(&(connection_key.clone(), virtual_uri.to_string()))
+        {
+            return None;
+        }
+        // Belt-and-suspenders on top of the claim gate: a version entry with
+        // neither a pending claim nor confirmed-open membership shouldn't
+        // exist, but if bookkeeping ever drifts, fail closed rather than
+        // vouch for it.
         if !self.is_virtual_doc_open_on_connection(virtual_uri, connection_key) {
             return None;
         }
@@ -1124,6 +1138,50 @@ mod tests {
             tracker.document_version(&uri_string, &conn).await,
             Some(1),
             "a confirmed open exposes the didOpen version"
+        );
+    }
+
+    /// The close+reclaim interleaving (CodeRabbit, PR #679): the remove paths
+    /// delete the version entry, then a reclaim seeds a fresh version + claim
+    /// BEFORE the prior lifetime's reverse-index membership is cleaned up.
+    /// Stale membership must not vouch for the unconfirmed reclaimed version —
+    /// the pending-claim gate answers None.
+    #[tokio::test]
+    async fn document_version_rejects_reclaim_behind_stale_membership() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        let uri_string = virtual_uri.to_uri_string();
+
+        // Confirmed open in the prior lifetime.
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        // First half of untrack/purge: the version entry is removed under the
+        // lock; reverse-index cleanup has NOT happened yet.
+        tracker
+            .document_versions
+            .lock()
+            .await
+            .get_mut(&conn)
+            .expect("connection tracked")
+            .remove(&uri_string);
+        // A reclaim lands in the gap: fresh version 1 + pending claim, didOpen
+        // not yet confirmed enqueued.
+        assert!(
+            tracker.try_claim_for_open(&virtual_uri, &conn).await,
+            "reclaim must win the claim (version entry was removed)"
+        );
+        assert!(
+            tracker.is_virtual_doc_open_on_connection(&uri_string, &conn),
+            "precondition: the prior lifetime's stale membership is still visible"
+        );
+
+        assert_eq!(
+            tracker.document_version(&uri_string, &conn).await,
+            None,
+            "stale membership must not vouch for the unconfirmed reclaimed version"
         );
     }
 

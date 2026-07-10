@@ -228,18 +228,23 @@ impl ApplyEditTranslator {
         edit: &WorkspaceEdit,
         connection: &ConnectionKey,
     ) -> Result<(), String> {
-        let mut versions_by_uri: Vec<(&str, i32)> = Vec::new();
+        let mut versions_by_uri: std::collections::HashMap<&str, i32> =
+            std::collections::HashMap::new();
         for (uri, version) in versioned_virtual_text_document_edits(edit) {
-            match versions_by_uri.iter().find(|(seen, _)| *seen == uri) {
-                Some((_, seen_version)) if *seen_version != version => {
-                    return Err(format!(
-                        "kakehashi: the edit claims two different versions ({seen_version} \
-                         and {version}) for the same virtual document; at most one can be \
-                         current, so the edit cannot be applied",
-                    ));
+            match versions_by_uri.entry(uri) {
+                std::collections::hash_map::Entry::Occupied(seen) => {
+                    let seen_version = *seen.get();
+                    if seen_version != version {
+                        return Err(format!(
+                            "kakehashi: the edit claims two different versions ({seen_version} \
+                             and {version}) for the same virtual document; at most one can be \
+                             current, so the edit cannot be applied",
+                        ));
+                    }
                 }
-                Some(_) => {}
-                None => versions_by_uri.push((uri, version)),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(version);
+                }
             }
         }
         for (uri, version) in versions_by_uri {
@@ -303,6 +308,14 @@ fn remove_empty_virtual_entries(edit: &mut WorkspaceEdit) {
         changes.retain(|uri, edits| {
             !(edits.is_empty() && VirtualDocumentUri::is_virtual_uri(uri.as_str()))
         });
+        // Drop the map entirely rather than forwarding `Some({})`: a client
+        // without `documentChanges` support processes `changes` (LSP 3.13's
+        // preference rule only orders the two when both are meaningful), and
+        // an empty map there would read as "whole edit is a no-op", silently
+        // losing the real edits carried in documentChanges.
+        if changes.is_empty() {
+            edit.changes = None;
+        }
     }
     let keep = |e: &TextDocumentEdit| {
         !(e.edits.is_empty() && VirtualDocumentUri::is_virtual_uri(e.text_document.uri.as_str()))
@@ -324,7 +337,7 @@ fn remove_empty_virtual_entries(edit: &mut WorkspaceEdit) {
 /// `documentChanges` can carry versions; the `changes` map cannot.
 fn versioned_virtual_text_document_edits(edit: &WorkspaceEdit) -> Vec<(&str, i32)> {
     let mut versioned = Vec::new();
-    let doc_edits: Box<dyn Iterator<Item = &tower_lsp_server::ls_types::TextDocumentEdit>> =
+    let doc_edits: Box<dyn Iterator<Item = &tower_lsp_server::ls_types::TextDocumentEdit> + '_> =
         match &edit.document_changes {
             None => Box::new(std::iter::empty()),
             Some(DocumentChanges::Edits(edits)) => Box::new(edits.iter()),
@@ -800,12 +813,10 @@ mod tests {
             .translate(params, &test_connection())
             .await
             .expect("an unversioned no-op virtual entry must not trip anything");
-        assert!(
-            out.edit
-                .changes
-                .as_ref()
-                .is_some_and(std::collections::HashMap::is_empty),
-            "the empty virtual `changes` entry must not reach the editor"
+        assert_eq!(
+            out.edit.changes, None,
+            "the emptied `changes` map must be dropped, not forwarded as `Some({{}})` \
+             (a documentChanges-unaware client would read that as a no-op edit)"
         );
         match out.edit.document_changes.as_ref().unwrap() {
             DocumentChanges::Edits(edits) => {
