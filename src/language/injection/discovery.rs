@@ -499,12 +499,10 @@ impl InjectionResolver {
                 .collect();
             Self::build_combined_injection(
                 coordinator,
-                tracker,
-                uri,
+                Some((tracker, uri, incarnation)),
                 &group,
                 None,
                 text,
-                Some(incarnation),
             )
         } else {
             Some(Self::build_resolved_injection(
@@ -598,19 +596,18 @@ impl InjectionResolver {
     /// line/column still maps directly back to the host document.
     fn build_combined_injection(
         coordinator: &LanguageCoordinator,
-        tracker: &NodeTracker,
-        uri: &Url,
+        identity: Option<(&NodeTracker, &Url, u64)>,
         regions: &[&InjectionRegionInfo<'_>],
         prebuilt: Option<&[&CacheableInjectionRegion]>,
         text: &str,
-        incarnation: Option<u64>,
     ) -> Option<ResolvedInjection> {
         debug_assert!(!regions.is_empty());
         let owned_cacheable;
         let cacheable: Vec<&CacheableInjectionRegion> = match prebuilt {
             Some(cacheable) => cacheable.to_vec(),
             None => {
-                let incarnation = incarnation?;
+                let (tracker, uri, incarnation) =
+                    identity.expect("non-prebuilt regions require identity");
                 owned_cacheable = regions
                     .iter()
                     .map(|region| {
@@ -710,12 +707,10 @@ impl InjectionResolver {
     ) -> Vec<ResolvedInjection> {
         Self::resolve_grouped(
             coordinator,
-            tracker,
-            uri,
+            Some((tracker, uri, incarnation)),
             regions,
             None,
             text,
-            Some(incarnation),
         )
     }
 
@@ -732,25 +727,15 @@ impl InjectionResolver {
         cacheable: &[CacheableInjectionRegion],
         text: &str,
     ) -> Vec<ResolvedInjection> {
-        Self::resolve_grouped(
-            coordinator,
-            &NodeTracker::new(),
-            &Url::parse("file:///prebuilt").unwrap(),
-            regions,
-            Some(cacheable),
-            text,
-            None,
-        )
+        Self::resolve_grouped(coordinator, None, regions, Some(cacheable), text)
     }
 
     fn resolve_grouped(
         coordinator: &LanguageCoordinator,
-        tracker: &NodeTracker,
-        uri: &Url,
+        identity: Option<(&NodeTracker, &Url, u64)>,
         regions: &[InjectionRegionInfo<'_>],
         prebuilt: Option<&[CacheableInjectionRegion]>,
         text: &str,
-        incarnation: Option<u64>,
     ) -> Vec<ResolvedInjection> {
         let mut resolved = Vec::new();
         let mut seen_combined = std::collections::HashSet::new();
@@ -775,12 +760,10 @@ impl InjectionResolver {
                     .map(|cacheable| indices.iter().map(|&i| &cacheable[i]).collect::<Vec<_>>());
                 if let Some(combined) = Self::build_combined_injection(
                     coordinator,
-                    tracker,
-                    uri,
+                    identity,
                     &group,
                     prebuilt_group.as_deref(),
                     text,
-                    incarnation,
                 ) {
                     resolved.push(combined);
                 }
@@ -796,16 +779,16 @@ impl InjectionResolver {
                     line_column_offsets,
                 });
             } else {
-                if let Some(incarnation) = incarnation
-                    && let Some(single) = Self::build_resolved_injection(
-                        coordinator,
-                        tracker,
-                        uri,
-                        region,
-                        text,
-                        incarnation,
-                    )
-                {
+                let (tracker, uri, incarnation) =
+                    identity.expect("non-prebuilt regions require identity");
+                if let Some(single) = Self::build_resolved_injection(
+                    coordinator,
+                    tracker,
+                    uri,
+                    region,
+                    text,
+                    incarnation,
+                ) {
                     resolved.push(single);
                 }
             }
