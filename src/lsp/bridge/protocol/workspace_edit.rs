@@ -363,7 +363,9 @@ pub(crate) fn text_edit_safe_in_region(
 /// capture a column-0 same-line range with a host suffix after it; the
 /// offsets cannot represent that shape (it is indistinguishable from a
 /// one-line fenced block, where rejecting newlines would break
-/// insertFinalNewline), and the built-in queries never produce it. In a prefixed per-line region, the closing-fence
+/// insertFinalNewline), and the built-in queries never produce it.
+///
+/// In a prefixed per-line region, the closing-fence
 /// BOUNDARY row (recorded as a trailing zero entry, or falling past the array)
 /// counts as prefixed, and edits touching it are rejected outright — the row's
 /// real prefix is unrecorded, so even a no-newline insertion at its column 0

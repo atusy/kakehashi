@@ -342,26 +342,25 @@ fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_li
 /// would only reject, never admit).
 fn snippet_contains_variable(text: &str) -> bool {
     let bytes = text.as_bytes();
-    let mut escaped = false;
+    let starts_name = |c: u8| c.is_ascii_alphabetic() || c == b'_';
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' if !escaped => escaped = true,
-            b'$' if !escaped => {
-                let next = bytes.get(i + 1).copied();
-                let starts_name = |c: u8| c.is_ascii_alphabetic() || c == b'_';
-                match next {
+            // A backslash escapes the next character (literal per the snippet
+            // grammar) — skip both.
+            b'\\' => i += 2,
+            b'$' => {
+                match bytes.get(i + 1).copied() {
                     Some(b'{') if bytes.get(i + 2).copied().is_some_and(starts_name) => {
                         return true;
                     }
                     Some(c) if starts_name(c) => return true,
                     _ => {}
                 }
-                escaped = false;
+                i += 1;
             }
-            _ => escaped = false,
+            _ => i += 1,
         }
-        i += 1;
     }
     false
 }

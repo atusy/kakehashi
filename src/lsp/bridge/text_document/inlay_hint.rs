@@ -151,9 +151,10 @@ fn transform_inlay_hint_response_to_host(
 
         // Transform textEdits ranges. If ANY edit is unsafe for the injection
         // region (escapes it, breaks `> ` prefixes, or merges content into
-        // the closing fence) when applied verbatim, strip them ALL: the client applies the whole array on accept (LSP 3.18), so a
-        // partial set could apply half of an interdependent pair. The hint
-        // itself stays useful without its accept edits (textEdits optional).
+        // the closing fence) when applied verbatim, strip them ALL: the
+        // client applies the whole array on accept (LSP 3.18), so a partial
+        // set could apply half of an interdependent pair. The hint itself
+        // stays useful without its accept edits (textEdits optional).
         if let Some(text_edits) = &mut hint.text_edits {
             for edit in text_edits.iter_mut() {
                 translate_virtual_range_to_host(&mut edit.range, offset);
