@@ -1839,12 +1839,13 @@ mod tests {
             ..Default::default()
         };
         let _summary = coordinator.load_settings(&settings);
-        if !coordinator.ensure_language_loaded("rust").success {
-            return;
-        }
-        let Some(highlight_query) = coordinator.highlight_query("rust") else {
-            return;
-        };
+        assert!(
+            coordinator.ensure_language_loaded("rust").success,
+            "rust fixture must be installed for cancellation coverage"
+        );
+        let highlight_query = coordinator
+            .highlight_query("rust")
+            .expect("rust highlight query must be installed for cancellation coverage");
         let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_parallel());
         let declarations = (0..256)
             .map(|index| format!("let value_{index} = {index};"))
