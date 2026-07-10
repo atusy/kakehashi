@@ -1650,7 +1650,6 @@ impl LanguageServerPool {
             ConnectionAction::SpawnNew => {
                 // Remove stale connection if present (Failed or Closed state)
                 if existing_state.is_some() {
-                    connections.remove(&connection_key);
                     // Drop the dead connection's document state with it: the
                     // replacement process has nothing open, so the lazy host
                     // sync must re-send didOpen and the virt tracker must let
@@ -1667,6 +1666,11 @@ impl LanguageServerPool {
                     self.document_tracker
                         .purge_connection(&connection_key)
                         .await;
+                    // Remove only after every async purge completes. If this
+                    // acquire future is aborted at a cleanup await, the stale
+                    // entry remains and the next acquire retries the idempotent
+                    // purge instead of spawning over partial document state.
+                    connections.remove(&connection_key);
                 }
             }
         }
