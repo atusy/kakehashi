@@ -73,9 +73,6 @@ struct SemanticDocumentCache {
     /// Baseline IDs from least to most recently stored or read.
     baseline_order: VecDeque<String>,
     baseline_bytes: usize,
-    /// Highest closed lifetime. Kept as a tombstone so a late store from that
-    /// lifetime cannot recreate state after didClose atomically cleared it.
-    closed_incarnation: Option<u64>,
 }
 
 impl SemanticTokenCache {
@@ -98,12 +95,6 @@ impl SemanticTokenCache {
         snapshot: SemanticSnapshotIdentity,
     ) {
         let mut document = self.documents.entry(uri).or_default();
-        if document
-            .closed_incarnation
-            .is_some_and(|closed| snapshot.incarnation <= closed)
-        {
-            return;
-        }
         let result_id = tokens.result_id.clone();
         let tokens = Arc::new(tokens);
         document.current = Some(CachedSemanticTokens {
@@ -221,12 +212,7 @@ impl SemanticTokenCache {
     /// settings/query reload to reclaim memory; the generation bump is what makes
     /// the invalidation race-safe, this just stops the dead entries from leaking.
     pub fn clear(&self) {
-        for mut document in self.documents.iter_mut() {
-            document.current = None;
-            document.baselines.clear();
-            document.baseline_order.clear();
-            document.baseline_bytes = 0;
-        }
+        self.documents.clear();
     }
 
     /// Get cached tokens if the result_id matches.
@@ -250,19 +236,8 @@ impl SemanticTokenCache {
     }
 
     /// Remove cached tokens for a document (e.g., on document close).
-    pub fn remove(&self, uri: &Url, incarnation: Option<u64>) {
-        let mut document = self.documents.entry(uri.clone()).or_default();
-        document.current = None;
-        document.baselines.clear();
-        document.baseline_order.clear();
-        document.baseline_bytes = 0;
-        if let Some(incarnation) = incarnation {
-            document.closed_incarnation = Some(
-                document
-                    .closed_incarnation
-                    .map_or(incarnation, |closed| closed.max(incarnation)),
-            );
-        }
+    pub fn remove(&self, uri: &Url) {
+        self.documents.remove(uri);
     }
 }
 
@@ -949,37 +924,6 @@ mod tests {
     }
 
     #[test]
-    fn closed_lifetime_cannot_recreate_semantic_cache_state() {
-        let cache = SemanticTokenCache::new();
-        let uri = Url::parse("file:///closed.rs").unwrap();
-        cache.remove(&uri, Some(3));
-        cache.store(
-            uri.clone(),
-            SemanticTokens {
-                result_id: Some("late".to_string()),
-                data: vec![],
-            },
-            "rust".to_string(),
-            1,
-            snapshot(7, 3, 0),
-        );
-        assert!(cache.get(&uri).is_none());
-        assert!(cache.get_if_valid(&uri, "late").is_none());
-
-        cache.store(
-            uri.clone(),
-            SemanticTokens {
-                result_id: Some("reopened".to_string()),
-                data: vec![],
-            },
-            "rust".to_string(),
-            2,
-            snapshot(0, 4, 0),
-        );
-        assert!(cache.get_if_valid(&uri, "reopened").is_some());
-    }
-
-    #[test]
     fn reading_stale_delta_baseline_refreshes_its_eviction_recency() {
         let cache = SemanticTokenCache::new();
         let uri = Url::parse("file:///baseline-recency.rs").unwrap();
@@ -1183,12 +1127,21 @@ mod tests {
         assert!(cache.get(&uri).is_some(), "Should have cached tokens");
 
         // Remove on close
-        cache.remove(&uri, Some(0));
+        cache.remove(&uri);
         assert!(cache.get(&uri).is_none(), "Should return None after remove");
 
         // Removing non-existent URI is safe
         let other_uri = Url::parse("file:///other.rs").unwrap();
-        cache.remove(&other_uri, None); // Should not panic
+        cache.remove(&other_uri); // Should not panic
+    }
+
+    #[test]
+    fn closed_uri_keys_are_reclaimed() {
+        let cache = SemanticTokenCache::new();
+        for index in 0..128 {
+            cache.remove(&Url::parse(&format!("file:///closed-{index}.rs")).unwrap());
+        }
+        assert!(cache.documents.is_empty());
     }
 
     #[test]

@@ -249,7 +249,6 @@ impl Kakehashi {
             );
             return Ok(None);
         }
-
         // Serve-current (ADR §3, revised): park until the snapshot matches the
         // live text — see `current_snapshot_for_tokens` for why answering from
         // a trailing snapshot corrupts the editor's existing highlights. The
@@ -505,6 +504,17 @@ impl Kakehashi {
                 "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (before store)",
                 uri, request_id
             );
+            return Ok(None);
+        }
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+        let still_current = self.cache.semantic_token_generation() == token_generation
+            && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.slot.current_incarnation == snapshot.incarnation
+                    && view.content_version == snapshot.parsed_version
+            });
+        if !still_current || !self.cache.is_request_active(&uri, request_id) {
+            self.cache.finish_request(&uri, request_id);
             return Ok(None);
         }
 
@@ -872,6 +882,17 @@ impl Kakehashi {
                 "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (before store)",
                 uri, request_id
             );
+            return Ok(None);
+        }
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+        let still_current = self.cache.semantic_token_generation() == token_generation
+            && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.slot.current_incarnation == snapshot.incarnation
+                    && view.content_version == snapshot.parsed_version
+            });
+        if !still_current || !self.cache.is_request_active(&uri, request_id) {
+            self.cache.finish_request(&uri, request_id);
             return Ok(None);
         }
 
