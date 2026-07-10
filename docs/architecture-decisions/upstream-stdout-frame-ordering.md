@@ -17,6 +17,12 @@ The transport observer records, on a shared monotonic clock:
 - response ID and exact header + body byte count; and
 - censored frames whose final flush is not observed.
 
+The writer observer is scoped to tower-lsp-server 0.23's tokio-util
+`FramedWrite`: while a write is pending, its encoded buffer is immutable, and
+only a successfully accepted prefix is advanced. The observer deliberately does
+not hash the complete outstanding multi-megabyte range on every retry, because
+that would introduce the very head-of-line cost being measured.
+
 The release workload used `__ignored/example.md`, a 5,088-line, 37,940-byte
 Markdown document matching the captured editor session's scale. Its SHA-256 is
 `bad443ab7b8d4328e1b255f90db65ee9c83353394e1db9f84f57b371972777f6`.
