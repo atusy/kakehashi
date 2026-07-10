@@ -1026,13 +1026,16 @@ fn parse_code_action_resolve_response(mut response: serde_json::Value) -> Option
         // is undebuggable in the field (the action just stays unresolved).
         // Mirrors parse_code_actions_leniently's per-item warn.
         Err(e) => {
-            // Truncate: serde errors can embed downstream payload snippets,
-            // and the eager-resolve fan-out can hit this once per lazy action.
-            let mut detail = e.to_string();
-            detail.truncate(200);
+            // Log the error CLASS and position, not `{e}`: serde's Display
+            // embeds downstream payload snippets (arbitrary, possibly
+            // non-ASCII values), which neither belongs in the log nor
+            // truncates safely.
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: malformed resolve result: {detail}"
+                "codeAction/resolve: malformed resolve result: {:?} at line {} column {}",
+                e.classify(),
+                e.line(),
+                e.column()
             );
             None
         }
