@@ -121,9 +121,10 @@ pub(super) fn count_lines(text: &str) -> u32 {
 
 /// If `pos` is the "synthetic next-line anchor" (column 0 of the line
 /// immediately after `last_real_line`), rewrite it to (last_real_line,
-/// u32::MAX) so the editor's standard end-of-line clamping snaps it to the
-/// real last column. Used to accept the canonical insertFinalNewline shape
-/// without dropping it as past-EOF.
+/// u32::MAX) — a sentinel the transform later snaps to the region's
+/// content-precise host end (see `transform_formatting_response_to_host`).
+/// Used to accept the canonical insertFinalNewline shape without dropping it
+/// as past-EOF.
 ///
 /// `virtual_line_count` is the synthetic-line index — i.e., the value that
 /// would be `last_real_line + 1` for non-empty docs. Passed in to avoid
@@ -262,6 +263,28 @@ pub(super) fn transform_formatting_response_to_host(
 
     for edit in &mut edits {
         translate_virtual_range_to_host(&mut edit.range, offset);
+    }
+
+    // Clamp synthetic-EOF sentinels into the region: the (last line, u32::MAX)
+    // sentinel from `clamp_synthetic_eof_anchor` saturates through translation
+    // and would otherwise fail the exact containment check below, dropping
+    // every canonical insertFinalNewline response. Clamping to `region_end`
+    // (the content-precise host end) is exact — the sentinel means "end of
+    // the region's last content line", which IS the region end. Restricted to
+    // the last content line: a stray u32::MAX character anywhere else stays
+    // put and fails containment (fail-closed).
+    let last_real_host_line = offset
+        .line()
+        .saturating_add(virtual_line_count.saturating_sub(1));
+    for edit in &mut edits {
+        for pos in [&mut edit.range.start, &mut edit.range.end] {
+            if pos.character == u32::MAX
+                && pos.line == last_real_host_line
+                && (pos.line, pos.character) > (region_end.line, region_end.character)
+            {
+                *pos = region_end;
+            }
+        }
     }
 
     // Prefix safety (same guard codeAction/rename/applyEdit apply via the
@@ -743,6 +766,36 @@ mod tests {
             edits.is_empty(),
             "any out-of-bounds edit must drop the whole response: {edits:?}"
         );
+    }
+
+    #[test]
+    fn insert_final_newline_survives_a_realistic_region_end() {
+        // Content "local x = 1" (no trailing newline) at host line 3 in a
+        // plain fence: region end is the exact content end (3, 11), NOT a
+        // permissive sentinel. The canonical insertFinalNewline shape — a
+        // zero-width insert at the synthetic next-line anchor — must snap to
+        // the region end and survive containment.
+        let offset = RegionOffset::new(3, 0);
+        let region_end = Position {
+            line: 3,
+            character: 11,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "range": { "start": { "line": 1, "character": 0 },
+                             "end": { "line": 1, "character": 0 } },
+                  "newText": "\n" }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &offset, 1, region_end).unwrap();
+
+        assert_eq!(edits.len(), 1, "insertFinalNewline must survive: {edits:?}");
+        assert_eq!(edits[0].range.start, region_end);
+        assert_eq!(edits[0].range.end, region_end);
+        assert_eq!(edits[0].new_text, "\n");
     }
 
     #[rstest]
