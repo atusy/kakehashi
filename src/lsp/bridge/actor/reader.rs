@@ -183,7 +183,8 @@ pub(crate) enum UpstreamRequest {
     /// `failureReason`, `failedChange`) is relayed back — the downstream acts
     /// on the outcome. The forwarding loop translates virtual-document edits
     /// back to host coordinates before the editor sees them, and answers
-    /// untranslatable edits `applied: false` locally (#568).
+    /// untranslatable edits — and all edits when the editor never declared
+    /// `workspace.applyEdit` — `applied: false` locally (#568).
     ApplyEdit {
         params: tower_lsp_server::ls_types::ApplyWorkspaceEditParams,
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,

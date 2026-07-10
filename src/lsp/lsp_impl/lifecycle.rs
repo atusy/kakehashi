@@ -2949,12 +2949,13 @@ mod tests {
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
         let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
+        let registry = crate::lsp::bridge::InboundRequestRegistry::default();
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
             upstream_rx,
             window_rx,
             request_rx,
             None,
-            crate::lsp::bridge::InboundRequestRegistry::default(),
+            registry.clone(),
             client,
             None,
             cancel.clone(),
@@ -2963,6 +2964,17 @@ mod tests {
             false,
         ));
 
+        // Register the request the way the reader does, so the test verifies
+        // the local-answer path unregisters it.
+        let connection_id = crate::lsp::bridge::ProgressConnectionId::for_test(0);
+        let request_id = tower_lsp_server::jsonrpc::Id::Number(1);
+        let (token, generation) = registry.register(connection_id, request_id.clone());
+        let forwarded_cancel = crate::lsp::bridge::ForwardedRequestCancel {
+            connection_id,
+            request_id: request_id.clone(),
+            token: token.clone(),
+            generation,
+        };
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
@@ -2971,7 +2983,7 @@ mod tests {
                 }))
                 .unwrap(),
                 reply: reply_tx,
-                cancel: test_forwarded_cancel(),
+                cancel: forwarded_cancel,
             })
             .unwrap();
 
@@ -2986,6 +2998,14 @@ mod tests {
                 .is_some_and(|r| r.contains("does not support workspace/applyEdit")),
             "failureReason should name the missing capability: {:?}",
             response.failure_reason
+        );
+
+        // The registry entry must be gone: a $/cancelRequest after the local
+        // answer must find nothing to cancel.
+        registry.cancel(connection_id, &request_id);
+        assert!(
+            !token.is_cancelled(),
+            "the entry must have been unregistered by the local-answer path"
         );
 
         cancel.cancel();

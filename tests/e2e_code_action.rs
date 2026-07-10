@@ -111,7 +111,12 @@ fn literal_support_caps(disabled_support: bool) -> Value {
     if disabled_support {
         code_action["disabledSupport"] = json!(true);
     }
-    json!({ "textDocument": { "codeAction": code_action } })
+    json!({
+        "textDocument": { "codeAction": code_action },
+        // The bridge relays downstream workspace/applyEdit only to editors
+        // that declare the capability; the applyEdit e2e depends on it.
+        "workspace": { "applyEdit": true }
+    })
 }
 
 /// Literal support PLUS dataSupport + resolveSupport — the client can hold a
