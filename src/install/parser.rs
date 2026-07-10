@@ -32,6 +32,8 @@ const MAX_ARCHIVE_TAR_STREAM_BYTES: u64 =
 /// Maximum compressed bytes downloaded for a parser archive.
 const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 =
     MAX_ARCHIVE_TAR_STREAM_BYTES + ARCHIVE_TAR_METADATA_MARGIN_BYTES;
+/// Maximum number of filesystem entries accepted from a parser archive.
+const MAX_ARCHIVE_ENTRIES: u64 = 10_000;
 
 /// Error types for parser installation.
 #[derive(Debug)]
@@ -533,7 +535,25 @@ fn extract_archive<R: Read>(
     revision: &str,
     dest: &Path,
 ) -> Result<(), ParserInstallError> {
-    let bounded_decoder = LimitedReader::new(decoder, MAX_ARCHIVE_TAR_STREAM_BYTES);
+    extract_archive_with_limits(
+        decoder,
+        repo_name,
+        revision,
+        dest,
+        MAX_ARCHIVE_TAR_STREAM_BYTES,
+        MAX_ARCHIVE_ENTRIES,
+    )
+}
+
+fn extract_archive_with_limits<R: Read>(
+    decoder: R,
+    repo_name: &str,
+    revision: &str,
+    dest: &Path,
+    tar_stream_limit: u64,
+    entry_limit: u64,
+) -> Result<(), ParserInstallError> {
+    let bounded_decoder = LimitedReader::new(decoder, tar_stream_limit);
     let mut archive = Archive::new(bounded_decoder);
 
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
@@ -541,12 +561,20 @@ fn extract_archive<R: Read>(
 
     fs::create_dir_all(dest)?;
     let mut extracted_bytes = 0u64;
+    let mut entry_count = 0u64;
 
     for entry_result in archive
         .entries()
         .map_err(|e| archive_io_error("Failed to read archive entries", e))?
     {
         let mut entry = entry_result.map_err(|e| archive_io_error("Failed to read entry", e))?;
+        entry_count += 1;
+        if entry_count > entry_limit {
+            return Err(ParserInstallError::ArchiveSizeLimitExceeded(format!(
+                "archive contains more than {} entries",
+                entry_limit
+            )));
+        }
 
         let path = entry.path().map_err(|e| {
             ParserInstallError::ArchiveError(format!("Invalid path in archive: {}", e))
@@ -1791,6 +1819,34 @@ mod tests {
     }
 
     #[test]
+    fn extract_archive_rejects_too_many_entries() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        let archive = tar_archive_with_empty_files("parser-1.0.0", 2);
+
+        let result = extract_archive_with_limits(
+            &archive[..],
+            "parser",
+            "v1.0.0",
+            &dest,
+            archive.len() as u64,
+            1,
+        );
+
+        match result {
+            Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
+                assert!(
+                    message.contains("archive contains more than 1 entries"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected archive entry count limit error, got {other:?}"),
+        }
+        assert!(dest.join("file-0").exists());
+        assert!(!dest.join("file-1").exists());
+    }
+
+    #[test]
     fn archive_io_error_maps_limited_reader_archive_failures() {
         let tar = tar_archive_with_payload("parser-1.0.0", 1);
         let mut archive = Archive::new(LimitedReader::new(&tar[..], 1));
@@ -1962,6 +2018,30 @@ mod tests {
             builder.finish().expect("finish tar");
         }
 
+        archive
+    }
+
+    fn tar_archive_with_empty_files(root: &str, count: usize) -> Vec<u8> {
+        use tar::{Builder, Header};
+
+        let mut archive = Vec::new();
+        {
+            let mut builder = Builder::new(&mut archive);
+            for index in 0..count {
+                let mut header = Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(
+                        &mut header,
+                        format!("{root}/file-{index}"),
+                        std::io::empty(),
+                    )
+                    .expect("append empty file");
+            }
+            builder.finish().expect("finish tar");
+        }
         archive
     }
 
