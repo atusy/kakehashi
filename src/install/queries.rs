@@ -188,7 +188,6 @@ fn install_queries_with_dependencies_from_with_http_policy(
             language.escape_default().to_string(),
         ));
     }
-    validate_base_url_http_policy(base_url, http_policy)?;
     let mut installed = std::collections::HashSet::new();
     install_queries_recursive(
         base_url,
@@ -360,6 +359,7 @@ fn install_queries_recursive(
 
 /// Download a file from a URL.
 fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, QueryInstallError> {
+    validate_base_url_http_policy(url, http_policy)?;
     let agent = match http_policy {
         QueryHttpPolicy::HttpsOnly => agent_with_timeout(QUERY_HTTP_TIMEOUT),
         #[cfg(test)]
@@ -446,8 +446,24 @@ mod tests {
             install_queries_with_dependencies_from("http://127.0.0.1:1", "lua", temp.path(), false);
 
         assert!(
-            matches!(result, Err(QueryInstallError::HttpsOnly { url }) if url == "http://127.0.0.1:1"),
-            "plain HTTP base URLs should fail before being reported as missing queries"
+            matches!(result, Err(QueryInstallError::HttpsOnly { url }) if url == "http://127.0.0.1:1/lua/highlights.scm"),
+            "plain HTTP downloads should fail before being reported as missing queries"
+        );
+    }
+
+    #[test]
+    fn installed_queries_skip_plain_http_sentinel_base_url() {
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries").join("lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+
+        let result =
+            install_queries_with_dependencies_from("http://127.0.0.1:1", "lua", temp.path(), false);
+
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(path)) if path == queries_dir),
+            "already-installed queries must not validate an unused HTTP sentinel URL"
         );
     }
 
