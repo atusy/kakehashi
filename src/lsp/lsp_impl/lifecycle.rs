@@ -123,10 +123,11 @@ impl Kakehashi {
             .pool()
             .set_workspace_folders(workspace_folders_for_bridge);
         // Clients without codeActionLiteralSupport only understand
-        // `Command[]` responses. The bridge surfaces CodeAction literals
-        // (bare downstream Commands are bridged too, but wrapped/renamed for
-        // routing — never a plain `Command[]` downgrade), so withhold the
-        // capability for such clients (#568).
+        // `Command[]` responses. The bridge surfaces CodeAction literals and
+        // cannot guarantee a Command-only response (bare downstream Commands
+        // stay bare — renamed for routing — but literal actions are never
+        // downgraded to Commands), so withhold the capability for such
+        // clients (#568).
         let client_supports_code_action_literals = params
             .capabilities
             .text_document
