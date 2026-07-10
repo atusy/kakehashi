@@ -250,7 +250,14 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     envelope_item_data(item, &ctx);
 }
 
-/// The `region_end` the resolve-path prefix guard runs with. Normally the
+/// The `region_end` the resolve-path prefix guard runs with.
+///
+/// Known limitation (pre-existing class, shared with the envelope's `offset`
+/// itself, which has translated resolve responses since #382): both are
+/// completion-time snapshots round-tripped through the client, so an edit
+/// arriving after the region moved translates against stale geometry. A live
+/// re-resolution needs a region identity the envelope doesn't carry — the
+/// codeAction path's freshness gate is the model if this ever bites. Normally the
 /// envelope carries the completion-time snapshot verbatim. A LEGACY envelope
 /// (minted before the field existed) has none, and the resolve path cannot
 /// recompute it — fall back to `(region start line, character 0)`, which is

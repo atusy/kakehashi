@@ -17,7 +17,8 @@
 //! answer is one atomic diff, so applying only its safe edits could
 //! duplicate or lose content. All-safe responses (single-line edits and
 //! zero-width inserts — the common `trimTrailingWhitespace` cases) pass
-//! through, and unprefixed regions are unaffected. Re-applying prefixes to `new_text` (which would let these
+//! through (a newline-bearing `new_text` in a prefixed region still rejects),
+//! and unprefixed regions are unaffected. Re-applying prefixes to `new_text` (which would let these
 //! edits APPLY instead of dropping) means rewriting it per embedded newline;
 //! deferred because it interacts with `trim_final_newlines` semantics —
 //! the lsp_impl concatenated pipeline's `reapply_host_line_prefixes` is the

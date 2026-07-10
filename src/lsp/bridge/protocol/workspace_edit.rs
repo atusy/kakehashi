@@ -400,6 +400,24 @@ pub(crate) fn text_edit_preserves_line_prefixes(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
+    // Fence-boundary EOL preservation — checked BEFORE the all-zero fast
+    // path because it protects plain fenced regions too. When the region's
+    // content end is the START of the closing-fence row (character 0 —
+    // content ends with a newline), an edit reaching that boundary erases or
+    // omits the newline separating content from fence: inserting "y" there
+    // yields "y```" on the fence line. After the edit, the text before the
+    // fence still ends with a newline iff the newText ends with one, or —
+    // for a pure deletion — the range starts at a line start (whole trailing
+    // lines removed; the preceding newline survives). Reject everything
+    // else. The canonical insertFinalNewline ("\n" at the boundary) passes.
+    if region_end.character == 0 && e.range.end == region_end {
+        let ends_with_newline = e.new_text.ends_with('\n');
+        let whole_line_deletion = e.new_text.is_empty() && e.range.start.character == 0;
+        if !ends_with_newline && !whole_line_deletion {
+            return false;
+        }
+    }
+
     let columns = offset.columns();
     if columns.iter().all(|&column| column == 0) {
         return true;
@@ -1260,5 +1278,41 @@ mod tests {
             }]
         }));
         assert!(!check(&doc_changes_into_prefix));
+    }
+
+    #[test]
+    fn boundary_edits_must_preserve_the_fence_separating_newline() {
+        // PLAIN fenced region (all-zero offsets): content host lines 3-4,
+        // closing fence at line 5, region end (5, 0) — the boundary is the
+        // fence row's start. Containment is inclusive there and the all-zero
+        // fast path skips the prefix rules, so the EOL-preservation rule is
+        // the only thing keeping "y" from landing as "y```".
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let edit = |start: Position, end: Position, new_text: &str| TextEdit {
+            range: tower_lsp_server::ls_types::Range { start, end },
+            new_text: new_text.to_string(),
+        };
+        let p = |line: u32, character: u32| Position { line, character };
+        let check = |e: &TextEdit| text_edit_safe_in_region(e, &offset, region_end);
+
+        // Insert without a trailing newline at the boundary → "y```". Reject.
+        assert!(!check(&edit(p(5, 0), p(5, 0), "y")));
+        // Canonical insertFinalNewline. Accept.
+        assert!(check(&edit(p(5, 0), p(5, 0), "\n")));
+        // Whole-block replacement ending at the boundary with a trailing
+        // newline (organize-imports shape). Accept.
+        assert!(check(&edit(p(3, 0), p(5, 0), "import a\nimport b\n")));
+        // Same replacement WITHOUT the trailing newline → fence merges into
+        // the last content line. Reject.
+        assert!(!check(&edit(p(3, 0), p(5, 0), "import a\nimport b")));
+        // Whole trailing-line deletion: preceding newline survives. Accept.
+        assert!(check(&edit(p(4, 0), p(5, 0), "")));
+        // Mid-line deletion ending at the boundary eats the separating
+        // newline → "x```". Reject.
+        assert!(!check(&edit(p(4, 2), p(5, 0), "")));
     }
 }

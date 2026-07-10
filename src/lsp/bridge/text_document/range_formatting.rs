@@ -13,9 +13,10 @@
 //! # Multi-line edit limitation
 //!
 //! Same caveat as full formatting: a multi-line edit's `new_text` inside a
-//! prefixed injection is not re-prefixed, so the shared guard now DROPS such
-//! edits instead of corrupting the host document. Single-line edits — which
-//! dominate the "format the selected range" use case — are unaffected.
+//! prefixed injection is not re-prefixed, so the shared guard DROPS the WHOLE
+//! response (one atomic formatter diff) when any edit is unsafe, instead of
+//! corrupting the host document. All-safe responses — the common case for
+//! "format the selected range" — are unaffected.
 
 use std::io;
 

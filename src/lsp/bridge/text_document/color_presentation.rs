@@ -65,7 +65,9 @@ impl LanguageServerPool {
             },
             |response, ctx| {
                 let region_end = region_host_end(virtual_content, ctx.offset);
-                transform_color_presentation_response_to_host(response, ctx.offset, region_end)
+                transform_color_presentation_response_to_host(
+                    response, ctx.offset, region_end, host_range,
+                )
             },
         )
         .await
@@ -109,6 +111,7 @@ fn transform_color_presentation_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     region_end: Position,
+    host_request_range: Range,
 ) -> Vec<ColorPresentation> {
     if response_has_jsonrpc_error(&response, "textDocument/colorPresentation") {
         return vec![];
@@ -134,18 +137,21 @@ fn transform_color_presentation_response_to_host(
     // editor falls back to inserting the label, still at the unguarded
     // range), so an unsafe textEdit drops the whole presentation; unsafe
     // additionalTextEdits are merely stripped.
-    let region_prefixed = offset.columns().iter().any(|column| *column != 0);
     let before = presentations.len();
     presentations.retain_mut(|presentation| {
-        // No textEdit: the client inserts the LABEL at the request range. A
-        // multi-line label in a prefixed region is the same hazard as a
-        // multi-line textEdit (no range to check here — the newline is the
-        // signal). Labels are single-line in practice, so this never bites.
-        if presentation.text_edit.is_none()
-            && region_prefixed
-            && (presentation.label.contains('\n') || presentation.label.contains('\r'))
-        {
-            return false;
+        // No textEdit: the client replaces the REQUEST range with the label
+        // (LSP 3.18). Guard that implicit edit exactly like an explicit one —
+        // a synthetic TextEdit over the (host) request range with the label
+        // as newText. Labels are single-line and request ranges in-region in
+        // practice, so this rarely bites.
+        if presentation.text_edit.is_none() {
+            let implicit = tower_lsp_server::ls_types::TextEdit {
+                range: host_request_range,
+                new_text: presentation.label.clone(),
+            };
+            if !text_edit_safe_in_region(&implicit, offset, region_end) {
+                return false;
+            }
         }
         if let Some(text_edit) = &mut presentation.text_edit {
             translate_virtual_range_to_host(&mut text_edit.range, offset);
@@ -188,6 +194,21 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    /// In-region host request range used by tests that don't exercise the
+    /// implicit label-replacement guard (single position on the region line).
+    fn test_host_request_range(region_start_line: u32) -> Range {
+        Range {
+            start: Position {
+                line: region_start_line,
+                character: 0,
+            },
+            end: Position {
+                line: region_start_line,
+                character: 4,
+            },
+        }
+    }
 
     // ==========================================================================
     // Color presentation request tests
@@ -492,6 +513,7 @@ mod tests {
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
+            test_host_request_range(region_start_line),
         );
 
         assert_eq!(presentations.len(), 1);
@@ -540,6 +562,7 @@ mod tests {
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
+            test_host_request_range(region_start_line),
         );
 
         assert_eq!(presentations.len(), 1);
@@ -572,6 +595,7 @@ mod tests {
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
+            test_host_request_range(region_start_line),
         );
 
         assert_eq!(presentations.len(), 3);
@@ -591,6 +615,7 @@ mod tests {
             response,
             &RegionOffset::new(5, 0),
             TEST_REGION_END,
+            test_host_request_range(5),
         );
         assert!(presentations.is_empty());
     }
@@ -603,6 +628,7 @@ mod tests {
             response,
             &RegionOffset::new(5, 0),
             TEST_REGION_END,
+            test_host_request_range(5),
         );
         assert!(presentations.is_empty());
     }
@@ -637,8 +663,12 @@ mod tests {
             ]
         });
 
-        let presentations =
-            transform_color_presentation_response_to_host(response, &offset, region_end);
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            region_end,
+            test_host_request_range(3),
+        );
 
         assert_eq!(presentations.len(), 1, "unsafe presentation is dropped");
         assert_eq!(presentations[0].label, "safe");
@@ -676,10 +706,53 @@ mod tests {
             ]
         });
 
-        let presentations =
-            transform_color_presentation_response_to_host(response, &offset, region_end);
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            region_end,
+            test_host_request_range(3),
+        );
 
         assert_eq!(presentations.len(), 1, "region-escaping presentation drops");
         assert_eq!(presentations[0].label, "contained");
+    }
+
+    #[test]
+    fn color_presentation_drops_label_fallback_over_a_prefixed_multiline_range() {
+        // No textEdit: the client replaces the REQUEST range with the label.
+        // A request range spanning prefixed lines makes even a single-line
+        // label strip the second line's `> ` prefix — the synthetic implicit
+        // edit must be rejected like an explicit one.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let multiline_request_range = Range {
+            start: Position {
+                line: 3,
+                character: 2,
+            },
+            end: Position {
+                line: 4,
+                character: 4,
+            },
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [ { "label": "#ff0000" } ]
+        });
+
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            region_end,
+            multiline_request_range,
+        );
+
+        assert!(
+            presentations.is_empty(),
+            "label fallback over a prefixed multi-line range must drop: {presentations:?}"
+        );
     }
 }
