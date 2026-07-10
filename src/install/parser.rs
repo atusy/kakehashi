@@ -1847,6 +1847,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_archive_rejects_oversized_decompressed_stream() {
+        const STREAM_LIMIT_BYTES: u64 = 520;
+
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        let archive = tar_archive_with_payload("parser-1.0.0", 16);
+
+        let result = extract_archive_with_limits(
+            &archive[..],
+            "parser",
+            "v1.0.0",
+            &dest,
+            STREAM_LIMIT_BYTES,
+            MAX_ARCHIVE_ENTRIES,
+        );
+
+        match result {
+            Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
+                assert!(
+                    message.contains(&format!(
+                        "decompressed tar stream exceeds {STREAM_LIMIT_BYTES} bytes"
+                    )),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected decompressed archive size limit error, got {other:?}"),
+        }
+        assert!(
+            !dest.join("payload.bin").exists(),
+            "stream-limit failure must not leave a completed target"
+        );
+    }
+
+    #[test]
     fn archive_io_error_maps_limited_reader_archive_failures() {
         let tar = tar_archive_with_payload("parser-1.0.0", 1);
         let mut archive = Archive::new(LimitedReader::new(&tar[..], 1));
