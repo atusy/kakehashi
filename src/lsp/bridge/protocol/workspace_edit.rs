@@ -773,6 +773,91 @@ mod tests {
     }
 
     #[test]
+    fn preserves_line_prefixes_rejects_insertion_when_only_the_next_line_is_prefixed() {
+        let host_uri = make_host_uri();
+        // Start line unprefixed, the FOLLOWING line prefixed (lazy-continuation
+        // first line): an inserted newline puts the new unprefixed line into a
+        // prefixed neighborhood. Pins the second disjunct of the insertion
+        // check — prefix_at(start.line) alone would let this through.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 2]);
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 1}, "end": {"line": 3, "character": 1}},
+                  "newText": "a\nb" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_span_when_only_the_end_line_is_prefixed() {
+        let host_uri = make_host_uri();
+        // Interior line unprefixed, END line prefixed: the range's tail eats
+        // the end line's prefix. Pins the `..=end.line` inclusivity — an
+        // exclusive range would miss it. Deletion-only (empty newText) shows
+        // the span check is independent of the replacement text.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 2]);
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 5, "character": 1}},
+                  "newText": "" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_checks_annotated_document_changes_operations() {
+        use tower_lsp_server::ls_types::{
+            AnnotatedTextEdit, OptionalVersionedTextDocumentIdentifier, Range, TextDocumentEdit,
+        };
+
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2]);
+        // Typed construction: serde's untagged OneOf never parses Right from
+        // JSON (annotationId is silently dropped), so exercise the annotated
+        // arm and the Operations arm of the shared walk in code. A newline-
+        // bearing annotated edit in a prefixed region must be rejected.
+        let edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: host_uri.clone(),
+                        version: None,
+                    },
+                    edits: vec![OneOf::Right(AnnotatedTextEdit {
+                        text_edit: TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: 3,
+                                    character: 2,
+                                },
+                                end: Position {
+                                    line: 3,
+                                    character: 2,
+                                },
+                            },
+                            new_text: "a\nb".to_string(),
+                        },
+                        annotation_id: "refactor".to_string(),
+                    })],
+                }),
+            ])),
+            ..Default::default()
+        };
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset
+        ));
+    }
+
+    #[test]
     fn within_region_bounds_the_host_uri_edits_only() {
         let host_uri = make_host_uri();
         // A 2-line BLOCKQUOTE region: starts at host line 3, and every line has a
