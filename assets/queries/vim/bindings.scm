@@ -3,11 +3,12 @@
 ; The scope prefix is part of the syntax, not the tree shape: `s:`/`g:`
 ; names register at the layer root in a "script"/"global" namespace
 ; regardless of where the `let` executes (a `g:` set inside a function
-; is visible everywhere after it), while `l:` and bare `let` names are
-; function-local in the default namespace — `l:t` and bare `t` are the
-; same variable. Function arguments answer `a:name` references. Bare
-; identifier reads search locals first, then globals. `b:`/`w:`/`t:`/
-; `v:` names, `{curly-braces}` names, and Vim9 syntax stay silent.
+; is visible everywhere after it). `l:` and function-local bare `let` names
+; are default-namespace locals — `l:t` and bare `t` are the same variable.
+; Script-level bare `let` names are global, addressable as both `x` and `g:x`.
+; Function arguments answer `a:name` references. Bare identifier reads search
+; locals first, then globals. `b:`/`w:`/`t:`/`v:` names, `{curly-braces}` names,
+; and Vim9 syntax stay silent.
 
 ; ── Scopes ──────────────────────────────────────────────────────────────
 (function_definition) @scope.function
@@ -27,6 +28,12 @@
  (#eq? @_s "l:")
  (#set! definition.visibility "after"))
 ((let_statement . (identifier) @definition)
+ (#has-ancestor? @definition "function_definition")
+ (#set! definition.visibility "after"))
+((let_statement . (identifier) @definition)
+ (#not-has-ancestor? @definition "function_definition")
+ (#set! definition.namespace "global")
+ (#set! definition.scope "global")
  (#set! definition.visibility "after"))
 
 ; ── Functions ────────────────────────────────────────────────────────────

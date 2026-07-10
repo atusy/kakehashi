@@ -87,7 +87,8 @@
  (#set! definition.visibility "after"))
 ((for_binding . (tuple_expression (identifier) @definition)) @_it
  (#set! definition.visibility "after"))
-(let_binding . (identifier) @definition)
+((let_binding . (identifier) @definition)
+ (#set! definition.visibility "after"))
 
 ; ── References ───────────────────────────────────────────────────────────
 ; The member after a dot is never a lexical reference; the value before

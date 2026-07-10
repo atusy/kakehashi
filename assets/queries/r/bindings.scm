@@ -31,6 +31,9 @@
 ((binary_operator lhs: (identifier) @definition operator: "<<-") @_a
  (#set! definition.visibility "after")
  (#set! definition.rebind "outer-or-local"))
+((binary_operator rhs: (identifier) @definition operator: "->>") @_a
+ (#set! definition.visibility "after")
+ (#set! definition.rebind "outer-or-local"))
 
 ; ── Parameters and loop variables ────────────────────────────────────────
 (parameter name: (identifier) @definition.parameter)

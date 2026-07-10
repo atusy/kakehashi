@@ -53,7 +53,10 @@
 ((assignment left: (identifier) @definition) @_a
  (#set! definition.visibility "after")
  (#set! definition.rebind "outer-or-local"))
-((left_assignment_list (identifier) @definition) @_a
+((assignment left: (left_assignment_list (identifier) @definition)) @_a
+ (#set! definition.visibility "after")
+ (#set! definition.rebind "outer-or-local"))
+((for pattern: (left_assignment_list (identifier) @definition)) @_a
  (#set! definition.visibility "after")
  (#set! definition.rebind "outer-or-local"))
 ((operator_assignment left: (identifier) @definition) @_a
@@ -92,6 +95,7 @@
  (#set! reference.namespace "default method"))
 ((call !receiver method: (identifier) @reference)
  (#set! reference.namespace "method"))
-(call receiver: (identifier) @reference)
+((call receiver: (identifier) @reference)
+ (#set! reference.namespace "default method"))
 ((constant) @reference
  (#set! reference.namespace "constant"))

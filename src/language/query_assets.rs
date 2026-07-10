@@ -8,6 +8,8 @@ mod tests {
     use crate::analysis::bindings::collect::collect;
     use crate::analysis::bindings::model::BindingsModel;
 
+    const DOCKERFILE_REVISION: &str = "971acdd908568b4531b0ba28a445bf0bb720aba5";
+
     /// The on-disk `bindings.scm` asset for a language.
     fn asset_source(lang_name: &str) -> String {
         let path = format!(
@@ -37,8 +39,8 @@ mod tests {
             // No tree-sitter-0.26-compatible dockerfile crate exists (the only
             // one pins tree-sitter ^0.20), so this fixture keeps no grammar
             // source in-repo: it auto-installs the grammar the same way
-            // `kakehashi language install` does and loads the compiled .so
-            // through the version-independent C ABI. See dockerfile_language.
+            // `kakehashi language install` does and loads the compiled shared
+            // library through the version-independent C ABI. See dockerfile_language.
             "dockerfile" => dockerfile_language(),
             // Terraform is HCL syntax: both names validate against the HCL
             // grammar (the terraform asset inherits hcl).
@@ -62,11 +64,11 @@ mod tests {
     /// once into a shared library, then load it through the C ABI (which is
     /// version-independent — the whole reason the runtime never hit the pin).
     ///
-    /// The compiled `.so` is cached under the project-local test data dir and
-    /// reused, so repeated `cargo test` runs never re-fetch or re-compile; only
-    /// a cold cache needs the network. The fixture seeds the metadata cache with
-    /// a pinned Dockerfile grammar revision so cold-cache runs do not follow
-    /// upstream nvim-treesitter metadata changes.
+    /// The compiled shared library is cached under the project-local test data
+    /// dir and reused, so repeated `cargo test` runs never re-fetch or
+    /// re-compile; only a cold cache needs the network. The fixture seeds the
+    /// metadata cache with a pinned Dockerfile grammar revision and persists a
+    /// marker next to the parser so branch switches and pin updates reinstall.
     ///
     /// A process-wide `OnceLock` memoizes the loaded grammar so the install +
     /// load runs exactly once no matter how many fixture threads race here —
@@ -78,29 +80,35 @@ mod tests {
         };
         use crate::install::{test_helpers, test_support};
         use crate::language::loader::ParserLoader;
+        use std::fs;
         use std::sync::OnceLock;
 
         static DOCKERFILE: OnceLock<tree_sitter::Language> = OnceLock::new();
         DOCKERFILE
             .get_or_init(|| {
                 let cache_dir = test_support::test_data_dir_path().join("query-assets");
+                let parser_dir = cache_dir.join("parser");
+                let revision_marker = parser_dir.join("dockerfile.revision");
                 test_helpers::setup_mock_metadata_cache(
                     &cache_dir,
-                    r#"
+                    &r#"
 return {
   dockerfile = {
     install_info = {
-      revision = '971acdd908568b4531b0ba28a445bf0bb720aba5',
+      revision = '{revision}',
       url = 'https://github.com/camdencheek/tree-sitter-dockerfile',
     },
   },
 }
-"#,
+"#
+                    .replace("{revision}", DOCKERFILE_REVISION),
                 );
-                let library = parser_file_exists("dockerfile", &cache_dir).unwrap_or_else(|| {
+                let marker_matches = fs::read_to_string(&revision_marker)
+                    .is_ok_and(|revision| revision == DOCKERFILE_REVISION);
+                let install = |force| {
                     let options = InstallOptions {
                         data_dir: cache_dir.clone(),
-                        force: false,
+                        force,
                         verbose: false,
                         no_cache: false,
                         // The test harness binary has no `__compile-parser`
@@ -118,12 +126,33 @@ return {
                             cache_dir.display()
                         ),
                     }
-                });
-                ParserLoader::new()
-                    .load_language(&library, "dockerfile")
-                    .unwrap_or_else(|e| {
-                        panic!("load dockerfile grammar {}: {e}", library.display())
-                    })
+                };
+                let mut library = if marker_matches {
+                    parser_file_exists("dockerfile", &cache_dir)
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| install(!marker_matches));
+                fs::create_dir_all(&parser_dir).expect("create parser cache dir");
+                fs::write(&revision_marker, DOCKERFILE_REVISION).expect("write dockerfile revision marker");
+
+                let mut loader = ParserLoader::new();
+                match loader.load_language(&library, "dockerfile") {
+                    Ok(language) => language,
+                    Err(first_error) => {
+                        let _ = fs::remove_file(&library);
+                        library = install(true);
+                        fs::write(&revision_marker, DOCKERFILE_REVISION)
+                            .expect("write dockerfile revision marker");
+                        let mut loader = ParserLoader::new();
+                        loader.load_language(&library, "dockerfile").unwrap_or_else(|e| {
+                            panic!(
+                                "load dockerfile grammar {} after reinstall: {e}; first error: {first_error}",
+                                library.display()
+                            )
+                        })
+                    }
+                }
             })
             .clone()
     }

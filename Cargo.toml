@@ -140,8 +140,8 @@ tree-sitter-haskell = "0.23.1"
 # dockerfile has no tree-sitter-0.26-compatible published crate (the only crate,
 # tree-sitter-dockerfile 0.2.0, hard-pins tree-sitter ^0.20). Its fixture instead
 # auto-installs the grammar at test time via the same path as `kakehashi language
-# install` and loads the compiled .so through the version-independent C ABI — no
-# grammar source lives in the repo. See src/language/query_assets.rs.
+# install` and loads the compiled shared library through the version-independent
+# C ABI — no grammar source lives in the repo. See src/language/query_assets.rs.
 tree-sitter-css = "0.25.0"
 tree-sitter-r = "1.3.0"
 tree-sitter-nix = "0.3.0"
@@ -154,4 +154,3 @@ tree-sitter-vim = "0.4.0"
 [[bench]]
 name = "semantic_tokens"
 harness = false
-
