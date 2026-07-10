@@ -817,6 +817,124 @@ fn test_blockquote_injection_tokens() {
     );
 }
 
+/// E2E test: blockquote prose lines with shortcut links highlight uniformly.
+///
+/// A blockquote paragraph whose lines contain shortcut links (`[foo]`) must
+/// render every identical line identically. The markdown_inline injection for
+/// the paragraph registers one exclusion gap per line, and interior gaps carry
+/// their trailing newline — which made `filter_by_injection_regions` classify
+/// them as multiline "container" regions (host `markup.quote` removed from the
+/// content), while the paragraph's LAST gap (no trailing newline) is
+/// single-line and keeps the host token as a gap filler. Result: `[` and
+/// `] aaa` lost their `string` coverage on interior lines only.
+///
+/// Expected (every `> [foo] aaa` line):
+/// ```text
+/// [string "> ["] [keyword "foo"] [string "] aaa"]
+/// ```
+#[test]
+fn test_blockquote_shortcut_link_uniform_highlight() {
+    let mut client = LspClient::new();
+
+    // Mirrors the user config that surfaced the bug: blockquote content is
+    // `string`, link labels are `keyword`, link brackets are suppressed.
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": true },
+                        "tokenTypes": ["keyword", "variable", "string", "number", "operator"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"],
+                        "multilineTokenSupport": true
+                    }
+                }
+            },
+            "initializationOptions": {
+                "captureMappings": {
+                    "_": {
+                        "highlights": {
+                            "markup.quote": "string",
+                            "markup.link": "",
+                            "markup.link.label": "keyword",
+                            "markup.heading.1": "class"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // Lines:
+    //   0: "# fooo"
+    //   1: ""
+    //   2: "> foo"
+    //   3: "> [foo] aaa"   (interior)
+    //   4: "> [foo] aaa"   (interior)
+    //   5: "> foo"
+    //   6: "> [foo] aaa"   (last line of the paragraph)
+    let content = "# fooo\n\n> foo\n> [foo] aaa\n> [foo] aaa\n> foo\n> [foo] aaa\n";
+    let tokens = open_and_get_tokens(&mut client, content);
+    assert!(!tokens.is_empty(), "Should have semantic tokens");
+
+    let signature = |line: u32| -> Vec<(u32, u32, u32)> {
+        tokens
+            .iter()
+            .filter(|t| t.line == line)
+            .map(|t| (t.start, t.length, t.token_type))
+            .collect()
+    };
+
+    // Identical lines must produce identical token sequences, regardless of
+    // their position within the paragraph.
+    let interior = signature(3);
+    assert_eq!(
+        interior,
+        signature(4),
+        "Interior `> [foo] aaa` lines should match each other. All: {:?}",
+        tokens
+    );
+    assert_eq!(
+        interior,
+        signature(6),
+        "Interior `> [foo] aaa` lines should match the paragraph's last line. All: {:?}",
+        tokens
+    );
+
+    // The blockquote `string` coverage must include the text after the link
+    // (`] aaa`, cols 6..11) on interior lines — this is what regressed.
+    let string_type = 2u32;
+    for line in [3u32, 4, 6] {
+        assert!(
+            tokens.iter().any(|t| t.line == line
+                && t.token_type == string_type
+                && t.start <= 6
+                && t.start + t.length >= 11),
+            "Line {} should keep `string` (markup.quote) coverage over `] aaa`. Tokens: {:?}",
+            line,
+            signature(line)
+        );
+    }
+
+    // The plain `> foo` lines keep their full-line string coverage.
+    for line in [2u32, 5] {
+        assert!(
+            tokens.iter().any(|t| t.line == line
+                && t.token_type == string_type
+                && t.start == 0
+                && t.length == 5),
+            "Line {} should be fully covered by `string`. Tokens: {:?}",
+            line,
+            signature(line)
+        );
+    }
+}
+
 // ─── Snapshot tests for observing token output before/after fixes ────────────
 
 /// Helper: initialize client with full captureMappings config and multilineTokenSupport.

@@ -850,8 +850,30 @@ fn rebuild_context<'a>(
     // single full content range. Byte ranges are relative to the effective window
     // start (inj_start_byte).
     if let Some(ref ranges) = region.included_ranges {
+        // Prose-style content (e.g. markdown_inline) ends flush with its last
+        // character, while container content (e.g. code_fence_content) is
+        // newline-terminated. Interior prose gaps still carry their line's
+        // newline, spanning (L, col)..(L+1, 0) — which finalize's region
+        // classifier reads as a multiline CONTAINER, stripping host gap-fill
+        // tokens (e.g. markup.quote) from every paragraph line except the
+        // last, so identical lines render differently. Trim the newline from
+        // prose gaps so each classifies as the single display line it covers.
+        // Containers keep their newlines: their host tokens must not leak.
+        let prose = ranges
+            .last()
+            .is_some_and(|r| !text[..inj_start_byte + r.end_byte].ends_with('\n'));
         for r in ranges {
-            exclusion_ranges.push((inj_start_byte + r.start_byte, inj_start_byte + r.end_byte));
+            let start = inj_start_byte + r.start_byte;
+            let mut end = inj_start_byte + r.end_byte;
+            if prose && text[..end].ends_with('\n') {
+                end -= 1;
+                if text[..end].ends_with('\r') {
+                    end -= 1;
+                }
+            }
+            if start < end {
+                exclusion_ranges.push((start, end));
+            }
         }
     } else {
         exclusion_ranges.push((inj_start_byte, inj_end_byte));
