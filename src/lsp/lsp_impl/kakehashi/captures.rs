@@ -957,8 +957,9 @@ impl Kakehashi {
         // depends on it. A request for a fresher snapshot atomically replaces
         // the marker and cancels the old winner; same-snapshot full/delta
         // requests still join it, while an older request that reaches the map
-        // after the replacement answers RequestCancelled instead of reviving
-        // obsolete compute.
+        // after the replacement answers protocol `null` instead of reviving
+        // obsolete compute. RequestCancelled is reserved for an explicit
+        // client `$/cancelRequest`.
         let mut flight_guard = None;
         let walk_key = if lsp_range.is_none() {
             let key = (uri.clone(), kind.to_string(), injection);
@@ -1046,7 +1047,7 @@ impl Kakehashi {
                     }
                     WalkFlightClaim::Obsolete => {
                         drop(edit_guard);
-                        return Err(JsonRpcError::request_cancelled());
+                        return Ok(None);
                     }
                 };
                 // Register interest BEFORE re-validating the marker: enable()
@@ -1227,14 +1228,14 @@ impl Kakehashi {
                     return Err(JsonRpcError::request_cancelled());
                 }
                 _ = &mut superseded => {
-                    return Err(JsonRpcError::request_cancelled());
+                    return Ok(None);
                 }
                 walked = walk_future => walked,
             }
         } else {
             tokio::select! {
                 _ = walk_cancel.cancelled() => {
-                    return Err(JsonRpcError::request_cancelled());
+                    return Ok(None);
                 }
                 walked = walk_future => walked,
             }
@@ -1242,14 +1243,14 @@ impl Kakehashi {
         let Some(walked) = walked else {
             // A pool-skip of an already-cancelled unit (or a work-unit panic).
             if walk_cancel.is_cancelled() {
-                return Err(JsonRpcError::request_cancelled());
+                return Ok(None);
             }
             return Ok(None);
         };
         // A completed walk can race a fresher flight or didClose after its last
         // internal checkpoint. Never cache or serve that obsolete result.
         if walk_cancel.is_cancelled() {
-            return Err(JsonRpcError::request_cancelled());
+            return Ok(None);
         }
         // Arc once; the memo and the returned ComputedCaptures share the
         // arrays by refcount instead of deep-cloning ~20k `Value`s. A `None`
