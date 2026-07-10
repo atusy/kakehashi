@@ -652,7 +652,11 @@ fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ArchiveFetchError>
     let mut safe = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Normal(part) => safe.push(part),
+            Component::Normal(part)
+                if !cfg!(windows) || !has_windows_normalization_suffix(part) =>
+            {
+                safe.push(part);
+            }
             Component::CurDir => {}
             _ => {
                 return Err(ArchiveFetchError::Unsafe(format!(
@@ -663,6 +667,10 @@ fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ArchiveFetchError>
         }
     }
     Ok(safe)
+}
+
+fn has_windows_normalization_suffix(component: &std::ffi::OsStr) -> bool {
+    matches!(component.as_encoded_bytes().last(), Some(b' ' | b'.'))
 }
 
 fn escaped_path(path: &Path) -> String {
@@ -1654,6 +1662,24 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn windows_normalization_suffix_detection_rejects_space_and_dot() {
+        use std::ffi::OsStr;
+
+        assert!(has_windows_normalization_suffix(OsStr::new(".. ")));
+        assert!(has_windows_normalization_suffix(OsStr::new("name.")));
+        assert!(!has_windows_normalization_suffix(OsStr::new("name")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archive_relative_paths_reject_windows_normalization_aliases() {
+        assert!(matches!(
+            safe_archive_relative_path(Path::new(".. /.. /parser.c")),
+            Err(ArchiveFetchError::Unsafe(_))
+        ));
     }
 
     #[test]
