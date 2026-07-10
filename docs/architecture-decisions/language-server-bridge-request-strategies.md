@@ -133,7 +133,7 @@ Request (cursor in injection) ──▶ Forward to language server
 | Input | Position + includeDeclaration flag |
 | Output | Location[] |
 | Cross-file | Real-file locations preserved (incl. host-URI, not containment-checked); only locations addressed to OTHER regions' virtual URIs filtered |
-| Position mapping | Each location's range: virtual → host |
+| Position mapping | Own-virtual-URI locations' ranges: virtual → host; real/host-URI locations keep their ranges unchanged |
 
 **Important**: References may return many locations. Real-file locations pass
 through as-is; locations in OTHER injection regions of the host document are
@@ -200,7 +200,9 @@ fn main() {
 }
 ```
 
-But line 0 of the virtual document maps to the injection start line in the host—**inside the code fence**, not at the file top where imports belong.
+Line 0 of the virtual document maps to the injection start line in the host —
+**inside the code fence**. For a standalone snippet that IS the right spot;
+whether it is what the user wants depends on the injection.
 
 **Implemented policy** (fail-closed, atomic):
 
@@ -228,7 +230,7 @@ But line 0 of the virtual document maps to the injection start line in the host�
 | Input | Position + newName |
 | Output | WorkspaceEdit (changes across files) |
 | Cross-file | Real-file edits preserved (shared WorkspaceEdit transform, incl. host-URI edits — not containment-checked on this path); edits keyed to OTHER regions' virtual URIs filtered |
-| Position mapping | All TextEdit ranges |
+| Position mapping | Own-virtual-URI TextEdit ranges: virtual → host; real/host-URI edits keep their ranges unchanged |
 
 Rename can affect multiple files. Real-file edits (a project-aware server's
 cross-file rename) are preserved — content and ranges untouched, though
@@ -326,7 +328,7 @@ to them).
 | Location[] | Each location |
 | LocationLink[] | Links targeting the request's own virtual URI: target ranges + originSelectionRange translated; links targeting real/host URIs pass through WHOLE — originSelectionRange stays virtual (known gap) |
 | Hover | range (if present) |
-| CompletionItem | textEdit.range, additionalTextEdits[].range |
+| CompletionItem | textEdit.range (or InsertReplaceEdit's insert + replace), additionalTextEdits[].range |
 | TextEdit | range |
 | WorkspaceEdit | The request's own virtual-URI entries (re-keyed + translated); real-URI entries pass unchanged; foreign virtual entries filtered or reject the edit |
 | Diagnostic | range; relatedInformation[].location: virtual-URI entries dropped, same-host entries translated, other real files unchanged |
