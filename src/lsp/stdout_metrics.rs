@@ -205,6 +205,14 @@ struct OfferedSegment {
 }
 
 #[doc(hidden)]
+/// Opt-in observer for the writer passed to tower-lsp-server's `Server`.
+///
+/// This is intentionally not a general-purpose `AsyncWrite` wrapper. Its
+/// offered-byte correlation relies on tokio-util `FramedWrite` retaining an
+/// immutable buffer while `poll_write` is pending and advancing only the
+/// accepted prefix (`FramedImpl::poll_flush` via `poll_write_buf`). Hashing a
+/// complete multi-megabyte pending range on every retry would itself create
+/// the head-of-line delay this observer measures.
 pub struct MeasuredStdout<W> {
     inner: W,
     observer: FrameObserver,
@@ -354,6 +362,9 @@ impl FrameObserver {
     fn offered(&mut self, bytes: &[u8], at: Instant) {
         let covered: usize = self.offered.iter().map(|segment| segment.remaining).sum();
         let pointer = bytes.as_ptr() as usize;
+        // FramedWrite preserves this range across Pending; the bounded prefix
+        // also detects unexpected replacement for the supported caller without
+        // rescanning a multi-megabyte frame on every retry.
         let same_offer = self.offered_ptr == Some(pointer)
             && covered <= bytes.len()
             && (self.offered_prefix.is_empty() || bytes.starts_with(&self.offered_prefix));
