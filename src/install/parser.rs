@@ -4,6 +4,7 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +29,8 @@ pub enum ParserInstallError {
     GitError(String),
     /// Archive download or extraction failed.
     ArchiveError(String),
+    /// Archive metadata violates the extraction boundary.
+    UnsafeArchive(String),
     /// Compilation failed.
     CompileError(String),
     /// File system operation failed.
@@ -42,6 +45,7 @@ impl std::fmt::Display for ParserInstallError {
             Self::MetadataError(e) => write!(f, "{}", e),
             Self::GitError(msg) => write!(f, "Git error: {}", msg),
             Self::ArchiveError(msg) => write!(f, "Archive error: {}", msg),
+            Self::UnsafeArchive(msg) => write!(f, "Unsafe archive: {}", msg),
             Self::CompileError(msg) => write!(f, "Compilation error: {}", msg),
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::AlreadyExists(path) => {
@@ -424,7 +428,7 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         );
         match download_and_extract_archive(&archive_url, &repo_name, revision, dest) {
             Ok(()) => return Ok(()),
-            Err(e) => {
+            Err(e) if archive_error_allows_clone_fallback(&e) => {
                 log::warn!(
                     target: "kakehashi::install",
                     "Archive download failed, falling back to git clone: {}",
@@ -432,6 +436,10 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
                 );
                 // Clean up partial extraction before fallback
                 let _ = fs::remove_dir_all(dest);
+            }
+            Err(e) => {
+                let _ = fs::remove_dir_all(dest);
+                return Err(e);
             }
         }
     }
@@ -444,6 +452,10 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         revision
     );
     clone_repo(url, revision, dest)
+}
+
+fn archive_error_allows_clone_fallback(error: &ParserInstallError) -> bool {
+    matches!(error, ParserInstallError::ArchiveError(_))
 }
 
 /// Download a GitHub archive tarball and extract it to the destination directory.
@@ -476,7 +488,7 @@ fn download_and_extract_archive(
     extract_archive(&mut archive, &expected_prefix, dest)
 }
 
-fn extract_archive<R: std::io::Read>(
+fn extract_archive<R: Read>(
     archive: &mut Archive<R>,
     expected_prefix: &str,
     dest: &Path,
@@ -491,11 +503,11 @@ fn extract_archive<R: std::io::Read>(
         })?;
 
         let path = entry.path().map_err(|e| {
-            ParserInstallError::ArchiveError(format!("Invalid path in archive: {}", e))
+            ParserInstallError::UnsafeArchive(format!("Invalid path in archive: {}", e))
         })?;
 
         // Strip the root directory prefix (e.g., "tree-sitter-json-0.24.8/")
-        let relative = match path.strip_prefix(&expected_prefix) {
+        let relative = match path.strip_prefix(expected_prefix) {
             Ok(p) => p.to_path_buf(),
             Err(_) => continue,
         };
@@ -505,50 +517,127 @@ fn extract_archive<R: std::io::Read>(
             continue;
         }
 
-        // Prevent path traversal attacks (zip slip)
-        if relative
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(ParserInstallError::ArchiveError(format!(
-                "Path traversal attempt detected in archive: {}",
-                relative.display()
-            )));
+        let safe_relative = safe_archive_relative_path(&relative)?;
+        if safe_relative.as_os_str().is_empty() {
+            continue;
         }
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
-            return Err(ParserInstallError::ArchiveError(format!(
+            return Err(ParserInstallError::UnsafeArchive(format!(
                 "Link entry rejected in archive: {}",
-                relative.display()
+                escaped_path(&safe_relative)
             )));
         }
         if !entry_type.is_dir() && !entry_type.is_file() {
-            return Err(ParserInstallError::ArchiveError(format!(
+            return Err(ParserInstallError::UnsafeArchive(format!(
                 "Unsupported entry type rejected in archive: {}",
-                relative.display()
+                escaped_path(&safe_relative)
             )));
         }
 
-        let target = dest.join(&relative);
-
         if entry_type.is_dir() {
-            fs::create_dir_all(&target)?;
+            create_archive_dir(dest, &safe_relative)?;
         } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            entry.unpack(&target).map_err(|e| {
-                ParserInstallError::ArchiveError(format!(
-                    "Failed to extract {}: {}",
-                    relative.display(),
-                    e
-                ))
-            })?;
+            unpack_archive_file_entry(&mut entry, dest, &safe_relative)?;
         }
     }
 
     Ok(())
+}
+
+fn unpack_archive_file_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    dest: &Path,
+    safe_relative: &Path,
+) -> Result<(), ParserInstallError> {
+    let target = ensure_archive_parent(dest, safe_relative)?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ParserInstallError::UnsafeArchive(format!(
+                "Archive path crosses symlink: {}",
+                escaped_path(safe_relative)
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ParserInstallError::IoError(e)),
+    }
+    let mut output = fs::File::create(&target).map_err(|e| {
+        ParserInstallError::IoError(io::Error::new(
+            e.kind(),
+            format!("Failed to create {}: {}", escaped_path(safe_relative), e),
+        ))
+    })?;
+    io::copy(entry, &mut output).map_err(|e| {
+        ParserInstallError::IoError(io::Error::new(
+            e.kind(),
+            format!("Failed to extract {}: {}", escaped_path(safe_relative), e),
+        ))
+    })?;
+    Ok(())
+}
+
+fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ParserInstallError> {
+    let target = ensure_archive_parent(dest, safe_relative)?;
+    if fs::symlink_metadata(&target)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(ParserInstallError::UnsafeArchive(format!(
+            "Archive path crosses symlink: {}",
+            escaped_path(safe_relative)
+        )));
+    }
+    fs::create_dir_all(&target)?;
+    Ok(())
+}
+
+fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, ParserInstallError> {
+    let target = dest.join(safe_relative);
+    let Some(parent_relative) = safe_relative.parent() else {
+        return Ok(target);
+    };
+    let mut current = dest.to_path_buf();
+    for component in parent_relative.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ParserInstallError::UnsafeArchive(format!(
+                    "Archive path crosses symlink: {}",
+                    escaped_path(safe_relative)
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(e) => return Err(ParserInstallError::IoError(e)),
+        }
+    }
+    Ok(target)
+}
+
+fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ParserInstallError> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            Component::CurDir => {}
+            _ => {
+                return Err(ParserInstallError::UnsafeArchive(format!(
+                    "Unsafe path detected in archive: {}",
+                    escaped_path(path)
+                )));
+            }
+        }
+    }
+    Ok(safe)
+}
+
+fn escaped_path(path: &Path) -> String {
+    path.display().to_string().escape_default().to_string()
 }
 
 /// Derive the expected root directory name inside a GitHub archive tarball.
@@ -1502,6 +1591,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unsafe_archive_errors_do_not_allow_clone_fallback() {
+        assert!(!archive_error_allows_clone_fallback(
+            &ParserInstallError::UnsafeArchive("unsafe metadata".to_string())
+        ));
+        assert!(archive_error_allows_clone_fallback(
+            &ParserInstallError::ArchiveError("download failed".to_string())
+        ));
+        assert!(!archive_error_allows_clone_fallback(
+            &ParserInstallError::IoError(io::Error::other("disk full"))
+        ));
+    }
+
+    #[test]
+    fn archive_relative_paths_allow_only_local_components() {
+        assert_eq!(
+            safe_archive_relative_path(Path::new("./src/parser.c")).expect("safe path"),
+            PathBuf::from("src/parser.c")
+        );
+
+        for path in [Path::new("../parser.c"), Path::new("/tmp/parser.c")] {
+            assert!(
+                matches!(
+                    safe_archive_relative_path(path),
+                    Err(ParserInstallError::UnsafeArchive(_))
+                ),
+                "non-local archive path must be rejected: {}",
+                path.display()
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn extract_archive_rejects_link_entries() {
@@ -1527,11 +1648,11 @@ mod tests {
         let result = extract_archive(&mut archive, "parser-1.0.0", temp.path());
 
         match result {
-            Err(ParserInstallError::ArchiveError(message)) => assert!(
+            Err(ParserInstallError::UnsafeArchive(message)) => assert!(
                 message.contains("Link entry rejected in archive: link"),
                 "expected link-entry rejection, got: {message}"
             ),
-            other => panic!("expected link-entry ArchiveError, got {other:?}"),
+            other => panic!("expected unsafe link-entry error, got {other:?}"),
         }
     }
 
@@ -1560,12 +1681,53 @@ mod tests {
         let result = extract_archive(&mut archive, "parser-1.0.0", temp.path());
 
         match result {
-            Err(ParserInstallError::ArchiveError(message)) => assert!(
+            Err(ParserInstallError::UnsafeArchive(message)) => assert!(
                 message.contains("Unsupported entry type rejected in archive: special"),
                 "expected special-entry rejection, got: {message}"
             ),
-            other => panic!("expected special-entry ArchiveError, got {other:?}"),
+            other => panic!("expected unsafe special-entry error, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_archive_rejects_preexisting_symlink_parent() {
+        use std::io::Cursor;
+        use std::os::unix::fs::symlink;
+        use tar::{Builder, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let body = b"parser source";
+            let mut header = Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "parser-1.0.0/link/parser.c", &body[..])
+                .expect("append synthetic regular file");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("dest");
+        let linked_dir = temp.path().join("linked");
+        fs::create_dir_all(&dest).expect("create destination");
+        fs::create_dir_all(&linked_dir).expect("create linked directory");
+        symlink(&linked_dir, dest.join("link")).expect("create destination symlink");
+
+        let mut archive = Archive::new(Cursor::new(bytes));
+        let result = extract_archive(&mut archive, "parser-1.0.0", &dest);
+
+        match result {
+            Err(ParserInstallError::UnsafeArchive(message)) => assert!(
+                message.contains("Archive path crosses symlink: link/parser.c"),
+                "expected symlink-parent rejection, got: {message}"
+            ),
+            other => panic!("expected unsafe destination-path error, got {other:?}"),
+        }
+        assert!(!linked_dir.join("parser.c").exists());
     }
 
     /// Test that download_and_extract_archive downloads and extracts a GitHub archive.
