@@ -83,5 +83,5 @@
 ; ── References ───────────────────────────────────────────────────────────
 ; The name after a dot is member access; the object before it resolves.
 ((identifier) @reference
- (#not-has-parent? @reference "member_access_expression" "qualified_name" "using_directive"))
+ (#not-has-parent? @reference "member_access_expression" "member_binding_expression" "qualified_name" "using_directive"))
 (member_access_expression expression: (identifier) @reference)

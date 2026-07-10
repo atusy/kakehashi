@@ -65,10 +65,11 @@ mod tests {
     /// version-independent — the whole reason the runtime never hit the pin).
     ///
     /// The compiled shared library is cached under the project-local test data
-    /// dir and reused, so repeated `cargo test` runs never re-fetch or
-    /// re-compile; only a cold cache needs the network. The fixture seeds the
-    /// metadata cache with a pinned Dockerfile grammar revision and persists a
-    /// marker next to the parser so branch switches and pin updates reinstall.
+    /// dir (`test_support::test_data_dir_path()`), not the OS temp directory,
+    /// and reused, so repeated `cargo test` runs never re-fetch or re-compile;
+    /// only a cold cache needs the network. The fixture seeds the metadata cache
+    /// with a pinned Dockerfile grammar revision and persists a marker next to
+    /// the parser so branch switches and pin updates reinstall.
     ///
     /// A process-wide `OnceLock` memoizes the loaded grammar so the install +
     /// load runs exactly once no matter how many fixture threads race here —
