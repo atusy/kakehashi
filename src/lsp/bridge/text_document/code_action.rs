@@ -814,6 +814,12 @@ impl LanguageServerPool {
             .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
             .await
         else {
+            // Per-selection warn (bounded: one per user-selected action) — the
+            // helper's transport failures log at debug and defer to callers.
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: no usable response from {server_name}; returning unresolved"
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         };

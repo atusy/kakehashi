@@ -249,7 +249,7 @@ impl Kakehashi {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             log::warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: envelope host_uri '{}' is not a valid URL",
+                "codeAction/resolve: envelope host_uri {:?} is not a valid URL",
                 envelope.host_uri
             );
             return Err(RegionEndUnavailable::MalformedEnvelope);
@@ -257,7 +257,7 @@ impl Kakehashi {
         let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
             log::warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: envelope region_id '{}' is not a valid ULID",
+                "codeAction/resolve: envelope region_id {:?} is not a valid ULID",
                 envelope.region_id
             );
             return Err(RegionEndUnavailable::MalformedEnvelope);
