@@ -69,10 +69,10 @@ pub(crate) enum UpstreamNotification {
     /// upstream channel. To keep a chatty downstream re-pushing the *same*
     /// `(connection, uri)` from making the loop republish every superseded push, the
     /// forwarding loop coalesces a drained burst by `(connection, uri)` to the latest
-    /// before delivering (`coalesce_upstream_batch`, #426): at most one republish per
-    /// distinct key per batch. This collapses same-key supersession only — a flood of
-    /// *distinct* URIs is not coalesced, and re-publish is otherwise unthrottled by
-    /// design (push-propagation-diagnostic-forwarding § Consequences).
+    /// before delivering (`coalesce_upstream_batch`, #426), then records each
+    /// surviving push in a barrier-delimited run and republishes once per resolved
+    /// host. The latter collapses distinct injection-region URIs that all contribute
+    /// to one host without dropping any region slot.
     PublishDiagnostics {
         /// The URI the downstream published for — a virtual injection URI (region
         /// push) or a real host URI (`_self` host-layer push).

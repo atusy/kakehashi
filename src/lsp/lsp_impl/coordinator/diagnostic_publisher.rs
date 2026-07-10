@@ -1,8 +1,9 @@
 //! The single proactive `textDocument/publishDiagnostics` publisher
 //! (push-propagation-diagnostic-forwarding).
 //!
-//! Every proactive diagnostic feed writes slots into the [`DiagnosticAggregator`]
-//! and then asks this publisher to **republish** the host: it snapshots the
+//! Proactive diagnostic feeds write slots into the [`DiagnosticAggregator`]
+//! and then ask this publisher to **republish** the host (a drained downstream
+//! burst records all slots first and asks once per affected host): it snapshots the
 //! cache, transforms region push slots to host coordinates against the region's
 //! *current* offset (lazy re-anchor), merges with the host-event pull blob, and
 //! emits one `publishDiagnostics`. Routing every feed through one publisher is
@@ -28,6 +29,13 @@ use tower_lsp_server::ls_types::Diagnostic;
 
 /// Logging target for proactive push diagnostics.
 const LOG_TARGET: &str = "kakehashi::push_diag";
+
+pub(crate) struct DiagnosticPush {
+    pub(crate) uri: String,
+    pub(crate) server: String,
+    pub(crate) connection_id: ProgressConnectionId,
+    pub(crate) diagnostics: Vec<Diagnostic>,
+}
 
 /// Bundles the state needed to merge the cache and publish for a host, so the
 /// notification feeds (reader push, host-event pull) can trigger a republish
@@ -65,13 +73,55 @@ impl DiagnosticPublisher {
         connection_id: ProgressConnectionId,
         diagnostics: Vec<Diagnostic>,
     ) {
-        if VirtualDocumentUri::is_virtual_uri(&uri) {
-            self.publish_region_push(&uri, server, connection_id, diagnostics)
-                .await;
-        } else {
-            self.publish_host_push(&uri, server, connection_id, diagnostics)
-                .await;
+        self.publish_push_batch(vec![DiagnosticPush {
+            uri,
+            server,
+            connection_id,
+            diagnostics,
+        }])
+        .await;
+    }
+
+    /// Record a drained run of downstream pushes, then publish each affected
+    /// host's final aggregate once. Distinct virtual URIs can all map to the
+    /// same host, so batching at this resolved-host boundary avoids serializing
+    /// and enqueueing a multi-megabyte intermediate aggregate per region.
+    pub(crate) async fn publish_push_batch(&self, pushes: Vec<DiagnosticPush>) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut hosts = Vec::new();
+        for push in pushes {
+            let host = if VirtualDocumentUri::is_virtual_uri(&push.uri) {
+                self.record_region_push(
+                    &push.uri,
+                    push.server,
+                    push.connection_id,
+                    push.diagnostics,
+                )
+                .await
+            } else {
+                self.record_host_push(&push.uri, push.server, push.connection_id, push.diagnostics)
+            };
+            if let Some(host) = host
+                && seen.insert(host.clone())
+            {
+                hosts.push(host);
+            }
         }
+        self.publish_recorded_hosts(hosts).await
+    }
+
+    async fn publish_recorded_hosts(&self, hosts: Vec<Url>) -> usize {
+        let mut published = 0;
+        for host in hosts {
+            if self.republish(&host).await {
+                self.bump_current_if_open(&host);
+                published += 1;
+            }
+        }
+        if published > 0 {
+            self.request_pull_diagnostic_refresh(false);
+        }
+        published
     }
 
     /// Record a `_self` host-layer push and republish the host (host-document-bridge).
@@ -82,6 +132,7 @@ impl DiagnosticPublisher {
     /// both the common stray case (a push for a workspace file the editor doesn't
     /// have open) and a real-URI push from a server that isn't a host server for
     /// this language. Host diagnostics need no coordinate transform.
+    #[cfg(test)]
     pub(crate) async fn publish_host_push(
         &self,
         host_uri: &str,
@@ -89,11 +140,23 @@ impl DiagnosticPublisher {
         connection_id: ProgressConnectionId,
         diagnostics: Vec<Diagnostic>,
     ) {
+        if let Some(host) = self.record_host_push(host_uri, server, connection_id, diagnostics) {
+            self.publish_recorded_hosts(vec![host]).await;
+        }
+    }
+
+    fn record_host_push(
+        &self,
+        host_uri: &str,
+        server: String,
+        connection_id: ProgressConnectionId,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Option<Url> {
         let Ok(host) = Url::parse(host_uri) else {
-            return;
+            return None;
         };
         let Some(language_name) = self.open_document_language(&host) else {
-            return; // not an open document
+            return None; // not an open document
         };
         let settings = self.settings_manager.load_settings();
         let is_host_server = self
@@ -114,7 +177,7 @@ impl DiagnosticPublisher {
             // unconditionally on every rejected push previously cost a full
             // lock+snapshot+merge republish per push for the life of the document
             // (caught by review), for a gap this branch didn't introduce.
-            return;
+            return None;
         }
         self.aggregator.record(
             &host,
@@ -123,15 +186,7 @@ impl DiagnosticPublisher {
             Some(connection_id),
             diagnostics,
         );
-        // A host `_self` push is spontaneous and asynchronous; a pull-mode client
-        // won't know to re-pull, so nudge it when the merged set actually changed
-        // (push/pull-divergence, #422). Bump the coverage version first so the gated
-        // refresh sees this push-origin change as dirty (#497) — only push/eviction
-        // origins bump; editor-originated republishes don't (the editor re-pulls).
-        if self.republish(&host).await {
-            self.bump_current_if_open(&host);
-            self.request_pull_diagnostic_refresh(false);
-        }
+        Some(host)
     }
 
     /// Bump a host's coverage version, but only if it is still an open document
@@ -248,6 +303,7 @@ impl DiagnosticPublisher {
     /// its host document + region id. A push for a URI that resolves to no live
     /// region (a closed/edited-away region, or a non-bridged document) is dropped.
     /// Diagnostics are stored in virtual coordinates and transformed at publish.
+    #[cfg(test)]
     pub(crate) async fn publish_region_push(
         &self,
         virtual_uri: &str,
@@ -255,12 +311,27 @@ impl DiagnosticPublisher {
         connection_id: ProgressConnectionId,
         diagnostics: Vec<Diagnostic>,
     ) {
+        if let Some(host) = self
+            .record_region_push(virtual_uri, server, connection_id, diagnostics)
+            .await
+        {
+            self.publish_recorded_hosts(vec![host]).await;
+        }
+    }
+
+    async fn record_region_push(
+        &self,
+        virtual_uri: &str,
+        server: String,
+        connection_id: ProgressConnectionId,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Option<Url> {
         let Some((host, region_id)) = self.bridge.resolve_virtual_uri(virtual_uri).await else {
             log::debug!(
                 target: LOG_TARGET,
                 "push for unresolved virtual uri {virtual_uri}, dropping"
             );
-            return;
+            return None;
         };
         // A server no longer spawnable (disabled via `enabled: false`, or no
         // longer configured at all) after it already spawned can still emit
@@ -278,7 +349,7 @@ impl DiagnosticPublisher {
                 target: LOG_TARGET,
                 "push from unspawnable server {server}, dropping"
             );
-            return;
+            return None;
         }
         self.aggregator.record(
             &host,
@@ -287,14 +358,7 @@ impl DiagnosticPublisher {
             Some(connection_id),
             diagnostics,
         );
-        // A region push is spontaneous and asynchronous (a push-only injected-
-        // language server); like the host push, nudge a pull-mode client to
-        // re-pull when the merged set actually changed (push/pull-divergence, #422).
-        // Bump the coverage version (a push-origin change) before the gated refresh (#497).
-        if self.republish(&host).await {
-            self.bump_current_if_open(&host);
-            self.request_pull_diagnostic_refresh(false);
-        }
+        Some(host)
     }
 
     /// Feed the host-event pull's combined result into the cache and republish.
@@ -835,6 +899,51 @@ mod tests {
             .expect("a Host slot should be recorded for an open _self-bridged doc");
         assert_eq!(host_slots["rust_ls"].diagnostics.len(), 1);
         assert_eq!(host_slots["rust_ls"].diagnostics[0].message, "boom");
+    }
+
+    #[tokio::test]
+    async fn push_batch_publishes_only_the_latest_host_state_once() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/host-batch.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        let published_hosts = publisher
+            .publish_push_batch(vec![
+                DiagnosticPush {
+                    uri: uri.to_string(),
+                    server: "rust_ls".to_string(),
+                    connection_id: ProgressConnectionId::for_test(1),
+                    diagnostics: vec![diag("superseded")],
+                },
+                DiagnosticPush {
+                    uri: uri.to_string(),
+                    server: "rust_ls".to_string(),
+                    connection_id: ProgressConnectionId::for_test(1),
+                    diagnostics: vec![diag("latest")],
+                },
+            ])
+            .await;
+
+        assert_eq!(published_hosts, 1, "one host should be published once");
+        assert!(
+            !publisher.republish(&uri).await,
+            "the batch must already have published its final aggregate"
+        );
+        let snapshot = server.diagnostics.snapshot(&uri);
+        assert_eq!(
+            snapshot[&DiagnosticSource::Host]["rust_ls"].diagnostics[0].message,
+            "latest"
+        );
     }
 
     #[tokio::test]
