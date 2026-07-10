@@ -122,9 +122,9 @@ Request (cursor in injection) ──▶ Forward to language server
 | Aspect | Handling |
 |--------|----------|
 | Input | Position (host → virtual translation) |
-| Output | Location or Location[] |
+| Output | Location, Location[], or LocationLink[] (for link-capable clients) |
 | Cross-file | Real-file targets preserved (incl. host-URI targets, not containment-checked); only locations addressed to OTHER regions' virtual URIs filtered |
-| Position mapping | Range start/end: virtual → host |
+| Position mapping | Range start/end: virtual → host. Known gap: a LocationLink whose target is a real/host URI passes through whole, leaving its `originSelectionRange` (a source-document range) in virtual coordinates |
 
 #### textDocument/references
 
@@ -324,11 +324,12 @@ to them).
 |---------------|---------------|
 | Location | uri (the request's own virtual URI rewrites to host; real/host URIs pass unchanged), range |
 | Location[] | Each location |
+| LocationLink[] | Links targeting the request's own virtual URI: target ranges + originSelectionRange translated; links targeting real/host URIs pass through WHOLE — originSelectionRange stays virtual (known gap) |
 | Hover | range (if present) |
 | CompletionItem | textEdit.range, additionalTextEdits[].range |
 | TextEdit | range |
 | WorkspaceEdit | The request's own virtual-URI entries (re-keyed + translated); real-URI entries pass unchanged; foreign virtual entries filtered or reject the edit |
-| Diagnostic | range, relatedInformation[].location |
+| Diagnostic | range; relatedInformation[].location: virtual-URI entries dropped, same-host entries translated, other real files unchanged |
 | CodeAction | Contained edits, same conditional rule |
 
 ### Multi-Server Merging Rules

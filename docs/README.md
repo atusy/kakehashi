@@ -457,7 +457,8 @@ Details:
   request methods — including pull/push diagnostics, with the `bridge._self`
   exceptions noted above — when host bridging is opted in. The `native`
   layer additionally computes definition/references/document highlight/
-  rename from Tree-sitter bindings under `KAKEHASHI_EXPERIMENTAL=true`.
+  rename from Tree-sitter bindings under `KAKEHASHI_EXPERIMENTAL=true` (for
+  languages shipping a `bindings.scm`; `#offset!`-shifted regions declined).
   Semantic tokens stay native-only for now.
 
 > **Migration note**: the layer list was renamed `order` →
