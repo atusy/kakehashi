@@ -255,7 +255,8 @@ impl DocumentTracker {
     ///
     /// Called when the didOpen send fails, so the document can be
     /// claimed again on a future attempt. Removes both the version
-    /// entry and the opened_documents entry initialized by `try_claim_for_open()`.
+    /// entry initialized by `try_claim_for_open()`. Pre-send claims are not in
+    /// the opened refcount or reverse index, so rollback must not touch either.
     pub(super) async fn unclaim_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -280,10 +281,6 @@ impl DocumentTracker {
         {
             docs.remove(&uri_string);
         }
-
-        // Then decrement the opened refcount and clean reverse index
-        self.decrement_opened(&uri_string);
-        self.remove_from_reverse_index(&uri_string, connection_key);
     }
 
     /// Test helper: record the host→virtual mapping, opened ref-count, and version.
@@ -1081,6 +1078,29 @@ mod tests {
             .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert!(version.is_none(), "Version should be removed after unclaim");
+    }
+
+    #[tokio::test]
+    async fn rolling_back_pending_connection_preserves_other_open_connection() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/shared.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let opened = ConnectionKey::for_server("opened");
+        let pending = ConnectionKey::for_server("pending");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &opened)
+            .await;
+        assert!(tracker.try_claim_for_open(&virtual_uri, &pending).await);
+
+        tracker
+            .rollback_open_claim(&host_uri, &virtual_uri, &pending)
+            .await;
+
+        assert!(tracker.is_document_opened(&virtual_uri));
+        assert_eq!(
+            tracker.get_all_connections_for_virtual_uri(&virtual_uri),
+            vec![opened]
+        );
     }
 
     // ========================================
