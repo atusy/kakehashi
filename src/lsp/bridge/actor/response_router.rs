@@ -199,29 +199,32 @@ impl ResponseRouter {
             .state
             .lock()
             .recover_poison("ResponseRouter::claim_for_write");
-        match state.pending.get_mut(&id).map(|pending| pending.delivery) {
-            Some(RequestDelivery::Queued) => {
-                state.pending.get_mut(&id).unwrap().delivery = RequestDelivery::Writing;
-                true
+        let Some(pending) = state.pending.get_mut(&id) else {
+            return false;
+        };
+        match pending.delivery {
+            RequestDelivery::Queued => {
+                pending.delivery = RequestDelivery::Writing;
+                return true;
             }
-            Some(RequestDelivery::CancelledQueued) => {
-                let pending = state.pending.remove(&id);
-                Self::remove_cancel_mapping_inner(&mut state, id);
-                drop(state);
-                if let Some(pending) = pending {
-                    let _ = pending.response_tx.send(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id.as_i64(),
-                        "error": {
-                            "code": -32800,
-                            "message": "bridge: request cancelled before downstream write"
-                        }
-                    }));
-                }
-                false
-            }
-            Some(RequestDelivery::Writing | RequestDelivery::Sent) | None => false,
+            RequestDelivery::Writing | RequestDelivery::Sent => return false,
+            RequestDelivery::CancelledQueued => {}
         }
+
+        let pending = state.pending.remove(&id);
+        Self::remove_cancel_mapping_inner(&mut state, id);
+        drop(state);
+        if let Some(pending) = pending {
+            let _ = pending.response_tx.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id.as_i64(),
+                "error": {
+                    "code": -32800,
+                    "message": "bridge: request cancelled before downstream write"
+                }
+            }));
+        }
+        false
     }
 
     /// Record successful completion of the writer-side request write.
