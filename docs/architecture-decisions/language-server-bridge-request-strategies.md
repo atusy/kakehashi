@@ -275,8 +275,10 @@ concatenated-formatting-pipeline.
 
 Note: spontaneous pushes bypass the aggregation priorities/strategy machinery
 on the proactive republish path — the diagnostic cache concatenates them
-across servers (cached pushes answering a client pull via `pushFallback` do
-pass through layer participation, priorities, and strategy). Configured
+across servers, suppressing push slots from pull-capable servers in favor of
+pull results while the pull layer is active (cached pushes answering a
+client pull via `pushFallback` do pass through layer participation,
+priorities, and strategy). Configured
 `_self` host-server pushes carry the real host URI and host-relative ranges,
 so they are republished as-is (no URI filtering or translation step applies
 to them).

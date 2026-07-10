@@ -25,11 +25,12 @@ extra setup:
 
 **Bridged features** cover the rest of kakehashi's supported features (hover,
 completion, go-to-definition, diagnostics, …) — not every LSP method
-(see [Not currently provided](#not-currently-provided)). kakehashi cannot
-compute these itself; instead it forwards your request to a real language
-server — one you configure for the embedded language, or (for the
-surrounding document) a `bridge._self` host server. If no server is
-configured, these features simply return nothing.
+(see [Not currently provided](#not-currently-provided)). kakehashi mostly
+forwards these requests to a real language server — one you configure for
+the embedded language, or (for the surrounding document) a `bridge._self`
+host server. Without a server they generally return nothing, though under
+`KAKEHASHI_EXPERIMENTAL=true` a native Tree-sitter layer answers
+definition/references/document highlight/rename lexically.
 
 ### Embedded code blocks
 
@@ -244,9 +245,11 @@ actions) — when multiple servers are configured for a block, all of their
 diagnostics are shown. The strategy is resolved per language, so different
 embedded languages can behave differently. Spontaneous pushes a server sends
 on its own bypass the strategy machinery when proactively republished: they
-are cached and concatenated across servers — except that push slots from
-pull-capable servers are suppressed in favor of their pull results (no
-double-counting). When those cached pushes later answer a client PULL
+are cached and concatenated across servers — except that whenever the pull
+layer is active for the document, cached push slots from pull-capable
+servers are suppressed in favor of pull results (no double-counting; in
+mixed configurations this can suppress a push whose server was not itself
+pulled). When those cached pushes later answer a client PULL
 (`pushFallback`), layer priorities and the cross-layer strategy do apply.
 
 ### Code actions

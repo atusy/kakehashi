@@ -20,7 +20,9 @@ Phased roadmap:
    `resolve_layer_config_from_settings` directly (it already holds a loaded
    settings arc), keyed `textDocument/publishDiagnostics` to match its
    aggregation config. With host bridging (host-document-bridge)
-   implemented for every bridged request method, handlers run the real
+   implemented for the bridged request methods (documented exceptions:
+   document color is virt-only; host completion-item/code-lens resolves
+   pass through unrouted), handlers run the real
    stage-2 `preferred` walk (`Kakehashi::walk_layers` →
    `race_layers_preferred`): the virt and host layers fan out
    **concurrently** — the layer-level analogue of the stage-1 `preferred`

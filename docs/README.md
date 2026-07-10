@@ -37,7 +37,7 @@ Current bridge-backed requests include:
 - On Type Formatting (config-driven; see `onTypeFormattingTriggers`)
 
 **Limitations:**
-- **No cross-region results within the host document**: a jump or edit targeting a *different* injection region of the same host document is filtered out (its virtual URI would be meaningless to the editor). Results in real files — an external definition, a cross-file rename edit — pass through.
+- **No cross-region results within the host document**: a result addressed to a *different* region's virtual URI is filtered out (that URI would be meaningless to the editor). Results in real files — an external definition, a cross-file rename edit — pass through unchanged, and host-URI results are not containment-checked.
 
 See [Bridge Configuration](#bridge-configuration) for setup instructions.
 
@@ -346,8 +346,10 @@ Each entry in the `bridge` map configures bridging for one injection language:
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` contains the **host** language, with the real URI and no
-coordinate translation. All bridged request methods are wired (semantic
-tokens excepted); by default the host layer is tried after
+coordinate translation. All bridged request methods are wired (exceptions:
+semantic tokens; document color stays injection-only; host completion-item
+and code-lens resolves pass through unrouted); by default the host layer is
+tried after
 `virt` (see `layers` above), so injections keep winning inside code fences
 while the host server answers everywhere else. For formatting, combine
 fence formatters with a whole-document formatter via
@@ -442,15 +444,19 @@ Details:
   the injection regions' per the layer `strategy`. Caveat: SPONTANEOUS
   pushes a downstream server sends on its own bypass the
   priorities/strategy machinery when proactively republished — cached and
-  concatenated across servers (host `_self` pushes keep their real host
+  concatenated across servers, except that push slots from pull-capable
+  servers are suppressed in favor of pull results while the pull layer is
+  active (host `_self` pushes keep their real host
   URIs and ranges as-is). When those cached pushes later answer a client
   pull (`pushFallback`), layer participation, priorities, and the
   cross-layer strategy do apply.
 - **Current effect**: the `virt` layer answers inside injection regions, and
-  the `host` layer answers on the host document itself for every bridged
-  request method — including pull/push diagnostics — when host bridging is
-  opted in (see `bridge._self` above). Bridged methods have no `native`
-  counterpart yet. Semantic tokens stay native-only for now.
+  the `host` layer answers on the host document itself for the bridged
+  request methods — including pull/push diagnostics, with the `bridge._self`
+  exceptions noted above — when host bridging is opted in. The `native`
+  layer additionally computes definition/references/document highlight/
+  rename from Tree-sitter bindings under `KAKEHASHI_EXPERIMENTAL=true`.
+  Semantic tokens stay native-only for now.
 
 > **Migration note**: the layer list was renamed `order` →
 > `priorities` (and, one change earlier, the method map moved under
