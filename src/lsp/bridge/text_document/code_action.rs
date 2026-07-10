@@ -862,7 +862,7 @@ fn finalize_virt_resolved_action(
     suffixed_title: String,
     upstream_caps: UpstreamCodeActionCaps,
 ) -> CodeAction {
-    let server_name = &envelope.origin.clone();
+    let server_name = envelope.origin.clone();
     {
         // Translate the resolved action's own diagnostics host-ward first, so
         // every surfaced action — including a disabled one returned below —
@@ -888,7 +888,7 @@ fn finalize_virt_resolved_action(
             resolved.title = resuffix_resolved_title(
                 std::mem::take(&mut resolved.title),
                 suffixed_title,
-                server_name,
+                &server_name,
             );
             resolved.edit = None;
             resolved.command = None;
@@ -911,7 +911,7 @@ fn finalize_virt_resolved_action(
         // `finalize_host_resolved_action`).
         let mut command_dropped = false;
         if let Some(command) = resolved.command.as_mut() {
-            match encode_command(server_name, &envelope.host_uri, &command.command) {
+            match encode_command(&server_name, &envelope.host_uri, &command.command) {
                 Some(encoded) => command.command = encoded,
                 None => command_dropped = true,
             }
@@ -927,7 +927,7 @@ fn finalize_virt_resolved_action(
             resolved.title = resuffix_resolved_title(
                 std::mem::take(&mut resolved.title),
                 suffixed_title,
-                server_name,
+                &server_name,
             );
             resolved.data = None;
             resolved.is_preferred = None;
@@ -983,7 +983,7 @@ fn finalize_virt_resolved_action(
                 action,
                 &envelope,
                 suffixed_title,
-                server_name,
+                &server_name,
                 upstream_caps,
                 reason,
             );
@@ -995,7 +995,8 @@ fn finalize_virt_resolved_action(
         // the raw (unsuffixed) server title first — the still-lazy path below
         // needs it to keep the envelope's title in sync.
         let server_title = std::mem::take(&mut resolved.title);
-        resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
+        resolved.title =
+            resuffix_resolved_title(server_title.clone(), suffixed_title, &server_name);
 
         // Once resolve has materialized an edit OR a command, the action is
         // complete (the edit is host-translated; the command name is routed).
@@ -2944,7 +2945,7 @@ mod tests {
         // A command-only resolved action whose routing name can't be encoded
         // (origin contains the routing separator) must NOT surface as an enabled
         // no-op: the command is dropped and, with no edit, the action is
-        // disabled as REASON_RESOLVE (regression for the dropped-command gap).
+        // disabled as REASON_UNROUTABLE_COMMAND (regression for the dropped-command gap).
         let resolved: CodeAction = serde_json::from_value(json!({
             "title": "Run fix",
             "command": { "title": "Run fix", "command": "server.fix" }
