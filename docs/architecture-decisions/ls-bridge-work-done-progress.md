@@ -36,7 +36,8 @@ so client–kakehashi–downstream stays consistent and collision-free:
   `create` when the editor can accept it — making the optimistic ack sound.
 - **`$/progress`** (downstream → bridge notification): the first `begin`
   decides the token's fate (lazy announcement). A `begin` carrying anything
-  renderable — a non-empty title, message, or a percentage — **announces**:
+  renderable — a non-empty title or message, a percentage, or
+  `cancellable: true` (a cancel button is renderable too) — **announces**:
   the bridge enqueues the editor-facing create immediately followed by the
   begin on the same FIFO channel, then rewrites and forwards subsequent
   progress. A fully blank `begin` (`{"kind":"begin","title":""}`) **swallows**

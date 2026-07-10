@@ -2004,10 +2004,10 @@ mod tests {
         assert_eq!(val["id"], 5);
         assert!(val["result"].is_null());
 
-        // Nothing reaches the editor yet: announcement waits for a titled begin.
+        // Nothing reaches the editor yet: announcement waits for a renderable begin.
         assert!(
             upstream_rx.try_recv().is_err(),
-            "create must not be bridged before a titled begin"
+            "create must not be bridged before a renderable begin"
         );
 
         // The mapping is registered so downstream `$/progress` can be translated.
@@ -2020,7 +2020,7 @@ mod tests {
             "upstream token must be remapped"
         );
 
-        // The first titled begin announces: create, then the begin itself.
+        // The first renderable begin announces: create, then the begin itself.
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
@@ -2032,7 +2032,7 @@ mod tests {
         handle_message(begin, &router, "", &deps).await;
         let UpstreamNotification::CreateWorkDoneProgress { token } = upstream_rx
             .try_recv()
-            .expect("titled begin should announce the token")
+            .expect("renderable begin should announce the token")
         else {
             panic!("Expected CreateWorkDoneProgress");
         };
@@ -2051,7 +2051,7 @@ mod tests {
     /// is the storm case — some downstreams declare a token per analysis pass
     /// with nothing renderable.
     #[tokio::test]
-    async fn handle_message_untitled_progress_lifecycle_is_swallowed() {
+    async fn handle_message_blank_progress_lifecycle_is_swallowed() {
         use tower_lsp_server::ls_types::NumberOrString;
 
         let router = ResponseRouter::new();
@@ -2098,7 +2098,7 @@ mod tests {
 
         assert!(
             upstream_rx.try_recv().is_err(),
-            "untitled lifecycle must not reach the editor"
+            "blank lifecycle must not reach the editor"
         );
         let downstream_token = NumberOrString::String("storm".to_string());
         assert_eq!(
@@ -2159,6 +2159,65 @@ mod tests {
         else {
             panic!("expected CreateWorkDoneProgress");
         };
+        assert!(
+            matches!(
+                upstream_rx.try_recv(),
+                Ok(UpstreamNotification::Progress { .. })
+            ),
+            "the begin itself must forward after the create"
+        );
+    }
+
+    /// A begin that is blank except for `cancellable: true` still announces:
+    /// a cancel button is renderable.
+    #[tokio::test]
+    async fn handle_message_cancellable_only_begin_still_announces() {
+        let router = ResponseRouter::new();
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+        let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::clone(&progress_registry),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id,
+        };
+
+        let create = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "window/workDoneProgress/create",
+            "params": { "token": "cancellable-only" }
+        });
+        handle_message(create, &router, "", &deps).await;
+        let begin = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": {
+                "token": "cancellable-only",
+                "value": { "kind": "begin", "title": "", "cancellable": true }
+            }
+        });
+        handle_message(begin, &router, "", &deps).await;
+
+        assert!(
+            matches!(
+                upstream_rx.try_recv(),
+                Ok(UpstreamNotification::CreateWorkDoneProgress { .. })
+            ),
+            "cancellable begin must announce"
+        );
         assert!(
             matches!(
                 upstream_rx.try_recv(),
@@ -2281,7 +2340,7 @@ mod tests {
             "unannounced stale token needs no Forget"
         );
 
-        // Announce the second token via a titled begin...
+        // Announce the second token via a renderable begin...
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
@@ -2405,7 +2464,7 @@ mod tests {
             progress_connection_id,
         };
 
-        // A titled "begin" announces the token (create first) and is forwarded
+        // A renderable "begin" announces the token (create first) and is forwarded
         // with the translated token.
         let begin = json!({
             "jsonrpc": "2.0",

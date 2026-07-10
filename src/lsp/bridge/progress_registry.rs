@@ -36,8 +36,8 @@
 //! round-trip that queues ahead of real responses on the shared stdout sink.
 //! Instead the registry tracks a per-token phase and [`ProgressRegistry::admit`]
 //! decides, on the first `$/progress`, whether the token is worth announcing:
-//! a `begin` with anything renderable (title, message, or percentage)
-//! announces — create + begin forwarded, in order, on the same FIFO channel —
+//! a `begin` with anything renderable (title, message, percentage, or a
+//! cancel button) announces — create + begin forwarded, in order, on the same FIFO channel —
 //! while a fully blank `begin` swallows the lifecycle's progress (a later
 //! renderable `begin` reusing the token still upgrades it to announced).
 
@@ -96,8 +96,8 @@ struct TokenEntry {
 /// What the first `$/progress` for a token reveals about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProgressSignal {
-    /// `begin` carrying something the editor can render (a non-empty
-    /// title, message, or a percentage) — worth announcing.
+    /// `begin` carrying something the editor can render (a non-empty title
+    /// or message, a percentage, or `cancellable: true`) — worth announcing.
     RenderableBegin,
     /// `begin` with nothing renderable at all — the per-request storm shape.
     BlankBegin,
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn admit_titled_begin_announces_then_forwards() {
+    fn admit_renderable_begin_announces_then_forwards() {
         let reg = ProgressRegistry::new();
         let conn = reg.new_connection_id();
         let downstream = NumberOrString::Number(1);
@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn admit_untitled_begin_swallows_whole_lifecycle() {
+    fn admit_blank_begin_swallows_lifecycle() {
         let reg = ProgressRegistry::new();
         let conn = reg.new_connection_id();
         let downstream = NumberOrString::Number(1);
@@ -630,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn admit_titled_begin_after_swallow_upgrades_to_announce() {
+    fn admit_renderable_begin_after_swallow_upgrades_to_announce() {
         let reg = ProgressRegistry::new();
         let conn = reg.new_connection_id();
         let downstream = NumberOrString::Number(1);

@@ -69,18 +69,19 @@ pub(in crate::lsp::bridge) fn forward(
 
     let signal = match &params.value {
         ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(begin)) => {
-            // A begin is renderable when ANY of title/message/percentage gives
-            // the editor something to show — an empty title alone is legal
-            // (title is a required field, "" a legal value) and clients render
-            // message/percentage without one. Only a fully blank begin (the
-            // per-analysis-pass storm shape, `{"kind":"begin","title":""}`)
-            // is swallowed.
+            // A begin is renderable when ANY of title/message/percentage/
+            // cancellable gives the editor something to show — an empty title
+            // alone is legal (title is a required field, "" a legal value)
+            // and clients render message/percentage/a cancel button without
+            // one. Only a fully blank begin (the per-analysis-pass storm
+            // shape, `{"kind":"begin","title":""}`) is swallowed.
             let renderable = !begin.title.is_empty()
                 || begin
                     .message
                     .as_deref()
                     .is_some_and(|message| !message.is_empty())
-                || begin.percentage.is_some();
+                || begin.percentage.is_some()
+                || begin.cancellable == Some(true);
             if renderable {
                 ProgressSignal::RenderableBegin
             } else {
