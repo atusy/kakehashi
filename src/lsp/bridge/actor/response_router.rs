@@ -36,6 +36,9 @@ pub(crate) struct ResponseRouter {
     /// All router state protected by a single mutex to avoid lock contention
     /// and simplify reasoning about thread safety.
     state: std::sync::Mutex<ResponseRouterState>,
+    /// Wakes connection-state waiters when reader/writer failure closes request
+    /// admission without going through `ConnectionHandle::set_state`.
+    terminal: tokio::sync::Notify,
 }
 
 /// Internal state for ResponseRouter, protected by a single mutex.
@@ -97,6 +100,7 @@ impl ResponseRouter {
                 upstream_to_downstream: HashMap::new(),
                 downstream_to_upstream: HashMap::new(),
             }),
+            terminal: tokio::sync::Notify::new(),
         }
     }
 
@@ -185,6 +189,19 @@ impl ResponseRouter {
             .lock()
             .recover_poison("ResponseRouter::is_accepting")
             .accepting
+    }
+
+    /// Completes once this router stops accepting requests. Register the
+    /// notification before checking the flag so a concurrent `fail_all` cannot
+    /// be lost between those operations.
+    pub(crate) async fn wait_until_terminal(&self) {
+        loop {
+            let notified = self.terminal.notified();
+            if !self.is_accepting() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Look up every in-flight downstream request ID for an upstream request
@@ -431,6 +448,7 @@ impl ResponseRouter {
 
         // Release lock before sending to avoid holding it during channel operations
         drop(state);
+        self.terminal.notify_waiters();
 
         for (id, pending) in entries {
             let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {
@@ -485,6 +503,7 @@ impl ResponseRouter {
         state.downstream_to_upstream.clear();
         drop(state);
         publish_failure();
+        self.terminal.notify_waiters();
 
         for (id, pending) in entries {
             let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {

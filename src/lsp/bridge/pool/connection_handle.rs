@@ -384,9 +384,18 @@ impl ConnectionHandle {
                         return Err(io::Error::other("bridge: server shutdown during wait"));
                     }
                     ConnectionState::Initializing => {
-                        // Wait for state change notification
-                        if receiver.changed().await.is_err() {
-                            return Err(io::Error::other("bridge: state channel closed"));
+                        tokio::select! {
+                            biased;
+                            _ = self.router.wait_until_terminal() => {
+                                return Err(io::Error::other(
+                                    "bridge: server failed during initialization",
+                                ));
+                            }
+                            changed = receiver.changed() => {
+                                if changed.is_err() {
+                                    return Err(io::Error::other("bridge: state channel closed"));
+                                }
+                            }
                         }
                     }
                 }
@@ -1540,6 +1549,53 @@ mod tests {
             "Should succeed after transitioning to Ready"
         );
         assert_eq!(handle.state(), ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_wakes_when_router_becomes_terminal() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle::with_state(
+            writer,
+            Arc::clone(&router),
+            reader_handle,
+            ConnectionState::Initializing,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+        ));
+
+        let waiter = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { handle.wait_for_ready(Duration::from_secs(5)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter should be parked on initialization"
+        );
+
+        router.fail_all("reader exited");
+
+        let result = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("terminal router should wake the waiter promptly")
+            .expect("wait task should not panic");
+        assert!(result.is_err(), "terminal router must fail readiness");
+        assert_ne!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     /// Test that wait_for_ready returns error on Failed state.
