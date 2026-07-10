@@ -55,19 +55,21 @@
 //! `label` and `changeAnnotations` pass through untouched (the transform only
 //! rewrites URIs/ranges/versions).
 //!
-//! Known degenerate edge: the transform drops a foreign-virtual entry with an
-//! EMPTY edit vector (a no-op), so an editor `failedChange` index can be
-//! skewed by one relative to what the downstream sent. A real (non-empty)
-//! foreign entry rejects the whole edit instead, so indexes never skew for
-//! edits that actually apply anything.
+//! Known degenerate edge: no-op (empty) virtual entries are removed before
+//! the forward — [`remove_empty_virtual_entries`] on every path (a raw
+//! virtual URI must never reach the editor), and the transform's
+//! foreign-virtual drop on the translated path — so an editor `failedChange`
+//! index can be skewed by one relative to what the downstream sent. A real
+//! (non-empty) foreign entry rejects the whole edit instead, so indexes
+//! never skew for edits that actually apply anything.
 //!
 //! [`transform_workspace_edit_to_host`]: crate::lsp::bridge::transform_workspace_edit_to_host
 
 use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{
-    ApplyWorkspaceEditParams, DocumentChangeOperation, DocumentChanges, Position, ResourceOp, Uri,
-    WorkspaceEdit,
+    ApplyWorkspaceEditParams, DocumentChangeOperation, DocumentChanges, Position, ResourceOp,
+    TextDocumentEdit, Uri, WorkspaceEdit,
 };
 
 use crate::document::DocumentStore;
@@ -129,6 +131,12 @@ impl ApplyEditTranslator {
         // Downstream document versions live in the bridge's version space,
         // never the editor's — null them on every forward (see the helper).
         strip_bridge_local_versions(&mut params.edit);
+        // No-op virtual entries skip the translation path below (they don't
+        // count as touching a virtual document), so they must be dropped here
+        // or a real-file-only forward would carry raw virtual URIs to the
+        // editor. Runs after validation: a versioned no-op's precondition has
+        // already been honored before its carrier is removed.
+        remove_empty_virtual_entries(&mut params.edit);
         let virtual_uris = collect_virtual_uris(&params.edit);
         let virtual_uri = match virtual_uris.as_slice() {
             // No virtual URIs: a host-layer connection's edit (real URIs
@@ -202,12 +210,33 @@ impl ApplyEditTranslator {
     /// empty entries, since a no-op needs no coordinate translation).
     /// Real-file versions are out of scope here (see the module docs) and are
     /// nulled by `strip_bridge_local_versions`.
+    ///
+    /// Entries are grouped per URI BEFORE any tracker read: two entries for
+    /// the same document claiming different versions are self-contradictory
+    /// (at most one can match) and are rejected up front — checking each
+    /// entry with its own awaited read would let a didChange bump the
+    /// tracked version between reads so that versions N and N+1 both pass.
+    /// One read per distinct URI then keeps the equal-version case coherent.
     async fn validate_virtual_document_versions(
         &self,
         edit: &WorkspaceEdit,
         connection: &ConnectionKey,
     ) -> Result<(), String> {
+        let mut versions_by_uri: Vec<(&str, i32)> = Vec::new();
         for (uri, version) in versioned_virtual_text_document_edits(edit) {
+            match versions_by_uri.iter().find(|(seen, _)| *seen == uri) {
+                Some((_, seen_version)) if *seen_version != version => {
+                    return Err(format!(
+                        "kakehashi: the edit claims two different versions ({seen_version} \
+                         and {version}) for the same virtual document; at most one can be \
+                         current, so the edit cannot be applied",
+                    ));
+                }
+                Some(_) => {}
+                None => versions_by_uri.push((uri, version)),
+            }
+        }
+        for (uri, version) in versions_by_uri {
             let Some(tracked) = self.bridge.virtual_document_version(uri, connection).await
             else {
                 return Err(format!(
@@ -233,6 +262,36 @@ impl ApplyEditTranslator {
             }
         }
         Ok(())
+    }
+}
+
+/// Remove no-op (empty) virtual-document entries so no raw virtual URI ever
+/// crosses the editor boundary. An empty entry skips the translation path
+/// ([`collect_virtual_uris`] ignores it), so on a real-file-only forward it
+/// would otherwise reach the editor verbatim — and LSP does not require
+/// clients to skip URI resolution for an empty `TextDocumentEdit`, so a
+/// `kakehashi://` URI could make the client fail the whole apply (or open a
+/// phantom document). Call AFTER version validation: a versioned no-op's
+/// precondition is honored before its carrier is dropped. Dropping a no-op
+/// can skew an editor `failedChange` index relative to what the downstream
+/// sent — the same accepted skew the transform's foreign-empty-entry drop
+/// already has (see the module docs).
+fn remove_empty_virtual_entries(edit: &mut WorkspaceEdit) {
+    if let Some(changes) = &mut edit.changes {
+        changes.retain(|uri, edits| {
+            !(edits.is_empty() && VirtualDocumentUri::is_virtual_uri(uri.as_str()))
+        });
+    }
+    let keep = |e: &TextDocumentEdit| {
+        !(e.edits.is_empty() && VirtualDocumentUri::is_virtual_uri(e.text_document.uri.as_str()))
+    };
+    match &mut edit.document_changes {
+        None => {}
+        Some(DocumentChanges::Edits(edits)) => edits.retain(keep),
+        Some(DocumentChanges::Operations(ops)) => ops.retain(|op| match op {
+            DocumentChangeOperation::Edit(e) => keep(e),
+            DocumentChangeOperation::Op(_) => true,
+        }),
     }
 }
 
@@ -534,8 +593,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_stale_virtual_document_version() {
-        // The downstream computed the edit against version 2, but the bridge
-        // has since synced version 3 (a content-changing didChange): the
+        // The downstream computed the edit against version 2, but the bridge's
+        // tracked version advanced to 3 (a content-changing didChange): the
         // edit's coordinates target replaced content and applying it could
         // misplace the edit. Reject with applied:false, never strip-and-apply.
         let connection = test_connection();
@@ -690,14 +749,16 @@ mod tests {
         // An UNVERSIONED empty virtual entry asserts nothing (no version, no
         // edits): the real-file-only edit around it must still pass through,
         // and the empty entry must not route it down the virtual path either
-        // (collect_virtual_uris ignores empty entries).
+        // (collect_virtual_uris ignores empty entries). The no-op carrier is
+        // REMOVED on the forward — LSP doesn't require clients to skip URI
+        // resolution for empty entries, so a raw kakehashi:// URI (in either
+        // shape) could fail the whole apply editor-side.
+        let vuri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let params = params_with_edit(json!({
+            "changes": { vuri.clone(): [] },
             "documentChanges": [
                 {
-                    "textDocument": {
-                        "uri": virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-                        "version": null
-                    },
+                    "textDocument": { "uri": vuri, "version": null },
                     "edits": []
                 },
                 {
@@ -707,10 +768,56 @@ mod tests {
             ]
         }));
 
-        translator()
+        let out = translator()
             .translate(params, &test_connection())
             .await
             .expect("an unversioned no-op virtual entry must not trip anything");
+        assert!(
+            out.edit
+                .changes
+                .as_ref()
+                .is_some_and(std::collections::HashMap::is_empty),
+            "the empty virtual `changes` entry must not reach the editor"
+        );
+        match out.edit.document_changes.as_ref().unwrap() {
+            DocumentChanges::Edits(edits) => {
+                assert_eq!(edits.len(), 1, "only the real-file edit survives");
+                assert_eq!(edits[0].text_document.uri.as_str(), "file:///project/main.rs");
+            }
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_conflicting_versions_for_the_same_virtual_document() {
+        // Two entries for the same document claiming different versions are
+        // self-contradictory (at most one can be current). Rejected BEFORE any
+        // tracker read: per-entry reads could interleave with a didChange bump
+        // so that versions 2 and 3 both matched, once each.
+        let connection = test_connection();
+        let (bridge, typed_uri) =
+            bridge_with_open_document("01ARZ3NDEKTSV4RRFFQ69G5FAV", &connection).await;
+        let params = params_with_edit(json!({
+            "documentChanges": [
+                {
+                    "textDocument": { "uri": typed_uri.to_uri_string(), "version": 1 },
+                    "edits": [text_edit(0)]
+                },
+                {
+                    "textDocument": { "uri": typed_uri.to_uri_string(), "version": 2 },
+                    "edits": [text_edit(1)]
+                }
+            ]
+        }));
+
+        let reason = translator_with_bridge(bridge)
+            .translate(params, &connection)
+            .await
+            .expect_err("conflicting versions for one document must be rejected");
+        assert!(
+            reason.contains("two different versions"),
+            "reason should name the failure: {reason}"
+        );
     }
 
     #[test]

@@ -382,7 +382,7 @@ impl DocumentTracker {
     /// Used by the inbound `workspace/applyEdit` validation: a downstream that
     /// versions a `TextDocumentEdit` pins the edit to the content revision it
     /// computed against, and the bridge rejects the edit when that revision is
-    /// no longer the one it last synced.
+    /// no longer the tracked one.
     ///
     /// Gated on CONFIRMED opened state (the reverse index, promoted only after
     /// the didOpen is enqueued), not just the version map: `try_claim_for_open`
