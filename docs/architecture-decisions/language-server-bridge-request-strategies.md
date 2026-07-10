@@ -122,7 +122,7 @@ Request (cursor in injection) ──▶ Forward to language server
 | Aspect | Handling |
 |--------|----------|
 | Input | Position (host → virtual translation) |
-| Output | Location, Location[], or LocationLink[] (for link-capable clients) |
+| Output | Location[] (a scalar downstream Location is normalized to a vector) or LocationLink[] (for link-capable clients) |
 | Cross-file | Real-file targets preserved (incl. host-URI targets, not containment-checked); only locations addressed to OTHER regions' virtual URIs filtered |
 | Position mapping | Range start/end: virtual → host. Known gap: a LocationLink whose target is a real/host URI passes through whole, leaving its `originSelectionRange` (a source-document range) in virtual coordinates |
 

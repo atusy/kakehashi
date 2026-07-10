@@ -580,11 +580,16 @@ commands a downstream registers dynamically afterwards are not routed.)
 
 Bridged features are also limited to **embedded code blocks** in one respect:
 navigation and edits do not cross between blocks — on the
-goto/references/rename/code-action transforms, results addressed to another
-block's virtual URI are filtered out (document-link targets are the
-exception and pass through untouched). Real-file and — for
-navigation/references/rename — host-URI results pass through, while
-INJECTION-layer code actions (and applyEdit requests that also touch a
-virtual document) region-bound host-URI edits. The surrounding host
-document can be bridged to the host language's own servers via
-`bridge._self` (host-document-bridge).
+goto/references/rename transforms, results addressed to another block's
+virtual URI are filtered out (document-link targets are the exception and
+pass through untouched), and a code ACTION touching another region stays
+visible as a disabled entry for `disabledSupport` clients (dropped only
+without that capability). One `applyEdit` nuance: the translator picks its
+target region from the edit itself, so a request touching exactly one live
+virtual URI is translated against that region even if it differs from the
+block that prompted the server's request (only multi-region requests are
+rejected). Real-file and — for navigation/references/rename — host-URI
+results pass through, while INJECTION-layer code actions (and applyEdit
+requests that also touch a virtual document) region-bound host-URI edits.
+The surrounding host document can be bridged to the host language's own
+servers via `bridge._self` (host-document-bridge).
