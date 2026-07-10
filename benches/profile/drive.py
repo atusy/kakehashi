@@ -518,13 +518,15 @@ def main() -> None:
     source = (f"file={args.file} ({n_bytes}B/{n_lines}L)"
               if args.file else f"size={args.size}")
     firsts = " ".join(f"{t*1000:.0f}" for t in req_times[:5])
+    measured_responses = sum(len(samples) for samples in request_samples.values())
     sys.stderr.write(f"[drive] first-cycle ms: {firsts}\n")
     sys.stderr.write(
         f"[drive] lang={lang} {source} cycles={args.requests} burst={args.burst} "
-        f"responses={args.requests * args.burst} "
+        f"responses={measured_responses} "
         f"ok={ok} canceled={canceled} superseded={superseded} tokens/req={tokens} "
         f"wall={elapsed*1000:.0f}ms "
-        f"({elapsed/(args.requests * args.burst)*1000:.2f}ms/response)\n")
+        f"({elapsed/args.requests*1000:.2f}ms/cycle, "
+        f"{elapsed/measured_responses*1000:.2f}ms/measured-response)\n")
     for method, samples in request_samples.items():
         summary = summarize_samples(samples)
         sys.stderr.write(
