@@ -1265,9 +1265,6 @@ impl Kakehashi {
         };
         let Some(walked) = walked else {
             // A pool-skip of an already-cancelled unit (or a work-unit panic).
-            if walk_cancel.is_cancelled() {
-                return Ok(None);
-            }
             return Ok(None);
         };
         // A completed walk can race a fresher flight or didClose after its last
