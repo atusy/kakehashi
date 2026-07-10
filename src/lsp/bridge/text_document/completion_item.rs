@@ -147,15 +147,9 @@ impl LanguageServerPool {
                 }
             };
 
-        // Forward with the item's edit ranges restored to VIRTUAL coordinates
-        // (the served item is host-translated; a downstream that echoes the
-        // ranges verbatim would otherwise get them re-translated on the way
-        // back — a double shift the safety guard can't always catch). The
-        // original host-coordinate `item` is kept untouched for the
-        // fail-soft returns below. Mirrors the codeAction resolve path.
-        let mut outgoing = item.clone();
-        translate_item_ranges_host_to_virtual(&mut outgoing, &RegionOffset::from(&envelope.offset));
-        let request = build_completion_resolve_request(&outgoing, request_id);
+        // The original host-coordinate `item` is kept untouched for the
+        // fail-soft returns below.
+        let request = prepare_completion_resolve_request(&item, &envelope, request_id);
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
@@ -226,9 +220,9 @@ impl LanguageServerPool {
 /// The `completionItem/resolve` method is unique: its params is the
 /// `CompletionItem` itself (not a wrapper struct), per the LSP spec.
 fn build_completion_resolve_request(
-    item: &CompletionItem,
+    item: CompletionItem,
     request_id: RequestId,
-) -> JsonRpcRequest<&CompletionItem> {
+) -> JsonRpcRequest<CompletionItem> {
     JsonRpcRequest::new(request_id.as_i64(), "completionItem/resolve", item)
 }
 
@@ -244,6 +238,21 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
         return None;
     }
     serde_json::from_value(result).ok()
+}
+
+/// Build the outgoing `completionItem/resolve` request from a SERVED item:
+/// a clone with its edit ranges restored to VIRTUAL coordinates (the served
+/// item is host-translated; a downstream that echoes the ranges verbatim
+/// would otherwise get them re-translated on the way back — a double shift
+/// the safety guard can't always catch). Mirrors the codeAction resolve path.
+fn prepare_completion_resolve_request(
+    item: &CompletionItem,
+    envelope: &KakehashiEnvelope,
+    request_id: RequestId,
+) -> JsonRpcRequest<CompletionItem> {
+    let mut outgoing = item.clone();
+    translate_item_ranges_host_to_virtual(&mut outgoing, &RegionOffset::from(&envelope.offset));
+    build_completion_resolve_request(outgoing, request_id)
 }
 
 /// Translate a served (host-coordinate) item's edit ranges back to virtual
@@ -409,7 +418,7 @@ mod tests {
             data: Some(json!({"resolve_id": 99})),
             ..Default::default()
         };
-        let request = build_completion_resolve_request(&item, RequestId::new(7));
+        let request = build_completion_resolve_request(item, RequestId::new(7));
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["jsonrpc"], "2.0");
@@ -696,15 +705,10 @@ mod tests {
             ..Default::default()
         };
         let envelope = test_envelope();
-        let offset = RegionOffset::from(&envelope.offset);
 
-        // Reproduce the production wiring: clone, untranslate, build the
-        // outgoing request — and assert on the SERIALIZED request, so
-        // removing the untranslation step in send_completion_resolve_request
-        // has a matching failure here.
-        let mut outgoing = item.clone();
-        translate_item_ranges_host_to_virtual(&mut outgoing, &offset);
-        let request = build_completion_resolve_request(&outgoing, RequestId::new(7));
+        // Go through the SAME request-preparation helper production uses, and
+        // assert on the serialized request.
+        let request = prepare_completion_resolve_request(&item, &envelope, RequestId::new(7));
         let wire = serde_json::to_value(&request).unwrap();
 
         assert_eq!(

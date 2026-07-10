@@ -344,14 +344,19 @@ The following table shows the current implementation status of bridged LSP metho
 | definition | ✅ Implemented | Full delegation with response filtering |
 | hover | ✅ Implemented | Pass-through with position translation |
 | signatureHelp | ✅ Implemented | Pass-through |
-| completion | ✅ Implemented | With additionalTextEdits filtering |
+| completion | ✅ Implemented | Fail-closed edit guards; atomic additionalTextEdits drop |
+| completionItem/resolve | ✅ Implemented | Envelope-routed; unsafe resolved responses serve the unresolved item |
 | references | ✅ Implemented | With cross-file filtering |
 | rename | ✅ Implemented | With workspace edit validation |
-| codeAction | ✅ Implemented | With edit filtering |
-| formatting | ✅ Implemented | With position mapping |
-| documentHighlight | ❌ Not implemented | |
-| diagnostics | ❌ Not implemented | Requires async push model |
-| semanticTokens | ❌ Not implemented | Would enable parallel fetch strategy |
+| codeAction | ✅ Implemented | With edit filtering (incl. resolve + executeCommand routing) |
+| formatting | ✅ Implemented | Whole-response atomic drop on unsafe edits |
+| rangeFormatting | ✅ Implemented | Shares the formatting guards |
+| onTypeFormatting | ✅ Implemented | Shares the formatting guards |
+| inlayHint | ✅ Implemented | Unsafe accept-edit sets dropped whole; hint kept |
+| colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
+| documentHighlight | ✅ Implemented | |
+| diagnostics | ✅ Implemented | Push + pull with host translation |
+| semanticTokens | ✅ Implemented | Cross-layer merge (see semantic-token merge ADR) |
 
 ### Original Implementation Priority
 
