@@ -468,7 +468,7 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
                 ArchiveRecovery::CloneFallback(error) => {
                     log::warn!(
                         target: "kakehashi::install",
-                        "Archive download failed, falling back to git clone: {}",
+                        "Archive fetch failed or was rejected, falling back to git clone: {}",
                         error
                     );
                     // Clean up partial extraction before fallback
