@@ -41,7 +41,7 @@ pub(crate) struct ResponseRouter {
 /// Internal state for ResponseRouter, protected by a single mutex.
 struct ResponseRouterState {
     /// Pending requests waiting for responses.
-    pending: HashMap<RequestId, oneshot::Sender<serde_json::Value>>,
+    pending: HashMap<RequestId, PendingRequest>,
     /// Maps upstream request ID (from client) to downstream request IDs (to LS).
     ///
     /// Used for $/cancelRequest forwarding: when the client cancels request 42,
@@ -61,6 +61,19 @@ struct ResponseRouterState {
     ///
     /// Enables O(1) cleanup when a response is routed or a request is removed.
     downstream_to_upstream: HashMap<RequestId, UpstreamId>,
+}
+
+struct PendingRequest {
+    response_tx: oneshot::Sender<serde_json::Value>,
+    delivery: RequestDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestDelivery {
+    Queued,
+    Writing,
+    Sent,
+    CancelledQueued,
 }
 
 impl ResponseRouter {
@@ -106,7 +119,13 @@ impl ResponseRouter {
             return None;
         }
 
-        state.pending.insert(downstream_id, tx);
+        state.pending.insert(
+            downstream_id,
+            PendingRequest {
+                response_tx: tx,
+                delivery: RequestDelivery::Queued,
+            },
+        );
 
         // Store bidirectional mapping if upstream_id is provided. Appending
         // (not inserting) keeps every concurrent downstream request for this
@@ -129,6 +148,7 @@ impl ResponseRouter {
     /// Used by `$/cancelRequest` forwarding to translate the client's request ID
     /// to the language server's. Does NOT remove the entries — a cancelled
     /// request must still receive its response.
+    #[cfg(test)]
     pub(crate) fn lookup_downstream_ids(&self, upstream_id: &UpstreamId) -> Vec<RequestId> {
         let state = self
             .state
@@ -141,6 +161,82 @@ impl ResponseRouter {
             .unwrap_or_default()
     }
 
+    /// Mark every queued request for `upstream_id` so the writer skips it, and
+    /// return only IDs whose write already started or completed and therefore
+    /// still require a downstream `$/cancelRequest` notification.
+    pub(crate) fn prepare_cancel_by_upstream(
+        &self,
+        upstream_id: &UpstreamId,
+    ) -> (bool, Vec<RequestId>) {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::prepare_cancel_by_upstream");
+        let Some(ids) = state.upstream_to_downstream.get(upstream_id).cloned() else {
+            return (false, Vec::new());
+        };
+        let mut sent = Vec::new();
+        for id in ids {
+            let Some(pending) = state.pending.get_mut(&id) else {
+                continue;
+            };
+            match pending.delivery {
+                RequestDelivery::Queued => {
+                    pending.delivery = RequestDelivery::CancelledQueued;
+                }
+                RequestDelivery::Writing | RequestDelivery::Sent => sent.push(id),
+                RequestDelivery::CancelledQueued => {}
+            }
+        }
+        (true, sent)
+    }
+
+    /// Atomically claim a tracked request immediately before the writer starts
+    /// its bytes. Returns `false` for a request cancelled or removed while it
+    /// was queued, so no orphan request reaches the downstream server.
+    pub(crate) fn claim_for_write(&self, id: RequestId) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::claim_for_write");
+        match state.pending.get_mut(&id).map(|pending| pending.delivery) {
+            Some(RequestDelivery::Queued) => {
+                state.pending.get_mut(&id).unwrap().delivery = RequestDelivery::Writing;
+                true
+            }
+            Some(RequestDelivery::CancelledQueued) => {
+                let pending = state.pending.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+                drop(state);
+                if let Some(pending) = pending {
+                    let _ = pending.response_tx.send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id.as_i64(),
+                        "error": {
+                            "code": -32800,
+                            "message": "bridge: request cancelled before downstream write"
+                        }
+                    }));
+                }
+                false
+            }
+            Some(RequestDelivery::Writing | RequestDelivery::Sent) | None => false,
+        }
+    }
+
+    /// Record successful completion of the writer-side request write.
+    pub(crate) fn mark_sent(&self, id: RequestId) {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::mark_sent");
+        if let Some(pending) = state.pending.get_mut(&id)
+            && pending.delivery == RequestDelivery::Writing
+        {
+            pending.delivery = RequestDelivery::Sent;
+        }
+    }
+
     /// Route a response to its pending request, also cleaning up both cancel-map
     /// directions for this ID in O(1).
     pub(crate) fn route(&self, response: serde_json::Value) -> RouteResult {
@@ -150,14 +246,14 @@ impl ResponseRouter {
         };
 
         let mut state = self.state.lock().recover_poison("ResponseRouter::route");
-        let tx = state.pending.remove(&id);
+        let pending = state.pending.remove(&id);
 
         // Clean up bidirectional cancel map entries in O(1)
         Self::remove_cancel_mapping_inner(&mut state, id);
 
-        match tx {
-            Some(sender) => {
-                if sender.send(response).is_ok() {
+        match pending {
+            Some(pending) => {
+                if pending.response_tx.send(response).is_ok() {
                     RouteResult::Delivered
                 } else {
                     RouteResult::ReceiverDropped
@@ -228,7 +324,7 @@ impl ResponseRouter {
             .lock()
             .recover_poison("ResponseRouter::fail_request");
 
-        let tx = state.pending.remove(&id);
+        let pending = state.pending.remove(&id);
 
         // Clean up bidirectional cancel map entries in O(1)
         Self::remove_cancel_mapping_inner(&mut state, id);
@@ -236,8 +332,8 @@ impl ResponseRouter {
         // Release lock before sending to avoid holding it during channel operations
         drop(state);
 
-        match tx {
-            Some(sender) => {
+        match pending {
+            Some(pending) => {
                 let error_response = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id.as_i64(),
@@ -246,7 +342,7 @@ impl ResponseRouter {
                         "message": format!("bridge: {}", reason)
                     }
                 });
-                let _ = sender.send(error_response);
+                let _ = pending.response_tx.send(error_response);
                 true
             }
             None => false,
@@ -272,7 +368,7 @@ impl ResponseRouter {
         // Release lock before sending to avoid holding it during channel operations
         drop(state);
 
-        for (id, tx) in entries {
+        for (id, pending) in entries {
             let error_response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.as_i64(),
@@ -281,7 +377,7 @@ impl ResponseRouter {
                     "message": error_message
                 }
             });
-            let _ = tx.send(error_response);
+            let _ = pending.response_tx.send(error_response);
         }
     }
 }
@@ -496,6 +592,30 @@ mod tests {
     // ========================================
     // CancelMap tests (ls-bridge-message-ordering Cancel Forwarding)
     // ========================================
+
+    #[tokio::test]
+    async fn cancelled_queued_request_is_not_claimed_for_write() {
+        let router = ResponseRouter::new();
+        let downstream_id = RequestId::new(42);
+        let upstream_id = UpstreamId::Number(100);
+        let response = router
+            .register_with_upstream(downstream_id, Some(upstream_id.clone()))
+            .expect("request registration should succeed");
+
+        let (known, sent_ids) = router.prepare_cancel_by_upstream(&upstream_id);
+
+        assert!(known);
+        assert!(
+            sent_ids.is_empty(),
+            "a request still in the writer queue needs no downstream cancel"
+        );
+        assert!(
+            !router.claim_for_write(downstream_id),
+            "the writer must skip a request cancelled before dequeue"
+        );
+        let cancelled = response.await.expect("queued cancellation should answer");
+        assert_eq!(cancelled["error"]["code"], -32800);
+    }
 
     /// Test that register_with_upstream stores upstream->downstream mapping.
     ///

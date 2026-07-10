@@ -1957,13 +1957,14 @@ impl LanguageServerPool {
     /// the downstream ID was already cleaned up, or an individual server send
     /// fails. This avoids racing cancel against handshake completion.
     ///
-    /// Capture-before-notify ordering is load-bearing: `notify` wakes the
+    /// Prepare-before-notify ordering is load-bearing: `notify` wakes the
     /// upstream handler (via `CancelForwarder::notify_cancel`), whose
     /// cancellation path immediately destroys the very state this lookup reads —
     /// `unregister_all_for_upstream_id` empties the registry, and dropping the
-    /// in-flight request futures removes their router cancel mappings. Capturing
-    /// first makes that cleanup harmless; sending a cancel for a request the
-    /// server already answered is a documented no-op.
+    /// in-flight request futures removes their router cancel mappings. Preparing
+    /// first atomically marks queued work for writer-side skipping and captures
+    /// only already-writing/sent IDs that still need a FIFO cancel notification;
+    /// the later cleanup is then harmless.
     pub(crate) async fn forward_cancel_by_upstream_id_with_notify(
         &self,
         upstream_id: UpstreamId,
@@ -1992,10 +1993,11 @@ impl LanguageServerPool {
             }
         };
 
-        // 2. Capture each server's connection handle and in-flight downstream
-        //    ids under a single connections-lock acquisition, so the time until
-        //    `notify` wakes the upstream handler is bounded by one lock wait,
-        //    not one per server (PR #359 review).
+        // 2. Capture each server's connection handle and atomically classify its
+        //    downstream ids under one connections-lock acquisition. Queued requests
+        //    are marked for writer-side skipping before `notify`, and the time to
+        //    wake the handler is bounded by one lock wait rather than one per server
+        //    (PR #359 review).
         let mut targets: Vec<(ConnectionKey, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
         {
             let connections = self.connections().await;
@@ -2007,8 +2009,9 @@ impl LanguageServerPool {
                 ) else {
                     continue;
                 };
-                let downstream_ids = handle.router().lookup_downstream_ids(&upstream_id);
-                if downstream_ids.is_empty() {
+                let (known, downstream_ids) =
+                    handle.router().prepare_cancel_by_upstream(&upstream_id);
+                if !known {
                     // Request already completed or ID never registered.
                     // Silently drop per best-effort semantics.
                     self.cancel_metrics.record_unknown_id();
@@ -2020,7 +2023,9 @@ impl LanguageServerPool {
                     );
                     continue;
                 }
-                targets.push((connection_key, handle, downstream_ids));
+                if !downstream_ids.is_empty() {
+                    targets.push((connection_key, handle, downstream_ids));
+                }
             }
             // Lock dropped here — notify and the sends below run without it.
         }
@@ -4009,6 +4014,8 @@ mod tests {
         let (downstream_id, _response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         // Insert the handle into the pool
         pool.connections
@@ -4205,6 +4212,8 @@ mod tests {
         let (downstream_id, _response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         pool.connections
             .lock()
@@ -4284,9 +4293,11 @@ mod tests {
 
         // Register a request with upstream ID mapping in ResponseRouter
         let upstream_id = UpstreamId::Number(42);
-        let (_downstream_id, _response_rx) = handle
+        let (downstream_id, _response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         // Insert the handle into the pool
         pool.connections
@@ -4343,6 +4354,8 @@ mod tests {
         let (downstream_id, response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         // Insert the handle into the pool
         pool.connections
@@ -4473,9 +4486,11 @@ mod tests {
 
         // Register a request with upstream ID
         let upstream_id = UpstreamId::Number(42);
-        let (_downstream_id, _response_rx) = handle
+        let (downstream_id, _response_rx) = handle
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register request");
+        assert!(handle.router().claim_for_write(downstream_id));
+        handle.router().mark_sent(downstream_id);
 
         pool.connections
             .lock()
@@ -5052,16 +5067,20 @@ mod tests {
         let handle_lua =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua-ls"))
                 .await;
-        let (_downstream_id_lua, _rx_lua) = handle_lua
+        let (downstream_id_lua, _rx_lua) = handle_lua
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register lua request");
+        assert!(handle_lua.router().claim_for_write(downstream_id_lua));
+        handle_lua.router().mark_sent(downstream_id_lua);
 
         let handle_py =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("pyright"))
                 .await;
-        let (_downstream_id_py, _rx_py) = handle_py
+        let (downstream_id_py, _rx_py) = handle_py
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register py request");
+        assert!(handle_py.router().claim_for_write(downstream_id_py));
+        handle_py.router().mark_sent(downstream_id_py);
 
         // Insert handles
         {
