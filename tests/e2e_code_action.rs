@@ -113,10 +113,16 @@ fn literal_support_caps(disabled_support: bool) -> Value {
     }
     json!({
         "textDocument": { "codeAction": code_action },
-        // The bridge relays downstream workspace/applyEdit only to editors
-        // that declare the capability; the applyEdit e2e depends on it.
-        "workspace": { "applyEdit": true }
     })
+}
+
+/// Add `workspace.applyEdit` to a capability set. The bridge relays
+/// downstream `workspace/applyEdit` only to editors that declare it; only
+/// the applyEdit-relay e2e tests opt in, so every other test keeps the
+/// minimal capability surface.
+fn with_apply_edit(mut caps: Value) -> Value {
+    caps["workspace"] = json!({ "applyEdit": true });
+    caps
 }
 
 /// Literal support PLUS dataSupport + resolveSupport — the client can hold a
@@ -440,7 +446,8 @@ fn executing_a_bridged_command_routes_back_and_relays_the_server_applyedit() {
     // server with the ORIGINAL name; the server answers by asking the client to
     // apply an edit (host-translated by the bridge) and returns a result the
     // bridge relays verbatim.
-    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    let (mut client, init_response, _config_dir) =
+        init_client(with_apply_edit(literal_support_caps(true)));
     assert_advertised(&init_response);
     open_markdown(&mut client);
 
@@ -895,7 +902,8 @@ fn palette_fired_command_routes_to_its_origin_server() {
     // from the palette, keyed off the advertised executeCommandProvider.commands
     // — routes to the server that advertised it (recorded at handshake), not just
     // commands surfaced through a bridged code action.
-    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    let (mut client, init_response, _config_dir) =
+        init_client(with_apply_edit(literal_support_caps(true)));
     assert_advertised(&init_response);
     open_markdown(&mut client);
     // Drive a codeAction so mock-codeaction handshakes and registers "mock.run".
