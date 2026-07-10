@@ -350,6 +350,12 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     // closed-fence row, so the guard stays fail-closed there — rejecting a
     // boundary-touching edit in a transient malformed construct is acceptable,
     // corrupting a well-formed one is not.
+    // Fast path: a region with no prefixes anywhere (plain fenced blocks —
+    // the common case) can't have anything stripped; skip the per-edit line
+    // scans entirely.
+    if columns.iter().all(|&column| column == 0) {
+        return true;
+    }
     let content_prefixed = columns.len() > 1 && columns.iter().any(|&column| column > 0);
     let boundary_at = |host_line: u32| {
         content_prefixed && region_end.character == 0 && host_line >= region_end.line
@@ -369,8 +375,18 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
         // end.line at character 0 still counts as spanned — deliberately
         // conservative (REJECT, never clamp): deleting up to (end, 0) removes
         // the previous line's newline and merges the prefixed line upward.
-        let spans_prefixed_line =
-            end.line > start.line && (start.line.saturating_add(1)..=end.line).any(prefix_at);
+        //
+        // The scan is CLAMPED to the explicit per-line array: every line past
+        // it classifies via `boundary_at`, which is monotone in the line
+        // number, so the range's largest line (`end.line`) decides for all of
+        // them — the scan is O(columns.len()), never O(end.line), even for a
+        // malformed edit claiming a huge range.
+        let last_explicit = offset
+            .line()
+            .saturating_add((columns.len() as u32).saturating_sub(1));
+        let spans_prefixed_line = end.line > start.line
+            && ((start.line.saturating_add(1)..=end.line.min(last_explicit)).any(prefix_at)
+                || boundary_at(end.line));
         // Single-element MULTI-LINE regions are exempt from the newline check:
         // later lines are designed unprefixed and line 0's region content runs
         // to end-of-line, so an inserted newline splits nothing. For a
