@@ -131,6 +131,15 @@ impl Kakehashi {
         let layer_cfg = self.resolve_layer_config(&language_name, "textDocument/formatting");
 
         let upstream_request_id = crate::lsp::current_upstream_id();
+        // Formatting drives its own layer race (not `run_layer_race`), so it
+        // holds its own registry sweep: a dropped losing arm (Preferred) or an
+        // aborted region task may not reach its refcounted unregister. RAII so
+        // the sweep also runs on the `?` early returns; it fires only after
+        // BOTH layers settled, so no live sibling can be wiped.
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            self.bridge.pool_arc(),
+            upstream_request_id.clone(),
+        );
         let mut cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
         cancel_state.request_error_sink = request_error_sink;
         let original = snapshot.text_arc();
@@ -452,9 +461,12 @@ impl Kakehashi {
             ClientProgressDeregisterGuard::new(registry, cp_minted, aggregator, pool.upstream_tx())
         });
 
-        let response = finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
-        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
-        response
+        // No `unregister_all` here: under the Preferred cross-layer strategy
+        // this future races the host layer under the SAME upstream id, and
+        // wiping the registry on this arm's completion would drop the
+        // sibling's live cancel registrations. `formatting_impl_with_error_sink`
+        // sweeps once after the whole strategy dispatch.
+        finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await
     }
 
     /// Format the host document itself (the **host** layer,
@@ -520,7 +532,9 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        // No `unregister_all` here — same reason as the virt arm: under
+        // Preferred this races the virt layer on one shared upstream id;
+        // the caller sweeps once after the whole strategy dispatch.
         // Count failures only when no host server won (#503): `NoResult` drains
         // every task, so its `errors` is the exhaustive, deterministic count.
         count_no_winner_errors(&result, &cancel_state.request_error_sink);

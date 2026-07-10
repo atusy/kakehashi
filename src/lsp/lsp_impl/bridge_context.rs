@@ -48,6 +48,32 @@ fn capability_prefilter_applies(method: &str) -> bool {
     )
 }
 
+/// RAII sweep of the upstream-request registry for one request id: on drop,
+/// removes every entry a dropped/aborted layer future did not get to
+/// unregister itself. Idempotent with the arms' own refcounted unregisters.
+/// Hold it across a layer race (or a standalone dispatch with no outer
+/// sweep) so the sweep runs on every exit — normal completion, `?`,
+/// cancellation, and even the whole request future being dropped.
+pub(crate) struct UpstreamRegistrySweepGuard {
+    pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
+    id: Option<UpstreamId>,
+}
+
+impl UpstreamRegistrySweepGuard {
+    pub(crate) fn new(
+        pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
+        id: Option<UpstreamId>,
+    ) -> Self {
+        Self { pool, id }
+    }
+}
+
+impl Drop for UpstreamRegistrySweepGuard {
+    fn drop(&mut self) {
+        self.pool.unregister_all_for_upstream_id(self.id.as_ref());
+    }
+}
+
 /// All resolved context needed to send bridge requests to multiple servers.
 ///
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
@@ -980,7 +1006,12 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        // No `unregister_all` here: as a walk arm this future runs
+        // concurrently with the virt/native layers under the SAME upstream id
+        // (`run_layer_race` sweeps after the whole race), and wiping the
+        // registry on this arm's completion would drop a live sibling's
+        // cancel registrations. The one non-walk caller
+        // (`will_save_wait_until`) sweeps for itself.
         // Quieter than `FanInResult::handle`: an all-empty host layer is the
         // normal outcome whenever virt answers, and the virt arm already
         // emits the client-visible "no response" LOG — only real host
@@ -1019,9 +1050,11 @@ impl Kakehashi {
     /// - Native has no contributor for bridged methods.
     ///
     /// A losing in-flight future is dropped; its RAII guards clean up the
-    /// response router and cancel subscription, and the trailing
-    /// `unregister_all_for_upstream_id` sweeps any upstream-registry entries
-    /// the dropped future did not get to remove itself.
+    /// response router and cancel subscription, and the request-scoped
+    /// [`UpstreamRegistrySweepGuard`] in [`run_layer_race`](Self::run_layer_race)
+    /// sweeps any upstream-registry entries the dropped future did not get to
+    /// remove itself — on drop, so the sweep also runs when this whole request
+    /// is cancelled.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn walk_layers<R>(
         &self,
@@ -1136,8 +1169,15 @@ impl Kakehashi {
         &self,
         race: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
-        let result = match cancel_rx {
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        // RAII: sweep upstream-registry entries a dropped (losing or
+        // cancelled) layer future did not get to unregister itself.
+        // Idempotent; a completed arm already cleaned up its own. A guard
+        // (not a trailing statement) so the sweep also runs if this whole
+        // request future is ever dropped mid-race.
+        let _sweep = UpstreamRegistrySweepGuard::new(self.bridge.pool_arc(), upstream_id);
+        match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
                     biased;
@@ -1146,14 +1186,7 @@ impl Kakehashi {
                 }
             }
             None => race.await,
-        };
-        // Sweep upstream-registry entries a dropped (losing or cancelled) layer
-        // future did not get to unregister itself. Idempotent; a completed arm
-        // already cleaned up its own.
-        self.bridge
-            .pool_arc()
-            .unregister_all_for_upstream_id(current_upstream_id().as_ref());
-        result
+        }
     }
 
     /// Cross-layer walk that picks `preferred` (first-wins) vs `concatenated`
@@ -1313,9 +1346,10 @@ impl Kakehashi {
             injection_query.as_ref(),
         );
 
-        // One upstream request ID for the whole scan: every overlapping region's
-        // context shares it, and the virt codeAction path unregisters it ONCE
-        // (`unregister_all_for_upstream_id`) after fanning out to all regions.
+        // One upstream request ID for the whole scan: every overlapping
+        // region's context shares it — with the OTHER layers too, so nothing
+        // in the virt walk may wipe the registry for it; `run_layer_race`'s
+        // request-wide sweep guard owns the cleanup after all layers finish.
         // Hoisted out of the loop so that shared-ID invariant is explicit and
         // can't drift if this scan is reused under a different request-id scope.
         let upstream_request_id = current_upstream_id();

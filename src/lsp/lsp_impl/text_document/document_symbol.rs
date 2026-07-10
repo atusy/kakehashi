@@ -250,11 +250,6 @@ impl Kakehashi {
         )
         .await;
 
-        // Clean up stale upstream registry entries once all region tasks have completed
-        // (or been aborted via JoinSet drop). Must happen after the JoinSet is drained
-        // so cancel forwarding remains intact for all in-flight downstream requests.
-        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
-
         let all_symbols = result?;
 
         Ok(format_document_symbol_response(
