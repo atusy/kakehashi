@@ -117,7 +117,7 @@ impl CacheCoordinator {
     /// - Injection map
     /// - Injection token cache
     /// - Request tracking state
-    pub(crate) fn remove_document(&self, uri: &Url) {
+    pub(crate) fn remove_document(&self, uri: &Url, incarnation: Option<u64>) {
         // Cancel any in-flight compute for this URI FIRST, so it has the best
         // chance to observe the flipped token and bail before its injection
         // store-half runs — otherwise a compute already past its last checkpoint
@@ -129,7 +129,7 @@ impl CacheCoordinator {
         // entries for a closed doc that no request can read.
         self.request_tracker.cancel_all_for_uri(uri);
         self.served_semantic_versions.remove(uri);
-        self.semantic_cache.remove(uri);
+        self.semantic_cache.remove(uri, incarnation);
         self.semantic_range_cache.remove(uri);
         self.injection_map.clear(uri);
         self.injection_token_cache.clear_document(uri);
@@ -152,7 +152,7 @@ impl CacheCoordinator {
                 cached.tokens.result_id.as_deref().unwrap_or("<none>")
             );
         }
-        self.semantic_cache.remove(uri);
+        self.semantic_cache.remove(uri, None);
     }
 
     // ========================================================================
@@ -724,7 +724,7 @@ mod tests {
         let (_request_id, _token) = cache.start_request(&uri);
 
         // Remove the document
-        cache.remove_document(&uri);
+        cache.remove_document(&uri, Some(0));
 
         // Verify all caches are cleared
         assert!(cache.get_tokens_if_valid(&uri, "test-id").is_none());
@@ -1218,7 +1218,7 @@ print("goodbye")
                 .is_some()
         );
 
-        cache.remove_document(&uri);
+        cache.remove_document(&uri, Some(0));
         assert!(
             cache
                 .get_current_range_tokens(&uri, &range, "rust", key)

@@ -12,6 +12,7 @@
 use crate::analysis::semantic::RawToken;
 use crate::language::injection::CacheableInjectionRegion;
 use dashmap::DashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{Range, SemanticTokens};
 use url::Url;
@@ -58,19 +59,25 @@ pub struct CachedSemanticTokens {
 
 /// Thread-safe semantic token cache.
 pub struct SemanticTokenCache {
-    cache: DashMap<Url, CachedSemanticTokens>,
-    baselines: DashMap<(Url, String), Arc<SemanticTokens>>,
-    /// Per-document baseline IDs from least to most recently stored or read.
-    baseline_order: DashMap<Url, Vec<String>>,
+    documents: DashMap<Url, SemanticDocumentCache>,
+}
+
+#[derive(Default)]
+struct SemanticDocumentCache {
+    current: Option<CachedSemanticTokens>,
+    baselines: HashMap<String, Arc<SemanticTokens>>,
+    /// Baseline IDs from least to most recently stored or read.
+    baseline_order: VecDeque<String>,
+    /// Highest closed lifetime. Kept as a tombstone so a late store from that
+    /// lifetime cannot recreate state after didClose atomically cleared it.
+    closed_incarnation: Option<u64>,
 }
 
 impl SemanticTokenCache {
     /// Create a new empty cache.
     pub fn new() -> Self {
         Self {
-            cache: DashMap::new(),
-            baselines: DashMap::new(),
-            baseline_order: DashMap::new(),
+            documents: DashMap::new(),
         }
     }
 
@@ -85,51 +92,66 @@ impl SemanticTokenCache {
         cache_key: u64,
         snapshot: SemanticSnapshotIdentity,
     ) {
+        let mut document = self.documents.entry(uri).or_default();
+        if document
+            .closed_incarnation
+            .is_some_and(|closed| snapshot.incarnation <= closed)
+        {
+            return;
+        }
         let result_id = tokens.result_id.clone();
         let tokens = Arc::new(tokens);
-        self.cache.insert(
-            uri.clone(),
-            CachedSemanticTokens {
-                tokens: Arc::clone(&tokens),
-                language,
-                snapshot,
-                cache_key,
-            },
-        );
+        document.current = Some(CachedSemanticTokens {
+            tokens: Arc::clone(&tokens),
+            language,
+            snapshot,
+            cache_key,
+        });
         if let Some(result_id) = result_id {
-            self.store_baseline(uri, result_id, tokens);
+            Self::store_baseline(&mut document, result_id, tokens);
         }
     }
 
-    fn store_baseline(&self, uri: Url, result_id: String, tokens: Arc<SemanticTokens>) {
-        self.baselines
-            .insert((uri.clone(), result_id.clone()), tokens);
-        let mut order = self.baseline_order.entry(uri.clone()).or_default();
-        order.retain(|id| id != &result_id);
-        order.push(result_id);
-        while order.len() > SEMANTIC_BASELINE_HISTORY {
-            let evicted = order.remove(0);
-            self.baselines.remove(&(uri.clone(), evicted));
+    fn store_baseline(
+        document: &mut SemanticDocumentCache,
+        result_id: String,
+        tokens: Arc<SemanticTokens>,
+    ) {
+        document.baselines.insert(result_id.clone(), tokens);
+        document.baseline_order.retain(|id| id != &result_id);
+        document.baseline_order.push_back(result_id);
+        while document.baseline_order.len() > SEMANTIC_BASELINE_HISTORY {
+            let evicted = document
+                .baseline_order
+                .pop_front()
+                .expect("length checked above");
+            document.baselines.remove(&evicted);
         }
     }
 
-    fn touch_baseline(&self, uri: &Url, result_id: &str) {
-        let Some(mut order) = self.baseline_order.get_mut(uri) else {
+    fn touch_baseline(document: &mut SemanticDocumentCache, result_id: &str) {
+        let Some(index) = document
+            .baseline_order
+            .iter()
+            .position(|id| id == result_id)
+        else {
             return;
         };
-        let Some(index) = order.iter().position(|id| id == result_id) else {
-            return;
-        };
-        if index + 1 == order.len() {
+        if index + 1 == document.baseline_order.len() {
             return;
         }
-        let result_id = order.remove(index);
-        order.push(result_id);
+        let result_id = document
+            .baseline_order
+            .remove(index)
+            .expect("index came from position");
+        document.baseline_order.push_back(result_id);
     }
 
     /// Retrieve semantic tokens for a document.
     pub fn get(&self, uri: &Url) -> Option<CachedSemanticTokens> {
-        self.cache.get(uri).map(|entry| entry.clone())
+        self.documents
+            .get(uri)
+            .and_then(|document| document.current.clone())
     }
 
     /// Get cached tokens if they were computed for this exact `language` under
@@ -143,7 +165,8 @@ impl SemanticTokenCache {
         language: &str,
         cache_key: u64,
     ) -> Option<Arc<SemanticTokens>> {
-        self.cache.get(uri).and_then(|entry| {
+        self.documents.get(uri).and_then(|document| {
+            let entry = document.current.as_ref()?;
             if entry.cache_key == cache_key && entry.language == language {
                 Some(Arc::clone(&entry.tokens))
             } else {
@@ -163,7 +186,8 @@ impl SemanticTokenCache {
         language: &str,
         snapshot: SemanticSnapshotIdentity,
     ) -> Option<Arc<SemanticTokens>> {
-        self.cache.get(uri).and_then(|entry| {
+        self.documents.get(uri).and_then(|document| {
+            let entry = document.current.as_ref()?;
             if entry.snapshot == snapshot && entry.language == language {
                 Some(Arc::clone(&entry.tokens))
             } else {
@@ -176,9 +200,11 @@ impl SemanticTokenCache {
     /// settings/query reload to reclaim memory; the generation bump is what makes
     /// the invalidation race-safe, this just stops the dead entries from leaking.
     pub fn clear(&self) {
-        self.cache.clear();
-        self.baselines.clear();
-        self.baseline_order.clear();
+        for mut document in self.documents.iter_mut() {
+            document.current = None;
+            document.baselines.clear();
+            document.baseline_order.clear();
+        }
     }
 
     /// Get cached tokens if the result_id matches.
@@ -187,32 +213,32 @@ impl SemanticTokenCache {
     /// - No tokens are cached for this URI
     /// - The cached result_id doesn't match the expected one
     pub fn get_if_valid(&self, uri: &Url, expected_result_id: &str) -> Option<Arc<SemanticTokens>> {
-        if let Some(tokens) = self.cache.get(uri).and_then(|entry| {
-            if entry.tokens.result_id.as_deref() == Some(expected_result_id) {
-                Some(Arc::clone(&entry.tokens))
-            } else {
-                None
-            }
+        let mut document = self.documents.get_mut(uri)?;
+        if let Some(tokens) = document.current.as_ref().and_then(|entry| {
+            (entry.tokens.result_id.as_deref() == Some(expected_result_id))
+                .then(|| Arc::clone(&entry.tokens))
         }) {
             return Some(tokens);
         }
-        let tokens = self
-            .baselines
-            .get(&(uri.clone(), expected_result_id.to_string()))
-            .map(|entry| Arc::clone(&entry));
+        let tokens = document.baselines.get(expected_result_id).map(Arc::clone);
         if tokens.is_some() {
-            self.touch_baseline(uri, expected_result_id);
+            Self::touch_baseline(&mut document, expected_result_id);
         }
         tokens
     }
 
     /// Remove cached tokens for a document (e.g., on document close).
-    pub fn remove(&self, uri: &Url) {
-        self.cache.remove(uri);
-        if let Some((_, order)) = self.baseline_order.remove(uri) {
-            for result_id in order {
-                self.baselines.remove(&(uri.clone(), result_id));
-            }
+    pub fn remove(&self, uri: &Url, incarnation: Option<u64>) {
+        let mut document = self.documents.entry(uri.clone()).or_default();
+        document.current = None;
+        document.baselines.clear();
+        document.baseline_order.clear();
+        if let Some(incarnation) = incarnation {
+            document.closed_incarnation = Some(
+                document
+                    .closed_incarnation
+                    .map_or(incarnation, |closed| closed.max(incarnation)),
+            );
         }
     }
 }
@@ -870,6 +896,37 @@ mod tests {
     }
 
     #[test]
+    fn closed_lifetime_cannot_recreate_semantic_cache_state() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///closed.rs").unwrap();
+        cache.remove(&uri, Some(3));
+        cache.store(
+            uri.clone(),
+            SemanticTokens {
+                result_id: Some("late".to_string()),
+                data: vec![],
+            },
+            "rust".to_string(),
+            1,
+            snapshot(7, 3, 0),
+        );
+        assert!(cache.get(&uri).is_none());
+        assert!(cache.get_if_valid(&uri, "late").is_none());
+
+        cache.store(
+            uri.clone(),
+            SemanticTokens {
+                result_id: Some("reopened".to_string()),
+                data: vec![],
+            },
+            "rust".to_string(),
+            2,
+            snapshot(0, 4, 0),
+        );
+        assert!(cache.get_if_valid(&uri, "reopened").is_some());
+    }
+
+    #[test]
     fn reading_stale_delta_baseline_refreshes_its_eviction_recency() {
         let cache = SemanticTokenCache::new();
         let uri = Url::parse("file:///baseline-recency.rs").unwrap();
@@ -1073,12 +1130,12 @@ mod tests {
         assert!(cache.get(&uri).is_some(), "Should have cached tokens");
 
         // Remove on close
-        cache.remove(&uri);
+        cache.remove(&uri, Some(0));
         assert!(cache.get(&uri).is_none(), "Should return None after remove");
 
         // Removing non-existent URI is safe
         let other_uri = Url::parse("file:///other.rs").unwrap();
-        cache.remove(&other_uri); // Should not panic
+        cache.remove(&other_uri, None); // Should not panic
     }
 
     #[test]

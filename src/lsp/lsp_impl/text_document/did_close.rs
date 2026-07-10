@@ -23,9 +23,13 @@ impl Kakehashi {
         // still holds the old `Arc`, so a later edit would create a *fresh* lock
         // and stop serializing with the in-flight one. The guard is dropped right
         // after the removal — the remaining cleanups touch other subsystems.
-        {
+        let closed_incarnation = {
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
+            let incarnation = self
+                .documents
+                .latest_snapshot(&uri)
+                .map(|view| view.slot.current_incarnation);
             // Drop stored captures lineage BEFORE the removal and INSIDE the
             // edit-lock section (captures-protocol): `store_lineage` inserts
             // under this same lock, so clearing here cannot wipe a lineage a
@@ -47,10 +51,11 @@ impl Kakehashi {
             // after the removal self-removes. Clearing BEFORE the removal
             // would reopen the resurrection leak (codex review).
             self.captures_match_cache.clear_document(&uri);
-        }
+            incarnation
+        };
 
         // Clean up all caches for this document (semantic tokens, injections, requests)
-        self.cache.remove_document(&uri);
+        self.cache.remove_document(&uri, closed_incarnation);
 
         // Clean up region ID mappings for this document
         // (lazy-node-identity-tracking). This runs AFTER the removal above
