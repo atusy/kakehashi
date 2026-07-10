@@ -62,6 +62,7 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
             | "textDocument/inlayHint"
             | "textDocument/linkedEditingRange"
             | "textDocument/onTypeFormatting"
+            | "textDocument/prepareRename"
             | "textDocument/rename"
     )
 }
@@ -2678,6 +2679,7 @@ mod tests {
             "textDocument/inlayHint",
             "textDocument/linkedEditingRange",
             "textDocument/onTypeFormatting",
+            "textDocument/prepareRename",
             "textDocument/rename",
         ] {
             assert!(method_requires_contiguous_injection(method), "{method}");
