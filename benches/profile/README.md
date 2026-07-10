@@ -39,10 +39,12 @@ python3 benches/profile/drive.py \
   --file path/to/input.md --requests 20 --burst 8 --burst-edits
 ```
 
-The driver reports per-method p50/p90/max request-to-response latency, exact
-JSON response-body bytes, cancellations/errors, cycle time, and server
-notification bytes grouped by method. This keeps semantic compute latency
-separate from large captures or diagnostic output that may dominate a cycle.
+The driver reports per-method p50/p90/max request-to-response latency both
+overall and split by outcome (`ok`, cancelled, `null`, error), time to the last
+successful semantic response in each cycle, exact JSON response-body bytes,
+and server notifications/requests grouped separately. This keeps completed
+semantic compute latency separate from cheap supersession responses and from
+large captures or diagnostic output that may dominate a cycle.
 
 With full Xcode installed, Instruments' Time Profiler can also be used from the
 CLI:
@@ -60,11 +62,12 @@ suite (or `make deps/tree-sitter`) once populates it.
 
 ## Why it's shaped this way
 
-- **Drive synchronously, don't pipe a static session.** The server coalesces
-  superseded requests: if many `semanticTokens/full` calls are queued at once it
-  answers all but the last with `-32800 Canceled` and does no real work. `drive.py`
-  waits for each response before sending the next, so every request actually
-  computes. (`gen_session.py` can still emit a framed session for other uses.)
+- **Drive synchronously, don't pipe a static session.** The default isolates one
+  request at a time; without `--edits`, requests after warmup intentionally
+  measure unchanged-snapshot cache hits. Add `--edits 1` to measure the
+  edit→reparse→recompute path, or `--burst`/`--burst-edits` to measure
+  supersession pressure with completed, cancelled, and `null` latency reported
+  separately. (`gen_session.py` can still emit a framed session for other uses.)
 - **Profile the server, driven by Python.** The semantic-tokens code is
   `pub(crate)`, so it can't be called from a bench/example. samply launches the
   driver and follows its child (the server), capturing the server's stacks.

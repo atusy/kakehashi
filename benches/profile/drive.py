@@ -188,8 +188,8 @@ def main() -> None:
         help="simulate typing: before each request, send this many incremental "
              "didChange edits (appending/removing a char at the end of the first "
              "line), then request tokens. Exercises the edit->reparse->recompute "
-             "cycle instead of the unchanged-document cache hit; token counts "
-             "may reflect a trailing snapshot (serve-stale).")
+             "cycle instead of the unchanged-document cache hit; the request "
+             "parks until the matching parse snapshot is current.")
     ap.add_argument(
         "--data-dir", default=os.path.join(os.getcwd(), "deps/test/kakehashi"),
         help="parser/query data dir; must already contain installed parsers "
