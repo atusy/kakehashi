@@ -137,7 +137,7 @@ impl Kakehashi {
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
             log::debug!(target: "kakehashi::diagnostic", "No language detected");
-            self.diagnostics.mark_served(&uri, served_version);
+            self.mark_pull_covered(&uri, served_version);
             return Ok(empty_diagnostic_report());
         };
 
@@ -158,7 +158,7 @@ impl Kakehashi {
                 "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
                 language_name
             );
-            self.diagnostics.mark_served(&uri, served_version);
+            self.mark_pull_covered(&uri, served_version);
             return Ok(empty_diagnostic_report());
         }
 
@@ -358,11 +358,12 @@ impl Kakehashi {
         // aggregator holds live region pushes — the fold above then silently
         // skipped every cached `Region` slot, so this answer is missing whole
         // servers' diagnostics. A pull must respond (there is no "defer" for a
-        // request), so serve the degraded set — but do NOT mark it served:
-        // coverage stays dirty, and the next push-origin change nudges the
-        // client back to a full view instead of the gap being masked until the
-        // next edit. The predicate mirrors `republish`'s `needs_geometry`
-        // (non-empty region slots only).
+        // request), so serve the degraded set — but do NOT mark it served, and
+        // record the per-host debt: the reparse loop's post-parse pass
+        // consumes it and requests the recovery refresh (coverage-gated) that
+        // brings the client back to a full view, instead of the gap being
+        // masked until the next edit. The predicate mirrors `republish`'s
+        // `needs_geometry` (non-empty region slots only).
         let degraded_virt =
             virt_enabled && snapshot.is_none() && self.diagnostics.has_region_slots(&uri);
 
@@ -375,9 +376,7 @@ impl Kakehashi {
             // `DiagnosticAggregator::degraded_pulls`).
             self.diagnostics.record_degraded_pull(&uri);
         } else {
-            self.diagnostics.mark_served(&uri, served_version);
-            // A covering pull supersedes any earlier degraded answer.
-            self.diagnostics.forget_degraded_pull(&uri);
+            self.mark_pull_covered(&uri, served_version);
         }
 
         let items = combine_layer_diagnostics(&layer_cfg, virt_items, host_items);
@@ -393,6 +392,15 @@ impl Kakehashi {
             return Ok(unchanged_diagnostic_report(result_id));
         }
         Ok(make_diagnostic_report(items, result_id))
+    }
+
+    /// A pull answered with a covering (non-degraded) report: advance the
+    /// coverage `served` marker and clear any earlier degraded-pull debt —
+    /// every covering exit must do both, or a stale debt would later fire an
+    /// unnecessary (though coverage-gated) recovery refresh.
+    fn mark_pull_covered(&self, uri: &Url, served_version: u64) {
+        self.diagnostics.mark_served(uri, served_version);
+        self.diagnostics.forget_degraded_pull(uri);
     }
 
     /// pushFallback fold (Path B, #425): append push-driven servers' cached
@@ -969,10 +977,10 @@ mod tests {
         // bounded parse wait lapses (no snapshot) while the aggregator holds
         // live region pushes, the answer is missing whole servers' diagnostics
         // (the fold skips region slots without offsets). The answer must still
-        // be served — a pull cannot defer — but it must NOT advance `served`:
-        // coverage stays dirty so the next push-origin change nudges the
-        // client back to a full view instead of the gap being masked until the
-        // next edit.
+        // be served — a pull cannot defer — but it must NOT advance `served`,
+        // and it records the per-host debt the post-parse pass consumes to
+        // fire the recovery refresh that brings the client back to a full
+        // view.
         let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
         let server = service.inner();
         server
