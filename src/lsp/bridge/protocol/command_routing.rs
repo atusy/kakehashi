@@ -68,12 +68,14 @@ pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Opt
         // covers all four call sites (initial bare/embedded command, virt and
         // host resolve), which fail closed on the `None` — deduplicated per
         // distinct origin so per-action shaping loops don't spam the log.
-        static WARNED_ORIGINS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
-            std::sync::Mutex::new(None);
+        // (Not `Mutex::new(HashSet::new())` in a plain static: `HashSet::new`
+        // is not const — it builds a RandomState. LazyLock defers it.)
+        static WARNED_ORIGINS: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashSet<String>>,
+        > = std::sync::LazyLock::new(Default::default);
         let first_for_origin = WARNED_ORIGINS
             .lock()
             .map(|mut set| {
-                let set = set.get_or_insert_with(Default::default);
                 // Check before allocating: after the first warn, the hot
                 // per-action path pays only a lookup.
                 !set.contains(origin) && set.insert(origin.to_string())
@@ -83,9 +85,10 @@ pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Opt
             log::warn!(
                 target: "kakehashi::bridge",
                 "cannot mint routing names for server '{origin}' (first affected \
-                 command: '{command}'): the server name or host URI contains the \
-                 reserved separator; its commands are dropped — rename the server \
-                 in languageServers to fix this"
+                 command: '{command}'): the server name or the host URI contains \
+                 the reserved 0x1f separator, so its routed commands are dropped. \
+                 If the server name is the culprit, rename it in languageServers; \
+                 a separator in a document URI has no config fix"
             );
         }
         return None;
