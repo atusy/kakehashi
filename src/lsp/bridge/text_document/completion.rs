@@ -176,8 +176,9 @@ fn transform_completion_response_to_host(
 /// injection region — escapes it, corrupts per-line `> ` prefixes, or merges
 /// content into the closing fence — if applied verbatim; the caller must
 /// drop the whole item (same fail-closed rule as WorkspaceEdit bridging).
-/// Unsafe `additionalTextEdits` are merely stripped: the primary insertion
-/// still works without them, so the item stays useful.
+/// An unsafe `additionalTextEdits` member drops the whole array instead:
+/// the primary insertion still applies, though possibly semantically
+/// incomplete (e.g. without its auto-import) — availability over fidelity.
 pub(super) fn transform_completion_item(
     item: &mut CompletionItem,
     offset: &RegionOffset,
@@ -1473,9 +1474,9 @@ mod tests {
     #[test]
     fn mixed_offset_boundary_rows_reject_multiline_fallbacks() {
         // Mixed per-line offsets [2,0,0] (a blockquote with a lazy
-        // continuation line): the trailing recorded zeros are BOUNDARY rows
-        // whose real prefix is unrecorded: host 4 is the lazy-continuation
-        // CONTENT row (recorded 0), host 5 the boundary. A multi-line
+        // continuation line): host 4 is the lazy-continuation CONTENT row
+        // (recorded 0); host 5 is the BOUNDARY row, whose real prefix is
+        // unrecorded. A multi-line
         // fallback insertion on host 4 must reject — its following row is
         // the boundary; the same shape in an all-zero region has no boundary
         // semantics and passes.
