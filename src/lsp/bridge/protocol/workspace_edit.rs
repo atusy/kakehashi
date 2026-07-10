@@ -323,7 +323,8 @@ pub(crate) fn text_edit_within_region(
 
 /// Combined per-edit safety check for response transforms: an
 /// already-host-translated edit is safe iff it stays inside the region AND
-/// keeps the region's per-line prefixes. Range translation guarantees the
+/// preserves its structure (per-line prefixes and the newline separating
+/// content from the closing fence). Range translation guarantees the
 /// start bound, but not the end: a stale/oversized downstream range still
 /// translates to a host range that overruns the closing fence (or the rest of
 /// an inline region's host line), so containment must be checked explicitly.

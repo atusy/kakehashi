@@ -274,8 +274,8 @@ pub(crate) struct KakehashiEnvelope {
     /// Region offset snapshot for coordinate transformation of the resolved response.
     pub offset: EnvelopeOffset,
     /// Region end (host `(line, character)`) snapshot for the resolve-path
-    /// prefix-safety guard — the resolve has no region-content access, so it
-    /// can't recompute this. `None` (via `serde(default)`) for envelopes
+    /// safety guard (containment, prefixes, fence boundary) — the resolve has
+    /// no region-content access, so it can't recompute this. `None` (via `serde(default)`) for envelopes
     /// minted before this field existed → the resolve path falls back to a
     /// fully fail-closed guard in prefixed regions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -324,7 +324,7 @@ pub(crate) struct EnvelopeContext<'a> {
     /// `completionItem/resolve` can route back to the originating connection.
     pub host_uri: &'a str,
     pub offset: &'a RegionOffset,
-    /// Region end (host coords) snapshot for the resolve-path prefix guard;
+    /// Region end (host coords) snapshot for the resolve-path safety guard;
     /// `None` only when re-enveloping a legacy envelope that never carried it.
     pub region_end: Option<Position>,
 }

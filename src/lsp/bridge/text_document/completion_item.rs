@@ -7,8 +7,9 @@
 //! completion that produced this item. If the downstream server has since
 //! restarted (or the connection was recreated), the resolve fails and we
 //! return the unresolved item with envelope intact: graceful degradation.
-//! The same degradation serves a resolved item whose primary edit would break
-//! per-line region prefixes (see `resolve_guard_region_end`).
+//! The same degradation serves a resolved item whose primary edit is unsafe
+//! for the injection region — escapes it, breaks per-line prefixes, or merges
+//! content into the closing fence (see `resolve_guard_region_end`).
 
 use std::sync::Arc;
 
@@ -189,8 +190,8 @@ impl LanguageServerPool {
                     re_envelope_item(&mut resolved, &envelope);
                     resolved
                 } else {
-                    // The resolved primary edit would corrupt region line
-                    // prefixes — serve the original (already host-translated,
+                    // The resolved primary edit is unsafe for the injection
+                    // region — serve the original (already host-translated,
                     // guard-passed) item instead of a corrupting one.
                     warn!(
                         target: "kakehashi::bridge",
