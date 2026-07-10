@@ -303,6 +303,13 @@ pub(crate) fn text_edit_within_region(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
+    // A REVERSED range (start after end) is malformed; some clients would
+    // normalize it by swapping, turning it into an edit the checks below (and
+    // the prefix/boundary rules, which assume start <= end) never inspected —
+    // reject it outright.
+    if position_after(e.range.start, e.range.end) {
+        return false;
+    }
     // A host position is in-region iff it's at/after the region's start line, at
     // /after that line's column floor, and at/before the region end.
     let in_region = |p: Position| {
@@ -330,7 +337,9 @@ pub(crate) fn text_edit_safe_in_region(
 }
 
 /// Whether every text edit targeting `host_uri` keeps the region's per-line
-/// host prefixes (e.g. a blockquote's `> ` on every line) intact.
+/// host prefixes (e.g. a blockquote's `> ` on every line) intact, and — in
+/// every region shape — preserves the newline separating content from the
+/// closing fence (the fence-boundary EOL rule).
 ///
 /// The virtual→host transform translates RANGES but emits `newText` verbatim
 /// — nothing re-inserts host line prefixes into replacement text. Two edit
@@ -345,9 +354,11 @@ pub(crate) fn text_edit_safe_in_region(
 ///   blockquote region has no line after, so the start line's own offset is
 ///   the only signal there).
 ///
-/// Plain fenced blocks (all-zero column offsets) are unaffected: every edit is
-/// prefix-safe there, which keeps the common case (whole-block refactors like
-/// organize-imports) working. In a prefixed per-line region, the closing-fence
+/// Plain fenced blocks (all-zero column offsets) are exempt from the prefix
+/// rules — every edit is prefix-safe there, which keeps the common case
+/// (whole-block refactors like organize-imports) working — but the
+/// fence-boundary EOL rule still applies to edits reaching a character-0
+/// region end. In a prefixed per-line region, the closing-fence
 /// BOUNDARY row (recorded as a trailing zero entry, or falling past the array)
 /// counts as prefixed, and edits touching it are rejected outright — the row's
 /// real prefix is unrecorded, so even a no-newline insertion at its column 0
@@ -390,7 +401,8 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
 /// shapes that carry bare `TextEdit`s rather than a `WorkspaceEdit`
 /// (formatting-family responses, completion/inlayHint/colorPresentation item
 /// edits). Same contract: `false` means applying the edit verbatim would
-/// strip or omit the region's per-line host prefixes — callers must reject
+/// strip or omit the region's per-line host prefixes, or merge content into
+/// the closing fence (the fence-boundary EOL rule) — callers must reject
 /// or drop, never clamp.
 pub(crate) fn text_edit_preserves_line_prefixes(
     e: &TextEdit,
@@ -1338,5 +1350,40 @@ mod tests {
 
         assert!(!check("y"), "non-newline boundary insert must reject");
         assert!(check("\n"), "insertFinalNewline must pass");
+    }
+
+    #[test]
+    fn reversed_ranges_are_rejected_in_every_region_shape() {
+        // A reversed range (start after end) is malformed, and a client that
+        // normalizes it by swapping would apply an edit none of the rules
+        // inspected (the boundary rule keys on range.end; the multi-line scan
+        // assumes start <= end). Containment must reject it outright.
+        let p = |line: u32, character: u32| Position { line, character };
+        let edit = |start: Position, end: Position, new_text: &str| TextEdit {
+            range: tower_lsp_server::ls_types::Range { start, end },
+            new_text: new_text.to_string(),
+        };
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+
+        // Plain fence: reversed {start: region_end, end: earlier} would
+        // normalize to a replacement ending at the fence without a newline.
+        let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        assert!(!text_edit_safe_in_region(
+            &edit(p(5, 0), p(4, 0), "x"),
+            &plain,
+            region_end
+        ));
+
+        // Prefixed region: reversed multi-line span would normalize to a
+        // prefix-stripping replacement.
+        let prefixed = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        assert!(!text_edit_safe_in_region(
+            &edit(p(4, 4), p(3, 2), "x"),
+            &prefixed,
+            region_end
+        ));
     }
 }

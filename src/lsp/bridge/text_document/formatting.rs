@@ -306,8 +306,9 @@ pub(super) fn transform_formatting_response_to_host(
     {
         warn!(
             target: "kakehashi::bridge",
-            "Dropped a formatting response ({} edit(s)): it would strip the region's \
-             per-line host prefixes (e.g. a blockquote's `> `)",
+            "Dropped a formatting response ({} edit(s)): an edit is unsafe for the \
+             injection region (escapes it, breaks per-line `> ` prefixes, or merges \
+             content into the closing fence)",
             edits.len()
         );
         return Ok(Vec::new());

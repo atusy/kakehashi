@@ -154,7 +154,7 @@ fn transform_completion_response_to_host(
     if dropped > 0 {
         log::warn!(
             target: "kakehashi::bridge",
-            "completion: dropped {dropped} item(s) whose text edit would break region line prefixes"
+            "completion: dropped {dropped} item(s) whose text edit is unsafe for the injection region (escapes it or breaks line prefixes)"
         );
     }
 
@@ -232,7 +232,7 @@ pub(super) fn transform_completion_item(
         if dropped > 0 {
             log::warn!(
                 target: "kakehashi::bridge",
-                "completion: stripped {dropped} additionalTextEdit(s) that would break region line prefixes"
+                "completion: stripped {dropped} additionalTextEdit(s) unsafe for the injection region (escape it or break line prefixes)"
             );
         }
     }

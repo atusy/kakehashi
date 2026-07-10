@@ -194,7 +194,7 @@ impl LanguageServerPool {
                     // guard-passed) item instead of a corrupting one.
                     warn!(
                         target: "kakehashi::bridge",
-                        "completionItem/resolve: resolved item from {} would break region line prefixes; serving unresolved item",
+                        "completionItem/resolve: resolved item from {} carries an edit unsafe for the injection region; serving unresolved item",
                         server_name
                     );
                     re_envelope_item(&mut item, &envelope);

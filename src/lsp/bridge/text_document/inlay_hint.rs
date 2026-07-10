@@ -163,7 +163,7 @@ fn transform_inlay_hint_response_to_host(
             {
                 log::warn!(
                     target: "kakehashi::bridge",
-                    "inlayHint: dropped a hint's textEdits ({}): they would break region line prefixes",
+                    "inlayHint: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it or breaks line prefixes)",
                     text_edits.len()
                 );
                 hint.text_edits = None;

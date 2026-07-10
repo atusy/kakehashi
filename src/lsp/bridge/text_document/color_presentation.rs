@@ -171,7 +171,7 @@ fn transform_color_presentation_response_to_host(
             if stripped > 0 {
                 log::warn!(
                     target: "kakehashi::bridge",
-                    "colorPresentation: stripped {stripped} additionalTextEdit(s) that would break region line prefixes"
+                    "colorPresentation: stripped {stripped} additionalTextEdit(s) unsafe for the injection region (escape it or break line prefixes)"
                 );
             }
         }
@@ -181,7 +181,7 @@ fn transform_color_presentation_response_to_host(
     if dropped > 0 {
         log::warn!(
             target: "kakehashi::bridge",
-            "colorPresentation: dropped {dropped} presentation(s) whose textEdit would break region line prefixes"
+            "colorPresentation: dropped {dropped} presentation(s) whose (implicit or explicit) textEdit is unsafe for the injection region"
         );
     }
 
