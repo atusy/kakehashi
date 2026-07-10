@@ -2107,9 +2107,10 @@ mod tests {
     }
 
     #[test]
-    fn host_layer_policy_keeps_edit_verbatim() {
+    fn host_layer_policy_keeps_edit_uris_and_ranges_untranslated() {
         // Host layer (virt = None): real URIs/coordinates, no translation —
-        // but the suffix and command policy still apply.
+        // but the suffix and command policy still apply (and versions are
+        // nulled, pinned separately by host_layer_edit_versions_are_stripped).
         let actions: Vec<CodeActionOrCommand> = serde_json::from_value(json!([
             {
                 "title": "Sort imports",

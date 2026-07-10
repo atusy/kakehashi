@@ -396,8 +396,9 @@ impl Kakehashi {
 
     /// Host layer: forward the params verbatim to the host language's own
     /// servers, then apply the bridge action policy (suffix, command
-    /// disabling) per winning server. Edits stay verbatim — real URIs and
-    /// coordinates need no translation.
+    /// disabling) per winning server. Edit URIs and coordinates stay
+    /// untranslated (already real); only bridge-local
+    /// `TextDocumentEdit.version`s are nulled.
     async fn code_action_host_layer(
         &self,
         lsp_uri: &Uri,
