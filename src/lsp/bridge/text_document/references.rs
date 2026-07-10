@@ -91,13 +91,13 @@ impl LanguageServerPool {
     }
 }
 
-/// Normalize a `references` response (`Location[] | null`) into `Vec<Location>`,
-/// applying the same URI filter as goto: keep real-file URIs, translate matches
-/// on the request's virtual URI, drop other virtual URIs (cross-region offsets
-/// are unsafe). An empty filtered vec is preserved (not `None`) so callers can
-/// tell "no results" from a downstream error response (`None`). Malformed
-/// success responses are protocol violations and return `Err` so callers can
-/// surface a warning.
+/// Normalize a `references` response (`Location[] | null`) into
+/// `io::Result<Option<Vec<Location>>>`, applying the same URI filter as goto:
+/// keep real-file URIs, translate matches on the request's virtual URI, drop
+/// other virtual URIs (cross-region offsets are unsafe). `Ok(Some(vec))` may
+/// be empty — preserved so callers can tell "no results" from a downstream
+/// error response (`Ok(None)`). A malformed success response is a protocol
+/// violation and returns `Err`, letting callers surface a warning.
 fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
@@ -168,85 +168,11 @@ fn transform_references_response_to_host(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, Once};
-
-    use log::{Level, LevelFilter, Log, Metadata, Record};
 
     use super::super::test_helpers::test_host_uri;
     use super::RegionOffset;
     use super::transform_references_response_to_host;
-
-    static LOGGER: CapturingLogger = CapturingLogger {
-        messages: Mutex::new(Vec::new()),
-    };
-    static INIT_LOGGER: Once = Once::new();
-    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
-    static CAPTURING: AtomicBool = AtomicBool::new(false);
-
-    struct CapturingLogger {
-        messages: Mutex<Vec<String>>,
-    }
-
-    struct CaptureGuard;
-
-    impl Drop for CaptureGuard {
-        fn drop(&mut self) {
-            CAPTURING.store(false, Ordering::Relaxed);
-        }
-    }
-
-    impl Log for CapturingLogger {
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            CAPTURING.load(Ordering::Relaxed)
-                && metadata.level() == Level::Warn
-                && metadata.target() == "kakehashi::bridge"
-        }
-
-        fn log(&self, record: &Record<'_>) {
-            if CAPTURING.load(Ordering::Relaxed) && self.enabled(record.metadata()) {
-                self.messages
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(format!(
-                        "{}:{}:{}",
-                        record.level(),
-                        record.target(),
-                        record.args()
-                    ));
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
-        INIT_LOGGER.call_once(|| {
-            log::set_logger(&LOGGER).expect("test logger should install once");
-            log::set_max_level(LevelFilter::Warn);
-        });
-        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        LOGGER
-            .messages
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
-        CAPTURING.store(true, Ordering::Relaxed);
-        let guard = CaptureGuard;
-        f();
-        drop(guard);
-        let captured = LOGGER
-            .messages
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        LOGGER
-            .messages
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
-        captured
-    }
+    use crate::lsp::bridge::test_logging::captured_warnings_for;
 
     // ==========================================================================
     // References response transformation tests

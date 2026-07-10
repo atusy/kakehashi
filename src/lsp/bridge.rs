@@ -35,6 +35,8 @@ mod progress_registry;
 mod protocol;
 mod root_markers;
 mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_logging;
 mod text_document;
 mod window;
 mod workspace;
