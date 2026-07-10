@@ -26,26 +26,66 @@
 /// lets the serve-current parked waits complete promptly when a newer request
 /// supersedes this one — an `AtomicBool` alone made supersession invisible to
 /// a parked future until its next wakeup.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct CancelToken(tokio_util::sync::CancellationToken);
+#[derive(Debug, Clone)]
+pub(crate) struct CancelToken {
+    inner: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    polls_before_cancel: std::sync::Arc<std::sync::atomic::AtomicIsize>,
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self {
+            inner: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            polls_before_cancel: std::sync::Arc::new(std::sync::atomic::AtomicIsize::new(-1)),
+        }
+    }
+}
 
 impl CancelToken {
     /// Signal cancellation to every holder of this token. Idempotent.
     pub(crate) fn cancel(&self) {
-        self.0.cancel();
+        self.inner.cancel();
     }
 
     /// Returns `true` once [`cancel`](Self::cancel) has been called on this
     /// token or any clone of it.
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.0.is_cancelled()
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let remaining = self.polls_before_cancel.load(Ordering::Relaxed);
+            if remaining > 0
+                && self
+                    .polls_before_cancel
+                    .compare_exchange(
+                        remaining,
+                        remaining - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                && remaining == 1
+            {
+                self.inner.cancel();
+            }
+        }
+        self.inner.is_cancelled()
     }
 
     /// Completes when [`cancel`](Self::cancel) is called on this token or any
     /// clone of it (immediately if it already was). Cancel-safe: dropping the
     /// future loses nothing.
     pub(crate) async fn cancelled(&self) {
-        self.0.cancelled().await;
+        self.inner.cancelled().await;
+    }
+
+    /// Deterministically flip during a later cooperative checkpoint.
+    #[cfg(test)]
+    pub(crate) fn cancel_after_polls(&self, polls: isize) {
+        self.polls_before_cancel
+            .store(polls, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

@@ -879,6 +879,19 @@ mod tests {
     }
 
     #[test]
+    fn finalize_tokens_cancellable_stops_at_periodic_mid_pass_checkpoint() {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(3);
+        let tokens = (0..512)
+            .map(|line| make_token(line, 0, 1, "variable", 0, 0))
+            .collect();
+        let lines = vec!["x"; 512];
+
+        assert!(finalize_tokens_cancellable(tokens, &[], &lines, Some(&cancel)).is_none());
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
     fn finalize_tokens_returns_none_for_empty_input() {
         let tokens: Vec<RawToken> = vec![];
         assert!(finalize_tokens(tokens, &[], &[]).is_none());

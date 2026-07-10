@@ -791,6 +791,47 @@ mod tests {
     }
 
     #[test]
+    fn collect_host_tokens_stops_after_periodic_mid_walk_cancel() {
+        let declarations = (0..256)
+            .map(|index| format!("let value_{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = format!("fn main() {{\n{declarations}\n}}");
+        let tree = parse_rust_tree(&code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @variable").unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(3);
+        let mut tokens = Vec::new();
+
+        let completed = collect_host_tokens(
+            &code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            &code,
+            &lines,
+            &build_line_start_bytes(&code),
+            0,
+            0,
+            false,
+            &[],
+            &[],
+            Some(&cancel),
+            &mut tokens,
+        );
+
+        assert!(!completed);
+        assert!(cancel.is_cancelled());
+        assert!(
+            !tokens.is_empty(),
+            "cancellation should land after collection began, not at entry"
+        );
+    }
+
+    #[test]
     fn collect_host_tokens_exclusion_suppresses_strictly_contained_tokens() {
         // "fn main() {}" — "main" identifier node is at [3, 7)
         let code = "fn main() {}";

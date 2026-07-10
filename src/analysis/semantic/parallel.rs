@@ -1830,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn process_injection_sync_returns_incomplete_when_cancelled() {
+    fn process_injection_sync_returns_incomplete_on_mid_region_cancel() {
         use crate::config::WorkspaceSettings;
 
         let coordinator = LanguageCoordinator::new();
@@ -1846,12 +1846,16 @@ mod tests {
             return;
         };
         let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_parallel());
-        let code = "fn main() {}";
+        let declarations = (0..256)
+            .map(|index| format!("let value_{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = format!("fn main() {{\n{declarations}\n}}");
         let host_lines: Vec<&str> = code.lines().collect();
         let ctx = InjectionContext {
             resolved_lang: "rust".to_string(),
             highlight_query,
-            content_text: code,
+            content_text: &code,
             host_start_byte: 0,
             included_ranges: None,
             prefix_byte_widths: Vec::new(),
@@ -1859,16 +1863,16 @@ mod tests {
             region_cache: None,
         };
         let cancel = crate::cancel::CancelToken::default();
-        cancel.cancel();
+        cancel.cancel_after_polls(3);
 
         let result = process_injection_sync(
             &ctx,
             &factory,
             &coordinator,
             None,
-            code,
+            &code,
             &host_lines,
-            &build_line_start_bytes(code),
+            &build_line_start_bytes(&code),
             1,
             false,
             Some(&cancel),
@@ -1876,6 +1880,7 @@ mod tests {
 
         assert!(result.tokens.is_empty());
         assert!(!result.fully_loaded);
+        assert!(cancel.is_cancelled());
     }
 
     /// Returns the search path for tree-sitter grammars.
