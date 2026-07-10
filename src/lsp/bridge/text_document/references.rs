@@ -199,6 +199,26 @@ mod tests {
     }
 
     #[test]
+    fn references_response_with_jsonrpc_error_returns_ok_none() {
+        // A downstream error response is a protocol-legal "no answer": it must
+        // stay Ok(None), not become Err (which is reserved for violations).
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": { "code": -32603, "message": "internal error" }
+        });
+
+        let transformed = transform_references_response_to_host(
+            response,
+            "file:///virtual.lua",
+            &test_host_uri(),
+            &RegionOffset::new(5, 0),
+        );
+
+        assert!(transformed.unwrap().is_none());
+    }
+
+    #[test]
     fn references_response_warns_on_missing_result_success() {
         let warnings = captured_warnings_for(|| {
             let response = serde_json::json!({
