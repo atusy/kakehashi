@@ -449,6 +449,9 @@ fn load_kind_query(
 struct ComputedCaptures {
     uri: Url,
     incarnation: u64,
+    /// Settings/query generation used by the walk. A reload can leave the
+    /// document text unchanged while changing capture semantics.
+    generation: u64,
     /// The live `content_version` at snapshot resolution. The resolved
     /// snapshot is current at that instant (serve-current park), but an edit
     /// landing DURING the walk still voids the lineage store: the response
@@ -586,7 +589,8 @@ impl Kakehashi {
     /// (or closed-and-reopened) or its text moved past the computed snapshot
     /// while the request was in flight. Returns whether the lineage landed.
     ///
-    /// Three guards, all under the same per-URI edit lock `didClose` and
+    /// Four guards, with document lifetime/version checks under the same
+    /// per-URI edit lock `didClose` and
     /// `didChange` hold around their mutations:
     /// - liveness: a close that won the lock first leaves the document gone,
     ///   so the check skips the insert; an insert that won first is cleared by
@@ -603,6 +607,8 @@ impl Kakehashi {
     ///   stored and the caller answers `null`. Under serve-current the
     ///   snapshot was current at resolution, so this guard covers exactly the
     ///   resolve→delivery window.
+    /// - generation: a settings/query reload can change captures without an
+    ///   edit, so a lineage computed under the prior generation is rejected.
     async fn store_lineage(
         &self,
         computed: ComputedCaptures,
@@ -618,7 +624,7 @@ impl Kakehashi {
         let still_current = self.documents.get(&uri).is_some_and(|doc| {
             doc.incarnation() == computed.incarnation
                 && doc.content_version() == computed.entry_content_version
-        });
+        }) && self.cache.semantic_token_generation() == computed.generation;
         if still_current {
             let mut entry = self.captures_cache.entry((uri, kind)).or_default();
             entry[usize::from(injection)] = Some((result_id, computed.matches));
@@ -1001,6 +1007,7 @@ impl Kakehashi {
                         .map(|(matches, skipped)| ComputedCaptures {
                             uri,
                             incarnation,
+                            generation,
                             entry_content_version,
                             matches,
                             skipped,
@@ -1033,6 +1040,7 @@ impl Kakehashi {
                             return Ok(result.map(|(matches, skipped)| ComputedCaptures {
                                 uri,
                                 incarnation,
+                                generation,
                                 entry_content_version,
                                 matches,
                                 skipped,
@@ -1286,6 +1294,7 @@ impl Kakehashi {
         Ok(result.map(|(matches, skipped)| ComputedCaptures {
             uri,
             incarnation,
+            generation,
             entry_content_version,
             matches,
             skipped,
@@ -2171,6 +2180,47 @@ mod tests {
         assert!(
             service.inner().captures_walk_cache.get(&key).is_none(),
             "the delayed old loser must not recreate an obsolete memo"
+        );
+    }
+
+    #[tokio::test]
+    async fn captures_lineage_rejects_pre_reload_generation() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///captures_reload.rs").unwrap();
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let view = service.inner().documents.latest_snapshot(&uri).unwrap();
+        let generation = service.inner().cache.semantic_token_generation();
+        service.inner().cache.bump_semantic_token_generation();
+
+        let landed = service
+            .inner()
+            .store_lineage(
+                ComputedCaptures {
+                    uri: uri.clone(),
+                    incarnation: view.slot.current_incarnation,
+                    generation,
+                    entry_content_version: view.content_version,
+                    matches: std::sync::Arc::new(Vec::new()),
+                    skipped: std::sync::Arc::new(Vec::new()),
+                },
+                "highlights".to_string(),
+                false,
+                "old-generation".to_string(),
+            )
+            .await;
+
+        assert!(!landed);
+        assert!(
+            service
+                .inner()
+                .captures_cache
+                .get(&(uri, "highlights".to_string()))
+                .is_none()
         );
     }
 
