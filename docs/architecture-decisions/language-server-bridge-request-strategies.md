@@ -238,7 +238,9 @@ bridge-local `TextDocumentEdit.version` values are cleared before relaying —
 while entries addressed to other regions' virtual URIs (meaningless to the
 editor) are FILTERED out with usable siblings surviving. The whole result is
 rejected only when an edit fails the region-safety guards or the edit carries
-a file operation (create/rename/delete) targeting a virtual URI.
+a create/rename/delete file operation referencing ANY virtual URI (including
+the request's own) — dropping just the op would misdirect the ordered
+`documentChanges` that follow it.
 
 #### textDocument/codeAction
 
