@@ -54,41 +54,37 @@ impl LanguageServerPool {
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
 
-            // Only sent/open documents appear here. A pre-send eager-open claim
-            // stays out of the reverse index, so didChange can never overtake its
-            // didOpen merely because both eventually use the same FIFO.
-            if !self.is_document_opened(&virtual_uri) {
-                // Not opened yet - didOpen will be sent on first request
-                continue;
-            }
-
-            // Look up ALL connections that have this virtual doc open.
+            // Include pre-send claims, then serialize behind their didOpen
+            // transition. Otherwise an edit in the claim→enqueue window would
+            // be dropped and the downstream document could remain stale.
             // Multiple servers may handle the same language (e.g., emmylua and
             // lua_ls), and one server may back several workspace roots (#382).
-            let connection_keys = self.get_all_connections_for_virtual_uri(&virtual_uri);
+            let connection_keys = self.connections_opening_or_opened(&virtual_uri);
 
             for connection_key in connection_keys {
-                // Check connection state BEFORE incrementing version.
-                // Non-Ready servers shouldn't consume version numbers.
-                //
-                // TOCTOU note: The connection state is checked under the `connections`
-                // lock, but the lock is released before `increment_document_version`
-                // acquires a separate lock. A server could transition away from Ready
-                // between these two operations. This is acceptable: worst case is a
-                // wasted version number and a silently-failed send (the channel write
-                // is non-blocking fire-and-forget).
-                let handle = {
-                    let connections = self.connections().await;
-                    let Some(handle) = connections.get(&connection_key) else {
-                        continue;
-                    };
-
-                    if handle.state() != ConnectionState::Ready {
-                        continue;
-                    }
-
-                    Arc::clone(handle)
+                // Match didOpen's connections→transition order. Holding the
+                // connection map pins this handle generation while the pending
+                // open settles and the ordered didChange is enqueued.
+                let connections = self.connections().await;
+                let Some(handle) = connections
+                    .get(&connection_key)
+                    .filter(|handle| handle.state() == ConnectionState::Ready)
+                    .cloned()
+                else {
+                    continue;
                 };
+                let transition = self.open_transition_lock(&virtual_uri, &connection_key);
+                let transition_guard = transition.lock().await;
+                if !self.is_document_opened_on_connection(&virtual_uri, &connection_key) {
+                    drop(transition_guard);
+                    drop(connections);
+                    self.remove_open_transition_lock_if_unshared(
+                        &virtual_uri,
+                        &connection_key,
+                        &transition,
+                    );
+                    continue;
+                }
 
                 // Per-connection filter (returns None if this connection hasn't
                 // registered the doc) AND content guard: skip the re-send when this
@@ -125,6 +121,8 @@ impl LanguageServerPool {
                     )
                     .await;
                 }
+                drop(transition_guard);
+                drop(connections);
             }
         }
     }

@@ -825,6 +825,15 @@ impl LanguageServerPool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
 
+    pub(super) fn is_document_opened_on_connection(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        self.document_tracker
+            .is_document_opened_on_connection(virtual_uri, connection_key)
+    }
+
     pub(super) fn document_connection_generation(&self, connection_key: &ConnectionKey) -> u64 {
         self.document_tracker.connection_generation(connection_key)
     }
@@ -881,6 +890,14 @@ impl LanguageServerPool {
     ) -> Vec<ConnectionKey> {
         self.document_tracker
             .get_all_connections_for_virtual_uri(virtual_uri)
+    }
+
+    pub(super) fn connections_opening_or_opened(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+    ) -> Vec<ConnectionKey> {
+        self.document_tracker
+            .connections_opening_or_opened(virtual_uri)
     }
 
     pub(super) fn open_transition_lock(
@@ -5545,6 +5562,68 @@ mod tests {
     // ============================================================
     // forward_didchange multi-server tests
     // ============================================================
+
+    #[tokio::test]
+    async fn forward_didchange_waits_for_pending_didopen_then_sends() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/pending-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua_ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, connection_key.clone()).await;
+        pool.connections
+            .lock()
+            .await
+            .insert(connection_key.clone(), handle);
+
+        let transition = pool.open_transition_lock(&virtual_uri, &connection_key);
+        let transition_guard = transition.lock().await;
+        assert!(
+            pool.document_tracker
+                .try_claim_for_open(&virtual_uri, &connection_key)
+                .await
+        );
+        let claim = pool
+            .document_tracker
+            .open_claim_waiter(&virtual_uri, &connection_key)
+            .unwrap();
+        pool.document_tracker
+            .register_pending_document(&host_uri, &virtual_uri, &connection_key)
+            .await;
+
+        let forwarding = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            tokio::spawn(async move {
+                pool.forward_didchange_to_opened_docs(
+                    &host_uri,
+                    &[crate::lsp::bridge::coordinator::BridgeInjection {
+                        language: "lua".to_string(),
+                        region_id: TEST_ULID_LUA_0.to_string(),
+                        content: "print('new')".to_string(),
+                    }],
+                )
+                .await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !forwarding.is_finished(),
+            "didChange must serialize behind the pending didOpen"
+        );
+
+        assert!(
+            pool.document_tracker
+                .mark_open_sent(&virtual_uri, &connection_key, &claim)
+        );
+        drop(transition_guard);
+        forwarding.await.unwrap();
+        assert_eq!(
+            pool.increment_document_version(&virtual_uri, &connection_key)
+                .await,
+            Some(3),
+            "didChange should advance version after didOpen promotion"
+        );
+    }
 
     /// When the same virtual doc is opened on two servers (e.g., emmylua and lua_ls),
     /// didChange must be forwarded to both.

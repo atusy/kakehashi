@@ -201,6 +201,24 @@ impl DocumentTracker {
             .is_some_and(|keys| keys.contains(connection_key))
     }
 
+    pub(super) fn connections_opening_or_opened(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+    ) -> Vec<ConnectionKey> {
+        let uri = virtual_uri.to_uri_string();
+        let mut connections = self
+            .virtual_to_servers
+            .get(&uri)
+            .map(|keys| keys.clone())
+            .unwrap_or_default();
+        for claim in self.open_claims.iter() {
+            if claim.key().1 == uri && !connections.contains(&claim.key().0) {
+                connections.push(claim.key().0.clone());
+            }
+        }
+        connections
+    }
+
     /// Promote a pre-send claim only after didOpen is confirmed enqueued.
     pub(super) fn mark_open_sent(
         &self,
