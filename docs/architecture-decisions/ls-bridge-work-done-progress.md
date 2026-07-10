@@ -56,7 +56,11 @@ so client–kakehashi–downstream stays consistent and collision-free:
   reordering risk. The blank-only gate was verified against a production
   capture: all 8,134 storm begins in a one-minute basedpyright session were
   fully blank (empty title, no message, no percentage), while every
-  legitimate begin carried a title.
+  legitimate begin carried a title. The same capture also settles why only
+  the **begin** classifies and a renderable `report` does not upgrade a
+  swallowed lifecycle: 8,288 of the storm's 8,351 reports carried a
+  message ("analyzing 1 file", once per pass), so report-based upgrading
+  would re-admit essentially the entire flood.
 - **cancel** (editor → bridge notification): `RequestIdCapture` intercepts
   `window/workDoneProgress/cancel` (as it already does for `$/cancelRequest`),
   resolves the upstream token to the owning downstream and its original token,

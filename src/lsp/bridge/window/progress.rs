@@ -136,6 +136,14 @@ pub(in crate::lsp::bridge) fn forward(
         ProgressAdmission::Drop => {
             // Swallowed lifecycle (blank begin) or report/end without a begin:
             // nothing reaches the editor. An End still clears the mapping.
+            //
+            // Deliberately, a renderable REPORT does not upgrade a swallowed
+            // lifecycle: only the begin classifies. In the production storm
+            // this gate exists for, 8,288 of 8,351 reports carried a message
+            // ("analyzing 1 file" per pass) under blank begins — upgrading on
+            // renderable reports would re-admit essentially the whole flood.
+            // A downstream that wants its progress rendered must say so at
+            // begin time (title/message/percentage/cancellable).
             if is_end {
                 deps.progress_registry
                     .complete(deps.progress_connection_id, &params.token);
