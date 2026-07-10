@@ -1103,12 +1103,13 @@ mod tests {
 
     #[test]
     fn transform_translates_utf16_prefix_widths() {
-        // Per-line offsets are UTF-16 code units. A blockquote prefix built
-        // from a non-ASCII marker (e.g. "＞ " — U+FF1E is ONE UTF-16 unit but
-        // three UTF-8 bytes) must translate by its UTF-16 width; a byte-width
-        // confusion in the offsets would shift every translated column. The
-        // fixture pins the transform against a width that differs between the
-        // two encodings ("＞ " = 2 UTF-16 units, 4 bytes).
+        // Per-line offsets are UTF-16 code units by contract: the transform
+        // adds the STORED width verbatim, so this test pins only that
+        // addition (offset 2 → +2 columns). The byte-vs-UTF-16 distinction is
+        // enforced where offsets are MINTED — see
+        // compute_line_column_offsets_converts_non_ascii_prefix_to_utf16 in
+        // language/injection/content.rs, whose fullwidth prefix would mint 4
+        // if the width were byte-derived.
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
         let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2]);

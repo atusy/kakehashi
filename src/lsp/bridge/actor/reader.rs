@@ -1115,27 +1115,9 @@ mod tests {
     ///
     /// Returns the deps along with the receivers (stored in a tuple) to keep them alive.
     fn dummy_server_request_deps() -> (ServerRequestDeps, impl std::any::Any) {
-        let (tx, rx) = mpsc::channel(16);
-        let caps = Arc::new(DynamicCapabilityRegistry::new());
-        let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
-        let (window_tx, window_rx) = mpsc::channel(16);
-        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
-        let progress_connection_id = progress_registry.new_connection_id();
-        let deps = ServerRequestDeps {
-            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
-            server_name: None,
-            response_tx: tx,
-            dynamic_capabilities: caps,
-            upstream_tx,
-            workspace_folders: WorkspaceFolderSet::new(None),
-            window_tx,
-            upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
-            progress_registry,
-            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
-            progress_connection_id,
-        };
-        (deps, (rx, upstream_rx, window_rx))
+        // Same construction as the typed builder; callers here only need the
+        // receivers kept alive, not read.
+        dummy_server_request_deps_with_rx()
     }
 
     #[tokio::test]
@@ -3591,7 +3573,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_edit_rejects_unparseable_params_with_invalid_params() {
-        let (deps, mut keep) = dummy_server_request_deps_with_rx();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
         let message = json!({
             "jsonrpc": "2.0", "id": 9, "method": "workspace/applyEdit",
             "params": { "edit": "not-an-object" }
@@ -3604,7 +3587,7 @@ mod tests {
             &deps,
         );
 
-        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), keep.0.recv())
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
             .await
             .expect("a response must be produced")
             .expect("channel open");
@@ -3622,7 +3605,8 @@ mod tests {
         // The forwarding loop dying mid-flight (or losing the editor response)
         // drops the reply sender; the downstream must still get a response —
         // applied:false with the neutral reason — never a hang.
-        let (mut deps, mut keep) = dummy_server_request_deps_with_rx();
+        let (mut deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
         let (request_tx, mut request_rx) = mpsc::unbounded_channel();
         deps.upstream_request_tx = request_tx;
         let message = json!({
@@ -3646,7 +3630,7 @@ mod tests {
         };
         drop(reply);
 
-        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), keep.0.recv())
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
             .await
             .expect("a response must be produced")
             .expect("channel open");
@@ -3669,7 +3653,8 @@ mod tests {
         // answers applied:false via the dropped reply channel — the
         // downstream never hangs and the registry entry doesn't leak into
         // the #404 cancel path.
-        let (deps, mut keep) = dummy_server_request_deps_with_rx();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
         // dummy deps' upstream_request_tx receiver is already dropped.
         let message = json!({
             "jsonrpc": "2.0", "id": 11, "method": "workspace/applyEdit",
@@ -3683,7 +3668,7 @@ mod tests {
             &deps,
         );
 
-        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), keep.0.recv())
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
             .await
             .expect("a response must be produced")
             .expect("channel open");
@@ -3691,6 +3676,14 @@ mod tests {
             panic!("expected an untracked server-request response");
         };
         assert_eq!(value["result"]["applied"], false, "got: {value}");
+        // The failed-enqueue path must also unregister its just-made registry
+        // entry, or it would leak into the #404 cancel path.
+        assert!(
+            !deps
+                .inbound_request_registry
+                .is_registered(deps.progress_connection_id, &jsonrpc::Id::Number(11)),
+            "the registry entry must not leak after a failed enqueue"
+        );
     }
 
     /// Like `dummy_server_request_deps` but hands back the typed receiver

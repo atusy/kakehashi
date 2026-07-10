@@ -141,6 +141,21 @@ impl InboundRequestRegistry {
             }
         }
     }
+
+    /// Test-only probe: whether an entry is currently registered. Production
+    /// code must not branch on this (register/unregister own the lifecycle).
+    #[cfg(test)]
+    pub(crate) fn is_registered(
+        &self,
+        connection_id: ProgressConnectionId,
+        request_id: &jsonrpc::Id,
+    ) -> bool {
+        self.inner
+            .lock()
+            .recover_poison("InboundRequestRegistry::is_registered")
+            .get(&connection_id)
+            .is_some_and(|requests| requests.contains_key(request_id))
+    }
 }
 
 #[cfg(test)]
