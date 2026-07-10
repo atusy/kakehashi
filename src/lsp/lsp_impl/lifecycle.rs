@@ -454,7 +454,10 @@ impl Kakehashi {
         //   window/showMessage, and telemetry/event.
         // - unbounded `upstream_request_rx` (loss-intolerant): downstream
         //   requests forwarded with a response relayed back
-        //   (window/showMessageRequest, window/showDocument, workspace/applyEdit).
+        //   (window/showMessageRequest, window/showDocument, and — only when
+        //   the editor declared the capability — workspace/applyEdit; without
+        //   it the reader answers applied:false locally and nothing reaches
+        //   this channel).
         if let Some(upstream_rx) = self.bridge.take_upstream_rx()
             && let Some(window_rx) = self.bridge.take_window_rx()
             && let Some(upstream_request_rx) = self.bridge.take_upstream_request_rx()
@@ -3002,9 +3005,11 @@ mod tests {
             .expect("reply delivered");
         // And nothing was emitted toward the editor: the request stream must
         // be empty (a regression that both forwards and answers locally would
-        // otherwise pass).
+        // otherwise pass). Yield first so a wrongly-spawned forward gets a
+        // fair chance to run before the bounded negative-observation window.
+        tokio::task::yield_now().await;
         let no_request = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(250),
             futures::StreamExt::next(&mut requests),
         )
         .await;
