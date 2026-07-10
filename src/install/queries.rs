@@ -530,8 +530,17 @@ pub fn remove_query_install_and_backups(
     };
 
     if queries_dir.exists() {
-        fs::remove_dir_all(&queries_dir)?;
-        removal.removed_queries = true;
+        // NotFound = the dir vanished between the exists() check and the
+        // removal (external cleanup — the lock only serializes kakehashi's
+        // own installers): already gone is the desired end state, so treat
+        // it as removed rather than failing the uninstall.
+        match fs::remove_dir_all(&queries_dir) {
+            Ok(()) => removal.removed_queries = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                removal.removed_queries = true;
+            }
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        }
     }
 
     // Propagate per-entry read_dir errors: uninstall must not report success
@@ -547,7 +556,13 @@ pub fn remove_query_install_and_backups(
             && backup_is_owned(&path)
         {
             let ownership = backup_ownership_sidecar(&path);
-            fs::remove_dir_all(path)?;
+            // Same NotFound tolerance as the canonical dir above: a backup
+            // deleted externally after enumeration is already the end state.
+            match fs::remove_dir_all(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(QueryInstallError::IoError(e)),
+            }
             let _ = fs::remove_file(ownership);
             removal.removed_backups = true;
         }
