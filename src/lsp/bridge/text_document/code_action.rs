@@ -213,7 +213,7 @@ fn finalize_host_resolved_action(
 ) -> CodeAction {
     // Clone the origin so later `envelope` mutation (lazy re-envelope) doesn't
     // conflict with the `&str` borrows below; resolve is a cold path.
-    let server_name = envelope.origin.clone();
+    let server_name = &envelope.origin;
 
     // Disabled resolve → surface disabled (strip payload) with disabledSupport,
     // else fail soft to the unresolved action.
@@ -225,7 +225,7 @@ fn finalize_host_resolved_action(
         resolved.title = resuffix_resolved_title(
             std::mem::take(&mut resolved.title),
             suffixed_title,
-            &server_name,
+            server_name,
         );
         resolved.edit = None;
         resolved.command = None;
@@ -241,7 +241,7 @@ fn finalize_host_resolved_action(
     // mutable borrow, then clear afterwards so the borrow is out of scope.
     let mut command_dropped = false;
     if let Some(command) = resolved.command.as_mut() {
-        match encode_command(&server_name, &envelope.host_uri, &command.command) {
+        match encode_command(server_name, &envelope.host_uri, &command.command) {
             Some(encoded) => command.command = encoded,
             None => command_dropped = true,
         }
@@ -280,7 +280,7 @@ fn finalize_host_resolved_action(
         resolved.title = resuffix_resolved_title(
             std::mem::take(&mut resolved.title),
             suffixed_title,
-            &server_name,
+            server_name,
         );
         resolved.edit = None;
         resolved.data = None;
@@ -302,7 +302,7 @@ fn finalize_host_resolved_action(
         strip_bridge_local_versions(edit);
     }
     let server_title = std::mem::take(&mut resolved.title);
-    resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, &server_name);
+    resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
 
     // Materialized (edit or command) → strip the envelope; still lazy →
     // re-envelope for a further resolve, syncing a server-changed title.
@@ -862,7 +862,7 @@ fn finalize_virt_resolved_action(
     suffixed_title: String,
     upstream_caps: UpstreamCodeActionCaps,
 ) -> CodeAction {
-    let server_name = envelope.origin.clone();
+    let server_name = &envelope.origin;
     // Translate the resolved action's own diagnostics host-ward first, so
     // every surfaced action — including a disabled one returned below —
     // carries host coordinates (mirrors the initial-path order).
@@ -887,7 +887,7 @@ fn finalize_virt_resolved_action(
         resolved.title = resuffix_resolved_title(
             std::mem::take(&mut resolved.title),
             suffixed_title,
-            &server_name,
+            server_name,
         );
         resolved.edit = None;
         resolved.command = None;
@@ -910,7 +910,7 @@ fn finalize_virt_resolved_action(
     // `finalize_host_resolved_action`).
     let mut command_dropped = false;
     if let Some(command) = resolved.command.as_mut() {
-        match encode_command(&server_name, &envelope.host_uri, &command.command) {
+        match encode_command(server_name, &envelope.host_uri, &command.command) {
             Some(encoded) => command.command = encoded,
             None => command_dropped = true,
         }
@@ -926,7 +926,7 @@ fn finalize_virt_resolved_action(
         resolved.title = resuffix_resolved_title(
             std::mem::take(&mut resolved.title),
             suffixed_title,
-            &server_name,
+            server_name,
         );
         resolved.data = None;
         resolved.is_preferred = None;
@@ -976,7 +976,7 @@ fn finalize_virt_resolved_action(
             action,
             &envelope,
             suffixed_title,
-            &server_name,
+            server_name,
             upstream_caps,
             reason,
         );
@@ -988,7 +988,7 @@ fn finalize_virt_resolved_action(
     // the raw (unsuffixed) server title first — the still-lazy path below
     // needs it to keep the envelope's title in sync.
     let server_title = std::mem::take(&mut resolved.title);
-    resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, &server_name);
+    resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, server_name);
 
     // Once resolve has materialized an edit OR a command, the action is
     // complete (the edit is host-translated; the command name is routed).
