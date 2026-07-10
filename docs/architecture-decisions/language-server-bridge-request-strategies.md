@@ -132,8 +132,8 @@ Request (cursor in injection) ──▶ Forward to language server
 |--------|----------|
 | Input | Position + includeDeclaration flag |
 | Output | Location[] |
-| Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
-| Position mapping | Each same-region location's range virtual → host; real-file ranges untouched |
+| Cross-file | Real-file locations preserved (incl. host-URI, not containment-checked); only locations addressed to OTHER regions' virtual URIs filtered |
+| Position mapping | Each location's range: virtual → host |
 
 **Important**: References may return many locations. Real-file locations pass
 through as-is; locations in OTHER injection regions of the host document are
@@ -227,8 +227,8 @@ But line 0 of the virtual document maps to the injection start line in the host�
 |--------|----------|
 | Input | Position + newName |
 | Output | WorkspaceEdit (changes across files) |
-| Cross-file | Real-file edits pass through; same-region virtual edits translate; foreign virtual-region entries filtered (siblings survive); structurally unsafe edits or virtual-URI file operations reject the result |
-| Position mapping | Same-region TextEdit ranges (real-file ranges untouched) |
+| Cross-file | Real-file edits preserved (shared WorkspaceEdit transform, incl. host-URI edits — not containment-checked on this path); edits keyed to OTHER regions' virtual URIs filtered |
+| Position mapping | All TextEdit ranges |
 
 Rename can affect multiple files. Real-file edits (a project-aware server's
 cross-file rename) are preserved — content and ranges untouched, though
@@ -320,8 +320,8 @@ to them).
 
 | Response Type | Fields to Map |
 |---------------|---------------|
-| Location | same-region virtual targets: uri rewritten to host + range translated; real-file targets: untouched |
-| Location[] | Each location, same rule |
+| Location | uri (the request's own virtual URI rewrites to host; real/host URIs pass unchanged), range |
+| Location[] | Each location |
 | Hover | range (if present) |
 | CompletionItem | textEdit.range, additionalTextEdits[].range |
 | TextEdit | range |

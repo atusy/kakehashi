@@ -368,7 +368,10 @@ impl Kakehashi {
                 // stable advertised entry anyway). Each server's RAW command
                 // names are dynamically registered as it reaches Ready
                 // (`UpstreamRequest::RegisterCommands` below, gated on client
-                // `dynamicRegistration`), which serves palette-fired commands.
+                // `dynamicRegistration`), which serves palette-fired commands
+                // — via a session-global registry keyed by raw command id, so
+                // a name advertised by several servers/roots routes to the
+                // latest advertiser (accepted limitation).
                 // Action-embedded commands carry ENCODED per-document names that
                 // are never registered: a client that dispatches an action's
                 // command on provider PRESENCE (Neovim's built-in client)

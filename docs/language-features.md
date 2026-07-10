@@ -157,9 +157,10 @@ through without a containment check. Default combine strategy: `preferred`.
 
 [`textDocument/references`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_references)
 
-Lists references to the symbol under the cursor. Like go-to-definition, results are
-limited to the same block and real files on disk; references in other embedded
-blocks are not included. Default combine strategy: `preferred`.
+Lists references to the symbol under the cursor. Like go-to-definition,
+results addressed to another block's virtual URI are not included; real-file
+and host-URI results pass through (not containment-checked). Default combine
+strategy: `preferred`.
 
 ### Document highlight
 
@@ -270,9 +271,11 @@ Lazy actions resolve back to their origin server (`codeAction/resolve`) —
 client-driven resolve routing additionally requires the client to declare
 `dataSupport` and `resolveSupport` covering `"edit"`; without those,
 injection-layer lazy actions are eagerly resolved by the bridge and
-host-layer ones are disabled or dropped. (Known limitation: lazy actions in
-`#offset!`-adjusted regions such as bundled YAML/TOML frontmatter always
-fail soft — the resolve freshness check cannot match there.)
+host-layer ones are disabled or dropped. (Known limitation: CLIENT-driven
+resolve of lazy actions in `#offset!`-adjusted regions such as bundled
+YAML/TOML frontmatter always fails soft — the resolve freshness check cannot
+match there; the eager-resolve path taken for non-envelope clients bypasses
+that check.)
 Command-carrying actions execute through the bridged
 `workspace/executeCommand`.
 

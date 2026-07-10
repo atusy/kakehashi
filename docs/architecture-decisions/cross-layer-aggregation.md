@@ -224,9 +224,9 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   dispatch across all layers (mirroring the stage-1 `priorities = []`).
   Exception: spontaneous diagnostic pushes bypass layer priorities on the
   proactive republish path and are still accepted and cache-concatenated
-  (cached pushes answering a client pull via `pushFallback` DO pass through
-  layer participation, priorities, and strategy — see item 4's pull/push
-  split). No `"*"` element is supported:
+  (cached pushes answering a client pull via `pushFallback` fold in only
+  push-driven servers' slots, under cross-layer priorities/strategy only —
+  see item 4's pull/push split). No `"*"` element is supported:
   with a closed three-value set, "the rest" is always expressible by explicit
   enumeration, so the enum stays pure.
 - **`priorities` ranks; `enabled` gates.** Host participation is additionally
