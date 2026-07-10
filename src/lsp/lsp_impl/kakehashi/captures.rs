@@ -968,6 +968,24 @@ impl Kakehashi {
                 parsed_version: snapshot.parsed_version,
             };
             loop {
+                // Memo lookup and flight election share didChange/didClose's
+                // per-document edit lock. Without this gate, a delayed loser
+                // could wake after its fresher successor removed the marker,
+                // reclaim the vacant flight with an old tag, and resurrect an
+                // obsolete memo after close or edit.
+                let edit_lock = self.documents.edit_lock(&uri);
+                let edit_guard = edit_lock.lock().await;
+                let current = self.cache.semantic_token_generation() == generation
+                    && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                        view.slot.current_incarnation == incarnation
+                            && view.content_version == snapshot.parsed_version
+                    });
+                if !current {
+                    drop(edit_guard);
+                    self.documents
+                        .remove_edit_lock_if_unshared(&uri, &edit_lock);
+                    return Ok(None);
+                }
                 if let Some(hit) = self.captures_walk_cache.get(&key)
                     && hit.parsed_version == snapshot.parsed_version
                     && hit.incarnation == incarnation
@@ -987,12 +1005,13 @@ impl Kakehashi {
                             skipped,
                         }));
                 }
-                let flight = match claim_walk_flight(
+                let claim = claim_walk_flight(
                     &self.captures_walk_inflight,
                     &key,
                     walk_tag,
                     cancel_token.clone(),
-                ) {
+                );
+                let flight = match claim {
                     WalkFlightClaim::Winner(flight) => {
                         flight_guard = Some(WalkFlightGuard {
                             map: &self.captures_walk_inflight,
@@ -1018,10 +1037,15 @@ impl Kakehashi {
                                 skipped,
                             }));
                         }
+                        drop(edit_guard);
                         break;
                     }
-                    WalkFlightClaim::Join(flight) => flight,
+                    WalkFlightClaim::Join(flight) => {
+                        drop(edit_guard);
+                        flight
+                    }
                     WalkFlightClaim::Obsolete => {
+                        drop(edit_guard);
                         return Err(JsonRpcError::request_cancelled());
                     }
                 };
@@ -1053,6 +1077,9 @@ impl Kakehashi {
                             }
                         }
                     }
+                }
+                if flight.cancel.is_cancelled() {
+                    return Ok(None);
                 }
             }
             Some(key)
@@ -1231,6 +1258,20 @@ impl Kakehashi {
         let result = walked
             .map(|(matches, skipped)| (std::sync::Arc::new(matches), std::sync::Arc::new(skipped)));
         if let Some(key) = walk_key {
+            // Serialize the final currency check and memo installation with
+            // didChange/didClose. This prevents a close from clearing the memo
+            // between our check and insert, then having this old winner recreate
+            // state for the dead document lifetime.
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let current = self.cache.semantic_token_generation() == generation
+                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                    view.slot.current_incarnation == incarnation
+                        && view.content_version == snapshot.parsed_version
+                });
+            if !current {
+                return Ok(None);
+            }
             self.captures_walk_cache.insert(
                 key,
                 CachedCapturesWalk {
@@ -2010,6 +2051,125 @@ mod tests {
         assert_eq!(
             result.matches[0], sentinel,
             "the loser must serve the winner's memo, not run its own walk"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_captures_loser_does_not_revive_old_memo() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///captures_stale_loser.rs").unwrap();
+        let text = "fn main() {}";
+        service.inner().documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let incarnation = service
+            .inner()
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .current_incarnation;
+        let parse = |source: &str| {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            parser.parse(source, None).unwrap()
+        };
+        let publish = |version, source: &'static str| {
+            service
+                .inner()
+                .documents
+                .get(&uri)
+                .unwrap()
+                .publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(source),
+                        tree: Some(parse(source)),
+                        language: Some("rust".to_string()),
+                        parsed_version: version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+        };
+        assert!(publish(0, text));
+
+        let generation = service.inner().cache.semantic_token_generation();
+        let key = (uri.clone(), "highlights".to_string(), false);
+        let old_flight = std::sync::Arc::new(CapturesWalkFlight::new(
+            CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: 0,
+            },
+            crate::cancel::CancelToken::default(),
+        ));
+        service
+            .inner()
+            .captures_walk_inflight
+            .insert(key.clone(), old_flight);
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .kakehashi_captures_full(CapturesFullParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                        },
+                        kind: "highlights".to_string(),
+                        injection: false,
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!request.is_finished());
+
+        let newer = "fn newer() {}";
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), newer.to_string(), None);
+        assert!(publish(1, newer));
+        let WalkFlightClaim::Winner(new_flight) = claim_walk_flight(
+            &service.inner().captures_walk_inflight,
+            &key,
+            CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: 1,
+            },
+            crate::cancel::CancelToken::default(),
+        ) else {
+            panic!("new snapshot must supersede old flight");
+        };
+        service
+            .inner()
+            .captures_walk_inflight
+            .remove_if(&key, |_, current| {
+                std::sync::Arc::ptr_eq(current, &new_flight)
+            });
+        new_flight.notify.notify_waiters();
+
+        let result = request
+            .await
+            .unwrap()
+            .expect("internal supersession is null");
+        assert!(result.is_none());
+        assert!(
+            service.inner().captures_walk_cache.get(&key).is_none(),
+            "the delayed old loser must not recreate an obsolete memo"
         );
     }
 
