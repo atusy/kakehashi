@@ -27,7 +27,7 @@ python3 benches/profile/drive.py \
   --bin ./target/release/kakehashi \
   --file path/to/input.md --requests 20 --edits 1
 
-# Queue captures first, then semantic tokens, to reproduce shared-pool and
+# Queue a captures delta first, then semantic tokens, to reproduce shared-pool and
 # response-output contention from an already-busy highlighter client.
 python3 benches/profile/drive.py \
   --bin ./target/release/kakehashi \

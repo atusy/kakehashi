@@ -173,11 +173,11 @@ def main() -> None:
                                    "extension, falling back to --lang)")
     ap.add_argument(
         "--captures", action="store_true",
-        help="also send kakehashi/captures/full (injection mode) per request, "
-             "mirroring a captures-protocol highlighter client")
+        help="warm kakehashi/captures/full once, then send a real injection-mode "
+             "captures delta per cycle")
     ap.add_argument(
         "--concurrent-captures", action="store_true",
-        help="send semantic tokens and both captures requests as one concurrent "
+        help="send semantic tokens and the captures delta as one concurrent "
              "batch; implies --captures and exposes shared-pool/output contention")
     ap.add_argument(
         "--settle", type=float, default=0.3,
@@ -429,8 +429,6 @@ def main() -> None:
                 {"textDocument": {"uri": uri}},
             )
             captures_requests = [
-                ("kakehashi/captures/full",
-                 {"textDocument": {"uri": uri}, "kind": "highlights", "injection": True}),
                 ("kakehashi/captures/full/delta",
                  {"textDocument": {"uri": uri}, "kind": "highlights",
                   "previousResultId": captures_result_id}),
