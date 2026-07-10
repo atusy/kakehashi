@@ -460,23 +460,30 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
         }),
     );
 
-    // The crash mock pushes one diagnostic on didOpen; the editor receives it.
-    client
-        .wait_for_notification_where(
-            &["textDocument/publishDiagnostics"],
+    // The spontaneous push changes the merged set, driving BOTH a refresh
+    // (push/pull-divergence, #422) and a publish. The publish can lag the
+    // refresh — the wire quiet-window may defer it to the trailing flush — so
+    // wait for the refresh while collecting publishes, then make sure the
+    // pushed publish arrived (from the collected ones or a fresh wait). Ack
+    // the refresh: the bridge single-flights it (#497), so the crash-eviction
+    // refresh below won't be sent until this one is answered.
+    let (push_refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
             Duration::from_secs(15),
-            has_pushed_diag,
+            &["textDocument/publishDiagnostics"],
         )
-        .expect("editor should receive the pushed diagnostic before the crash");
-
-    // That spontaneous push itself changed the merged set, so it also drives a
-    // refresh (push/pull-divergence, #422). Consume it, and **ack** it: the bridge
-    // single-flights the workspace refresh (#497), so the crash-eviction refresh
-    // below won't be sent until this one is answered.
-    let (push_refresh_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
         .expect("the spontaneous push must drive a workspace/diagnostic/refresh (#422)");
     client.send_response(push_refresh_id, json!(null));
+    if !publishes.iter().any(|(_, params)| has_pushed_diag(params)) {
+        client
+            .wait_for_notification_where(
+                &["textDocument/publishDiagnostics"],
+                Duration::from_secs(15),
+                has_pushed_diag,
+            )
+            .expect("editor should receive the pushed diagnostic before the crash");
+    }
 
     // The content-changing edit reaches the mock, driving it to exit (crash). The
     // bridge's reader sees EOF, evicts the dead connection's slots, and republishes
@@ -489,23 +496,32 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
         }),
     );
 
-    client
-        .wait_for_notification_where(
-            &["textDocument/publishDiagnostics"],
+    // The eviction changed the merged set with no event the editor could see,
+    // so the bridge must emit a second `workspace/diagnostic/refresh` (#499),
+    // and the host must be republished cleared — again in either order (the
+    // cleared publish may ride the trailing quiet-window flush).
+    let (evict_refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
             Duration::from_secs(15),
-            cleared_host_diag,
+            &["textDocument/publishDiagnostics"],
         )
-        .expect("the crash must evict the dead server's diagnostic and republish cleared");
-
-    // The eviction changed the merged set with no event the editor could see, so
-    // the bridge must emit a second `workspace/diagnostic/refresh` (#499) after the
-    // cleared publish, telling the pull-mode editor to re-pull the now-current set.
-    assert!(
+        .expect(
+            "a crash eviction that clears the host must drive a workspace/diagnostic/refresh (#499)",
+        );
+    client.send_response(evict_refresh_id, json!(null));
+    if !publishes
+        .iter()
+        .any(|(_, params)| cleared_host_diag(params))
+    {
         client
-            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
-            .is_some(),
-        "a crash eviction that clears the host must drive a workspace/diagnostic/refresh (#499)"
-    );
+            .wait_for_notification_where(
+                &["textDocument/publishDiagnostics"],
+                Duration::from_secs(15),
+                cleared_host_diag,
+            )
+            .expect("the crash must evict the dead server's diagnostic and republish cleared");
+    }
 
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
@@ -519,9 +535,11 @@ fn e2e_publish_seal_delivers_via_refresh_and_pull_only() {
     // namespace; measured at ~1 MB × dozens per typing burst on a
     // diagnostics-heavy host) while delivery continues via
     // `workspace/diagnostic/refresh` → client re-pull. Deterministic ordering:
-    // a publish (were it sent) is enqueued strictly before the refresh the
-    // same set-change drives, so collecting publishes while waiting for the
-    // refresh proves the seal without a negative timeout.
+    // a publish (were the seal broken) would be a host's FIRST — which the
+    // wire quiet-window never defers (leading edge) — so it would be enqueued
+    // strictly before the refresh the same set-change drives; collecting
+    // publishes while waiting for the refresh therefore proves the seal
+    // without a negative timeout.
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("publish_seal.toml");
     std::fs::write(&config_path, "").expect("write config");

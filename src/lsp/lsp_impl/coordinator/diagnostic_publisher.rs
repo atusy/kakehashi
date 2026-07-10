@@ -37,9 +37,25 @@ pub(crate) struct DiagnosticPush {
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
+/// Quiet window for the editor-facing `publishDiagnostics` wire sends, per
+/// host. A changed merge inside the window after the last send is withheld and
+/// re-merged by one trailing republish at the window's end, so a burst of
+/// feeds (spontaneous pushes, the pull-layer completion, the post-parse
+/// geometry re-merge) collapses into at most one full-set publish per window
+/// per host — on a diagnostics-heavy host each publish is ~1 MB (measured:
+/// ~2,235 merged diagnostics), so the gate bounds sustained-typing wire cost
+/// at ~1 MB/s/host where it was ~2.2. An isolated change (window already
+/// elapsed) passes through immediately: the gate adds no latency outside
+/// bursts. One second matches the cadence editors themselves update
+/// diagnostics UI at during active typing.
+const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Bundles the state needed to merge the cache and publish for a host, so the
 /// notification feeds (reader push, host-event pull) can trigger a republish
-/// without each holding `Kakehashi`.
+/// without each holding `Kakehashi`. `Clone` is cheap (a `Client` handle plus
+/// `Arc`s) — the trailing wire-publish task clones it to re-run `republish`
+/// after the quiet window.
+#[derive(Clone)]
 pub(crate) struct DiagnosticPublisher {
     client: Client,
     language: Arc<LanguageCoordinator>,
@@ -448,6 +464,11 @@ impl DiagnosticPublisher {
     /// event to learn about, so it does refresh).
     pub(crate) async fn clear_host(&self, host: &Url) {
         self.aggregator.evict_host(host);
+        // Drop the wire-gate state BEFORE the clearing republish so it passes
+        // the quiet window unconditionally: a deferred clear would be dropped
+        // by the trailing task's closed-document guard, leaving the editor's
+        // push namespace showing diagnostics for a closed buffer.
+        self.aggregator.forget_wire_gate(host);
         self.republish(host).await;
         // The host is closed: forget its last-published set so the entry does not
         // linger and a later re-open publishes afresh (#422). Done after the
@@ -458,6 +479,8 @@ impl DiagnosticPublisher {
         // 0. (`clear_host` is editor-originated, so its republish doesn't bump
         // `current`; this just drops any prior push-origin coverage state.)
         self.aggregator.forget_coverage(host);
+        // And the wire-gate entry the clearing republish itself just stamped.
+        self.aggregator.forget_wire_gate(host);
         // didClose is off the hot path: reclaim republish-lock entries whose lock
         // now has no live holder — this host's, once the clear-republish above
         // released it, plus any earlier-closed hosts that have since drained (#466).
@@ -554,8 +577,12 @@ impl DiagnosticPublisher {
         // Suppress a republish that would re-send the exact set the editor already
         // has — a redundant publishDiagnostics is needless flicker/noise (#422).
         // Done under the per-host republish lock (held above), so the compare-and-set
-        // is serialized with other republishes for this host.
-        if !self.aggregator.published_set_changed(host, &diagnostics) {
+        // is serialized with other republishes for this host. A withheld wire
+        // send (`wire_gate_is_dirty`) still proceeds: the recorded set is ahead
+        // of what actually reached the editor, so the trailing republish must
+        // send even though its own merge compares unchanged.
+        let changed = self.aggregator.published_set_changed(host, &diagnostics);
+        if !changed && !self.aggregator.wire_gate_is_dirty(host) {
             log::debug!(
                 target: LOG_TARGET,
                 "skip republish for {host}: merged set unchanged ({} diagnostics)",
@@ -574,8 +601,11 @@ impl DiagnosticPublisher {
         // merge above still ran and recorded the set: change detection keeps
         // driving the push-origin coverage bump and
         // `workspace/diagnostic/refresh`, which IS the sealed setup's delivery
-        // signal (refresh → client re-pull).
+        // signal (refresh → client re-pull). The wire-gate state is dropped —
+        // there is no wire under the seal, so nothing can be owed to it (a
+        // stale `dirty` from before a mid-session seal would otherwise linger).
         if self.publish_sealed(host) {
+            self.aggregator.forget_wire_gate(host);
             log::debug!(
                 target: LOG_TARGET,
                 "seal: skipping publish of {} merged diagnostics for {} \
@@ -583,19 +613,77 @@ impl DiagnosticPublisher {
                 diagnostics.len(),
                 host
             );
-            return true;
+            return changed;
         }
 
-        log::debug!(
-            target: LOG_TARGET,
-            "publishing {} merged diagnostics for {}",
-            diagnostics.len(),
-            host
-        );
-        self.client
-            .publish_diagnostics(lsp_uri, diagnostics, None)
-            .await;
-        true
+        // Coalesce the wire sends per host (the quiet window): a burst of
+        // set-changing feeds — spontaneous pushes, the pull-layer completion,
+        // the post-parse geometry re-merge, each ~1 MB on a diagnostics-heavy
+        // host — collapses into at most one publish per window, re-merged from
+        // the LATEST cache by the trailing republish. An isolated change sends
+        // immediately. Deferral withholds only the wire: the set was already
+        // recorded above, so the return value (and with it the push-origin
+        // coverage bump + refresh nudge) is unaffected.
+        match self
+            .aggregator
+            .wire_gate_admit(host, WIRE_PUBLISH_QUIET_WINDOW)
+        {
+            crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "publishing {} merged diagnostics for {}",
+                    diagnostics.len(),
+                    host
+                );
+                self.client
+                    .publish_diagnostics(lsp_uri, diagnostics, None)
+                    .await;
+            }
+            crate::lsp::diagnostic_cache::WireAdmit::Defer {
+                schedule_trailing,
+                remaining,
+            } => {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "withholding publish of {} merged diagnostics for {} ({}ms of quiet window left)",
+                    diagnostics.len(),
+                    host,
+                    remaining.as_millis()
+                );
+                if schedule_trailing {
+                    self.spawn_trailing_wire_publish(host.clone(), remaining);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Re-run [`Self::republish`] for `host` once the quiet window elapses,
+    /// sending the (re-merged, latest) withheld set to the wire. Exactly one
+    /// task is parked per host per window ([`WireAdmit::Defer`]'s
+    /// `schedule_trailing`). Clears the gate's `pending` marker *before*
+    /// re-running, so a defer racing the re-run schedules a fresh task rather
+    /// than being absorbed by one that already woke.
+    ///
+    /// [`WireAdmit::Defer`]: crate::lsp::diagnostic_cache::WireAdmit::Defer
+    fn spawn_trailing_wire_publish(&self, host: Url, remaining: std::time::Duration) {
+        let publisher = self.clone();
+        // Anchor the deadline NOW (at defer time), not at the task's first poll
+        // — under load the first poll can lag, which would silently stretch the
+        // quiet window.
+        let deadline = tokio::time::Instant::now() + remaining;
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            publisher.aggregator.wire_gate_take_pending(&host);
+            // A host closed while this task was parked: `clear_host` already
+            // published the clearing set and forgot the host's state —
+            // republishing would resurrect a `last_published` entry for a gone
+            // document.
+            if publisher.documents.get(&host).is_none() {
+                return;
+            }
+            publisher.republish(&host).await;
+        });
     }
 
     /// Whether the editor-facing `publishDiagnostics` wire sends are sealed for
@@ -1217,6 +1305,70 @@ mod tests {
         assert!(
             !publisher.republish(&uri).await,
             "the sealed set was recorded as last-published, so a re-merge is unchanged"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trailing_republish_flushes_the_withheld_wire_send() {
+        // Inside the quiet window a changed merge is withheld from the wire
+        // (dirty) and one trailing task is parked; once the window elapses the
+        // task re-runs republish, which sends despite its own merge comparing
+        // unchanged, and clears the dirty marker — after which an identical
+        // re-merge is a plain skip again.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/host_trailing.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        // Leading edge: first changed set passes through immediately.
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("first")],
+        );
+        assert!(publisher.republish(&uri).await);
+        assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
+
+        // A second change inside the window: reported as changed, but the wire
+        // send is withheld (dirty) with a trailing task parked.
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("second")],
+        );
+        assert!(
+            publisher.republish(&uri).await,
+            "a withheld change still reports changed (drives the refresh nudge)"
+        );
+        assert!(
+            server.diagnostics.wire_gate_is_dirty(&uri),
+            "the change was withheld from the wire"
+        );
+
+        // The window elapses; the parked trailing task re-runs republish.
+        tokio::time::advance(super::WIRE_PUBLISH_QUIET_WINDOW).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !server.diagnostics.wire_gate_is_dirty(&uri),
+            "the trailing republish flushed the withheld set"
+        );
+        assert!(
+            !publisher.republish(&uri).await,
+            "after the flush an identical re-merge is a plain unchanged skip"
         );
     }
 
