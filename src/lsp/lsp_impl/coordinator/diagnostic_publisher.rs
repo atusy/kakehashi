@@ -861,8 +861,10 @@ impl DiagnosticPublisher {
     /// answer to a pull the editor made, and an ordinary edit-origin re-merge
     /// is covered by the editor's own `didChange` re-pull — so a refresh there
     /// would be redundant. (No tight loop forms: a
-    /// refresh-induced pull is answered inline by `diagnostic_impl`, which never
-    /// republishes, so a refresh cannot directly beget another; the indirect
+    /// refresh-induced pull is answered inline by `diagnostic_impl`, which
+    /// never republishes; the one pull-side refresh — the degraded-pull TOCTOU
+    /// guard — consumes its debt on firing and the induced re-pull sees ready
+    /// geometry and answers covering, so it begets at most one round; the indirect
     /// push→refresh→re-pull→downstream-re-push→here path is bounded by
     /// `published_set_changed`, converging once the re-pushed set stabilizes.)
     ///

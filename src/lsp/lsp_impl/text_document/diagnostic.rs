@@ -375,6 +375,26 @@ impl Kakehashi {
             // The debt drives the post-parse recovery refresh (see
             // `DiagnosticAggregator::degraded_pulls`).
             self.diagnostics.record_degraded_pull(&uri);
+            // TOCTOU guard: `snapshot` was captured before the fan-out/fold
+            // awaits above, so the parse may have landed — and the post-parse
+            // debt consumer already run — in between, leaving this
+            // freshly-recorded debt with no consumer until the next edit. If
+            // geometry is available NOW, consume the debt here and fire the
+            // recovery refresh ourselves (same coverage + single-flight
+            // gates). `take` on both consumers makes double-firing impossible;
+            // if the snapshot is still absent, the parse that produces it has
+            // not run its post-parse pass yet, so that pass will consume.
+            // Loop-bounded: the refresh-induced re-pull sees the ready
+            // geometry, answers covering, and clears everything.
+            let geometry_ready = self
+                .documents
+                .get(&uri)
+                .and_then(|doc| doc.snapshot())
+                .is_some();
+            if geometry_ready && self.diagnostics.take_degraded_pull(&uri) {
+                crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
+                    .request_pull_diagnostic_refresh(false);
+            }
         } else {
             self.mark_pull_covered(&uri, served_version);
         }
