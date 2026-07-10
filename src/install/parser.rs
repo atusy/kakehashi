@@ -473,6 +473,14 @@ fn download_and_extract_archive(
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
     let expected_prefix = archive_root_dir_name(repo_name, revision);
 
+    extract_archive(&mut archive, &expected_prefix, dest)
+}
+
+fn extract_archive<R: std::io::Read>(
+    archive: &mut Archive<R>,
+    expected_prefix: &str,
+    dest: &Path,
+) -> Result<(), ParserInstallError> {
     fs::create_dir_all(dest)?;
 
     for entry_result in archive.entries().map_err(|e| {
