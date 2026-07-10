@@ -882,6 +882,19 @@ impl LanguageServerPool {
         self.document_tracker.resolve_virtual_uri(virtual_uri).await
     }
 
+    /// The version currently tracked for a virtual document on one connection
+    /// (used by the inbound `workspace/applyEdit` version validation). See
+    /// [`DocumentTracker::document_version`].
+    pub(super) async fn virtual_document_version(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> Option<i32> {
+        self.document_tracker
+            .document_version(virtual_uri, connection_key)
+            .await
+    }
+
     /// Find ALL connections (`(server, root)` keys) that have opened a given
     /// virtual document URI.
     ///
@@ -1776,6 +1789,9 @@ impl LanguageServerPool {
             Some(liveness_timeout.as_duration()),
             ServerRequestDeps {
                 server_name: Some(server_name.to_string()),
+                // The applyEdit version validation scopes downstream-supplied
+                // versions to this connection's version space (PR-L).
+                connection_key: connection_key.clone(),
                 response_tx: tx.clone(),
                 dynamic_capabilities: Arc::clone(&dynamic_capabilities),
                 upstream_tx: self.upstream_tx.clone(),

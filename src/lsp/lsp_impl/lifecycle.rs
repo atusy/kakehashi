@@ -1255,6 +1255,7 @@ fn spawn_upstream_request(
             }
             UpstreamRequest::ApplyEdit {
                 params,
+                connection,
                 reply,
                 cancel,
             } => {
@@ -1284,11 +1285,15 @@ fn spawn_upstream_request(
                 // Translate virtual-document edits back to host coordinates
                 // before forwarding (#568). Unlike showDocument there is no
                 // safe degraded forward: an untranslatable edit (unknown/stale
-                // region, virtual-URI file ops, multi-region edit) is answered
-                // `applied: false` locally with a failureReason, never sent to
-                // the editor. See `ApplyEditTranslator::translate`.
+                // region, virtual-URI file ops, multi-region edit, or a
+                // versioned edit whose version no longer matches what the
+                // bridge tracks for `connection`) is answered `applied: false`
+                // locally with a failureReason, never sent to the editor. See
+                // `ApplyEditTranslator::translate`.
                 let params = match &translators {
-                    Some(translators) => translators.apply_edit.translate(params).await,
+                    Some(translators) => {
+                        translators.apply_edit.translate(params, &connection).await
+                    }
                     None => Ok(params),
                 };
                 let response = match params {
@@ -3079,6 +3084,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { "file:///x.rs": [] } }
                 }))
@@ -3154,6 +3160,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 // A NON-empty edit against a virtual URI that resolves to no open
                 // document: the translator can't map it, so the loop must reject
                 // it locally. (An empty edit array would be a no-op forwarded

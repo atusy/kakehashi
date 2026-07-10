@@ -371,6 +371,29 @@ impl DocumentTracker {
         None
     }
 
+    /// The version currently tracked for a virtual document on one connection —
+    /// the version of the content the bridge last announced to that connection
+    /// (didOpen = 1, each content-changing didChange bumps it). `None` when the
+    /// document is not tracked for this connection (never opened here, or
+    /// purged on respawn).
+    ///
+    /// Used by the inbound `workspace/applyEdit` validation: a downstream that
+    /// versions a `TextDocumentEdit` pins the edit to the content revision it
+    /// computed against, and the bridge rejects the edit when that revision is
+    /// no longer the one it last synced.
+    pub(super) async fn document_version(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> Option<i32> {
+        self.document_versions
+            .lock()
+            .await
+            .get(connection_key)?
+            .get(virtual_uri)
+            .copied()
+    }
+
     /// Like [`Self::increment_document_version`], but a no-op (`None`) when
     /// `content` is unchanged since the last `didChange` sent to this connection
     /// for this virtual document — so a host edit that doesn't alter a region's

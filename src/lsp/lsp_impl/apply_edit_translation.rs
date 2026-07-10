@@ -17,6 +17,23 @@
 //! against that region's live offset (rebuilt exactly as goto/showDocument do,
 //! via [`resolve_region_offset`](super::region_offset::resolve_region_offset)).
 //!
+//! **Version validation** (before the nulling): a downstream that versions a
+//! `TextDocumentEdit` for a VIRTUAL document pins the edit to the content
+//! revision it computed against, in the bridge-local version space of the
+//! connection it arrived on. The translation compares that version against the
+//! version the bridge currently tracks for `(connection, virtual doc)`: a
+//! mismatch means the bridge has since replaced the content (stale) — or the
+//! downstream claims a revision the bridge never announced — and the edit's
+//! coordinates cannot be trusted, so it is rejected with `applied: false`
+//! instead of silently un-versioning it. Versions on REAL-file edits are
+//! nulled without validation, as before: they are equally bridge-local (a
+//! host-layer didOpen starts its own counter), but the bridge tracks host
+//! documents in a separate per-connection tracker keyed by server name, not
+//! [`ConnectionKey`], and the editor-side freshness of a host edit is the
+//! editor's own version check to make — nulling ("apply without check") is
+//! the spec-sanctioned degradation there, while validating host versions is
+//! follow-up hardening.
+//!
 //! Unlike `window/showDocument` — which degrades by dropping the selection —
 //! an applyEdit whose coordinates can't be trusted must **not** be forwarded:
 //! a mistranslated edit corrupts the user's buffer. Untranslatable edits
@@ -46,9 +63,9 @@ use tower_lsp_server::ls_types::{
 use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{
-    BridgeCoordinator, RegionOffset, VirtualDocumentUri, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, workspace_edit_preserves_line_prefixes,
-    workspace_edit_within_region,
+    BridgeCoordinator, ConnectionKey, RegionOffset, VirtualDocumentUri,
+    strip_bridge_local_versions, transform_workspace_edit_to_host,
+    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
 use super::region_offset::resolve_region_offset;
@@ -80,13 +97,25 @@ impl ApplyEditTranslator {
 
     /// Translate a virtual-document applyEdit to host coordinates; when the
     /// edit touches no virtual URIs, forward `params` with only the
-    /// bridge-local `TextDocumentEdit.version`s nulled. `Err` carries the
-    /// `failureReason` for a local `applied: false` answer — the edit must
-    /// not reach the editor. See the module docs for the exact behavior.
+    /// bridge-local `TextDocumentEdit.version`s nulled. `connection` is the
+    /// `(server, root)` key of the downstream connection the request arrived
+    /// on — versioned virtual-document edits are validated against that
+    /// connection's tracked versions before the versions are nulled. `Err`
+    /// carries the `failureReason` for a local `applied: false` answer — the
+    /// edit must not reach the editor. See the module docs for the exact
+    /// behavior.
     pub(super) async fn translate(
         &self,
         mut params: ApplyWorkspaceEditParams,
+        connection: &ConnectionKey,
     ) -> Result<ApplyWorkspaceEditParams, String> {
+        // A versioned virtual-document edit pins the content revision the
+        // downstream computed against; validate it against the version this
+        // connection currently tracks BEFORE the versions are erased below —
+        // a stale edit's coordinates target content the bridge has since
+        // replaced and must not be applied.
+        self.validate_virtual_document_versions(&params.edit, connection)
+            .await?;
         // Downstream document versions live in the bridge's version space,
         // never the editor's — null them on every forward (see the helper).
         strip_bridge_local_versions(&mut params.edit);
@@ -137,6 +166,88 @@ impl ApplyEditTranslator {
         transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset, region_end)?;
         Ok(params)
     }
+
+    /// Validate every versioned `TextDocumentEdit` targeting a VIRTUAL
+    /// document against the version the bridge tracks for that document on
+    /// `connection` (didOpen = 1, each content-changing didChange bumps it).
+    ///
+    /// `Err` (→ `applied: false`) when the supplied version is STALE (older
+    /// than tracked: the downstream computed the edit against content the
+    /// bridge has since replaced — its coordinates may be misplaced), AHEAD
+    /// (newer than tracked: a revision the bridge never announced on this
+    /// connection — bookkeeping is broken, fail closed), or the document is
+    /// not tracked on this connection at all (closed or purged since the
+    /// downstream saw it — its content basis is gone). Only a version equal
+    /// to the tracked one proceeds.
+    ///
+    /// Unversioned edits (`version: null`) and the `changes` map (which
+    /// carries no versions) are not validated — the spec defines a missing
+    /// version as "apply without a version check", and the region-freshness +
+    /// region-bounds guards downstream of this still apply. Entries with an
+    /// EMPTY edit vector are no-ops and skipped, mirroring
+    /// [`collect_virtual_uris`]. Real-file versions are out of scope here (see
+    /// the module docs) and are nulled by `strip_bridge_local_versions`.
+    async fn validate_virtual_document_versions(
+        &self,
+        edit: &WorkspaceEdit,
+        connection: &ConnectionKey,
+    ) -> Result<(), String> {
+        for (uri, version) in versioned_virtual_text_document_edits(edit) {
+            let Some(tracked) = self.bridge.virtual_document_version(uri, connection).await
+            else {
+                return Err(format!(
+                    "kakehashi: the edit is versioned against virtual document {uri}, \
+                     which is no longer open on this connection; the content it was \
+                     computed against is gone"
+                ));
+            };
+            if version != tracked {
+                return Err(if version < tracked {
+                    format!(
+                        "kakehashi: the edit was computed against version {version} of \
+                         the virtual document, but the bridge has since synced version \
+                         {tracked}; applying it could misplace the edit"
+                    )
+                } else {
+                    format!(
+                        "kakehashi: the edit claims version {version} of the virtual \
+                         document, but the bridge has only synced up to version \
+                         {tracked}; the edit cannot be validated"
+                    )
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `(virtual URI, version)` of every VERSIONED `TextDocumentEdit` that
+/// targets a virtual document and carries at least one edit (empty edit
+/// vectors are no-ops, mirroring [`collect_virtual_uris`]). Only
+/// `documentChanges` can carry versions; the `changes` map cannot.
+fn versioned_virtual_text_document_edits(edit: &WorkspaceEdit) -> Vec<(&str, i32)> {
+    let mut versioned = Vec::new();
+    let doc_edits: Box<dyn Iterator<Item = &tower_lsp_server::ls_types::TextDocumentEdit>> =
+        match &edit.document_changes {
+            None => Box::new(std::iter::empty()),
+            Some(DocumentChanges::Edits(edits)) => Box::new(edits.iter()),
+            Some(DocumentChanges::Operations(ops)) => Box::new(ops.iter().filter_map(|op| {
+                match op {
+                    DocumentChangeOperation::Edit(e) => Some(e),
+                    DocumentChangeOperation::Op(_) => None,
+                }
+            })),
+        };
+    for e in doc_edits {
+        let uri = e.text_document.uri.as_str();
+        if e.edits.is_empty() || !VirtualDocumentUri::is_virtual_uri(uri) {
+            continue;
+        }
+        if let Some(version) = e.text_document.version {
+            versioned.push((uri, version));
+        }
+    }
+    versioned
 }
 
 /// Rewrite `params.edit` to host coordinates via the shared WorkspaceEdit
@@ -251,11 +362,19 @@ mod tests {
     use std::str::FromStr;
 
     fn translator() -> ApplyEditTranslator {
+        translator_with_bridge(Arc::new(BridgeCoordinator::new()))
+    }
+
+    fn translator_with_bridge(bridge: Arc<BridgeCoordinator>) -> ApplyEditTranslator {
         ApplyEditTranslator::new(
             Arc::new(DocumentStore::new()),
             Arc::new(LanguageCoordinator::new()),
-            Arc::new(BridgeCoordinator::new()),
+            bridge,
         )
+    }
+
+    fn test_connection() -> ConnectionKey {
+        ConnectionKey::for_server("lua_ls")
     }
 
     fn host_uri() -> Uri {
@@ -290,7 +409,7 @@ mod tests {
         }))
         .unwrap();
         let out = translator()
-            .translate(original.clone())
+            .translate(original.clone(), &test_connection())
             .await
             .expect("real-file edit must pass through");
         assert_eq!(out, original);
@@ -311,7 +430,7 @@ mod tests {
         }))
         .unwrap();
         let out = translator()
-            .translate(original)
+            .translate(original, &test_connection())
             .await
             .expect("real-file edit must pass through");
         match out.edit.document_changes.as_ref().unwrap() {
@@ -332,7 +451,7 @@ mod tests {
         let uri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let original = params_with_edit(json!({ "changes": { uri.clone(): [text_edit(0)] } }));
         let reason = translator()
-            .translate(original)
+            .translate(original, &test_connection())
             .await
             .expect_err("unknown virtual document must be rejected");
         assert!(
@@ -352,7 +471,7 @@ mod tests {
             }
         }));
         let reason = translator()
-            .translate(original)
+            .translate(original, &test_connection())
             .await
             .expect_err("multi-region edit must be rejected");
         assert!(
@@ -370,15 +489,177 @@ mod tests {
         let original = params_with_edit(json!({
             "changes": { uri.clone(): [text_edit(0)] },
             "documentChanges": [{
-                "textDocument": { "uri": uri, "version": 2 },
+                "textDocument": { "uri": uri, "version": null },
                 "edits": [text_edit(1)]
             }]
         }));
-        let reason = translator().translate(original).await.unwrap_err();
+        let reason = translator().translate(original, &test_connection()).await.unwrap_err();
         assert!(
             reason.contains("unknown virtual document"),
             "dedup must reach the single-region path, not the multi-region reject: {reason}"
         );
+    }
+
+    /// Bridge with the test virtual document registered on `connection`
+    /// (tracked version starts at 1, as after didOpen), returning the typed
+    /// virtual URI for version bumps.
+    async fn bridge_with_open_document(
+        region_id: &str,
+        connection: &ConnectionKey,
+    ) -> (Arc<BridgeCoordinator>, VirtualDocumentUri) {
+        let bridge = Arc::new(BridgeCoordinator::new());
+        let host_url = url::Url::parse("file:///project/doc.md").unwrap();
+        let typed_uri = VirtualDocumentUri::new(&host_uri(), "lua", region_id);
+        bridge
+            .register_opened_document_for_test(&host_url, &typed_uri, connection)
+            .await;
+        (bridge, typed_uri)
+    }
+
+    #[tokio::test]
+    async fn rejects_stale_virtual_document_version() {
+        // The downstream computed the edit against version 2, but the bridge
+        // has since synced version 3 (a content-changing didChange): the
+        // edit's coordinates target replaced content and applying it could
+        // misplace the edit. Reject with applied:false, never strip-and-apply.
+        let connection = test_connection();
+        let (bridge, typed_uri) =
+            bridge_with_open_document("01ARZ3NDEKTSV4RRFFQ69G5FAV", &connection).await;
+        for expected in [2, 3] {
+            assert_eq!(
+                bridge
+                    .increment_document_version_for_test(&typed_uri, &connection)
+                    .await,
+                Some(expected)
+            );
+        }
+        let params = params_with_edit(json!({
+            "documentChanges": [{
+                "textDocument": { "uri": typed_uri.to_uri_string(), "version": 2 },
+                "edits": [text_edit(0)]
+            }]
+        }));
+
+        let reason = translator_with_bridge(bridge)
+            .translate(params, &connection)
+            .await
+            .expect_err("a stale versioned edit must be rejected");
+        assert!(
+            reason.contains("version 2") && reason.contains("since synced version 3"),
+            "reason should name both versions: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_virtual_document_version_ahead_of_tracked() {
+        // A version the bridge never announced on this connection (tracked is
+        // 1, the edit claims 5): bookkeeping is broken somewhere — fail closed
+        // rather than un-version and apply.
+        let connection = test_connection();
+        let (bridge, typed_uri) =
+            bridge_with_open_document("01ARZ3NDEKTSV4RRFFQ69G5FAV", &connection).await;
+        let params = params_with_edit(json!({
+            "documentChanges": [{
+                "textDocument": { "uri": typed_uri.to_uri_string(), "version": 5 },
+                "edits": [text_edit(0)]
+            }]
+        }));
+
+        let reason = translator_with_bridge(bridge)
+            .translate(params, &connection)
+            .await
+            .expect_err("a version ahead of the tracked one must be rejected");
+        assert!(
+            reason.contains("version 5") && reason.contains("synced up to version 1"),
+            "reason should name both versions: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_versioned_edit_for_document_not_open_on_this_connection() {
+        // The document is open on ANOTHER connection only (this one was
+        // purged/closed since the downstream saw the doc): the content basis
+        // for the versioned edit is gone on the requesting connection — fail
+        // closed. Version spaces are per connection, so the sibling's tracked
+        // version must not vouch for this connection's edit.
+        let other = ConnectionKey::for_server("emmylua");
+        let (bridge, typed_uri) =
+            bridge_with_open_document("01ARZ3NDEKTSV4RRFFQ69G5FAV", &other).await;
+        let params = params_with_edit(json!({
+            "documentChanges": [{
+                "textDocument": { "uri": typed_uri.to_uri_string(), "version": 1 },
+                "edits": [text_edit(0)]
+            }]
+        }));
+
+        let reason = translator_with_bridge(bridge)
+            .translate(params, &test_connection())
+            .await
+            .expect_err("a versioned edit for a doc this connection no longer has must be rejected");
+        assert!(
+            reason.contains("no longer open on this connection"),
+            "reason should name the failure: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_version_passes_validation() {
+        // A version matching the tracked one proceeds as before: validation
+        // lets it through to the translation pipeline, whose next stage
+        // (region-offset resolution against an empty document store) fails
+        // with the REGION error — proof the version gate did not fire.
+        let connection = test_connection();
+        let (bridge, typed_uri) =
+            bridge_with_open_document("01ARZ3NDEKTSV4RRFFQ69G5FAV", &connection).await;
+        assert_eq!(
+            bridge
+                .increment_document_version_for_test(&typed_uri, &connection)
+                .await,
+            Some(2)
+        );
+        let params = params_with_edit(json!({
+            "documentChanges": [{
+                "textDocument": { "uri": typed_uri.to_uri_string(), "version": 2 },
+                "edits": [text_edit(0)]
+            }]
+        }));
+
+        let reason = translator_with_bridge(bridge)
+            .translate(params, &connection)
+            .await
+            .expect_err("empty document store cannot resolve the region");
+        assert!(
+            reason.contains("the injected region changed"),
+            "a matching version must pass the gate and fail only at region \
+             resolution: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn versioned_empty_virtual_entry_does_not_trip_validation() {
+        // A versioned virtual TextDocumentEdit with an EMPTY edit vector is a
+        // no-op (mirrors collect_virtual_uris): it must not reject an
+        // otherwise valid real-file-only edit, whatever version it claims.
+        let params = params_with_edit(json!({
+            "documentChanges": [
+                {
+                    "textDocument": {
+                        "uri": virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                        "version": 99
+                    },
+                    "edits": []
+                },
+                {
+                    "textDocument": { "uri": "file:///project/main.rs", "version": null },
+                    "edits": [text_edit(3)]
+                }
+            ]
+        }));
+
+        translator()
+            .translate(params, &test_connection())
+            .await
+            .expect("a no-op versioned virtual entry must not trip validation");
     }
 
     #[test]

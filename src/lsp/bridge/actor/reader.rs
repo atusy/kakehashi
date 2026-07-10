@@ -30,7 +30,7 @@ use super::OutboundMessage;
 use super::ResponseRouter;
 use super::response_router::{LivenessExpiry, RouteResult};
 use crate::error::LockResultExt;
-use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
+use crate::lsp::bridge::pool::{ConnectionKey, DynamicCapabilityRegistry};
 use crate::lsp::bridge::workspace::{self, WorkspaceFolderSet};
 
 /// Notification to forward from downstream server to upstream editor.
@@ -188,6 +188,12 @@ pub(crate) enum UpstreamRequest {
     /// `applied: false` locally (#568).
     ApplyEdit {
         params: tower_lsp_server::ls_types::ApplyWorkspaceEditParams,
+        /// The `(server, root)` connection the request arrived on. Versioned
+        /// `TextDocumentEdit`s in the edit are validated against the version
+        /// the bridge tracks for that virtual document ON THIS CONNECTION
+        /// (each connection's didOpen starts its own counter), so the
+        /// translation must know which connection's version space applies.
+        connection: ConnectionKey,
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
         cancel: ForwardedRequestCancel,
     },
@@ -245,6 +251,11 @@ struct LivenessParams {
 /// `workspace.workspaceFolders` capability, so servers may query them).
 pub(crate) struct ServerRequestDeps {
     pub(crate) server_name: Option<String>,
+    /// The `(server, root)` key of this connection, carried on forwarded
+    /// `workspace/applyEdit` requests so the translation can validate
+    /// downstream-supplied `TextDocumentEdit.version`s against the version the
+    /// bridge tracks for the virtual document on THIS connection.
+    pub(crate) connection_key: ConnectionKey,
     pub(crate) response_tx: mpsc::Sender<OutboundMessage>,
     pub(crate) dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
     /// Loss-intolerant notifications (`DiagnosticRefresh` and work-done
@@ -549,6 +560,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
         ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -640,6 +652,7 @@ async fn reader_loop(
     let server_request_deps = ServerRequestDeps {
         settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         server_name: None,
+        connection_key: ConnectionKey::for_server("test"),
         response_tx,
         dynamic_capabilities,
         upstream_tx,
@@ -1231,6 +1244,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: server_name.map(String::from),
+            connection_key: ConnectionKey::for_server("test"),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
@@ -1329,6 +1343,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
+            connection_key: ConnectionKey::for_server("test"),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
@@ -1406,6 +1421,7 @@ mod tests {
             ServerRequestDeps {
                 settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: None,
+                connection_key: ConnectionKey::for_server("test"),
                 response_tx,
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
                 upstream_tx,
@@ -1860,6 +1876,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -1922,6 +1939,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -1984,6 +2002,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2073,6 +2092,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2133,6 +2153,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2191,6 +2212,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2250,6 +2272,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2318,6 +2341,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2404,6 +2428,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2461,6 +2486,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2546,6 +2572,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2586,6 +2613,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2643,6 +2671,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2688,6 +2717,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2733,6 +2763,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2784,6 +2815,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("luals".to_string()),
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -2843,6 +2875,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("lua_ls".to_string()),
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -2895,6 +2928,7 @@ mod tests {
             let deps = ServerRequestDeps {
                 settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: Some("luals".to_string()),
+                connection_key: ConnectionKey::for_server("test"),
                 response_tx,
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
                 upstream_tx,
@@ -2977,6 +3011,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -3018,6 +3053,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -3074,6 +3110,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -3141,6 +3178,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx: response_tx.clone(),
             dynamic_capabilities,
             upstream_tx,
@@ -3203,6 +3241,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -3593,6 +3632,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
+            connection_key: ConnectionKey::for_server("test"),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -4044,6 +4084,7 @@ mod tests {
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
