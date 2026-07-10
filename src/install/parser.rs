@@ -1753,8 +1753,11 @@ mod tests {
     fn download_and_extract_archive_rejects_oversized_extracted_payload() {
         let temp = tempdir().expect("Failed to create temp dir");
         let dest = temp.path().join("source");
-        let archive =
-            compressed_tar_archive_with_payload("parser-1.0.0", MAX_ARCHIVE_EXTRACTED_BYTES + 1);
+        let archive = gzip_archive(tar_archive_with_declared_payload(
+            "parser-1.0.0",
+            MAX_ARCHIVE_EXTRACTED_BYTES + 1,
+            0,
+        ));
         let result = extract_archive(GzDecoder::new(&archive[..]), "parser", "v1.0.0", &dest);
 
         match result {
@@ -2079,6 +2082,23 @@ mod tests {
         archive
     }
 
+    fn tar_archive_with_declared_payload(
+        root: &str,
+        declared_size: u64,
+        data_len: usize,
+    ) -> Vec<u8> {
+        let mut archive = Vec::new();
+        append_tar_entry(
+            &mut archive,
+            &format!("{root}/payload.bin"),
+            tar::EntryType::file(),
+            &vec![0; data_len],
+            declared_size,
+        );
+        archive.extend_from_slice(&[0; 1024]);
+        archive
+    }
+
     fn pax_size_override_archive_with_data_len(
         path: &str,
         raw_size: u64,
@@ -2164,32 +2184,6 @@ mod tests {
         gzip.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
         gzip.extend_from_slice(&[0; 8]);
         gzip
-    }
-
-    fn compressed_tar_archive_with_payload(root: &str, payload_size: u64) -> Vec<u8> {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Read;
-        use tar::{Builder, Header};
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        {
-            let mut builder = Builder::new(&mut encoder);
-            let mut header = Header::new_gnu();
-            header.set_size(payload_size);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(
-                    &mut header,
-                    format!("{root}/payload.bin"),
-                    std::io::repeat(0).take(payload_size),
-                )
-                .expect("append payload");
-            builder.finish().expect("finish tar");
-        }
-
-        encoder.finish().expect("finish gzip")
     }
 
     /// Test that fetch_source succeeds for a GitHub URL (uses archive download).
