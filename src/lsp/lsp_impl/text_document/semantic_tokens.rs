@@ -377,6 +377,7 @@ impl Kakehashi {
             self.cache
                 .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
         {
+            let cached = (*cached).clone();
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
             let still_current = self.cache.semantic_token_generation() == token_generation
@@ -391,7 +392,7 @@ impl Kakehashi {
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens((*cached).clone())));
+            return Ok(Some(SemanticTokensResult::Tokens(cached)));
         }
 
         // Validity key for the snapshot's text under the generation captured at
@@ -414,6 +415,7 @@ impl Kakehashi {
                 .cache
                 .get_current_tokens(&uri, &language_name, cache_key)
             {
+                let cached = (*cached).clone();
                 let edit_lock = self.documents.edit_lock(&uri);
                 let _edit_guard = edit_lock.lock().await;
                 let still_current = self.cache.semantic_token_generation() == token_generation
@@ -432,7 +434,7 @@ impl Kakehashi {
                 // has no borrowing variant), so this is the one legitimate
                 // materialization point — everything upstream (the cache hit
                 // itself) stayed O(1) via the `Arc`.
-                return Ok(Some(SemanticTokensResult::Tokens((*cached).clone())));
+                return Ok(Some(SemanticTokensResult::Tokens(cached)));
             }
 
             // capture_mappings and supports_multiline were read before the await
