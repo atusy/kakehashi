@@ -187,12 +187,14 @@ pub(super) struct HostDocSyncState {
 struct OpenClaimGuard {
     tracker: Arc<DocumentTracker>,
     transition: Arc<tokio::sync::Mutex<()>>,
-    transition_locks: Arc<DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>>,
+    transition_locks: Arc<OpenTransitionLocks>,
     host_uri: Url,
     virtual_uri: VirtualDocumentUri,
     connection_key: ConnectionKey,
     armed: bool,
 }
+
+type OpenTransitionLocks = DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>;
 
 impl OpenClaimGuard {
     fn disarm(&mut self) {
@@ -256,7 +258,7 @@ pub struct LanguageServerPool {
     document_tracker: Arc<DocumentTracker>,
     /// Serializes didOpen enqueue/promotion, rollback, and didClose per exact
     /// downstream document so wire order matches tracker state transitions.
-    open_transition_locks: Arc<DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>>,
+    open_transition_locks: Arc<OpenTransitionLocks>,
     /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
