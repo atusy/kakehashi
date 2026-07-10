@@ -64,8 +64,10 @@ Phased roadmap:
    `publishDiagnostics` PUSHES are also accepted and republished
    (`DiagnosticPublisher::publish_push` classifies non-virtual URIs as
    `_self` host-layer pushes), but pushes bypass the dispatchers: the cache
-   always concatenates them across servers — preferred-style push election
-   is deferred. Diagnostics are joined rather than raced:
+   concatenates push-driven slots across servers — though when a pull layer
+   exists, cached push slots from pull-capable servers are suppressed in
+   favor of the pull result (no double-counting); preferred-style push
+   election is deferred. Diagnostics are joined rather than raced:
    they are not latency-interactive and `concatenated` needs every layer
    anyway, so one code path with a pure combine function replaces the
    `race_layers_preferred` machinery here.

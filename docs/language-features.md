@@ -101,9 +101,11 @@ embedded blocks. Works for any grammar, no setup required.
 ## Bridged features
 
 The features below are served by a language server configured for the
-embedded language — or, on the surrounding document itself, by a
-`bridge._self` host server. Placing the cursor outside an embedded code
-block yields no result from the injection bridges; with `bridge._self`
+embedded language — most of them also on the surrounding document itself,
+by a `bridge._self` host server (exceptions: document color stays
+injection-only, and host completion items are passed through without
+`completionItem/resolve` routing). Placing the cursor outside an embedded
+code block yields no result from the injection bridges; with `bridge._self`
 configured, the host language's own servers still answer there.
 
 ### Hover
@@ -242,9 +244,10 @@ actions) — when multiple servers are configured for a block, all of their
 diagnostics are shown. The strategy is resolved per language, so different
 embedded languages can behave differently. Spontaneous pushes a server sends
 on its own bypass the strategy machinery when proactively republished: they
-are cached and concatenated across servers. (When those cached pushes later
-answer a client PULL — `pushFallback` — layer priorities and the cross-layer
-strategy do apply.)
+are cached and concatenated across servers — except that push slots from
+pull-capable servers are suppressed in favor of their pull results (no
+double-counting). When those cached pushes later answer a client PULL
+(`pushFallback`), layer priorities and the cross-layer strategy do apply.
 
 ### Code actions
 

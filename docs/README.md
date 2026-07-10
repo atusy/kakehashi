@@ -37,7 +37,7 @@ Current bridge-backed requests include:
 - On Type Formatting (config-driven; see `onTypeFormattingTriggers`)
 
 **Limitations:**
-- **Same-region navigation only**: Cross-region jumps/edits (e.g., go to Definition, rename, ...) are not supported—these results are filtered out.
+- **No cross-region results within the host document**: a jump or edit targeting a *different* injection region of the same host document is filtered out (its virtual URI would be meaningless to the editor). Results in real files — an external definition, a cross-file rename edit — pass through.
 
 See [Bridge Configuration](#bridge-configuration) for setup instructions.
 
