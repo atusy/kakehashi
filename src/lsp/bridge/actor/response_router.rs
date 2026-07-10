@@ -40,6 +40,8 @@ pub(crate) struct ResponseRouter {
 
 /// Internal state for ResponseRouter, protected by a single mutex.
 struct ResponseRouterState {
+    /// False once the connection's reader/writer is terminal.
+    accepting: bool,
     /// Advances whenever downstream-progressing requests transition 0 -> 1.
     liveness_epoch: u64,
     /// Pending requests waiting for responses.
@@ -89,6 +91,7 @@ impl ResponseRouter {
     pub(crate) fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(ResponseRouterState {
+                accepting: true,
                 liveness_epoch: 0,
                 pending: HashMap::new(),
                 upstream_to_downstream: HashMap::new(),
@@ -135,7 +138,7 @@ impl ResponseRouter {
             .recover_poison("ResponseRouter::register_with_upstream");
 
         // Prevent duplicate registration
-        if state.pending.contains_key(&downstream_id) {
+        if !state.accepting || state.pending.contains_key(&downstream_id) {
             return None;
         }
         let starts_liveness = state
@@ -412,6 +415,7 @@ impl ResponseRouter {
     /// state and entries get overwritten when the next upstream ID reuses them.
     pub(crate) fn fail_all(&self, error_message: &str) {
         let mut state = self.state.lock().recover_poison("ResponseRouter::fail_all");
+        state.accepting = false;
         let entries: Vec<_> = state.pending.drain().collect();
 
         // Clear both cancel map directions
@@ -442,6 +446,7 @@ impl ResponseRouter {
         &self,
         expected_epoch: u64,
         error_message: &str,
+        publish_failure: impl FnOnce(),
     ) -> LivenessExpiry {
         let mut state = self
             .state
@@ -460,10 +465,14 @@ impl ResponseRouter {
         if awaiting == 0 {
             return LivenessExpiry::Idle;
         }
+        // Close admission under the same lock as the epoch check and drain.
+        // Publish the connection failure before waking any drained waiter.
+        state.accepting = false;
         let entries: Vec<_> = state.pending.drain().collect();
         state.upstream_to_downstream.clear();
         state.downstream_to_upstream.clear();
         drop(state);
+        publish_failure();
 
         for (id, pending) in entries {
             let error_response = serde_json::json!({
@@ -750,10 +759,37 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            router.fail_all_if_awaiting_downstream(old_epoch.unwrap(), "expired"),
+            router.fail_all_if_awaiting_downstream(old_epoch.unwrap(), "expired", || {}),
             LivenessExpiry::Stale { current_epoch } if Some(current_epoch) == new_epoch
         ));
         assert_eq!(router.awaiting_downstream_count(), 1);
+    }
+
+    #[test]
+    fn genuine_liveness_expiry_closes_admission_before_waking_waiters() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let router = ResponseRouter::new();
+        let (mut rx, epoch) = router
+            .register_with_upstream_liveness(RequestId::new(1), None)
+            .unwrap();
+        let published = AtomicBool::new(false);
+        assert!(matches!(
+            router.fail_all_if_awaiting_downstream(epoch.unwrap(), "expired", || {
+                published.store(true, Ordering::Release);
+            }),
+            LivenessExpiry::Failed { pending_count: 1 }
+        ));
+
+        assert!(published.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_ok(),
+            "waiter should be woken after publish"
+        );
+        assert!(
+            router.register(RequestId::new(2)).is_none(),
+            "a terminal router must reject new requests"
+        );
     }
 
     /// Test that register_with_upstream stores upstream->downstream mapping.

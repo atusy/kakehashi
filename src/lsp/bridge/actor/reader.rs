@@ -680,6 +680,7 @@ async fn reader_loop_with_liveness(
 
     // Consolidated liveness timer state (ls-bridge-async-connection)
     let mut liveness = LivenessTimerState::new(liveness_timeout);
+    let mut liveness_failed_tx = Some(liveness_failed_tx);
 
     loop {
         tokio::select! {
@@ -709,6 +710,11 @@ async fn reader_loop_with_liveness(
                 let pending_count = match router.fail_all_if_awaiting_downstream(
                     expected_epoch,
                     "bridge: liveness timeout - server unresponsive",
+                    || {
+                        if let Some(tx) = liveness_failed_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    },
                 ) {
                     LivenessExpiry::Stale { current_epoch } => {
                         liveness.start(&server_prefix, current_epoch);
@@ -731,8 +737,6 @@ async fn reader_loop_with_liveness(
                     liveness.timeout_duration(),
                     pending_count
                 );
-                // Signal liveness failure for state transition (ls-bridge-async-connection Phase 3)
-                let _ = liveness_failed_tx.send(());
                 break;
             }
 
