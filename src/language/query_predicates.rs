@@ -153,19 +153,20 @@ pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &
         // ANY predicates like #contains?: otherwise one stale capture would
         // make the whole match pass.
         let node_text = |node: tree_sitter::Node| text.get(node.start_byte()..node.end_byte());
+        let predicate_tail = predicate.args.get(1..).unwrap_or(&[]);
 
         let aggregate = match operator {
             "lua-match?" => nodes()
                 .all(|n| node_text(n).is_none_or(|t| check_lua_match(predicate.args.get(1), t))),
             "contains?" => any_or_vacuously_true(nodes(), |n| {
-                node_text(n).is_some_and(|t| check_contains(&predicate.args[1..], t))
+                node_text(n).is_some_and(|t| check_contains(predicate_tail, t))
             }),
             // Neovim: vacuously true with no nodes, otherwise ANY node hit.
             "has-parent?" => {
-                any_or_vacuously_true(nodes(), |n| check_has_parent(&predicate.args[1..], n))
+                any_or_vacuously_true(nodes(), |n| check_has_parent(predicate_tail, n))
             }
             "has-ancestor?" => {
-                any_or_vacuously_true(nodes(), |n| check_has_ancestor(&predicate.args[1..], n))
+                any_or_vacuously_true(nodes(), |n| check_has_ancestor(predicate_tail, n))
             }
             unknown => {
                 log::debug!(
@@ -573,6 +574,15 @@ mod tests {
             !check_match_predicates(&query, match_, "x"),
             "a stale capture whose byte span is unreadable must not satisfy #contains?"
         );
+    }
+
+    #[test]
+    fn contains_match_predicate_zero_args_does_not_panic() {
+        let source_code = "fn target() {}";
+        let results =
+            collect_filtered_captures(source_code, r#"((identifier) @name (#contains?))"#);
+
+        assert!(results.contains(&"target".to_string()));
     }
 
     #[test]
