@@ -1623,6 +1623,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn extract_archive_accepts_regular_files_under_destination() {
+        use std::io::Cursor;
+        use tar::{Builder, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let body = b"parser source";
+            let mut header = Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "parser-1.0.0/src/parser.c", &body[..])
+                .expect("append synthetic regular file");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(Cursor::new(bytes));
+        extract_archive(&mut archive, "parser-1.0.0", temp.path())
+            .expect("regular file should extract");
+
+        assert_eq!(
+            fs::read(temp.path().join("src/parser.c")).expect("read extracted file"),
+            b"parser source"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn extract_archive_rejects_link_entries() {
