@@ -1955,9 +1955,10 @@ mod tests {
     }
 
     /// A downstream `window/workDoneProgress/create` is acknowledged to the
-    /// downstream AND bridged upstream: a unique upstream token is minted,
-    /// registered (so `$/progress` can be translated), and a
-    /// `CreateWorkDoneProgress` notification is emitted for the editor.
+    /// downstream and registered (so `$/progress` can be translated), but the
+    /// editor-facing `CreateWorkDoneProgress` is deferred until the token's
+    /// first titled `begin` (lazy announcement: per-request downstream
+    /// progress storms must not reach the editor).
     #[tokio::test]
     async fn handle_message_work_done_progress_create_bridges_upstream() {
         use tower_lsp_server::ls_types::NumberOrString;
@@ -2001,26 +2002,113 @@ mod tests {
         assert_eq!(val["id"], 5);
         assert!(val["result"].is_null());
 
-        // The editor is asked to create a *different* (unique) token.
+        // Nothing reaches the editor yet: announcement waits for a titled begin.
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "create must not be bridged before a titled begin"
+        );
+
+        // The mapping is registered so downstream `$/progress` can be translated.
+        let downstream_token = NumberOrString::String("some-token".to_string());
+        let upstream_token = progress_registry
+            .translate(progress_connection_id, &downstream_token)
+            .expect("mapping registered");
+        assert_ne!(
+            upstream_token, downstream_token,
+            "upstream token must be remapped"
+        );
+
+        // The first titled begin announces: create, then the begin itself.
+        let begin = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": {
+                "token": "some-token",
+                "value": { "kind": "begin", "title": "Indexing" }
+            }
+        });
+        handle_message(begin, &router, "", &deps).await;
         let UpstreamNotification::CreateWorkDoneProgress { token } = upstream_rx
             .try_recv()
-            .expect("should forward CreateWorkDoneProgress")
+            .expect("titled begin should announce the token")
         else {
             panic!("Expected CreateWorkDoneProgress");
         };
-        let downstream_token = NumberOrString::String("some-token".to_string());
-        assert_ne!(token, downstream_token, "upstream token must be remapped");
+        assert_eq!(token, upstream_token);
+        let UpstreamNotification::Progress { params } =
+            upstream_rx.try_recv().expect("begin should forward")
+        else {
+            panic!("Expected Progress");
+        };
+        assert_eq!(params.token, upstream_token);
+    }
 
-        // The mapping is registered so downstream `$/progress` can be translated.
+    /// A downstream progress lifecycle whose `begin` has an empty title is
+    /// swallowed entirely: no create, no begin, no end reach the editor, and
+    /// the `End` still clears the mapping. This is the storm case — some
+    /// downstreams declare a token per analysis pass with nothing renderable.
+    #[tokio::test]
+    async fn handle_message_untitled_progress_lifecycle_is_swallowed() {
+        use tower_lsp_server::ls_types::NumberOrString;
+
+        let router = ResponseRouter::new();
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+        let deps = ServerRequestDeps {
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::clone(&progress_registry),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id,
+        };
+
+        let create = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "window/workDoneProgress/create",
+            "params": { "token": "storm" }
+        });
+        handle_message(create, &router, "", &deps).await;
+        let begin = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": { "token": "storm", "value": { "kind": "begin", "title": "" } }
+        });
+        handle_message(begin, &router, "", &deps).await;
+        let end = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": { "token": "storm", "value": { "kind": "end" } }
+        });
+        handle_message(end, &router, "", &deps).await;
+
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "untitled lifecycle must not reach the editor"
+        );
+        let downstream_token = NumberOrString::String("storm".to_string());
         assert_eq!(
             progress_registry.translate(progress_connection_id, &downstream_token),
-            Some(token)
+            None,
+            "End clears the swallowed mapping"
         );
     }
 
     /// Re-`create`ing the same downstream token mints a fresh upstream token and
-    /// emits a `ForgetWorkDoneProgress` for the evicted one, so the forwarding
-    /// loop's admission set can't leak the stale token.
+    /// emits a `ForgetWorkDoneProgress` for the evicted one — but only if it was
+    /// announced (the editor saw a create); unannounced tokens have no admission
+    /// to forget, so no message is wasted on them.
     #[tokio::test]
     async fn handle_message_recreate_same_token_forgets_stale() {
         let router = ResponseRouter::new();
@@ -2055,28 +2143,40 @@ mod tests {
         };
 
         handle_message(make(), &router, "", &deps).await;
-        let UpstreamNotification::CreateWorkDoneProgress { token: first } =
-            upstream_rx.try_recv().expect("first create")
+
+        // Re-create before any begin: the first token was never announced, so
+        // nothing is forgotten (and nothing was created).
+        handle_message(make(), &router, "", &deps).await;
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "unannounced stale token needs no Forget"
+        );
+
+        // Announce the second token via a titled begin...
+        let begin = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": { "token": "dup", "value": { "kind": "begin", "title": "Indexing" } }
+        });
+        handle_message(begin, &router, "", &deps).await;
+        let UpstreamNotification::CreateWorkDoneProgress { token: announced } =
+            upstream_rx.try_recv().expect("announce create")
         else {
             panic!("expected CreateWorkDoneProgress");
         };
+        let UpstreamNotification::Progress { .. } = upstream_rx.try_recv().expect("begin forwards")
+        else {
+            panic!("expected Progress");
+        };
 
-        // Second create for the SAME downstream token.
+        // ...then a third create for the SAME downstream token forgets it.
         handle_message(make(), &router, "", &deps).await;
-        // It first forgets the stale upstream token...
         let UpstreamNotification::ForgetWorkDoneProgress(forgotten) =
             upstream_rx.try_recv().expect("forget stale")
         else {
             panic!("expected ForgetWorkDoneProgress");
         };
-        assert_eq!(forgotten, vec![first.clone()]);
-        // ...then creates a fresh, distinct upstream token.
-        let UpstreamNotification::CreateWorkDoneProgress { token: second } =
-            upstream_rx.try_recv().expect("second create")
-        else {
-            panic!("expected CreateWorkDoneProgress");
-        };
-        assert_ne!(first, second);
+        assert_eq!(forgotten, vec![announced]);
     }
 
     /// A `window/workDoneProgress/create` without a token is rejected with
@@ -2162,7 +2262,8 @@ mod tests {
             progress_connection_id,
         };
 
-        // A "begin" progress is forwarded with the translated token.
+        // A titled "begin" announces the token (create first) and is forwarded
+        // with the translated token.
         let begin = json!({
             "jsonrpc": "2.0",
             "method": "$/progress",
@@ -2172,6 +2273,12 @@ mod tests {
             }
         });
         handle_message(begin, &router, "", &deps).await;
+        let UpstreamNotification::CreateWorkDoneProgress { token } =
+            upstream_rx.try_recv().expect("begin should announce")
+        else {
+            panic!("Expected CreateWorkDoneProgress");
+        };
+        assert_eq!(token, upstream_token);
         let UpstreamNotification::Progress { params } =
             upstream_rx.try_recv().expect("begin should forward")
         else {

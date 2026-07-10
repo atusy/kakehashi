@@ -26,6 +26,19 @@
 //! Forward translation is keyed by [`ProgressConnectionId`] because the same
 //! downstream token value may be used by different connections; the connection
 //! id disambiguates them.
+//!
+//! # Lazy announcement (storm suppression)
+//!
+//! Registering a token does **not** immediately ask the editor to create it.
+//! Some downstreams (e.g. basedpyright) declare a fresh progress token for
+//! every analysis pass — thousands of `create` → `begin("")` → `end` triples
+//! per minute of typing — and each forwarded `create` is a full editor
+//! round-trip that queues ahead of real responses on the shared stdout sink.
+//! Instead the registry tracks a per-token phase and [`ProgressRegistry::admit`]
+//! decides, on the first `$/progress`, whether the token is worth announcing:
+//! a `begin` with a non-empty title announces (create + begin forwarded, in
+//! order, on the same FIFO channel); a `begin` with an empty title has nothing
+//! the editor could render, so the whole lifecycle is swallowed.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -60,16 +73,65 @@ struct CancelTarget {
     downstream_token: NumberOrString,
 }
 
+/// Lifecycle phase of a registered token (lazy announcement, see module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Registered via `create`, no `$/progress` seen yet; nothing sent upstream.
+    Pending,
+    /// A titled `begin` arrived; the editor has been asked to create the token
+    /// and subsequent progress is forwarded.
+    Announced,
+    /// An untitled `begin` arrived; the whole lifecycle is dropped.
+    Swallowed,
+}
+
+struct TokenEntry {
+    upstream: NumberOrString,
+    phase: Phase,
+}
+
+/// What the first `$/progress` for a token reveals about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgressSignal {
+    /// `begin` with a non-empty title — renderable, worth announcing.
+    TitledBegin,
+    /// `begin` with an empty title — nothing the editor could render.
+    UntitledBegin,
+    /// `report`/`end` (or anything else).
+    Other,
+}
+
+/// Routing decision for one `$/progress` notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProgressAdmission {
+    /// First titled `begin`: send `window/workDoneProgress/create` for the
+    /// token, then forward this notification with it.
+    Announce(NumberOrString),
+    /// Already announced: forward with the token.
+    Forward(NumberOrString),
+    /// Swallowed or meaningless without a `begin`: drop the notification.
+    Drop,
+}
+
+/// A previously registered upstream token evicted by a re-`create`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvictedToken {
+    pub(crate) token: NumberOrString,
+    /// Whether the editor was ever asked to create it — only then does the
+    /// forwarding loop hold an admission that needs forgetting.
+    pub(crate) announced: bool,
+}
+
 #[derive(Default)]
 struct Inner {
     /// upstream token → cancel routing target.
     up_to_down: HashMap<NumberOrString, CancelTarget>,
-    /// connection → (downstream token → upstream token). Nesting by connection
+    /// connection → (downstream token → upstream entry). Nesting by connection
     /// keeps forward translation scoped (the same downstream token value may be
     /// used by different connections) and makes per-connection purge a single
     /// map removal. `NumberOrString` derives `Hash`/`Eq`, so the numeric token
     /// `1` and the string token `"1"` never collide as keys.
-    down_to_up: HashMap<ProgressConnectionId, HashMap<NumberOrString, NumberOrString>>,
+    down_to_up: HashMap<ProgressConnectionId, HashMap<NumberOrString, TokenEntry>>,
 }
 
 /// Bidirectional registry mapping downstream-declared progress tokens to
@@ -98,10 +160,14 @@ impl ProgressRegistry {
     }
 
     /// Register a downstream-declared token and return `(upstream_token, stale)`:
-    /// the unique upstream token the editor should see, plus the prior upstream
-    /// token if this `(connection, downstream_token)` was already registered.
+    /// the unique upstream token the editor should see, plus the prior entry if
+    /// this `(connection, downstream_token)` was already registered.
     /// `writer` is the owning connection's writer channel, used later to route a
     /// cancel back to that downstream.
+    ///
+    /// The token starts [`Phase::Pending`]: nothing is sent to the editor until
+    /// [`ProgressRegistry::admit`] sees a titled `begin` (lazy announcement, see
+    /// module docs).
     ///
     /// Re-registering the same `(connection, downstream_token)` (a downstream that
     /// re-creates a token it already declared) replaces the prior mapping and
@@ -113,7 +179,7 @@ impl ProgressRegistry {
         connection_id: ProgressConnectionId,
         downstream_token: NumberOrString,
         writer: tokio::sync::mpsc::Sender<OutboundMessage>,
-    ) -> (NumberOrString, Option<NumberOrString>) {
+    ) -> (NumberOrString, Option<EvictedToken>) {
         let suffix = self.token_counter.fetch_add(1, Ordering::Relaxed);
         let upstream_token = NumberOrString::String(format!("kakehashi/bridge/progress/{suffix}"));
 
@@ -126,9 +192,19 @@ impl ProgressRegistry {
             .down_to_up
             .entry(connection_id)
             .or_default()
-            .insert(downstream_token.clone(), upstream_token.clone());
+            .insert(
+                downstream_token.clone(),
+                TokenEntry {
+                    upstream: upstream_token.clone(),
+                    phase: Phase::Pending,
+                },
+            )
+            .map(|entry| EvictedToken {
+                announced: entry.phase == Phase::Announced,
+                token: entry.upstream,
+            });
         if let Some(ref stale_upstream) = stale {
-            inner.up_to_down.remove(stale_upstream);
+            inner.up_to_down.remove(&stale_upstream.token);
         }
         inner.up_to_down.insert(
             upstream_token.clone(),
@@ -140,9 +216,46 @@ impl ProgressRegistry {
         (upstream_token, stale)
     }
 
-    /// Translate a downstream token to its upstream token for `$/progress`
-    /// forwarding. Returns `None` for tokens this registry never minted (e.g.
-    /// client-provided `workDoneToken`s — out of scope, see module docs).
+    /// Decide how to route one `$/progress` for a registered token, advancing
+    /// its phase (lazy announcement, see module docs). Returns `None` for
+    /// tokens this registry never minted.
+    ///
+    /// - `Pending` + titled `begin` → `Announce` (create + forward).
+    /// - `Pending` + untitled `begin` → swallow the whole lifecycle.
+    /// - `Pending` + `report`/`end` (no `begin` seen) → drop: without a `begin`
+    ///   the editor has no progress UI to update.
+    /// - `Swallowed` + titled `begin` (token reuse without an `end`) → upgrade
+    ///   to `Announce` rather than lose renderable progress.
+    pub(crate) fn admit(
+        &self,
+        connection_id: ProgressConnectionId,
+        downstream_token: &NumberOrString,
+        signal: ProgressSignal,
+    ) -> Option<ProgressAdmission> {
+        let mut guard = self.inner.lock().recover_poison("ProgressRegistry::admit");
+        let entry = guard
+            .down_to_up
+            .get_mut(&connection_id)
+            .and_then(|tokens| tokens.get_mut(downstream_token))?;
+        Some(match (entry.phase, signal) {
+            (Phase::Announced, _) => ProgressAdmission::Forward(entry.upstream.clone()),
+            (Phase::Pending | Phase::Swallowed, ProgressSignal::TitledBegin) => {
+                entry.phase = Phase::Announced;
+                ProgressAdmission::Announce(entry.upstream.clone())
+            }
+            (Phase::Pending, ProgressSignal::UntitledBegin) => {
+                entry.phase = Phase::Swallowed;
+                ProgressAdmission::Drop
+            }
+            (Phase::Pending | Phase::Swallowed, _) => ProgressAdmission::Drop,
+        })
+    }
+
+    /// Translate a downstream token to its upstream token. Returns `None` for
+    /// tokens this registry never minted. Production forwarding goes through
+    /// [`ProgressRegistry::admit`] (which also advances the phase); this
+    /// phase-blind lookup remains for test assertions on the mapping itself.
+    #[cfg(test)]
     pub(crate) fn translate(
         &self,
         connection_id: ProgressConnectionId,
@@ -155,7 +268,8 @@ impl ProgressRegistry {
         inner
             .down_to_up
             .get(&connection_id)
-            .and_then(|tokens| tokens.get(downstream_token).cloned())
+            .and_then(|tokens| tokens.get(downstream_token))
+            .map(|entry| entry.upstream.clone())
     }
 
     /// Drop the mapping for a finished progress operation (a `$/progress` with
@@ -174,8 +288,8 @@ impl ProgressRegistry {
             .down_to_up
             .get_mut(&connection_id)
             .and_then(|tokens| tokens.remove(downstream_token));
-        if let Some(upstream_token) = removed {
-            inner.up_to_down.remove(&upstream_token);
+        if let Some(entry) = removed {
+            inner.up_to_down.remove(&entry.upstream);
         }
     }
 
@@ -196,7 +310,8 @@ impl ProgressRegistry {
         let Some(tokens) = inner.down_to_up.remove(&connection_id) else {
             return Vec::new();
         };
-        let upstream_tokens: Vec<NumberOrString> = tokens.into_values().collect();
+        let upstream_tokens: Vec<NumberOrString> =
+            tokens.into_values().map(|entry| entry.upstream).collect();
         for upstream_token in &upstream_tokens {
             inner.up_to_down.remove(upstream_token);
         }
@@ -352,11 +467,119 @@ mod tests {
         assert_ne!(up_first, up_second);
         // First registration evicts nothing; the second evicts and returns the first.
         assert_eq!(stale_first, None);
-        assert_eq!(stale_second, Some(up_first.clone()));
+        assert_eq!(
+            stale_second,
+            Some(EvictedToken {
+                token: up_first.clone(),
+                announced: false,
+            })
+        );
         // Stale upstream token no longer routable.
         assert!(reg.resolve_cancel(&up_first).is_none());
         // New one is.
         assert!(reg.resolve_cancel(&up_second).is_some());
         assert_eq!(reg.translate(conn, &downstream), Some(up_second));
+    }
+
+    #[test]
+    fn re_register_reports_whether_evicted_token_was_announced() {
+        let reg = ProgressRegistry::new();
+        let conn = reg.new_connection_id();
+        let downstream = NumberOrString::Number(1);
+
+        let (up_first, _) = reg.register(conn, downstream.clone(), dummy_writer());
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::TitledBegin),
+            Some(ProgressAdmission::Announce(up_first.clone()))
+        );
+
+        let (_, stale) = reg.register(conn, downstream.clone(), dummy_writer());
+        assert_eq!(
+            stale,
+            Some(EvictedToken {
+                token: up_first,
+                announced: true,
+            })
+        );
+    }
+
+    #[test]
+    fn admit_titled_begin_announces_then_forwards() {
+        let reg = ProgressRegistry::new();
+        let conn = reg.new_connection_id();
+        let downstream = NumberOrString::Number(1);
+        let (upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
+
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::TitledBegin),
+            Some(ProgressAdmission::Announce(upstream.clone()))
+        );
+        // Subsequent report/end forward without re-announcing.
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::Other),
+            Some(ProgressAdmission::Forward(upstream))
+        );
+    }
+
+    #[test]
+    fn admit_untitled_begin_swallows_whole_lifecycle() {
+        let reg = ProgressRegistry::new();
+        let conn = reg.new_connection_id();
+        let downstream = NumberOrString::Number(1);
+        let (_upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
+
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::UntitledBegin),
+            Some(ProgressAdmission::Drop)
+        );
+        // report/end for the swallowed token stay dropped.
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::Other),
+            Some(ProgressAdmission::Drop)
+        );
+    }
+
+    #[test]
+    fn admit_report_or_end_without_begin_is_dropped() {
+        let reg = ProgressRegistry::new();
+        let conn = reg.new_connection_id();
+        let downstream = NumberOrString::Number(1);
+        let (_upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
+
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::Other),
+            Some(ProgressAdmission::Drop)
+        );
+    }
+
+    #[test]
+    fn admit_titled_begin_after_swallow_upgrades_to_announce() {
+        let reg = ProgressRegistry::new();
+        let conn = reg.new_connection_id();
+        let downstream = NumberOrString::Number(1);
+        let (upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
+
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::UntitledBegin),
+            Some(ProgressAdmission::Drop)
+        );
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::TitledBegin),
+            Some(ProgressAdmission::Announce(upstream))
+        );
+    }
+
+    #[test]
+    fn admit_unknown_token_returns_none() {
+        let reg = ProgressRegistry::new();
+        let conn = reg.new_connection_id();
+        assert_eq!(
+            reg.admit(
+                conn,
+                &NumberOrString::Number(9),
+                ProgressSignal::TitledBegin
+            ),
+            None
+        );
     }
 }

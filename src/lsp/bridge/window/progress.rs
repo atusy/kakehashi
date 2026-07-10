@@ -12,6 +12,7 @@ use serde::Deserialize;
 use tower_lsp_server::ls_types::{ProgressParams, ProgressParamsValue, WorkDoneProgress};
 
 use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
+use crate::lsp::bridge::progress_registry::{ProgressAdmission, ProgressSignal};
 
 /// Translate and forward a downstream `$/progress` notification to the editor.
 ///
@@ -21,6 +22,12 @@ use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
 /// any other token (e.g. a client-provided `workDoneToken`) is **dropped** — it
 /// is out of scope for token remapping (see [`ProgressRegistry`] module docs),
 /// and forwarding it verbatim risks duplicates under request fan-out.
+///
+/// Announcement is lazy: the editor-facing `window/workDoneProgress/create` is
+/// enqueued here, immediately before the first titled `begin` (same FIFO
+/// channel, so create-before-progress ordering holds), and untitled progress
+/// lifecycles are swallowed entirely — see [`ProgressRegistry`] module docs
+/// for why (per-request downstream progress storms).
 ///
 /// A terminating `WorkDoneProgress::End` clears the mapping after forwarding.
 ///
@@ -59,10 +66,25 @@ pub(in crate::lsp::bridge) fn forward(
         return;
     }
 
-    let Some(upstream_token) = deps
-        .progress_registry
-        .translate(deps.progress_connection_id, &params.token)
-    else {
+    let signal = match &params.value {
+        ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(begin)) => {
+            if begin.title.is_empty() {
+                ProgressSignal::UntitledBegin
+            } else {
+                ProgressSignal::TitledBegin
+            }
+        }
+        _ => ProgressSignal::Other,
+    };
+    let is_end = matches!(
+        &params.value,
+        ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+    );
+
+    let admission =
+        deps.progress_registry
+            .admit(deps.progress_connection_id, &params.token, signal);
+    let Some(admission) = admission else {
         // Unknown token: not a downstream-declared progress we remapped.
         debug!(
             target: "kakehashi::bridge::reader",
@@ -72,18 +94,38 @@ pub(in crate::lsp::bridge) fn forward(
         return;
     };
 
-    let is_end = matches!(
-        &params.value,
-        ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
-    );
-
-    let downstream_token = std::mem::replace(&mut params.token, upstream_token);
-    let _ = deps
-        .upstream_tx
-        .send(UpstreamNotification::Progress { params });
-
-    if is_end {
-        deps.progress_registry
-            .complete(deps.progress_connection_id, &downstream_token);
+    match admission {
+        ProgressAdmission::Announce(upstream_token) => {
+            // First titled begin: ask the editor to create the token, then
+            // forward the begin. Same FIFO channel, and the forwarding loop
+            // awaits the create inline, so ordering holds.
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::CreateWorkDoneProgress {
+                    token: upstream_token.clone(),
+                });
+            params.token = upstream_token;
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::Progress { params });
+        }
+        ProgressAdmission::Forward(upstream_token) => {
+            let downstream_token = std::mem::replace(&mut params.token, upstream_token);
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::Progress { params });
+            if is_end {
+                deps.progress_registry
+                    .complete(deps.progress_connection_id, &downstream_token);
+            }
+        }
+        ProgressAdmission::Drop => {
+            // Swallowed lifecycle (untitled) or report/end without a begin:
+            // nothing reaches the editor. An End still clears the mapping.
+            if is_end {
+                deps.progress_registry
+                    .complete(deps.progress_connection_id, &params.token);
+            }
+        }
     }
 }
