@@ -30,8 +30,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::analysis::{
-    calculate_delta_or_full, filter_semantic_tokens_by_range, handle_semantic_tokens_full,
-    next_result_id,
+    SemanticSnapshotIdentity, calculate_delta_or_full, filter_semantic_tokens_by_range,
+    handle_semantic_tokens_full, next_result_id,
 };
 use crate::lsp::current_upstream_id;
 
@@ -370,12 +370,15 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        if let Some(cached) = self.cache.get_current_tokens_for_snapshot(
-            &uri,
-            &language_name,
-            snapshot.parsed_version,
-            token_generation,
-        ) {
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation: token_generation,
+        };
+        if let Some(cached) =
+            self.cache
+                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
+        {
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
@@ -534,8 +537,7 @@ impl Kakehashi {
             stored_tokens,
             language_name,
             cache_key,
-            snapshot.parsed_version,
-            token_generation,
+            snapshot_identity,
         );
 
         // Finish tracking this request
@@ -715,12 +717,15 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        if let Some(cached) = self.cache.get_current_tokens_for_snapshot(
-            &uri,
-            &language_name,
-            snapshot.parsed_version,
-            token_generation,
-        ) && cached.result_id.as_deref() == Some(previous_result_id.as_str())
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation: token_generation,
+        };
+        if let Some(cached) =
+            self.cache
+                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
+            && cached.result_id.as_deref() == Some(previous_result_id.as_str())
         {
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
@@ -887,8 +892,7 @@ impl Kakehashi {
                 tokens.clone(),
                 language_name.clone(),
                 cache_key,
-                snapshot.parsed_version,
-                token_generation,
+                snapshot_identity,
             );
             let final_result = SemanticTokensFullDeltaResult::Tokens(tokens);
             self.cache
@@ -915,8 +919,7 @@ impl Kakehashi {
                     tokens.clone(),
                     language_name.clone(),
                     cache_key,
-                    snapshot.parsed_version,
-                    token_generation,
+                    snapshot_identity,
                 );
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
@@ -941,8 +944,7 @@ impl Kakehashi {
                     stored_tokens,
                     language_name.clone(),
                     cache_key,
-                    snapshot.parsed_version,
-                    token_generation,
+                    snapshot_identity,
                 );
                 SemanticTokensFullDeltaResult::TokensDelta(delta)
             }
@@ -962,8 +964,7 @@ impl Kakehashi {
                     tokens.clone(),
                     language_name.clone(),
                     cache_key,
-                    snapshot.parsed_version,
-                    token_generation,
+                    snapshot_identity,
                 );
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
@@ -1034,6 +1035,11 @@ impl Kakehashi {
         {
             return Err(crate::error::content_modified_error());
         }
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation,
+        };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
@@ -1103,6 +1109,18 @@ impl Kakehashi {
         )
         .await;
 
+        // A range is authored against one live document lifetime. A close,
+        // reopen, or edit during the uncancellable full-document compute makes
+        // both its response coordinates and any cache store obsolete.
+        let still_current = self.cache.semantic_token_generation() == generation
+            && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.slot.current_incarnation == snapshot.incarnation
+                    && view.content_version == snapshot.parsed_version
+            });
+        if !still_current {
+            return Err(crate::error::content_modified_error());
+        }
+
         // Convert the computed full result to RangeResult. Cache ONLY a clean
         // `Tokens` result (#535); a `Partial` is passed through to the client as-is
         // but NOT cached (it is a degraded response), and a `None` becomes an empty
@@ -1120,8 +1138,7 @@ impl Kakehashi {
                     full_tokens.clone(),
                     language_name.clone(),
                     cache_key,
-                    snapshot.parsed_version,
-                    generation,
+                    snapshot_identity,
                 );
                 let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
                 self.cache.store_range_tokens(

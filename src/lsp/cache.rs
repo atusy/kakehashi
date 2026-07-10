@@ -16,7 +16,8 @@ use tree_sitter::Tree;
 use url::Url;
 
 use crate::analysis::{
-    InjectionMap, InjectionTokenCache, SemanticTokenCache, SemanticTokenRangeCache,
+    InjectionMap, InjectionTokenCache, SemanticSnapshotIdentity, SemanticTokenCache,
+    SemanticTokenRangeCache,
 };
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
@@ -549,11 +550,10 @@ impl CacheCoordinator {
         tokens: SemanticTokens,
         language: String,
         cache_key: u64,
-        parsed_version: u64,
-        generation: u64,
+        snapshot: SemanticSnapshotIdentity,
     ) {
         self.semantic_cache
-            .store(uri, tokens, language, cache_key, parsed_version, generation);
+            .store(uri, tokens, language, cache_key, snapshot);
     }
 
     /// Store the most-recent `semanticTokens/range` result for a document (#535),
@@ -604,11 +604,10 @@ impl CacheCoordinator {
         &self,
         uri: &Url,
         language: &str,
-        parsed_version: u64,
-        generation: u64,
+        snapshot: SemanticSnapshotIdentity,
     ) -> Option<std::sync::Arc<SemanticTokens>> {
         self.semantic_cache
-            .get_if_same_snapshot(uri, language, parsed_version, generation)
+            .get_if_same_snapshot(uri, language, snapshot)
     }
 
     /// Bump the settings generation on a settings/query reload so every cached
@@ -709,7 +708,17 @@ mod tests {
                 token_modifiers_bitset: 0,
             }],
         };
-        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0, 0, 0);
+        cache.store_tokens(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: 0,
+            },
+        );
 
         // Start a request
         let (_request_id, _token) = cache.start_request(&uri);
@@ -740,8 +749,11 @@ mod tests {
             tokens.clone(),
             "rust".to_string(),
             key_before,
-            0,
-            gen_before,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: gen_before,
+            },
         );
         assert!(cache.get_current_tokens(&uri, "rust", key_before).is_some());
 
@@ -755,8 +767,11 @@ mod tests {
             tokens,
             "rust".to_string(),
             key_before,
-            0,
-            gen_before,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: gen_before,
+            },
         );
 
         // A fresh post-reload request snapshots the new generation and builds its
@@ -784,7 +799,17 @@ mod tests {
             result_id: Some("test-id".to_string()),
             data: vec![],
         };
-        cache.store_tokens(uri.clone(), tokens, "rust".to_string(), 0, 0, 0);
+        cache.store_tokens(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            0,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: 0,
+            },
+        );
 
         // Verify stored
         assert!(cache.get_tokens_if_valid(&uri, "test-id").is_some());
