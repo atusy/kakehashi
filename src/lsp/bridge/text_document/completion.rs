@@ -267,20 +267,25 @@ pub(super) fn transform_completion_item(
         }
     }
 
-    // Transform additional_text_edits if present, stripping any unsafe for
-    // the injection region.
+    // Transform additional_text_edits if present. ALL-OR-NOTHING: the array
+    // can carry paired halves of one operation (a deletion plus a
+    // reinsertion), so stripping only the unsafe member could apply half and
+    // lose content — if any member is unsafe, drop the whole array. The
+    // primary insertion still works without it.
     if let Some(ref mut additional_edits) = item.additional_text_edits {
-        let before = additional_edits.len();
         for edit in additional_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
         }
-        additional_edits.retain(|edit| text_edit_safe_in_region(edit, offset, region_end));
-        let dropped = before - additional_edits.len();
-        if dropped > 0 {
+        if !additional_edits
+            .iter()
+            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+        {
             log::warn!(
                 target: "kakehashi::bridge",
-                "completion: stripped {dropped} additionalTextEdit(s) unsafe for the injection region (escape it, break line prefixes, or merge content into the closing fence)"
+                "completion: dropped an item's additionalTextEdits ({}): a member is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
+                additional_edits.len()
             );
+            item.additional_text_edits = None;
         }
     }
     true
@@ -313,6 +318,11 @@ fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_li
             // continues past the region, so a non-zero start column (inline
             // content always sits behind its delimiter) is prefixed. A
             // column-0 same-line region is a one-line fenced block — safe.
+            // Known limitation: a CUSTOM injection query (`#offset!`) could
+            // capture a column-0 same-line range with a host suffix after it;
+            // the offsets can't represent that, and treating column 0 as
+            // unsafe breaks insertFinalNewline for one-line fences — the
+            // built-in queries never produce the shape.
             Some(&column) => column != 0 && (columns.len() > 1 || region_end.line == offset.line()),
             None => per_line_prefixed,
         },
@@ -1167,10 +1177,11 @@ mod tests {
     }
 
     #[test]
-    fn transform_strips_prefix_breaking_additional_edits_but_keeps_item() {
+    fn transform_drops_whole_additional_edit_array_but_keeps_item() {
         // An import-style additionalTextEdit that inserts a raw newline at a
-        // prefixed line would break the `> ` prefix — strip just that edit;
-        // the item's primary insertion still works.
+        // prefixed line would break the `> ` prefix — the array drops WHOLE
+        // (it can carry paired halves of one operation); the item's primary
+        // insertion still works.
         let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
         let region_end = Position {
             line: 5,
@@ -1198,9 +1209,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(list.items.len(), 1, "item with safe primary edit is kept");
-        let additional = list.items[0].additional_text_edits.as_ref().unwrap();
-        assert_eq!(additional.len(), 1, "newline-inserting edit is stripped");
-        assert_eq!(additional[0].new_text, "ok");
+        assert!(
+            list.items[0].additional_text_edits.is_none(),
+            "an unsafe member drops the whole additionalTextEdits array \
+             (halves of one operation must not apply separately)"
+        );
     }
 
     #[test]
@@ -1424,22 +1437,25 @@ mod tests {
 
     #[test]
     fn insert_replace_snippet_checks_both_start_lines() {
-        // Malformed InsertReplaceEdit with unequal starts: insert anchors on
-        // the (unprefixed) later line, replace on the prefixed line 0-adjacent
-        // row of a blockquote. The snippet-variable gate must check BOTH.
-        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        // Malformed InsertReplaceEdit with unequal starts in a MIXED-offset
+        // region ([0,0,2,0]): the insert range anchors on virtual line 0
+        // (host 3 — unprefixed, and host 4 is unprefixed too), the replace
+        // range on virtual line 2 (host 5 — prefixed). A minimum-start
+        // implementation anchors at the unprefixed line and would ADMIT the
+        // snippet variable; checking both starts rejects it.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 2, 0]);
         let region_end = Position {
-            line: 5,
+            line: 7,
             character: 0,
         };
         let response = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": [
                 { "label": "unequal", "insertTextFormat": 2,
-                  "textEdit": { "insert": { "start": { "line": 1, "character": 0 },
-                                            "end": { "line": 1, "character": 3 } },
-                                "replace": { "start": { "line": 0, "character": 0 },
-                                             "end": { "line": 0, "character": 3 } },
+                  "textEdit": { "insert": { "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 3 } },
+                                "replace": { "start": { "line": 2, "character": 2 },
+                                             "end": { "line": 2, "character": 5 } },
                                 "newText": "${CLIPBOARD}" } }
             ]
         });

@@ -163,19 +163,23 @@ fn transform_color_presentation_response_to_host(
             }
         }
 
+        // ALL-OR-NOTHING (same reasoning as completion): the array can carry
+        // paired halves of one operation, so any unsafe member drops the
+        // whole array rather than half-applying it.
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
-            let before = additional_edits.len();
             for edit in additional_edits.iter_mut() {
                 translate_virtual_range_to_host(&mut edit.range, offset);
             }
-            additional_edits
-                .retain(|edit| text_edit_safe_in_region(edit, offset, region_end));
-            let stripped = before - additional_edits.len();
-            if stripped > 0 {
+            if !additional_edits
+                .iter()
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+            {
                 log::warn!(
                     target: "kakehashi::bridge",
-                    "colorPresentation: stripped {stripped} additionalTextEdit(s) unsafe for the injection region (escape it, break line prefixes, or merge content into the closing fence)"
+                    "colorPresentation: dropped a presentation's additionalTextEdits ({}): a member is unsafe for the injection region",
+                    additional_edits.len()
                 );
+                presentation.additional_text_edits = None;
             }
         }
         true
@@ -675,13 +679,9 @@ mod tests {
 
         assert_eq!(presentations.len(), 1, "unsafe presentation is dropped");
         assert_eq!(presentations[0].label, "safe");
-        assert_eq!(
-            presentations[0]
-                .additional_text_edits
-                .as_ref()
-                .map(Vec::len),
-            Some(0),
-            "prefix-breaking additionalTextEdit is stripped"
+        assert!(
+            presentations[0].additional_text_edits.is_none(),
+            "an unsafe member drops the whole additionalTextEdits array"
         );
     }
 
