@@ -299,13 +299,22 @@ struct WalkFlightGuard<'a> {
     map: &'a dashmap::DashMap<(Url, String, bool), std::sync::Arc<CapturesWalkFlight>>,
     key: (Url, String, bool),
     flight: std::sync::Arc<CapturesWalkFlight>,
+    cancel_on_drop: bool,
+}
+
+impl WalkFlightGuard<'_> {
+    fn complete(&mut self) {
+        self.cancel_on_drop = false;
+    }
 }
 
 impl Drop for WalkFlightGuard<'_> {
     fn drop(&mut self) {
         // Also covers wholesale handler-future drops: a detached compute-pool
         // unit observes the same token and stops at its next checkpoint.
-        self.flight.cancel.cancel();
+        if self.cancel_on_drop {
+            self.flight.cancel.cancel();
+        }
         self.map.remove_if(&self.key, |_, current| {
             std::sync::Arc::ptr_eq(current, &self.flight)
         });
@@ -1025,6 +1034,7 @@ impl Kakehashi {
                             map: &self.captures_walk_inflight,
                             key: key.clone(),
                             flight,
+                            cancel_on_drop: true,
                         });
                         // A prior winner can store its memo and remove its
                         // marker between the loop's memo read and our claim.
@@ -1037,6 +1047,10 @@ impl Kakehashi {
                         {
                             let result = hit.result.clone();
                             drop(hit);
+                            flight_guard
+                                .as_mut()
+                                .expect("winner guard was just installed")
+                                .complete();
                             return Ok(result.map(|(matches, skipped)| ComputedCaptures {
                                 uri,
                                 incarnation,
@@ -1098,7 +1112,7 @@ impl Kakehashi {
         // Holds the in-flight marker for the winner until this function
         // returns (its Drop removes the marker and wakes the losers, AFTER
         // the memo store below on the success path).
-        let _flight_guard = flight_guard;
+        let mut flight_guard = flight_guard;
 
         let uri_for_walk = uri.clone();
         let kind = kind.to_string();
@@ -1290,6 +1304,9 @@ impl Kakehashi {
                     result: result.clone(),
                 },
             );
+            if let Some(guard) = flight_guard.as_mut() {
+                guard.complete();
+            }
         }
         Ok(result.map(|(matches, skipped)| ComputedCaptures {
             uri,
@@ -2006,11 +2023,16 @@ mod tests {
             },
             crate::cancel::CancelToken::default(),
         ));
-        let winner_notify = std::sync::Arc::clone(&winner_flight.notify);
-        service
-            .inner()
+        let inner = service.inner();
+        inner
             .captures_walk_inflight
-            .insert(key.clone(), winner_flight);
+            .insert(key.clone(), std::sync::Arc::clone(&winner_flight));
+        let mut winner_guard = WalkFlightGuard {
+            map: &inner.captures_walk_inflight,
+            key: key.clone(),
+            flight: winner_flight,
+            cancel_on_drop: true,
+        };
 
         let request = {
             let service = std::sync::Arc::clone(&service);
@@ -2050,8 +2072,8 @@ mod tests {
                 )),
             },
         );
-        service.inner().captures_walk_inflight.remove(&key);
-        winner_notify.notify_waiters();
+        winner_guard.complete();
+        drop(winner_guard);
 
         let result = request
             .await
@@ -2243,6 +2265,7 @@ mod tests {
             map: &flights,
             key: key.clone(),
             flight: old_flight,
+            cancel_on_drop: true,
         };
 
         let new_cancel = crate::cancel::CancelToken::default();
