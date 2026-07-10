@@ -583,7 +583,7 @@ Bridged features are also limited to **embedded code blocks** in one respect:
 navigation and edits do not cross between blocks — on the
 goto/references/rename transforms, results addressed to another block's
 virtual URI are filtered out (document-link targets are the exception and
-pass through untouched), and a code ACTION touching another region stays
+pass through untouched), and a code action touching another region stays
 visible as a disabled entry for `disabledSupport` clients (without that
 capability: dropped from the initial response, returned unresolved on
 `codeAction/resolve`). One `applyEdit` nuance: the translator picks its
