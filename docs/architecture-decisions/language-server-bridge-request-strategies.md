@@ -220,7 +220,7 @@ But line 0 of the virtual document maps to the injection start line in the hostâ
 |--------|----------|
 | Input | Position + newName |
 | Output | WorkspaceEdit (changes across files) |
-| Cross-file | Real-file edits pass through; same-region virtual edits translate; foreign virtual-region or structurally unsafe edits reject |
+| Cross-file | Real-file edits pass through; same-region virtual edits translate; foreign virtual-region entries filtered (siblings survive); structurally unsafe edits or virtual-URI file operations reject the result |
 | Position mapping | Same-region TextEdit ranges (real-file ranges untouched) |
 
 Rename can affect multiple files. Real-file edits (a project-aware server's
