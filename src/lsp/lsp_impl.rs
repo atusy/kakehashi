@@ -673,6 +673,17 @@ impl Kakehashi {
                 // loses its retry (diagnostic_publisher.rs).
                 if diagnostics.has_region_slots(&uri) {
                     publisher.republish(&uri).await;
+                    // Degraded-pull recovery: a pull answered while THIS parse
+                    // was pending couldn't fold the region slots and skipped
+                    // `mark_served`, so coverage is still dirty — and no later
+                    // event re-nudges a pull-first client until the next push.
+                    // Ask through the existing coverage + single-flight gates:
+                    // this fires only when some host's change is genuinely
+                    // uncovered (a pull that raced the parse, or a push the
+                    // client never pulled for), so the ordinary edit cycle —
+                    // where the editor's own re-pull marks served — stays
+                    // refresh-free as documented.
+                    publisher.request_pull_diagnostic_refresh(false);
                 }
 
                 // Schedule the debounced diagnostic HERE, after the reparse restored

@@ -845,16 +845,19 @@ impl DiagnosticPublisher {
     /// Emitted **off** the per-host republish lock and **only** from the origins
     /// the editor can't learn about on its own — the push-origin paths
     /// ([`Self::publish_host_push`], [`Self::publish_region_push`]), the
-    /// crash-driven eviction ([`Self::evict_connection_diagnostics`]), and the
+    /// crash-driven eviction ([`Self::evict_connection_diagnostics`]), the
     /// upstream forwarding loop relaying a downstream server's own
-    /// `workspace/diagnostic/refresh` (`deliver_upstream_notification`) — never from
-    /// the pull-origin republish ([`Self::publish_pull_layer`]), the
-    /// editor-originated eviction paths ([`Self::clear_pull_layer`],
-    /// [`Self::clear_host`]), nor the edit-origin re-merge (`did_change`): those
-    /// carry no *new* result the editor is unaware of — a pull-origin set is already
-    /// the answer to a pull the editor made, and an edit-origin re-merge is covered
-    /// by the editor's own `didChange` re-pull — so a refresh there would be
-    /// redundant. (No tight loop forms: a
+    /// `workspace/diagnostic/refresh` (`deliver_upstream_notification`), and the
+    /// reparse loop's post-parse backstop as **degraded-pull recovery** (a pull
+    /// that raced the parse was answered without the region fold and did not
+    /// mark coverage served; the coverage gate below makes that call a no-op in
+    /// the ordinary covered cycle) — never from the pull-origin republish
+    /// ([`Self::publish_pull_layer`]) nor the editor-originated eviction paths
+    /// ([`Self::clear_pull_layer`], [`Self::clear_host`]): those carry no *new*
+    /// result the editor is unaware of — a pull-origin set is already the
+    /// answer to a pull the editor made, and an ordinary edit-origin re-merge
+    /// is covered by the editor's own `didChange` re-pull — so a refresh there
+    /// would be redundant. (No tight loop forms: a
     /// refresh-induced pull is answered inline by `diagnostic_impl`, which never
     /// republishes, so a refresh cannot directly beget another; the indirect
     /// push→refresh→re-pull→downstream-re-push→here path is bounded by
