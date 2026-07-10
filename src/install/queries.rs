@@ -631,6 +631,9 @@ fn process_is_running(pid: &str) -> bool {
 
 #[cfg(not(unix))]
 fn process_is_running(pid: &str) -> bool {
+    // No portable std API can test another process's liveness. Be
+    // conservative: generated temp names contain numeric PIDs, so treat them
+    // as possibly live and leave cleanup to a future platform-specific pass.
     pid.parse::<u32>().is_ok()
 }
 
