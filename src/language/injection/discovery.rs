@@ -716,8 +716,9 @@ impl InjectionResolver {
         })
     }
 
-    /// Resolve every injection region in the document (whole-doc operations
-    /// like `documentLink` use this rather than a position lookup). Holds no
+    /// Resolve every bridge virtual document in the host (whole-doc operations
+    /// like `documentLink` use this rather than a position lookup). Combined
+    /// capture groups produce one resolved document. Holds no
     /// Document lock — `tree`/`text` must already be cloned, typically via
     /// `DocumentSnapshot`. Empty vec when nothing matches.
     pub(crate) fn resolve_all(

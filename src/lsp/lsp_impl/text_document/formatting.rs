@@ -1,10 +1,10 @@
 //! `textDocument/formatting` handler and helpers shared with
 //! `textDocument/rangeFormatting`.
 //!
-//! `textDocument/formatting` resolves every injection region in the document
-//! and asks the configured downstream language servers to format each one.
-//! Across regions the resulting [`TextEdit`] lists are concatenated, since each
-//! region edits a disjoint span of the host document.
+//! `textDocument/formatting` resolves bridge virtual documents in the host and
+//! asks the configured downstream language servers to format each safe,
+//! contiguous one. Their [`TextEdit`] lists are concatenated because the
+//! remaining documents edit disjoint host spans.
 //!
 //! Within a region, the aggregation strategy decides how multiple servers
 //! combine:
@@ -237,9 +237,9 @@ impl Kakehashi {
         Ok(result)
     }
 
-    /// Format every injection region (the **virt** layer): resolve regions
-    /// from the parsed snapshot, format each one per its aggregation config,
-    /// and concatenate the per-region edits (disjoint spans).
+    /// Format every safe bridge virtual document (the **virt** layer): resolve
+    /// from the parsed snapshot, skip non-contiguous groups, format each
+    /// remaining document, and concatenate its disjoint edits.
     #[allow(clippy::too_many_arguments)]
     async fn virt_format_edits(
         &self,
