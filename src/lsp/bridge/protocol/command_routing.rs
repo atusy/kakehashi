@@ -66,13 +66,26 @@ pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Opt
         // Not a transient: the origin is a TOML config key, so an affected
         // config drops this server's commands on EVERY request. One warn here
         // covers all four call sites (initial bare/embedded command, virt and
-        // host resolve), which fail closed on the `None`.
-        log::warn!(
-            target: "kakehashi::bridge",
-            "cannot mint a routing name for command '{command}': the server name \
-             ('{origin}') or host URI contains the reserved separator; the command \
-             is dropped — rename the server in languageServers to fix this"
-        );
+        // host resolve), which fail closed on the `None` — deduplicated per
+        // distinct origin so per-action shaping loops don't spam the log.
+        static WARNED_ORIGINS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+            std::sync::Mutex::new(None);
+        let first_for_origin = WARNED_ORIGINS
+            .lock()
+            .map(|mut set| {
+                set.get_or_insert_with(Default::default)
+                    .insert(origin.to_string())
+            })
+            .unwrap_or(true);
+        if first_for_origin {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "cannot mint routing names for server '{origin}' (first affected \
+                 command: '{command}'): the server name or host URI contains the \
+                 reserved separator; its commands are dropped — rename the server \
+                 in languageServers to fix this"
+            );
+        }
         return None;
     }
     Some(format!(

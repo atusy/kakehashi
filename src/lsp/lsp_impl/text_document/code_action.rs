@@ -42,6 +42,14 @@ use crate::text::PositionMapper;
 
 const METHOD: &str = "textDocument/codeAction";
 
+/// Why [`Kakehashi::code_action_region_end_if_fresh`] produced no region end,
+/// so the caller logs staleness once and skips it for already-warned
+/// malformed envelopes.
+enum RegionEndUnavailable {
+    MalformedEnvelope,
+    Stale,
+}
+
 /// Flatten the per-server results of a `concatenated` dispatch into one response
 /// in priority order (`dispatch_concatenated` yields them ordered). Each server
 /// contributes `Option<CodeActionResponse>`; drop the `None`s, concatenate the
@@ -181,12 +189,16 @@ impl Kakehashi {
             Position::default()
         } else {
             match self.code_action_region_end_if_fresh(&envelope) {
-                Some(region_end) => region_end,
-                None => {
+                Ok(region_end) => region_end,
+                Err(RegionEndUnavailable::MalformedEnvelope) => {
+                    // Already warned with the malformed field; no stale-debug.
+                    return Ok(action);
+                }
+                Err(RegionEndUnavailable::Stale) => {
                     log::debug!(
                         target: "kakehashi::bridge",
-                        "codeAction/resolve: region {} of {} (origin {}) is stale or \
-                         unresolvable; returning action unresolved",
+                        "codeAction/resolve: region {} of {} (origin {}) is stale; \
+                         returning action unresolved",
                         envelope.region_id,
                         envelope.host_uri,
                         envelope.origin
@@ -226,17 +238,21 @@ impl Kakehashi {
     /// never matches and resolve always fails soft for those regions. That errs
     /// in the safe direction (the action stays unresolved) and frontmatter code
     /// actions have no known real-world producer; revisit if one appears.
-    fn code_action_region_end_if_fresh(&self, envelope: &CodeActionEnvelope) -> Option<Position> {
+    fn code_action_region_end_if_fresh(
+        &self,
+        envelope: &CodeActionEnvelope,
+    ) -> std::result::Result<Position, RegionEndUnavailable> {
         // A malformed envelope is NOT staleness — the bridge only mints valid
         // URLs/ULIDs, so warn (mirroring the bridge-side host_uri warn) rather
-        // than letting it hide under the "stale region" debug line.
+        // than letting it hide under the "stale region" debug line; the
+        // caller skips its stale-debug for this classification.
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             log::warn!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: envelope host_uri '{}' is not a valid URL",
                 envelope.host_uri
             );
-            return None;
+            return Err(RegionEndUnavailable::MalformedEnvelope);
         };
         let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
             log::warn!(
@@ -244,20 +260,33 @@ impl Kakehashi {
                 "codeAction/resolve: envelope region_id '{}' is not a valid ULID",
                 envelope.region_id
             );
-            return None;
+            return Err(RegionEndUnavailable::MalformedEnvelope);
         };
+        self.code_action_region_end_live(envelope, &host_url, ulid)
+            .ok_or(RegionEndUnavailable::Stale)
+    }
+
+    /// The live-lookup half of [`Self::code_action_region_end_if_fresh`]:
+    /// every `None` here is the STALE class (region moved, invalidated, or
+    /// diverged), never a malformed envelope.
+    fn code_action_region_end_live(
+        &self,
+        envelope: &CodeActionEnvelope,
+        host_url: &Url,
+        ulid: Ulid,
+    ) -> Option<Position> {
         // Re-resolve the region from the LIVE parse (same construction as the
         // goto/showDocument offset path), yielding the current per-line offset
         // AND the content-precise host byte range.
         let (start_byte, _end, _kind, _layer) =
-            self.bridge.node_tracker().lookup_node(&host_url, &ulid)?;
-        let snapshot = self.documents.get(&host_url)?.snapshot()?;
-        let language_name = detect_document_language(&self.language, &self.documents, &host_url)?;
+            self.bridge.node_tracker().lookup_node(host_url, &ulid)?;
+        let snapshot = self.documents.get(host_url)?.snapshot()?;
+        let language_name = detect_document_language(&self.language, &self.documents, host_url)?;
         let injection_query = self.language.injection_query(&language_name)?;
         let resolved = InjectionResolver::resolve_at_byte_offset(
             &self.language,
             self.bridge.node_tracker(),
-            &host_url,
+            host_url,
             snapshot.tree(),
             snapshot.text(),
             injection_query.as_ref(),

@@ -174,14 +174,31 @@ impl LanguageServerPool {
             // back); reconstructing a shared/marker root without a document is a
             // deferred follow-up.
             None if key.is_client_fallback() => {
+                // The palette registry is session-persistent, so an origin
+                // removed/disabled from config after registration lands here —
+                // warn like the encoded-command path (user-invoked).
                 if !crate::config::is_server_spawnable(&settings.language_servers, origin) {
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: palette origin '{origin}' is no longer spawnable; \
+                         dropping '{}'",
+                        params.command
+                    );
                     return None;
                 }
-                let config = resolve_with_wildcard(
+                let Some(config) = resolve_with_wildcard(
                     &settings.language_servers,
                     origin,
                     merge_bridge_server_configs,
-                )?;
+                ) else {
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: palette origin '{origin}' has no resolvable config; \
+                         dropping '{}'",
+                        params.command
+                    );
+                    return None;
+                };
                 // Wait through initialization (bounded by the standard init
                 // budget) rather than take a possibly-`Initializing` handle: the
                 // pool returns an existing not-yet-Ready connection here, whose
