@@ -182,6 +182,16 @@ pub(crate) fn merge_cached_diagnostics(
 /// and the client-pull response (`diagnostic_impl`): the pull's `resultId` is
 /// a content hash of the serialized items, so the same logical set must
 /// serialize identically across pulls regardless of fan-in completion order.
+///
+/// The tiebreak's `unwrap_or_default` cannot fire in practice: `ls_types`
+/// values serialize infallibly (string-keyed maps only, no non-UTF-8, no
+/// custom `Serialize`), and the idiom predates this sort's extraction. Were
+/// serialization ever to fail, the cheap keys above still order by
+/// position/message/source/severity — only fully-tied distinct diagnostics
+/// could then keep input order, and the `resultId`'s length suffix plus the
+/// per-item hash of everything that DID serialize bound the unchanged-report
+/// consequence to the same accepted 2^-64 collision class documented at
+/// `diagnostic_result_id`.
 pub(crate) fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
     diagnostics.sort_by(|a, b| {
         let key = |d: &Diagnostic| {
