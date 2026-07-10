@@ -183,11 +183,6 @@ fn install_queries_with_dependencies_from_with_http_policy(
     force: bool,
     http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    if !is_safe_language_name(language) {
-        return Err(QueryInstallError::LanguageNotSupported(
-            language.escape_default().to_string(),
-        ));
-    }
     let mut installed = std::collections::HashSet::new();
     install_queries_recursive(
         base_url,
@@ -199,14 +194,14 @@ fn install_queries_with_dependencies_from_with_http_policy(
     )
 }
 
-fn validate_base_url_http_policy(
-    base_url: &str,
+fn validate_url_http_policy(
+    url: &str,
     http_policy: QueryHttpPolicy,
 ) -> Result<(), QueryInstallError> {
     match http_policy {
-        QueryHttpPolicy::HttpsOnly if base_url.starts_with("http://") => {
+        QueryHttpPolicy::HttpsOnly if url.starts_with("http://") => {
             Err(QueryInstallError::HttpsOnly {
-                url: base_url.to_string(),
+                url: url.to_string(),
             })
         }
         _ => Ok(()),
@@ -359,7 +354,7 @@ fn install_queries_recursive(
 
 /// Download a file from a URL.
 fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, QueryInstallError> {
-    validate_base_url_http_policy(url, http_policy)?;
+    validate_url_http_policy(url, http_policy)?;
     let agent = match http_policy {
         QueryHttpPolicy::HttpsOnly => agent_with_timeout(QUERY_HTTP_TIMEOUT),
         #[cfg(test)]
