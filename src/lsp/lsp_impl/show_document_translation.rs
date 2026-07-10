@@ -128,7 +128,7 @@ impl ShowDocumentTranslator {
             host_url,
             region_id,
         )
-        .map(|(offset, _region_end)| offset)
+        .map(|(offset, _region_end, _contiguous)| offset)
     }
 }
 

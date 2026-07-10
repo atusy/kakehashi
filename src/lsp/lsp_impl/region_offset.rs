@@ -33,7 +33,7 @@ pub(super) fn resolve_region_offset(
     bridge: &BridgeCoordinator,
     host_url: &Url,
     region_id: &str,
-) -> Option<(RegionOffset, Position)> {
+) -> Option<(RegionOffset, Position, bool)> {
     let ulid = ulid::Ulid::from_string(region_id).ok()?;
     let (start_byte, _end, _kind, _layer, tracked_incarnation) =
         bridge.node_tracker().lookup_node(host_url, &ulid)?;
@@ -78,5 +78,6 @@ pub(super) fn resolve_region_offset(
     Some((
         RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets),
         region_end,
+        resolved.contiguous,
     ))
 }
