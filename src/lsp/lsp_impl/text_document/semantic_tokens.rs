@@ -377,6 +377,17 @@ impl Kakehashi {
             self.cache
                 .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
         {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let still_current = self.cache.semantic_token_generation() == token_generation
+                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                    view.slot.current_incarnation == snapshot.incarnation
+                        && view.content_version == snapshot.parsed_version
+                });
+            if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(None);
+            }
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
@@ -403,6 +414,17 @@ impl Kakehashi {
                 .cache
                 .get_current_tokens(&uri, &language_name, cache_key)
             {
+                let edit_lock = self.documents.edit_lock(&uri);
+                let _edit_guard = edit_lock.lock().await;
+                let still_current = self.cache.semantic_token_generation() == token_generation
+                    && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                        view.slot.current_incarnation == snapshot.incarnation
+                            && view.content_version == snapshot.parsed_version
+                    });
+                if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                    self.cache.finish_request(&uri, request_id);
+                    return Ok(None);
+                }
                 self.cache
                     .record_served_semantic_version(&uri, snapshot.parsed_version);
                 self.cache.finish_request(&uri, request_id);
@@ -735,6 +757,17 @@ impl Kakehashi {
                 .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
             && cached.result_id.as_deref() == Some(previous_result_id.as_str())
         {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let still_current = self.cache.semantic_token_generation() == token_generation
+                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                    view.slot.current_incarnation == snapshot.incarnation
+                        && view.content_version == snapshot.parsed_version
+                });
+            if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(None);
+            }
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
@@ -764,6 +797,17 @@ impl Kakehashi {
                 // so the delta is necessarily empty — return it directly and skip
                 // the `previous_tokens` clone + O(N) `calculate_delta` below.
                 if cached.result_id.as_deref() == Some(previous_result_id.as_str()) {
+                    let edit_lock = self.documents.edit_lock(&uri);
+                    let _edit_guard = edit_lock.lock().await;
+                    let still_current = self.cache.semantic_token_generation() == token_generation
+                        && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                            view.slot.current_incarnation == snapshot.incarnation
+                                && view.content_version == snapshot.parsed_version
+                        });
+                    if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                        self.cache.finish_request(&uri, request_id);
+                        return Ok(None);
+                    }
                     self.cache
                         .record_served_semantic_version(&uri, snapshot.parsed_version);
                     self.cache.finish_request(&uri, request_id);
