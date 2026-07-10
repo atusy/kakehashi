@@ -5,7 +5,10 @@
 //!
 //! Unlike position-based requests, inlay hints use a range parameter in the request
 //! that specifies the visible document range. Both request range (host->virtual) and
-//! response positions/textEdits (virtual->host) need transformation.
+//! response positions/textEdits (virtual->host) need transformation. A hint
+//! whose textEdits are unsafe for the injection region (escape it, break
+//! per-line `> ` prefixes, or merge content into the closing fence) is served
+//! without them (see the safety guard in the response transform).
 //!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
@@ -15,7 +18,7 @@
 use std::io;
 
 use crate::config::settings::BridgeServerConfig;
-use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Range, Uri};
+use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Position, Range, Uri};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
@@ -24,9 +27,9 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    translate_host_range_to_virtual, translate_virtual_position_to_host,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
+    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_range_to_virtual,
+    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -73,11 +76,13 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
+                let region_end = region_host_end(virtual_content, ctx.offset);
                 transform_inlay_hint_response_to_host(
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
                     ctx.offset,
+                    region_end,
                 )
             },
         )
@@ -126,6 +131,7 @@ fn transform_inlay_hint_response_to_host(
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
+    region_end: Position,
 ) -> Option<Vec<InlayHint>> {
     if response_has_jsonrpc_error(&response, "textDocument/inlayHint") {
         return None;
@@ -143,10 +149,26 @@ fn transform_inlay_hint_response_to_host(
         // Transform position to host coordinates
         translate_virtual_position_to_host(&mut hint.position, offset);
 
-        // Transform textEdits ranges
+        // Transform textEdits ranges. If ANY edit is unsafe for the injection
+        // region (escapes it, breaks `> ` prefixes, or merges content into
+        // the closing fence) when applied verbatim, strip them ALL: the
+        // client applies the whole array on accept (LSP 3.18), so a partial
+        // set could apply half of an interdependent pair. The hint itself
+        // stays useful without its accept edits (textEdits optional).
         if let Some(text_edits) = &mut hint.text_edits {
             for edit in text_edits.iter_mut() {
                 translate_virtual_range_to_host(&mut edit.range, offset);
+            }
+            if !text_edits
+                .iter()
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+            {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "inlayHint: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
+                    text_edits.len()
+                );
+                hint.text_edits = None;
             }
         }
 
@@ -424,6 +446,7 @@ mod tests {
             &make_virtual_uri_string(),
             &make_host_uri(),
             &RegionOffset::new(5, 0),
+            TEST_REGION_END,
         );
 
         let hints = hints.unwrap();
@@ -445,6 +468,7 @@ mod tests {
             &make_virtual_uri_string(),
             &make_host_uri(),
             &RegionOffset::new(5, 0),
+            TEST_REGION_END,
         );
         assert!(result.is_none());
     }
@@ -458,6 +482,7 @@ mod tests {
             &make_virtual_uri_string(),
             &make_host_uri(),
             &RegionOffset::new(5, 0),
+            TEST_REGION_END,
         );
 
         assert!(hints.is_some());
@@ -496,6 +521,7 @@ mod tests {
             &make_virtual_uri_string(),
             &make_host_uri(),
             &RegionOffset::new(5, 0),
+            TEST_REGION_END,
         )
         .unwrap();
 
@@ -541,6 +567,7 @@ mod tests {
             &virtual_uri,
             &host_uri,
             &RegionOffset::new(10, 0),
+            TEST_REGION_END,
         )
         .unwrap();
 
@@ -590,6 +617,7 @@ mod tests {
             &virtual_uri,
             &host_uri,
             &RegionOffset::new(10, 0),
+            TEST_REGION_END,
         )
         .unwrap();
 
@@ -648,6 +676,7 @@ mod tests {
             &virtual_uri,
             &host_uri,
             &RegionOffset::new(10, 0),
+            TEST_REGION_END,
         )
         .unwrap();
 
@@ -687,6 +716,7 @@ mod tests {
             &make_virtual_uri_string(),
             &make_host_uri(),
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
         );
 
         assert!(hints.is_some());
@@ -738,6 +768,7 @@ mod tests {
             &virtual_uri,
             &host_uri,
             &RegionOffset::new(10, 0),
+            TEST_REGION_END,
         )
         .unwrap();
 
@@ -750,5 +781,93 @@ mod tests {
         } else {
             panic!("Expected LabelParts variant");
         }
+    }
+
+    #[test]
+    fn inlay_hint_drops_all_text_edits_when_any_breaks_prefixes() {
+        // Blockquote region, content host lines 3-4, region end (5, 0). A
+        // hint textEdit spanning prefixed lines would strip the `> ` prefix
+        // when accept-applied; the accept set applies atomically, so ALL
+        // textEdits drop while the (display-only) hint itself is kept.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                {
+                    "position": { "line": 1, "character": 4 },
+                    "label": ": number",
+                    "textEdits": [
+                        { "range": { "start": { "line": 0, "character": 0 },
+                                     "end": { "line": 1, "character": 2 } },
+                          "newText": "a\nb" },
+                        { "range": { "start": { "line": 1, "character": 5 },
+                                     "end": { "line": 1, "character": 5 } },
+                          "newText": ": number" }
+                    ]
+                }
+            ]
+        });
+
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &make_virtual_uri_string(),
+            &make_host_uri(),
+            &offset,
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(hints.len(), 1, "the hint itself is kept");
+        assert!(
+            hints[0].text_edits.is_none(),
+            "one unsafe edit drops the WHOLE accept-edit set (it applies atomically): {:?}",
+            hints[0].text_edits
+        );
+    }
+
+    #[test]
+    fn inlay_hint_drops_text_edits_that_escape_the_region() {
+        // Plain fenced region (all-zero offsets), region end (5, 0): a
+        // textEdit whose stale range translates past the closing fence must
+        // drop the accept-edit set even though the prefix rules fast-path.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                {
+                    "position": { "line": 1, "character": 4 },
+                    "label": ": number",
+                    "textEdits": [
+                        { "range": { "start": { "line": 0, "character": 0 },
+                                     "end": { "line": 9, "character": 0 } },
+                          "newText": "x" }
+                    ]
+                }
+            ]
+        });
+
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &make_virtual_uri_string(),
+            &make_host_uri(),
+            &offset,
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(hints.len(), 1);
+        assert!(
+            hints[0].text_edits.is_none(),
+            "region-escaping accept edits must drop: {:?}",
+            hints[0].text_edits
+        );
     }
 }

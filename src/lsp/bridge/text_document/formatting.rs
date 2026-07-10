@@ -6,16 +6,24 @@
 //! so [`super::range_formatting`], which shares the same virtual→host hazards,
 //! can reuse them.
 //!
-//! # Known limitation: multi-line edits drop host indentation
+//! # Known limitation: formatting in prefixed regions can drop WHOLE responses
 //!
 //! [`RegionOffset::column_for_line`] translates positions correctly for both
 //! `new()` (single-column) and `with_per_line_offsets()` (blockquote `> `) shapes.
 //! But `new_text` of a multi-line edit starts at column 0 of the embedded language,
-//! so replacement lines insert at host column 0 instead of re-applying the indent
-//! or `> ` prefix. Single-line edits and zero-width inserts (the common
-//! `trimTrailingWhitespace` / `insertFinalNewline` cases) are unaffected. Fixing
-//! this means rewriting `new_text` per embedded newline; deferred because it
-//! interacts with `trim_final_newlines` semantics.
+//! so replacement lines would insert at host column 0 instead of re-applying the
+//! `> ` prefix. A response containing any such edit is dropped WHOLE by the
+//! shared prefix guard (`text_edit_safe_in_region`) — a formatter
+//! answer is one atomic diff, so applying only its safe edits could
+//! duplicate or lose content. All-safe responses (single-line edits and
+//! zero-width inserts — the common `trimTrailingWhitespace` cases) pass
+//! through (a newline-bearing `new_text` in a prefixed region still rejects).
+//! Unprefixed regions are exempt from the prefix rules but still subject to
+//! region containment and the fence-boundary EOL rule. Re-applying prefixes to `new_text` (which would let these
+//! edits APPLY instead of dropping) means rewriting it per embedded newline;
+//! deferred because it interacts with `trim_final_newlines` semantics —
+//! the lsp_impl concatenated pipeline's `reapply_host_line_prefixes` is the
+//! model if demand appears.
 
 use std::io;
 
@@ -23,15 +31,16 @@ use log::warn;
 
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{
-    DocumentFormattingParams, FormattingOptions, NumberOrString, TextDocumentIdentifier, TextEdit,
-    WorkDoneProgressParams,
+    DocumentFormattingParams, FormattingOptions, NumberOrString, Position, TextDocumentIdentifier,
+    TextEdit, WorkDoneProgressParams,
 };
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
+    response_has_jsonrpc_error, text_edit_safe_in_region,
 };
 
 impl LanguageServerPool {
@@ -70,6 +79,7 @@ impl LanguageServerPool {
             return Ok(None);
         }
         let virtual_line_count = count_lines(virtual_content);
+        let region_end = region_host_end(virtual_content, &offset);
         self.execute_bridge_request_observed(
             handle,
             host_uri,
@@ -85,8 +95,13 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // no-capability early return above yields `Ok(None)`.
             |response, ctx| {
-                transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
-                    .map(Some)
+                transform_formatting_response_to_host(
+                    response,
+                    ctx.offset,
+                    virtual_line_count,
+                    region_end,
+                )
+                .map(Some)
             },
             downstream_id_probe,
         )
@@ -108,9 +123,10 @@ pub(super) fn count_lines(text: &str) -> u32 {
 
 /// If `pos` is the "synthetic next-line anchor" (column 0 of the line
 /// immediately after `last_real_line`), rewrite it to (last_real_line,
-/// u32::MAX) so the editor's standard end-of-line clamping snaps it to the
-/// real last column. Used to accept the canonical insertFinalNewline shape
-/// without dropping it as past-EOF.
+/// u32::MAX) — a sentinel the transform later snaps to the region's
+/// content-precise host end (see `transform_formatting_response_to_host`).
+/// Used to accept the canonical insertFinalNewline shape without dropping it
+/// as past-EOF.
 ///
 /// `virtual_line_count` is the synthetic-line index — i.e., the value that
 /// would be `last_real_line + 1` for non-empty docs. Passed in to avoid
@@ -176,6 +192,7 @@ pub(super) fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     virtual_line_count: u32,
+    region_end: Position,
 ) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, "formatting-style request") {
         return Err(io::Error::other(
@@ -231,25 +248,70 @@ pub(super) fn transform_formatting_response_to_host(
     // function-level docs). Checking both endpoints handles both the common
     // "formatter overshoots EOF" case and the malformed `start > virtual_eof`
     // shape that would otherwise sneak through with an in-bounds `end`.
-    let before = edits.len();
-    edits.retain(|edit| {
+    // ALL-OR-NOTHING (like the prefix gate below): a formatter answer is one
+    // atomic diff, so applying only its in-bounds edits could pair-break a
+    // deletion/insertion and duplicate or lose content.
+    if !edits.iter().all(|edit| {
         edit.range.start.line < virtual_line_count && edit.range.end.line < virtual_line_count
-    });
-    // `retain` never grows the vec so this can't underflow today, but
-    // saturating_sub keeps the count valid if the surrounding logic ever
-    // changes (e.g., a new clamping step that re-inserts edits).
-    let dropped = before.saturating_sub(edits.len());
-    if dropped > 0 {
+    }) {
         warn!(
             target: "kakehashi::bridge",
-            "Dropped {} formatting edit(s) extending past virtual EOF (line {}); would corrupt host content beyond injection region",
-            dropped,
+            "Dropped a formatting response ({} edit(s)): an edit extends past virtual EOF (line {}) and would corrupt host content beyond the injection region",
+            edits.len(),
             virtual_line_count
         );
+        return Ok(Vec::new());
     }
 
     for edit in &mut edits {
         translate_virtual_range_to_host(&mut edit.range, offset);
+    }
+
+    // Clamp synthetic-EOF sentinels into the region: the (last line, u32::MAX)
+    // sentinel from `clamp_synthetic_eof_anchor` saturates through translation
+    // and would otherwise fail the exact containment check below, dropping
+    // every canonical insertFinalNewline response. Clamping to `region_end`
+    // (the content-precise host end) is exact — the sentinel means "end of
+    // the region's last content line", which IS the region end. Restricted to
+    // the last content line: a stray u32::MAX character anywhere else stays
+    // put and fails containment (fail-closed).
+    let last_real_host_line = offset
+        .line()
+        .saturating_add(virtual_line_count.saturating_sub(1));
+    for edit in &mut edits {
+        for pos in [&mut edit.range.start, &mut edit.range.end] {
+            if pos.character == u32::MAX
+                && pos.line == last_real_host_line
+                && (pos.line, pos.character) > (region_end.line, region_end.character)
+            {
+                *pos = region_end;
+            }
+        }
+    }
+
+    // Prefix safety (same guard codeAction/rename/applyEdit apply via the
+    // WorkspaceEdit form): the transform translates RANGES but emits newText
+    // verbatim, so a multi-line replacement or newline insertion in a
+    // prefixed (blockquote) region would strip the `> ` prefixes it overlaps.
+    // ALL-OR-NOTHING: a formatting response is one atomic diff — formatters
+    // routinely pair a line-deletion with a same-line insertion of the merged
+    // text, so dropping only the unsafe half would duplicate or lose content.
+    // If any edit is unsafe, drop the whole response (an empty edit list —
+    // the document is left untouched, like the null "already formatted"
+    // answer). All-zero regions (plain fences) skip the prefix rules but are
+    // still containment- and fence-boundary-checked.
+    if !edits
+        .iter()
+        .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+    {
+        warn!(
+            target: "kakehashi::bridge",
+            "Dropped a formatting response ({} edit(s)): an edit is unsafe for the \
+             injection region (escapes it, breaks per-line `> ` prefixes, or merges \
+             content into the closing fence)",
+            edits.len()
+        );
+        return Ok(Vec::new());
     }
 
     Ok(edits)
@@ -261,6 +323,67 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    #[test]
+    fn transform_drops_the_whole_response_when_any_edit_breaks_prefixes() {
+        // Blockquote region (production offsets: per-line `> ` widths plus the
+        // trailing boundary-row zero), content host lines 3-4, fence line 5,
+        // region end (5, 0). The response pairs a multi-line prefix-breaking
+        // replacement with a safe single-line edit — the diff halves of one
+        // atomic formatter answer. Applying only the safe half would
+        // duplicate/lose content, so the WHOLE response must drop.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 1, "character": 4 } },
+                  "newText": "formatted\nlines" },
+                { "range": { "start": { "line": 1, "character": 6 },
+                             "end": { "line": 1, "character": 8 } },
+                  "newText": "safe" }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+
+        assert!(
+            edits.is_empty(),
+            "a response with any prefix-breaking edit must drop whole: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn transform_keeps_an_all_safe_response_in_blockquote_regions() {
+        // Same region: single-line, newline-free edits behind the prefix are
+        // safe and must pass through (translated), not be caught by the
+        // all-or-nothing drop.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "range": { "start": { "line": 1, "character": 0 },
+                             "end": { "line": 1, "character": 4 } },
+                  "newText": "safe" }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+
+        assert_eq!(edits.len(), 1, "all-safe response passes: {edits:?}");
+        assert_eq!(edits[0].new_text, "safe");
+        assert_eq!(edits[0].range.start.line, 4, "translated to host line");
+    }
 
     fn default_options() -> FormattingOptions {
         FormattingOptions {
@@ -377,9 +500,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), UNBOUNDED)
-                .unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            UNBOUNDED,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[0].range.start.line, 10);
@@ -414,9 +541,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(5, 4), UNBOUNDED)
-                .unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(5, 4),
+            UNBOUNDED,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         // Line 0 in virtual → line 5 in host, character shifted by column offset 4
         assert_eq!(edits[0].range.start.line, 5);
@@ -439,8 +570,12 @@ mod tests {
         // Error / missing / malformed must be `Err` (request failure) — not
         // the no-capability `None` — so the fan-in counts it and CLI mode
         // can exit non-zero for a broken formatter.
-        let transformed =
-            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED);
+        let transformed = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(5, 0),
+            UNBOUNDED,
+            TEST_REGION_END,
+        );
         assert!(transformed.is_err());
     }
 
@@ -455,9 +590,13 @@ mod tests {
         // concatenated-formatting-pipeline Decision point 3.2).
         let response = json!({"jsonrpc": "2.0", "id": 42, "result": null});
 
-        let transformed =
-            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED)
-                .expect("null result is a handled response, not a failure");
+        let transformed = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(5, 0),
+            UNBOUNDED,
+            TEST_REGION_END,
+        )
+        .expect("null result is a handled response, not a failure");
 
         assert_eq!(
             transformed,
@@ -470,9 +609,13 @@ mod tests {
     fn formatting_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED)
-                .unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(5, 0),
+            UNBOUNDED,
+            TEST_REGION_END,
+        )
+        .unwrap();
         assert!(edits.is_empty());
     }
 
@@ -493,9 +636,13 @@ mod tests {
             }]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(u32::MAX - 1, 0), 2)
-                .unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(u32::MAX - 1, 0),
+            2,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 1);
         assert_eq!(
@@ -536,8 +683,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 3).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            3,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 1, "synthetic-EOF-anchored edit is kept");
         assert_eq!(edits[0].new_text, "\n");
@@ -567,17 +719,24 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 3).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            3,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 1, "in-bounds zero-width EOF insert is kept");
         assert_eq!(edits[0].new_text, "\n");
     }
 
     #[test]
-    fn formatting_response_keeps_in_bounds_drops_out_of_bounds() {
+    fn formatting_response_with_an_out_of_bounds_edit_drops_whole() {
         // Mixed batch: a valid edit on line 0 and a malformed edit whose end
-        // extends past EOF. Only the valid one survives.
+        // extends past EOF. A formatter answer is one atomic diff, so the
+        // WHOLE response drops — applying only the valid half could
+        // duplicate or lose content.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -599,11 +758,48 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 2).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            2,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
-        assert_eq!(edits.len(), 1, "only the in-bounds edit survives");
-        assert_eq!(edits[0].new_text, "    ");
+        assert!(
+            edits.is_empty(),
+            "any out-of-bounds edit must drop the whole response: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn insert_final_newline_survives_a_realistic_region_end() {
+        // Content "local x = 1" (no trailing newline) at host line 3 in a
+        // plain fence: region end is the exact content end (3, 11), NOT a
+        // permissive sentinel. The canonical insertFinalNewline shape — a
+        // zero-width insert at the synthetic next-line anchor — must snap to
+        // the region end and survive containment.
+        let offset = RegionOffset::new(3, 0);
+        let region_end = Position {
+            line: 3,
+            character: 11,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "range": { "start": { "line": 1, "character": 0 },
+                             "end": { "line": 1, "character": 0 } },
+                  "newText": "\n" }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &offset, 1, region_end).unwrap();
+
+        assert_eq!(edits.len(), 1, "insertFinalNewline must survive: {edits:?}");
+        assert_eq!(edits[0].range.start, region_end);
+        assert_eq!(edits[0].range.end, region_end);
+        assert_eq!(edits[0].new_text, "\n");
     }
 
     #[rstest]
@@ -649,8 +845,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 1).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(10, 0),
+            1,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 1, "canonical insertFinalNewline shape kept");
         assert_eq!(edits[0].new_text, "\n");
@@ -686,8 +887,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(0, 0), 2).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(0, 0),
+            2,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         assert_eq!(edits.len(), 1, "boundary-crossing replacement kept");
         assert_eq!(edits[0].range.start.line, 1);
@@ -718,8 +924,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(0, 0), 2).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(0, 0),
+            2,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         assert!(
             edits.is_empty(),
@@ -747,8 +958,13 @@ mod tests {
             ]
         });
 
-        let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(0, 0), 2).unwrap();
+        let edits = transform_formatting_response_to_host(
+            response,
+            &RegionOffset::new(0, 0),
+            2,
+            TEST_REGION_END,
+        )
+        .unwrap();
 
         assert!(
             edits.is_empty(),

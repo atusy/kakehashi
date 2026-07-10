@@ -12,11 +12,11 @@
 //!
 //! # Multi-line edit limitation
 //!
-//! Same caveat as full formatting: positions translate correctly via
-//! [`RegionOffset::column_for_line`], but the `new_text` payload of a
-//! multi-line edit inside a prefixed injection (indented or blockquoted code
-//! block) is not re-indented. Single-line edits — which dominate the
-//! "format the selected range" use case — are unaffected.
+//! Same caveat as full formatting: a multi-line edit's `new_text` inside a
+//! prefixed injection is not re-prefixed, so the shared guard DROPS the WHOLE
+//! response (one atomic formatter diff) when any edit is unsafe, instead of
+//! corrupting the host document. All-safe responses — the common case for
+//! "format the selected range" — are unaffected.
 
 use std::io;
 
@@ -29,7 +29,8 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
+    translate_host_range_to_virtual,
 };
 use super::formatting::{count_lines, transform_formatting_response_to_host};
 
@@ -70,6 +71,7 @@ impl LanguageServerPool {
             return Ok(None);
         }
         let virtual_line_count = count_lines(virtual_content);
+        let region_end = region_host_end(virtual_content, &offset);
         let offset_for_request = offset.clone();
         self.execute_bridge_request_observed(
             handle,
@@ -93,8 +95,13 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // no-capability early return above yields `Ok(None)`.
             |response, ctx| {
-                transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
-                    .map(Some)
+                transform_formatting_response_to_host(
+                    response,
+                    ctx.offset,
+                    virtual_line_count,
+                    region_end,
+                )
+                .map(Some)
             },
             downstream_id_probe,
         )

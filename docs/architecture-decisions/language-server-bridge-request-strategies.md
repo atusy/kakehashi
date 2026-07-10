@@ -5,12 +5,6 @@
 > ls-bridge-message-ordering and
 > ls-bridge-server-pool-coordination.
 
-## Decision–Implementation Gap
-
-8 of the 11 per-method strategies described below are implemented (definition,
-hover, signatureHelp, completion, references, rename, codeAction, formatting).
-The remaining three are not yet implemented.
-
 ## Context
 
 When bridging LSP requests for injection regions (see language-server-bridge), different LSP methods have different characteristics:
@@ -27,7 +21,10 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 
 ### Injection Isolation Constraint
 
-**Critical insight**: Injection regions are isolated code fragments. They exist within a single host document and have no relationship to other files. This affects how we handle features that can return cross-file results.
+**Critical insight**: Injection regions are isolated code fragments with no
+relationship to OTHER VIRTUAL REGIONS — each is analyzed on its own. Real
+files on disk (library sources, workspace files) remain valid targets. This
+affects how we handle features that can return cross-file results.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -46,7 +43,8 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 │         │  on "Serialize"              │                        │
 │         └──────────────────────────────┘                        │
 │                                                                 │
-│  Result: Location in serde crate → FILTER OUT (not in injection)│
+│  Result: Location in serde crate → KEPT (real file on disk);   │
+│  only OTHER VIRTUAL-REGION locations are filtered out           │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -90,30 +88,36 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 
 ### Strategy 2: Full Delegation with Response Filtering
 
-**Applies to**: `textDocument/definition`, `textDocument/references`, `textDocument/hover`, `textDocument/signatureHelp`
+**Applies to**: `textDocument/definition`, `textDocument/declaration`,
+`textDocument/typeDefinition`, `textDocument/implementation`,
+`textDocument/references`, `textDocument/hover`, `textDocument/signatureHelp`
 
 ```
 Request (cursor in injection) ──▶ Forward to language server
                                          │
                                          ▼
                                   Filter response
-                                  (remove cross-file locations)
+                                  (translate same-region virtual URIs,
+                                   keep real-file URIs untranslated, drop
+                                   other virtual-region URIs)
                                          │
                                          ▼
                                   Translate positions
-                                  (virtual → host)
+                                  (virtual → host — same-region
+                                   targets only; real-file locations
+                                   keep URI and range unchanged)
 ```
 
 **Per-Method Details**:
 
-#### textDocument/definition (PoC implemented)
+#### textDocument/definition (and declaration / typeDefinition / implementation, via the shared goto transformer)
 
 | Aspect | Handling |
 |--------|----------|
 | Input | Position (host → virtual translation) |
 | Output | Location or Location[] |
-| Cross-file | Filter out locations outside virtual document |
-| Position mapping | Range start/end: virtual → host |
+| Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
+| Position mapping | Range start/end virtual → host for same-region targets; real-file ranges untouched |
 
 #### textDocument/references
 
@@ -121,10 +125,12 @@ Request (cursor in injection) ──▶ Forward to language server
 |--------|----------|
 | Input | Position + includeDeclaration flag |
 | Output | Location[] |
-| Cross-file | **Filter out** locations outside virtual document |
-| Position mapping | Each location's range: virtual → host |
+| Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
+| Position mapping | Each same-region location's range virtual → host; real-file ranges untouched |
 
-**Important**: References may return many locations from external files. Only references within the same injection region are meaningful.
+**Important**: Real-file locations (e.g. library sources on disk) are kept —
+they are valid navigation targets. Only locations in OTHER virtual regions are
+dropped, since their URIs are meaningless to the editor.
 
 #### textDocument/hover
 
@@ -150,7 +156,10 @@ No position information in response—pass through directly.
 
 ### Strategy 3: Delegation with Edit Filtering
 
-**Applies to**: `textDocument/completion`, `textDocument/rename`, `textDocument/codeAction`, `textDocument/formatting`
+**Applies to**: `textDocument/completion`, `completionItem/resolve`,
+`textDocument/rename`, `textDocument/codeAction`, `textDocument/formatting`,
+`textDocument/rangeFormatting`, `textDocument/onTypeFormatting`,
+`textDocument/inlayHint` (its `textEdits`), `textDocument/colorPresentation`
 
 These methods return edits that must be carefully validated.
 
@@ -186,12 +195,24 @@ fn main() {
 
 But line 0 of the virtual document maps to the injection start line in the host—**inside the code fence**, not at the file top where imports belong.
 
-**Solutions**:
-1. **Filter out**: Remove additionalTextEdits outside injection range (loses auto-import)
-2. **Warn user**: Apply main edit, show message about skipped import
-3. **Smart placement**: Detect import patterns and place at injection start (complex)
+**Implemented policy** (fail-closed, atomic):
 
-Recommended: Option 1 or 2 for initial implementation.
+- The primary `textEdit`/`InsertReplaceEdit` (or the insertText/label
+  fallback, and snippet variables whose client-side expansion is unknowable)
+  is validated against the injection region — containment, per-line prefix
+  preservation, and the fence-boundary rule. An unsafe primary drops the
+  whole item at completion time; at `completionItem/resolve` time the unsafe
+  resolved response is discarded and the original (already-validated)
+  unresolved item is served instead.
+- `additionalTextEdits` are validated as one atomic set: any unsafe member
+  drops the entire array (never a subset — the array can carry paired halves
+  of one operation). The item is kept; its primary insertion stays
+  mechanically applicable, though possibly semantically incomplete without
+  its auto-import (availability over fidelity, with a warn log).
+- The same guards apply to inlay-hint `textEdits` (the hint is kept, its
+  accept-edit set drops whole) and color presentations (an unsafe explicit or
+  implicit label-replacement edit drops the presentation; unsafe
+  additionalTextEdits drop as an array).
 
 #### textDocument/rename
 
@@ -199,10 +220,16 @@ Recommended: Option 1 or 2 for initial implementation.
 |--------|----------|
 | Input | Position + newName |
 | Output | WorkspaceEdit (changes across files) |
-| Cross-file | **Reject entirely** if any edit outside virtual document |
-| Position mapping | All TextEdit ranges |
+| Cross-file | Real-file edits pass through; same-region virtual edits translate; foreign virtual-region entries filtered (siblings survive); structurally unsafe edits or virtual-URI file operations reject the result |
+| Position mapping | Same-region TextEdit ranges (real-file ranges untouched) |
 
-Rename can affect multiple files. For injections, only same-document renames are valid.
+Rename can affect multiple files. Real-file edits (a project-aware server's
+cross-file rename) are preserved — content and ranges untouched, though
+bridge-local `TextDocumentEdit.version` values are cleared before relaying —
+while entries addressed to other regions' virtual URIs (meaningless to the
+editor) are FILTERED out with usable siblings surviving. The whole result is
+rejected only when an edit fails the region-safety guards or the edit carries
+a file operation (create/rename/delete) targeting a virtual URI.
 
 #### textDocument/codeAction
 
@@ -210,10 +237,10 @@ Rename can affect multiple files. For injections, only same-document renames are
 |--------|----------|
 | Input | Range + context (diagnostics) |
 | Output | CodeAction[] (each may contain WorkspaceEdit) |
-| Cross-file | Filter out actions with cross-file edits |
-| Position mapping | All ranges in remaining actions |
+| Cross-file | Real-file edits/resource ops pass through; actions with foreign virtual-region or unsafe edits are disabled/dropped |
+| Position mapping | Same-region ranges in remaining actions |
 
-#### textDocument/formatting / textDocument/rangeFormatting
+#### textDocument/formatting / rangeFormatting / onTypeFormatting
 
 | Aspect | Handling |
 |--------|----------|
@@ -223,7 +250,10 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Position mapping | All edit ranges |
 | Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline over `priorities` (also the membership allowlist — unlisted servers do not run). `textDocument/rangeFormatting`: `preferred` only |
 
-Single-server formatting is simple—all edits are within the virtual document.
+Formatting responses are validated per edit (virtual-EOF bounds, region
+containment, prefix preservation, fence-boundary rule) and dropped **whole**
+when any edit is unsafe — a formatter answer is one atomic diff, so applying
+only its safe edits could duplicate or lose content.
 For multiple servers, the `concatenated`
 behavior does **not** concatenate edit lists (that would overlap); it runs a
 sequential formatter pipeline over `priorities`, which is both the
@@ -268,14 +298,14 @@ concatenated-formatting-pipeline.
 
 | Response Type | Fields to Map |
 |---------------|---------------|
-| Location | uri (rewrite to host), range |
-| Location[] | Each location |
+| Location | same-region virtual targets: uri rewritten to host + range translated; real-file targets: untouched |
+| Location[] | Each location, same rule |
 | Hover | range (if present) |
 | CompletionItem | textEdit.range, additionalTextEdits[].range |
 | TextEdit | range |
-| WorkspaceEdit | All documentChanges/changes entries |
+| WorkspaceEdit | Same-region virtual entries translated; real-file ranges untouched; foreign virtual entries filtered (or the action rejected) |
 | Diagnostic | range, relatedInformation[].location |
-| CodeAction | All contained edits |
+| CodeAction | Contained edits, same conditional rule |
 
 ### Multi-Server Merging Rules
 
@@ -302,13 +332,13 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 - **Optimized UX per feature**: Each method gets the strategy that best fits its characteristics
 - **Fast visual feedback**: Semantic tokens appear instantly via parallel fetch
 - **Accurate navigation**: Go-to-definition uses authoritative language server
-- **Safe editing**: Cross-file edits are filtered to prevent corruption
+- **Safe editing**: real-file edits/resource operations are retained; foreign virtual-region or structurally unsafe edits are filtered/rejected to prevent corruption
 - **Comprehensive diagnostics**: Aggregated from multiple sources
 
 ### Negative
 
 - **Implementation complexity**: Four different strategies to implement and maintain
-- **Feature limitations**: Some features degraded (no auto-import in completion)
+- **Feature limitations**: Some features degraded (auto-imports may be dropped when unsafe for the region)
 - **Inconsistent latency**: Some features instant (semantic tokens), others have server latency
 - **Refresh mechanism dependency**: Progressive refinement requires editor support for token refresh
 
@@ -319,21 +349,31 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 
 ## Implementation Status
 
-The following table shows the current implementation status of bridged LSP methods:
+The following table is a SELECTED-FEATURE summary of the bridged LSP methods
+this ADR discusses in detail (the goto family rows stand for
+definition/declaration/typeDefinition/implementation, which share one
+transformer). The full, user-facing feature list — documentLink,
+documentSymbol, prepareRename, documentColor, moniker, codeLens/resolve,
+foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| definition | ✅ Implemented | Full delegation with response filtering |
+| definition (+ declaration / typeDefinition / implementation) | ✅ Implemented | Shared goto transformer; real-file URIs kept, cross-region virtual URIs dropped |
 | hover | ✅ Implemented | Pass-through with position translation |
 | signatureHelp | ✅ Implemented | Pass-through |
-| completion | ✅ Implemented | With additionalTextEdits filtering |
-| references | ✅ Implemented | With cross-file filtering |
+| completion | ✅ Implemented | Fail-closed edit guards; atomic additionalTextEdits drop |
+| completionItem/resolve | ✅ Implemented | Envelope-routed; an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set |
+| references | ✅ Implemented | Real-file URIs kept, cross-region virtual URIs dropped |
 | rename | ✅ Implemented | With workspace edit validation |
-| codeAction | ✅ Implemented | With edit filtering |
-| formatting | ✅ Implemented | With position mapping |
-| documentHighlight | ❌ Not implemented | |
-| diagnostics | ❌ Not implemented | Requires async push model |
-| semanticTokens | ❌ Not implemented | Would enable parallel fetch strategy |
+| codeAction | ✅ Implemented | With edit filtering (incl. resolve + executeCommand routing) |
+| formatting | ✅ Implemented | Whole-response atomic drop on unsafe edits |
+| rangeFormatting | ✅ Implemented | Shares the formatting guards |
+| onTypeFormatting | ✅ Implemented | Shares the formatting guards |
+| inlayHint | ✅ Implemented | Unsafe accept-edit sets dropped whole; hint kept |
+| colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
+| documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
+| diagnostics | ✅ Implemented | Push + pull with host translation |
+| semanticTokens | ✅ Implemented | Cross-layer merge (see semantic-token merge ADR) |
 
 ### Original Implementation Priority
 

@@ -2,19 +2,24 @@
 //! host↔virtual coordinate transformation. Like inlay hints, the request carries a
 //! range (where the color was found) and the response may include textEdits and
 //! additionalTextEdits whose ranges must be translated back to host coordinates.
+//! Presentations whose (implicit or explicit) textEdit is unsafe for the
+//! injection region — escapes it, breaks per-line `> ` prefixes, or merges
+//! content into the closing fence — are dropped; unsafe additionalTextEdits
+//! are stripped.
 
 use std::io;
 
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{
-    Color, ColorPresentation, ColorPresentationParams, Range, TextDocumentIdentifier,
+    Color, ColorPresentation, ColorPresentationParams, Position, Range, TextDocumentIdentifier,
 };
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    translate_host_range_to_virtual, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
+    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_range_to_virtual,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -60,7 +65,12 @@ impl LanguageServerPool {
                     request_id,
                 )
             },
-            |response, ctx| transform_color_presentation_response_to_host(response, ctx.offset),
+            |response, ctx| {
+                let region_end = region_host_end(virtual_content, ctx.offset);
+                transform_color_presentation_response_to_host(
+                    response, ctx.offset, region_end, host_range,
+                )
+            },
         )
         .await
     }
@@ -102,6 +112,8 @@ fn build_color_presentation_request(
 fn transform_color_presentation_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
+    region_end: Position,
+    host_request_range: Range,
 ) -> Vec<ColorPresentation> {
     if response_has_jsonrpc_error(&response, "textDocument/colorPresentation") {
         return vec![];
@@ -120,17 +132,66 @@ fn transform_color_presentation_response_to_host(
         Err(_) => return vec![],
     };
 
-    // Transform textEdit and additionalTextEdits ranges to host coordinates
-    for presentation in &mut presentations {
+    // Transform textEdit and additionalTextEdits ranges to host coordinates,
+    // then drop any presentation whose edits are unsafe for the injection
+    // region (escape it, break line prefixes, or merge content into the
+    // closing fence) if applied verbatim. Unlike completion, the
+    // primary textEdit is not separable from the presentation (without it the
+    // editor falls back to inserting the label, still at the unguarded
+    // range), so an unsafe textEdit drops the whole presentation; unsafe
+    // additionalTextEdits are merely stripped.
+    let before = presentations.len();
+    presentations.retain_mut(|presentation| {
+        // No textEdit: the client replaces the REQUEST range with the label
+        // (LSP 3.18). Guard that implicit edit exactly like an explicit one —
+        // a synthetic TextEdit over the (host) request range with the label
+        // as newText. Labels are single-line and request ranges in-region in
+        // practice, so this rarely bites.
+        if presentation.text_edit.is_none() {
+            let implicit = tower_lsp_server::ls_types::TextEdit {
+                range: host_request_range,
+                new_text: presentation.label.clone(),
+            };
+            if !text_edit_safe_in_region(&implicit, offset, region_end) {
+                return false;
+            }
+        }
         if let Some(text_edit) = &mut presentation.text_edit {
             translate_virtual_range_to_host(&mut text_edit.range, offset);
+            if !text_edit_safe_in_region(text_edit, offset, region_end) {
+                return false;
+            }
         }
 
+        // ALL-OR-NOTHING (same reasoning as completion): the array can carry
+        // paired halves of one operation, so any unsafe member drops the
+        // whole array rather than half-applying it. The presentation is kept:
+        // its textEdit still applies, though possibly semantically incomplete
+        // — availability over fidelity, never corruption.
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
             for edit in additional_edits.iter_mut() {
                 translate_virtual_range_to_host(&mut edit.range, offset);
             }
+            if !additional_edits
+                .iter()
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+            {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "colorPresentation: dropped a presentation's additionalTextEdits ({}): a member is unsafe for the injection region",
+                    additional_edits.len()
+                );
+                presentation.additional_text_edits = None;
+            }
         }
+        true
+    });
+    let dropped = before - presentations.len();
+    if dropped > 0 {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "colorPresentation: dropped {dropped} presentation(s) whose (implicit or explicit) textEdit is unsafe for the injection region"
+        );
     }
 
     presentations
@@ -138,9 +199,25 @@ fn transform_color_presentation_response_to_host(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::TEST_REGION_END;
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    /// In-region host request range used by tests that don't exercise the
+    /// implicit label-replacement guard (single position on the region line).
+    fn test_host_request_range(region_start_line: u32) -> Range {
+        Range {
+            start: Position {
+                line: region_start_line,
+                character: 0,
+            },
+            end: Position {
+                line: region_start_line,
+                character: 4,
+            },
+        }
+    }
 
     // ==========================================================================
     // Color presentation request tests
@@ -444,6 +521,8 @@ mod tests {
         let presentations = transform_color_presentation_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
+            test_host_request_range(region_start_line),
         );
 
         assert_eq!(presentations.len(), 1);
@@ -491,6 +570,8 @@ mod tests {
         let presentations = transform_color_presentation_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
+            test_host_request_range(region_start_line),
         );
 
         assert_eq!(presentations.len(), 1);
@@ -522,6 +603,8 @@ mod tests {
         let presentations = transform_color_presentation_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
+            test_host_request_range(region_start_line),
         );
 
         assert_eq!(presentations.len(), 3);
@@ -537,8 +620,12 @@ mod tests {
     fn color_presentation_response_returns_empty_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let presentations =
-            transform_color_presentation_response_to_host(response, &RegionOffset::new(5, 0));
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &RegionOffset::new(5, 0),
+            TEST_REGION_END,
+            test_host_request_range(5),
+        );
         assert!(presentations.is_empty());
     }
 
@@ -546,8 +633,134 @@ mod tests {
     fn color_presentation_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let presentations =
-            transform_color_presentation_response_to_host(response, &RegionOffset::new(5, 0));
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &RegionOffset::new(5, 0),
+            TEST_REGION_END,
+            test_host_request_range(5),
+        );
         assert!(presentations.is_empty());
+    }
+
+    #[test]
+    fn color_presentation_drops_prefix_breaking_presentations() {
+        // Blockquote region, content host lines 3-4, region end (5, 0). A
+        // presentation whose textEdit spans prefixed lines is dropped whole
+        // (the label fallback would insert at the same unsafe range); an
+        // unsafe additionalTextEdit is stripped from a kept presentation.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "label": "unsafe",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 1, "character": 2 } },
+                                "newText": "#fff" } },
+                { "label": "safe",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 4 } },
+                                "newText": "#fff" },
+                  "additionalTextEdits": [
+                      { "range": { "start": { "line": 1, "character": 3 },
+                                   "end": { "line": 1, "character": 5 } },
+                        "newText": "safe-sibling" },
+                      { "range": { "start": { "line": 1, "character": 0 },
+                                   "end": { "line": 1, "character": 0 } },
+                        "newText": "x\n" }
+                  ] }
+            ]
+        });
+
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            region_end,
+            test_host_request_range(3),
+        );
+
+        assert_eq!(presentations.len(), 1, "unsafe presentation is dropped");
+        assert_eq!(presentations[0].label, "safe");
+        assert!(
+            presentations[0].additional_text_edits.is_none(),
+            "an unsafe member drops the whole additionalTextEdits array"
+        );
+    }
+
+    #[test]
+    fn color_presentation_drops_presentations_whose_edit_escapes_the_region() {
+        // Plain fenced region (all-zero offsets), region end (5, 0): a
+        // textEdit range translating past the closing fence must drop the
+        // presentation even though the prefix rules fast-path.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "label": "escapes",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 9, "character": 0 } },
+                                "newText": "#fff" } },
+                { "label": "contained",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 4 } },
+                                "newText": "#fff" } }
+            ]
+        });
+
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            region_end,
+            test_host_request_range(3),
+        );
+
+        assert_eq!(presentations.len(), 1, "region-escaping presentation drops");
+        assert_eq!(presentations[0].label, "contained");
+    }
+
+    #[test]
+    fn color_presentation_drops_label_fallback_over_a_prefixed_multiline_range() {
+        // No textEdit: the client replaces the REQUEST range with the label.
+        // A request range spanning prefixed lines makes even a single-line
+        // label strip the second line's `> ` prefix — the synthetic implicit
+        // edit must be rejected like an explicit one.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let multiline_request_range = Range {
+            start: Position {
+                line: 3,
+                character: 2,
+            },
+            end: Position {
+                line: 4,
+                character: 4,
+            },
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [ { "label": "#ff0000" } ]
+        });
+
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &offset,
+            region_end,
+            multiline_request_range,
+        );
+
+        assert!(
+            presentations.is_empty(),
+            "label fallback over a prefixed multi-line range must drop: {presentations:?}"
+        );
     }
 }

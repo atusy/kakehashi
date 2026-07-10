@@ -116,7 +116,12 @@ Additional details for a highlighted item (documentation, extra edits) are resol
 on demand from the server that produced it. Because the language server only sees
 the isolated snippet, any edits it returns — including auto-import edits — are
 placed relative to the embedded block, so file-level imports may not land where they
-would in a standalone file. Default combine strategy: `preferred`.
+would in a standalone file. Edits that would corrupt the host document around the
+embedded block (escape the region, break blockquote `> ` prefixes, or merge content
+into the closing fence) are dropped fail-closed: an unsafe primary edit drops
+the item (at resolve time, the unsafe resolved response is discarded and the
+unresolved item is served instead), while an unsafe auto-import set — at either
+stage — is dropped whole and the completion itself still applies. Default combine strategy: `preferred`.
 
 ### Signature help
 
@@ -186,6 +191,12 @@ seeing the previous formatter's output (e.g. `black` then `isort`). The
 pipeline requires explicitly named servers — `"*"` is ignored there, since a
 reproducible pipeline needs a deterministic order.
 
+A response whose edits would corrupt the host document around the embedded
+block (escape the region, break blockquote `> ` prefixes, or merge content
+into the closing fence) is dropped **whole** — a formatter answer is one
+atomic diff, so applying only its safe edits could duplicate or lose content.
+The same rule covers range and on-type formatting.
+
 ### Range formatting
 
 [`textDocument/rangeFormatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rangeFormatting)
@@ -198,7 +209,9 @@ formatting, scoped to the selection.
 [`textDocument/inlayHint`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_inlayHint)
 
 Shows inline hints (types, parameter names) for the embedded block overlapping the
-requested range. Default combine strategy: `preferred`.
+requested range. A hint whose accept-time text edits would corrupt the host
+document around the embedded block is served without them (the edits drop as
+one atomic set). Default combine strategy: `preferred`.
 
 ### Moniker
 
@@ -225,6 +238,10 @@ differently.
 and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
 Shows color swatches and color picker presentations for embedded blocks.
+Presentations whose primary edit (explicit, or the implicit label replacement)
+would corrupt the host document around the embedded block are dropped
+fail-closed; unsafe additional edits are dropped as one atomic set while the
+presentation itself survives.
 **Only available with the `KAKEHASHI_EXPERIMENTAL=true` environment variable** —
 without the opt-in the server does not advertise color support.
 

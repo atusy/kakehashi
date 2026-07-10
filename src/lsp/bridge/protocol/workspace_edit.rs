@@ -288,6 +288,28 @@ pub(crate) fn workspace_edit_within_region(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
+    host_uri_text_edits_all(edit, host_uri, |e| {
+        text_edit_within_region(e, offset, region_end)
+    })
+}
+
+/// Whether a single already-host-translated text edit stays inside the region
+/// (see [`workspace_edit_within_region`]). Response transforms use this to
+/// reject a downstream range that — via a stale/malformed virtual range —
+/// lands past the region's content end (the closing fence, or the rest of an
+/// inline region's host line), which range translation alone cannot prevent.
+pub(crate) fn text_edit_within_region(
+    e: &TextEdit,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
+    // A REVERSED range (start after end) is malformed; some clients would
+    // normalize it by swapping, turning it into an edit the checks below (and
+    // the prefix/boundary rules, which assume start <= end) never inspected —
+    // reject it outright.
+    if position_after(e.range.start, e.range.end) {
+        return false;
+    }
     // A host position is in-region iff it's at/after the region's start line, at
     // /after that line's column floor, and at/before the region end.
     let in_region = |p: Position| {
@@ -296,13 +318,29 @@ pub(crate) fn workspace_edit_within_region(
             p.character >= offset.column_for_line(virtual_line) && !position_after(p, region_end)
         }
     };
-    host_uri_text_edits_all(edit, host_uri, |e| {
-        in_region(e.range.start) && in_region(e.range.end)
-    })
+    in_region(e.range.start) && in_region(e.range.end)
+}
+
+/// Combined per-edit safety check for response transforms: an
+/// already-host-translated edit is safe iff it stays inside the region AND
+/// preserves its structure (per-line prefixes and the newline separating
+/// content from the closing fence). Range translation guarantees the
+/// start bound, but not the end: a stale/oversized downstream range still
+/// translates to a host range that overruns the closing fence (or the rest of
+/// an inline region's host line), so containment must be checked explicitly.
+pub(crate) fn text_edit_safe_in_region(
+    e: &TextEdit,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
+    text_edit_within_region(e, offset, region_end)
+        && text_edit_preserves_line_prefixes(e, offset, region_end)
 }
 
 /// Whether every text edit targeting `host_uri` keeps the region's per-line
-/// host prefixes (e.g. a blockquote's `> ` on every line) intact.
+/// host prefixes (e.g. a blockquote's `> ` on every line) intact, and — in
+/// every region shape — preserves the newline separating content from the
+/// closing fence (the fence-boundary EOL rule).
 ///
 /// The virtual→host transform translates RANGES but emits `newText` verbatim
 /// — nothing re-inserts host line prefixes into replacement text. Two edit
@@ -317,9 +355,17 @@ pub(crate) fn workspace_edit_within_region(
 ///   blockquote region has no line after, so the start line's own offset is
 ///   the only signal there).
 ///
-/// Plain fenced blocks (all-zero column offsets) are unaffected: every edit is
-/// prefix-safe there, which keeps the common case (whole-block refactors like
-/// organize-imports) working. In a prefixed per-line region, the closing-fence
+/// Plain fenced blocks (all-zero column offsets) are exempt from the prefix
+/// rules — every edit is prefix-safe there, which keeps the common case
+/// (whole-block refactors like organize-imports) working — but the
+/// fence-boundary EOL rule still applies to edits reaching a character-0
+/// region end. Known limitation: a CUSTOM injection query (`#offset!`) could
+/// capture a column-0 same-line range with a host suffix after it; the
+/// offsets cannot represent that shape (it is indistinguishable from a
+/// one-line fenced block, where rejecting newlines would break
+/// insertFinalNewline), and the built-in queries never produce it.
+///
+/// In a prefixed per-line region, the closing-fence
 /// BOUNDARY row (recorded as a trailing zero entry, or falling past the array)
 /// counts as prefixed, and edits touching it are rejected outright — the row's
 /// real prefix is unrecorded, so even a no-newline insertion at its column 0
@@ -332,7 +378,6 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
-    let columns = offset.columns();
     // In the per-line (blockquote) shape, content ending with a newline puts
     // the region end at column 0 of the NEXT host row — the closing fence,
     // whose recorded offset is 0 (`compute_line_column_offsets` leaves a
@@ -350,14 +395,49 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     // closed-fence row, so the guard stays fail-closed there — rejecting a
     // boundary-touching edit in a transient malformed construct is acceptable,
     // corrupting a well-formed one is not.
-    // Fast path: a region with no prefixes anywhere (plain fenced blocks —
-    // the common case) can't have anything stripped; skip the per-edit line
-    // scans entirely.
+    // No outer all-zero fast path: the per-edit predicate keeps its own for
+    // the prefix rules, but its fence-boundary EOL rule must run even in
+    // plain fenced regions (a boundary edit there can merge content into the
+    // closing fence — "y```").
+    host_uri_text_edits_all(edit, host_uri, |e| {
+        text_edit_preserves_line_prefixes(e, offset, region_end)
+    })
+}
+
+/// Per-edit form of [`workspace_edit_preserves_line_prefixes`], for response
+/// shapes that carry bare `TextEdit`s rather than a `WorkspaceEdit`
+/// (formatting-family responses, completion/inlayHint/colorPresentation item
+/// edits). Same contract: `false` means applying the edit verbatim would
+/// strip or omit the region's per-line host prefixes, or merge content into
+/// the closing fence (the fence-boundary EOL rule) — callers must reject
+/// or drop, never clamp.
+pub(crate) fn text_edit_preserves_line_prefixes(
+    e: &TextEdit,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
+    // Fence-boundary EOL preservation — checked BEFORE the all-zero fast
+    // path because it protects plain fenced regions too. When the region's
+    // content end is the START of the closing-fence row (character 0 —
+    // content ends with a newline), an edit reaching that boundary erases or
+    // omits the newline separating content from fence: inserting "y" there
+    // yields "y```" on the fence line. After the edit, the text before the
+    // fence still ends with a newline iff the newText ends with one, or —
+    // for a pure deletion — the range starts at a line start (whole trailing
+    // lines removed; the preceding newline survives). Reject everything
+    // else. The canonical insertFinalNewline ("\n" at the boundary) passes.
+    if region_end.character == 0 && e.range.end == region_end {
+        let ends_with_newline = e.new_text.ends_with('\n') || e.new_text.ends_with('\r');
+        let whole_line_deletion = e.new_text.is_empty() && e.range.start.character == 0;
+        if !ends_with_newline && !whole_line_deletion {
+            return false;
+        }
+    }
+
+    let columns = offset.columns();
     if columns.iter().all(|&column| column == 0) {
         return true;
     }
-    // The all-zero fast path above guarantees SOME column is non-zero here,
-    // so only the shape distinction remains.
     let content_prefixed = columns.len() > 1;
     let boundary_at = |host_line: u32| {
         content_prefixed && region_end.character == 0 && host_line >= region_end.line
@@ -368,7 +448,7 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
                 .checked_sub(offset.line())
                 .is_some_and(|v| offset.column_for_line(v) > 0)
     };
-    host_uri_text_edits_all(edit, host_uri, |e| {
+    {
         let (start, end) = (e.range.start, e.range.end);
         // The boundary row's real prefix is unrecorded (0), so the per-line
         // floor can't protect it: even a same-line, no-newline insertion at
@@ -400,7 +480,7 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
             && (e.new_text.contains('\n') || e.new_text.contains('\r'))
             && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
         !touches_boundary && !spans_prefixed_line && !inserts_unprefixed_line
-    })
+    }
 }
 
 /// Whether every text edit targeting `host_uri` (across both the `changes` map
@@ -1214,5 +1294,125 @@ mod tests {
             }]
         }));
         assert!(!check(&doc_changes_into_prefix));
+    }
+
+    #[test]
+    fn boundary_edits_must_preserve_the_fence_separating_newline() {
+        // PLAIN fenced region (all-zero offsets): content host lines 3-4,
+        // closing fence at line 5, region end (5, 0) — the boundary is the
+        // fence row's start. Containment is inclusive there and the all-zero
+        // fast path skips the prefix rules, so the EOL-preservation rule is
+        // the only thing keeping "y" from landing as "y```".
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let edit = |start: Position, end: Position, new_text: &str| TextEdit {
+            range: tower_lsp_server::ls_types::Range { start, end },
+            new_text: new_text.to_string(),
+        };
+        let p = |line: u32, character: u32| Position { line, character };
+        let check = |e: &TextEdit| text_edit_safe_in_region(e, &offset, region_end);
+
+        // Insert without a trailing newline at the boundary → "y```". Reject.
+        assert!(!check(&edit(p(5, 0), p(5, 0), "y")));
+        // Canonical insertFinalNewline. Accept.
+        assert!(check(&edit(p(5, 0), p(5, 0), "\n")));
+        // Whole-block replacement ending at the boundary with a trailing
+        // newline (organize-imports shape). Accept.
+        assert!(check(&edit(p(3, 0), p(5, 0), "import a\nimport b\n")));
+        // Same replacement WITHOUT the trailing newline → fence merges into
+        // the last content line. Reject.
+        assert!(!check(&edit(p(3, 0), p(5, 0), "import a\nimport b")));
+        // Whole trailing-line deletion: preceding newline survives. Accept.
+        assert!(check(&edit(p(4, 0), p(5, 0), "")));
+        // Mid-line deletion ending at the boundary eats the separating
+        // newline → "x```". Reject.
+        assert!(!check(&edit(p(4, 2), p(5, 0), "")));
+    }
+
+    #[test]
+    fn workspace_edit_boundary_rule_applies_to_plain_fenced_regions() {
+        // Regression: the wrapper used to fast-path all-zero regions before
+        // the per-edit predicate ran, so codeAction/rename/applyEdit edits
+        // could still merge content into the closing fence ("y```"). The
+        // fence-boundary EOL rule must fire through the WorkspaceEdit form.
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let check = |new_text: &str| {
+            let edit = parse_workspace_edit(json!({
+                "changes": { host_uri.as_str(): [
+                    { "range": {"start": {"line": 5, "character": 0},
+                                "end": {"line": 5, "character": 0}},
+                      "newText": new_text }
+                ] }
+            }));
+            workspace_edit_preserves_line_prefixes(&edit, &host_uri, &offset, region_end)
+        };
+
+        assert!(!check("y"), "non-newline boundary insert must reject");
+        assert!(check("\n"), "insertFinalNewline must pass");
+    }
+
+    #[test]
+    fn reversed_ranges_are_rejected_in_every_region_shape() {
+        // A reversed range (start after end) is malformed, and a client that
+        // normalizes it by swapping would apply an edit none of the rules
+        // inspected (the boundary rule keys on range.end; the multi-line scan
+        // assumes start <= end). Containment must reject it outright.
+        let p = |line: u32, character: u32| Position { line, character };
+        let edit = |start: Position, end: Position, new_text: &str| TextEdit {
+            range: tower_lsp_server::ls_types::Range { start, end },
+            new_text: new_text.to_string(),
+        };
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+
+        // Plain fence: reversed {start: region_end, end: earlier} would
+        // normalize to a replacement ending at the fence without a newline.
+        let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        assert!(!text_edit_safe_in_region(
+            &edit(p(5, 0), p(4, 0), "x"),
+            &plain,
+            region_end
+        ));
+
+        // Prefixed region: reversed multi-line span would normalize to a
+        // prefix-stripping replacement.
+        let prefixed = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        assert!(!text_edit_safe_in_region(
+            &edit(p(4, 4), p(3, 2), "x"),
+            &prefixed,
+            region_end
+        ));
+    }
+
+    #[test]
+    fn boundary_deletion_accepts_a_lone_cr_terminator() {
+        // LSP recognizes lone '\r' as an EOL; a replacement ending with it
+        // still separates content from the closing fence.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let e = TextEdit {
+            range: tower_lsp_server::ls_types::Range {
+                start: Position {
+                    line: 3,
+                    character: 0,
+                },
+                end: region_end,
+            },
+            new_text: "replaced\r".to_string(),
+        };
+        assert!(text_edit_safe_in_region(&e, &offset, region_end));
     }
 }

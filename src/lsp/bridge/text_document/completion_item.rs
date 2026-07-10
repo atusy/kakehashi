@@ -7,15 +7,21 @@
 //! completion that produced this item. If the downstream server has since
 //! restarted (or the connection was recreated), the resolve fails and we
 //! return the unresolved item with envelope intact: graceful degradation.
+//! The same degradation serves a resolved item whose primary edit is unsafe
+//! for the injection region — escapes it, breaks per-line prefixes, or merges
+//! content into the closing fence (see `resolve_guard_region_end`).
 
 use std::sync::Arc;
 
 use log::warn;
-use tower_lsp_server::ls_types::CompletionItem;
+use tower_lsp_server::ls_types::{CompletionItem, Position};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error};
+use super::super::protocol::{
+    JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
+    translate_host_range_to_virtual,
+};
 use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
     transform_completion_item,
@@ -141,7 +147,9 @@ impl LanguageServerPool {
                 }
             };
 
-        let request = build_completion_resolve_request(&item, request_id);
+        // The original host-coordinate `item` is kept untouched for the
+        // fail-soft returns below.
+        let request = prepare_completion_resolve_request(&item, &envelope, request_id);
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
@@ -182,9 +190,22 @@ impl LanguageServerPool {
         match parse_completion_resolve_response(response) {
             Some(mut resolved) => {
                 let offset = RegionOffset::from(&envelope.offset);
-                transform_completion_item(&mut resolved, &offset);
-                re_envelope_item(&mut resolved, &envelope);
-                resolved
+                let region_end = resolve_guard_region_end(&envelope, &offset);
+                if transform_completion_item(&mut resolved, &offset, region_end, None) {
+                    re_envelope_item(&mut resolved, &envelope);
+                    resolved
+                } else {
+                    // The resolved primary edit is unsafe for the injection
+                    // region — serve the original (already host-translated,
+                    // guard-passed) item instead of a corrupting one.
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "completionItem/resolve: resolved item from {} carries an edit unsafe for the injection region; serving unresolved item",
+                        server_name
+                    );
+                    re_envelope_item(&mut item, &envelope);
+                    item
+                }
             }
             None => {
                 re_envelope_item(&mut item, &envelope);
@@ -199,9 +220,9 @@ impl LanguageServerPool {
 /// The `completionItem/resolve` method is unique: its params is the
 /// `CompletionItem` itself (not a wrapper struct), per the LSP spec.
 fn build_completion_resolve_request(
-    item: &CompletionItem,
+    item: CompletionItem,
     request_id: RequestId,
-) -> JsonRpcRequest<&CompletionItem> {
+) -> JsonRpcRequest<CompletionItem> {
     JsonRpcRequest::new(request_id.as_i64(), "completionItem/resolve", item)
 }
 
@@ -219,6 +240,43 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
     serde_json::from_value(result).ok()
 }
 
+/// Build the outgoing `completionItem/resolve` request from a SERVED item:
+/// a clone with its edit ranges restored to VIRTUAL coordinates (the served
+/// item is host-translated; a downstream that echoes the ranges verbatim
+/// would otherwise get them re-translated on the way back — a double shift
+/// the safety guard can't always catch). Mirrors the codeAction resolve path.
+fn prepare_completion_resolve_request(
+    item: &CompletionItem,
+    envelope: &KakehashiEnvelope,
+    request_id: RequestId,
+) -> JsonRpcRequest<CompletionItem> {
+    let mut outgoing = item.clone();
+    translate_item_ranges_host_to_virtual(&mut outgoing, &RegionOffset::from(&envelope.offset));
+    build_completion_resolve_request(outgoing, request_id)
+}
+
+/// Translate a served (host-coordinate) item's edit ranges back to virtual
+/// coordinates before forwarding it in a `completionItem/resolve` request —
+/// the inverse of `transform_completion_item`'s range translation.
+fn translate_item_ranges_host_to_virtual(item: &mut CompletionItem, offset: &RegionOffset) {
+    if let Some(text_edit) = &mut item.text_edit {
+        match text_edit {
+            tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
+                translate_host_range_to_virtual(&mut edit.range, offset);
+            }
+            tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                translate_host_range_to_virtual(&mut edit.insert, offset);
+                translate_host_range_to_virtual(&mut edit.replace, offset);
+            }
+        }
+    }
+    if let Some(additional_edits) = &mut item.additional_text_edits {
+        for edit in additional_edits.iter_mut() {
+            translate_host_range_to_virtual(&mut edit.range, offset);
+        }
+    }
+}
+
 /// Restore the envelope into a resolved item's `data` field.
 ///
 /// The resolved item may have its own `data` (from the downstream's resolve
@@ -228,8 +286,39 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         server_name: &envelope.origin,
         host_uri: &envelope.host_uri,
         offset: &RegionOffset::from(&envelope.offset),
+        region_end: envelope
+            .region_end
+            .map(|(line, character)| Position { line, character }),
     };
     envelope_item_data(item, &ctx);
+}
+
+/// The `region_end` the resolve-path prefix guard runs with.
+///
+/// Known limitation (pre-existing class, shared with the envelope's `offset`
+/// itself, which has translated resolve responses since #382): both are
+/// completion-time snapshots round-tripped through the client, so an edit
+/// arriving after the region moved translates against stale geometry. A live
+/// re-resolution needs a region identity the envelope doesn't carry — the
+/// codeAction path's freshness gate is the model if this ever bites. Normally the
+/// envelope carries the completion-time snapshot verbatim. A LEGACY envelope
+/// (minted before the field existed) has none, and the resolve path cannot
+/// recompute it — fall back to `(region start line, character 0)`, which is
+/// fully fail-closed: with `character == 0` the guard's boundary rule rejects
+/// every edit at or past the region start in per-line-prefixed regions (the
+/// unresolved item is served instead); unprefixed regions skip the prefix
+/// rules but stay subject to containment and the fence-boundary EOL rule,
+/// both fail-closed under this anchor. A permissive sentinel would disable the
+/// boundary rule entirely and let fence-row edits through — never trade that
+/// for fewer over-strips on envelopes that disappear after one session.
+fn resolve_guard_region_end(envelope: &KakehashiEnvelope, offset: &RegionOffset) -> Position {
+    envelope
+        .region_end
+        .map(|(line, character)| Position { line, character })
+        .unwrap_or(Position {
+            line: offset.line(),
+            character: 0,
+        })
 }
 
 #[cfg(test)]
@@ -250,7 +339,72 @@ mod tests {
                 column: 0,
                 line_column_offsets: None,
             },
+            region_end: Some((9, 0)),
         }
+    }
+
+    // ==========================================================================
+    // resolve_guard_region_end tests
+    // ==========================================================================
+
+    #[test]
+    fn guard_region_end_uses_the_envelope_snapshot_when_carried() {
+        let envelope = test_envelope();
+        let offset = RegionOffset::from(&envelope.offset);
+        assert_eq!(
+            resolve_guard_region_end(&envelope, &offset),
+            Position {
+                line: 9,
+                character: 0
+            },
+        );
+    }
+
+    #[test]
+    fn guard_region_end_falls_back_fail_closed_for_legacy_envelopes() {
+        let mut envelope = test_envelope();
+        envelope.region_end = None;
+        envelope.offset.line = 3;
+        envelope.offset.line_column_offsets = Some(vec![2, 2, 0]);
+        let offset = RegionOffset::from(&envelope.offset);
+
+        let region_end = resolve_guard_region_end(&envelope, &offset);
+        assert_eq!(
+            region_end,
+            Position {
+                line: 3,
+                character: 0
+            },
+            "legacy fallback anchors the boundary at the region start"
+        );
+
+        // Fail-closed: with character 0 the guard's boundary rule rejects even
+        // a same-line, newline-free edit in this per-line-prefixed region —
+        // the resolve serves the unresolved item rather than guessing where
+        // the region really ends.
+        let mut resolved = CompletionItem {
+            label: "x".into(),
+            text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
+                tower_lsp_server::ls_types::TextEdit {
+                    range: tower_lsp_server::ls_types::Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 3,
+                        },
+                    },
+                    new_text: "single".into(),
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(
+            !transform_completion_item(&mut resolved, &offset, region_end, None),
+            "prefixed-region edits must be rejected under the legacy fallback"
+        );
     }
 
     // ==========================================================================
@@ -264,7 +418,7 @@ mod tests {
             data: Some(json!({"resolve_id": 99})),
             ..Default::default()
         };
-        let request = build_completion_resolve_request(&item, RequestId::new(7));
+        let request = build_completion_resolve_request(item, RequestId::new(7));
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["jsonrpc"], "2.0");
@@ -373,6 +527,7 @@ mod tests {
                 column: 0,
                 line_column_offsets: None,
             },
+            region_end: Some((9, 0)),
         };
         let mut item = CompletionItem {
             label: "print".to_string(),
@@ -523,5 +678,49 @@ mod tests {
                 line_column_offsets: Some(vec![0])
             }
         );
+    }
+
+    #[test]
+    fn resolve_forwards_edit_ranges_in_virtual_coordinates() {
+        // The served item is host-translated (region at host line 5); the
+        // outgoing resolve must restore virtual coordinates or a downstream
+        // echoing the ranges verbatim gets them double-shifted on return.
+        let item = CompletionItem {
+            label: "print".to_string(),
+            text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
+                tower_lsp_server::ls_types::TextEdit {
+                    range: tower_lsp_server::ls_types::Range {
+                        start: Position {
+                            line: 5,
+                            character: 2,
+                        },
+                        end: Position {
+                            line: 5,
+                            character: 7,
+                        },
+                    },
+                    new_text: "print".to_string(),
+                },
+            )),
+            ..Default::default()
+        };
+        let envelope = test_envelope();
+
+        // Go through the SAME request-preparation helper production uses, and
+        // assert on the serialized request.
+        let request = prepare_completion_resolve_request(&item, &envelope, RequestId::new(7));
+        let wire = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            wire["params"]["textEdit"]["range"]["start"]["line"], 0,
+            "the resolve request must carry VIRTUAL coordinates (host 5 → virtual 0): {wire}"
+        );
+        assert_eq!(wire["params"]["textEdit"]["range"]["end"]["line"], 0);
+        // The served item stays host-translated for the fail-soft returns.
+        let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &item.text_edit
+        else {
+            panic!("edit variant preserved");
+        };
+        assert_eq!(edit.range.start.line, 5);
     }
 }
