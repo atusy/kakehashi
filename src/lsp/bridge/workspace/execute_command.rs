@@ -99,8 +99,17 @@ impl LanguageServerPool {
             );
             return None;
         };
+        // Wait through initialization like the palette path: after a respawn
+        // the fail-fast variant hands back an Initializing handle whose
+        // capability probe is still false, spuriously dropping the command
+        // with a misleading "does not advertise executeCommandProvider".
         let handle = match self
-            .get_or_create_connection(&origin, &config, Some(&host_url))
+            .get_or_create_connection_wait_ready(
+                &origin,
+                &config,
+                Some(&host_url),
+                std::time::Duration::from_secs(crate::lsp::bridge::pool::INIT_TIMEOUT_SECS),
+            )
             .await
         {
             Ok(handle) => handle,
