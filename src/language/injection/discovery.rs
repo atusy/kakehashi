@@ -276,7 +276,8 @@ pub(crate) fn collect_all_injections<'a>(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, *root, text.as_bytes());
 
-    // Use a map to deduplicate by content node range.
+    // Deduplicate repeated matches of the same language layer while preserving
+    // distinct languages assigned to the same content range (#598).
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
@@ -288,7 +289,11 @@ pub(crate) fn collect_all_injections<'a>(
                 continue;
             }
             if let Some(language) = extract_injection_language(query, match_, text) {
-                let key = (capture.node.start_byte(), capture.node.end_byte());
+                let key = (
+                    capture.node.start_byte(),
+                    capture.node.end_byte(),
+                    language.clone(),
+                );
                 // `or_insert_with` so the per-pattern predicate scans
                 // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
                 // are skipped when this content-node range was already inserted by
@@ -384,14 +389,19 @@ fn collect_injection_regions<'a>(
     let mut matches = cursor.matches(query, *root, text.as_bytes());
 
     // Collect all injection regions that contain our node
-    // Use a map to deduplicate by node range (start, end)
+    // Deduplicate by node range and language so alternate language layers on
+    // the same node remain discoverable.
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
         if let Some((content_node, language, pattern_index)) =
             extract_content_and_language(node, match_, query, text)
         {
-            let key = (content_node.start_byte(), content_node.end_byte());
+            let key = (
+                content_node.start_byte(),
+                content_node.end_byte(),
+                language.clone(),
+            );
 
             // Only keep the first injection for each unique range
             // This handles cases where multiple patterns match the same node
@@ -405,8 +415,15 @@ fn collect_injection_regions<'a>(
         }
     }
 
-    // Convert to vector
-    let injections: Vec<_> = injections_map.into_values().collect();
+    let mut injections: Vec<_> = injections_map.into_values().collect();
+    injections.sort_by_key(|region| {
+        (
+            region.start_byte,
+            std::cmp::Reverse(region.end_byte),
+            region.pattern_index,
+            region.language.clone(),
+        )
+    });
 
     Some(injections)
 }
@@ -1163,9 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_injections_same_node() {
-        // Test that multiple injection patterns matching the same node
-        // should only result in one injection (not nested)
+    fn same_range_injections_keep_distinct_languages() {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { /* comment */ }"#;
         let tree = parse_rust_code(&mut parser, text);
@@ -1201,14 +1216,12 @@ mod tests {
         let node_in_comment = find_node_at_byte(&root, 14).expect("node in comment");
         let result = detect_injection(&node_in_comment, &root, text, Some(&query), "rust");
 
-        // Should detect only one injection (first pattern takes precedence)
         assert!(result.is_some(), "Should find injection");
         let (hierarchy, _, _) = result.unwrap();
-        // Should only use the first matching pattern, not both
         assert_eq!(
             hierarchy,
-            vec!["rust", "doc"],
-            "Should only show first injection"
+            vec!["rust", "doc", "comment"],
+            "distinct language layers on the same node must survive discovery"
         );
     }
 
