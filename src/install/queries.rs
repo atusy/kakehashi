@@ -473,7 +473,7 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
         }
         if let Some(language) = backup_language_name(&path) {
             recover_interrupted_query_install(queries_parent, &language)?;
-        } else if let Some(language) = temp_language_name(&path) {
+        } else if let Some((language, _)) = temp_language_name_and_pid(&path) {
             remove_interrupted_temp_query_install(queries_parent, &language, &path)?;
         }
     }
@@ -540,11 +540,11 @@ fn backup_language_name(path: &Path) -> Option<String> {
     }
 }
 
-fn temp_language_name(path: &Path) -> Option<String> {
+fn temp_language_name_and_pid(path: &Path) -> Option<(String, u32)> {
     let name = path.file_name()?.to_str()?;
-    let (language, _, _) = generated_temp_parts(name)?;
+    let (language, pid, _) = generated_temp_parts(name)?;
     if is_safe_language_name(language) {
-        Some(language.to_string())
+        Some((language.to_string(), pid.parse().ok()?))
     } else {
         None
     }
@@ -554,13 +554,6 @@ fn generated_backup_matches_language(name: &str, language: &str) -> bool {
     matches!(
         generated_backup_parts(name),
         Some((backup_language, _, _)) if backup_language == language
-    )
-}
-
-fn generated_temp_matches_language(name: &str, language: &str) -> bool {
-    matches!(
-        generated_temp_parts(name),
-        Some((tmp_language, _, _)) if tmp_language == language
     )
 }
 
@@ -602,13 +595,43 @@ fn remove_interrupted_temp_query_install(
     tmp_dir: &Path,
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
+    let Some(name) = tmp_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    let Some((tmp_language, pid, _)) = generated_temp_parts(name) else {
+        return Ok(());
+    };
+    if tmp_language != language || process_is_running(pid) {
+        return Ok(());
+    }
+
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
-    if let Some(name) = tmp_dir.file_name().and_then(|name| name.to_str())
-        && generated_temp_matches_language(name, language)
-    {
-        fs::remove_dir_all(tmp_dir)?;
+    match fs::remove_dir_all(tmp_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(QueryInstallError::IoError(e)),
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: &str) -> bool {
+    let Ok(pid) = pid.parse::<i32>() else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_is_running(_pid: &str) -> bool {
+    false
 }
 
 fn recover_interrupted_query_install(
@@ -916,6 +939,14 @@ mod tests {
         base_url
     }
 
+    fn dead_test_pid() -> u32 {
+        let mut pid = std::process::id().saturating_add(100_000);
+        while process_is_running(&pid.to_string()) {
+            pid = pid.saturating_add(1);
+        }
+        pid
+    }
+
     /// The rejected name flows into the error's `Display` (printed raw by
     /// the CLI), so control characters in an untrusted name must be escaped
     /// before they reach terminal output.
@@ -1042,7 +1073,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         fs::create_dir_all(&queries_parent).unwrap();
-        let tmp = queries_parent.join(".lua.123.0.tmp");
+        let tmp = queries_parent.join(format!(".lua.{}.0.tmp", dead_test_pid()));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(tmp.join("highlights.scm"), "(comment) @comment\n").unwrap();
 
@@ -1052,6 +1083,33 @@ mod tests {
             !tmp.exists(),
             "generated staging dirs from crashed installs should be collected"
         );
+    }
+
+    #[test]
+    fn recover_interrupted_query_installs_preserves_live_tmp_dirs() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tmp = queries_parent.join(format!(".lua.{}.0.tmp", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("highlights.scm"), "(comment) @comment\n").unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            tmp.exists(),
+            "generated staging dirs from live installers must not be collected"
+        );
+    }
+
+    #[test]
+    fn remove_interrupted_temp_query_install_treats_missing_tmp_as_clean() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tmp = queries_parent.join(format!(".lua.{}.0.tmp", dead_test_pid()));
+
+        remove_interrupted_temp_query_install(&queries_parent, "lua", &tmp).unwrap();
     }
 
     #[test]
