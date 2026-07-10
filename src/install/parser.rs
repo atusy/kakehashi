@@ -4,7 +4,7 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -585,12 +585,25 @@ fn unpack_archive_file_entry<R: Read>(
             format!("Failed to create {}: {}", escaped_path(safe_relative), e),
         ))
     })?;
-    io::copy(entry, &mut output).map_err(|e| {
-        ArchiveFetchError::Io(io::Error::new(
-            e.kind(),
-            format!("Failed to extract {}: {}", escaped_path(safe_relative), e),
-        ))
-    })?;
+    let mut buffer = [0; 8192];
+    loop {
+        let read = entry.read(&mut buffer).map_err(|e| {
+            ArchiveFetchError::Content(format!(
+                "Failed to read {}: {}",
+                escaped_path(safe_relative),
+                e
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read]).map_err(|e| {
+            ArchiveFetchError::Io(io::Error::new(
+                e.kind(),
+                format!("Failed to extract {}: {}", escaped_path(safe_relative), e),
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -1671,6 +1684,58 @@ mod tests {
             fs::read(temp.path().join("src/parser.c")).expect("read extracted file"),
             b"parser source"
         );
+    }
+
+    #[test]
+    fn extract_archive_classifies_entry_read_failures_as_content_errors() {
+        use std::io::Cursor;
+        use tar::{Builder, Header};
+
+        struct FailAfter {
+            inner: Cursor<Vec<u8>>,
+            remaining: usize,
+        }
+
+        impl Read for FailAfter {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::other("synthetic read failure"));
+                }
+                let limit = buf.len().min(self.remaining);
+                let read = self.inner.read(&mut buf[..limit])?;
+                self.remaining -= read;
+                Ok(read)
+            }
+        }
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let body = b"parser source";
+            let mut header = Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "parser-1.0.0/src/parser.c", &body[..])
+                .expect("append synthetic regular file");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let reader = FailAfter {
+            inner: Cursor::new(bytes),
+            remaining: 512 + 4,
+        };
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(reader);
+
+        match extract_archive(&mut archive, "parser-1.0.0", temp.path()) {
+            Err(ArchiveFetchError::Content(message)) => assert!(
+                message.contains("synthetic read failure"),
+                "expected source-read context, got: {message}"
+            ),
+            other => panic!("expected archive content error, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
