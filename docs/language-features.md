@@ -262,9 +262,11 @@ command-carrying actions execute through the bridged
 Edit safety differs by layer and direction. An INJECTION-layer action edit
 that cannot be represented in the host document (touching another injection
 region, virtual-document file operations, or escaping the block) is
-rejected — shown as a disabled action where the client supports that,
-dropped otherwise. HOST-layer (`bridge._self`) action edits already target
-the real document and pass through as-is. A downstream server's own
+rejected: in the initial response it surfaces as a disabled action where the
+client supports that and is dropped otherwise; during `codeAction/resolve`
+(where a response cannot be dropped) the unsafe payload is removed and the
+action is returned unresolved. HOST-layer (`bridge._self`) action edits
+already target the real document and pass through as-is. A downstream server's own
 `workspace/applyEdit` request is translated the same way, but an
 untranslatable one is answered `applied: false` locally — it never reaches
 the editor and no action is involved.

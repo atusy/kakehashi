@@ -302,8 +302,10 @@ to them).
 
 **Behavior**:
 - Language servers push diagnostics asynchronously
-- kakehashi filters to virtual document URI only
-- Translate all diagnostic ranges to host coordinates
+- VIRTUAL-region pushes: filtered to the virtual document URI, all ranges
+  translated to host coordinates
+- `_self` HOST pushes: real host URI and host-relative ranges, republished
+  as-is (no filtering or translation step)
 - Concatenate diagnostics from multiple servers (multiplicity preserved — no
   deduplication)
 - Forward combined diagnostics to the editor with host document URI
@@ -359,7 +361,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 
 ### Neutral
 
-- **Per-method configuration**: shipped — `bridge.<lang>.aggregation` overrides strategy/priorities/maxFanOut per LSP method (see aggregation-priorities-wildcard)
+- **Per-method configuration**: shipped — `bridge.<lang>.aggregation` overrides priorities/maxFanOut per LSP method, and strategy for the methods that consume it (diagnostics, code actions, full formatting; every other method dispatches `preferred` regardless — see aggregation-priorities-wildcard)
 - **Server capability detection**: Some servers may not support all methods; need graceful degradation
 
 ## Implementation Status
