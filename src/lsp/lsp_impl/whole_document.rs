@@ -297,6 +297,18 @@ fn nonempty_whole_document_items<T>(items: Vec<T>) -> Option<Vec<T>> {
     if items.is_empty() { None } else { Some(items) }
 }
 
+/// Flatten per-region result vectors back into ONE list in region source
+/// order (the region index recorded at fan-out time), regardless of task
+/// completion order.
+fn flatten_ordered_region_items<T>(mut region_items: Vec<(usize, Option<Vec<T>>)>) -> Vec<T> {
+    region_items.sort_by_key(|(region_index, _)| *region_index);
+    region_items
+        .into_iter()
+        .filter_map(|(_, items)| items)
+        .flatten()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,15 +393,6 @@ mod tests {
 
         assert_eq!(result, Some(vec!["virt", "host"]));
     }
-}
-
-fn flatten_ordered_region_items<T>(mut region_items: Vec<(usize, Option<Vec<T>>)>) -> Vec<T> {
-    region_items.sort_by_key(|(region_index, _)| *region_index);
-    region_items
-        .into_iter()
-        .filter_map(|(_, items)| items)
-        .flatten()
-        .collect()
 }
 
 #[cfg(test)]

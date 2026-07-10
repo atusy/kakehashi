@@ -28,9 +28,15 @@ fn diagnostic_position_key(diagnostic: &Diagnostic) -> (u32, u32, u32, u32) {
     )
 }
 
-fn canonical_json_string<T: serde::Serialize>(value: &T) -> String {
-    let value = serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
-    serde_json::to_string(&canonicalize_json(value)).unwrap_or_default()
+fn canonical_json_string<T: serde::Serialize + std::fmt::Debug>(value: &T) -> String {
+    // Fall back to the (deterministic, derive-generated) Debug rendering on a
+    // serialization failure instead of a shared sentinel: distinct
+    // diagnostics must not collapse to one cached sort key, or the final
+    // order would silently degrade to input order for them.
+    let Ok(json) = serde_json::to_value(value) else {
+        return format!("{value:?}");
+    };
+    serde_json::to_string(&canonicalize_json(json)).unwrap_or_else(|_| format!("{value:?}"))
 }
 
 fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
