@@ -8,11 +8,10 @@
 //! - The blocking Rayon computation is cancelled *cooperatively*: the handler
 //!   flips a [`CancelToken`](crate::cancel::CancelToken) (also flipped when a
 //!   newer request supersedes this one, or the document closes) and the compute
-//!   polls it at coarse checkpoints — after the host pass, inside the injection
-//!   discovery loop, and at each per-region fan-out entry — bailing early. A region
-//!   already mid-parse runs to completion, but not-yet-started work returns
-//!   immediately, so an obsolete request stops burning CPU instead of computing
-//!   a result that is only discarded.
+//!   polls it throughout host and injected-language query walks, injection
+//!   discovery, nested regions, and final shaping. Parsing itself remains
+//!   non-preemptible, but a region that observes cancellation returns incomplete
+//!   output that is neither served nor cached.
 //!
 //! This is achieved by subscribing to cancel notifications via `CancelForwarder::subscribe()`
 //! and using biased `tokio::select!` to prioritize cancel handling.

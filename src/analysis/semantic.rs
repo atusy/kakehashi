@@ -626,8 +626,8 @@ mod tests {
 
     /// Test async wrapper for parallel injection processing.
     ///
-    /// This verifies the spawn_blocking bridge works correctly when calling
-    /// the Rayon-based parallel injection processing from an async context.
+    /// This verifies the bounded compute-pool bridge works correctly when
+    /// calling Rayon-based injection processing from an async context.
     #[tokio::test]
     async fn test_handle_semantic_tokens_full() {
         use crate::config::WorkspaceSettings;

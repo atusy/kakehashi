@@ -1,8 +1,9 @@
 //! Cooperative cancellation for long-running semantic-token computation.
 //!
-//! A full-document semantic-token compute runs on tokio's blocking pool and
-//! fans out across Rayon workers. Dropping its future does **not** stop it — the
-//! blocking task detaches and runs to completion, burning CPU whose result is
+//! A full-document semantic-token compute runs on the bounded `ComputePool` and
+//! fans out across its Rayon workers. Dropping its future does **not** preempt
+//! an already-running work unit, which otherwise runs to completion and burns CPU
+//! whose result is
 //! then discarded (see `analysis::handle_semantic_tokens_full`). Under rapid
 //! typing on a large document that turns into a pile-up: every keystroke
 //! supersedes the previous request, but the superseded compute keeps running.

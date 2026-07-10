@@ -7,7 +7,7 @@
 //! - Thread-local parser caching (no cross-thread synchronization during parsing)
 //! - Work-stealing via Rayon's par_iter() for top-level injections
 //! - Sequential processing for nested injections (same thread, no coordination)
-//! - Single spawn_blocking bridge at the top level
+//! - One bounded `ComputePool` work unit at the top level
 
 use std::cell::RefCell;
 use std::collections::HashMap;
