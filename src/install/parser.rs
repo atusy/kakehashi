@@ -29,7 +29,10 @@ const ARCHIVE_TAR_METADATA_MARGIN_BYTES: u64 = 10 * 1024 * 1024;
 /// Maximum decompressed tar stream bytes for parser archives.
 const MAX_ARCHIVE_TAR_STREAM_BYTES: u64 =
     MAX_ARCHIVE_EXTRACTED_BYTES + ARCHIVE_TAR_METADATA_MARGIN_BYTES;
-/// Maximum compressed bytes downloaded for a parser archive.
+/// Maximum accepted compressed payload bytes for a parser archive.
+///
+/// Oversize detection may consume one additional probe byte to distinguish a
+/// payload at the exact limit from one with more data.
 const MAX_ARCHIVE_DOWNLOAD_BYTES: u64 =
     MAX_ARCHIVE_TAR_STREAM_BYTES + ARCHIVE_TAR_METADATA_MARGIN_BYTES;
 /// Maximum number of filesystem entries accepted from a parser archive.
@@ -739,6 +742,9 @@ impl<R: Read> Read for LimitedReader<R> {
                     },
                 ));
             }
+            // A reader cannot distinguish exact-limit EOF without probing.
+            // Consume at most one detection byte, then make every retry fail
+            // without advancing the inner reader.
             let mut probe = [0];
             return match self.inner.read(&mut probe) {
                 Ok(0) => Ok(0),
