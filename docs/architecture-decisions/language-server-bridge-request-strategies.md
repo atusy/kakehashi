@@ -100,7 +100,9 @@ Request (cursor in injection) ──▶ Forward to language server
                                          │
                                          ▼
                                   Translate positions
-                                  (virtual → host)
+                                  (virtual → host — same-region
+                                   targets only; real-file locations
+                                   keep URI and range unchanged)
 ```
 
 **Per-Method Details**:
@@ -112,7 +114,7 @@ Request (cursor in injection) ──▶ Forward to language server
 | Input | Position (host → virtual translation) |
 | Output | Location or Location[] |
 | Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
-| Position mapping | Range start/end: virtual → host |
+| Position mapping | Range start/end virtual → host for same-region targets; real-file ranges untouched |
 
 #### textDocument/references
 
@@ -121,7 +123,7 @@ Request (cursor in injection) ──▶ Forward to language server
 | Input | Position + includeDeclaration flag |
 | Output | Location[] |
 | Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
-| Position mapping | Each location's range: virtual → host |
+| Position mapping | Each same-region location's range virtual → host; real-file ranges untouched |
 
 **Important**: Real-file locations (e.g. library sources on disk) are kept —
 they are valid navigation targets. Only locations in OTHER virtual regions are
@@ -338,16 +340,16 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 
 ## Implementation Status
 
-The following table shows the implementation status of the bridged LSP
-methods this ADR's strategies cover (many more pass-through/position-mapped
-methods — declaration, typeDefinition, implementation, documentLink,
+The following table is a SELECTED-FEATURE summary of the bridged LSP methods
+this ADR discusses in detail (the goto family rows stand for
+definition/declaration/typeDefinition/implementation, which share one
+transformer). The full, user-facing feature list — documentLink,
 documentSymbol, prepareRename, documentColor, moniker, codeLens/resolve,
-foldingRange, linkedEditingRange, … — are implemented and documented in
-`docs/language-features.md`):
+foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| definition | ✅ Implemented | Full delegation; real-file URIs kept, cross-region virtual URIs dropped |
+| definition (+ declaration / typeDefinition / implementation) | ✅ Implemented | Shared goto transformer; real-file URIs kept, cross-region virtual URIs dropped |
 | hover | ✅ Implemented | Pass-through with position translation |
 | signatureHelp | ✅ Implemented | Pass-through |
 | completion | ✅ Implemented | Fail-closed edit guards; atomic additionalTextEdits drop |
@@ -360,7 +362,7 @@ foldingRange, linkedEditingRange, … — are implemented and documented in
 | onTypeFormatting | ✅ Implemented | Shares the formatting guards |
 | inlayHint | ✅ Implemented | Unsafe accept-edit sets dropped whole; hint kept |
 | colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
-| documentHighlight | ✅ Implemented | |
+| documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
 | semanticTokens | ✅ Implemented | Cross-layer merge (see semantic-token merge ADR) |
 
