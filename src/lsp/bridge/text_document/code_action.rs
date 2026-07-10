@@ -251,18 +251,28 @@ fn finalize_host_resolved_action(
     }
 
     // A resolved action with no command and no applicable edit is a no-op —
-    // disable it as unresolvable (`REASON_RESOLVE`) rather than hand the client
-    // an enabled action that applies nothing (mirrors the virt path's empty-edit
-    // policy). Two shapes qualify: a `Some`-but-empty edit (the server resolved
-    // to nothing), and a command-only action whose routing name couldn't be
-    // encoded above (command dropped, edit absent). A resolve that NEVER carried
-    // a command and has no edit is NOT a no-op — it is a still-lazy staged
-    // resolve, re-enveloped for a further pass below. Without `disabledSupport`,
-    // fail soft to the unresolved action.
-    if resolved.command.is_none()
-        && (resolved.edit.as_ref().is_some_and(workspace_edit_is_empty)
-            || (command_dropped && resolved.edit.is_none()))
-    {
+    // disable it rather than hand the client an enabled action that applies
+    // nothing (mirrors the virt path's empty-edit policy). Two shapes qualify,
+    // with distinct user-facing reasons: a `Some`-but-empty edit (the server
+    // resolved to nothing → `REASON_RESOLVE`), and a command-only action whose
+    // routing name couldn't be encoded above (command dropped, edit absent →
+    // `REASON_UNROUTABLE_COMMAND` — the server resolved fine; the routing name
+    // is the problem, so don't misdirect debugging at the server). A resolve
+    // that NEVER carried a command and has no edit is NOT a no-op — it is a
+    // still-lazy staged resolve, re-enveloped for a further pass below.
+    // Without `disabledSupport`, fail soft to the unresolved action.
+    let no_op_reason = if resolved.command.is_none() {
+        if resolved.edit.as_ref().is_some_and(workspace_edit_is_empty) {
+            Some(REASON_RESOLVE)
+        } else if command_dropped && resolved.edit.is_none() {
+            Some(REASON_UNROUTABLE_COMMAND)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(reason) = no_op_reason {
         if !upstream_caps.disabled_support {
             re_envelope_action(&mut action, &envelope);
             return action;
@@ -276,7 +286,7 @@ fn finalize_host_resolved_action(
         resolved.data = None;
         resolved.is_preferred = None;
         resolved.disabled = Some(CodeActionDisabled {
-            reason: REASON_RESOLVE.to_string(),
+            reason: reason.to_string(),
         });
         return resolved;
     }
@@ -893,17 +903,38 @@ fn finalize_virt_resolved_action(
         // codeAction path). An edit+command action keeps both — the edit is
         // translated below, then the client executes the command.
         // Drop the command if its routing name can't be encoded (unroutable);
-        // an accompanying edit is still applied.
-        if resolved
-            .command
-            .as_mut()
-            .and_then(|command| {
-                encode_command(server_name, &envelope.host_uri, &command.command)
-                    .map(|encoded| command.command = encoded)
-            })
-            .is_none()
-        {
+        // an accompanying edit is still applied. Track the drop: a
+        // command-only resolve whose command was dropped must NOT fall into
+        // the still-lazy branch below — every future resolve would
+        // re-materialize the same unroutable command, leaving the client an
+        // enabled action that can never do anything (mirrors
+        // `finalize_host_resolved_action`).
+        let mut command_dropped = false;
+        if let Some(command) = resolved.command.as_mut() {
+            match encode_command(server_name, &envelope.host_uri, &command.command) {
+                Some(encoded) => command.command = encoded,
+                None => command_dropped = true,
+            }
+        }
+        if command_dropped {
             resolved.command = None;
+        }
+        if command_dropped && resolved.edit.is_none() {
+            if !upstream_caps.disabled_support {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+            resolved.title = resuffix_resolved_title(
+                std::mem::take(&mut resolved.title),
+                suffixed_title,
+                server_name,
+            );
+            resolved.data = None;
+            resolved.is_preferred = None;
+            resolved.disabled = Some(CodeActionDisabled {
+                reason: REASON_UNROUTABLE_COMMAND.to_string(),
+            });
+            return resolved;
         }
 
         // isPreferred is its own client capability (LSP 3.15); the downstream
@@ -1294,6 +1325,7 @@ const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host do
 const REASON_PREFIXED_REGION: &str = "the edit would break the host document's structure \
      around the injected region (its line prefixes, e.g. a blockquote's, or the \
      closing fence)";
+const REASON_UNROUTABLE_COMMAND: &str = "the action's command cannot be routed by kakehashi";
 
 fn bridge_code_action(
     item: CodeActionOrCommand,
@@ -1361,6 +1393,7 @@ fn bridge_code_action(
     // execute — no data envelope). Arguments pass through verbatim (they are the
     // downstream's own coordinate system, checklist §10). An edit+command action
     // keeps BOTH: the client applies the (translated) edit, then executes.
+    let had_command = action.command.is_some();
     let has_command = action
         .command
         .as_mut()
@@ -1370,11 +1403,14 @@ fn bridge_code_action(
         })
         .is_some();
     // A command whose name couldn't be encoded (unroutable) is dropped; an
-    // accompanying edit is still applied below, else the action is dropped as a
-    // no-op. Assigning None when there was no command is a harmless no-op.
+    // accompanying edit is still applied below. Without an edit the action is
+    // DISABLED below rather than reclassified lazy — a resolve would only
+    // re-materialize the same unroutable command. Assigning None when there
+    // was no command is a harmless no-op.
     if !has_command {
         action.command = None;
     }
+    let command_dropped = had_command && !has_command;
 
     match &mut action.edit {
         Some(edit) => {
@@ -1407,6 +1443,17 @@ fn bridge_code_action(
                 action.data = None;
                 action.title = suffix_title(action.title, server_name);
                 return Some(CodeActionOrCommand::CodeAction(action));
+            }
+            // The action's ONLY payload was a command whose routing name
+            // couldn't be encoded: a permanent failure, not a lazy action —
+            // resolving it would re-materialize the same unroutable command.
+            if command_dropped {
+                return disable_action(
+                    action,
+                    REASON_UNROUTABLE_COMMAND,
+                    server_name,
+                    upstream_caps,
+                );
             }
             // No edit, no command: is this a lazy (resolve-deferred) action?
             //
@@ -2932,10 +2979,108 @@ mod tests {
                 .as_ref()
                 .expect("must be disabled, not an enabled no-op")
                 .reason,
-            REASON_RESOLVE
+            REASON_UNROUTABLE_COMMAND,
+            "the reason must name the routing problem, not blame the server's resolve"
         );
         assert!(out.command.is_none(), "unencodable command must be dropped");
         assert!(out.edit.is_none());
+    }
+
+    #[test]
+    fn virt_resolve_disables_command_only_action_when_routing_name_unencodable() {
+        // The virt twin of the host case above: a resolve that materializes
+        // ONLY a command whose routing name can't be encoded must not fall
+        // into the still-lazy branch and come back ENABLED — the client would
+        // resolve it forever with the same result and applying it does
+        // nothing. Disable it (permanent failure).
+        let resolved: CodeAction = serde_json::from_value(json!({
+            "title": "Run fix",
+            "command": { "title": "Run fix", "command": "server.fix" }
+        }))
+        .unwrap();
+        let action: CodeAction = serde_json::from_value(json!({
+            "title": "Run fix — srv", "data": { "id": 1 }
+        }))
+        .unwrap();
+        let envelope: CodeActionEnvelope = serde_json::from_value(json!({
+            "origin": "sr\u{1f}v", // contains SEP → encode_command fails
+            "host_uri": "file:///test.md",
+            "region_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "injection_language": "lua",
+            "offset": { "line": 0, "column": 0 },
+            "original_title": "Run fix",
+            "inner": null,
+            "host_layer": false
+        }))
+        .unwrap();
+
+        let out = finalize_virt_resolved_action(
+            resolved,
+            action,
+            envelope,
+            &RegionOffset::new(3, 0),
+            Position {
+                line: u32::MAX,
+                character: u32::MAX,
+            },
+            Some(&make_host_uri()),
+            "Run fix — sr\u{1f}v".to_string(),
+            caps_resolve(),
+        );
+
+        assert_eq!(
+            out.disabled
+                .as_ref()
+                .expect("must be disabled, not an enabled forever-lazy action")
+                .reason,
+            REASON_UNROUTABLE_COMMAND
+        );
+        assert!(out.command.is_none(), "unencodable command must be dropped");
+        assert!(out.edit.is_none());
+        assert!(
+            out.data.is_none(),
+            "a permanently failed action must not keep a resolve envelope"
+        );
+    }
+
+    #[test]
+    fn unroutable_command_only_action_is_disabled_not_lazy_on_initial_response() {
+        // Initial surfacing twin: a command-carrying, no-edit action whose
+        // command can't be encoded must not be reclassified as lazy (each
+        // future resolve would re-materialize the same unroutable command).
+        // Disable it up front.
+        let actions: Vec<CodeActionOrCommand> = serde_json::from_value(json!([
+            {
+                "title": "Run fix",
+                "command": { "title": "Run fix", "command": "server.fix" }
+            }
+        ]))
+        .unwrap();
+
+        let bridged = bridge_code_actions(
+            actions,
+            "sr\u{1f}v", // SEP in the server name → encode_command fails
+            "file:///test.md",
+            caps_resolve(),
+            true, // server resolves: the old behavior enveloped this as lazy
+            None,
+        );
+        let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            action
+                .disabled
+                .as_ref()
+                .expect("must be disabled, not enveloped lazy")
+                .reason,
+            REASON_UNROUTABLE_COMMAND
+        );
+        assert!(action.command.is_none());
+        assert!(
+            action.data.is_none(),
+            "no resolve envelope for a permanent failure"
+        );
     }
 
     #[test]
