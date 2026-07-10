@@ -328,6 +328,18 @@ fn remove_empty_virtual_entries(edit: &mut WorkspaceEdit) {
             DocumentChangeOperation::Op(_) => true,
         }),
     }
+    // Mirror the `changes` handling above: clients that prefer
+    // `documentChanges` when both fields are present would read a forwarded
+    // `Some([])` as "whole edit is a no-op" and drop the real edits still
+    // carried in `changes`.
+    let emptied = match &edit.document_changes {
+        None => false,
+        Some(DocumentChanges::Edits(edits)) => edits.is_empty(),
+        Some(DocumentChanges::Operations(ops)) => ops.is_empty(),
+    };
+    if emptied {
+        edit.document_changes = None;
+    }
 }
 
 /// The `(virtual URI, version)` of every VERSIONED `TextDocumentEdit` that
@@ -828,6 +840,39 @@ mod tests {
             }
             DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
         }
+    }
+
+    #[tokio::test]
+    async fn emptied_document_changes_is_dropped_not_forwarded_as_some_empty() {
+        // When every documentChanges entry is a removed no-op virtual carrier
+        // but `changes` still holds a real edit, forwarding
+        // `documentChanges: []` would overshadow `changes` for clients that
+        // prefer documentChanges when both are present — the real edit would
+        // silently no-op. The emptied container must become None.
+        let vuri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let params = params_with_edit(json!({
+            "changes": { "file:///project/main.rs": [text_edit(3)] },
+            "documentChanges": [
+                {
+                    "textDocument": { "uri": vuri, "version": null },
+                    "edits": []
+                }
+            ]
+        }));
+
+        let out = translator()
+            .translate(params, &test_connection())
+            .await
+            .expect("a removable no-op virtual entry must not fail the apply");
+        assert_eq!(
+            out.edit.document_changes, None,
+            "an emptied documentChanges must be dropped, not forwarded as `Some([])`"
+        );
+        let changes = out.edit.changes.expect("the real edit must survive");
+        assert!(
+            changes.contains_key(&"file:///project/main.rs".parse().unwrap()),
+            "the real-file edit in `changes` survives: {changes:?}"
+        );
     }
 
     #[tokio::test]

@@ -3029,6 +3029,7 @@ mod tests {
                     "edit": { "changes": { "file:///x.rs": [] } }
                 }))
                 .unwrap(),
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 reply: reply_tx,
                 cancel: forwarded_cancel,
             })
@@ -3172,6 +3173,7 @@ mod tests {
             client,
             None,
             cancel.clone(),
+            true,
         ));
 
         let host = tower_lsp_server::ls_types::Uri::from_str("file:///project/doc.md").unwrap();
