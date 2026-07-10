@@ -942,7 +942,10 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
 
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            // Bounded so the thread (and its socket) terminates instead of
+            // living until process exit: no test downloads anywhere near this
+            // many files (2 query files per language, short inherits chains).
+            for stream in listener.incoming().take(64) {
                 let Ok(mut stream) = stream else { continue };
                 let mut reader = BufReader::new(&mut stream);
                 let mut request_line = String::new();
