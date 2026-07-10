@@ -211,10 +211,12 @@ fn transform_text_document_edit(
 ///
 /// Deliberately erase-without-validate: the version was never a working
 /// cross-boundary protection (the spaces differ, so pre-strip it rejected
-/// EVERYTHING), the majority shape (`changes` map) carries no version at all,
-/// and staleness is guarded by the region-freshness resolution and region
-/// bounds that apply to both shapes alike. Validating the versioned minority
-/// against the originating connection's tracked version first is follow-up
+/// EVERYTHING), and the majority shape (`changes` map) carries no version at
+/// all. What remains is COORDINATE validity on virtual paths (region
+/// freshness + region bounds) — not general content freshness, and nothing
+/// on host paths: an action whose edit aged in the editor's menu while the
+/// user kept typing applies unconditionally, versioned shape or not. Mapping
+/// downstream versions to editor versions (instead of erasing) is follow-up
 /// hardening.
 pub(crate) fn strip_bridge_local_versions(edit: &mut WorkspaceEdit) {
     let Some(doc_changes) = &mut edit.document_changes else {
