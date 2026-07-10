@@ -939,6 +939,9 @@ fn build_combined_virtual_content(
     let mut offsets = Vec::new();
     let mut line_start = span.start;
     let mut range_index = 0;
+    let mut host_line_start = text[..line_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
 
     while line_start < span.end {
         let remaining = clamped_slice(text, line_start..span.end);
@@ -966,9 +969,6 @@ fn build_combined_virtual_content(
         });
 
         if let Some(first_included) = first_included {
-            let host_line_start = text[..first_included]
-                .rfind('\n')
-                .map_or(0, |newline| newline + 1);
             offsets.push(
                 clamped_slice(text, host_line_start..first_included)
                     .encode_utf16()
@@ -985,6 +985,7 @@ fn build_combined_virtual_content(
         }
 
         line_start = line_end;
+        host_line_start = line_end;
     }
 
     if output.ends_with('\n') {
