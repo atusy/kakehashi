@@ -252,7 +252,15 @@ pub(crate) fn process_injection_sync(
     host_line_starts: &[usize],
     depth: usize,
     supports_multiline: bool,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> InjectionTokens {
+    if crate::cancel::is_cancelled(cancel) {
+        return InjectionTokens {
+            tokens: Vec::new(),
+            fully_loaded: false,
+        };
+    }
+
     // Check recursion depth. Hitting the cap is a deliberate truncation, not a
     // missing parser, so the result is still "fully loaded" for caching purposes.
     if depth >= MAX_INJECTION_DEPTH {
@@ -289,10 +297,9 @@ pub(crate) fn process_injection_sync(
             ctx.host_start_byte,
             ctx.included_ranges.as_deref(),
             None,
-            // Nested discovery for a single region is bounded; cancellation is
-            // enforced at the per-region fan-out entry (this region was already
-            // committed there), so no token is threaded into the recursion.
-            None,
+            // A large region can contain many nested candidates, so cancellation
+            // must remain observable after the outer fan-out entry check.
+            cancel,
         );
 
     let mut tokens = Vec::new();
@@ -305,7 +312,7 @@ pub(crate) fn process_injection_sync(
     // emission: a capture node may span the excluded host text between
     // combined blocks (e.g. a string opened in one block, closed in the
     // next), and only per-line tokens can be clipped back to the blocks.
-    collect_host_tokens(
+    if !collect_host_tokens(
         ctx.content_text,
         &tree,
         &ctx.highlight_query,
@@ -319,9 +326,14 @@ pub(crate) fn process_injection_sync(
         supports_multiline && !ctx.combined,
         &nested_exclusion_ranges,
         &ctx.prefix_byte_widths,
-        None,
+        cancel,
         &mut tokens,
-    );
+    ) {
+        return InjectionTokens {
+            tokens: Vec::new(),
+            fully_loaded: false,
+        };
+    }
     if ctx.combined {
         clip_tokens_to_included_ranges(&mut tokens, ctx, host_lines, host_line_starts);
     }
@@ -341,6 +353,7 @@ pub(crate) fn process_injection_sync(
             host_line_starts,
             depth + 1,
             supports_multiline,
+            cancel,
         );
         tokens.extend(nested.tokens);
         fully_loaded &= nested.fully_loaded;
@@ -1307,6 +1320,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                 host_line_starts,
                 1, // depth 1 (first level of injection, host is 0)
                 supports_multiline,
+                cancel,
             ),
         )
     };
@@ -1743,6 +1757,7 @@ mod tests {
             &build_line_start_bytes(host_text),
             1, // depth 1 (not host document)
             false,
+            None,
         )
         .tokens;
 
@@ -1804,6 +1819,7 @@ mod tests {
             &build_line_start_bytes(host_text),
             MAX_INJECTION_DEPTH,
             false,
+            None,
         )
         .tokens;
 
@@ -1811,6 +1827,55 @@ mod tests {
             tokens.is_empty(),
             "Should return empty at MAX_INJECTION_DEPTH"
         );
+    }
+
+    #[test]
+    fn process_injection_sync_returns_incomplete_when_cancelled() {
+        use crate::config::WorkspaceSettings;
+
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _summary = coordinator.load_settings(&settings);
+        if !coordinator.ensure_language_loaded("rust").success {
+            return;
+        }
+        let Some(highlight_query) = coordinator.highlight_query("rust") else {
+            return;
+        };
+        let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_parallel());
+        let code = "fn main() {}";
+        let host_lines: Vec<&str> = code.lines().collect();
+        let ctx = InjectionContext {
+            resolved_lang: "rust".to_string(),
+            highlight_query,
+            content_text: code,
+            host_start_byte: 0,
+            included_ranges: None,
+            prefix_byte_widths: Vec::new(),
+            combined: false,
+            region_cache: None,
+        };
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+
+        let result = process_injection_sync(
+            &ctx,
+            &factory,
+            &coordinator,
+            None,
+            code,
+            &host_lines,
+            &build_line_start_bytes(code),
+            1,
+            false,
+            Some(&cancel),
+        );
+
+        assert!(result.tokens.is_empty());
+        assert!(!result.fully_loaded);
     }
 
     /// Returns the search path for tree-sitter grammars.
@@ -3268,12 +3333,11 @@ local b = 2
     /// path. The fan-out's own cancel skip is narrower: `process_one`'s entry
     /// check zeroes only regions whose tokenization had NOT started when the
     /// token flipped (returning `fully_loaded: false`, which the #529 store gate
-    /// then drops). A region already inside `process_injection_sync` has no inner
-    /// poll — it completes and IS stored, which is correct: its tokens are
-    /// content-keyed (`validity_hash` + `generation`) and so valid for any later
-    /// matching request (see the store-half comment). Contrast the uncancelled
-    /// run in `injection_cache_reuse_matches_uncached_output`, which stores all
-    /// eight regions.
+    /// then drops). A region already inside `process_injection_sync` continues
+    /// polling through nested discovery and highlight collection; if it observes
+    /// cancellation it returns `fully_loaded: false` and is not stored. Contrast
+    /// the uncancelled run in `injection_cache_reuse_matches_uncached_output`,
+    /// which stores all eight regions.
     #[test]
     fn cancelled_token_stores_no_injection_regions() {
         let Some(coordinator) = markdown_lua_coordinator() else {
