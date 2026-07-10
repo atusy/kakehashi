@@ -305,35 +305,48 @@ pub(crate) fn workspace_edit_within_region(
 ///
 /// Plain fenced blocks (all-zero column offsets) are unaffected: every edit is
 /// prefix-safe there, which keeps the common case (whole-block refactors like
-/// organize-imports) working. In a prefixed region, lines PAST the per-line
-/// array (the closing-fence boundary the region end still admits at column 0)
-/// count as prefixed — conservative, since that next host line does carry the
-/// prefix. Callers must REJECT unsafe edits, never clamp — same contract as
-/// [`workspace_edit_within_region`]. Positions ABOVE the region are this
-/// predicate's don't-care (the region bound rejects them).
+/// organize-imports) working. In a prefixed per-line region, the closing-fence
+/// BOUNDARY row (recorded as a trailing zero entry, or falling past the array)
+/// counts as prefixed, and edits touching it are rejected outright — the row's
+/// real prefix is unrecorded, so even a no-newline insertion at its column 0
+/// would land before the `> `. Callers must REJECT unsafe edits, never clamp —
+/// same contract as [`workspace_edit_within_region`]. Positions ABOVE the
+/// region are this predicate's don't-care (the region bound rejects them).
 pub(crate) fn workspace_edit_preserves_line_prefixes(
     edit: &WorkspaceEdit,
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> bool {
-    // Lines past the columns array are NOT known-unprefixed: for a blockquote
-    // the array covers only the CONTENT lines, and the next host line is the
-    // prefixed closing fence (`> ```` ), which the region end (content end,
-    // column 0 of that line) lets an edit reach. Merging or inserting there
-    // must reject too, so in a prefixed region the out-of-array fallback is
-    // "prefixed" — conservative, never corrupting. All-zero regions (plain
-    // fences) keep the permissive fallback.
-    let region_prefixed = offset.columns().iter().any(|&column| column > 0);
+    let columns = offset.columns();
+    // Per-line arrays (the blockquote shape from `compute_line_column_offsets`)
+    // carry one entry per content line PLUS a trailing row where the included
+    // ranges end — column 0 of the closing-fence line. That row's recorded
+    // offset is 0 even though the host line carries the `> ` prefix, and the
+    // region end (content end) admits edits reaching it. So in a prefixed
+    // per-line region, a trailing zero entry and anything past the array count
+    // as the prefixed BOUNDARY. Single-element arrays are the non-blockquote
+    // fallback whose later lines are designed unprefixed (see `RegionOffset`),
+    // so they get no boundary semantics.
+    let content_prefixed = columns.len() > 1 && columns.iter().any(|&column| column > 0);
+    let boundary_at = |host_line: u32| {
+        content_prefixed
+            && host_line.checked_sub(offset.line()).is_some_and(|v| {
+                let v = v as usize;
+                v >= columns.len() - 1 && columns.get(v).copied().unwrap_or(0) == 0
+            })
+    };
     let prefix_at = |host_line: u32| {
-        host_line.checked_sub(offset.line()).is_some_and(|v| {
-            match offset.columns().get(v as usize) {
-                Some(&column) => column > 0,
-                None => region_prefixed,
-            }
-        })
+        boundary_at(host_line)
+            || host_line
+                .checked_sub(offset.line())
+                .is_some_and(|v| offset.column_for_line(v) > 0)
     };
     host_uri_text_edits_all(edit, host_uri, |e| {
         let (start, end) = (e.range.start, e.range.end);
+        // The boundary row's real prefix is unrecorded (0), so the per-line
+        // floor can't protect it: even a same-line, no-newline insertion at
+        // (fence, 0) lands before the `> `. Reject anything touching it.
+        let touches_boundary = boundary_at(start.line) || boundary_at(end.line);
         // end.line at character 0 still counts as spanned — deliberately
         // conservative (REJECT, never clamp): deleting up to (end, 0) removes
         // the previous line's newline and merges the prefixed line upward.
@@ -341,7 +354,7 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
             end.line > start.line && (start.line.saturating_add(1)..=end.line).any(prefix_at);
         let inserts_unprefixed_line = e.new_text.contains(['\n', '\r'])
             && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
-        !spans_prefixed_line && !inserts_unprefixed_line
+        !touches_boundary && !spans_prefixed_line && !inserts_unprefixed_line
     })
 }
 
@@ -675,22 +688,52 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn preserves_line_prefixes_rejects_edit_reaching_the_boundary_of_prefixed_region() {
+    #[rstest::rstest]
+    // The PRODUCTION blockquote shape: included ranges end at column 0 of the
+    // closing-fence line, so `compute_line_column_offsets` leaves a trailing
+    // EXPLICIT zero entry for that row — content on host lines 3-4, fence on
+    // host line 5 recorded as offset 0 despite its real `> ` prefix.
+    #[case::trailing_zero_entry(vec![2, 2, 0], 4, 5)]
+    // Defensive shape: no trailing artifact (content ends mid-line); the
+    // fence line falls PAST the array and must count as prefixed too.
+    #[case::past_the_array(vec![2, 2, 2], 5, 6)]
+    fn preserves_line_prefixes_rejects_edit_reaching_the_boundary_of_prefixed_region(
+        #[case] columns: Vec<u32>,
+        #[case] last_content_line: u32,
+        #[case] fence_line: u32,
+    ) {
         let host_uri = make_host_uri();
-        // Blockquote region, content on host lines 3-5 (`columns` has one entry
-        // per CONTENT line). The line just past the array — host line 6 — is
-        // the closing `> ```` fence line. Content ends with a newline, so the
-        // region end is (6, 0) and edits may legally reach it.
-        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 2]);
-        // "Delete the last line": host (5,2)-(6,0). Applying removes line 5's
-        // newline and merges the PREFIXED fence line up into `> `, yielding
-        // `> > ```` — structural corruption past the columns array. Must be
-        // rejected even though every touched line inside the array is handled.
+        let offset = RegionOffset::with_per_line_offsets(3, columns);
+        // "Delete the last line": ends at (fence_line, 0), which the region
+        // end admits. Applying removes the previous line's newline and merges
+        // the PREFIXED fence line up into `> `, yielding `> > ```` —
+        // structural corruption at the boundary row.
         let edit = parse_workspace_edit(json!({
             "changes": { host_uri.as_str(): [
-                { "range": {"start": {"line": 5, "character": 2}, "end": {"line": 6, "character": 0}},
+                { "range": {"start": {"line": last_content_line, "character": 2},
+                            "end": {"line": fence_line, "character": 0}},
                   "newText": "" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_plain_insertion_on_the_boundary_row() {
+        let host_uri = make_host_uri();
+        // Production blockquote shape: trailing zero entry = the closing-fence
+        // row. A same-line, no-newline insertion at (5, 0) — which the region
+        // end admits and the per-line floor (recorded 0) lets through — would
+        // land BEFORE the fence line's `> `, producing `x> ````. No span, no
+        // newline: only boundary awareness catches it.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 0}},
+                  "newText": "x" }
             ] }
         }));
 
@@ -757,14 +800,13 @@ mod tests {
     #[test]
     fn preserves_line_prefixes_allows_multi_line_edit_over_unprefixed_tail() {
         let host_uri = make_host_uri();
-        // Only virtual line 0 has a column offset; lines 1-2 are KNOWN
-        // unprefixed (explicit zero entries). A multi-line edit starting on
-        // line 0 never deletes a prefix — line 0's offset sits before the
-        // range start, and the spanned lines carry none. (A single-entry
-        // `columns` would leave the tail out-of-array, which in a prefixed
-        // region falls back to "prefixed" and rejects — see the boundary
-        // test.)
-        let offset = RegionOffset::with_per_line_offsets(3, vec![4, 0, 0]);
+        // The PRODUCTION non-blockquote shape (`vec![start_column]`): per the
+        // RegionOffset contract, lines past the first are DESIGNED unprefixed
+        // — a single-element array never means "blockquote", which always
+        // carries one entry per content line plus the trailing boundary row.
+        // A multi-line edit starting on line 0 never deletes a prefix: line
+        // 0's offset sits before the range start, and the tail carries none.
+        let offset = RegionOffset::new(3, 4);
         let edit = parse_workspace_edit(json!({
             "changes": { host_uri.as_str(): [
                 { "range": {"start": {"line": 3, "character": 4}, "end": {"line": 5, "character": 2}},
