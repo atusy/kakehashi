@@ -180,10 +180,12 @@ These methods return edits that must be carefully validated.
 │                                                                 │
 │  CompletionItem {                                               │
 │    label: "HashMap",                                            │
-│    textEdit: { range: ..., newText: "HashMap" },  ──▶ TRANSLATE │
+│    textEdit: { range: ..., newText: "HashMap" },                │
+│      ──▶ VALIDATE (region-safety), then TRANSLATE               │
 │    additionalTextEdits: [                                       │
 │      { range: {0,0}-{0,0}, newText: "use std::...\n" }          │
-│    ]  ─────────────────────────────────────────────▶ TRANSLATE  │
+│    ]  ──▶ VALIDATE as one atomic set: TRANSLATE all, or         │
+│        DROP the whole array if any member is unsafe             │
 │  }                                                              │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
