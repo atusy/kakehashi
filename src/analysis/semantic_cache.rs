@@ -54,6 +54,7 @@ pub struct CachedSemanticTokens {
 pub struct SemanticTokenCache {
     cache: DashMap<Url, CachedSemanticTokens>,
     baselines: DashMap<(Url, String), Arc<SemanticTokens>>,
+    /// Per-document baseline IDs from least to most recently stored or read.
     baseline_order: DashMap<Url, Vec<String>>,
 }
 
@@ -106,6 +107,20 @@ impl SemanticTokenCache {
             let evicted = order.remove(0);
             self.baselines.remove(&(uri.clone(), evicted));
         }
+    }
+
+    fn touch_baseline(&self, uri: &Url, result_id: &str) {
+        let Some(mut order) = self.baseline_order.get_mut(uri) else {
+            return;
+        };
+        let Some(index) = order.iter().position(|id| id == result_id) else {
+            return;
+        };
+        if index + 1 == order.len() {
+            return;
+        }
+        let result_id = order.remove(index);
+        order.push(result_id);
     }
 
     /// Retrieve semantic tokens for a document.
@@ -181,9 +196,14 @@ impl SemanticTokenCache {
         }) {
             return Some(tokens);
         }
-        self.baselines
+        let tokens = self
+            .baselines
             .get(&(uri.clone(), expected_result_id.to_string()))
-            .map(|entry| Arc::clone(&entry))
+            .map(|entry| Arc::clone(&entry));
+        if tokens.is_some() {
+            self.touch_baseline(uri, expected_result_id);
+        }
+        tokens
     }
 
     /// Remove cached tokens for a document (e.g., on document close).
@@ -812,6 +832,41 @@ mod tests {
         assert!(
             cache.get_if_valid(&uri, "new").is_some(),
             "the latest baseline must remain available"
+        );
+    }
+
+    #[test]
+    fn reading_stale_delta_baseline_refreshes_its_eviction_recency() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///baseline-recency.rs").unwrap();
+        let store = |result_id: usize| {
+            cache.store(
+                uri.clone(),
+                SemanticTokens {
+                    result_id: Some(result_id.to_string()),
+                    data: vec![],
+                },
+                "rust".to_string(),
+                result_id as u64,
+                result_id as u64,
+                0,
+            );
+        };
+
+        for result_id in 0..SEMANTIC_BASELINE_HISTORY {
+            store(result_id);
+        }
+        assert!(cache.get_if_valid(&uri, "0").is_some());
+
+        store(SEMANTIC_BASELINE_HISTORY);
+
+        assert!(
+            cache.get_if_valid(&uri, "0").is_some(),
+            "a baseline just reissued to the client must survive the next store"
+        );
+        assert!(
+            cache.get_if_valid(&uri, "1").is_none(),
+            "the least recently used baseline should be evicted instead"
         );
     }
 
