@@ -704,9 +704,7 @@ fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ArchiveFetchError>
     let mut safe = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Normal(part)
-                if !cfg!(windows) || !has_windows_normalization_suffix(part) =>
-            {
+            Component::Normal(part) if !cfg!(windows) || !has_windows_unsafe_component(part) => {
                 safe.push(part);
             }
             Component::CurDir => {}
@@ -721,8 +719,26 @@ fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ArchiveFetchError>
     Ok(safe)
 }
 
-fn has_windows_normalization_suffix(component: &std::ffi::OsStr) -> bool {
-    matches!(component.as_encoded_bytes().last(), Some(b' ' | b'.'))
+fn has_windows_unsafe_component(component: &std::ffi::OsStr) -> bool {
+    if matches!(component.as_encoded_bytes().last(), Some(b' ' | b'.')) {
+        return true;
+    }
+
+    let name = component.to_string_lossy();
+    if name.contains(':') {
+        return true;
+    }
+    let basename = name.split('.').next().unwrap_or_default();
+    if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|reserved| basename.eq_ignore_ascii_case(reserved))
+    {
+        return true;
+    }
+    let bytes = basename.as_bytes();
+    bytes.len() == 4
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
 }
 
 fn escaped_path(path: &Path) -> String {
@@ -1717,21 +1733,36 @@ mod tests {
     }
 
     #[test]
-    fn windows_normalization_suffix_detection_rejects_space_and_dot() {
+    fn windows_component_validation_rejects_aliases_and_devices() {
         use std::ffi::OsStr;
 
-        assert!(has_windows_normalization_suffix(OsStr::new(".. ")));
-        assert!(has_windows_normalization_suffix(OsStr::new("name.")));
-        assert!(!has_windows_normalization_suffix(OsStr::new("name")));
+        for component in [
+            ".. ",
+            "name.",
+            "NUL",
+            "nul.txt",
+            "COM1",
+            "lpt9.log",
+            "file:stream",
+        ] {
+            assert!(
+                has_windows_unsafe_component(OsStr::new(component)),
+                "Windows-unsafe component must be rejected: {component}"
+            );
+        }
+        assert!(!has_windows_unsafe_component(OsStr::new("name")));
+        assert!(!has_windows_unsafe_component(OsStr::new("COM10")));
     }
 
     #[cfg(windows)]
     #[test]
     fn archive_relative_paths_reject_windows_normalization_aliases() {
-        assert!(matches!(
-            safe_archive_relative_path(Path::new(".. /.. /parser.c")),
-            Err(ArchiveFetchError::Unsafe(_))
-        ));
+        for path in [".. /.. /parser.c", "NUL/parser.c", "src/parser.c:stream"] {
+            assert!(matches!(
+                safe_archive_relative_path(Path::new(path)),
+                Err(ArchiveFetchError::Unsafe(_))
+            ));
+        }
     }
 
     #[test]
