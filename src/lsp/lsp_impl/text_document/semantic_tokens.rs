@@ -1099,6 +1099,7 @@ impl Kakehashi {
             self.cache
                 .get_current_range_tokens(&uri, &domain_range, &language_name, cache_key)
         {
+            let tokens = (*tokens).clone();
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
             let current = self.cache.semantic_token_generation() == generation
@@ -1109,7 +1110,7 @@ impl Kakehashi {
             if !current {
                 return Err(crate::error::content_modified_error());
             }
-            return Ok(Some(SemanticTokensRangeResult::Tokens((*tokens).clone())));
+            return Ok(Some(SemanticTokensRangeResult::Tokens(tokens)));
         }
 
         // A previous full/delta request, or an earlier range miss below, may have
@@ -1121,6 +1122,7 @@ impl Kakehashi {
             .get_current_tokens(&uri, &language_name, cache_key)
         {
             let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
+            let response_tokens = range_tokens.clone();
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
             let current = self.cache.semantic_token_generation() == generation
@@ -1135,10 +1137,10 @@ impl Kakehashi {
                 uri,
                 domain_range,
                 language_name,
-                range_tokens.clone(),
+                range_tokens,
                 cache_key,
             );
-            return Ok(Some(SemanticTokensRangeResult::Tokens(range_tokens)));
+            return Ok(Some(SemanticTokensRangeResult::Tokens(response_tokens)));
         }
 
         // Get capture mappings for token type resolution
@@ -1162,6 +1164,32 @@ impl Kakehashi {
         )
         .await;
 
+        // Shape immutable payloads before taking the edit lock. Only the final
+        // live-snapshot validation and cache commits need to exclude edits.
+        let (domain_range_result, tokens_to_store) = match result {
+            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(mut full_tokens)) => {
+                full_tokens.result_id = Some(next_result_id());
+                let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
+                let response = tower_lsp_server::ls_types::SemanticTokensRangeResult::from(
+                    range_tokens.clone(),
+                );
+                (response, Some((full_tokens, range_tokens)))
+            }
+            Some(tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial)) => (
+                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial),
+                None,
+            ),
+            None => (
+                tower_lsp_server::ls_types::SemanticTokensRangeResult::Tokens(
+                    tower_lsp_server::ls_types::SemanticTokens {
+                        result_id: None,
+                        data: Vec::new(),
+                    },
+                ),
+                None,
+            ),
+        };
+
         // A range is authored against one live document lifetime. A close,
         // reopen, or edit during the uncancellable full-document compute makes
         // both its response coordinates and any cache store obsolete.
@@ -1176,45 +1204,24 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
-        // Convert the computed full result to RangeResult. Cache ONLY a clean
-        // `Tokens` result (#535); a `Partial` is passed through to the client as-is
-        // but NOT cached (it is a degraded response), and a `None` becomes an empty
-        // `Tokens` and is not cached either (transient miss/cancel) — caching
-        // either could serve a degraded set on a later identical-viewport
-        // re-request.
-        let domain_range_result = match result {
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(mut full_tokens)) => {
-                // Store the full result too: a range miss already paid the whole
-                // full-tokenization cost, and subsequent scrolled viewports can
-                // cheaply filter this cache entry instead of recomputing.
-                full_tokens.result_id = Some(next_result_id());
-                let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
-                self.cache.store_tokens(
-                    uri.clone(),
-                    full_tokens,
-                    language_name.clone(),
-                    cache_key,
-                    snapshot_identity,
-                );
-                self.cache.store_range_tokens(
-                    uri,
-                    domain_range,
-                    language_name,
-                    range_tokens.clone(),
-                    cache_key,
-                );
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(range_tokens)
-            }
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial)) => {
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial)
-            }
-            None => tower_lsp_server::ls_types::SemanticTokensRangeResult::Tokens(
-                tower_lsp_server::ls_types::SemanticTokens {
-                    result_id: None,
-                    data: Vec::new(),
-                },
-            ),
-        };
+        // Cache ONLY a clean `Tokens` result (#535). Partial/None responses are
+        // degraded or transient and must not become reusable cache entries.
+        if let Some((full_tokens, range_tokens)) = tokens_to_store {
+            self.cache.store_tokens(
+                uri.clone(),
+                full_tokens,
+                language_name.clone(),
+                cache_key,
+                snapshot_identity,
+            );
+            self.cache.store_range_tokens(
+                uri,
+                domain_range,
+                language_name,
+                range_tokens,
+                cache_key,
+            );
+        }
 
         Ok(Some(domain_range_result))
     }
