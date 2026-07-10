@@ -459,10 +459,14 @@ required follow-on work, not something the bounded pool delivers on its own.
 *superseded* compute: Rayon does not preempt, and dropping the `oneshot`-bridged
 future leaves the work-unit running to completion — wasting a pool thread that is
 now scarcer than the process-global Rayon pool it replaces. The merged `CancelToken`
-(`src/cancel.rs`: an `Arc<AtomicBool>` flipped by `SemanticRequestTracker` on
-supersede, `$/cancelRequest`, or `didClose`, which the compute polls at coarse
-checkpoints — the injection discovery loop and the per-region fan-out — and bails)
-closes exactly that gap. It **composes with** this design rather than competing, so
+(`src/cancel.rs`) closes exactly that gap. Semantic tokens flip it through
+`SemanticRequestTracker` on supersede, `$/cancelRequest`, or `didClose`; captures
+full/delta attach it to the single-flight marker tagged by
+`(incarnation, generation, parsed_version)`, join identical work, and atomically
+replace + cancel only an older tag (also cancelling on `$/cancelRequest`, handler
+drop, or `didClose`). Their compute loops poll the token at coarse checkpoints and
+bail without caching a partial or obsolete result. It **composes with** this design
+rather than competing, so
 it is carried forward, not re-derived: the token is an architecture-independent
 primitive, **re-homed at Stage 1 as a cancellation hook on the bounded-pool work-unit (the `oneshot` bridge) contract**. Keep the split explicit — §2's terminal
 `SnapshotSlot` + incarnation rejection guarantees *correctness* on close/supersede

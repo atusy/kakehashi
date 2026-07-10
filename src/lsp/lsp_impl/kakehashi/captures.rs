@@ -209,6 +209,86 @@ pub(in crate::lsp::lsp_impl) struct CachedCapturesWalk {
 pub(in crate::lsp::lsp_impl) type WalkArrays =
     (std::sync::Arc<Vec<Value>>, std::sync::Arc<Vec<Value>>);
 
+/// Identity and freshness of one full-mode captures walk. Field order is the
+/// supersession order: a reopened document beats every prior lifetime, a
+/// settings generation beats prior query assets, then a newer parse snapshot
+/// beats an older one within that generation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(in crate::lsp::lsp_impl) struct CapturesWalkTag {
+    incarnation: u64,
+    generation: u64,
+    parsed_version: u64,
+}
+
+/// Shared state for the winner and same-snapshot losers of one captures walk.
+pub(in crate::lsp::lsp_impl) struct CapturesWalkFlight {
+    tag: CapturesWalkTag,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+    cancel: crate::cancel::CancelToken,
+}
+
+impl CapturesWalkFlight {
+    fn new(tag: CapturesWalkTag, cancel: crate::cancel::CancelToken) -> Self {
+        Self {
+            tag,
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            cancel,
+        }
+    }
+
+    pub(in crate::lsp::lsp_impl) fn cancel_and_notify(&self) {
+        self.cancel.cancel();
+        self.notify.notify_waiters();
+    }
+}
+
+enum WalkFlightClaim {
+    Winner(std::sync::Arc<CapturesWalkFlight>),
+    Join(std::sync::Arc<CapturesWalkFlight>),
+    Obsolete,
+}
+
+fn claim_walk_flight(
+    map: &dashmap::DashMap<(Url, String, bool), std::sync::Arc<CapturesWalkFlight>>,
+    key: &(Url, String, bool),
+    tag: CapturesWalkTag,
+    cancel: crate::cancel::CancelToken,
+) -> WalkFlightClaim {
+    // Avoid cloning the owned key on the same-snapshot loser path.
+    if let Some(current) = map.get(key) {
+        match tag.cmp(&current.tag) {
+            std::cmp::Ordering::Equal => {
+                return WalkFlightClaim::Join(std::sync::Arc::clone(&current));
+            }
+            std::cmp::Ordering::Less => return WalkFlightClaim::Obsolete,
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
+    match map.entry(key.clone()) {
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            let flight = std::sync::Arc::new(CapturesWalkFlight::new(tag, cancel));
+            vacant.insert(std::sync::Arc::clone(&flight));
+            WalkFlightClaim::Winner(flight)
+        }
+        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+            match tag.cmp(&occupied.get().tag) {
+                std::cmp::Ordering::Equal => {
+                    WalkFlightClaim::Join(std::sync::Arc::clone(occupied.get()))
+                }
+                std::cmp::Ordering::Less => WalkFlightClaim::Obsolete,
+                std::cmp::Ordering::Greater => {
+                    let previous = std::sync::Arc::clone(occupied.get());
+                    let flight = std::sync::Arc::new(CapturesWalkFlight::new(tag, cancel));
+                    occupied.insert(std::sync::Arc::clone(&flight));
+                    previous.cancel_and_notify();
+                    WalkFlightClaim::Winner(flight)
+                }
+            }
+        }
+    }
+}
+
 /// Winner-side handle of the single-flight captures walk: holds the
 /// in-flight marker for one `(uri, kind, injection)` and, on drop (every
 /// exit path — success, cancel, panic-unwind), removes it and wakes the
@@ -216,17 +296,20 @@ pub(in crate::lsp::lsp_impl) type WalkArrays =
 /// `remove_if` with pointer equality so a slow winner can never evict a
 /// successor's marker.
 struct WalkFlightGuard<'a> {
-    map: &'a dashmap::DashMap<(Url, String, bool), std::sync::Arc<tokio::sync::Notify>>,
+    map: &'a dashmap::DashMap<(Url, String, bool), std::sync::Arc<CapturesWalkFlight>>,
     key: (Url, String, bool),
-    notify: std::sync::Arc<tokio::sync::Notify>,
+    flight: std::sync::Arc<CapturesWalkFlight>,
 }
 
 impl Drop for WalkFlightGuard<'_> {
     fn drop(&mut self) {
+        // Also covers wholesale handler-future drops: a detached compute-pool
+        // unit observes the same token and stops at its next checkpoint.
+        self.flight.cancel.cancel();
         self.map.remove_if(&self.key, |_, current| {
-            std::sync::Arc::ptr_eq(current, &self.notify)
+            std::sync::Arc::ptr_eq(current, &self.flight)
         });
-        self.notify.notify_waiters();
+        self.flight.notify.notify_waiters();
     }
 }
 
@@ -447,6 +530,17 @@ pub enum CapturesDeltaResponse {
 }
 
 impl Kakehashi {
+    pub(in crate::lsp::lsp_impl) fn cancel_captures_walks_for_document(&self, uri: &Url) {
+        self.captures_walk_inflight.retain(|key, flight| {
+            if key.0 == *uri {
+                flight.cancel_and_notify();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// Handler for `kakehashi/captures/full`.
     pub async fn kakehashi_captures_full(
         &self,
@@ -726,10 +820,9 @@ impl Kakehashi {
         // (`layer_trees.get_or_init`) deliberately ignores cancel — its result
         // is shared by every subsequent walk on the snapshot via OnceLock, and
         // a cancelled partial build must never be cached, so it runs at most
-        // once per snapshot to completion; (b) the token's only cancel source
-        // is the select arm below — if this handler future is dropped wholesale
-        // (client disconnect / service teardown) a walk already dequeued runs
-        // to completion once, bounded by the walk itself.
+        // once per snapshot to completion. The token is flipped by an explicit
+        // client cancel, a fresher snapshot replacing this flight, didClose,
+        // or the winner guard dropping with its handler future.
         let upstream_id = crate::lsp::current_upstream_id();
         let (mut cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let cancel_token = crate::cancel::CancelToken::default();
@@ -861,14 +954,19 @@ impl Kakehashi {
         // a `null` outcome as a negative entry — so the no-kind-file case
         // can't convoy the losers into sequential identical walks. The 1s
         // re-loop timeout is a lost-wakeup backstop only — correctness never
-        // depends on it. Accepted dedup gap: each request resolves its
-        // snapshot BEFORE this loop, so a loser whose wake finds the memo
-        // tagged one publish newer than its own snapshot misses and re-walks
-        // — correct (the lineage gate voids nothing), just less deduped
-        // exactly under burst load.
+        // depends on it. A request for a fresher snapshot atomically replaces
+        // the marker and cancels the old winner; same-snapshot full/delta
+        // requests still join it, while an older request that reaches the map
+        // after the replacement answers RequestCancelled instead of reviving
+        // obsolete compute.
         let mut flight_guard = None;
         let walk_key = if lsp_range.is_none() {
             let key = (uri.clone(), kind.to_string(), injection);
+            let walk_tag = CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: snapshot.parsed_version,
+            };
             loop {
                 if let Some(hit) = self.captures_walk_cache.get(&key)
                     && hit.parsed_version == snapshot.parsed_version
@@ -889,64 +987,55 @@ impl Kakehashi {
                             skipped,
                         }));
                 }
-                // `get` before `entry`: the loser path (marker present) is
-                // the one taken repeatedly under a burst, and `entry` would
-                // clone the (Url, String) key just to find it occupied. Only
-                // a would-be winner pays the owned-key clone.
-                let notify = if let Some(current) = self.captures_walk_inflight.get(&key) {
-                    std::sync::Arc::clone(&current)
-                } else {
-                    match self.captures_walk_inflight.entry(key.clone()) {
-                        dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                            // Re-check the memo before claiming winnership: a
-                            // concurrent winner may have stored its result and
-                            // dropped its marker between the memo check at the
-                            // top of the loop and this claim — claiming here
-                            // would re-run the identical walk right past its
-                            // fresh result. (Ordering is inflight-shard →
-                            // memo-shard; no path acquires them in reverse.)
-                            if let Some(hit) = self.captures_walk_cache.get(&key)
-                                && hit.parsed_version == snapshot.parsed_version
-                                && hit.incarnation == incarnation
-                                && hit.generation == generation
-                            {
-                                let result = hit.result.clone();
-                                drop(hit);
-                                return Ok(result.map(|(matches, skipped)| ComputedCaptures {
-                                    uri,
-                                    incarnation,
-                                    entry_content_version,
-                                    matches,
-                                    skipped,
-                                }));
-                            }
-                            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-                            vacant.insert(std::sync::Arc::clone(&notify));
-                            flight_guard = Some(WalkFlightGuard {
-                                map: &self.captures_walk_inflight,
-                                key: key.clone(),
-                                notify,
-                            });
-                            break;
+                let flight = match claim_walk_flight(
+                    &self.captures_walk_inflight,
+                    &key,
+                    walk_tag,
+                    cancel_token.clone(),
+                ) {
+                    WalkFlightClaim::Winner(flight) => {
+                        flight_guard = Some(WalkFlightGuard {
+                            map: &self.captures_walk_inflight,
+                            key: key.clone(),
+                            flight,
+                        });
+                        // A prior winner can store its memo and remove its
+                        // marker between the loop's memo read and our claim.
+                        // Re-check after claiming so this successor does not
+                        // repeat an already-completed identical walk.
+                        if let Some(hit) = self.captures_walk_cache.get(&key)
+                            && hit.parsed_version == snapshot.parsed_version
+                            && hit.incarnation == incarnation
+                            && hit.generation == generation
+                        {
+                            let result = hit.result.clone();
+                            drop(hit);
+                            return Ok(result.map(|(matches, skipped)| ComputedCaptures {
+                                uri,
+                                incarnation,
+                                entry_content_version,
+                                matches,
+                                skipped,
+                            }));
                         }
-                        // A racing winner claimed the marker between the get
-                        // and the entry: park on it like any loser.
-                        dashmap::mapref::entry::Entry::Occupied(occupied) => {
-                            std::sync::Arc::clone(occupied.get())
-                        }
+                        break;
+                    }
+                    WalkFlightClaim::Join(flight) => flight,
+                    WalkFlightClaim::Obsolete => {
+                        return Err(JsonRpcError::request_cancelled());
                     }
                 };
                 // Register interest BEFORE re-validating the marker: enable()
                 // makes a notify_waiters() between here and the await visible,
                 // and the marker re-check catches a winner that exited before
                 // we registered (its notify_waiters preceded our enable).
-                let notified = notify.notified();
+                let notified = flight.notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 let winner_live = self
                     .captures_walk_inflight
                     .get(&key)
-                    .is_some_and(|current| std::sync::Arc::ptr_eq(&*current, &notify));
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(&*current, &flight));
                 if winner_live {
                     match cancel_rx.as_mut() {
                         Some(rx) => {
@@ -1097,6 +1186,8 @@ impl Kakehashi {
             });
         let walked = if let Some(cancel_rx) = cancel_rx {
             tokio::pin!(cancel_rx);
+            let superseded = walk_cancel.cancelled();
+            tokio::pin!(superseded);
             tokio::select! {
                 biased;
                 // $/cancelRequest while queued/walking: flip the token so a
@@ -1108,10 +1199,18 @@ impl Kakehashi {
                     walk_cancel.cancel();
                     return Err(JsonRpcError::request_cancelled());
                 }
+                _ = &mut superseded => {
+                    return Err(JsonRpcError::request_cancelled());
+                }
                 walked = walk_future => walked,
             }
         } else {
-            walk_future.await
+            tokio::select! {
+                _ = walk_cancel.cancelled() => {
+                    return Err(JsonRpcError::request_cancelled());
+                }
+                walked = walk_future => walked,
+            }
         };
         let Some(walked) = walked else {
             // A pool-skip of an already-cancelled unit (or a work-unit panic).
@@ -1120,13 +1219,8 @@ impl Kakehashi {
             }
             return Ok(None);
         };
-        // Forward-looking guard, unreachable today: the only current writer of
-        // this token is the `cancel_rx` select arm above, which returns
-        // instead of falling through. It stays because the token is designed
-        // to gain writers (captures supersession would flip it the way
-        // `SemanticRequestTracker` flips the token handlers'), and a completed
-        // walk raced by its own cancellation must never be cached or served —
-        // the client already discarded this request.
+        // A completed walk can race a fresher flight or didClose after its last
+        // internal checkpoint. Never cache or serve that obsolete result.
         if walk_cancel.is_cancelled() {
             return Err(JsonRpcError::request_cancelled());
         }
@@ -1853,11 +1947,19 @@ mod tests {
 
         // Simulate a winner already walking this key.
         let key = (uri.clone(), "highlights".to_string(), false);
-        let winner_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let winner_flight = std::sync::Arc::new(CapturesWalkFlight::new(
+            CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: 0,
+            },
+            crate::cancel::CancelToken::default(),
+        ));
+        let winner_notify = std::sync::Arc::clone(&winner_flight.notify);
         service
             .inner()
             .captures_walk_inflight
-            .insert(key.clone(), std::sync::Arc::clone(&winner_notify));
+            .insert(key.clone(), winner_flight);
 
         let request = {
             let service = std::sync::Arc::clone(&service);
@@ -1909,6 +2011,133 @@ mod tests {
             result.matches[0], sentinel,
             "the loser must serve the winner's memo, not run its own walk"
         );
+    }
+
+    #[test]
+    fn newer_snapshot_cancels_older_captures_flight() {
+        let flights = dashmap::DashMap::new();
+        let uri = Url::parse("file:///captures_supersede.rs").expect("valid test uri");
+        let key = (uri, "highlights".to_string(), false);
+        let old_cancel = crate::cancel::CancelToken::default();
+        let old_flight = std::sync::Arc::new(CapturesWalkFlight::new(
+            CapturesWalkTag {
+                incarnation: 1,
+                generation: 4,
+                parsed_version: 0,
+            },
+            old_cancel.clone(),
+        ));
+        flights.insert(key.clone(), std::sync::Arc::clone(&old_flight));
+        let old_guard = WalkFlightGuard {
+            map: &flights,
+            key: key.clone(),
+            flight: old_flight,
+        };
+
+        let new_cancel = crate::cancel::CancelToken::default();
+        let new_tag = CapturesWalkTag {
+            incarnation: 1,
+            generation: 4,
+            parsed_version: 1,
+        };
+        let WalkFlightClaim::Winner(new_flight) =
+            claim_walk_flight(&flights, &key, new_tag, new_cancel.clone())
+        else {
+            panic!("the newer snapshot must become the winner");
+        };
+
+        assert!(
+            old_cancel.is_cancelled(),
+            "a current-snapshot request must stop the obsolete walk"
+        );
+        assert!(!new_cancel.is_cancelled());
+        drop(old_guard);
+        assert!(
+            flights
+                .get(&key)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &new_flight)),
+            "the old guard must not remove the atomically installed successor"
+        );
+
+        let WalkFlightClaim::Join(joined) = claim_walk_flight(
+            &flights,
+            &key,
+            new_tag,
+            crate::cancel::CancelToken::default(),
+        ) else {
+            panic!("an identical snapshot must join the winner");
+        };
+        assert!(std::sync::Arc::ptr_eq(&joined, &new_flight));
+
+        let older = CapturesWalkTag {
+            parsed_version: 0,
+            ..new_tag
+        };
+        assert!(matches!(
+            claim_walk_flight(&flights, &key, older, crate::cancel::CancelToken::default()),
+            WalkFlightClaim::Obsolete
+        ));
+        assert!(
+            !new_cancel.is_cancelled(),
+            "an obsolete requester must not cancel the newer winner"
+        );
+
+        let reopened_cancel = crate::cancel::CancelToken::default();
+        let reopened_tag = CapturesWalkTag {
+            incarnation: 2,
+            generation: 4,
+            parsed_version: 0,
+        };
+        assert!(matches!(
+            claim_walk_flight(&flights, &key, reopened_tag, reopened_cancel.clone()),
+            WalkFlightClaim::Winner(_)
+        ));
+        assert!(
+            new_cancel.is_cancelled(),
+            "a reopened document must supersede the prior lifetime despite version reset"
+        );
+        assert!(!reopened_cancel.is_cancelled());
+    }
+
+    #[test]
+    fn document_close_cancels_only_its_captures_flights() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let closed_uri = Url::parse("file:///captures-close.rs").expect("valid test uri");
+        let live_uri = Url::parse("file:///captures-live.rs").expect("valid test uri");
+        let tag = CapturesWalkTag {
+            incarnation: 1,
+            generation: 0,
+            parsed_version: 0,
+        };
+        let closed_cancel = crate::cancel::CancelToken::default();
+        let live_cancel = crate::cancel::CancelToken::default();
+        service.inner().captures_walk_inflight.insert(
+            (closed_uri.clone(), "highlights".to_string(), false),
+            std::sync::Arc::new(CapturesWalkFlight::new(tag, closed_cancel.clone())),
+        );
+        service.inner().captures_walk_inflight.insert(
+            (live_uri.clone(), "highlights".to_string(), false),
+            std::sync::Arc::new(CapturesWalkFlight::new(tag, live_cancel.clone())),
+        );
+
+        service
+            .inner()
+            .cancel_captures_walks_for_document(&closed_uri);
+
+        assert!(closed_cancel.is_cancelled());
+        assert!(!live_cancel.is_cancelled());
+        assert!(
+            service
+                .inner()
+                .captures_walk_inflight
+                .iter()
+                .all(|entry| entry.key().0 != closed_uri)
+        );
+        assert!(service.inner().captures_walk_inflight.contains_key(&(
+            live_uri,
+            "highlights".to_string(),
+            false
+        )));
     }
 
     /// A `$/cancelRequest` arriving while the handler is parked on a trailing

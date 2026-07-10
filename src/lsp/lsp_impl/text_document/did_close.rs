@@ -37,6 +37,7 @@ impl Kakehashi {
             // full again", never to stale data.)
             self.captures_cache.retain(|key, _| key.0 != uri);
             self.captures_walk_cache.retain(|key, _| key.0 != uri);
+            self.cancel_captures_walks_for_document(&uri);
             self.documents.remove(&uri);
             // AFTER the document removal, deliberately: the match cache's
             // store paths use an insert-then-verify handshake against this
