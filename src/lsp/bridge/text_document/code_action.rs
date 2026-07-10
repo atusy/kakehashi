@@ -1528,14 +1528,14 @@ fn disable_action(
         // No title in the log: titles are downstream-controlled free text.
         log::debug!(
             target: "kakehashi::bridge",
-            "codeAction from {server_name} dropped ({reason}); the client \
+            "codeAction from {server_name:?} dropped ({reason}); the client \
              lacks disabledSupport to show it disabled"
         );
         return None;
     }
     log::debug!(
         target: "kakehashi::bridge",
-        "codeAction from {server_name} disabled: {reason}"
+        "codeAction from {server_name:?} disabled: {reason}"
     );
     action.title = suffix_title(action.title, server_name);
     action.edit = None;

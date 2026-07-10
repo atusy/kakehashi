@@ -1243,7 +1243,7 @@ fn spawn_upstream_request(
                         // invisible on the kakehashi side.
                         log::warn!(
                             target: "kakehashi::bridge",
-                            "workspace/applyEdit rejected locally: {failure_reason}"
+                            "workspace/applyEdit rejected locally: {failure_reason:?}"
                         );
                         ApplyWorkspaceEditResponse {
                             applied: false,
