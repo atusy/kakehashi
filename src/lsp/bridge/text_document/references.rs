@@ -96,10 +96,10 @@ impl LanguageServerPool {
 /// keep real-file URIs, translate matches on the request's virtual URI, drop
 /// other virtual URIs (cross-region offsets are unsafe). `Ok(Some(vec))` may
 /// be empty — an empty array from the server is preserved as-is, while
-/// `Ok(None)` covers everything the server did not answer with an array: a
-/// JSON-RPC error response, a `null` result, or a missing `result` field. A
-/// malformed success response is a protocol violation and returns `Err`,
-/// letting callers surface a warning.
+/// `Ok(None)` covers the answers the protocol allows that carry no array: a
+/// JSON-RPC error response or a `null` result. Protocol violations — a
+/// response with neither `result` nor `error`, or a result that is not
+/// `Location[] | null` — return `Err`, letting callers surface a warning.
 fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
