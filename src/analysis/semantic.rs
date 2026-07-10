@@ -419,10 +419,10 @@ mod tests {
         );
     }
 
-    /// When lines are inserted, tokens at the end have the same delta encoding
-    /// but are at different absolute positions, so they must not match as suffix.
+    /// When lines are inserted, unchanged encoded suffix tokens can remain in
+    /// place because semantic-token edits address the flattened wire array.
     #[test]
-    fn test_diff_tokens_line_insertion_no_suffix() {
+    fn test_diff_tokens_line_insertion_retains_encoded_suffix() {
         // Before: 3 tokens on lines 0, 1, 2
         let previous = SemanticTokens {
             result_id: Some("v1".to_string()),
@@ -492,25 +492,22 @@ mod tests {
         let delta = delta.unwrap();
         assert_eq!(delta.edits.len(), 1);
 
-        // The last two tokens in current have SAME delta encoding as last two in previous,
-        // but they're at DIFFERENT absolute positions (line 2,3 vs line 1,2).
-        // Suffix optimization MUST be disabled.
+        // The last two tokens have the same encoded fields, so the wire edit can
+        // retain them even though their decoded absolute lines have shifted.
         let edit = &delta.edits[0];
         // LSP spec: start and deleteCount are integer indices (each token = 5 integers)
         assert_eq!(
             edit.start, 5,
             "Should skip 1 prefix token (line 0) = 5 integers"
         );
-        // Without suffix: delete_count=2 (tokens at line 1,2), data=3 tokens
-        // With incorrect suffix: would wrongly match last token
         assert_eq!(
-            edit.delete_count, 10,
-            "Should delete 2 original tokens after prefix = 10 integers"
+            edit.delete_count, 0,
+            "Should retain both encoded suffix tokens"
         );
         assert_eq!(
             edit.data.as_ref().unwrap().len(),
-            3,
-            "Should include 3 new tokens"
+            1,
+            "Should include only the inserted token"
         );
     }
 

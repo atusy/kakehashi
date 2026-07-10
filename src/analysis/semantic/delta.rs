@@ -32,9 +32,6 @@ pub(super) fn tokens_equal(a: &SemanticToken, b: &SemanticToken) -> bool {
 }
 
 /// Calculate delta between two sets of semantic tokens using prefix-suffix matching.
-///
-/// Suffix matching is disabled when total line deltas differ, since tokens with
-/// identical delta encoding would be at different absolute positions.
 pub(super) fn calculate_semantic_tokens_delta(
     previous: &SemanticTokens,
     current: &SemanticTokens,
@@ -55,27 +52,15 @@ pub(super) fn calculate_semantic_tokens_delta(
         });
     }
 
-    // --- Step 2: Find common suffix (with line change safety) ---
+    // --- Step 2: Find common suffix ---
     let prev_suffix = &previous.data[common_prefix_len..];
     let curr_suffix = &current.data[common_prefix_len..];
-
-    // When line count changes, identical delta encoding maps to different absolute
-    // positions, so suffix matching is unsafe.
-    let prev_total_lines: u32 = previous.data.iter().map(|t| t.delta_line).sum();
-    let curr_total_lines: u32 = current.data.iter().map(|t| t.delta_line).sum();
-
-    let common_suffix_len = if prev_total_lines != curr_total_lines {
-        // Line count changed - disable suffix optimization
-        0
-    } else {
-        // Safe to find matching suffix
-        prev_suffix
-            .iter()
-            .rev()
-            .zip(curr_suffix.iter().rev())
-            .take_while(|(a, b)| tokens_equal(a, b))
-            .count()
-    };
+    let common_suffix_len = prev_suffix
+        .iter()
+        .rev()
+        .zip(curr_suffix.iter().rev())
+        .take_while(|(a, b)| tokens_equal(a, b))
+        .count();
 
     // --- Step 3: Calculate the edit ---
     // LSP spec requires start and deleteCount to be integer indices into the
@@ -194,5 +179,53 @@ mod tests {
 
         let delta = delta.unwrap();
         assert_eq!(delta.edits.len(), 0);
+    }
+
+    #[test]
+    fn line_shift_retains_unchanged_encoded_suffix() {
+        let token = |delta_line| SemanticToken {
+            delta_line,
+            delta_start: 0,
+            length: 1,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        };
+        let previous = SemanticTokens {
+            result_id: Some("v1".to_string()),
+            data: vec![token(0), token(10), token(1)],
+        };
+        let current = SemanticTokens {
+            result_id: Some("v2".to_string()),
+            data: vec![token(0), token(12), token(1)],
+        };
+
+        let delta = calculate_semantic_tokens_delta(&previous, &current).unwrap();
+        let edit = &delta.edits[0];
+
+        assert_eq!(edit.start, 5);
+        assert_eq!(edit.delete_count, 5);
+        assert_eq!(edit.data.as_ref().map(Vec::len), Some(1));
+
+        let flatten = |tokens: &[SemanticToken]| {
+            tokens
+                .iter()
+                .flat_map(|t| {
+                    [
+                        t.delta_line,
+                        t.delta_start,
+                        t.length,
+                        t.token_type,
+                        t.token_modifiers_bitset,
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut reconstructed = flatten(&previous.data);
+        let replacement = flatten(edit.data.as_deref().unwrap_or_default());
+        reconstructed.splice(
+            edit.start as usize..(edit.start + edit.delete_count) as usize,
+            replacement,
+        );
+        assert_eq!(reconstructed, flatten(&current.data));
     }
 }
