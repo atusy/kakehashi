@@ -46,8 +46,8 @@ The packing combines three techniques: a **columnar layout** (transpose the arra
 ```jsonc
 // verbose: array-of-objects — keys + strings repeat every capture
 [ { "name": "keyword", "range": {…} }, { "name": "keyword", "range": {…} }, … ]
-// packed: columnar arrays + interned names + flat int ranges
-{ "name": [0, 0, …], "range": [10,4,10,11, 12,0,12,6, …] }  // 0 → legend.names[0] == "keyword"
+// packed: columnar arrays + match grouping + interned names + flat int ranges
+{ "name": [0, 0, …], "matchId": [0, 0, …], "range": [10,4,10,11, 12,0,12,6, …] }  // 0 → legend.names[0] == "keyword"
 ```
 
 The method family:
@@ -94,6 +94,7 @@ type Legend = {
 type MatchColumns = {
   patternIndex: number[];      // parallel arrays, index = match index
   language: number[];          // index into legend.languages
+  [column: string]: unknown[];  // OPEN: future columns are additive
 };
 
 type CaptureColumns = {
@@ -101,10 +102,13 @@ type CaptureColumns = {
   matchId: number[];           // index into MatchColumns — restores grouping, 1 int/capture
   range: number[];             // FLAT, 4 ints/capture: [startLine, startChar, endLine, endChar]
                                // absolute (UTF-16), NOT delta-encoded (see Delta semantics)
+  [column: string]: unknown[];  // OPEN: future columns are additive
 };
 
 type MetadataTable = {
   // Sparse: only matches/captures that carry #set! appear. Absent field => none.
+  // JSON object keys are strings on the wire; numeric indices are written as
+  // decimal string property names such as "0" and "42".
   match?:   { [matchIndex: number]:   Metadata };
   capture?: { [captureIndex: number]: Metadata };
 };
