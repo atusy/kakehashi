@@ -1,7 +1,7 @@
 //! Virtual→host translation for inbound `window/showDocument` requests.
 //!
 //! A bridged downstream server only knows the *virtual* document it was handed
-//! (one per injected region), so a `window/showDocument` it issues carries a
+//! (one per isolated region or combined group), so a `window/showDocument` carries a
 //! virtual URI and a `selection` in virtual coordinates. Before the bridge
 //! forwards the request to the editor, [`ShowDocumentTranslator`] rewrites the
 //! URI back to the host document and the selection back to host coordinates —
