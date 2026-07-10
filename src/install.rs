@@ -282,7 +282,6 @@ fn install_language_blocking_with_query_installer(
     if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
         let reason = e.to_string();
         result.queries_error = Some(reason);
-        return result;
     }
 
     // Install parser
@@ -698,7 +697,11 @@ mod tests {
 
         assert!(
             result.parser_error.is_none(),
-            "parser install was never attempted, so tombstone cleanup must not be reported as a parser error"
+            "tombstone cleanup must not be reported as a parser error"
+        );
+        assert!(
+            result.parser_path.is_some(),
+            "query tombstone cleanup failures must not prevent parser installation"
         );
         assert!(result.queries_error.is_some());
     }
