@@ -34,6 +34,9 @@ static QUERY_TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub enum QueryInstallError {
     /// The language is not supported (queries don't exist in nvim-treesitter).
     LanguageNotSupported(String),
+    /// The language name is not a valid path/URL segment (see
+    /// [`is_safe_language_name`]) — invalid input, not a missing upstream.
+    InvalidLanguageName(String),
     /// HTTP request failed.
     HttpError(String),
     /// HTTP response returned a structured non-success status code.
@@ -53,6 +56,13 @@ impl std::fmt::Display for QueryInstallError {
                 write!(
                     f,
                     "Language '{}' is not supported or queries not found in nvim-treesitter",
+                    lang
+                )
+            }
+            Self::InvalidLanguageName(lang) => {
+                write!(
+                    f,
+                    "Invalid language name '{}' (allowed: lowercase ASCII letters, digits, underscore)",
                     lang
                 )
             }
@@ -106,7 +116,7 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
     if is_safe_language_name(language) {
         Ok(())
     } else {
-        Err(QueryInstallError::LanguageNotSupported(
+        Err(QueryInstallError::InvalidLanguageName(
             language.escape_default().to_string(),
         ))
     }
@@ -524,8 +534,10 @@ pub fn remove_query_install_and_backups(
         removal.removed_queries = true;
     }
 
-    let entries = fs::read_dir(queries_parent)?;
-    for entry in entries.flatten() {
+    // Propagate per-entry read_dir errors: uninstall must not report success
+    // while backups it could not even enumerate stay behind.
+    for entry in fs::read_dir(queries_parent)? {
+        let entry = entry?;
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -1002,14 +1014,14 @@ mod tests {
             false,
         );
         match result {
-            Err(QueryInstallError::LanguageNotSupported(name)) => {
+            Err(QueryInstallError::InvalidLanguageName(name)) => {
                 assert!(
                     !name.contains('\u{1b}'),
                     "stored name must not carry raw escape bytes: {:?}",
                     name
                 );
             }
-            other => panic!("expected LanguageNotSupported, got {:?}", other.err()),
+            other => panic!("expected InvalidLanguageName, got {:?}", other.err()),
         }
     }
 
@@ -1035,7 +1047,7 @@ mod tests {
         let result = clear_uninstall_tombstone_for_install(data_dir, "a/../../victim");
 
         assert!(
-            matches!(result, Err(QueryInstallError::LanguageNotSupported(_))),
+            matches!(result, Err(QueryInstallError::InvalidLanguageName(_))),
             "unsafe language must be rejected before tombstone path construction"
         );
         assert_eq!(
@@ -1101,7 +1113,7 @@ mod tests {
         let result = remove_query_install_and_backups(&queries_parent, "a/../../victim");
 
         assert!(
-            matches!(result, Err(QueryInstallError::LanguageNotSupported(_))),
+            matches!(result, Err(QueryInstallError::InvalidLanguageName(_))),
             "unsafe language must be rejected before cleanup paths are derived"
         );
         assert!(

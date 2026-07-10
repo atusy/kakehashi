@@ -567,7 +567,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(queries::QueryInstallError::LanguageNotSupported(_))
+                Err(queries::QueryInstallError::InvalidLanguageName(_))
             ),
             "unsafe top-level language name must be rejected"
         );
