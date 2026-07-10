@@ -1101,9 +1101,10 @@ impl Kakehashi {
                         }
                     }
                 }
-                if flight.cancel.is_cancelled() {
-                    return Ok(None);
-                }
+                // A cancelled token belongs to the winner, not to every
+                // same-snapshot joiner. Re-enter the currency/memo/claim loop:
+                // a still-current joiner can elect a replacement, while a
+                // genuinely superseded snapshot fails the currency check.
             }
             Some(key)
         } else {
@@ -2331,6 +2332,43 @@ mod tests {
             "a reopened document must supersede the prior lifetime despite version reset"
         );
         assert!(!reopened_cancel.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_winner_allows_same_snapshot_replacement() {
+        let flights = dashmap::DashMap::new();
+        let key = (
+            Url::parse("file:///captures_cancelled_winner.rs").unwrap(),
+            "highlights".to_string(),
+            false,
+        );
+        let tag = CapturesWalkTag {
+            incarnation: 1,
+            generation: 2,
+            parsed_version: 3,
+        };
+        let WalkFlightClaim::Winner(first) =
+            claim_walk_flight(&flights, &key, tag, crate::cancel::CancelToken::default())
+        else {
+            panic!("first request must win");
+        };
+        let guard = WalkFlightGuard {
+            map: &flights,
+            key: key.clone(),
+            flight: std::sync::Arc::clone(&first),
+            cancel_on_drop: true,
+        };
+        assert!(matches!(
+            claim_walk_flight(&flights, &key, tag, crate::cancel::CancelToken::default()),
+            WalkFlightClaim::Join(_)
+        ));
+
+        drop(guard);
+        assert!(first.cancel.is_cancelled());
+        assert!(matches!(
+            claim_walk_flight(&flights, &key, tag, crate::cancel::CancelToken::default()),
+            WalkFlightClaim::Winner(_)
+        ));
     }
 
     #[test]
