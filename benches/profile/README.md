@@ -27,11 +27,14 @@ python3 benches/profile/drive.py \
   --bin ./target/release/kakehashi \
   --file path/to/input.md --requests 20 --edits 1
 
-# Queue a captures delta first, then semantic tokens, to reproduce shared-pool and
-# response-output contention from an already-busy highlighter client.
-python3 benches/profile/drive.py \
-  --bin ./target/release/kakehashi \
-  --file path/to/input.md --requests 20 --edits 1 --concurrent-captures
+# Measure the four stdout head-of-line scenarios from issue #665. The captures
+# modes verify that the response is a real delta or the intended full fallback.
+for scenario in semantic-only captures-delta captures-full diagnostics-burst; do
+  python3 benches/profile/drive.py \
+    --bin ./target/release/kakehashi \
+    --file path/to/input.md --requests 20 --edits 1 \
+    --stdout-metrics --scenario "$scenario"
+done
 
 # Send superseding requests in bursts to measure cancellation pressure.
 python3 benches/profile/drive.py \
@@ -45,6 +48,16 @@ successful semantic response in each cycle, exact JSON response-body bytes,
 and server notifications/requests grouped separately. This keeps completed
 semantic compute latency separate from cheap supersession responses and from
 large captures or diagnostic output that may dominate a cycle.
+
+`--stdout-metrics` also reports exact framed bytes and p50/p90
+response-ready→last-byte-accepted and response-ready→flush-complete latency.
+For semantic responses delayed behind a frame of at least 64 KiB, it separates
+cases where semantic work was ready before that frame started (a bounded writer
+scheduler could help) from cases where the frame was already being written (it
+cannot be safely interrupted). Change the classification threshold with
+`--large-frame-kib`. The driver's dedicated reader thread continuously drains
+stdout in every mode, so waiting for one request ID does not create artificial
+pipe backpressure or hide out-of-order responses.
 
 With full Xcode installed, Instruments' Time Profiler can also be used from the
 CLI:
@@ -62,7 +75,8 @@ suite (or `make deps/tree-sitter`) once populates it.
 
 ## Why it's shaped this way
 
-- **Drive synchronously, don't pipe a static session.** The default isolates one
+- **Drain continuously, drive synchronously by default.** A dedicated reader
+  always drains and dispatches stdout while the default workload isolates one
   request at a time; without `--edits`, requests after warmup intentionally
   measure unchanged-snapshot cache hits. Add `--edits 1` to measure the
   edit→reparse→recompute path, or `--burst`/`--burst-edits` to measure
