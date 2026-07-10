@@ -566,12 +566,26 @@ impl LanguageServerPool {
             .buffer_unordered(MAX_CONCURRENT_EAGER_RESOLVES)
             .collect()
             .await;
+        let mut failed = 0usize;
+        let total = resolved.len();
         for (idx, outcome) in resolved {
-            if let Some(materialized) = outcome
-                && let CodeActionOrCommand::CodeAction(slot) = &mut actions[idx]
-            {
-                *slot = materialized;
+            match outcome {
+                Some(materialized) => {
+                    if let CodeActionOrCommand::CodeAction(slot) = &mut actions[idx] {
+                        *slot = materialized;
+                    }
+                }
+                None => failed += 1,
             }
+        }
+        // ONE aggregated warn per request, however many lazy actions the
+        // server returned (per-result warns would be unbounded).
+        if failed > 0 {
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction: {failed} of {total} eager resolves failed (transport \
+                 error or malformed result; see debug logs); those actions stay lazy"
+            );
         }
     }
 
@@ -715,6 +729,13 @@ impl LanguageServerPool {
             .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id)
             .await
         else {
+            // Client-driven (one per user selection, so bounded): the resolve
+            // failed in transport or returned a malformed result (debug logs
+            // carry the detail); the action goes back unresolved.
+            warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: no usable response from {server_name}; returning unresolved"
+            );
             re_envelope_action(&mut action, &envelope);
             return action;
         };
@@ -1026,16 +1047,16 @@ fn parse_code_action_resolve_response(mut response: serde_json::Value) -> Option
         // is undebuggable in the field (the action just stays unresolved).
         // Mirrors parse_code_actions_leniently's per-item warn.
         Err(e) => {
-            // Log the error CLASS and position, not `{e}`: serde's Display
-            // embeds downstream payload snippets (arbitrary, possibly
-            // non-ASCII values), which neither belongs in the log nor
-            // truncates safely.
-            warn!(
+            // DEBUG and payload-free: serde's Display embeds downstream
+            // payload snippets, and `from_value` reports a meaningless
+            // line 0 column 0 — only the error class is trustworthy. The
+            // call sites aggregate the user-facing warn (a hostile server
+            // could return arbitrarily many lazy actions, so a per-result
+            // warn here would be unbounded per request).
+            log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: malformed resolve result: {:?} at line {} column {}",
-                e.classify(),
-                e.line(),
-                e.column()
+                "codeAction/resolve: malformed resolve result: {:?}",
+                e.classify()
             );
             None
         }
@@ -1492,18 +1513,17 @@ fn disable_action(
     if !upstream_caps.disabled_support {
         // Without disabledSupport the action vanishes from the menu — the
         // only trace of a server bug (e.g. an out-of-region edit) is this log.
+        // No title in the log: titles are downstream-controlled free text.
         log::debug!(
             target: "kakehashi::bridge",
-            "codeAction '{}' from {server_name} dropped ({reason}); the client \
-             lacks disabledSupport to show it disabled",
-            action.title
+            "codeAction from {server_name} dropped ({reason}); the client \
+             lacks disabledSupport to show it disabled"
         );
         return None;
     }
     log::debug!(
         target: "kakehashi::bridge",
-        "codeAction '{}' from {server_name} disabled: {reason}",
-        action.title
+        "codeAction from {server_name} disabled: {reason}"
     );
     action.title = suffix_title(action.title, server_name);
     action.edit = None;
