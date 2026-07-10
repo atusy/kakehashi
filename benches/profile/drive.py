@@ -159,7 +159,7 @@ def classify_semantic_blocking(
         ]
         if not blockers:
             continue
-        blocker = max(blockers, key=lambda frame: frame.last_byte_us)
+        blocker = max(blockers, key=lambda frame: frame.write_sequence)
         if semantic.ready_sequence < blocker.write_sequence:
             schedulable += 1
         else:
