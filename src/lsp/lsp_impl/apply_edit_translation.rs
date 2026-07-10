@@ -170,7 +170,9 @@ fn transform_params_to_host(
     }
     // The transform translates ranges but emits newText verbatim: an edit that
     // spans or inserts lines in a line-prefixed (e.g. blockquote) region would
-    // strip the prefixes it overlaps and leave the inserted lines unprefixed.
+    // strip the prefixes it overlaps and leave the inserted lines unprefixed;
+    // an edit reaching a character-0 region end without a trailing newline
+    // would merge content into the closing fence.
     if !workspace_edit_preserves_line_prefixes(&params.edit, host_uri, offset, region_end) {
         return Err(
             "kakehashi: the edit would break the host document's structure around the \

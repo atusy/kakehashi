@@ -1,8 +1,9 @@
 //! Completion request handling for bridge connections.
 //!
 //! Handles the coordinate transformation between host and virtual documents,
-//! and drops items whose text edits would break per-line region prefixes
-//! (blockquote `> `) if applied verbatim (see `transform_completion_item`).
+//! and drops items whose text edits are unsafe for the injection region —
+//! escape it, break per-line `> ` prefixes, or merge content into the closing
+//! fence — if applied verbatim (see `transform_completion_item`).
 //! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
 //! ordering with other messages.
 
@@ -138,8 +139,9 @@ fn transform_completion_response_to_host(
         list
     };
 
-    // Transform all items in the list (dropping any whose primary edit would
-    // corrupt region line prefixes), then optionally envelope for resolve routing
+    // Transform all items in the list (dropping any whose primary edit is
+    // unsafe for the injection region), then optionally envelope for resolve
+    // routing
     let before = list.items.len();
     list.items.retain_mut(|item| {
         if !transform_completion_item(item, offset, region_end) {
@@ -166,11 +168,12 @@ fn transform_completion_response_to_host(
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
 /// additionalTextEdits if present.
 ///
-/// Returns `false` when the item's primary text edit would corrupt per-line
-/// region prefixes (e.g. blockquote `> `) if applied verbatim — the caller
-/// must drop the whole item (same fail-closed rule as WorkspaceEdit
-/// bridging). Unsafe `additionalTextEdits` are merely stripped: the primary
-/// insertion still works without them, so the item stays useful.
+/// Returns `false` when the item's primary text edit is unsafe for the
+/// injection region — escapes it, corrupts per-line `> ` prefixes, or merges
+/// content into the closing fence — if applied verbatim; the caller must
+/// drop the whole item (same fail-closed rule as WorkspaceEdit bridging).
+/// Unsafe `additionalTextEdits` are merely stripped: the primary insertion
+/// still works without them, so the item stays useful.
 pub(super) fn transform_completion_item(
     item: &mut CompletionItem,
     offset: &RegionOffset,

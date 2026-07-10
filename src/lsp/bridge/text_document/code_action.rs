@@ -332,9 +332,10 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
 /// - [`REASON_RESOLVE`] — the edit ended up empty: the server produced nothing
 ///   applicable, which reads as "could not be resolved to an applicable edit",
 ///   not "cannot be represented in the host document".
-/// - [`REASON_PREFIXED_REGION`] — the translated edit spans or inserts lines in
-///   a line-prefixed (e.g. blockquote) region; the verbatim newText would strip
-///   the prefixes and corrupt the host document.
+/// - [`REASON_PREFIXED_REGION`] — the translated edit would corrupt the host
+///   structure around the region: it spans/inserts lines in a line-prefixed
+///   (e.g. blockquote) region whose prefixes the verbatim newText would strip,
+///   or it merges content into the closing fence.
 ///
 /// Used by BOTH the initial-response policy and the codeAction/resolve path so
 /// these are rejected uniformly, never partially applied.

@@ -2,8 +2,10 @@
 //! host↔virtual coordinate transformation. Like inlay hints, the request carries a
 //! range (where the color was found) and the response may include textEdits and
 //! additionalTextEdits whose ranges must be translated back to host coordinates.
-//! Presentations whose textEdit would break per-line region prefixes
-//! (blockquote `> `) are dropped; unsafe additionalTextEdits are stripped.
+//! Presentations whose (implicit or explicit) textEdit is unsafe for the
+//! injection region — escapes it, breaks per-line `> ` prefixes, or merges
+//! content into the closing fence — are dropped; unsafe additionalTextEdits
+//! are stripped.
 
 use std::io;
 

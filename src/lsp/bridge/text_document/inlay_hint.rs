@@ -5,9 +5,10 @@
 //!
 //! Unlike position-based requests, inlay hints use a range parameter in the request
 //! that specifies the visible document range. Both request range (host->virtual) and
-//! response positions/textEdits (virtual->host) need transformation. A hint whose
-//! textEdits would break per-line region prefixes (blockquote `> `) is served
-//! without them (see the prefix-safety guard in the response transform).
+//! response positions/textEdits (virtual->host) need transformation. A hint
+//! whose textEdits are unsafe for the injection region (escape it, break
+//! per-line `> ` prefixes, or merge content into the closing fence) is served
+//! without them (see the safety guard in the response transform).
 //!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
