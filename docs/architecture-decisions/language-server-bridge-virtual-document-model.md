@@ -1,10 +1,12 @@
 # Language Server Bridge Virtual Document Model
 
-## Decision–Implementation Gap
+## Implementation Status
 
-`isolation=true` (one virtual document per injection region) is implemented.
-`isolation=false` (combining same-language injections into a single virtual
-document) is deferred and not implemented.
+Isolated virtual documents remain the default. Query-authored
+`#set! injection.combined` patterns are implemented: captures from the same
+query pattern and language share one bridge virtual document, with host-only
+gaps masked by coordinate-preserving whitespace. The separately proposed
+user-facing `isolation=false` configuration remains deferred.
 
 ## Context
 
@@ -62,7 +64,10 @@ The appropriate isolation behavior depends on **both** the host document and the
 
 The same injection language (e.g., Python) may need different isolation behavior in different host contexts.
 
-**Note**: The current implementation only supports **isolated mode** (`isolation: true`). Non-isolated mode is deferred for future implementation. When non-isolated mode is added, configuration allows specifying isolation per `(host, injection)` pair:
+**Note**: Query-controlled `injection.combined` is supported independently of
+this proposed configuration. User-configurable `isolation=false` remains
+deferred; when added, configuration can specify isolation per `(host,
+injection)` pair:
 
 ```toml
 # Global default: isolate all injections
@@ -96,10 +101,18 @@ Note: The `isolation` field is configured per **host/injection pair** within the
 | `true` (default) | Documentation, tutorials | Each injection → independent virtual document |
 | `false` | Literate programming (`.lhs`, org-mode tangling) | All injections of same language → single virtual document |
 
-Non-isolated mode considerations for future implementation:
-- Insert placeholder lines (comments/whitespace) to preserve line numbers for diagnostics
+Remaining considerations for configurable non-isolated mode:
+- The query-controlled implementation already inserts coordinate-preserving
+  whitespace for host-only gaps. A configurable mode must define equivalent
+  grouping boundaries without query pattern identity.
 - Handle conflicting symbols gracefully (report as diagnostics from kakehashi, not language server)
 - Consider block ordering annotations for explicit concatenation order
+
+For non-contiguous combined documents, read-only bridge features remain
+available. Edit-producing methods are disabled until edit translation can
+validate the individual allowed host spans rather than only the combined
+document's outer range; this prevents masked gaps from becoming edits over
+real host text.
 
 #### Feature-Specific Isolation Overrides
 
