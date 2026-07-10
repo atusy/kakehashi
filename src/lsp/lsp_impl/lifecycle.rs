@@ -454,10 +454,10 @@ impl Kakehashi {
         //   window/showMessage, and telemetry/event.
         // - unbounded `upstream_request_rx` (loss-intolerant): downstream
         //   requests forwarded with a response relayed back
-        //   (window/showMessageRequest, window/showDocument, and — only when
-        //   the editor declared the capability — workspace/applyEdit; without
-        //   it the reader answers applied:false locally and nothing reaches
-        //   this channel).
+        //   (window/showMessageRequest, window/showDocument,
+        //   workspace/applyEdit — though when the editor never declared the
+        //   applyEdit capability, the forwarding loop answers applied:false
+        //   itself instead of forwarding to the editor).
         if let Some(upstream_rx) = self.bridge.take_upstream_rx()
             && let Some(window_rx) = self.bridge.take_window_rx()
             && let Some(upstream_request_rx) = self.bridge.take_upstream_request_rx()
