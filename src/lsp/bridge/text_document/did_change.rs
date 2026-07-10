@@ -62,9 +62,11 @@ impl LanguageServerPool {
             let connection_keys = self.connections_opening_or_opened(&virtual_uri);
 
             for connection_key in connection_keys {
-                // Match didOpen's connections→transition order. Holding the
-                // connection map pins this handle generation while the pending
-                // open settles and the ordered didChange is enqueued.
+                // Match didOpen's connections→transition order. Hold the map only
+                // until this generation owns the transition: a respawn also waits
+                // on that transition before purging the old generation, so the
+                // cloned handle stays pinned without blocking unrelated map users
+                // during the version/fingerprint awaits below.
                 let connections = self.connections().await;
                 let Some(handle) = connections
                     .get(&connection_key)
@@ -75,9 +77,9 @@ impl LanguageServerPool {
                 };
                 let transition = self.open_transition_lock(&virtual_uri, &connection_key);
                 let transition_guard = transition.lock().await;
+                drop(connections);
                 if !self.is_document_opened_on_connection(&virtual_uri, &connection_key) {
                     drop(transition_guard);
-                    drop(connections);
                     self.remove_open_transition_lock_if_unshared(
                         &virtual_uri,
                         &connection_key,
@@ -122,7 +124,6 @@ impl LanguageServerPool {
                     .await;
                 }
                 drop(transition_guard);
-                drop(connections);
             }
         }
     }
