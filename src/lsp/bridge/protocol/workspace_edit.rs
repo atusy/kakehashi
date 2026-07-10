@@ -319,28 +319,26 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     region_end: Position,
 ) -> bool {
     let columns = offset.columns();
-    // Per-line arrays (the blockquote shape from `compute_line_column_offsets`)
-    // carry one entry per content line PLUS a trailing row where the included
-    // ranges end — column 0 of the closing-fence line. That row's recorded
-    // offset is 0 even though the host line carries the `> ` prefix, and the
-    // region end (content end) admits edits reaching it. So in a prefixed
-    // per-line region, a trailing zero entry and anything past the array count
-    // as the prefixed BOUNDARY. Single-element arrays are the non-blockquote
-    // fallback whose later lines are designed unprefixed (see `RegionOffset`),
-    // so they get no boundary semantics.
+    // In the per-line (blockquote) shape, content ending with a newline puts
+    // the region end at column 0 of the NEXT host row — the closing fence,
+    // whose recorded offset is 0 (`compute_line_column_offsets` leaves a
+    // trailing zero for the row where the included ranges end) even though the
+    // host line carries the `> ` prefix. That row is the prefixed BOUNDARY:
+    // derived from the region end, not the array shape, because a trailing
+    // zero entry can equally be a REAL unprefixed content row when an included
+    // gap ends mid-row (region end at a non-zero character — no boundary row
+    // is reachable then). Single-element arrays are the non-blockquote
+    // fallback whose closing fence carries no prefix, so no boundary
+    // semantics.
     //
-    // A trailing zero can also be the EOF row of an UNCLOSED blockquote fence
-    // (no closing line exists); `columns` alone cannot distinguish that from
-    // the closed-fence row, so the guard stays fail-closed there — rejecting a
+    // The boundary row can also be the EOF row of an UNCLOSED blockquote fence
+    // (no closing line exists); the offsets cannot distinguish that from the
+    // closed-fence row, so the guard stays fail-closed there — rejecting a
     // boundary-touching edit in a transient malformed construct is acceptable,
     // corrupting a well-formed one is not.
     let content_prefixed = columns.len() > 1 && columns.iter().any(|&column| column > 0);
     let boundary_at = |host_line: u32| {
-        content_prefixed
-            && host_line.checked_sub(offset.line()).is_some_and(|v| {
-                let v = v as usize;
-                v >= columns.len() - 1 && columns.get(v).copied().unwrap_or(0) == 0
-            })
+        content_prefixed && region_end.character == 0 && host_line >= region_end.line
     };
     let prefix_at = |host_line: u32| {
         boundary_at(host_line)
@@ -799,6 +797,32 @@ mod tests {
             "changes": { host_uri.as_str(): [
                 { "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 6}},
                   "newText": "x\ny" }
+            ] }
+        }));
+
+        assert!(workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset, region_end
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_allows_edit_on_trailing_zero_content_row() {
+        let host_uri = make_host_uri();
+        // A trailing zero entry is NOT always the closing-fence boundary:
+        // custom injection queries can produce an included gap that spans into
+        // a real second row and ends MID-row, yielding [start_column, 0] where
+        // row 1 is genuine unprefixed content. The region end then sits at a
+        // non-zero character on that row — no boundary row is reachable, and
+        // edits touching it must stay allowed.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![4, 0]);
+        let region_end = Position {
+            line: 4,
+            character: 3,
+        };
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 4, "character": 0}, "end": {"line": 4, "character": 2}},
+                  "newText": "x" }
             ] }
         }));
 
