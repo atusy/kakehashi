@@ -225,21 +225,25 @@ impl Kakehashi {
             upstream_id,
             region_end,
         );
-        let result = match cancel_rx {
+        // The cancel arm DROPS the in-flight dispatch, which then never
+        // reaches its own refcounted unregister — an RAII sweep (dropped at
+        // function exit) covers that, and unlike a trailing statement it also
+        // runs when this whole handler future is dropped (client disconnect /
+        // shutdown). Idempotent after normal completion, where the dispatch
+        // cleaned up itself. The CAPTURED id, not a re-read of the task-local:
+        // the sweep must target exactly the id the dispatch registered under.
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            std::sync::Arc::clone(&pool),
+            sweep_id,
+        );
+        match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
                 resolved = dispatch => Ok(resolved),
             },
             None => Ok(dispatch.await),
-        };
-        // The cancel arm DROPS the in-flight dispatch, which then never
-        // reaches its own refcounted unregister — sweep the id (idempotent
-        // after normal completion, where the dispatch cleaned up itself).
-        // The CAPTURED id, not a re-read of the task-local: the sweep must
-        // target exactly the id the dispatch registered under.
-        pool.unregister_all_for_upstream_id(sweep_id.as_ref());
-        result
+        }
     }
 
     /// The region's current content-precise host-document END position if the
