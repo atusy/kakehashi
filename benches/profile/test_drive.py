@@ -233,6 +233,25 @@ class RequestSummaryTest(unittest.TestCase):
             classify_semantic_blocking([tied_batch_blocker, semantic], 64 * 1024),
             (1, 0),
         )
+        earlier_blocker = dataclasses.replace(
+            large,
+            write_sequence=0,
+            flush_sequence=6,
+            last_byte_us=500,
+        )
+        later_blocker = dataclasses.replace(
+            large,
+            write_sequence=2,
+            flush_sequence=6,
+            last_byte_us=500,
+        )
+        semantic_between = dataclasses.replace(semantic, ready_sequence=1)
+        self.assertEqual(
+            classify_semantic_blocking(
+                [earlier_blocker, later_blocker, semantic_between], 64 * 1024
+            ),
+            (1, 0),
+        )
 
     def test_transport_validation_rejects_missing_or_censored_metrics(self):
         frame = TransportFrame(
