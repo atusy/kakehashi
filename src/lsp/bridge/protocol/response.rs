@@ -32,7 +32,13 @@ pub(crate) fn transform_goto_response_to_host(
     if response_has_jsonrpc_error(&response, "goto request") {
         return None;
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "goto response is missing result without a JSON-RPC error (protocol violation)"
+        );
+        return None;
+    };
     if result.is_null() {
         return None;
     }
@@ -90,7 +96,10 @@ pub(crate) fn transform_goto_response_to_host(
         }
     }
 
-    // Failed to deserialize as any known variant
+    log::warn!(
+        target: "kakehashi::bridge",
+        "goto response did not match Location | Location[] | LocationLink[]"
+    );
     None
 }
 
@@ -178,4 +187,127 @@ fn transform_location_link_for_goto(
 
     // Case 3: Different virtual URI (cross-region) → filter out
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, Once};
+
+    use log::{Level, LevelFilter, Log, Metadata, Record};
+    use serde_json::json;
+
+    use super::*;
+
+    static LOGGER: CapturingLogger = CapturingLogger {
+        messages: Mutex::new(Vec::new()),
+    };
+    static INIT_LOGGER: Once = Once::new();
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    static CAPTURING: AtomicBool = AtomicBool::new(false);
+
+    struct CapturingLogger {
+        messages: Mutex<Vec<String>>,
+    }
+
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            CAPTURING.store(false, Ordering::Relaxed);
+        }
+    }
+
+    impl Log for CapturingLogger {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            CAPTURING.load(Ordering::Relaxed)
+                && metadata.level() <= Level::Warn
+                && metadata.target() == "kakehashi::bridge"
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let message = format!("{}:{}:{}", record.level(), record.target(), record.args());
+            self.messages.lock().unwrap().push(message);
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
+        INIT_LOGGER.call_once(|| {
+            log::set_logger(&LOGGER).expect("test logger should install once");
+            log::set_max_level(LevelFilter::Warn);
+        });
+        let _capture = CAPTURE_LOCK.lock().unwrap();
+        LOGGER.messages.lock().unwrap().clear();
+        CAPTURING.store(true, Ordering::Relaxed);
+        let guard = CaptureGuard;
+        f();
+        drop(guard);
+        let captured = LOGGER.messages.lock().unwrap().clone();
+        LOGGER.messages.lock().unwrap().clear();
+        captured
+    }
+
+    #[test]
+    fn goto_response_warns_on_malformed_success_result() {
+        let warnings = captured_warnings_for(|| {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": "not a goto result"
+            });
+
+            let transformed = transform_goto_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &"file:///project/host.lua".parse().unwrap(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_none());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains(
+                        "goto response did not match Location | Location[] | LocationLink[]",
+                    )
+            }),
+            "expected malformed goto response warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn goto_response_warns_on_missing_result_success() {
+        let warnings = captured_warnings_for(|| {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": 42
+            });
+
+            let transformed = transform_goto_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &"file:///project/host.lua".parse().unwrap(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_none());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains(
+                        "goto response is missing result without a JSON-RPC error (protocol violation)",
+                    )
+            }),
+            "expected missing-result goto response warning, got {warnings:?}"
+        );
+    }
 }
