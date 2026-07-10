@@ -178,9 +178,10 @@ fn transform_params_to_host(
 /// A text-edit entry (`changes` value or a `TextDocumentEdit`) with an EMPTY
 /// edit vector is a no-op and does NOT count as touching its URI: an edit that
 /// is real-file-only but carries a stray empty virtual entry must forward
-/// verbatim, not be routed down the virtual-translation path (and then fail
-/// `applied: false`). File operations always count — a create/rename/delete is
-/// a real change even with no accompanying text edits.
+/// as-is (modulo the version nulling every forward gets), not be routed down
+/// the virtual-translation path (and then fail `applied: false`). File
+/// operations always count — a create/rename/delete is a real change even
+/// with no accompanying text edits.
 fn collect_virtual_uris(edit: &WorkspaceEdit) -> Vec<String> {
     let mut uris: Vec<String> = Vec::new();
     let mut push = |uri: &str| {

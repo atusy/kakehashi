@@ -304,7 +304,11 @@ fn merge_upstream_capabilities(
     // `failureHandling`/`normalizesLineEndings`) is the honest semantics.
     // `changeAnnotationSupport` is deliberately withheld: ls-types' untagged
     // `OneOf` drops `annotationId` when deserializing downstream responses, so
-    // inviting annotated edits would silently lose `needsConfirmation`.
+    // inviting annotated edits would silently lose `needsConfirmation`. The
+    // proposed 3.18 `metadataSupport`/`snippetEditSupport` fields are also
+    // effectively withheld — ls-types' WorkspaceEditClientCapabilities has no
+    // such fields, so the typed InitializeParams parse drops them before this
+    // clone ever sees them.
     if let Some(upstream_workspace_edit) = upstream
         .workspace
         .as_ref()
