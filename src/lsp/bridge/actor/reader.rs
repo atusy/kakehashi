@@ -404,6 +404,11 @@ impl LivenessTimerState {
         self.epoch = None;
     }
 
+    fn disable(&mut self, server_prefix: &str, reason: &str) {
+        self.stop(server_prefix, reason);
+        self.timeout = None;
+    }
+
     /// Get the configured timeout duration (for logging on expiry).
     fn timeout_duration(&self) -> Duration {
         self.timeout.unwrap_or_default()
@@ -684,7 +689,7 @@ async fn reader_loop_with_liveness(
 
     loop {
         tokio::select! {
-            biased; // Process in order: cancellation, timer, liveness start, liveness stop, read
+            biased; // Process in order: cancellation, shutdown stop, timer, start, read
 
             // Check for cancellation first (highest priority)
             _ = cancel_token.cancelled() => {
@@ -698,6 +703,13 @@ async fn reader_loop_with_liveness(
                 // per-request timeout.
                 router.fail_all("bridge: reader task cancelled");
                 break;
+            }
+
+            // Global shutdown overrides Tier-2 liveness, including when its
+            // stop signal and an expired timer become ready together. Disable
+            // future starts too, so a previously queued wake-up cannot re-arm.
+            Some(()) = liveness_stop_rx.recv() => {
+                liveness.disable(&server_prefix, "shutdown began");
             }
 
             // Check for liveness timeout (if timer is active)
@@ -746,11 +758,6 @@ async fn reader_loop_with_liveness(
                 // router epoch is authoritative and was advanced atomically
                 // with registration.
                 liveness.start(&server_prefix, router.liveness_epoch());
-            }
-
-            // Check for liveness timer stop notification (shutdown began - ls-bridge-timeout-hierarchy Phase 4)
-            Some(()) = liveness_stop_rx.recv() => {
-                liveness.stop(&server_prefix, "shutdown began");
             }
 
             // Try to read a message (lowest priority)
