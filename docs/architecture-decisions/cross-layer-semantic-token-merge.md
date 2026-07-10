@@ -12,8 +12,8 @@
 
 **Aspirational — deferred with a specified design and trigger.** Semantic
 tokens are **native-only today**: `textDocument/semanticTokens/{full,range}` is
-not bridged (language-server-bridge-request-strategies marks the semanticTokens row ❌ Not
-implemented), and
+not bridged (language-server-bridge-request-strategies marks the semanticTokens
+row ❌ Not implemented), and
 cross-layer-aggregation deliberately scoped semantic tokens out of its
 `preferred`/`concatenated` mechanism. This decision does **not** schedule
 implementation. It records *how* the merge will work when token bridging is
