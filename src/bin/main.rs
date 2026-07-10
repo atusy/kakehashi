@@ -703,7 +703,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
 
     if let Err(e) = queries::clear_uninstall_tombstone_for_install(&data_dir, language) {
         eprintln!("✗ Failed to prepare query installation: {}", e);
-        return Err(ExitCode::FAILURE);
+        queries_success = false;
     }
 
     // Install parser

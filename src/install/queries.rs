@@ -631,8 +631,7 @@ fn process_is_running(pid: &str) -> bool {
 
 #[cfg(not(unix))]
 fn process_is_running(pid: &str) -> bool {
-    pid.parse::<u32>()
-        .is_ok_and(|pid| pid == std::process::id())
+    pid.parse::<u32>().is_ok()
 }
 
 fn recover_interrupted_query_install(
