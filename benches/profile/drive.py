@@ -66,6 +66,18 @@ def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
     )
 
 
+def summarize_samples_by_status(
+    samples: list[RequestSample],
+) -> dict[str, RequestSummary]:
+    return {
+        status: summarize_samples(
+            [sample for sample in samples if sample.status == status]
+        )
+        for status in ("ok", "canceled", "null", "error")
+        if any(sample.status == status for sample in samples)
+    }
+
+
 def response_status(message: dict) -> str:
     error = message.get("error")
     if not error:
@@ -364,6 +376,7 @@ def main() -> None:
         first_line_len = len(text.split("\n", 1)[0].encode("utf-16-le")) // 2
         t0 = time.time()
         req_times = []
+        cycle_success_times = []
         line_has_extra = False
 
         def send_toggle_edit():
@@ -384,6 +397,9 @@ def main() -> None:
                 # a beat for the off-ingress reparse to run (the profiled work)
                 time.sleep(0.01)
             t_req = time.perf_counter()
+            semantic_sample_start = len(
+                request_samples["textDocument/semanticTokens/full"]
+            )
             semantic_request = (
                 "textDocument/semanticTokens/full",
                 {"textDocument": {"uri": uri}},
@@ -413,6 +429,16 @@ def main() -> None:
                     for captures_request in captures_requests:
                         measured_request(*captures_request)
             req_times.append(time.perf_counter() - t_req)
+            cycle_semantic_samples = request_samples[
+                "textDocument/semanticTokens/full"
+            ][semantic_sample_start:]
+            successes = [
+                sample.seconds
+                for sample in cycle_semantic_samples
+                if sample.status == "ok"
+            ]
+            if successes:
+                cycle_success_times.append(max(successes))
             cycle_ok, cycle_canceled, cycle_superseded, tokens = count_semantic_outcomes(
                 semantic_responses, tokens
             )
@@ -450,6 +476,24 @@ def main() -> None:
             f"canceled={summary.canceled} null={summary.null} errors={summary.errors} "
             f"p50={summary.p50_ms:.1f}ms p90={summary.p90_ms:.1f}ms "
             f"max={summary.max_ms:.1f}ms wire={summary.wire_bytes / 1024:.1f}KiB\n")
+        for status, status_summary in summarize_samples_by_status(samples).items():
+            sys.stderr.write(
+                f"[drive] method={method} status={status} "
+                f"count={status_summary.count} p50={status_summary.p50_ms:.1f}ms "
+                f"p90={status_summary.p90_ms:.1f}ms "
+                f"max={status_summary.max_ms:.1f}ms\n"
+            )
+    if cycle_success_times:
+        success_samples = [
+            RequestSample(seconds=seconds, wire_bytes=0, status="ok")
+            for seconds in cycle_success_times
+        ]
+        summary = summarize_samples(success_samples)
+        sys.stderr.write(
+            f"[drive] time-to-last-semantic-success cycles={summary.count} "
+            f"p50={summary.p50_ms:.1f}ms p90={summary.p90_ms:.1f}ms "
+            f"max={summary.max_ms:.1f}ms\n"
+        )
     if notification_counts:
         total_count = sum(notification_counts.values())
         total_bytes = sum(notification_bytes.values())

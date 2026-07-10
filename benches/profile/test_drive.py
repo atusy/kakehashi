@@ -10,6 +10,7 @@ from drive import (
     next_toggle_change,
     server_request_result,
     summarize_samples,
+    summarize_samples_by_status,
 )
 
 
@@ -30,6 +31,13 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(summary.p90_ms, 30.0)
         self.assertEqual(summary.max_ms, 30.0)
         self.assertEqual(summary.wire_bytes, 600)
+
+        by_status = summarize_samples_by_status(samples)
+        self.assertEqual(by_status["ok"].count, 2)
+        self.assertEqual(by_status["ok"].p50_ms, 10.0)
+        self.assertEqual(by_status["ok"].p90_ms, 20.0)
+        self.assertEqual(by_status["canceled"].count, 1)
+        self.assertEqual(by_status["canceled"].p50_ms, 30.0)
 
     def test_counts_mixed_burst_outcomes_and_last_completed_payload(self):
         responses = [
