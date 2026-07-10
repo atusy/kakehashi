@@ -1133,14 +1133,14 @@ impl Kakehashi {
                 // full-tokenization cost, and subsequent scrolled viewports can
                 // cheaply filter this cache entry instead of recomputing.
                 full_tokens.result_id = Some(next_result_id());
+                let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
                 self.cache.store_tokens(
                     uri.clone(),
-                    full_tokens.clone(),
+                    full_tokens,
                     language_name.clone(),
                     cache_key,
                     snapshot_identity,
                 );
-                let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
                 self.cache.store_range_tokens(
                     uri,
                     domain_range,
