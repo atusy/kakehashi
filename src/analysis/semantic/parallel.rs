@@ -859,18 +859,24 @@ fn rebuild_context<'a>(
         // last, so identical lines render differently. Trim the newline from
         // prose gaps so each classifies as the single display line it covers.
         // Containers keep their newlines: their host tokens must not leak.
-        let prose = ranges
-            .last()
-            .is_some_and(|r| !text[..inj_start_byte + r.end_byte].ends_with('\n'));
+        // `get` instead of indexing: like the content re-slice above, a
+        // corrupt reuse-path entry must degrade (here: to the untrimmed
+        // container classification), not panic.
+        let ends_with_newline = |end: usize| text.get(..end).is_some_and(|s| s.ends_with('\n'));
+        let prose = ranges.last().is_some_and(|r| {
+            text.get(..inj_start_byte + r.end_byte)
+                .is_some_and(|s| !s.ends_with('\n'))
+        });
         for r in ranges {
             let start = inj_start_byte + r.start_byte;
             let mut end = inj_start_byte + r.end_byte;
-            if prose && text[..end].ends_with('\n') {
+            if prose && ends_with_newline(end) {
                 end -= 1;
-                if text[..end].ends_with('\r') {
+                if text.get(..end).is_some_and(|s| s.ends_with('\r')) {
                     end -= 1;
                 }
             }
+            // A newline-only gap (empty prose line) trims to zero width.
             if start < end {
                 exclusion_ranges.push((start, end));
             }
