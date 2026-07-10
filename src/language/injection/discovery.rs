@@ -298,9 +298,9 @@ pub(crate) fn collect_all_injections<'a>(
                 // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
                 // are skipped when this content-node range was already inserted by
                 // an earlier matching pattern. Same resulting map, fewer scans.
-                injections_map
-                    .entry(key)
-                    .or_insert_with(|| InjectionRegionInfo {
+                injections_map.entry(key).or_insert_with(|| {
+                    let offset = effective_offset_for_pattern(query, match_.pattern_index);
+                    InjectionRegionInfo {
                         language,
                         content_node: capture.node,
                         pattern_index: match_.pattern_index,
@@ -308,9 +308,13 @@ pub(crate) fn collect_all_injections<'a>(
                             query,
                             match_.pattern_index,
                         ),
-                        offset: effective_offset_for_pattern(query, match_.pattern_index),
-                        combined: has_combined_for_pattern(query, match_.pattern_index),
-                    });
+                        // Match the semantic path: effective offsets and
+                        // multi-region grouping do not compose safely.
+                        combined: has_combined_for_pattern(query, match_.pattern_index)
+                            && offset.is_none(),
+                        offset,
+                    }
+                });
             }
         }
     }
@@ -1228,6 +1232,39 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].contiguous);
         assert_eq!(resolved[0].virtual_content, "<div></div>");
+    }
+
+    #[test]
+    fn combined_patterns_with_offsets_remain_separate() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "abc"; let b = "def"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((string_literal
+                   (string_content) @injection.content)
+                 (#set! injection.language "html")
+                 (#set! injection.combined)
+                 (#offset! @injection.content 0 1 0 -1))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("combined_offset"),
+            &tree,
+            text,
+            &query,
+        );
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].virtual_content, "b");
+        assert_eq!(resolved[1].virtual_content, "e");
+        assert!(resolved.iter().all(|region| region.contiguous));
     }
 
     #[test]
