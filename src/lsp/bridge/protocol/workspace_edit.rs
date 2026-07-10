@@ -356,8 +356,26 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     if columns.iter().all(|&column| column == 0) {
         return true;
     }
-    // The all-zero fast path above guarantees SOME column is non-zero here,
-    // so only the shape distinction remains.
+    host_uri_text_edits_all(edit, host_uri, |e| {
+        text_edit_preserves_line_prefixes(e, offset, region_end)
+    })
+}
+
+/// Per-edit form of [`workspace_edit_preserves_line_prefixes`], for response
+/// shapes that carry bare `TextEdit`s rather than a `WorkspaceEdit`
+/// (formatting-family responses, completion/inlayHint/colorPresentation item
+/// edits). Same contract: `false` means applying the edit verbatim would
+/// strip or omit the region's per-line host prefixes — callers must reject
+/// or drop, never clamp.
+pub(crate) fn text_edit_preserves_line_prefixes(
+    e: &TextEdit,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
+    let columns = offset.columns();
+    if columns.iter().all(|&column| column == 0) {
+        return true;
+    }
     let content_prefixed = columns.len() > 1;
     let boundary_at = |host_line: u32| {
         content_prefixed && region_end.character == 0 && host_line >= region_end.line
@@ -368,7 +386,7 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
                 .checked_sub(offset.line())
                 .is_some_and(|v| offset.column_for_line(v) > 0)
     };
-    host_uri_text_edits_all(edit, host_uri, |e| {
+    {
         let (start, end) = (e.range.start, e.range.end);
         // The boundary row's real prefix is unrecorded (0), so the per-line
         // floor can't protect it: even a same-line, no-newline insertion at
@@ -400,7 +418,7 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
             && (e.new_text.contains('\n') || e.new_text.contains('\r'))
             && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
         !touches_boundary && !spans_prefixed_line && !inserts_unprefixed_line
-    })
+    }
 }
 
 /// Whether every text edit targeting `host_uri` (across both the `changes` map
