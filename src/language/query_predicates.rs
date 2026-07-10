@@ -149,15 +149,16 @@ pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &
                 .filter(|c| Some(c.index) == capture_id)
                 .map(|c| c.node)
         };
-        // A node whose span doesn't slice as UTF-8 passes its check
-        // permissively, matching check_predicate's unreadable-text skip.
+        // A node whose span doesn't slice as UTF-8 cannot satisfy positive
+        // ANY predicates like #contains?: otherwise one stale capture would
+        // make the whole match pass.
         let node_text = |node: tree_sitter::Node| text.get(node.start_byte()..node.end_byte());
 
         let aggregate = match operator {
             "lua-match?" => nodes()
                 .all(|n| node_text(n).is_none_or(|t| check_lua_match(predicate.args.get(1), t))),
             "contains?" => any_or_vacuously_true(nodes(), |n| {
-                node_text(n).is_none_or(|t| check_contains(&predicate.args[1..], t))
+                node_text(n).is_some_and(|t| check_contains(&predicate.args[1..], t))
             }),
             // Neovim: vacuously true with no nodes, otherwise ANY node hit.
             "has-parent?" => {
@@ -543,6 +544,34 @@ mod tests {
         assert_eq!(
             accepted, 1,
             "#contains? should accept when any node of a quantified capture contains an argument"
+        );
+    }
+
+    #[test]
+    fn contains_match_predicate_rejects_unreadable_capture_node() {
+        let source_code = "fn target(foo: i32) {}";
+        let mut parser = Parser::new();
+        let language = tree_sitter_rust::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source_code, None).unwrap();
+        let root_node = tree.root_node();
+
+        let query = Query::new(
+            &language,
+            r#"
+            ((function_item
+                name: (identifier) @name)
+             (#contains? @name "target"))
+            "#,
+        )
+        .unwrap();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, root_node, source_code.as_bytes());
+        let match_ = matches.next().expect("query should match the parsed tree");
+
+        assert!(
+            !check_match_predicates(&query, match_, "x"),
+            "a stale capture whose byte span is unreadable must not satisfy #contains?"
         );
     }
 

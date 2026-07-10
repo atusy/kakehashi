@@ -98,14 +98,16 @@ fn apply_offset_to_position(
     // slicing at a raw byte_pos panics if it lands mid-codepoint (e.g. a
     // stale tree-sitter offset) — the caller's later clamp/snap only applies
     // to the *returned* value, not this internal slice.
-    let current_line_start = text[..floor_char_boundary(text, byte_pos)]
+    let snapped_byte_pos = floor_char_boundary(text, byte_pos);
+    let current_line_start = text[..snapped_byte_pos]
         .rfind('\n')
         .map(|i| i + 1)
         .unwrap_or(0);
 
     let target_line_start = if row_offset > 0 {
-        // Overshooting the last line stops at that line's start (matching the
-        // original whole-scan behavior), not the document end.
+        // Overshooting the last line stops row movement at that line's start
+        // (matching the original whole-scan behavior) before the original
+        // column and column offset are reapplied.
         let mut pos = current_line_start;
         for _ in 0..row_offset {
             match text[pos..].find('\n') {
@@ -125,7 +127,7 @@ fn apply_offset_to_position(
         pos
     };
 
-    let original_column = byte_pos.saturating_sub(current_line_start);
+    let original_column = snapped_byte_pos.saturating_sub(current_line_start);
     apply_column_offset(
         target_line_start.saturating_add(original_column),
         col_offset,
@@ -320,6 +322,17 @@ mod tests {
             apply_offset_to_position(text, 2, 1, 1),
             8,
             "row offsets should apply column deltas relative to the original column"
+        );
+    }
+
+    #[test]
+    fn test_apply_offset_to_position_out_of_bounds_uses_clamped_column() {
+        let text = "a\nb";
+
+        assert_eq!(
+            apply_offset_to_position(text, usize::MAX, 1, 0),
+            text.len(),
+            "stale out-of-bounds byte positions should not produce huge columns"
         );
     }
 
