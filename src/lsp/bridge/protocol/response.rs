@@ -145,15 +145,22 @@ pub(crate) fn transform_location_for_goto(
     None
 }
 
-/// Transform a single LocationLink to host coordinates for goto endpoints, applying
-/// the region offset to all of its ranges (targetRange, targetSelectionRange,
-/// originSelectionRange) and returning `None` to filter out a cross-region virtual URI.
+/// Transform a single LocationLink to host coordinates for goto endpoints.
+///
+/// `originSelectionRange` belongs to the requesting virtual document, so it is
+/// always translated to host coordinates. Target ranges are translated only when
+/// the target points back to the same virtual document; real-file targets are
+/// preserved as-is. Targets pointing at a different virtual URI are filtered
+/// out because cross-region offsets are unsafe.
 fn transform_location_link_for_goto(
     mut link: LocationLink,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> Option<LocationLink> {
+    if let Some(ref mut origin_range) = link.origin_selection_range {
+        translate_virtual_range_to_host(origin_range, offset);
+    }
     let uri_str = link.target_uri.as_str();
 
     // Case 1: NOT a virtual URI (real file reference) → preserve as-is
@@ -166,9 +173,6 @@ fn transform_location_link_for_goto(
         link.target_uri = host_uri.clone();
         translate_virtual_range_to_host(&mut link.target_range, offset);
         translate_virtual_range_to_host(&mut link.target_selection_range, offset);
-        if let Some(ref mut origin_range) = link.origin_selection_range {
-            translate_virtual_range_to_host(origin_range, offset);
-        }
         return Some(link);
     }
 

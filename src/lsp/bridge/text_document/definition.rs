@@ -101,6 +101,7 @@ mod tests {
     use super::super::super::protocol::transform_goto_response_to_host;
     use super::super::test_helpers::*;
     use super::*;
+    use tower_lsp_server::ls_types::Uri;
 
     // ==========================================================================
     // Definition request tests
@@ -509,7 +510,7 @@ mod tests {
         // target_selection_range: line 5 + 10 = 15
         assert_eq!(links[0].target_selection_range.start.line, 15);
         assert_eq!(links[0].target_selection_range.end.line, 15);
-        // origin_selection_range: line 2 + 10 = 12 (the bug: currently NOT transformed)
+        // origin_selection_range: line 2 + 10 = 12
         let origin = links[0]
             .origin_selection_range
             .expect("origin_selection_range should be present");
@@ -521,6 +522,54 @@ mod tests {
             origin.end.line, 12,
             "origin_selection_range end line should be translated from virtual (2) to host (12)"
         );
+        assert_eq!(origin.start.character, 4);
+        assert_eq!(origin.end.character, 9);
+    }
+
+    #[test]
+    fn definition_response_transforms_origin_selection_range_for_real_file_location_link() {
+        let virtual_uri = "file:///project/kakehashi-virtual-uri-region-0.lua";
+        let target_uri: Uri = "file:///project/lib.rs".parse().unwrap();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "originSelectionRange": {
+                        "start": { "line": 2, "character": 4 },
+                        "end": { "line": 2, "character": 9 }
+                    },
+                    "targetUri": target_uri.as_str(),
+                    "targetRange": {
+                        "start": { "line": 20, "character": 0 },
+                        "end": { "line": 22, "character": 1 }
+                    },
+                    "targetSelectionRange": {
+                        "start": { "line": 21, "character": 4 },
+                        "end": { "line": 21, "character": 9 }
+                    }
+                }
+            ]
+        });
+        let host_uri = test_host_uri();
+
+        let transformed = transform_goto_response_to_host(
+            response,
+            virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        )
+        .expect("real file LocationLink should be preserved");
+
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].target_uri, target_uri);
+        assert_eq!(transformed[0].target_range.start.line, 20);
+        assert_eq!(transformed[0].target_selection_range.start.line, 21);
+        let origin = transformed[0]
+            .origin_selection_range
+            .expect("origin_selection_range should be present");
+        assert_eq!(origin.start.line, 12);
+        assert_eq!(origin.end.line, 12);
         assert_eq!(origin.start.character, 4);
         assert_eq!(origin.end.character, 9);
     }
