@@ -137,6 +137,13 @@ kakehashi keeps answering `textDocument/diagnostic` from the client:
 - For push-driven downstream, serve their cached push slots from Path A via the
   `pushFallback` toggle.
 - Merge and respond. The advertised `diagnosticProvider` capability is unchanged.
+- The response is deterministically sorted (the same order as Path A's publish,
+  #423) and carries a **content-addressed `resultId`** (hash of the serialized
+  items — stateless, nothing to invalidate). A re-pull whose `previousResultId`
+  matches the recomputed id is answered with an `unchanged` report instead of
+  re-shipping the items: on a diagnostics-heavy host the full report is ~1 MB
+  (measured: ~2,235 items), and every `workspace/diagnostic/refresh`-induced
+  re-pull of a settled set previously re-shipped all of it.
 
 Path A writes the cache; Path B reads it for push-driven servers — one cache,
 two readers.

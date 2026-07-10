@@ -1,8 +1,10 @@
 ---
 source: tests/e2e_lsp_lua_diagnostic.rs
+assertion_line: 113
 expression: result
 ---
 {
   "kind": "full",
+  "resultId": "[content hash redacted]",
   "items": "[0 items redacted]"
 }

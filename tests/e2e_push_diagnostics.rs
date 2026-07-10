@@ -528,6 +528,97 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
 }
 
 #[test]
+fn e2e_pull_result_id_roundtrip_reports_unchanged() {
+    // LSP 3.17 pull diagnostics: the full report carries a resultId; a re-pull
+    // echoing it as previousResultId while the set is unchanged is answered
+    // with an `unchanged` report (no items re-shipped — on a diagnostics-heavy
+    // host the full report is ~1 MB, and every refresh-induced re-pull of a
+    // settled set previously re-shipped all of it). A content change makes the
+    // next pull full again, with a different id.
+    let (mut client, _config_dir) = init_client();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    // Wait for the spontaneous push so the folded set is stable across the two
+    // pulls below.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("the push-driven mock should push on didOpen");
+
+    let first = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    assert_eq!(first["result"]["kind"], "full");
+    let result_id = first["result"]["resultId"]
+        .as_str()
+        .expect("a full pull report carries a resultId")
+        .to_string();
+
+    // Same set + matching previousResultId → unchanged, same id, no items.
+    let second = client.send_request(
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": { "uri": MD_URI },
+            "previousResultId": result_id
+        }),
+    );
+    assert_eq!(
+        second["result"]["kind"], "unchanged",
+        "an unchanged set answered against a matching previousResultId re-ships nothing"
+    );
+    assert_eq!(second["result"]["resultId"], json!(result_id));
+    assert!(second["result"].get("items").is_none());
+
+    // A content change (the mock clears on didChange) invalidates the id: the
+    // next pull is full again with a different id. Wait for the cleared
+    // publish first so the cache settled.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
+        }),
+    );
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            cleared_host_diag,
+        )
+        .expect("the mock's empty push should clear the host set");
+
+    let third = client.send_request(
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": { "uri": MD_URI },
+            "previousResultId": result_id
+        }),
+    );
+    assert_eq!(
+        third["result"]["kind"], "full",
+        "a changed set must be answered full even with a previousResultId"
+    );
+    assert_ne!(
+        third["result"]["resultId"],
+        json!(result_id),
+        "the id is content-addressed, so a changed set gets a new one"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
 fn e2e_publish_seal_delivers_via_refresh_and_pull_only() {
     // The cross-layer gate for `textDocument/publishDiagnostics` doubles as a
     // wire seal: `priorities = []` stops the proactive publishes entirely (a

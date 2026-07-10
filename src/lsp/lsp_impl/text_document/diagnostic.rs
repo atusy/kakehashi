@@ -16,6 +16,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     Diagnostic, DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     FullDocumentDiagnosticReport, RelatedFullDocumentDiagnosticReport,
+    RelatedUnchangedDocumentDiagnosticReport, UnchangedDocumentDiagnosticReport,
 };
 use url::Url;
 
@@ -357,9 +358,24 @@ impl Kakehashi {
         // can't beget a refresh.
         self.diagnostics.mark_served(&uri, served_version);
 
-        Ok(make_diagnostic_report(combine_layer_diagnostics(
-            &layer_cfg, virt_items, host_items,
-        )))
+        let mut items = combine_layer_diagnostics(&layer_cfg, virt_items, host_items);
+        // Deterministic order: the fan-outs above complete in arbitrary order,
+        // and the result id below is a hash of the serialized items, so the
+        // same logical set must serialize identically across pulls (it also
+        // gives the editor a stable list order, matching the publish path #423).
+        crate::lsp::diagnostic_cache::sort_diagnostics(&mut items);
+
+        // Content-addressed result id (stateless): the client echoes the id it
+        // last received as `previousResultId`; when the recomputed id matches,
+        // an UNCHANGED report replaces the full item list. On a
+        // diagnostics-heavy host a full report is ~1 MB (measured: ~2,235
+        // items), and every `workspace/diagnostic/refresh`-induced re-pull of
+        // a settled set previously re-shipped all of it.
+        let result_id = diagnostic_result_id(&items);
+        if params.previous_result_id.as_deref() == Some(result_id.as_str()) {
+            return Ok(unchanged_diagnostic_report(result_id));
+        }
+        Ok(make_diagnostic_report(items, result_id))
     }
 
     /// pushFallback fold (Path B, #425): append push-driven servers' cached
@@ -710,14 +726,52 @@ async fn dispatch_preferred_diagnostics(
     }
 }
 
-/// Create a full diagnostic report from aggregated diagnostics.
-fn make_diagnostic_report(diagnostics: Vec<Diagnostic>) -> DocumentDiagnosticReportResult {
+/// Content-address a **sorted** pull result: the deterministic sort
+/// ([`sort_diagnostics`]) makes the serialization canonical, so the same
+/// logical set always hashes to the same id and any field change produces a
+/// different one. The length suffix is cheap insurance against a 64-bit
+/// collision making a changed set read as unchanged (the same accepted trade
+/// as the bridge's `document_tracker` content fingerprint). Stateless: the
+/// client echoes the id back as `previousResultId` and the handler just
+/// recomputes — nothing to invalidate.
+///
+/// [`sort_diagnostics`]: crate::lsp::diagnostic_cache::sort_diagnostics
+fn diagnostic_result_id(items: &[Diagnostic]) -> String {
+    // `to_string` on ls_types values cannot realistically fail (no non-string
+    // map keys); `unwrap_or_default` matches the sort tiebreak's idiom.
+    let serialized = serde_json::to_string(items).unwrap_or_default();
+    format!(
+        "{:016x}-{}",
+        crate::text::fnv1a_hash(&serialized),
+        items.len()
+    )
+}
+
+/// Create a full diagnostic report from aggregated diagnostics. `result_id`
+/// lets the client echo `previousResultId` on its next pull so an unchanged
+/// set can be answered with [`unchanged_diagnostic_report`].
+fn make_diagnostic_report(
+    diagnostics: Vec<Diagnostic>,
+    result_id: String,
+) -> DocumentDiagnosticReportResult {
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
             full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                result_id: None, // No result_id for aggregated multi-region response
+                result_id: Some(result_id),
                 items: diagnostics,
             },
+            related_documents: None,
+        },
+    ))
+}
+
+/// Create an UNCHANGED diagnostic report: the client's `previousResultId`
+/// matches the current set, so no items are re-shipped (LSP 3.17 pull
+/// diagnostics).
+fn unchanged_diagnostic_report(result_id: String) -> DocumentDiagnosticReportResult {
+    DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(
+        RelatedUnchangedDocumentDiagnosticReport {
+            unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport { result_id },
             related_documents: None,
         },
     ))
@@ -804,5 +858,55 @@ mod tests {
     fn combine_empty_priorities_yields_nothing() {
         let cfg = layer_cfg(vec![], AggregationStrategy::Concatenated);
         assert!(combine_layer_diagnostics(&cfg, vec![diag("virt")], vec![diag("host")]).is_empty());
+    }
+
+    #[test]
+    fn result_id_is_stable_across_fan_in_order() {
+        // The pull's fan-outs complete in arbitrary order; after the shared
+        // deterministic sort, permutations of the same logical set must hash to
+        // the same result id — otherwise a client's previousResultId would
+        // never match and unchanged reports would never fire.
+        let mut a = vec![diag("x"), diag("y"), diag("z")];
+        let mut b = vec![diag("z"), diag("x"), diag("y")];
+        crate::lsp::diagnostic_cache::sort_diagnostics(&mut a);
+        crate::lsp::diagnostic_cache::sort_diagnostics(&mut b);
+        assert_eq!(a, b, "the sort canonicalizes permutations");
+        assert_eq!(diagnostic_result_id(&a), diagnostic_result_id(&b));
+    }
+
+    #[test]
+    fn result_id_changes_with_any_content_change() {
+        let base = vec![diag("x"), diag("y")];
+        let mut changed_message = base.clone();
+        changed_message[1].message = "y'".to_string();
+        let mut changed_severity = base.clone();
+        changed_severity[0].severity = Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR);
+        let shrunk = vec![diag("x")];
+
+        let id = diagnostic_result_id(&base);
+        assert_ne!(id, diagnostic_result_id(&changed_message));
+        assert_ne!(id, diagnostic_result_id(&changed_severity));
+        assert_ne!(id, diagnostic_result_id(&shrunk));
+    }
+
+    #[test]
+    fn unchanged_report_carries_the_id_and_no_items() {
+        let report = unchanged_diagnostic_report("abc-1".to_string());
+        let serialized = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(serialized["kind"], "unchanged");
+        assert_eq!(serialized["resultId"], "abc-1");
+        assert!(
+            serialized.get("items").is_none(),
+            "an unchanged report re-ships no items"
+        );
+    }
+
+    #[test]
+    fn full_report_carries_the_result_id() {
+        let report = make_diagnostic_report(vec![diag("x")], "abc-1".to_string());
+        let serialized = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(serialized["kind"], "full");
+        assert_eq!(serialized["resultId"], "abc-1");
+        assert_eq!(serialized["items"].as_array().map(Vec::len), Some(1));
     }
 }
