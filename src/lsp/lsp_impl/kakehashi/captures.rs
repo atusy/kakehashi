@@ -2085,6 +2085,68 @@ mod tests {
             result.matches[0], sentinel,
             "the loser must serve the winner's memo, not run its own walk"
         );
+
+        // A winner-local cancellation must not cancel its unrelated joiner.
+        // Model a replacement winner completing immediately after the old
+        // guard wakes the joiner: the handler must re-loop and consume this
+        // memo. The former early `return Ok(None)` would fail this assertion.
+        service.inner().captures_walk_cache.remove(&key);
+        let cancelled_flight = std::sync::Arc::new(CapturesWalkFlight::new(
+            CapturesWalkTag {
+                incarnation,
+                generation,
+                parsed_version: 0,
+            },
+            crate::cancel::CancelToken::default(),
+        ));
+        service
+            .inner()
+            .captures_walk_inflight
+            .insert(key.clone(), std::sync::Arc::clone(&cancelled_flight));
+        let cancelled_guard = WalkFlightGuard {
+            map: &service.inner().captures_walk_inflight,
+            key: key.clone(),
+            flight: cancelled_flight,
+            cancel_on_drop: true,
+        };
+        let joined_after_cancel = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .kakehashi_captures_full(CapturesFullParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                        },
+                        kind: "highlights".to_string(),
+                        injection: false,
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!joined_after_cancel.is_finished());
+        drop(cancelled_guard);
+        let replacement = json!({"sentinel": "from-replacement-memo"});
+        service.inner().captures_walk_cache.insert(
+            key.clone(),
+            CachedCapturesWalk {
+                parsed_version: 0,
+                incarnation,
+                generation,
+                result: Some((
+                    std::sync::Arc::new(vec![replacement.clone()]),
+                    std::sync::Arc::new(Vec::new()),
+                )),
+            },
+        );
+        let result = joined_after_cancel
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("same-snapshot joiner must retry after winner cancellation");
+        assert_eq!(result.matches[0], replacement);
     }
 
     #[tokio::test(start_paused = true)]
