@@ -250,8 +250,9 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   merge — native immediately, bridged tokens replacing them later — not an
   ordering. Semantic tokens stay outside this mechanism (native-only today);
   the `merged` composition that brings them in is specified by
-  cross-layer-semantic-token-merge, which reuses this decision's `priorities`
-  ordering as its sweep-line layer rank.
+  [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md),
+  which reuses this decision's `priorities` ordering as its sweep-line layer
+  rank.
 
 ## Consequences
 

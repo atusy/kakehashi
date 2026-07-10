@@ -86,11 +86,11 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 3. If Tree-sitter response arrives first → return it immediately as provisional response
 4. When bridged response arrives → send updated tokens (via `textDocument/semanticTokens/full` refresh mechanism)
 
-The cross-layer-semantic-token-merge ADR refines this for the eventual merged
-semantic-token implementation: the instant response is deliberately
-native-first when `native` participates, then bridged/host tokens refine it
-through the merge. This row keeps Strategy 1's temporal shape, not its
-race-winner first-paint rule.
+The [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md) ADR
+refines this for the eventual merged semantic-token implementation: the instant
+response is deliberately native-first when `native` participates, then
+bridged/host tokens refine it through the merge. This row keeps Strategy 1's
+temporal shape, not its race-winner first-paint rule.
 
 **Rationale**: Users see instant syntax highlighting from Tree-sitter while richer type-aware tokens arrive asynchronously.
 
@@ -289,7 +289,7 @@ When multiple servers are configured for a language:
 
 | Method | Merging Strategy |
 |--------|------------------|
-| Semantic Tokens | *(aspirational — token bridging not implemented)* per-region winner by `priorities` rank; two-level sweep in cross-layer-semantic-token-merge |
+| Semantic Tokens | *(aspirational — token bridging not implemented)* per-region winner by `priorities` rank; two-level sweep in [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md) |
 | Go-to-Definition | Return first non-empty result (query in order) |
 | Find References | Concatenate all results, dedupe by location |
 | Completion | Merge completion lists from all servers |
@@ -306,7 +306,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 ### Positive
 
 - **Optimized UX per feature**: Each method gets the strategy that best fits its characteristics
-- **Fast visual feedback**: Native Tree-sitter semantic tokens appear instantly today; the parallel-fetch enrichment with bridged tokens is aspirational (cross-layer-semantic-token-merge)
+- **Fast visual feedback**: Native Tree-sitter semantic tokens appear instantly today; the parallel-fetch enrichment with bridged tokens is aspirational ([cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md))
 - **Accurate navigation**: Go-to-definition uses authoritative language server
 - **Safe editing**: Cross-file edits are filtered to prevent corruption
 - **Comprehensive diagnostics**: Aggregated from multiple sources
