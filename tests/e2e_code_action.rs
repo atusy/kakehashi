@@ -121,7 +121,16 @@ fn literal_support_caps(disabled_support: bool) -> Value {
 /// the applyEdit-relay e2e tests opt in, so every other test keeps the
 /// minimal capability surface.
 fn with_apply_edit(mut caps: Value) -> Value {
-    caps["workspace"] = json!({ "applyEdit": true });
+    // Merge instead of replacing `workspace`, so a caller that already
+    // declares other workspace.* capabilities keeps them.
+    match caps.get_mut("workspace") {
+        Some(Value::Object(workspace)) => {
+            workspace.insert("applyEdit".to_string(), json!(true));
+        }
+        _ => {
+            caps["workspace"] = json!({ "applyEdit": true });
+        }
+    }
     caps
 }
 
