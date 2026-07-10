@@ -11,7 +11,9 @@
 //! The host/virt distinction is made from the edit itself, not the connection:
 //! an edit that touches **no** virtual URIs (every edit from a host-layer
 //! connection, and real-file-only edits from virt connections) is forwarded
-//! verbatim. An edit that touches exactly one virtual document is translated
+//! as-is except that every `TextDocumentEdit.version` is nulled — downstream
+//! versions are bridge-local and would read as stale to the editor. An edit
+//! that touches exactly one virtual document is translated
 //! against that region's live offset (rebuilt exactly as goto/showDocument do,
 //! via [`resolve_region_offset`](super::region_offset::resolve_region_offset)).
 //!
@@ -75,9 +77,10 @@ impl ApplyEditTranslator {
         }
     }
 
-    /// Translate a virtual-document applyEdit to host coordinates; forward
-    /// `params` unchanged when the edit touches no virtual URIs. `Err` carries
-    /// the `failureReason` for a local `applied: false` answer — the edit must
+    /// Translate a virtual-document applyEdit to host coordinates; when the
+    /// edit touches no virtual URIs, forward `params` with only the
+    /// bridge-local `TextDocumentEdit.version`s nulled. `Err` carries the
+    /// `failureReason` for a local `applied: false` answer — the edit must
     /// not reach the editor. See the module docs for the exact behavior.
     pub(super) async fn translate(
         &self,
