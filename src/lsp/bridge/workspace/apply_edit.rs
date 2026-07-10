@@ -10,7 +10,10 @@
 //! loop rewrites virtual-document URIs + ranges back to the host document
 //! (see `ApplyEditTranslator` in `lsp_impl::apply_edit_translation`) before
 //! sending the edit to the editor, and answers untranslatable edits
-//! `applied: false` locally. This handler stays transport-only, exactly like
+//! `applied: false` locally. When the editor never declared the
+//! `workspace.applyEdit` capability, the loop answers every
+//! `workspace/applyEdit` request `applied: false` the same way. This handler
+//! stays transport-only, exactly like
 //! [`show_document`](crate::lsp::bridge::window::show_document).
 //!
 //! Like the other deferred handlers this **defers** its response on a spawned
@@ -34,7 +37,9 @@ use crate::lsp::bridge::actor::{
 const METHOD: &str = "workspace/applyEdit";
 
 /// Handle a `workspace/applyEdit` request, relaying the editor's
-/// `ApplyWorkspaceEditResponse` back to the downstream asynchronously.
+/// `ApplyWorkspaceEditResponse` back to the downstream asynchronously (the
+/// forwarding loop answers `applied: false` locally — no editor round-trip —
+/// when the editor never declared `workspace.applyEdit`).
 pub(in crate::lsp::bridge) fn handle(
     message: &serde_json::Value,
     id: jsonrpc::Id,

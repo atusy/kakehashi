@@ -183,7 +183,9 @@ pub(crate) enum UpstreamRequest {
     /// `failureReason`, `failedChange`) is relayed back — the downstream acts
     /// on the outcome. The forwarding loop translates virtual-document edits
     /// back to host coordinates before the editor sees them, and answers
-    /// untranslatable edits `applied: false` locally (#568).
+    /// untranslatable edits — and every `workspace/applyEdit` request when
+    /// the editor never declared the `workspace.applyEdit` capability —
+    /// `applied: false` locally (#568).
     ApplyEdit {
         params: tower_lsp_server::ls_types::ApplyWorkspaceEditParams,
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
@@ -253,11 +255,14 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) window_tx: mpsc::Sender<UpstreamNotification>,
     /// Downstream-initiated requests forwarded to the editor with a response
     /// relayed back (`window/showMessageRequest`, `window/showDocument`,
-    /// `workspace/applyEdit`). Unbounded: a dropped request would hang the
-    /// downstream. See [`UpstreamRequest`].
+    /// `workspace/applyEdit` — answered locally when the editor lacks the
+    /// capability). Unbounded: a dropped request would hang the downstream.
+    /// See [`UpstreamRequest`].
     pub(crate) upstream_request_tx: mpsc::UnboundedSender<UpstreamRequest>,
     /// Tracks in-flight forwarded requests so a downstream `$/cancelRequest`
     /// (or connection death) can cancel the editor-bound request (#404).
+    /// (Capability-gated applyEdits are registered too, though answered
+    /// locally.)
     pub(crate) inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     /// The folders this connection currently serves, used to answer downstream
     /// `workspace/workspaceFolders` pulls. Mutable: a `preferSharedInstance`
@@ -897,7 +902,8 @@ async fn handle_message(
 }
 
 /// Handle an inbound downstream `$/cancelRequest`: if it targets a forwarded
-/// request still in flight (`window/showMessageRequest` / `window/showDocument`),
+/// request still in flight (`window/showMessageRequest`, `window/showDocument`,
+/// or a supported `workspace/applyEdit`),
 /// cancel the editor-bound request so its dialog is dismissed (#404). The id is
 /// parsed as a [`jsonrpc::Id`] exactly as the original request's id was, so the
 /// registry key matches. Ids that aren't tracked (e.g. the bridge's own outbound
@@ -957,10 +963,12 @@ async fn handle_server_request(
         .unwrap_or_default();
     let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Deferred request handlers forward to the editor and relay its response
-    // back asynchronously (the editor may pend on user interaction), so they own
-    // their entire response lifecycle on a spawned task rather than returning a
-    // synchronous `body` to frame-and-send below.
+    // Deferred request handlers forward to the editor (or, for a
+    // workspace/applyEdit the editor never declared support for, answer
+    // locally) and relay the response back asynchronously (the editor may
+    // pend on user interaction), so they own their entire response lifecycle
+    // on a spawned task rather than returning a synchronous `body` to
+    // frame-and-send below.
     match method {
         "window/showMessageRequest" => {
             window::show_message_request::handle(&message, id, server_prefix, deps);
@@ -1016,7 +1024,8 @@ async fn handle_server_request(
 ///
 /// Used both by the synchronous dispatch in [`handle_server_request`] and by the
 /// deferred request handlers ([`window::show_message_request`],
-/// [`window::show_document`]) that relay an editor response back asynchronously.
+/// [`window::show_document`], [`workspace::apply_edit`]) that relay a
+/// response back asynchronously.
 ///
 /// We use [`OutboundMessage::Untracked`] because a server-initiated response has
 /// no [`ResponseRouter`] entry to clean up on failure (unlike `Tracked`

@@ -126,11 +126,13 @@ fn build_baseline_capabilities(
         workspace: Some(WorkspaceClientCapabilities {
             // The bridge handles inbound `workspace/applyEdit` (#568 PR 5),
             // translating virtual-document edits to the host document and
-            // relaying the editor's response. Advertise it so a spec-compliant
-            // downstream server actually issues applyEdit (e.g. rust-analyzer's
-            // "extract into function") instead of assuming the client can't
-            // apply edits.
-            apply_edit: Some(true),
+            // relaying the editor's response — but the relay terminates at the
+            // EDITOR, so the capability is only honest when the editor itself
+            // declared `workspace.applyEdit`. Gated in
+            // `merge_upstream_capabilities` (like `window.workDoneProgress`):
+            // withheld here, advertised downstream only when the editor
+            // genuinely supports it.
+            apply_edit: None,
             // The bridge executes a surfaced command via `workspace/executeCommand`
             // (#568 PR 6), so advertise the client capability — a spec-compliant
             // server may withhold command-carrying actions otherwise. No dynamic
@@ -178,7 +180,9 @@ fn build_baseline_capabilities(
 /// `signatureHelp.signatureInformation`, `window.workDoneProgress`,
 /// `window.showDocument`, `window.showMessage`,
 /// `workspace.workspaceEdit` (mirrored minus `changeAnnotationSupport` — see
-/// the merge site for why annotations are withheld).
+/// the merge site for why annotations are withheld), and `workspace.applyEdit`
+/// (gated on the editor genuinely declaring it — the relay terminates at the
+/// editor).
 ///
 /// `window.workDoneProgress` and `window.showDocument` are gated on the real
 /// upstream editor so the bridge only invites a downstream server-initiated
@@ -319,6 +323,23 @@ fn merge_upstream_capabilities(
         base.workspace
             .get_or_insert_with(Default::default)
             .workspace_edit = Some(mirrored);
+    }
+
+    // --- workspace.applyEdit (gated on real upstream support) ---
+    // The bridge can only relay a downstream `workspace/applyEdit` to an
+    // editor that declared the capability itself; advertising it regardless
+    // would invite requests the bridge can only answer `applied: false`.
+    // Same gating rationale as `window.workDoneProgress` below. An explicit
+    // `false` or an absent value stays unadvertised.
+    if upstream
+        .workspace
+        .as_ref()
+        .and_then(|w| w.apply_edit)
+        .unwrap_or(false)
+    {
+        base.workspace
+            .get_or_insert_with(Default::default)
+            .apply_edit = Some(true);
     }
 
     // --- window.workDoneProgress (gated on real upstream support) ---
@@ -471,6 +492,41 @@ mod tests {
                 .is_none(),
             "an editor that omits workspaceEdit implies documentChanges:false — do not overclaim"
         );
+    }
+
+    #[test]
+    fn apply_edit_gated_on_upstream_declaration() {
+        use tower_lsp_server::ls_types::WorkspaceClientCapabilities;
+
+        // Editor declares workspace.applyEdit → advertised downstream.
+        let upstream = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                apply_edit: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        assert_eq!(
+            merged.workspace.as_ref().and_then(|w| w.apply_edit),
+            Some(true)
+        );
+
+        // Editor silent (or explicit false) → withheld: the bridge could only
+        // ever answer applied:false, so inviting applyEdits would overclaim.
+        let merged =
+            build_bridge_client_capabilities(Some(&ClientCapabilities::default()), true, false);
+        assert_eq!(merged.workspace.as_ref().and_then(|w| w.apply_edit), None);
+
+        let upstream_false = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                apply_edit: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = build_bridge_client_capabilities(Some(&upstream_false), true, false);
+        assert_eq!(merged.workspace.as_ref().and_then(|w| w.apply_edit), None);
     }
 
     #[test]
@@ -910,6 +966,8 @@ mod tests {
                     ]),
                     ..Default::default()
                 }),
+                // Neovim's default capabilities declare applyEdit.
+                apply_edit: Some(true),
                 ..Default::default()
             }),
             text_document: Some(TextDocumentClientCapabilities {

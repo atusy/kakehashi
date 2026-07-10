@@ -111,7 +111,34 @@ fn literal_support_caps(disabled_support: bool) -> Value {
     if disabled_support {
         code_action["disabledSupport"] = json!(true);
     }
-    json!({ "textDocument": { "codeAction": code_action } })
+    json!({
+        "textDocument": { "codeAction": code_action },
+    })
+}
+
+/// Add `workspace.applyEdit` to a capability set. The bridge relays
+/// downstream `workspace/applyEdit` only to editors that declare it; only
+/// the applyEdit-relay e2e tests opt in, so every other test keeps the
+/// minimal capability surface.
+fn with_apply_edit(mut caps: Value) -> Value {
+    // A capability set is always a JSON object; fail with a clear message
+    // instead of the opaque panic Value's index-assign raises on, say, an
+    // array.
+    assert!(
+        caps.is_object(),
+        "with_apply_edit expects a capability object, got: {caps:?}"
+    );
+    // Merge instead of replacing `workspace`, so a caller that already
+    // declares other workspace.* capabilities keeps them.
+    match caps.get_mut("workspace") {
+        Some(Value::Object(workspace)) => {
+            workspace.insert("applyEdit".to_string(), json!(true));
+        }
+        _ => {
+            caps["workspace"] = json!({ "applyEdit": true });
+        }
+    }
+    caps
 }
 
 /// Literal support PLUS dataSupport + resolveSupport — the client can hold a
@@ -435,7 +462,8 @@ fn executing_a_bridged_command_routes_back_and_relays_the_server_applyedit() {
     // server with the ORIGINAL name; the server answers by asking the client to
     // apply an edit (host-translated by the bridge) and returns a result the
     // bridge relays verbatim.
-    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    let (mut client, init_response, _config_dir) =
+        init_client(with_apply_edit(literal_support_caps(true)));
     assert_advertised(&init_response);
     open_markdown(&mut client);
 
@@ -890,7 +918,8 @@ fn palette_fired_command_routes_to_its_origin_server() {
     // from the palette, keyed off the advertised executeCommandProvider.commands
     // — routes to the server that advertised it (recorded at handshake), not just
     // commands surfaced through a bridged code action.
-    let (mut client, init_response, _config_dir) = init_client(literal_support_caps(true));
+    let (mut client, init_response, _config_dir) =
+        init_client(with_apply_edit(literal_support_caps(true)));
     assert_advertised(&init_response);
     open_markdown(&mut client);
     // Drive a codeAction so mock-codeaction handshakes and registers "mock.run".
