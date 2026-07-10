@@ -114,8 +114,8 @@ pub(crate) struct DiscoveredBridgeRegion {
     /// `InjectionMap` (same `get_or_create` on the same node).
     pub region_id: String,
     /// The exact virtual-document text the bridge opens downstream: excluded
-    /// prefixes are removed for a single region, while host-only gaps in an
-    /// `injection.combined` group are masked with coordinate-preserving spaces.
+    /// prefixes are removed, while an `injection.combined` group preserves host
+    /// line numbers with empty lines and uses spaces for later gaps on a line.
     pub content: String,
 }
 

@@ -505,15 +505,17 @@ pub(crate) struct ResolvedInjection {
     /// Language of the injection content
     pub injection_language: String,
     /// Extracted virtual document content. Excluded line prefixes are stripped;
-    /// combined regions additionally mask host-only gaps with whitespace.
+    /// combined regions additionally retain host line layout with empty or
+    /// whitespace-only gaps.
     pub virtual_content: String,
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.
     pub line_column_offsets: Vec<u32>,
-    /// Whether `virtual_content` maps to one contiguous host byte range —
-    /// i.e. no host-only span between multiple captures was whitespace-masked.
-    /// A combined pattern that currently matches one capture uses the ordinary
-    /// single-region mapping and remains `true`.
+    /// Whether `virtual_content` maps through the ordinary single-region path.
+    /// For a multi-capture combined document this is `false` whenever the union
+    /// of included ranges leaves uncovered host bytes, including inter-capture
+    /// gaps and excluded prefix/child bytes. A combined pattern that currently
+    /// matches one capture uses the ordinary mapping and remains `true`.
     pub contiguous: bool,
 }
 
