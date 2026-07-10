@@ -4,6 +4,7 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -412,8 +413,10 @@ fn clean_url(url: &str) -> &str {
 ///
 /// Strategy:
 /// 1. If the URL is a GitHub HTTPS URL, try downloading the archive tarball.
-/// 2. If ordinary archive download/extraction fails (or URL is not GitHub), fall back to git clone.
-/// 3. If archive metadata is unsafe, fail closed without clone fallback.
+/// 2. If ordinary archive download/read errors occur (or URL is not GitHub),
+///    fall back to git clone.
+/// 3. If archive metadata is unsafe or local extraction I/O fails, fail closed
+///    without clone fallback.
 fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
     validate_parser_source_metadata(url, revision)?;
 
@@ -510,63 +513,128 @@ fn download_and_extract_archive(
         }
 
         let safe_relative = safe_archive_relative_path(&relative)?;
+        if safe_relative.as_os_str().is_empty() {
+            continue;
+        }
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(ParserInstallError::UnsafeArchive(format!(
                 "Link entry rejected in archive: {}",
-                safe_relative.display()
+                escaped_path(&safe_relative)
             )));
         }
         if !entry_type.is_dir() && !entry_type.is_file() {
             return Err(ParserInstallError::UnsafeArchive(format!(
                 "Unsupported entry type rejected in archive: {}",
-                safe_relative.display()
+                escaped_path(&safe_relative)
             )));
         }
 
-        let target = dest.join(&safe_relative);
-
         if entry_type.is_dir() {
-            fs::create_dir_all(&target)?;
+            create_archive_dir(dest, &safe_relative)?;
         } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            entry.unpack(&target).map_err(|e| {
-                ParserInstallError::ArchiveError(format!(
-                    "Failed to extract {}: {}",
-                    safe_relative.display(),
-                    e
-                ))
-            })?;
+            unpack_archive_file_entry(&mut entry, dest, &safe_relative)?;
         }
     }
 
     Ok(())
 }
 
+fn unpack_archive_file_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    dest: &Path,
+    safe_relative: &Path,
+) -> Result<(), ParserInstallError> {
+    let target = ensure_archive_parent(dest, safe_relative)?;
+    let mut output = fs::File::create(&target).map_err(|e| {
+        ParserInstallError::IoError(io::Error::new(
+            e.kind(),
+            format!("Failed to create {}: {}", escaped_path(safe_relative), e),
+        ))
+    })?;
+    io::copy(entry, &mut output).map_err(|e| {
+        ParserInstallError::IoError(io::Error::new(
+            e.kind(),
+            format!("Failed to extract {}: {}", escaped_path(safe_relative), e),
+        ))
+    })?;
+    Ok(())
+}
+
+fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ParserInstallError> {
+    let target = ensure_archive_parent(dest, safe_relative)?;
+    if fs::symlink_metadata(&target)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(ParserInstallError::UnsafeArchive(format!(
+            "Archive path crosses symlink: {}",
+            escaped_path(safe_relative)
+        )));
+    }
+    fs::create_dir_all(&target)?;
+    Ok(())
+}
+
+fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, ParserInstallError> {
+    let target = dest.join(safe_relative);
+    let Some(parent_relative) = safe_relative.parent() else {
+        return Ok(target);
+    };
+    let mut current = dest.to_path_buf();
+    for component in parent_relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ParserInstallError::UnsafeArchive(format!(
+                    "Archive path crosses symlink: {}",
+                    escaped_path(safe_relative)
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+            }
+            Err(e) => return Err(ParserInstallError::IoError(e)),
+        }
+    }
+    Ok(target)
+}
+
 fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ParserInstallError> {
     let mut safe = PathBuf::new();
     for component in path.components() {
         match component {
-            std::path::Component::Normal(part) => safe.push(part),
+            std::path::Component::Normal(part) => {
+                let mut components = Path::new(part).components();
+                if !matches!(components.next(), Some(std::path::Component::Normal(roundtrip)) if roundtrip == part)
+                    || components.next().is_some()
+                {
+                    return Err(ParserInstallError::UnsafeArchive(format!(
+                        "Unsafe path detected in archive: {}",
+                        escaped_path(path)
+                    )));
+                }
+                safe.push(part);
+            }
             std::path::Component::CurDir => {}
             _ => {
                 return Err(ParserInstallError::UnsafeArchive(format!(
                     "Unsafe path detected in archive: {}",
-                    path.display()
+                    escaped_path(path)
                 )));
             }
         }
     }
-    if safe.as_os_str().is_empty() {
-        return Err(ParserInstallError::UnsafeArchive(format!(
-            "Unsafe path detected in archive: {}",
-            path.display()
-        )));
-    }
     Ok(safe)
+}
+
+fn escaped_path(path: &Path) -> String {
+    path.display().to_string().escape_default().to_string()
 }
 
 /// Derive the expected root directory name inside a GitHub archive tarball.
@@ -1495,17 +1563,36 @@ mod tests {
 
     #[test]
     fn safe_archive_relative_path_rejects_non_normal_components() {
-        for path in [Path::new("../payload"), Path::new(".")] {
-            match safe_archive_relative_path(path) {
-                Err(ParserInstallError::UnsafeArchive(message)) => {
-                    assert!(
-                        message.contains("Unsafe path detected"),
-                        "expected unsafe path message, got: {message}"
-                    );
-                }
-                other => panic!("expected unsafe archive path error for {path:?}, got {other:?}"),
+        match safe_archive_relative_path(Path::new("../payload")) {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
+                assert!(
+                    message.contains("Unsafe path detected"),
+                    "expected unsafe path message, got: {message}"
+                );
             }
+            other => panic!("expected unsafe archive path error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn safe_archive_relative_path_escapes_untrusted_path_in_error() {
+        match safe_archive_relative_path(Path::new("../bad\npath")) {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
+                assert!(
+                    message.contains("../bad\\npath"),
+                    "expected escaped control character in path, got: {message}"
+                );
+            }
+            other => panic!("expected unsafe archive path error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safe_archive_relative_path_allows_empty_current_dir() {
+        assert_eq!(
+            safe_archive_relative_path(Path::new(".")).expect("current dir is skipped later"),
+            PathBuf::new()
+        );
     }
 
     #[cfg(unix)]
@@ -1565,6 +1652,36 @@ mod tests {
         assert!(
             !payload_path.exists(),
             "archive extraction must not write through a symlink outside dest"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_and_extract_archive_rejects_preexisting_symlink_parent() {
+        let temp = tempdir().expect("temp dir");
+        let outside = temp.path().join("outside");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::create_dir_all(&dest).expect("create dest dir");
+        std::os::unix::fs::symlink(&outside, dest.join("out")).expect("create symlink");
+        let payload_path = outside.join("payload");
+        let archive = archive_with_file("parser-1.0.0", "out/payload", b"escaped");
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
+
+        match result {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
+                assert!(
+                    message.contains("Archive path crosses symlink: out/payload"),
+                    "expected preexisting symlink rejection, got: {message}"
+                );
+            }
+            other => panic!("expected symlink-parent UnsafeArchive, got {other:?}"),
+        }
+        assert!(
+            !payload_path.exists(),
+            "archive extraction must not write through a preexisting symlink"
         );
     }
 
@@ -1685,6 +1802,29 @@ mod tests {
         encoder.finish().expect("finish gzip")
     }
 
+    fn archive_with_file(root: &str, relative: &str, payload: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tar::{Builder, Header};
+
+        let mut tar = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar);
+            let mut header = Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{root}/{relative}"), payload)
+                .expect("append payload");
+            builder.finish().expect("finish tar");
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).expect("compress tar");
+        encoder.finish().expect("finish gzip")
+    }
+
     fn malicious_hardlink_archive(root: &str) -> Vec<u8> {
         use flate2::Compression;
         use flate2::write::GzEncoder;
@@ -1780,9 +1920,24 @@ mod tests {
 
     fn serve_once(body: Vec<u8>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
         let addr = listener.local_addr().expect("local addr");
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            };
             let mut request = [0; 1024];
             let _ = stream.read(&mut request);
             let response = format!(
