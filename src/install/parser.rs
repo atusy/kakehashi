@@ -547,6 +547,17 @@ fn unpack_archive_file_entry<R: Read>(
     safe_relative: &Path,
 ) -> Result<(), ParserInstallError> {
     let target = ensure_archive_parent(dest, safe_relative)?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ParserInstallError::UnsafeArchive(format!(
+                "Archive path crosses symlink: {}",
+                escaped_path(safe_relative)
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ParserInstallError::IoError(e)),
+    }
     let mut output = fs::File::create(&target).map_err(|e| {
         ParserInstallError::IoError(io::Error::new(
             e.kind(),
@@ -1682,6 +1693,37 @@ mod tests {
         assert!(
             !payload_path.exists(),
             "archive extraction must not write through a preexisting symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_and_extract_archive_rejects_preexisting_symlink_target() {
+        let temp = tempdir().expect("temp dir");
+        let outside = temp.path().join("outside");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::create_dir_all(&dest).expect("create dest dir");
+        let outside_payload = outside.join("payload");
+        std::os::unix::fs::symlink(&outside_payload, dest.join("payload"))
+            .expect("create symlink target");
+        let archive = archive_with_file("parser-1.0.0", "payload", b"escaped");
+        let archive_url = serve_once(archive);
+
+        let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
+
+        match result {
+            Err(ParserInstallError::UnsafeArchive(message)) => {
+                assert!(
+                    message.contains("Archive path crosses symlink: payload"),
+                    "expected preexisting symlink target rejection, got: {message}"
+                );
+            }
+            other => panic!("expected symlink-target UnsafeArchive, got {other:?}"),
+        }
+        assert!(
+            !outside_payload.exists(),
+            "archive extraction must not write through a preexisting file symlink"
         );
     }
 
