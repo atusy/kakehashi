@@ -323,7 +323,7 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
 /// Translate an action's edit host-ward with resolve-grade validation, in
 /// place. Returns `Err(reason)` (leaving the edit partially mutated — the caller
 /// must discard the action and disable it with `reason`) when the edit can't be
-/// faithfully represented in the host document. The reason distinguishes two
+/// faithfully represented in the host document. The reason distinguishes three
 /// permanent failures the client shows to the user:
 /// - [`REASON_CROSS_REGION`] — the edit touches another injection region (the
 ///   shared transform would silently filter those and partially apply the rest),
@@ -334,6 +334,9 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
 /// - [`REASON_RESOLVE`] — the edit ended up empty: the server produced nothing
 ///   applicable, which reads as "could not be resolved to an applicable edit",
 ///   not "cannot be represented in the host document".
+/// - [`REASON_PREFIXED_REGION`] — the translated edit spans or inserts lines in
+///   a line-prefixed (e.g. blockquote) region; the verbatim newText would strip
+///   the prefixes and corrupt the host document.
 ///
 /// Used by BOTH the initial-response policy and the codeAction/resolve path so
 /// these are rejected uniformly, never partially applied.
@@ -1190,8 +1193,8 @@ pub(crate) fn bridge_code_actions(
 
 const REASON_RESOLVE: &str = "this action could not be resolved to an applicable edit";
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
-const REASON_PREFIXED_REGION: &str =
-    "the edit would break the host document's line prefixes around the injected region";
+const REASON_PREFIXED_REGION: &str = "the edit would break the host document's line prefixes \
+     (e.g. a blockquote) around the injected region";
 
 fn bridge_code_action(
     item: CodeActionOrCommand,

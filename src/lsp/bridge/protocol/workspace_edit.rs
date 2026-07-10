@@ -1,9 +1,14 @@
 //! WorkspaceEdit coordinate transformation from virtual to host documents.
 //!
-//! Shared by response paths that carry a `WorkspaceEdit` produced against a
-//! virtual document — rename today; codeAction and workspace/applyEdit will
-//! reuse it (#568). Per LSP spec a WorkspaceEdit may carry edits via `changes`
-//! (URI→TextEdit map) or `documentChanges`; both are handled.
+//! Shared by the response paths that carry a `WorkspaceEdit` produced against
+//! a virtual document: rename, codeAction, and workspace/applyEdit (#568).
+//! Per LSP spec a WorkspaceEdit may carry edits via `changes` (URI→TextEdit
+//! map) or `documentChanges`; both are handled.
+//!
+//! The guards below ([`workspace_edit_within_region`],
+//! [`workspace_edit_preserves_line_prefixes`]) are enforced by codeAction and
+//! applyEdit; rename still calls the bare transform and adopts both guards in
+//! a follow-up PR.
 
 use std::collections::HashMap;
 
