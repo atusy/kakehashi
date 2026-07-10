@@ -312,14 +312,23 @@ impl Kakehashi {
         };
 
         // Both layers fan out concurrently; the layer strategy decides the
-        // combine. Cancel drops both in-flight layer futures.
+        // combine. Cancel drops both in-flight layer futures. The RAII sweep
+        // cleans stale upstream-registry entries on every exit (completion,
+        // cancel, or the request future being dropped) — it fires only after
+        // both layer futures are dropped/settled, so no live sharer of the
+        // id can be wiped. Sweeping while dropped futures unwind is safe:
+        // cancel forwarding captures its targets before notifying, and the
+        // pool tolerates entries unregistered out of order.
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard {
+            pool: pool.clone(),
+            id: upstream_request_id.clone(),
+        };
         let combined = async { tokio::join!(virt_fut, host_fut) };
         let (mut virt_items, mut host_items) = match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
                     biased;
                     _ = &mut cancel_rx => {
-                        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
                         return Err(tower_lsp_server::jsonrpc::Error::request_cancelled());
                     }
                     result = combined => result,
@@ -327,14 +336,6 @@ impl Kakehashi {
             }
             None => combined.await,
         };
-
-        // Clean up stale upstream registry entries once all layer tasks have
-        // completed. On the cancel path above the sweep runs BEFORE the
-        // dropped futures unwind — safe because cancel forwarding
-        // captures its targets before notifying, and the pool tolerates
-        // entries unregistered out of order (see forward_cancel_by
-        // _upstream_id_with_notify).
-        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
         // pushFallback (Path B, #425): the live pulls above cover only
         // pull-driven servers (capability-gated). Fold in push-driven servers'

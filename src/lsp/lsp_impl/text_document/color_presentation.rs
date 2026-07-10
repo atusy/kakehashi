@@ -33,6 +33,13 @@ impl Kakehashi {
 
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
+        // RAII sweep: virt-only handler with no layer race or outer sweep —
+        // clean stale registry entries on every exit, including a dropped
+        // request future (dispatch_preferred aborts losers without joining).
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard {
+            pool: pool.clone(),
+            id: ctx.document.upstream_request_id.clone(),
+        };
         let range = ctx.range;
         let result = dispatch_preferred(
             &ctx.document,
@@ -57,7 +64,6 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
 
         result
             .handle(&self.client, "color presentation", Vec::new(), Ok)

@@ -48,20 +48,12 @@ fn capability_prefilter_applies(method: &str) -> bool {
     )
 }
 
-/// All resolved context needed to send bridge requests to multiple servers.
-///
-/// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
-/// configs for the injection language, enabling fan-out to multiple downstream
-/// servers via [`fan_out()`](crate::lsp::aggregation::server::fan_out::fan_out).
-///
-/// This is the document-level context (no position). Position-based handlers
-/// use [`PositionRequestContext`] which wraps this struct.
 /// RAII sweep of the upstream-request registry for one request id: on drop,
 /// removes every entry a dropped/aborted layer future did not get to
 /// unregister itself. Idempotent with the arms' own refcounted unregisters.
-/// Hold it across a layer race so the sweep runs on every exit — normal
-/// completion, `?`, cancellation, and even the whole request future being
-/// dropped.
+/// Hold it across a layer race (or a standalone dispatch with no outer
+/// sweep) so the sweep runs on every exit — normal completion, `?`,
+/// cancellation, and even the whole request future being dropped.
 pub(crate) struct UpstreamRegistrySweepGuard {
     pub(crate) pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
     pub(crate) id: Option<UpstreamId>,
@@ -73,6 +65,14 @@ impl Drop for UpstreamRegistrySweepGuard {
     }
 }
 
+/// All resolved context needed to send bridge requests to multiple servers.
+///
+/// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
+/// configs for the injection language, enabling fan-out to multiple downstream
+/// servers via [`fan_out()`](crate::lsp::aggregation::server::fan_out::fan_out).
+///
+/// This is the document-level context (no position). Position-based handlers
+/// use [`PositionRequestContext`] which wraps this struct.
 pub(crate) struct DocumentRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
