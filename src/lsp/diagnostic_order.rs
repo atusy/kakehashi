@@ -1,13 +1,19 @@
 use tower_lsp_server::ls_types::Diagnostic;
 
 pub(crate) fn sort_diagnostics_deterministically(diagnostics: &mut [Diagnostic]) {
-    diagnostics.sort_by(|a, b| {
-        diagnostic_position_key(a)
-            .cmp(&diagnostic_position_key(b))
-            .then_with(|| a.message.cmp(&b.message))
-            .then_with(|| a.source.cmp(&b.source))
-            .then_with(|| a.severity.cmp(&b.severity))
-            .then_with(|| canonical_json_string(a).cmp(&canonical_json_string(b)))
+    // Cached key: the canonical-JSON tiebreaker serializes the whole
+    // diagnostic, so computing it per COMPARISON (O(n log n) times, twice
+    // each) would dominate the sort — compute every component once per
+    // element instead. Key order preserves the previous comparator's
+    // tie-break semantics exactly.
+    diagnostics.sort_by_cached_key(|d| {
+        (
+            diagnostic_position_key(d),
+            d.message.clone(),
+            d.source.clone(),
+            d.severity,
+            canonical_json_string(d),
+        )
     });
 }
 
