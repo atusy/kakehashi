@@ -627,14 +627,16 @@ fn unpack_archive_file_entry<R: Read>(
 
 fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ArchiveFetchError> {
     let target = ensure_archive_parent(dest, safe_relative)?;
-    if fs::symlink_metadata(&target)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(ArchiveFetchError::Unsafe(format!(
-            "Archive path crosses symlink: {}",
-            escaped_path(safe_relative)
-        )));
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive path crosses symlink: {}",
+                escaped_path(safe_relative)
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ArchiveFetchError::Io(error)),
     }
     fs::create_dir_all(&target)?;
     Ok(())
