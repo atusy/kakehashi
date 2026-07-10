@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use log::warn;
-use tower_lsp_server::ls_types::CompletionItem;
+use tower_lsp_server::ls_types::{CompletionItem, Position};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
@@ -182,9 +182,30 @@ impl LanguageServerPool {
         match parse_completion_resolve_response(response) {
             Some(mut resolved) => {
                 let offset = RegionOffset::from(&envelope.offset);
-                transform_completion_item(&mut resolved, &offset);
-                re_envelope_item(&mut resolved, &envelope);
-                resolved
+                // The envelope has no region-content snapshot, so the real
+                // region end is unknown here. Assume a single-line region —
+                // the strictest setting for the prefix-safety guard (it can
+                // only over-strip in PREFIXED regions; unprefixed regions
+                // pass the guard's fast path untouched).
+                let region_end = Position {
+                    line: offset.line(),
+                    character: u32::MAX,
+                };
+                if transform_completion_item(&mut resolved, &offset, region_end) {
+                    re_envelope_item(&mut resolved, &envelope);
+                    resolved
+                } else {
+                    // The resolved primary edit would corrupt region line
+                    // prefixes — serve the original (already host-translated,
+                    // guard-passed) item instead of a corrupting one.
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "completionItem/resolve: resolved item from {} would break region line prefixes; serving unresolved item",
+                        server_name
+                    );
+                    re_envelope_item(&mut item, &envelope);
+                    item
+                }
             }
             None => {
                 re_envelope_item(&mut item, &envelope);

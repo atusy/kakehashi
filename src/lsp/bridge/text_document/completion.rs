@@ -17,7 +17,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    response_has_jsonrpc_error,
+    region_host_end, response_has_jsonrpc_error, text_edit_preserves_line_prefixes,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -64,9 +64,11 @@ impl LanguageServerPool {
                 build_completion_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| {
+                let region_end = region_host_end(virtual_content, ctx.offset);
                 transform_completion_response_to_host(
                     response,
                     ctx.offset,
+                    region_end,
                     Some(EnvelopeContext {
                         server_name,
                         host_uri: host_uri.as_str(),
@@ -104,6 +106,7 @@ fn build_completion_request(
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
+    region_end: Position,
     envelope_ctx: Option<EnvelopeContext<'_>>,
 ) -> Option<CompletionList> {
     if response_has_jsonrpc_error(&response, "textDocument/completion") {
@@ -132,12 +135,24 @@ fn transform_completion_response_to_host(
         list
     };
 
-    // Transform all items in the list, then optionally envelope for resolve routing
-    for item in &mut list.items {
-        transform_completion_item(item, offset);
+    // Transform all items in the list (dropping any whose primary edit would
+    // corrupt region line prefixes), then optionally envelope for resolve routing
+    let before = list.items.len();
+    list.items.retain_mut(|item| {
+        if !transform_completion_item(item, offset, region_end) {
+            return false;
+        }
         if let Some(ref ctx) = envelope_ctx {
             envelope_item_data(item, ctx);
         }
+        true
+    });
+    let dropped = before - list.items.len();
+    if dropped > 0 {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "completion: dropped {dropped} item(s) whose text edit would break region line prefixes"
+        );
     }
 
     Some(list)
@@ -147,26 +162,63 @@ fn transform_completion_response_to_host(
 ///
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
 /// additionalTextEdits if present.
-pub(super) fn transform_completion_item(item: &mut CompletionItem, offset: &RegionOffset) {
+///
+/// Returns `false` when the item's primary text edit would corrupt per-line
+/// region prefixes (e.g. blockquote `> `) if applied verbatim — the caller
+/// must drop the whole item (same fail-closed rule as WorkspaceEdit
+/// bridging). Unsafe `additionalTextEdits` are merely stripped: the primary
+/// insertion still works without them, so the item stays useful.
+pub(super) fn transform_completion_item(
+    item: &mut CompletionItem,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
                 translate_virtual_range_to_host(&mut edit.range, offset);
+                if !text_edit_preserves_line_prefixes(edit, offset, region_end) {
+                    return false;
+                }
             }
             tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
                 translate_virtual_range_to_host(&mut edit.insert, offset);
                 translate_virtual_range_to_host(&mut edit.replace, offset);
+                // Check both ranges through one probe edit, moving new_text in
+                // and out instead of cloning it per range.
+                let mut probe = tower_lsp_server::ls_types::TextEdit {
+                    range: edit.insert,
+                    new_text: std::mem::take(&mut edit.new_text),
+                };
+                let insert_ok = text_edit_preserves_line_prefixes(&probe, offset, region_end);
+                probe.range = edit.replace;
+                let replace_ok = text_edit_preserves_line_prefixes(&probe, offset, region_end);
+                edit.new_text = probe.new_text;
+                if !insert_ok || !replace_ok {
+                    return false;
+                }
             }
         }
     }
 
-    // Transform additional_text_edits if present
+    // Transform additional_text_edits if present, stripping any that would
+    // break region line prefixes.
     if let Some(ref mut additional_edits) = item.additional_text_edits {
-        for edit in additional_edits {
+        let before = additional_edits.len();
+        for edit in additional_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
         }
+        additional_edits.retain(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end));
+        let dropped = before - additional_edits.len();
+        if dropped > 0 {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "completion: stripped {dropped} additionalTextEdit(s) that would break region line prefixes"
+            );
+        }
     }
+    true
 }
 
 // =============================================================================
@@ -287,6 +339,13 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
+    /// A region end far past any test edit: keeps the prefix-safety guard out
+    /// of the way for tests that exercise coordinate translation only.
+    const TEST_REGION_END: Position = Position {
+        line: u32::MAX,
+        character: u32::MAX,
+    };
+
     // ==========================================================================
     // Completion request tests
     // ==========================================================================
@@ -350,6 +409,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
             None,
         );
 
@@ -379,8 +439,12 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_completion_response"}))]
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed =
-            transform_completion_response_to_host(response, &RegionOffset::new(3, 0), None);
+        let transformed = transform_completion_response_to_host(
+            response,
+            &RegionOffset::new(3, 0),
+            TEST_REGION_END,
+            None,
+        );
         assert!(transformed.is_none());
     }
 
@@ -405,6 +469,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
             None,
         );
 
@@ -453,6 +518,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
             None,
         );
 
@@ -498,6 +564,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
             None,
         );
 
@@ -536,8 +603,12 @@ mod tests {
             }
         });
 
-        let transformed =
-            transform_completion_response_to_host(response, &RegionOffset::new(10, 4), None);
+        let transformed = transform_completion_response_to_host(
+            response,
+            &RegionOffset::new(10, 4),
+            TEST_REGION_END,
+            None,
+        );
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -573,8 +644,12 @@ mod tests {
             }
         });
 
-        let transformed =
-            transform_completion_response_to_host(response, &RegionOffset::new(10, 4), None);
+        let transformed = transform_completion_response_to_host(
+            response,
+            &RegionOffset::new(10, 4),
+            TEST_REGION_END,
+            None,
+        );
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -614,8 +689,12 @@ mod tests {
             }
         });
 
-        let transformed =
-            transform_completion_response_to_host(response, &RegionOffset::new(5, 7), None);
+        let transformed = transform_completion_response_to_host(
+            response,
+            &RegionOffset::new(5, 7),
+            TEST_REGION_END,
+            None,
+        );
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(ref edit)) =
@@ -657,8 +736,12 @@ mod tests {
             }
         });
 
-        let transformed =
-            transform_completion_response_to_host(response, &RegionOffset::new(5, 3), None);
+        let transformed = transform_completion_response_to_host(
+            response,
+            &RegionOffset::new(5, 3),
+            TEST_REGION_END,
+            None,
+        );
 
         let list = transformed.unwrap();
         let edits = list.items[0].additional_text_edits.as_ref().unwrap();
@@ -730,6 +813,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
             None,
         );
 
@@ -899,5 +983,104 @@ mod tests {
         };
         let json = serde_json::to_value(&offset).expect("should serialize");
         assert!(json.get("line_column_offsets").is_none());
+    }
+
+    #[test]
+    fn transform_drops_prefix_breaking_items_in_blockquote_regions() {
+        // Blockquote region (per-line `> ` widths plus the trailing
+        // boundary-row zero), content host lines 3-4, region end (5, 0).
+        // An item whose primary textEdit inserts a newline behind the prefix
+        // would produce an unprefixed continuation line — the whole item must
+        // be dropped. A same-line item survives.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "unsafe",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 3 } },
+                                "newText": "multi\nline" } },
+                { "label": "safe",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 3 } },
+                                "newText": "single" } }
+            ]
+        });
+
+        let list =
+            transform_completion_response_to_host(response, &offset, region_end, None).unwrap();
+
+        assert_eq!(list.items.len(), 1, "prefix-breaking item must be dropped");
+        assert_eq!(list.items[0].label, "safe");
+    }
+
+    #[test]
+    fn transform_strips_prefix_breaking_additional_edits_but_keeps_item() {
+        // An import-style additionalTextEdit that inserts a raw newline at a
+        // prefixed line would break the `> ` prefix — strip just that edit;
+        // the item's primary insertion still works.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "item",
+                  "textEdit": { "range": { "start": { "line": 1, "character": 0 },
+                                           "end": { "line": 1, "character": 3 } },
+                                "newText": "single" },
+                  "additionalTextEdits": [
+                      { "range": { "start": { "line": 0, "character": 0 },
+                                   "end": { "line": 0, "character": 0 } },
+                        "newText": "import x\n" },
+                      { "range": { "start": { "line": 0, "character": 0 },
+                                   "end": { "line": 0, "character": 2 } },
+                        "newText": "ok" }
+                  ] }
+            ]
+        });
+
+        let list =
+            transform_completion_response_to_host(response, &offset, region_end, None).unwrap();
+
+        assert_eq!(list.items.len(), 1, "item with safe primary edit is kept");
+        let additional = list.items[0].additional_text_edits.as_ref().unwrap();
+        assert_eq!(additional.len(), 1, "newline-inserting edit is stripped");
+        assert_eq!(additional[0].new_text, "ok");
+    }
+
+    #[test]
+    fn transform_drops_prefix_breaking_insert_replace_items() {
+        // InsertReplaceEdit variant: reject when EITHER range is unsafe.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "unsafe",
+                  "textEdit": { "insert": { "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 3 } },
+                                "replace": { "start": { "line": 0, "character": 0 },
+                                             "end": { "line": 1, "character": 3 } },
+                                "newText": "x" } }
+            ]
+        });
+
+        let list =
+            transform_completion_response_to_host(response, &offset, region_end, None).unwrap();
+
+        assert!(
+            list.items.is_empty(),
+            "item whose replace range spans a prefixed line must be dropped"
+        );
     }
 }

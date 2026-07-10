@@ -7,14 +7,15 @@ use std::io;
 
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{
-    Color, ColorPresentation, ColorPresentationParams, Range, TextDocumentIdentifier,
+    Color, ColorPresentation, ColorPresentationParams, Position, Range, TextDocumentIdentifier,
 };
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    translate_host_range_to_virtual, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
+    response_has_jsonrpc_error, text_edit_preserves_line_prefixes, translate_host_range_to_virtual,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -60,7 +61,10 @@ impl LanguageServerPool {
                     request_id,
                 )
             },
-            |response, ctx| transform_color_presentation_response_to_host(response, ctx.offset),
+            |response, ctx| {
+                let region_end = region_host_end(virtual_content, ctx.offset);
+                transform_color_presentation_response_to_host(response, ctx.offset, region_end)
+            },
         )
         .await
     }
@@ -102,6 +106,7 @@ fn build_color_presentation_request(
 fn transform_color_presentation_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
+    region_end: Position,
 ) -> Vec<ColorPresentation> {
     if response_has_jsonrpc_error(&response, "textDocument/colorPresentation") {
         return vec![];
@@ -120,17 +125,45 @@ fn transform_color_presentation_response_to_host(
         Err(_) => return vec![],
     };
 
-    // Transform textEdit and additionalTextEdits ranges to host coordinates
-    for presentation in &mut presentations {
+    // Transform textEdit and additionalTextEdits ranges to host coordinates,
+    // then drop any presentation whose edits would break region line prefixes
+    // (e.g. blockquote `> `) if applied verbatim. Unlike completion, the
+    // primary textEdit is not separable from the presentation (without it the
+    // editor falls back to inserting the label, still at the unguarded
+    // range), so an unsafe textEdit drops the whole presentation; unsafe
+    // additionalTextEdits are merely stripped.
+    let before = presentations.len();
+    presentations.retain_mut(|presentation| {
         if let Some(text_edit) = &mut presentation.text_edit {
             translate_virtual_range_to_host(&mut text_edit.range, offset);
+            if !text_edit_preserves_line_prefixes(text_edit, offset, region_end) {
+                return false;
+            }
         }
 
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
+            let before = additional_edits.len();
             for edit in additional_edits.iter_mut() {
                 translate_virtual_range_to_host(&mut edit.range, offset);
             }
+            additional_edits
+                .retain(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end));
+            let stripped = before - additional_edits.len();
+            if stripped > 0 {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "colorPresentation: stripped {stripped} additionalTextEdit(s) that would break region line prefixes"
+                );
+            }
         }
+        true
+    });
+    let dropped = before - presentations.len();
+    if dropped > 0 {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "colorPresentation: dropped {dropped} presentation(s) whose textEdit would break region line prefixes"
+        );
     }
 
     presentations
@@ -141,6 +174,13 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    /// A region end far past any test edit: keeps the prefix-safety guard out
+    /// of the way for tests that exercise coordinate translation only.
+    const TEST_REGION_END: Position = Position {
+        line: u32::MAX,
+        character: u32::MAX,
+    };
 
     // ==========================================================================
     // Color presentation request tests
@@ -444,6 +484,7 @@ mod tests {
         let presentations = transform_color_presentation_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
         );
 
         assert_eq!(presentations.len(), 1);
@@ -491,6 +532,7 @@ mod tests {
         let presentations = transform_color_presentation_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
         );
 
         assert_eq!(presentations.len(), 1);
@@ -522,6 +564,7 @@ mod tests {
         let presentations = transform_color_presentation_response_to_host(
             response,
             &RegionOffset::new(region_start_line, 0),
+            TEST_REGION_END,
         );
 
         assert_eq!(presentations.len(), 3);
@@ -537,8 +580,11 @@ mod tests {
     fn color_presentation_response_returns_empty_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let presentations =
-            transform_color_presentation_response_to_host(response, &RegionOffset::new(5, 0));
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &RegionOffset::new(5, 0),
+            TEST_REGION_END,
+        );
         assert!(presentations.is_empty());
     }
 
@@ -546,8 +592,56 @@ mod tests {
     fn color_presentation_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let presentations =
-            transform_color_presentation_response_to_host(response, &RegionOffset::new(5, 0));
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            &RegionOffset::new(5, 0),
+            TEST_REGION_END,
+        );
         assert!(presentations.is_empty());
+    }
+
+    #[test]
+    fn color_presentation_drops_prefix_breaking_presentations() {
+        // Blockquote region, content host lines 3-4, region end (5, 0). A
+        // presentation whose textEdit spans prefixed lines is dropped whole
+        // (the label fallback would insert at the same unsafe range); an
+        // unsafe additionalTextEdit is stripped from a kept presentation.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "label": "unsafe",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 1, "character": 2 } },
+                                "newText": "#fff" } },
+                { "label": "safe",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 4 } },
+                                "newText": "#fff" },
+                  "additionalTextEdits": [
+                      { "range": { "start": { "line": 1, "character": 0 },
+                                   "end": { "line": 1, "character": 0 } },
+                        "newText": "x\n" }
+                  ] }
+            ]
+        });
+
+        let presentations =
+            transform_color_presentation_response_to_host(response, &offset, region_end);
+
+        assert_eq!(presentations.len(), 1, "unsafe presentation is dropped");
+        assert_eq!(presentations[0].label, "safe");
+        assert_eq!(
+            presentations[0]
+                .additional_text_edits
+                .as_ref()
+                .map(Vec::len),
+            Some(0),
+            "prefix-breaking additionalTextEdit is stripped"
+        );
     }
 }
