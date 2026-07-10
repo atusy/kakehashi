@@ -186,6 +186,7 @@ pub(super) struct HostDocSyncState {
 /// phantom "opened" document that suppresses every later didOpen.
 struct OpenClaimGuard {
     tracker: Arc<DocumentTracker>,
+    claim: Arc<tokio::sync::Notify>,
     transition: Arc<tokio::sync::Mutex<()>>,
     transition_locks: Arc<OpenTransitionLocks>,
     host_uri: Url,
@@ -208,6 +209,7 @@ impl Drop for OpenClaimGuard {
             return;
         }
         let tracker = Arc::clone(&self.tracker);
+        let claim = Arc::clone(&self.claim);
         let transition = Arc::clone(&self.transition);
         let transition_locks = Arc::clone(&self.transition_locks);
         let host_uri = self.host_uri.clone();
@@ -217,7 +219,7 @@ impl Drop for OpenClaimGuard {
             runtime.spawn(async move {
                 let transition_guard = transition.lock().await;
                 tracker
-                    .rollback_open_claim(&host_uri, &virtual_uri, &connection_key)
+                    .rollback_open_claim_if(&host_uri, &virtual_uri, &connection_key, &claim)
                     .await;
                 drop(transition_guard);
                 let key = (connection_key, virtual_uri.to_uri_string());
@@ -963,12 +965,16 @@ impl LanguageServerPool {
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         let transition = self.open_transition_lock(virtual_uri, connection_key);
-        let _transition_guard = transition.lock().await;
-        if !self
+        let transition_guard = transition.lock().await;
+        let claim = if self
             .document_tracker
             .try_claim_for_open(virtual_uri, connection_key)
             .await
         {
+            self.document_tracker
+                .open_claim_waiter(virtual_uri, connection_key)
+                .expect("successful claim must have an identity")
+        } else {
             if self
                 .document_tracker
                 .is_document_opened_on_connection(virtual_uri, connection_key)
@@ -986,13 +992,23 @@ impl LanguageServerPool {
                 .try_claim_for_open(virtual_uri, connection_key)
                 .await
             {
+                drop(transition_guard);
+                self.remove_open_transition_lock_if_unshared(
+                    virtual_uri,
+                    connection_key,
+                    &transition,
+                );
                 return Err(io::Error::other(
                     "bridge: virtual document claim did not settle",
                 ));
             }
-        }
+            self.document_tracker
+                .open_claim_waiter(virtual_uri, connection_key)
+                .expect("successful reclaim must have an identity")
+        };
         let mut claim_guard = OpenClaimGuard {
             tracker: Arc::clone(&self.document_tracker),
+            claim: Arc::clone(&claim),
             transition: Arc::clone(&transition),
             transition_locks: Arc::clone(&self.open_transition_locks),
             host_uri: host_uri.clone(),
@@ -1011,16 +1027,22 @@ impl LanguageServerPool {
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
-                .rollback_open_claim(host_uri, virtual_uri, connection_key)
+                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
                 .await;
             claim_guard.disarm();
+            drop(claim_guard);
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(e);
         }
         if !self
             .document_tracker
-            .mark_open_sent(virtual_uri, connection_key)
+            .mark_open_sent(virtual_uri, connection_key, &claim)
         {
             claim_guard.disarm();
+            drop(claim_guard);
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(io::Error::other(
                 "bridge: didOpen claim invalidated during enqueue",
             ));
@@ -3485,6 +3507,13 @@ mod tests {
             !pool.is_document_opened(&virtual_uri),
             "Claim should be rolled back on send failure"
         );
+        assert!(
+            !pool.open_transition_locks.contains_key(&(
+                ConnectionKey::for_server("lua"),
+                virtual_uri.to_uri_string()
+            )),
+            "failed open must reclaim its transition lock entry"
+        );
     }
 
     #[tokio::test]
@@ -3565,6 +3594,12 @@ mod tests {
             .expect("retry task should not panic")
             .expect("retry should enqueue didOpen");
         assert!(rx.try_recv().is_ok(), "a later didOpen must be retryable");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            pool.document_tracker
+                .is_document_opened_on_connection(&virtual_uri, &connection_key),
+            "the aborted owner's delayed rollback must not erase the successor claim"
+        );
     }
 
     #[tokio::test]

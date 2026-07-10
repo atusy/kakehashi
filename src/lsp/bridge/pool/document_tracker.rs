@@ -171,7 +171,6 @@ impl DocumentTracker {
         true
     }
 
-    #[cfg(test)]
     pub(super) fn open_claim_waiter(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -197,11 +196,14 @@ impl DocumentTracker {
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
+        expected_claim: &Arc<tokio::sync::Notify>,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
         let Some((_, notify)) = self
             .open_claims
-            .remove(&(connection_key.clone(), uri_string.clone()))
+            .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
+                Arc::ptr_eq(claim, expected_claim)
+            })
         else {
             return false;
         };
@@ -271,10 +273,12 @@ impl DocumentTracker {
     ) {
         self.register_pending_document(host_uri, virtual_uri, connection_key)
             .await;
-        self.open_claims
+        let claim = self
+            .open_claims
             .entry((connection_key.clone(), virtual_uri.to_uri_string()))
-            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
-        assert!(self.mark_open_sent(virtual_uri, connection_key));
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        assert!(self.mark_open_sent(virtual_uri, connection_key, &claim));
     }
 
     /// Register close-cleanup ownership without exposing the document to
@@ -538,9 +542,31 @@ impl DocumentTracker {
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-    ) {
-        self.unclaim_document(virtual_uri, connection_key).await;
+    ) -> bool {
+        let Some(claim) = self.open_claim_waiter(virtual_uri, connection_key) else {
+            return false;
+        };
+        self.rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
+            .await
+    }
+
+    pub(super) async fn rollback_open_claim_if(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        expected_claim: &Arc<tokio::sync::Notify>,
+    ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
+        let Some((_, notify)) = self
+            .open_claims
+            .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
+                Arc::ptr_eq(claim, expected_claim)
+            })
+        else {
+            return false;
+        };
+        self.unclaim_document(virtual_uri, connection_key).await;
         let mut host_map = self.host_to_virtual.lock().await;
         if let Some(docs) = host_map.get_mut(host_uri) {
             docs.retain(|doc| {
@@ -552,12 +578,8 @@ impl DocumentTracker {
             }
         }
         drop(host_map);
-        if let Some((_, notify)) = self
-            .open_claims
-            .remove(&(connection_key.clone(), uri_string))
-        {
-            notify.notify_waiters();
-        }
+        notify.notify_waiters();
+        true
     }
 
     /// Snapshot (without removing) every virtual document currently open for a
