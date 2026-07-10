@@ -55,18 +55,11 @@ impl CancelToken {
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering;
-            let remaining = self.polls_before_cancel.load(Ordering::Relaxed);
-            if remaining > 0
-                && self
-                    .polls_before_cancel
-                    .compare_exchange(
-                        remaining,
-                        remaining - 1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                && remaining == 1
+            if self.polls_before_cancel.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |remaining| (remaining > 0).then_some(remaining - 1),
+            ) == Ok(1)
             {
                 self.inner.cancel();
             }
