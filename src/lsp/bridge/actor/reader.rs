@@ -254,8 +254,9 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) window_tx: mpsc::Sender<UpstreamNotification>,
     /// Downstream-initiated requests forwarded to the editor with a response
     /// relayed back (`window/showMessageRequest`, `window/showDocument`,
-    /// `workspace/applyEdit`). Unbounded: a dropped request would hang the
-    /// downstream. See [`UpstreamRequest`].
+    /// `workspace/applyEdit` — answered locally when the editor lacks the
+    /// capability). Unbounded: a dropped request would hang the downstream.
+    /// See [`UpstreamRequest`].
     pub(crate) upstream_request_tx: mpsc::UnboundedSender<UpstreamRequest>,
     /// Tracks in-flight forwarded requests so a downstream `$/cancelRequest`
     /// (or connection death) can cancel the editor-bound request (#404).

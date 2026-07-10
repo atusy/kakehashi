@@ -993,7 +993,9 @@ fn coalesce_upstream_batch(
 
 /// Service a downstream-initiated request by forwarding it to the editor on a
 /// detached task and relaying the editor's answer through the request's `reply`
-/// oneshot.
+/// oneshot. (Exception: a `workspace/applyEdit` the editor never declared
+/// support for is answered `applied: false` locally, without an editor
+/// round-trip.)
 ///
 /// Spawned (not awaited) so the shared forwarding loop keeps draining
 /// notifications while the editor — possibly a human — takes its time. On editor
@@ -1018,7 +1020,8 @@ fn coalesce_upstream_batch(
 /// `client.*` call returns `Err` promptly and the task ends.
 ///
 /// Why not bound this as flood protection? A request flood from an
-/// adversarial/buggy downstream propagates to the editor either way — exactly as
+/// adversarial/buggy downstream propagates to the editor either way (modulo
+/// the capability-gated applyEdit local answer) — exactly as
 /// it would if the editor spoke to that server directly, with no bridge. The
 /// bridge cannot shield the client from such floods, and rate-limiting
 /// client-facing requests is the *client's* responsibility; the bridge's job is
@@ -2991,7 +2994,10 @@ mod tests {
 
         // The reply arrives WITHOUT any editor round-trip (no response is ever
         // fed to `_responses`), proving the request was answered locally.
-        let response = reply_rx.await.expect("reply delivered");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .expect("a local answer must arrive without any editor round-trip")
+            .expect("reply delivered");
         // And nothing was emitted toward the editor: the request stream must
         // be empty (a regression that both forwards and answers locally would
         // otherwise pass).
