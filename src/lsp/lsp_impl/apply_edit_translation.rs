@@ -27,12 +27,22 @@
 //! coordinates cannot be trusted, so it is rejected with `applied: false`
 //! instead of silently un-versioning it. Versions on REAL-file edits are
 //! nulled without validation, as before: they are equally bridge-local (a
-//! host-layer didOpen starts its own counter), but the bridge tracks host
-//! documents in a separate per-connection tracker keyed by server name, not
-//! [`ConnectionKey`], and the editor-side freshness of a host edit is the
-//! editor's own version check to make — nulling ("apply without check") is
-//! the spec-sanctioned degradation there, while validating host versions is
-//! follow-up hardening.
+//! host-layer didOpen starts its own counter), but a real-file edit may
+//! target a file the bridge never synced at all (a downstream can edit any
+//! file it knows from disk), and the host-document sync state lives in a
+//! separate tracker (`LanguageServerPool::host_documents`) not exposed to
+//! this translator — nulling ("apply without a version check") is the
+//! spec-sanctioned degradation there, and the editor still applies host
+//! edits against its own live buffer. Validating host-document versions
+//! through that tracker is follow-up hardening.
+//!
+//! The validation is a point-in-time read, not a lock: a content-changing
+//! `didChange` can still race in between the check and the editor applying
+//! the edit (exactly as it always could for the unversioned majority shape).
+//! The check narrows the stale window to that race instead of accepting
+//! arbitrarily old revisions; CLOSING it needs a bridge→editor version
+//! mapping so the editor can do the atomic check itself — also follow-up
+//! hardening (see `strip_bridge_local_versions`).
 //!
 //! Unlike `window/showDocument` — which degrades by dropping the selection —
 //! an applyEdit whose coordinates can't be trusted must **not** be forwarded:

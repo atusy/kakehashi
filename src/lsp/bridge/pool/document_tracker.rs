@@ -381,11 +381,20 @@ impl DocumentTracker {
     /// versions a `TextDocumentEdit` pins the edit to the content revision it
     /// computed against, and the bridge rejects the edit when that revision is
     /// no longer the one it last synced.
+    ///
+    /// Gated on CONFIRMED opened state (the reverse index, promoted only after
+    /// the didOpen is enqueued), not just the version map: `try_claim_for_open`
+    /// seeds the version at claim time, BEFORE the didOpen reaches the FIFO,
+    /// so reading the bare map would let a versioned edit validate against a
+    /// revision the downstream was never actually given.
     pub(super) async fn document_version(
         &self,
         virtual_uri: &str,
         connection_key: &ConnectionKey,
     ) -> Option<i32> {
+        if !self.is_virtual_doc_open_on_connection(virtual_uri, connection_key) {
+            return None;
+        }
         self.document_versions
             .lock()
             .await
@@ -1075,6 +1084,36 @@ mod tests {
             version,
             Some(2),
             "Version should be available immediately after claim (1 → 2)"
+        );
+    }
+
+    /// `document_version` (the applyEdit validation read) must NOT see a
+    /// pre-send claim: the claim seeds the version map before the didOpen
+    /// reaches the FIFO, but the downstream was never given that revision, so
+    /// a versioned edit must not validate against it. Only a confirmed open
+    /// (reverse-index promotion) exposes the version.
+    #[tokio::test]
+    async fn document_version_hidden_until_open_confirmed() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        let uri_string = virtual_uri.to_uri_string();
+
+        assert!(tracker.try_claim_for_open(&virtual_uri, &conn).await);
+        assert_eq!(
+            tracker.document_version(&uri_string, &conn).await,
+            None,
+            "a pre-send claim must stay invisible to the applyEdit validation"
+        );
+
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        assert_eq!(
+            tracker.document_version(&uri_string, &conn).await,
+            Some(1),
+            "a confirmed open exposes the didOpen version"
         );
     }
 
