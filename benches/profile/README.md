@@ -32,6 +32,11 @@ python3 benches/profile/drive.py \
 python3 benches/profile/drive.py \
   --bin ./target/release/kakehashi \
   --file path/to/input.md --requests 20 --edits 1 --concurrent-captures
+
+# Send superseding requests in bursts to measure cancellation pressure.
+python3 benches/profile/drive.py \
+  --bin ./target/release/kakehashi \
+  --file path/to/input.md --requests 20 --burst 8 --burst-edits
 ```
 
 The driver reports per-method p50/p90/max request-to-response latency, exact

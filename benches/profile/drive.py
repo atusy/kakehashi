@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Synchronously drive the kakehashi server through a heavy semanticTokens load.
+"""Drive the kakehashi server through a heavy semanticTokens load.
 
-Unlike piping a static session, this waits for each response before sending the
-next request, so the server never coalesces/cancels a superseded request (it
-would otherwise answer most with `-32800 Canceled` and do no real work). Run the
-server under a sampler (samply/flamegraph) with this as the driver so the sampled
-process actually spends its time in the semantic-tokens hot path.
+By default this waits for each response before sending the next request, so every
+request completes real work. `--burst N --burst-edits` instead reproduces rapid
+typing and measures how promptly superseded work releases the compute pool. Run
+the server under a sampler (samply/flamegraph) with the synchronous default so
+the sampled process actually spends its time in the semantic-tokens hot path.
 
 Usage:
     drive.py --bin ./target/profiling/kakehashi --lang rust --size 150 --requests 300
@@ -36,6 +36,7 @@ class RequestSummary:
     count: int
     ok: int
     canceled: int
+    null: int
     errors: int
     p50_ms: float
     p90_ms: float
@@ -56,12 +57,66 @@ def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
         count=len(samples),
         ok=statuses["ok"],
         canceled=statuses["canceled"],
+        null=statuses["null"],
         errors=statuses["error"],
         p50_ms=percentile(0.5),
         p90_ms=percentile(0.9),
         max_ms=latencies[-1],
         wire_bytes=sum(sample.wire_bytes for sample in samples),
     )
+
+
+def response_status(message: dict) -> str:
+    error = message.get("error")
+    if not error:
+        return "null" if "result" in message and message["result"] is None else "ok"
+    return "canceled" if error.get("code") == -32800 else "error"
+
+
+def count_semantic_outcomes(
+    responses: list[dict], previous_tokens: int
+) -> tuple[int, int, int, int]:
+    ok = 0
+    canceled = 0
+    superseded = 0
+    tokens = previous_tokens
+    for response in responses:
+        status = response_status(response)
+        if status == "canceled":
+            canceled += 1
+        elif status == "null":
+            superseded += 1
+        elif status == "error":
+            raise RuntimeError(
+                f"server error (not a cancellation): {response['error']}"
+            )
+        else:
+            ok += 1
+            tokens = len((response.get("result") or {}).get("data", [])) // 5
+    return ok, canceled, superseded, tokens
+
+
+def next_toggle_change(
+    first_line_len: int, line_has_extra: bool
+) -> tuple[dict, bool]:
+    grow = not line_has_extra
+    if grow:
+        change = {
+            "range": {
+                "start": {"line": 0, "character": first_line_len},
+                "end": {"line": 0, "character": first_line_len},
+            },
+            "text": "x",
+        }
+    else:
+        change = {
+            "range": {
+                "start": {"line": 0, "character": first_line_len},
+                "end": {"line": 0, "character": first_line_len + 1},
+            },
+            "text": "",
+        }
+    return change, grow
 
 
 def main() -> None:
@@ -74,6 +129,17 @@ def main() -> None:
     ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
+    ap.add_argument(
+        "--burst", type=int, default=1,
+        help="send this many semantic-token requests back-to-back per cycle; "
+             "reproduces supersession/cancellation pressure")
+    ap.add_argument(
+        "--burst-edits", action="store_true",
+        help="toggle a real edit between requests in each burst so every request "
+             "targets a newer snapshot")
+    ap.add_argument(
+        "--burst-delay-ms", type=float, default=1.0,
+        help="typing interval between a burst request and the next edit")
     ap.add_argument("--file", help="drive with this file's content instead of a "
                                    "generated document (language inferred from the "
                                    "extension, falling back to --lang)")
@@ -104,6 +170,14 @@ def main() -> None:
     args = ap.parse_args()
     if args.requests <= 0:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
+    if args.burst <= 0:
+        ap.error("--burst must be positive")
+    if args.burst_edits and args.burst <= 1:
+        ap.error("--burst-edits requires --burst greater than 1")
+    if args.burst_delay_ms < 0:
+        ap.error("--burst-delay-ms must be non-negative")
+    if args.burst > 1 and (args.captures or args.concurrent_captures):
+        ap.error("--burst cannot be combined with captures modes")
 
     if args.file:
         if args.file.endswith(".md"):
@@ -179,12 +253,6 @@ def main() -> None:
             if m.get("id") == want_id:
                 return m, wire_bytes
 
-    def response_status(message):
-        error = message.get("error")
-        if not error:
-            return "ok"
-        return "canceled" if error.get("code") == -32800 else "error"
-
     def measured_request(method, params):
         started = time.perf_counter()
         response, wire_bytes = request(method, params)
@@ -219,6 +287,36 @@ def main() -> None:
             responses[method] = message
         return responses
 
+    def measured_repeated(method, params, count, before_next=None, delay_seconds=0):
+        pending = {}
+        request_ids = []
+        for index in range(count):
+            request_id = send_request(method, params)
+            request_ids.append(request_id)
+            pending[request_id] = time.perf_counter()
+            if index + 1 < count and before_next is not None:
+                if delay_seconds > 0:
+                    time.sleep(delay_seconds)
+                before_next()
+
+        responses = {}
+        while pending:
+            message, wire_bytes = read_message()
+            if message.get("method"):
+                record_notification(message, wire_bytes)
+                continue
+            request_id = message.get("id")
+            if request_id not in pending:
+                continue
+            started = pending.pop(request_id)
+            request_samples[method].append(RequestSample(
+                seconds=time.perf_counter() - started,
+                wire_bytes=wire_bytes,
+                status=response_status(message),
+            ))
+            responses[request_id] = message
+        return [responses[request_id] for request_id in request_ids]
+
     # Drive inside try/finally so any error (e.g. a server error raised in the
     # loop, or a shutdown timeout) still reaps the server instead of leaving a
     # stray process behind.
@@ -233,7 +331,7 @@ def main() -> None:
         if args.settle > 0:
             time.sleep(args.settle)  # let the initial parse settle
 
-        ok, canceled, tokens = 0, 0, 0
+        ok, canceled, superseded, tokens = 0, 0, 0, 0
         version = 1
         # LSP `character` offsets are UTF-16 code units, not Unicode code
         # points — a non-ASCII first line would make the edit range invalid.
@@ -241,24 +339,22 @@ def main() -> None:
         t0 = time.time()
         req_times = []
         line_has_extra = False
+
+        def send_toggle_edit():
+            nonlocal version, line_has_extra
+            change, line_has_extra = next_toggle_change(
+                first_line_len, line_has_extra
+            )
+            version += 1
+            notify("textDocument/didChange", {
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [change],
+            })
+
         for i in range(args.requests):
             for j in range(args.edits):
-                # Toggle a trailing char on line 0 so the text genuinely changes
-                # each time (a no-op didChange would be deduped by hashes).
-                grow = not line_has_extra
-                version += 1
-                if grow:
-                    change = {"range": {"start": {"line": 0, "character": first_line_len},
-                                        "end": {"line": 0, "character": first_line_len}},
-                              "text": "x"}
-                else:
-                    change = {"range": {"start": {"line": 0, "character": first_line_len},
-                                        "end": {"line": 0, "character": first_line_len + 1}},
-                              "text": ""}
-                line_has_extra = grow
-                notify("textDocument/didChange", {
-                    "textDocument": {"uri": uri, "version": version},
-                    "contentChanges": [change]})
+                # A no-op didChange would be deduped by hashes.
+                send_toggle_edit()
                 # a beat for the off-ingress reparse to run (the profiled work)
                 time.sleep(0.01)
             t_req = time.perf_counter()
@@ -277,26 +373,26 @@ def main() -> None:
                 # Queue captures first to model an editor whose highlighting work
                 # is already in flight when semantic tokens arrive.
                 responses = measured_batch([*captures_requests, semantic_request])
-                resp = responses[semantic_request[0]]
+                semantic_responses = [responses[semantic_request[0]]]
+            elif args.burst > 1:
+                semantic_responses = measured_repeated(
+                    *semantic_request,
+                    count=args.burst,
+                    before_next=send_toggle_edit if args.burst_edits else None,
+                    delay_seconds=args.burst_delay_ms / 1000,
+                )
             else:
-                resp = measured_request(*semantic_request)
+                semantic_responses = [measured_request(*semantic_request)]
                 if args.captures:
                     for captures_request in captures_requests:
                         measured_request(*captures_request)
             req_times.append(time.perf_counter() - t_req)
-            if "error" in resp:
-                # Only -32800 (request cancelled) is expected here; any other
-                # error means a broken setup that would make the profile
-                # meaningless, so surface it instead of counting it as cancelled.
-                if resp["error"].get("code") == -32800:
-                    canceled += 1
-                else:
-                    raise RuntimeError(f"server error (not a cancellation): {resp['error']}")
-            else:
-                ok += 1
-                # `result` may be null (the server can answer Ok(None)); `or {}`
-                # guards against `None.get`, which a `{}` default would not.
-                tokens = len((resp.get("result") or {}).get("data", [])) // 5
+            cycle_ok, cycle_canceled, cycle_superseded, tokens = count_semantic_outcomes(
+                semantic_responses, tokens
+            )
+            ok += cycle_ok
+            canceled += cycle_canceled
+            superseded += cycle_superseded
         elapsed = time.time() - t0
 
         request("shutdown", None)
@@ -316,14 +412,16 @@ def main() -> None:
     firsts = " ".join(f"{t*1000:.0f}" for t in req_times[:5])
     sys.stderr.write(f"[drive] first-cycle ms: {firsts}\n")
     sys.stderr.write(
-        f"[drive] lang={lang} {source} requests={args.requests} "
-        f"ok={ok} canceled={canceled} tokens/req={tokens} "
-        f"wall={elapsed*1000:.0f}ms ({elapsed/args.requests*1000:.2f}ms/req)\n")
+        f"[drive] lang={lang} {source} cycles={args.requests} burst={args.burst} "
+        f"responses={args.requests * args.burst} "
+        f"ok={ok} canceled={canceled} superseded={superseded} tokens/req={tokens} "
+        f"wall={elapsed*1000:.0f}ms "
+        f"({elapsed/(args.requests * args.burst)*1000:.2f}ms/response)\n")
     for method, samples in request_samples.items():
         summary = summarize_samples(samples)
         sys.stderr.write(
             f"[drive] method={method} count={summary.count} ok={summary.ok} "
-            f"canceled={summary.canceled} errors={summary.errors} "
+            f"canceled={summary.canceled} null={summary.null} errors={summary.errors} "
             f"p50={summary.p50_ms:.1f}ms p90={summary.p90_ms:.1f}ms "
             f"max={summary.max_ms:.1f}ms wire={summary.wire_bytes / 1024:.1f}KiB\n")
     if notification_counts:

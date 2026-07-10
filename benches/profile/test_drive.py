@@ -4,7 +4,12 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from drive import RequestSample, summarize_samples
+from drive import (
+    RequestSample,
+    count_semantic_outcomes,
+    next_toggle_change,
+    summarize_samples,
+)
 
 
 class RequestSummaryTest(unittest.TestCase):
@@ -24,6 +29,32 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(summary.p90_ms, 30.0)
         self.assertEqual(summary.max_ms, 30.0)
         self.assertEqual(summary.wire_bytes, 600)
+
+    def test_counts_mixed_burst_outcomes_and_last_completed_payload(self):
+        responses = [
+            {"error": {"code": -32800, "message": "cancelled"}},
+            {"result": {"data": [0, 0, 3, 1, 0, 0, 4, 2, 1, 0]}},
+            {"result": None},
+            {"error": {"code": -32800, "message": "cancelled"}},
+        ]
+
+        ok, canceled, superseded, tokens = count_semantic_outcomes(
+            responses, previous_tokens=7
+        )
+
+        self.assertEqual((ok, canceled, superseded, tokens), (1, 2, 1, 2))
+
+    def test_toggle_change_alternates_insert_and_delete(self):
+        insert, has_extra = next_toggle_change(first_line_len=5, line_has_extra=False)
+        delete, has_extra = next_toggle_change(5, has_extra)
+
+        self.assertEqual(insert["range"]["start"]["character"], 5)
+        self.assertEqual(insert["range"]["end"]["character"], 5)
+        self.assertEqual(insert["text"], "x")
+        self.assertEqual(delete["range"]["start"]["character"], 5)
+        self.assertEqual(delete["range"]["end"]["character"], 6)
+        self.assertEqual(delete["text"], "")
+        self.assertFalse(has_extra)
 
 
 if __name__ == "__main__":
