@@ -260,6 +260,8 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) upstream_request_tx: mpsc::UnboundedSender<UpstreamRequest>,
     /// Tracks in-flight forwarded requests so a downstream `$/cancelRequest`
     /// (or connection death) can cancel the editor-bound request (#404).
+    /// (Capability-gated applyEdits are registered too, though answered
+    /// locally.)
     pub(crate) inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     /// The folders this connection currently serves, used to answer downstream
     /// `workspace/workspaceFolders` pulls. Mutable: a `preferSharedInstance`
@@ -959,10 +961,12 @@ async fn handle_server_request(
         .unwrap_or_default();
     let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Deferred request handlers forward to the editor and relay its response
-    // back asynchronously (the editor may pend on user interaction), so they own
-    // their entire response lifecycle on a spawned task rather than returning a
-    // synchronous `body` to frame-and-send below.
+    // Deferred request handlers forward to the editor (or, for a
+    // workspace/applyEdit the editor never declared support for, answer
+    // locally) and relay the response back asynchronously (the editor may
+    // pend on user interaction), so they own their entire response lifecycle
+    // on a spawned task rather than returning a synchronous `body` to
+    // frame-and-send below.
     match method {
         "window/showMessageRequest" => {
             window::show_message_request::handle(&message, id, server_prefix, deps);
@@ -1018,7 +1022,8 @@ async fn handle_server_request(
 ///
 /// Used both by the synchronous dispatch in [`handle_server_request`] and by the
 /// deferred request handlers ([`window::show_message_request`],
-/// [`window::show_document`]) that relay an editor response back asynchronously.
+/// [`window::show_document`], [`workspace::apply_edit`]) that relay a
+/// response back asynchronously.
 ///
 /// We use [`OutboundMessage::Untracked`] because a server-initiated response has
 /// no [`ResponseRouter`] entry to clean up on failure (unlike `Tracked`

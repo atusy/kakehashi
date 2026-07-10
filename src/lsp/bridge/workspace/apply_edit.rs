@@ -35,7 +35,9 @@ use crate::lsp::bridge::actor::{
 const METHOD: &str = "workspace/applyEdit";
 
 /// Handle a `workspace/applyEdit` request, relaying the editor's
-/// `ApplyWorkspaceEditResponse` back to the downstream asynchronously.
+/// `ApplyWorkspaceEditResponse` back to the downstream asynchronously (the
+/// forwarding loop answers `applied: false` locally — no editor round-trip —
+/// when the editor never declared `workspace.applyEdit`).
 pub(in crate::lsp::bridge) fn handle(
     message: &serde_json::Value,
     id: jsonrpc::Id,

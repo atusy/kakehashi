@@ -444,8 +444,10 @@ impl Kakehashi {
     pub(crate) async fn initialized_impl(&self, _: InitializedParams) {
         self.notifier().log_info("server is ready").await;
 
-        // Forward downstream-initiated messages to the upstream editor. The
-        // reader tasks feed three channels:
+        // Forward downstream-initiated messages to the upstream editor
+        // (workspace/applyEdit is answered locally instead when the editor
+        // never declared the capability). The reader tasks feed three
+        // channels:
         // - unbounded `upstream_rx` (loss-intolerant): DiagnosticRefresh and
         //   work-done progress (create/$progress/forget).
         // - bounded `window_rx` (best-effort, drop-on-full): window/logMessage,

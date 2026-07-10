@@ -340,7 +340,8 @@ pub struct LanguageServerPool {
     client_progress_registry: Arc<super::ClientProgressRegistry>,
     /// Tracks downstream-initiated requests forwarded to the editor so a
     /// downstream `$/cancelRequest` (or connection death) can cancel the
-    /// editor-bound request (#404). Shared with every reader task (to register /
+    /// editor-bound request (#404) — capability-gated applyEdits are
+    /// registered too, though answered locally. Shared with every reader task (to register /
     /// fire) and the forwarding loop (to await / drop). Distinct from
     /// `upstream_request_registry`, which is the *outbound* (editor → downstream)
     /// cancel direction.
