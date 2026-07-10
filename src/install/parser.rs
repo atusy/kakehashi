@@ -500,6 +500,15 @@ fn download_and_extract_archive(
     // into_reader() streams without ureq's 10MB read_to_* cap, so enforce our
     // own limit on the decompressed tar stream.
     let decoder = GzDecoder::new(response.into_body().into_reader());
+    extract_archive(decoder, repo_name, revision, dest)
+}
+
+fn extract_archive<R: Read>(
+    decoder: R,
+    repo_name: &str,
+    revision: &str,
+    dest: &Path,
+) -> Result<(), ParserInstallError> {
     let bounded_decoder = LimitedReader::new(decoder, MAX_ARCHIVE_TAR_STREAM_BYTES);
     let mut archive = Archive::new(bounded_decoder);
 
@@ -1681,9 +1690,7 @@ mod tests {
         let dest = temp.path().join("source");
         let archive =
             compressed_tar_archive_with_payload("parser-1.0.0", MAX_ARCHIVE_EXTRACTED_BYTES + 1);
-        let archive_url = serve_once(archive);
-
-        let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
+        let result = extract_archive(GzDecoder::new(&archive[..]), "parser", "v1.0.0", &dest);
 
         match result {
             Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
@@ -1710,9 +1717,7 @@ mod tests {
             MAX_ARCHIVE_EXTRACTED_BYTES + 1,
             0,
         ));
-        let archive_url = serve_once(archive);
-
-        let result = download_and_extract_archive(&archive_url, "parser", "v1.0.0", &dest);
+        let result = extract_archive(GzDecoder::new(&archive[..]), "parser", "v1.0.0", &dest);
 
         match result {
             Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
@@ -2005,26 +2010,6 @@ mod tests {
         }
 
         encoder.finish().expect("finish gzip")
-    }
-
-    fn serve_once(body: Vec<u8>) -> String {
-        use std::io::{Read, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
-        let addr = listener.local_addr().expect("local addr");
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            let mut request = [0; 1024];
-            let _ = stream.read(&mut request);
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .expect("write response headers");
-            stream.write_all(&body).expect("write response body");
-        });
-        format!("http://{addr}/archive.tar.gz")
     }
 
     /// Test that fetch_source succeeds for a GitHub URL (uses archive download).
