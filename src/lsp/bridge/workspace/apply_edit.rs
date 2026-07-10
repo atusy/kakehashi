@@ -9,9 +9,9 @@
 //! **Edit translation happens downstream of this handler:** the forwarding
 //! loop rewrites virtual-document URIs + ranges back to the host document
 //! (see `ApplyEditTranslator` in `lsp_impl::apply_edit_translation`) before
-//! sending the edit to the editor, and answers untranslatable edits —
-//! and, when the editor never declared `workspace.applyEdit`, ALL edits —
-//! `applied: false` locally. This handler stays transport-only, exactly like
+//! sending the edit to the editor, and answers untranslatable edits
+//! `applied: false` locally — as it does EVERY `workspace/applyEdit` request
+//! when the editor never declared the `workspace.applyEdit` capability. This handler stays transport-only, exactly like
 //! [`show_document`](crate::lsp::bridge::window::show_document).
 //!
 //! Like the other deferred handlers this **defers** its response on a spawned
