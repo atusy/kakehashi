@@ -50,6 +50,8 @@ pub(crate) struct OpenedVirtualDoc {
     /// languages may map to the same server (e.g., ts and tsx -> tsgo), and the
     /// same server may back several connections (one per workspace root, #382).
     pub(crate) connection_key: ConnectionKey,
+    /// Tracker generation for this connection key when didOpen was claimed.
+    pub(crate) connection_generation: u64,
 }
 
 /// Per-connection virtual document state: versions (for `didChange`),
@@ -103,6 +105,8 @@ pub(crate) struct DocumentTracker {
     /// Pre-send claims keyed by exact connection. Waiters park until the owner
     /// promotes the claim after enqueue or finishes rollback.
     open_claims: DashMap<(ConnectionKey, String), Arc<tokio::sync::Notify>>,
+    /// Advances whenever a dead connection is purged before respawn.
+    connection_generations: DashMap<ConnectionKey, u64>,
 }
 
 impl DocumentTracker {
@@ -118,7 +122,14 @@ impl DocumentTracker {
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
             open_claims: DashMap::new(),
+            connection_generations: DashMap::new(),
         }
+    }
+
+    pub(super) fn connection_generation(&self, connection_key: &ConnectionKey) -> u64 {
+        self.connection_generations
+            .get(connection_key)
+            .map_or(0, |generation| *generation)
     }
 
     /// Check if a virtual document is opened on a downstream server.
@@ -146,7 +157,6 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
-
         // Step 1: Check-and-initialize version under Mutex (serializes concurrent claims)
         {
             let mut versions = self.document_versions.lock().await;
@@ -234,7 +244,6 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
     ) {
         let uri_string = virtual_uri.to_uri_string();
-
         // Remove version first (mirrors claim order)
         {
             let mut versions = self.document_versions.lock().await;
@@ -290,6 +299,7 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
     ) {
         let uri_string = virtual_uri.to_uri_string();
+        let connection_generation = self.connection_generation(connection_key);
 
         // Step 1: Update versions (release lock after block)
         {
@@ -315,6 +325,7 @@ impl DocumentTracker {
                 docs.push(OpenedVirtualDoc {
                     virtual_uri: virtual_uri.clone(),
                     connection_key: connection_key.clone(),
+                    connection_generation,
                 });
             }
         }
@@ -468,6 +479,12 @@ impl DocumentTracker {
     /// a different root) keep their state; `opened_documents` is decremented
     /// per URI (not cleared), so a URI also open on another connection survives.
     pub(super) async fn purge_connection(&self, connection_key: &ConnectionKey) {
+        let mut generation = self
+            .connection_generations
+            .entry(connection_key.clone())
+            .or_insert(0);
+        *generation = generation.wrapping_add(1);
+        drop(generation);
         // Take this connection's version map; its keys are the virtual URIs it
         // had open. Done first so the per-URI refcount/reverse-index cleanup
         // below mirrors `untrack_document` exactly, once per opened document.
@@ -765,11 +782,13 @@ mod tests {
         let doc = OpenedVirtualDoc {
             virtual_uri: virtual_uri.clone(),
             connection_key: ConnectionKey::for_server("lua"),
+            connection_generation: 0,
         };
 
         assert_eq!(doc.virtual_uri.language(), "lua");
         assert_eq!(doc.virtual_uri.region_id(), "region-0");
         assert_eq!(doc.connection_key, ConnectionKey::for_server("lua"));
+        assert_eq!(doc.connection_generation, 0);
     }
 
     // ========================================

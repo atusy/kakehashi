@@ -825,6 +825,10 @@ impl LanguageServerPool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
 
+    pub(super) fn document_connection_generation(&self, connection_key: &ConnectionKey) -> u64 {
+        self.document_tracker.connection_generation(connection_key)
+    }
+
     /// Whether the host document at `host_uri` has been synced (didOpen sent) to a
     /// `_self` host server named `server_name` — i.e. a `host_documents` sync-state
     /// entry exists for that `(uri, server)`. Used to verify host-layer eager open.
@@ -3670,6 +3674,34 @@ mod tests {
             pool.document_tracker
                 .open_claim_waiter(&virtual_uri, &connection_key)
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_connection_generation_close_does_not_untrack_reopened_document() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/reopened.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &connection_key)
+            .await;
+        let stale = pool.document_tracker.host_virtual_docs(&host_uri).await[0].clone();
+
+        pool.document_tracker
+            .purge_connection(&connection_key)
+            .await;
+        pool.register_opened_document(&host_uri, &virtual_uri, &connection_key)
+            .await;
+        assert_ne!(
+            stale.connection_generation,
+            pool.document_connection_generation(&connection_key)
+        );
+
+        pool.close_single_virtual_doc(&stale).await;
+        assert!(
+            pool.document_tracker
+                .is_document_opened_on_connection(&virtual_uri, &connection_key),
+            "a stale close must not erase the replacement generation's open state"
         );
     }
 

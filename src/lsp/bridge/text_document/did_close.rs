@@ -32,7 +32,6 @@ impl LanguageServerPool {
         Self::send_didclose_notification_to(handle.as_ref(), virtual_uri)
     }
 
-    #[cfg(test)]
     async fn connection_for_didclose(
         &self,
         connection_key: &ConnectionKey,
@@ -107,14 +106,7 @@ impl LanguageServerPool {
         scratch_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
     ) {
-        // Hold `connections` across this transition so a respawn cannot replace
-        // the handle and purge/reopen tracking while this close is waiting.
-        // Open paths use the same connections -> transition order.
-        let connections = self.connections().await;
-        let handle = connections
-            .get(connection_key)
-            .filter(|handle| handle.state() == ConnectionState::Ready)
-            .cloned();
+        let handle = self.connection_for_didclose(connection_key).await;
         let transition = self.open_transition_lock(scratch_uri, connection_key);
         let transition_guard = transition.lock().await;
         // Idempotent close: if the scratch document is no longer open, a
@@ -123,7 +115,6 @@ impl LanguageServerPool {
         // the downstream server may warn about. Nothing left to do.
         if !self.is_document_opened(scratch_uri) {
             drop(transition_guard);
-            drop(connections);
             self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
             return;
         }
@@ -154,7 +145,6 @@ impl LanguageServerPool {
             );
         }
         drop(transition_guard);
-        drop(connections);
         self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
     }
 
@@ -163,14 +153,19 @@ impl LanguageServerPool {
     /// This is the core cleanup operation used by both `close_host_document`
     /// and `close_invalidated_docs`. Errors are logged but do not prevent
     /// cleanup of the document_versions tracking.
-    async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
-        let connections = self.connections().await;
-        let handle = connections
-            .get(&doc.connection_key)
-            .filter(|handle| handle.state() == ConnectionState::Ready)
-            .cloned();
+    pub(crate) async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
+        let handle = self.connection_for_didclose(&doc.connection_key).await;
         let transition = self.open_transition_lock(&doc.virtual_uri, &doc.connection_key);
         let transition_guard = transition.lock().await;
+        if self.document_connection_generation(&doc.connection_key) != doc.connection_generation {
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(
+                &doc.virtual_uri,
+                &doc.connection_key,
+                &transition,
+            );
+            return;
+        }
         if let Err(e) = Self::send_didclose_notification_to(handle.as_ref(), &doc.virtual_uri) {
             log::warn!(
                 target: "kakehashi::bridge",
@@ -182,7 +177,6 @@ impl LanguageServerPool {
         self.untrack_document(&doc.virtual_uri, &doc.connection_key)
             .await;
         drop(transition_guard);
-        drop(connections);
         self.remove_open_transition_lock_if_unshared(
             &doc.virtual_uri,
             &doc.connection_key,
