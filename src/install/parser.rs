@@ -77,6 +77,21 @@ enum ArchiveFetchError {
     Io(io::Error),
 }
 
+#[derive(Debug)]
+enum ArchiveRecovery {
+    CloneFallback(ArchiveFetchError),
+    Fail(io::Error),
+}
+
+impl ArchiveFetchError {
+    fn into_recovery(self) -> ArchiveRecovery {
+        match self {
+            error @ (Self::Content(_) | Self::Unsafe(_)) => ArchiveRecovery::CloneFallback(error),
+            Self::Io(error) => ArchiveRecovery::Fail(error),
+        }
+    }
+}
+
 impl std::fmt::Display for ArchiveFetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -449,19 +464,21 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         );
         match download_and_extract_archive(&archive_url, &repo_name, revision, dest) {
             Ok(()) => return Ok(()),
-            Err(e @ (ArchiveFetchError::Content(_) | ArchiveFetchError::Unsafe(_))) => {
-                log::warn!(
-                    target: "kakehashi::install",
-                    "Archive download failed, falling back to git clone: {}",
-                    e
-                );
-                // Clean up partial extraction before fallback
-                let _ = fs::remove_dir_all(dest);
-            }
-            Err(ArchiveFetchError::Io(e)) => {
-                let _ = fs::remove_dir_all(dest);
-                return Err(ParserInstallError::IoError(e));
-            }
+            Err(error) => match error.into_recovery() {
+                ArchiveRecovery::CloneFallback(error) => {
+                    log::warn!(
+                        target: "kakehashi::install",
+                        "Archive download failed, falling back to git clone: {}",
+                        error
+                    );
+                    // Clean up partial extraction before fallback
+                    let _ = fs::remove_dir_all(dest);
+                }
+                ArchiveRecovery::Fail(error) => {
+                    let _ = fs::remove_dir_all(dest);
+                    return Err(ParserInstallError::IoError(error));
+                }
+            },
         }
     }
 
@@ -1636,13 +1653,13 @@ mod tests {
             ArchiveFetchError::Content("download failed".to_string()),
         ] {
             assert!(matches!(
-                error,
-                ArchiveFetchError::Content(_) | ArchiveFetchError::Unsafe(_)
+                error.into_recovery(),
+                ArchiveRecovery::CloneFallback(_)
             ));
         }
         assert!(matches!(
-            ArchiveFetchError::Io(io::Error::other("disk full")),
-            ArchiveFetchError::Io(_)
+            ArchiveFetchError::Io(io::Error::other("disk full")).into_recovery(),
+            ArchiveRecovery::Fail(_)
         ));
     }
 
