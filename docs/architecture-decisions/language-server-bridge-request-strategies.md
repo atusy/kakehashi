@@ -84,7 +84,7 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 1. Fetch Tree-sitter tokens and bridged tokens **in parallel**
 2. When native Tree-sitter tokens participate, return them immediately as the provisional response
 3. When bridged/host tokens arrive, merge them into the native-first result
-4. Send updated tokens through the `textDocument/semanticTokens/full` refresh mechanism
+4. Request `workspace/semanticTokens/refresh`; the client then pulls updated tokens with `textDocument/semanticTokens/full`
 
 The [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md) ADR
 refines this for the eventual merged semantic-token implementation: the instant
@@ -289,7 +289,7 @@ When multiple servers are configured for a language:
 
 | Method | Merging Strategy |
 |--------|------------------|
-| Semantic Tokens | *(aspirational — token bridging not implemented)* per-region winner by `priorities` rank; two-level sweep in [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md) |
+| Semantic Tokens | *(aspirational — token bridging not implemented)* per-region winner by per-target server `priorities` order; two-level sweep in [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md) |
 | Go-to-Definition | Return first non-empty result (query in order) |
 | Find References | Concatenate all results, dedupe by location |
 | Completion | Merge completion lists from all servers |
