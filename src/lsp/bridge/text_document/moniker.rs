@@ -61,7 +61,7 @@ impl LanguageServerPool {
             },
             |response, _ctx| transform_moniker_response_to_host(response),
         )
-        .await
+        .await?
     }
 }
 
@@ -85,27 +85,36 @@ fn build_moniker_request(
 ///
 /// Moniker fields (scheme, identifier, unique, kind) are non-coordinate data,
 /// so no line/range transformation is needed.
-fn transform_moniker_response_to_host(mut response: serde_json::Value) -> Option<Vec<Moniker>> {
+fn transform_moniker_response_to_host(
+    mut response: serde_json::Value,
+) -> io::Result<Option<Vec<Moniker>>> {
     if response_has_jsonrpc_error(&response, "textDocument/moniker") {
-        return None;
+        return Ok(None);
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        return Err(io::Error::other(
+            "textDocument/moniker response carries neither result nor error (protocol violation)",
+        ));
+    };
 
     if result.is_null() {
-        return None;
+        return Ok(None);
     }
 
     // Parse into typed Vec<Moniker>
     // Moniker doesn't have ranges that need transformation.
     // scheme, identifier, unique, and kind are all non-coordinate data.
-    serde_json::from_value(result).ok()
+    serde_json::from_value(result).map(Some).map_err(|err| {
+        io::Error::other(format!(
+            "malformed textDocument/moniker result from downstream server: {err}"
+        ))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-    use rstest::rstest;
     use serde_json::json;
 
     #[test]
@@ -159,8 +168,7 @@ mod tests {
 
         let transformed = transform_moniker_response_to_host(response);
 
-        assert!(transformed.is_some());
-        let monikers = transformed.unwrap();
+        let monikers = transformed.unwrap().unwrap();
         assert_eq!(monikers.len(), 2);
         assert_eq!(monikers[0].scheme, "tsc");
         assert_eq!(monikers[0].identifier, "typescript:foo:bar:Baz");
@@ -168,13 +176,36 @@ mod tests {
         assert_eq!(monikers[1].identifier, "package:module:Class.method");
     }
 
-    #[rstest]
-    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
-    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
-    #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
-    fn moniker_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
+    #[test]
+    fn moniker_response_returns_none_for_null_result() {
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": null});
         let transformed = transform_moniker_response_to_host(response);
-        assert!(transformed.is_none());
+        assert!(transformed.unwrap().is_none());
+    }
+
+    #[test]
+    fn moniker_response_returns_none_for_jsonrpc_error() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": {"code": -32600, "message": "Invalid Request"}
+        });
+        let transformed = transform_moniker_response_to_host(response);
+        assert!(transformed.unwrap().is_none());
+    }
+
+    #[test]
+    fn moniker_response_errors_on_missing_result_success() {
+        let response = json!({"jsonrpc": "2.0", "id": 42});
+        let transformed = transform_moniker_response_to_host(response);
+        assert!(transformed.is_err());
+    }
+
+    #[test]
+    fn moniker_response_errors_on_malformed_success_result() {
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"});
+        let transformed = transform_moniker_response_to_host(response);
+        assert!(transformed.is_err());
     }
 
     #[test]
@@ -182,8 +213,7 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
         let transformed = transform_moniker_response_to_host(response);
-        assert!(transformed.is_some());
-        let monikers = transformed.unwrap();
+        let monikers = transformed.unwrap().unwrap();
         assert!(monikers.is_empty());
     }
 }
