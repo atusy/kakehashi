@@ -115,7 +115,8 @@ pub(crate) fn check_predicate(
 /// rejects the whole match.
 ///
 /// Aggregation per operator mirrors Neovim's handlers:
-/// - `lua-match?` / `contains?`: ALL nodes of the capture must satisfy;
+/// - `lua-match?`: ALL nodes of the capture must satisfy;
+/// - `contains?`: ANY node of the capture must satisfy;
 /// - `has-parent?` / `has-ancestor?`: ANY node suffices;
 /// - a capture with no nodes is vacuously true;
 /// - unknown operators (including the unimplemented `any-*` family) are
@@ -155,8 +156,9 @@ pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &
         let aggregate = match operator {
             "lua-match?" => nodes()
                 .all(|n| node_text(n).is_none_or(|t| check_lua_match(predicate.args.get(1), t))),
-            "contains?" => nodes()
-                .all(|n| node_text(n).is_none_or(|t| check_contains(&predicate.args[1..], t))),
+            "contains?" => any_or_vacuously_true(nodes(), |n| {
+                node_text(n).is_none_or(|t| check_contains(&predicate.args[1..], t))
+            }),
             // Neovim: vacuously true with no nodes, otherwise ANY node hit.
             "has-parent?" => {
                 any_or_vacuously_true(nodes(), |n| check_has_parent(&predicate.args[1..], n))
@@ -277,17 +279,19 @@ fn compile_lua_regex(pattern_str: &str) -> Option<Regex> {
     }
 }
 
-/// Check contains? predicate - returns true if ALL string args are substrings of node_text.
+/// Check contains? predicate - returns true if ANY string arg is a substring of node_text.
 ///
 /// Non-string args (captures) are skipped permissively — they don't affect the result.
-/// Zero string args yields true (vacuous truth via `Iterator::all`).
+/// Zero string args yields true, matching the previous permissive behavior for malformed queries.
 fn check_contains(args: &[tree_sitter::QueryPredicateArg], node_text: &str) -> bool {
-    args.iter().all(|arg| {
-        let tree_sitter::QueryPredicateArg::String(s) = arg else {
-            return true; // Skip non-string args (permissive)
-        };
-        node_text.contains(s.as_ref())
-    })
+    let mut string_args = args.iter().filter_map(|arg| match arg {
+        tree_sitter::QueryPredicateArg::String(s) => Some(s.as_ref()),
+        _ => None,
+    });
+    match string_args.next() {
+        None => true,
+        Some(first) => node_text.contains(first) || string_args.any(|s| node_text.contains(s)),
+    }
 }
 
 /// Check has-parent? predicate - returns true if direct parent's kind matches ANY string arg
@@ -504,8 +508,42 @@ mod tests {
         let results = collect_filtered_captures(source_code, query_str);
 
         assert!(results.contains(&"foobar".to_string()));
-        assert!(!results.contains(&"foo".to_string()));
-        assert!(!results.contains(&"bar".to_string()));
+        assert!(results.contains(&"foo".to_string()));
+        assert!(results.contains(&"bar".to_string()));
+    }
+
+    #[test]
+    fn contains_match_predicate_accepts_any_quantified_capture_node() {
+        let source_code = "fn target(foo: i32, baz: i32) {}";
+        let mut parser = Parser::new();
+        let language = tree_sitter_rust::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source_code, None).unwrap();
+        let root_node = tree.root_node();
+
+        let query = Query::new(
+            &language,
+            r#"
+            ((function_item
+                parameters: (parameters
+                  (parameter pattern: (identifier) @param)+))
+             (#contains? @param "foo"))
+            "#,
+        )
+        .unwrap();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, root_node, source_code.as_bytes());
+        let mut accepted = 0;
+        while let Some(match_) = matches.next() {
+            if check_match_predicates(&query, match_, source_code) {
+                accepted += 1;
+            }
+        }
+
+        assert_eq!(
+            accepted, 1,
+            "#contains? should accept when any node of a quantified capture contains an argument"
+        );
     }
 
     #[test]
