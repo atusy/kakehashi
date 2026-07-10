@@ -935,7 +935,7 @@ fn build_combined_virtual_content(
     span: Range<usize>,
     included: &[Range<usize>],
 ) -> (String, Vec<u32>) {
-    let mut output = String::new();
+    let mut output = String::with_capacity(span.len());
     let mut offsets = Vec::new();
     let mut line_start = span.start;
     let mut range_index = 0;
