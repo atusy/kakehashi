@@ -1,7 +1,8 @@
 //! Completion request handling for bridge connections.
 //!
 //! Handles the coordinate transformation between host and virtual documents,
-//! and drops items whose text edits are unsafe for the injection region —
+//! and drops items whose primary insertion (text edit, or the insertText/
+//! label fallback at the request position) is unsafe for the injection region —
 //! escape it, break per-line `> ` prefixes, or merge content into the closing
 //! fence — if applied verbatim (see `transform_completion_item`).
 //! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
@@ -294,16 +295,26 @@ pub(super) fn transform_completion_item(
 /// mid-host-line) later lines are whole and unprefixed: `false`.
 fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_line: u32) -> bool {
     let columns = offset.columns();
+    // Boundary rows of a per-line-prefixed region — the recorded trailing
+    // zeros and everything past the array — carry an unrecorded real prefix
+    // (the closing fence's `> `): fail-closed, mirroring the shared guard's
+    // boundary rule. All-zero multi-line regions have no boundary semantics.
+    let per_line_prefixed = columns.len() > 1 && columns.iter().any(|&column| column != 0);
+    if per_line_prefixed && region_end.character == 0 && host_line >= region_end.line {
+        return true;
+    }
     match host_line.checked_sub(offset.line()) {
         None => true,
         Some(virtual_line) => match columns.get(virtual_line as usize) {
-            // Single-element shape on line 0: the captured content runs to
-            // end-of-line in a MULTI-LINE region, so an inserted newline
-            // splits only injected content — mirror the shared guard's
-            // `newline_splits_nothing`. Only a same-line inline region (the
-            // host line continues past the region) counts as prefixed.
+            // Single-element shape on line 0: in a MULTI-LINE region the
+            // captured content runs to end-of-line, so an inserted newline
+            // splits only injected content (mirror the shared guard's
+            // `newline_splits_nothing`); in a SAME-LINE region the host line
+            // continues past the region, so a non-zero start column (inline
+            // content always sits behind its delimiter) is prefixed. A
+            // column-0 same-line region is a one-line fenced block — safe.
             Some(&column) => column != 0 && (columns.len() > 1 || region_end.line == offset.line()),
-            None => columns.len() > 1,
+            None => per_line_prefixed,
         },
     }
 }
@@ -1355,11 +1366,12 @@ mod tests {
 
     #[test]
     fn mixed_region_allows_multiline_fallback_on_unprefixed_later_lines() {
-        // Single-element offsets `[7]`: only line 0 starts mid-host-line;
-        // later lines are whole and unprefixed. A multi-line no-textEdit
-        // insertion is unsafe at line 0 (it would split the host line) but
-        // safe on a later line — the region-wide any-prefix shortcut used to
-        // drop both.
+        // Single-element offsets `[7]`: line 0 starts mid-host-line but its
+        // captured content runs to end-of-line in a MULTI-LINE region, and
+        // later lines are whole and unprefixed — multi-line no-textEdit
+        // insertions are safe on every content line; only a SAME-LINE inline
+        // region rejects them. The region-wide any-prefix shortcut used to
+        // drop all of these.
         let offset = RegionOffset::new(3, 7);
         let region_end = Position {
             line: 9,
@@ -1407,6 +1419,36 @@ mod tests {
         assert!(
             list.items.is_empty(),
             "inline-region line-0 insertion would split the host line"
+        );
+    }
+
+    #[test]
+    fn insert_replace_snippet_checks_both_start_lines() {
+        // Malformed InsertReplaceEdit with unequal starts: insert anchors on
+        // the (unprefixed) later line, replace on the prefixed line 0-adjacent
+        // row of a blockquote. The snippet-variable gate must check BOTH.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "unequal", "insertTextFormat": 2,
+                  "textEdit": { "insert": { "start": { "line": 1, "character": 0 },
+                                            "end": { "line": 1, "character": 3 } },
+                                "replace": { "start": { "line": 0, "character": 0 },
+                                             "end": { "line": 0, "character": 3 } },
+                                "newText": "${CLIPBOARD}" } }
+            ]
+        });
+
+        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
+            .unwrap();
+        assert!(
+            list.items.is_empty(),
+            "either prefixed start line must reject the snippet variable"
         );
     }
 }

@@ -1387,4 +1387,26 @@ mod tests {
             region_end
         ));
     }
+
+    #[test]
+    fn boundary_deletion_accepts_a_lone_cr_terminator() {
+        // LSP recognizes lone '\r' as an EOL; a replacement ending with it
+        // still separates content from the closing fence.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let e = TextEdit {
+            range: tower_lsp_server::ls_types::Range {
+                start: Position {
+                    line: 3,
+                    character: 0,
+                },
+                end: region_end,
+            },
+            new_text: "replaced\r".to_string(),
+        };
+        assert!(text_edit_safe_in_region(&e, &offset, region_end));
+    }
 }
