@@ -44,8 +44,8 @@ pub fn calculate_effective_range(
     // Calculate raw effective positions
     let (raw_start, raw_end) = if offset.start_row == 0 && offset.end_row == 0 {
         // Column offsets only - apply directly
-        let start = (byte_range.start as i32 + offset.start_column).max(0) as usize;
-        let end = (byte_range.end as i32 + offset.end_column).max(0) as usize;
+        let start = apply_column_offset(byte_range.start, offset.start_column);
+        let end = apply_column_offset(byte_range.end, offset.end_column);
         (start, end)
     } else {
         // Row offsets require text scanning
@@ -89,7 +89,7 @@ fn apply_offset_to_position(
 ) -> usize {
     if row_offset == 0 {
         // No row offset, just apply column offset
-        return (byte_pos as i32 + col_offset).max(0) as usize;
+        return apply_column_offset(byte_pos, col_offset);
     }
 
     // Start of the line containing byte_pos, found by scanning backward from
@@ -98,14 +98,16 @@ fn apply_offset_to_position(
     // slicing at a raw byte_pos panics if it lands mid-codepoint (e.g. a
     // stale tree-sitter offset) — the caller's later clamp/snap only applies
     // to the *returned* value, not this internal slice.
-    let current_line_start = text[..floor_char_boundary(text, byte_pos)]
+    let snapped_byte_pos = floor_char_boundary(text, byte_pos);
+    let current_line_start = text[..snapped_byte_pos]
         .rfind('\n')
         .map(|i| i + 1)
         .unwrap_or(0);
 
     let target_line_start = if row_offset > 0 {
-        // Overshooting the last line stops at that line's start (matching the
-        // original whole-scan behavior), not the document end.
+        // Overshooting the last line stops row movement at that line's start
+        // (matching the original whole-scan behavior) before the original
+        // column and column offset are reapplied.
         let mut pos = current_line_start;
         for _ in 0..row_offset {
             match text[pos..].find('\n') {
@@ -125,8 +127,20 @@ fn apply_offset_to_position(
         pos
     };
 
-    // Apply column offset from the start of the target line
-    (target_line_start as i32 + col_offset).max(0) as usize
+    let original_column = snapped_byte_pos.saturating_sub(current_line_start);
+    apply_column_offset(
+        target_line_start.saturating_add(original_column),
+        col_offset,
+    )
+}
+
+fn apply_column_offset(base: usize, offset: i32) -> usize {
+    let result = base as i128 + offset as i128;
+    if result <= 0 {
+        0
+    } else {
+        usize::try_from(result).unwrap_or(usize::MAX)
+    }
 }
 
 #[cfg(test)]
@@ -286,7 +300,7 @@ mod tests {
         // line's start, not the document end — pins the exact overshoot
         // value against the whole-scan behavior this function replaced.
         let text = "line 1\nline 2";
-        assert_eq!(apply_offset_to_position(text, 6, 5, 0), 7);
+        assert_eq!(apply_offset_to_position(text, 0, 5, 0), 7);
     }
 
     #[test]
@@ -298,6 +312,37 @@ mod tests {
         // Byte 8 is the second byte of "あ" (starts at byte 7, 3 bytes).
         let _ = apply_offset_to_position(text, 8, 1, 0);
         let _ = apply_offset_to_position(text, 8, -1, 0);
+    }
+
+    #[test]
+    fn test_apply_offset_to_position_row_offset_preserves_original_column() {
+        let text = "aaXX\nbbYY\n";
+
+        assert_eq!(
+            apply_offset_to_position(text, 2, 1, 1),
+            8,
+            "row offsets should apply column deltas relative to the original column"
+        );
+    }
+
+    #[test]
+    fn test_apply_offset_to_position_out_of_bounds_uses_clamped_column() {
+        let text = "a\nb";
+
+        assert_eq!(
+            apply_offset_to_position(text, usize::MAX, 1, 0),
+            text.len(),
+            "stale out-of-bounds byte positions should not produce huge columns"
+        );
+    }
+
+    #[test]
+    fn test_apply_column_offset_does_not_narrow_large_positions() {
+        let base = i32::MAX as usize + 10;
+
+        assert_eq!(apply_column_offset(base, 5), base + 5);
+        assert_eq!(apply_column_offset(3, -10), 0);
+        assert_eq!(apply_offset_to_position("", base, 0, 5), base + 5);
     }
 
     #[test]

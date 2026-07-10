@@ -168,7 +168,7 @@ impl QueryLoader {
         let first_line = content.lines().next().unwrap_or("");
         if let Some(rest) = first_line.strip_prefix(INHERITS_DIRECTIVE_PREFIX) {
             rest.split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| normalize_inherited_language_name(s.trim()))
                 .filter(|s| !s.is_empty())
                 .collect()
         } else {
@@ -410,6 +410,14 @@ impl QueryLoader {
     }
 }
 
+fn normalize_inherited_language_name(name: &str) -> String {
+    name.strip_prefix('(')
+        .and_then(|name| name.strip_suffix(')'))
+        .unwrap_or(name)
+        .trim()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +551,13 @@ mod tests {
         let result = QueryLoader::load_content_from_paths(&paths).unwrap();
         assert!(result.contains("(identifier) @variable"));
         assert!(result.contains("(string) @string"));
+    }
+
+    #[test]
+    fn parse_inherits_directive_strips_parenthesized_language_names() {
+        let parents = QueryLoader::parse_inherits_directive("; inherits: c, (cpp), (cuda)\n");
+
+        assert_eq!(parents, vec!["c", "cpp", "cuda"]);
     }
 
     /// Create a directory with non-UTF-8 bytes in its name under the given temp dir.
