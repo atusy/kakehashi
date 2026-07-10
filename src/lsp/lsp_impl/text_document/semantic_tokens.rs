@@ -105,6 +105,26 @@ impl CurrentTokens {
 }
 
 impl Kakehashi {
+    fn semantic_snapshot_is_current(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        parsed_version: u64,
+        generation: u64,
+        edit_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
+        let latest = self.documents.latest_snapshot(uri);
+        let current = self.cache.semantic_token_generation() == generation
+            && latest.as_ref().is_some_and(|view| {
+                view.slot.current_incarnation == incarnation
+                    && view.content_version == parsed_version
+            });
+        if latest.is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, edit_lock);
+        }
+        current
+    }
+
     /// Latest-completed snapshot resolution (parse-snapshot ADR §3): returns
     /// the newest published snapshot, which may trail the input. The only
     /// wait is the bounded first-parse wait (no snapshot for this lifetime
@@ -380,11 +400,13 @@ impl Kakehashi {
             let cached = (*cached).clone();
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
-            let still_current = self.cache.semantic_token_generation() == token_generation
-                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                    view.slot.current_incarnation == snapshot.incarnation
-                        && view.content_version == snapshot.parsed_version
-                });
+            let still_current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                &edit_lock,
+            );
             if !still_current || !self.cache.is_request_active(&uri, request_id) {
                 self.cache.finish_request(&uri, request_id);
                 return Ok(None);
@@ -418,11 +440,13 @@ impl Kakehashi {
                 let cached = (*cached).clone();
                 let edit_lock = self.documents.edit_lock(&uri);
                 let _edit_guard = edit_lock.lock().await;
-                let still_current = self.cache.semantic_token_generation() == token_generation
-                    && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                        view.slot.current_incarnation == snapshot.incarnation
-                            && view.content_version == snapshot.parsed_version
-                    });
+                let still_current = self.semantic_snapshot_is_current(
+                    &uri,
+                    snapshot.incarnation,
+                    snapshot.parsed_version,
+                    token_generation,
+                    &edit_lock,
+                );
                 if !still_current || !self.cache.is_request_active(&uri, request_id) {
                     self.cache.finish_request(&uri, request_id);
                     return Ok(None);
@@ -552,11 +576,13 @@ impl Kakehashi {
         let lsp_tokens = tokens_with_id;
         let edit_lock = self.documents.edit_lock(&uri);
         let _edit_guard = edit_lock.lock().await;
-        let still_current = self.cache.semantic_token_generation() == token_generation
-            && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                view.slot.current_incarnation == snapshot.incarnation
-                    && view.content_version == snapshot.parsed_version
-            });
+        let still_current = self.semantic_snapshot_is_current(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            token_generation,
+            &edit_lock,
+        );
         if !still_current || !self.cache.is_request_active(&uri, request_id) {
             self.cache.finish_request(&uri, request_id);
             return Ok(None);
@@ -761,11 +787,13 @@ impl Kakehashi {
         {
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
-            let still_current = self.cache.semantic_token_generation() == token_generation
-                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                    view.slot.current_incarnation == snapshot.incarnation
-                        && view.content_version == snapshot.parsed_version
-                });
+            let still_current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                &edit_lock,
+            );
             if !still_current || !self.cache.is_request_active(&uri, request_id) {
                 self.cache.finish_request(&uri, request_id);
                 return Ok(None);
@@ -801,11 +829,13 @@ impl Kakehashi {
                 if cached.result_id.as_deref() == Some(previous_result_id.as_str()) {
                     let edit_lock = self.documents.edit_lock(&uri);
                     let _edit_guard = edit_lock.lock().await;
-                    let still_current = self.cache.semantic_token_generation() == token_generation
-                        && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                            view.slot.current_incarnation == snapshot.incarnation
-                                && view.content_version == snapshot.parsed_version
-                        });
+                    let still_current = self.semantic_snapshot_is_current(
+                        &uri,
+                        snapshot.incarnation,
+                        snapshot.parsed_version,
+                        token_generation,
+                        &edit_lock,
+                    );
                     if !still_current || !self.cache.is_request_active(&uri, request_id) {
                         self.cache.finish_request(&uri, request_id);
                         return Ok(None);
@@ -984,11 +1014,13 @@ impl Kakehashi {
 
         let edit_lock = self.documents.edit_lock(&uri);
         let _edit_guard = edit_lock.lock().await;
-        let still_current = self.cache.semantic_token_generation() == token_generation
-            && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                view.slot.current_incarnation == snapshot.incarnation
-                    && view.content_version == snapshot.parsed_version
-            });
+        let still_current = self.semantic_snapshot_is_current(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            token_generation,
+            &edit_lock,
+        );
         if !still_current || !self.cache.is_request_active(&uri, request_id) {
             self.cache.finish_request(&uri, request_id);
             return Ok(None);
@@ -1102,11 +1134,13 @@ impl Kakehashi {
             let tokens = (*tokens).clone();
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
-            let current = self.cache.semantic_token_generation() == generation
-                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                    view.slot.current_incarnation == snapshot.incarnation
-                        && view.content_version == snapshot.parsed_version
-                });
+            let current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                generation,
+                &edit_lock,
+            );
             if !current {
                 return Err(crate::error::content_modified_error());
             }
@@ -1125,11 +1159,13 @@ impl Kakehashi {
             let response_tokens = range_tokens.clone();
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
-            let current = self.cache.semantic_token_generation() == generation
-                && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                    view.slot.current_incarnation == snapshot.incarnation
-                        && view.content_version == snapshot.parsed_version
-                });
+            let current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                generation,
+                &edit_lock,
+            );
             if !current {
                 return Err(crate::error::content_modified_error());
             }
@@ -1195,11 +1231,13 @@ impl Kakehashi {
         // both its response coordinates and any cache store obsolete.
         let edit_lock = self.documents.edit_lock(&uri);
         let _edit_guard = edit_lock.lock().await;
-        let still_current = self.cache.semantic_token_generation() == generation
-            && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                view.slot.current_incarnation == snapshot.incarnation
-                    && view.content_version == snapshot.parsed_version
-            });
+        let still_current = self.semantic_snapshot_is_current(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            generation,
+            &edit_lock,
+        );
         if !still_current {
             return Err(crate::error::content_modified_error());
         }
