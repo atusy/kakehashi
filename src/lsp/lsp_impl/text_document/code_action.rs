@@ -325,6 +325,13 @@ impl Kakehashi {
             start_byte,
             snapshot.incarnation(),
         )?;
+        // The action may have been created while a single combined capture was
+        // contiguous, then resolved after another capture introduced a masked
+        // host gap. The stable first-region ID/offset alone cannot detect that
+        // geometry change, so re-check live edit safety here.
+        if !resolved.contiguous {
+            return None;
+        }
         // The tracker byte and the freshly-resolved region can disagree after an
         // edit (the byte now falls in a different live region); a mismatched
         // region_id means we'd bound/translate against the wrong region.
