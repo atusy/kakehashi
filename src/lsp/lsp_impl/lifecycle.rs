@@ -1290,6 +1290,15 @@ fn spawn_upstream_request(
                 // bridge tracks for `connection`) is answered `applied: false`
                 // locally with a failureReason, never sent to the editor. See
                 // `ApplyEditTranslator::translate`.
+                // The editor answers `failedChange` as an index into the
+                // FORWARDED documentChanges array; the downstream interprets
+                // it against the array it SENT. Translation can REMOVE no-op
+                // entries (never reorder or insert), so a changed entry count
+                // means the two index spaces diverged and the index must be
+                // dropped rather than relayed misaligned — `applied` and
+                // `failureReason` still relay.
+                let sent_change_count =
+                    super::apply_edit_translation::document_change_count(&params);
                 let params = match &translators {
                     Some(translators) => {
                         translators.apply_edit.translate(params, &connection).await
@@ -1316,43 +1325,53 @@ fn spawn_upstream_request(
                     // but forwarding `params: null` on the off chance it did
                     // would send the editor an invalid request; answer local
                     // applied:false with a serialization reason instead.
-                    Ok(params) => match serde_json::to_value(params) {
-                        Ok(value) => {
-                            let id = client.next_request_id();
-                            forward_with_cancel(
-                                &client,
-                                id,
-                                "workspace/applyEdit",
-                                value,
-                                &cancel.token,
-                            )
-                            .await
-                            .and_then(|v| {
-                                serde_json::from_value::<ApplyWorkspaceEditResponse>(v).ok()
-                            })
-                            // Editor error/cancel, or a response that didn't
-                            // parse as an ApplyWorkspaceEditResponse: the
-                            // protocol default — the edit was not applied.
-                            .unwrap_or(ApplyWorkspaceEditResponse {
+                    Ok(params) => {
+                        let forwarded_change_count =
+                            super::apply_edit_translation::document_change_count(&params);
+                        match serde_json::to_value(params) {
+                            Ok(value) => {
+                                let id = client.next_request_id();
+                                let mut response = forward_with_cancel(
+                                    &client,
+                                    id,
+                                    "workspace/applyEdit",
+                                    value,
+                                    &cancel.token,
+                                )
+                                .await
+                                .and_then(|v| {
+                                    serde_json::from_value::<ApplyWorkspaceEditResponse>(v).ok()
+                                })
+                                // Editor error/cancel, or a response that didn't
+                                // parse as an ApplyWorkspaceEditResponse: the
+                                // protocol default — the edit was not applied.
+                                .unwrap_or(ApplyWorkspaceEditResponse {
+                                    applied: false,
+                                    // Covers editor error, cancellation, AND an
+                                    // unparseable response — neutral wording (like
+                                    // the reader drop-path) so a cancel/transport
+                                    // failure isn't misattributed to the editor.
+                                    failure_reason: Some(
+                                        "kakehashi: no valid workspace/applyEdit response"
+                                            .to_string(),
+                                    ),
+                                    failed_change: None,
+                                });
+                                if forwarded_change_count != sent_change_count {
+                                    // Index spaces diverged; see above.
+                                    response.failed_change = None;
+                                }
+                                response
+                            }
+                            Err(e) => ApplyWorkspaceEditResponse {
                                 applied: false,
-                                // Covers editor error, cancellation, AND an
-                                // unparseable response — neutral wording (like
-                                // the reader drop-path) so a cancel/transport
-                                // failure isn't misattributed to the editor.
-                                failure_reason: Some(
-                                    "kakehashi: no valid workspace/applyEdit response".to_string(),
-                                ),
+                                failure_reason: Some(format!(
+                                    "kakehashi: could not serialize the workspace/applyEdit request: {e}"
+                                )),
                                 failed_change: None,
-                            })
+                            },
                         }
-                        Err(e) => ApplyWorkspaceEditResponse {
-                            applied: false,
-                            failure_reason: Some(format!(
-                                "kakehashi: could not serialize the workspace/applyEdit request: {e}"
-                            )),
-                            failed_change: None,
-                        },
-                    },
+                    }
                 };
                 inbound_request_registry.unregister(
                     cancel.connection_id,

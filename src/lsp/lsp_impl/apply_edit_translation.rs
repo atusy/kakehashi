@@ -11,8 +11,10 @@
 //! The host/virt distinction is made from the edit itself, not the connection:
 //! an edit that touches **no** virtual URIs (every edit from a host-layer
 //! connection, and real-file-only edits from virt connections) is forwarded
-//! as-is except that every `TextDocumentEdit.version` is nulled — downstream
-//! versions are bridge-local and would read as stale to the editor. An edit
+//! with every `TextDocumentEdit.version` nulled — downstream versions are
+//! bridge-local and would read as stale to the editor — and no-op (empty)
+//! virtual entries removed (a raw virtual URI must never reach the editor,
+//! see [`remove_empty_virtual_entries`]); it is otherwise unchanged. An edit
 //! that touches exactly one virtual document is translated
 //! against that region's live offset (rebuilt exactly as goto/showDocument do,
 //! via [`resolve_region_offset`](super::region_offset::resolve_region_offset)).
@@ -55,13 +57,16 @@
 //! `label` and `changeAnnotations` pass through untouched (the transform only
 //! rewrites URIs/ranges/versions).
 //!
-//! Known degenerate edge: no-op (empty) virtual entries are removed before
-//! the forward — [`remove_empty_virtual_entries`] on every path (a raw
-//! virtual URI must never reach the editor), and the transform's
-//! foreign-virtual drop on the translated path — so an editor `failedChange`
-//! index can be skewed by one relative to what the downstream sent. A real
-//! (non-empty) foreign entry rejects the whole edit instead, so indexes
-//! never skew for edits that actually apply anything.
+//! No-op (empty) virtual entries are removed before the forward —
+//! [`remove_empty_virtual_entries`] on every path (a raw virtual URI must
+//! never reach the editor), and the transform's foreign-virtual drop on the
+//! translated path — which shifts the `documentChanges` indices the editor's
+//! `failedChange` answer refers to. The forwarding loop compares the entry
+//! count before/after translation (via [`document_change_count`]) and drops
+//! `failedChange` from the relayed response when they differ, rather than
+//! relaying a misaligned index. A real (non-empty) foreign entry rejects the
+//! whole edit instead, so responses for edits that actually apply anything
+//! keep their index.
 //!
 //! [`transform_workspace_edit_to_host`]: crate::lsp::bridge::transform_workspace_edit_to_host
 
@@ -108,8 +113,9 @@ impl ApplyEditTranslator {
     }
 
     /// Translate a virtual-document applyEdit to host coordinates; when the
-    /// edit touches no virtual URIs, forward `params` with only the
-    /// bridge-local `TextDocumentEdit.version`s nulled. `connection` is the
+    /// edit touches no virtual URIs, forward `params` with the bridge-local
+    /// `TextDocumentEdit.version`s nulled and no-op virtual entries removed
+    /// (otherwise unchanged). `connection` is the
     /// `(server, root)` key of the downstream connection the request arrived
     /// on — versioned virtual-document edits are validated against that
     /// connection's tracked versions before the versions are nulled. `Err`
@@ -265,6 +271,22 @@ impl ApplyEditTranslator {
     }
 }
 
+/// The number of `documentChanges` entries in an applyEdit's edit — the index
+/// space of the editor's `failedChange` answer. The forwarding loop compares
+/// this count before and after translation: translation can REMOVE entries
+/// (no-op virtual entries via [`remove_empty_virtual_entries`], foreign
+/// no-op entries via the transform), which shifts the indices of everything
+/// after them, so a `failedChange` computed by the editor against the
+/// forwarded array would misindex the downstream's original array. It never
+/// reorders or inserts, so an unchanged count means the indices still align.
+pub(super) fn document_change_count(params: &ApplyWorkspaceEditParams) -> usize {
+    match &params.edit.document_changes {
+        None => 0,
+        Some(DocumentChanges::Edits(edits)) => edits.len(),
+        Some(DocumentChanges::Operations(ops)) => ops.len(),
+    }
+}
+
 /// Remove no-op (empty) virtual-document entries so no raw virtual URI ever
 /// crosses the editor boundary. An empty entry skips the translation path
 /// ([`collect_virtual_uris`] ignores it), so on a real-file-only forward it
@@ -376,9 +398,10 @@ fn transform_params_to_host(
 /// discovery and is only meaningful for the single-element case.
 ///
 /// A text-edit entry (`changes` value or a `TextDocumentEdit`) with an EMPTY
-/// edit vector is a no-op and does NOT count as touching its URI: an edit that
-/// is real-file-only but carries a stray empty virtual entry must forward
-/// as-is (modulo the version nulling every forward gets), not be routed down
+/// edit vector is a no-op and does NOT count as touching its URI: an edit
+/// that is real-file-only but carries a stray empty virtual entry must still
+/// forward (the caller removes the no-op carrier via
+/// [`remove_empty_virtual_entries`] before this runs), not be routed down
 /// the virtual-translation path (and then fail `applied: false`). File
 /// operations always count — a create/rename/delete is a real change even
 /// with no accompanying text edits.
