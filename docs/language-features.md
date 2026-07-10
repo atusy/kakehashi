@@ -498,6 +498,9 @@ kakehashi does not yet provide these LSP features:
 - Call hierarchy / type hierarchy
 - Workspace symbol search (`workspace/symbol`)
 
+(Code actions and command execution are advertised only to clients with
+`codeActionLiteralSupport`.)
+
 Bridged features are also limited to **embedded code blocks** in one respect:
 navigation and edits do not cross between blocks (cross-region results are
 filtered out). The surrounding host document can be bridged to the host

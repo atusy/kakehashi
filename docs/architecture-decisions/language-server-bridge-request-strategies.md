@@ -366,7 +366,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | completionItem/resolve | ✅ Implemented | Envelope-routed; an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set |
 | references | ✅ Implemented | Real-file URIs kept, cross-region virtual URIs dropped |
 | rename | ✅ Implemented | With workspace edit validation |
-| codeAction | ✅ Implemented | Edit-carrying, lazy (`codeAction/resolve` routed to the origin server), command-carrying (`workspace/executeCommand` name-routing + palette dispatch), host layer, multi-region menu merge; strict edit validation (cross-region / region-bounds / prefix preservation) |
+| codeAction | ✅ Implemented | Edit-carrying, lazy (`codeAction/resolve` routed to the origin server), command-carrying (`workspace/executeCommand` name-routing + palette dispatch), host layer, multi-region menu merge; strict edit validation (cross-region / region bounds incl. per-line prefix floor) |
 | formatting | ✅ Implemented | Whole-response atomic drop on unsafe edits |
 | rangeFormatting | ✅ Implemented | Shares the formatting guards |
 | onTypeFormatting | ✅ Implemented | Shares the formatting guards |
