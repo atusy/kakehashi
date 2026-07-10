@@ -41,10 +41,12 @@ server. Two consequences follow from this, and they shape what you can expect:
   `main()` without conflicting. But features that need to see across blocks do not
   work between them — for example, you cannot go to a definition that lives in a
   *different* block.
-- **Only embedded content is bridged.** The surrounding document itself (the
-  Markdown prose, the host file as a whole) currently receives only the built-in
-  features. Wiring a whole-document language server to the host file is not yet
-  available.
+- **Embedded content is bridged per block; the host document is opt-in.** The
+  surrounding document itself (the Markdown prose, the host file as a whole)
+  receives the built-in features by default, and can additionally be bridged
+  to the host language's own servers via `bridge._self`
+  (host-document-bridge) — e.g. marksman answering on the Markdown file
+  itself.
 
 When you trigger a bridged feature, kakehashi uses the embedded block under your
 cursor (for position-based features like hover) or gathers results from **all**
@@ -59,8 +61,8 @@ method (`strategy` in the bridge configuration):
 
 | Strategy | Behavior |
 |----------|----------|
-| `preferred` | Uses the first non-empty response, in your configured `priorities` order. **Default for every feature except diagnostics.** |
-| `concatenated` | Merges the responses from all servers. **Default for diagnostics.** For full formatting it instead runs a sequential formatter pipeline over `priorities` (see [Formatting](#formatting)). |
+| `preferred` | Uses the first non-empty response, in your configured `priorities` order. **Default for every feature except diagnostics and code actions.** |
+| `concatenated` | Merges the responses from all servers. **Default for diagnostics and code actions.** For full formatting it instead runs a sequential formatter pipeline over `priorities` (see [Formatting](#formatting)). |
 
 `priorities` is an ordered **allowlist**: servers absent from the list do not
 run, and a `"*"` element stands for the unlisted rest (see the
@@ -95,9 +97,11 @@ embedded blocks. Works for any grammar, no setup required.
 
 ## Bridged features
 
-All features below require a language server configured for the embedded language.
-Where the request must be inside an embedded code block, placing the cursor outside
-one yields no result.
+All features below require a language server configured for the embedded
+language. Where the request must be inside an embedded code block, placing
+the cursor outside one yields no result from the injection bridges — though
+with `bridge._self` configured, the host language's own servers can still
+answer on the surrounding document.
 
 ### Hover
 
@@ -227,10 +231,10 @@ Returns monikers for the symbol under the cursor. Default combine strategy: `pre
 (push)
 
 Reports errors and warnings from every embedded block, merged into the document.
-This is the one feature whose default combine strategy is **`concatenated`** — when
-multiple servers are configured for a block, all of their diagnostics are shown.
-The strategy is resolved per language, so different embedded languages can behave
-differently.
+The default combine strategy here is **`concatenated`** (shared with code
+actions) — when multiple servers are configured for a block, all of their
+diagnostics are shown. The strategy is resolved per language, so different
+embedded languages can behave differently.
 
 ### Document color (experimental)
 
@@ -498,8 +502,10 @@ kakehashi does not yet provide these LSP features:
 - Call hierarchy / type hierarchy
 - Workspace symbol search (`workspace/symbol`)
 
-(Code actions and command execution are advertised only to clients with
-`codeActionLiteralSupport`.)
+(The static code-action and execute-command providers are advertised only to
+clients with `codeActionLiteralSupport`; palette command names are registered
+dynamically and depend only on the client's
+`workspace.executeCommand.dynamicRegistration`.)
 
 Bridged features are also limited to **embedded code blocks** in one respect:
 navigation and edits do not cross between blocks (cross-region results are

@@ -123,9 +123,10 @@ impl Kakehashi {
             .pool()
             .set_workspace_folders(workspace_folders_for_bridge);
         // Clients without codeActionLiteralSupport only understand
-        // `Command[]` responses, and the bridge can only produce CodeAction
-        // literals (commands aren't bridged) — withhold the capability for
-        // them (#568).
+        // `Command[]` responses. The bridge surfaces CodeAction literals
+        // (bare downstream Commands are bridged too, but wrapped/renamed for
+        // routing — never a plain `Command[]` downgrade), so withhold the
+        // capability for such clients (#568).
         let client_supports_code_action_literals = params
             .capabilities
             .text_document
@@ -364,14 +365,17 @@ impl Kakehashi {
                 // No STATIC `commands` here: downstream servers connect lazily so
                 // their command names aren't known at initialize (and each routed
                 // name embeds a per-document host_uri, so it could never be a
-                // stable advertised entry anyway). Instead, each server's real
-                // command names are dynamically registered as they reach Ready
-                // (`UpstreamRequest::RegisterCommands` below), which serves both
-                // palette-fired commands and clients that only dispatch command
-                // ids from registered lists (VS Code's vscode-languageclient) —
-                // when the client advertises `dynamicRegistration`. A client that
-                // dispatches an action's command on provider PRESENCE (Neovim's
-                // built-in client) executes routed names regardless.
+                // stable advertised entry anyway). Each server's RAW command
+                // names are dynamically registered as it reaches Ready
+                // (`UpstreamRequest::RegisterCommands` below, gated on client
+                // `dynamicRegistration`), which serves palette-fired commands.
+                // Action-embedded commands carry ENCODED per-document names that
+                // are never registered: a client that dispatches an action's
+                // command on provider PRESENCE (Neovim's built-in client)
+                // executes them regardless; one that only dispatches command ids
+                // from registered lists (VS Code's vscode-languageclient) still
+                // shows such an action without running its command — a known
+                // limitation.
                 execute_command_provider: client_supports_code_action_literals.then(|| {
                     ExecuteCommandOptions {
                         commands: vec![],

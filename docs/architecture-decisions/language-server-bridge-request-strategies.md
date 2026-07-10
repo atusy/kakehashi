@@ -5,6 +5,13 @@
 > ls-bridge-message-ordering and
 > ls-bridge-server-pool-coordination.
 
+## Decision–Implementation Gap
+
+10 of the 11 per-method strategies described below are implemented
+(definition, hover, signatureHelp, completion, references, rename,
+codeAction, formatting, documentHighlight, diagnostics). Bridged semantic
+tokens remain unimplemented.
+
 ## Context
 
 When bridging LSP requests for injection regions (see language-server-bridge), different LSP methods have different characteristics:
@@ -235,10 +242,10 @@ a file operation (create/rename/delete) targeting a virtual URI.
 
 | Aspect | Handling |
 |--------|----------|
-| Input | Range + context (diagnostics) |
-| Output | CodeAction[] (each may contain WorkspaceEdit) |
-| Cross-file | Real-file edits/resource ops pass through; actions with foreign virtual-region or unsafe edits are disabled/dropped |
-| Position mapping | Same-region ranges in remaining actions |
+| Input | Range + context (in-region diagnostics, translated) |
+| Output | (CodeAction \| Command)[] — bare Commands are bridged too, their names encoded for executeCommand routing |
+| Cross-file | Real-file edits and file operations are PRESERVED; rejected (action disabled) are: edits touching a foreign injection region, virtual-URI file operations, and host-document edits escaping the source region |
+| Position mapping | All ranges in surfaced actions (edits via the shared WorkspaceEdit transform) |
 
 #### textDocument/formatting / rangeFormatting / onTypeFormatting
 
@@ -333,7 +340,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 - **Optimized UX per feature**: Each method gets the strategy that best fits its characteristics
 - **Fast visual feedback**: Semantic tokens appear instantly via parallel fetch
 - **Accurate navigation**: Go-to-definition uses authoritative language server
-- **Safe editing**: real-file edits/resource operations are retained; foreign virtual-region or structurally unsafe edits are filtered/rejected to prevent corruption
+- **Safe editing**: Unrepresentable edits (foreign injection regions, virtual-URI file operations, region-escaping host edits) are rejected to prevent corruption; real cross-file edits pass through
 - **Comprehensive diagnostics**: Aggregated from multiple sources
 
 ### Negative
@@ -345,7 +352,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 
 ### Neutral
 
-- **Per-method configuration possible**: Future enhancement could allow users to override strategies
+- **Per-method configuration**: shipped — `bridge.<lang>.aggregation` overrides strategy/priorities/maxFanOut per LSP method (see aggregation-priorities-wildcard)
 - **Server capability detection**: Some servers may not support all methods; need graceful degradation
 
 ## Implementation Status

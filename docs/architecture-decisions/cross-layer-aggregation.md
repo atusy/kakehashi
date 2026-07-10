@@ -59,8 +59,9 @@ Phased roadmap:
    applies the resolved strategy — `concatenated` (the default) appends
    items in `priorities` order, `preferred` returns the first non-empty
    layer. The host layer is a `textDocument/diagnostic` pull with the real
-   URI — push-propagation-diagnostic-forwarding plans to drive host diagnostics by
-   push too, but that is not yet implemented — combined within the layer per
+   URI — and host-server `publishDiagnostics` pushes are also accepted and
+   republished (`DiagnosticPublisher::publish_push` classifies non-virtual
+   URIs as `_self` host-layer pushes) — combined within the layer per
    `bridge._self.aggregation` via `dispatch_host_concatenated` /
    `dispatch_host_preferred`. Diagnostics are joined rather than raced:
    they are not latency-interactive and `concatenated` needs every layer
@@ -230,10 +231,11 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   field: a method-specific `priorities` replaces the wildcard's list
   wholesale, it does not merge element-wise.
 - **Strategy is phased.** Phase 2 implements `preferred` only; with
-  layer-level `concatenated` landed for formatting (phase 3) and
-  diagnostics (phase 4), the layer defaults come from
-  `default_layer_strategy_for_method`: `concatenated` for diagnostics
-  *and* `textDocument/formatting`, `preferred` otherwise. The formatting
+  layer-level `concatenated` landed for formatting (phase 3), diagnostics
+  (phase 4), and codeAction (item 5), the layer defaults come from
+  `default_layer_strategy_for_method`: `concatenated` for diagnostics,
+  `textDocument/codeAction`, *and* `textDocument/formatting`, `preferred`
+  otherwise. The formatting
   default diverges from the bridge level deliberately — the cross-layer
   pipeline composes disjoint work (virt formats injection regions, host
   formats the resulting text), whereas multiple servers of one bridge
@@ -272,7 +274,10 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   `AggregationConfig` or `BridgeLanguageConfig`; existing bridge configs
   resolve as before.
 - **Defaults preserve behavior**: `["virt", "host", "native"]` with host
-  inert (opt-in off) and `preferred` reproduces today's routing exactly.
+  inert (opt-in off) and `preferred` reproduced the routing at decision
+  time exactly. (Since then the per-method defaults moved to
+  `concatenated` for formatting, diagnostics, and codeAction — see the
+  implementation ledger above.)
 - **Per-method layer suppression for free**: omitting a layer from
   `priorities` (e.g. dropping native for hover) needs no dedicated disable
   switch — a direct payoff of the allowlist semantics.
