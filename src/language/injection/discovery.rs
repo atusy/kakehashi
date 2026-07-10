@@ -877,7 +877,9 @@ impl InjectionResolver {
 }
 
 fn mask_outside_ranges(text: &str, span: Range<usize>, included: &[Range<usize>]) -> String {
-    let mut output = String::new();
+    // The output is the span verbatim with excluded bytes turned to spaces
+    // (multi-byte chars can shrink it, never grow it) — preallocate the span.
+    let mut output = String::with_capacity(span.len());
     let mut cursor = span.start;
     for range in included {
         let start = range.start.clamp(cursor, span.end);
