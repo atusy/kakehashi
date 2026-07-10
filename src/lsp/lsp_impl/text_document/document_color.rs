@@ -182,10 +182,10 @@ impl Kakehashi {
         // the JoinSet is drained/dropped, so cancel forwarding remains intact
         // for all in-flight downstream requests. Nothing else shares the id
         // (virt-only handler, no layer race, no outer sweep).
-        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard {
-            pool: pool.clone(),
-            id: upstream_request_id.clone(),
-        };
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            pool.clone(),
+            upstream_request_id.clone(),
+        );
         // Collect results, aborting early if $/cancelRequest arrives.
         crate::lsp::aggregation::region::collect_region_results_with_cancel(
             outer_join_set,

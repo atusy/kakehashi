@@ -36,10 +36,10 @@ impl Kakehashi {
         // RAII sweep: virt-only handler with no layer race or outer sweep —
         // clean stale registry entries on every exit, including a dropped
         // request future (dispatch_preferred aborts losers without joining).
-        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard {
-            pool: pool.clone(),
-            id: ctx.document.upstream_request_id.clone(),
-        };
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            pool.clone(),
+            ctx.document.upstream_request_id.clone(),
+        );
         let range = ctx.range;
         let result = dispatch_preferred(
             &ctx.document,

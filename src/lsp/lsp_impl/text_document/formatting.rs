@@ -136,10 +136,10 @@ impl Kakehashi {
         // aborted region task may not reach its refcounted unregister. RAII so
         // the sweep also runs on the `?` early returns; it fires only after
         // BOTH layers settled, so no live sibling can be wiped.
-        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard {
-            pool: self.bridge.pool_arc(),
-            id: upstream_request_id.clone(),
-        };
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            self.bridge.pool_arc(),
+            upstream_request_id.clone(),
+        );
         let mut cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
         cancel_state.request_error_sink = request_error_sink;
         let original = snapshot.text_arc();

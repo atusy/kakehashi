@@ -319,10 +319,10 @@ impl Kakehashi {
         // id can be wiped. Sweeping while dropped futures unwind is safe:
         // cancel forwarding captures its targets before notifying, and the
         // pool tolerates entries unregistered out of order.
-        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard {
-            pool: pool.clone(),
-            id: upstream_request_id.clone(),
-        };
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            pool.clone(),
+            upstream_request_id.clone(),
+        );
         let combined = async { tokio::join!(virt_fut, host_fut) };
         let (mut virt_items, mut host_items) = match cancel_rx {
             Some(mut cancel_rx) => {

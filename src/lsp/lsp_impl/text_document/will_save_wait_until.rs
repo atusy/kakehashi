@@ -58,10 +58,10 @@ impl Kakehashi {
         // upstream-registry unregister. The RAII sweep cleans the id on every
         // exit — success, timeout, and a dropped request future alike.
         // Nothing else shares the id here.
-        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard {
-            pool: self.bridge.pool_arc(),
-            id: ctx.upstream_request_id.clone(),
-        };
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            self.bridge.pool_arc(),
+            ctx.upstream_request_id.clone(),
+        );
         let fut =
             self.host_layer_value_with_ctx(&ctx, "textDocument/willSaveWaitUntil", raw_params);
         let value = match tokio::time::timeout(WILL_SAVE_WAIT_UNTIL_BUDGET, fut).await {

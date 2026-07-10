@@ -55,8 +55,17 @@ fn capability_prefilter_applies(method: &str) -> bool {
 /// sweep) so the sweep runs on every exit — normal completion, `?`,
 /// cancellation, and even the whole request future being dropped.
 pub(crate) struct UpstreamRegistrySweepGuard {
-    pub(crate) pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
-    pub(crate) id: Option<UpstreamId>,
+    pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
+    id: Option<UpstreamId>,
+}
+
+impl UpstreamRegistrySweepGuard {
+    pub(crate) fn new(
+        pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
+        id: Option<UpstreamId>,
+    ) -> Self {
+        Self { pool, id }
+    }
 }
 
 impl Drop for UpstreamRegistrySweepGuard {
@@ -1165,10 +1174,7 @@ impl Kakehashi {
         // Idempotent; a completed arm already cleaned up its own. A guard
         // (not a trailing statement) so the sweep also runs if this whole
         // request future is ever dropped mid-race.
-        let _sweep = UpstreamRegistrySweepGuard {
-            pool: self.bridge.pool_arc(),
-            id: upstream_id,
-        };
+        let _sweep = UpstreamRegistrySweepGuard::new(self.bridge.pool_arc(), upstream_id);
         match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
