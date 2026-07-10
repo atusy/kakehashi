@@ -863,166 +863,157 @@ fn finalize_virt_resolved_action(
     upstream_caps: UpstreamCodeActionCaps,
 ) -> CodeAction {
     let server_name = envelope.origin.clone();
-    {
-        // Translate the resolved action's own diagnostics host-ward first, so
-        // every surfaced action — including a disabled one returned below —
-        // carries host coordinates (mirrors the initial-path order).
-        if let Some(diagnostics) = &mut resolved.diagnostics {
-            for diagnostic in diagnostics {
-                translate_virtual_range_to_host(&mut diagnostic.range, offset);
-            }
+    // Translate the resolved action's own diagnostics host-ward first, so
+    // every surfaced action — including a disabled one returned below —
+    // carries host coordinates (mirrors the initial-path order).
+    if let Some(diagnostics) = &mut resolved.diagnostics {
+        for diagnostic in diagnostics {
+            translate_virtual_range_to_host(&mut diagnostic.range, offset);
         }
-
-        // A resolve that marks the action `disabled` makes it non-executable —
-        // handle it BEFORE the command/edit policy (mirrors the initial path,
-        // so a disabled+command resolve is surfaced disabled, not failed soft).
-        // Without upstream `disabledSupport` the client can't render it, so
-        // fail soft (return the original, already-sanitized action unresolved);
-        // with it, strip the payload (a disabled action must never carry an
-        // executable edit/command) and surface it disabled with reason + suffix.
-        if resolved.disabled.is_some() {
-            if !upstream_caps.disabled_support {
-                re_envelope_action(&mut action, &envelope);
-                return action;
-            }
-            resolved.title = resuffix_resolved_title(
-                std::mem::take(&mut resolved.title),
-                suffixed_title,
-                &server_name,
-            );
-            resolved.edit = None;
-            resolved.command = None;
-            resolved.data = None;
-            resolved.is_preferred = None;
-            return resolved;
-        }
-
-        // A resolve that materializes a `command` (or edit+command) is now
-        // executable: rewrite the command name to encode the origin server so
-        // the bridged executeCommand routes back to it (mirrors the initial
-        // codeAction path). An edit+command action keeps both — the edit is
-        // translated below, then the client executes the command.
-        // Drop the command if its routing name can't be encoded (unroutable);
-        // an accompanying edit is still applied. Track the drop: a
-        // command-only resolve whose command was dropped must NOT fall into
-        // the still-lazy branch below — every future resolve would
-        // re-materialize the same unroutable command, leaving the client an
-        // enabled action that can never do anything (mirrors
-        // `finalize_host_resolved_action`).
-        let mut command_dropped = false;
-        if let Some(command) = resolved.command.as_mut() {
-            match encode_command(&server_name, &envelope.host_uri, &command.command) {
-                Some(encoded) => command.command = encoded,
-                None => command_dropped = true,
-            }
-        }
-        if command_dropped {
-            resolved.command = None;
-        }
-        if command_dropped && resolved.edit.is_none() {
-            if !upstream_caps.disabled_support {
-                re_envelope_action(&mut action, &envelope);
-                return action;
-            }
-            resolved.title = resuffix_resolved_title(
-                std::mem::take(&mut resolved.title),
-                suffixed_title,
-                &server_name,
-            );
-            resolved.data = None;
-            resolved.is_preferred = None;
-            resolved.disabled = Some(CodeActionDisabled {
-                reason: REASON_UNROUTABLE_COMMAND.to_string(),
-            });
-            return resolved;
-        }
-
-        // isPreferred is its own client capability (LSP 3.15); the downstream
-        // baseline advertises it unconditionally, so strip it for clients that
-        // did not opt in.
-        if !upstream_caps.is_preferred_support {
-            resolved.is_preferred = None;
-        }
-
-        // Translate the resolved edit host-ward. When it can't be faithfully
-        // represented in the host document — a virtual-URI file op (transform
-        // returns false); ANY cross-region edit (the shared transform would
-        // silently filter it, partially applying the rest); or an edit that
-        // ends up empty — disable the action (or, without disabledSupport, fail
-        // soft to the unresolved action). Any of these is worse than a disabled
-        // action: the user would apply it and get a partial or no-op change.
-        // This is a PERMANENT failure, so `resolve_untranslatable_edit` disables
-        // rather than transient-fail-softing.
-        let disable_reason = match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
-            (Some(edit), Some(host_uri_lsp)) => {
-                let virtual_uri = VirtualDocumentUri::new(
-                    host_uri_lsp,
-                    &envelope.injection_language,
-                    &envelope.region_id,
-                )
-                .to_uri_string();
-                translate_edit_host_ward_strict(
-                    edit,
-                    &virtual_uri,
-                    host_uri_lsp,
-                    offset,
-                    region_end,
-                )
-                .err()
-            }
-            // The server resolved an edit, but the host URI couldn't be rebuilt
-            // to translate it (a `url`/`Uri` parser divergence). Shipping the
-            // untranslated virtual-coordinate edit would be unappliable — same
-            // permanent failure as the cross-region case.
-            (Some(_), None) => Some(REASON_CROSS_REGION),
-            (None, _) => None,
-        };
-        if let Some(reason) = disable_reason {
-            return resolve_untranslatable_edit(
-                resolved,
-                action,
-                &envelope,
-                suffixed_title,
-                &server_name,
-                upstream_caps,
-                reason,
-            );
-        }
-
-        // Re-apply the "{title} — {server}" suffix. The server normally echoes
-        // the restored original title back, but if it changed the title during
-        // resolve (allowed by LSP) that change is kept and re-suffixed. Capture
-        // the raw (unsuffixed) server title first — the still-lazy path below
-        // needs it to keep the envelope's title in sync.
-        let server_title = std::mem::take(&mut resolved.title);
-        resolved.title =
-            resuffix_resolved_title(server_title.clone(), suffixed_title, &server_name);
-
-        // Once resolve has materialized an edit OR a command, the action is
-        // complete (the edit is host-translated; the command name is routed).
-        // Re-enveloping it would let a second resolve forward that host-
-        // coordinate edit back downstream (no inverse transform) — so strip the
-        // data instead, mirroring the initial-response policy. Only a still-lazy
-        // resolved action (no edit, no command) keeps a routing envelope for a
-        // further resolve.
-        if resolved.edit.is_some() || resolved.command.is_some() {
-            resolved.data = None;
-        } else {
-            // Still lazy: a future resolve restores `envelope.original_title`
-            // and forwards it downstream. If the server changed the title on
-            // THIS resolve, track the new (unsuffixed) title so a title-matching
-            // server sees the title it last advertised, not the stale initial
-            // one. (The envelope exists precisely for match-by-title servers.)
-            if !server_title.is_empty() {
-                envelope.original_title = server_title;
-            }
-            if resolved.data.is_none() {
-                resolved.data = action.data.take();
-            }
-            re_envelope_action(&mut resolved, &envelope);
-        }
-        resolved
     }
+
+    // A resolve that marks the action `disabled` makes it non-executable —
+    // handle it BEFORE the command/edit policy (mirrors the initial path,
+    // so a disabled+command resolve is surfaced disabled, not failed soft).
+    // Without upstream `disabledSupport` the client can't render it, so
+    // fail soft (return the original, already-sanitized action unresolved);
+    // with it, strip the payload (a disabled action must never carry an
+    // executable edit/command) and surface it disabled with reason + suffix.
+    if resolved.disabled.is_some() {
+        if !upstream_caps.disabled_support {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+        resolved.title = resuffix_resolved_title(
+            std::mem::take(&mut resolved.title),
+            suffixed_title,
+            &server_name,
+        );
+        resolved.edit = None;
+        resolved.command = None;
+        resolved.data = None;
+        resolved.is_preferred = None;
+        return resolved;
+    }
+
+    // A resolve that materializes a `command` (or edit+command) is now
+    // executable: rewrite the command name to encode the origin server so
+    // the bridged executeCommand routes back to it (mirrors the initial
+    // codeAction path). An edit+command action keeps both — the edit is
+    // translated below, then the client executes the command.
+    // Drop the command if its routing name can't be encoded (unroutable);
+    // an accompanying edit is still applied. Track the drop: a
+    // command-only resolve whose command was dropped must NOT fall into
+    // the still-lazy branch below — every future resolve would
+    // re-materialize the same unroutable command, leaving the client an
+    // enabled action that can never do anything (mirrors
+    // `finalize_host_resolved_action`).
+    let mut command_dropped = false;
+    if let Some(command) = resolved.command.as_mut() {
+        match encode_command(&server_name, &envelope.host_uri, &command.command) {
+            Some(encoded) => command.command = encoded,
+            None => command_dropped = true,
+        }
+    }
+    if command_dropped {
+        resolved.command = None;
+    }
+    if command_dropped && resolved.edit.is_none() {
+        if !upstream_caps.disabled_support {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
+        resolved.title = resuffix_resolved_title(
+            std::mem::take(&mut resolved.title),
+            suffixed_title,
+            &server_name,
+        );
+        resolved.data = None;
+        resolved.is_preferred = None;
+        resolved.disabled = Some(CodeActionDisabled {
+            reason: REASON_UNROUTABLE_COMMAND.to_string(),
+        });
+        return resolved;
+    }
+
+    // isPreferred is its own client capability (LSP 3.15); the downstream
+    // baseline advertises it unconditionally, so strip it for clients that
+    // did not opt in.
+    if !upstream_caps.is_preferred_support {
+        resolved.is_preferred = None;
+    }
+
+    // Translate the resolved edit host-ward. When it can't be faithfully
+    // represented in the host document — a virtual-URI file op (transform
+    // returns false); ANY cross-region edit (the shared transform would
+    // silently filter it, partially applying the rest); or an edit that
+    // ends up empty — disable the action (or, without disabledSupport, fail
+    // soft to the unresolved action). Any of these is worse than a disabled
+    // action: the user would apply it and get a partial or no-op change.
+    // This is a PERMANENT failure, so `resolve_untranslatable_edit` disables
+    // rather than transient-fail-softing.
+    let disable_reason = match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
+        (Some(edit), Some(host_uri_lsp)) => {
+            let virtual_uri = VirtualDocumentUri::new(
+                host_uri_lsp,
+                &envelope.injection_language,
+                &envelope.region_id,
+            )
+            .to_uri_string();
+            translate_edit_host_ward_strict(edit, &virtual_uri, host_uri_lsp, offset, region_end)
+                .err()
+        }
+        // The server resolved an edit, but the host URI couldn't be rebuilt
+        // to translate it (a `url`/`Uri` parser divergence). Shipping the
+        // untranslated virtual-coordinate edit would be unappliable — same
+        // permanent failure as the cross-region case.
+        (Some(_), None) => Some(REASON_CROSS_REGION),
+        (None, _) => None,
+    };
+    if let Some(reason) = disable_reason {
+        return resolve_untranslatable_edit(
+            resolved,
+            action,
+            &envelope,
+            suffixed_title,
+            &server_name,
+            upstream_caps,
+            reason,
+        );
+    }
+
+    // Re-apply the "{title} — {server}" suffix. The server normally echoes
+    // the restored original title back, but if it changed the title during
+    // resolve (allowed by LSP) that change is kept and re-suffixed. Capture
+    // the raw (unsuffixed) server title first — the still-lazy path below
+    // needs it to keep the envelope's title in sync.
+    let server_title = std::mem::take(&mut resolved.title);
+    resolved.title = resuffix_resolved_title(server_title.clone(), suffixed_title, &server_name);
+
+    // Once resolve has materialized an edit OR a command, the action is
+    // complete (the edit is host-translated; the command name is routed).
+    // Re-enveloping it would let a second resolve forward that host-
+    // coordinate edit back downstream (no inverse transform) — so strip the
+    // data instead, mirroring the initial-response policy. Only a still-lazy
+    // resolved action (no edit, no command) keeps a routing envelope for a
+    // further resolve.
+    if resolved.edit.is_some() || resolved.command.is_some() {
+        resolved.data = None;
+    } else {
+        // Still lazy: a future resolve restores `envelope.original_title`
+        // and forwards it downstream. If the server changed the title on
+        // THIS resolve, track the new (unsuffixed) title so a title-matching
+        // server sees the title it last advertised, not the stale initial
+        // one. (The envelope exists precisely for match-by-title servers.)
+        if !server_title.is_empty() {
+            envelope.original_title = server_title;
+        }
+        if resolved.data.is_none() {
+            resolved.data = action.data.take();
+        }
+        re_envelope_action(&mut resolved, &envelope);
+    }
+    resolved
 }
 
 impl LanguageServerPool {
