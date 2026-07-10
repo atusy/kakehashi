@@ -106,6 +106,7 @@ class RequestSummaryTest(unittest.TestCase):
                 "event": "stdout_frame",
                 "frame": {
                     "ready_sequence": 3,
+                    "write_sequence": 4,
                     "method": "textDocument/semanticTokens/full",
                     "id": 9,
                     "body_bytes": 100,
@@ -130,6 +131,8 @@ class RequestSummaryTest(unittest.TestCase):
                 write_start_us=1500,
                 last_byte_us=2500,
                 flush_complete_us=3000,
+                ready_sequence=3,
+                write_sequence=4,
             ),
         )
         summary = summarize_transport_frames([frame])
@@ -172,6 +175,8 @@ class RequestSummaryTest(unittest.TestCase):
             write_start_us=500,
             last_byte_us=510,
             flush_complete_us=520,
+            ready_sequence=1,
+            write_sequence=4,
         )
         large = TransportFrame(
             method="kakehashi/captures/full/delta",
@@ -181,19 +186,25 @@ class RequestSummaryTest(unittest.TestCase):
             write_start_us=200,
             last_byte_us=450,
             flush_complete_us=460,
+            ready_sequence=0,
+            write_sequence=2,
         )
 
         self.assertEqual(
             classify_semantic_blocking([large, semantic], 64 * 1024),
             (1, 0),
         )
-        semantic_after_start = dataclasses.replace(semantic, ready_us=300)
+        semantic_after_start = dataclasses.replace(
+            semantic, ready_us=300, ready_sequence=3
+        )
         self.assertEqual(
             classify_semantic_blocking([large, semantic_after_start], 64 * 1024),
             (0, 1),
         )
 
-        semantic_during_flush = dataclasses.replace(semantic, ready_us=455)
+        semantic_during_flush = dataclasses.replace(
+            semantic, ready_us=455, ready_sequence=3
+        )
         self.assertEqual(
             classify_semantic_blocking([large, semantic_during_flush], 64 * 1024),
             (0, 1),

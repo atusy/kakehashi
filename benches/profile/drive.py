@@ -57,6 +57,8 @@ class TransportFrame:
     last_byte_us: int
     flush_complete_us: int | None
     id_unattributed: bool = False
+    ready_sequence: int | None = None
+    write_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,8 @@ def parse_stdout_metric_line(line: str) -> TransportFrame | None:
         last_byte_us=frame["last_byte_us"],
         flush_complete_us=frame.get("flush_complete_us"),
         id_unattributed=frame.get("id_unattributed", False),
+        ready_sequence=frame.get("ready_sequence"),
+        write_sequence=frame.get("write_sequence", 0),
     )
 
 
@@ -135,6 +139,7 @@ def classify_semantic_blocking(
         (index, frame)
         for index, frame in enumerate(frames)
         if frame.ready_us is not None
+        and frame.ready_sequence is not None
         and (frame.method or "").startswith("textDocument/semanticTokens/")
     ]
     for semantic_index, semantic in semantics:
@@ -156,7 +161,7 @@ def classify_semantic_blocking(
         if not blockers:
             continue
         blocker = max(blockers, key=lambda frame: frame.last_byte_us)
-        if semantic.ready_us <= blocker.write_start_us:
+        if semantic.ready_sequence < blocker.write_sequence:
             schedulable += 1
         else:
             already_writing += 1
