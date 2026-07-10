@@ -21,7 +21,7 @@ use tower_lsp_server::ls_types::{Diagnostic, DocumentDiagnosticReport};
 use url::Url;
 
 use super::super::pool::{INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId};
-use tower_lsp_server::ls_types::{DocumentDiagnosticParams, TextDocumentIdentifier};
+use tower_lsp_server::ls_types::TextDocumentIdentifier;
 
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
@@ -107,23 +107,35 @@ impl LanguageServerPool {
     }
 }
 
+/// `DocumentDiagnosticParams` for the wire, omitting absent optionals.
+///
+/// `ls_types::DocumentDiagnosticParams` serializes `identifier: None` and
+/// `previous_result_id: None` as explicit JSON `null`s (no
+/// `skip_serializing_if`), and strictly-decoding downstreams (typescript-go's
+/// Go unmarshaler) reject those nulls with InvalidParams on every pull. The
+/// spec marks both fields optional, so absent is the interoperable encoding.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticRequestParams {
+    text_document: TextDocumentIdentifier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_result_id: Option<String>,
+}
+
 /// Build a JSON-RPC diagnostic request for a downstream language server.
 ///
-/// Like DocumentSymbolParams, DocumentDiagnosticParams operates on the entire
+/// Like DocumentSymbolParams, diagnostic params operate on the entire
 /// document; an optional `previous_result_id` enables incremental updates.
 fn build_diagnostic_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
     previous_result_id: Option<&str>,
-) -> JsonRpcRequest<DocumentDiagnosticParams> {
-    let params = DocumentDiagnosticParams {
+) -> JsonRpcRequest<DiagnosticRequestParams> {
+    let params = DiagnosticRequestParams {
         text_document: TextDocumentIdentifier {
             uri: virtual_uri_to_lsp_uri(virtual_uri),
         },
-        identifier: None,
         previous_result_id: previous_result_id.map(|s| s.to_string()),
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
     };
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/diagnostic", params)
 }
@@ -641,10 +653,15 @@ mod tests {
             json["params"].get("position").is_none(),
             "Diagnostic request should not have position parameter"
         );
-        // Without previous_result_id, the field should be null (typed params serialize None as null)
+        // Without previous_result_id, the field must be ABSENT, not null:
+        // strict downstream decoders (typescript-go) reject explicit nulls.
         assert!(
-            json["params"]["previousResultId"].is_null(),
-            "Diagnostic request without previous_result_id should have null previousResultId"
+            json["params"].get("previousResultId").is_none(),
+            "Diagnostic request without previous_result_id must omit previousResultId"
+        );
+        assert!(
+            json["params"].get("identifier").is_none(),
+            "Diagnostic request must omit the unused identifier field"
         );
     }
 
