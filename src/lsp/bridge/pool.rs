@@ -179,6 +179,43 @@ pub(super) struct HostDocSyncState {
     pub(super) fingerprint: u64,
 }
 
+/// Cancellation-safe rollback for the pre-send virtual-document claim.
+/// Eager-open tasks are deliberately aborted when a newer parse supersedes
+/// them; dropping the handler between claim and FIFO enqueue must not leave a
+/// phantom "opened" document that suppresses every later didOpen.
+struct OpenClaimGuard {
+    tracker: Arc<DocumentTracker>,
+    host_uri: Url,
+    virtual_uri: VirtualDocumentUri,
+    connection_key: ConnectionKey,
+    armed: bool,
+}
+
+impl OpenClaimGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpenClaimGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let tracker = Arc::clone(&self.tracker);
+        let host_uri = self.host_uri.clone();
+        let virtual_uri = self.virtual_uri.clone();
+        let connection_key = self.connection_key.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                tracker
+                    .rollback_open_claim(&host_uri, &virtual_uri, &connection_key)
+                    .await;
+            });
+        }
+    }
+}
+
 pub struct LanguageServerPool {
     /// Map of connection key `(server_name, root)` -> connection handle.
     ///
@@ -205,7 +242,7 @@ pub struct LanguageServerPool {
     /// which already stop most eager spawns before they reach this point.
     shutting_down: AtomicBool,
     /// Document tracking for virtual documents (versions, host mappings, opened state)
-    document_tracker: DocumentTracker,
+    document_tracker: Arc<DocumentTracker>,
     /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
@@ -312,7 +349,7 @@ impl LanguageServerPool {
         Self {
             connections: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
-            document_tracker: DocumentTracker::new(),
+            document_tracker: Arc::new(DocumentTracker::new()),
             host_documents: Mutex::new(HashMap::new()),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
@@ -878,6 +915,13 @@ impl LanguageServerPool {
         {
             return Ok(()); // Already claimed by another caller
         }
+        let mut claim_guard = OpenClaimGuard {
+            tracker: Arc::clone(&self.document_tracker),
+            host_uri: host_uri.clone(),
+            virtual_uri: virtual_uri.clone(),
+            connection_key: connection_key.clone(),
+            armed: true,
+        };
         // Register host_to_virtual BEFORE send so that close_host_document
         // can find this document even if the task is aborted after send.
         // The single-writer loop (ls-bridge-message-ordering) guarantees FIFO ordering, so
@@ -889,13 +933,12 @@ impl LanguageServerPool {
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
-                .unclaim_document(virtual_uri, connection_key)
+                .rollback_open_claim(host_uri, virtual_uri, connection_key)
                 .await;
-            self.document_tracker
-                .unregister_virtual_doc(host_uri, virtual_uri)
-                .await;
+            claim_guard.disarm();
             return Err(e);
         }
+        claim_guard.disarm();
         // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
         // `Ok`), so seed the content fingerprint with the opened content. Without
         // this, the FIRST position-only host edit — which leaves this region's
@@ -3355,6 +3398,71 @@ mod tests {
             !pool.is_document_opened(&virtual_uri),
             "Claim should be rolled back on send failure"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_document_opened_unclaims_when_task_is_aborted_before_enqueue() {
+        struct BlockingSender {
+            entered: Arc<tokio::sync::Notify>,
+        }
+
+        impl message_sender::MessageSender for BlockingSender {
+            async fn send_notification<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/abort.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let connection_key = connection_key.clone();
+            let entered = Arc::clone(&entered);
+            tokio::spawn(async move {
+                let mut sender = BlockingSender { entered };
+                pool.ensure_document_opened(
+                    &mut sender,
+                    &host_uri,
+                    &virtual_uri,
+                    "print('old')",
+                    &connection_key,
+                )
+                .await
+            })
+        };
+
+        entered.notified().await;
+        assert!(pool.is_document_opened(&virtual_uri));
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.is_document_opened(&virtual_uri) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abort rollback should complete");
+
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "print('new')",
+            &connection_key,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_ok(), "a later didOpen must be retryable");
     }
 
     // ========================================

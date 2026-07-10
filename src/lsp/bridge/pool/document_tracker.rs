@@ -470,6 +470,29 @@ impl DocumentTracker {
         }
     }
 
+    /// Roll back one connection's pre-send open claim and host registration.
+    /// Unlike `unregister_virtual_doc`, this preserves the same virtual URI on
+    /// other workspace-root connections.
+    pub(super) async fn rollback_open_claim(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) {
+        self.unclaim_document(virtual_uri, connection_key).await;
+        let uri_string = virtual_uri.to_uri_string();
+        let mut host_map = self.host_to_virtual.lock().await;
+        if let Some(docs) = host_map.get_mut(host_uri) {
+            docs.retain(|doc| {
+                doc.virtual_uri.to_uri_string() != uri_string
+                    || &doc.connection_key != connection_key
+            });
+            if docs.is_empty() {
+                host_map.remove(host_uri);
+            }
+        }
+    }
+
     /// Snapshot (without removing) every virtual document currently open for a
     /// host URI. Used by the save-notification fan-out (#357), which forwards
     /// willSave/didSave to the host's open virtual docs but must keep them open.
