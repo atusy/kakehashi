@@ -345,6 +345,11 @@ fn read_framed_message<R: BufRead>(reader: &mut R) -> ReadOutcome {
     }
 }
 
+/// A server→client request's `(id, params)` plus the watched notifications
+/// (method, params) collected while waiting for it — the result of
+/// [`LspClient::wait_for_server_request_watching`].
+pub(crate) type WatchedServerRequest = (Value, Value, Vec<(String, Value)>);
+
 impl LspClient {
     /// Spawn the kakehashi binary and create a new LSP client.
     pub fn new() -> Self {
@@ -690,6 +695,48 @@ impl LspClient {
             }
             // A response or notification, or a different request — skip and keep
             // waiting within the deadline.
+        }
+    }
+
+    /// Like [`Self::wait_for_server_request`], but also collects every
+    /// notification whose method is in `watch` seen while waiting (in arrival
+    /// order). Lets a test assert something did NOT precede the awaited request
+    /// — the pipe is FIFO, so anything the server enqueued earlier is in the
+    /// collected list — without resorting to a flaky negative timeout.
+    pub(crate) fn wait_for_server_request_watching(
+        &mut self,
+        expected_method: &str,
+        timeout: Duration,
+        watch: &[&str],
+    ) -> Option<WatchedServerRequest> {
+        let start_time = Instant::now();
+        let mut watched = Vec::new();
+
+        loop {
+            let remaining = timeout.saturating_sub(start_time.elapsed());
+            if remaining.is_zero() {
+                return None;
+            }
+
+            let message = self.try_receive_message(remaining)?;
+
+            let Value::Object(mut map) = message else {
+                continue;
+            };
+            let method = map
+                .get("method")
+                .and_then(|m| m.as_str())
+                .map(str::to_string);
+            match (method, map.remove("id")) {
+                (Some(method), Some(id)) if method == expected_method => {
+                    let params = map.remove("params").unwrap_or(Value::Null);
+                    return Some((id, params, watched));
+                }
+                (Some(method), None) if watch.contains(&method.as_str()) => {
+                    watched.push((method, map.remove("params").unwrap_or(Value::Null)));
+                }
+                _ => {} // other request/response/notification — skip
+            }
         }
     }
 

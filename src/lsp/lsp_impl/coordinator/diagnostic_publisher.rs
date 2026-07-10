@@ -564,6 +564,28 @@ impl DiagnosticPublisher {
             return false;
         }
 
+        // The cross-layer gate for `textDocument/publishDiagnostics` doubles as a
+        // WIRE SEAL when it resolves to no layers at all: a pull-first editor
+        // setup can stop the proactive publishes entirely via existing config.
+        // On a diagnostics-heavy host they dominated the editor pipe (measured:
+        // 51 publishes × ~1 MB in a 44 s typing burst, 68% of all server→client
+        // bytes — head-of-line blocking every other response) while a pulling
+        // editor ignores them or renders them as a duplicate namespace. The
+        // merge above still ran and recorded the set: change detection keeps
+        // driving the push-origin coverage bump and
+        // `workspace/diagnostic/refresh`, which IS the sealed setup's delivery
+        // signal (refresh → client re-pull).
+        if self.publish_sealed(host) {
+            log::debug!(
+                target: LOG_TARGET,
+                "seal: skipping publish of {} merged diagnostics for {} \
+                 (layers.aggregation publishDiagnostics resolves to no layers)",
+                diagnostics.len(),
+                host
+            );
+            return true;
+        }
+
         log::debug!(
             target: LOG_TARGET,
             "publishing {} merged diagnostics for {}",
@@ -574,6 +596,33 @@ impl DiagnosticPublisher {
             .publish_diagnostics(lsp_uri, diagnostics, None)
             .await;
         true
+    }
+
+    /// Whether the editor-facing `publishDiagnostics` wire sends are sealed for
+    /// `host` by config: the cross-layer gate for
+    /// `textDocument/publishDiagnostics` resolves to an **empty** priorities
+    /// list (`layers.aggregation."textDocument/publishDiagnostics".priorities =
+    /// []` on the host's language or the `_` wildcard).
+    ///
+    /// The seal is deliberately **binary** (all layers gated off), not
+    /// per-layer: a partially gated list still publishes the full merge, and
+    /// per-layer selection keeps applying to the debounced pull feed
+    /// (`coordinator/diagnostic.rs`) as before — filtering the wire set by
+    /// layer would diverge it from the change-detection set that drives the
+    /// refresh nudging. Fails open (not sealed) when the document is gone or
+    /// its language is undetectable, so a `didClose` clearing publish still
+    /// goes out.
+    fn publish_sealed(&self, host: &Url) -> bool {
+        self.open_document_language(host)
+            .is_some_and(|language_name| {
+                crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                    &self.settings_manager.load_settings(),
+                    &language_name,
+                    "textDocument/publishDiagnostics",
+                )
+                .priorities
+                .is_empty()
+            })
     }
 
     /// Ask pull-mode clients to re-pull diagnostics (`workspace/diagnostic/refresh`)
@@ -778,7 +827,7 @@ mod tests {
     use super::*;
     use crate::config::settings::{
         BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY, LanguageSettings,
-        WorkspaceSettings,
+        LayerAggregationConfig, LayersConfig, WorkspaceSettings,
     };
     use std::collections::HashMap;
     use tower_lsp_server::LspService;
@@ -834,6 +883,29 @@ mod tests {
             languages,
             ..Default::default()
         }
+    }
+
+    /// [`rust_settings`]`(true)` plus the publish wire seal on the rust entry:
+    /// `layers.aggregation."textDocument/publishDiagnostics".priorities = []`.
+    /// (On the exact language entry — `resolve_host_language_settings` is
+    /// exact-or-wildcard wholesale, so a `_` seal wouldn't reach a language
+    /// with its own entry.)
+    fn rust_settings_with_publish_seal() -> WorkspaceSettings {
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        lang.layers = Some(LayersConfig {
+            aggregation: Some(HashMap::from([(
+                "textDocument/publishDiagnostics".to_string(),
+                LayerAggregationConfig {
+                    priorities: Some(Vec::new()),
+                    strategy: None,
+                },
+            )])),
+        });
+        settings
     }
 
     /// `service.inner()` borrows from `service`, so the harness is set up inline
@@ -1071,6 +1143,80 @@ mod tests {
         assert!(
             !publisher.republish(&uri).await,
             "re-publishing the identical set must report unchanged (no redundant refresh)"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sealed_reflects_the_layer_gate() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        let uri = Url::parse("file:///test/host_seal.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        server.settings_manager.apply_settings(rust_settings(true));
+        assert!(
+            !publisher.publish_sealed(&uri),
+            "default layer priorities publish as before"
+        );
+
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_seal());
+        assert!(
+            publisher.publish_sealed(&uri),
+            "publishDiagnostics priorities = [] seals the wire sends"
+        );
+
+        let closed = Url::parse("file:///test/never_opened.rs").unwrap();
+        assert!(
+            !publisher.publish_sealed(&closed),
+            "an unresolvable document fails open (didClose's clearing publish goes out)"
+        );
+    }
+
+    #[tokio::test]
+    async fn republish_under_seal_keeps_the_change_contract() {
+        // With the wire sealed, the merge and the last-published recording must
+        // behave exactly as in publish mode: a changed set reports true (drives
+        // the coverage bump + refresh — the sealed setup's delivery signal), an
+        // identical re-merge reports false. If the seal skipped the recording,
+        // every push would re-report "changed" and spam refreshes forever.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_seal());
+        let uri = Url::parse("file:///test/host_sealed_contract.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("boom")],
+        );
+
+        assert!(
+            publisher.republish(&uri).await,
+            "a changed set reports true under the seal (drives the refresh)"
+        );
+        assert!(
+            !publisher.republish(&uri).await,
+            "the sealed set was recorded as last-published, so a re-merge is unchanged"
         );
     }
 

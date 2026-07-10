@@ -511,6 +511,101 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
     client.send_notification("exit", json!(null));
 }
 
+#[test]
+fn e2e_publish_seal_delivers_via_refresh_and_pull_only() {
+    // The cross-layer gate for `textDocument/publishDiagnostics` doubles as a
+    // wire seal: `priorities = []` stops the proactive publishes entirely (a
+    // pull-first editor setup ignores them or renders them as a duplicate
+    // namespace; measured at ~1 MB × dozens per typing burst on a
+    // diagnostics-heavy host) while delivery continues via
+    // `workspace/diagnostic/refresh` → client re-pull. Deterministic ordering:
+    // a publish (were it sent) is enqueued strictly before the refresh the
+    // same set-change drives, so collecting publishes while waiting for the
+    // refresh proves the seal without a negative timeout.
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("publish_seal.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": { "workspace": { "diagnostics": { "refreshSupport": true } } },
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                },
+                "languages": {
+                    "markdown": {
+                        "layers": {
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "priorities": [] }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    // The mock's spontaneous push changes the merged set → the refresh nudge
+    // still fires (it is the sealed setup's delivery signal) — and no
+    // publishDiagnostics for the host may precede it.
+    let (refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(15),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("a sealed setup must still drive workspace/diagnostic/refresh on a push");
+    let host_publishes: Vec<_> = publishes
+        .iter()
+        .filter(|(_, params)| params["uri"] == json!(MD_URI))
+        .collect();
+    assert!(
+        host_publishes.is_empty(),
+        "the seal must stop publishDiagnostics for the host (got {host_publishes:?})"
+    );
+    client.send_response(refresh_id, json!(null));
+
+    // Delivery works through the pull: the push-only mock's cached push is
+    // folded into the client-pull response in host coordinates (pushFallback).
+    let response = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let items = response["result"]["items"]
+        .as_array()
+        .expect("the pull answer is a full diagnostic report with an items array");
+    let pulled = items
+        .iter()
+        .find(|d| is_mock_push(d))
+        .expect("the pushed diagnostic must be deliverable through the client pull");
+    assert_eq!(
+        pulled["range"]["start"]["line"],
+        json!(HOST_LINE),
+        "the pulled diagnostic must be in host coordinates (host line {HOST_LINE})"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
 /// Send a `didOpen` for the markdown host (with its lua region) so the bridge
 /// spawns the downstream mock for that region and forwards the region's events.
 fn open_host(client: &mut LspClient) {

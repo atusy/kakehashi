@@ -98,6 +98,23 @@ source. Push-driven servers feed this path natively; pull-driven servers feed it
 via the `pullFallback` toggle and, opportunistically, via any push they emit (see
 Per-server source and fallback).
 
+**Config wire seal.** The cross-layer gate for
+`textDocument/publishDiagnostics` doubles as a seal on the editor-facing wire
+sends: when `layers.aggregation."textDocument/publishDiagnostics".priorities`
+resolves to `[]` for the host's language, `republish` skips the
+`publishDiagnostics` send entirely. This is the opt-out for pull-first editor
+setups, where the proactive publish is a redundant second delivery of the same
+merged set — the editor either ignores it or (Neovim ≥ 0.11) renders it as a
+duplicate diagnostic namespace next to the pulled one; on a diagnostics-heavy
+host it dominated the editor pipe (measured: 51 publishes × ~1 MB in a 44 s
+typing burst, 68% of all server→client bytes), head-of-line blocking every
+other response. The seal skips only the wire send: the merge still runs and
+records the last-published set, so change detection keeps driving the
+push-origin coverage bump and `workspace/diagnostic/refresh` — the sealed
+setup's delivery signal (refresh → client re-pull). The seal is binary (all
+layers gated off); a partially gated priorities list still publishes the full
+merge — per-layer selection applies to the debounced pull feed, as before.
+
 ### Path B — Client-initiated pull (retained)
 
 kakehashi keeps answering `textDocument/diagnostic` from the client:
