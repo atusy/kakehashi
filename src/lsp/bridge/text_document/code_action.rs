@@ -952,7 +952,7 @@ fn finalize_virt_resolved_action(
     // action: the user would apply it and get a partial or no-op change.
     // This is a PERMANENT failure, so `resolve_untranslatable_edit` disables
     // rather than transient-fail-softing.
-    let disable_reason = match (resolved.edit.as_mut(), host_uri_lsp.as_ref()) {
+    let disable_reason = match (resolved.edit.as_mut(), host_uri_lsp) {
         (Some(edit), Some(host_uri_lsp)) => {
             let virtual_uri = VirtualDocumentUri::new(
                 host_uri_lsp,
