@@ -4,8 +4,10 @@ pub(crate) fn sort_diagnostics_deterministically(diagnostics: &mut [Diagnostic])
     // Cached key: the canonical-JSON tiebreaker serializes the whole
     // diagnostic, so computing it per COMPARISON (O(n log n) times, twice
     // each) would dominate the sort — compute every component once per
-    // element instead. Key order preserves the previous comparator's
-    // tie-break semantics exactly.
+    // element instead. The key components compare in the same order as the
+    // previous comparator; the final tiebreaker is canonical JSON (sorted
+    // object keys), stronger than the old serde_json::to_string whose key
+    // order could differ between equal-content diagnostics.
     diagnostics.sort_by_cached_key(|d| {
         (
             diagnostic_position_key(d),
