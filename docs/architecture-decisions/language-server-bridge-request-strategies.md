@@ -308,8 +308,10 @@ to them).
 
 **Behavior**:
 - Language servers push diagnostics asynchronously
-- VIRTUAL-region pushes: filtered to the virtual document URI, all ranges
-  translated to host coordinates
+- VIRTUAL-region pushes: filtered to the virtual document URI; primary
+  diagnostic ranges translated to host coordinates (`relatedInformation`:
+  virtual-URI entries dropped, same-host entries translated, other real-file
+  entries unchanged)
 - `_self` HOST pushes: real host URI and host-relative ranges, republished
   as-is (no filtering or translation step)
 - Concatenate diagnostics from multiple servers (multiplicity preserved — no

@@ -30,7 +30,9 @@ forwards these requests to a real language server — one you configure for
 the embedded language, or (for the surrounding document) a `bridge._self`
 host server. Without a server they generally return nothing, though under
 `KAKEHASHI_EXPERIMENTAL=true` a native Tree-sitter layer answers
-definition/references/document highlight/rename lexically.
+definition/references/document highlight/rename lexically — for languages
+that ship a `bindings.scm`, and not in `#offset!`-shifted regions (e.g.
+frontmatter).
 
 ### Embedded code blocks
 
@@ -570,9 +572,11 @@ kakehashi does not yet provide these LSP features:
 - Workspace symbol search (`workspace/symbol`)
 
 (The static code-action and execute-command providers are advertised only to
-clients with `codeActionLiteralSupport`; palette command names are registered
-dynamically and depend only on the client's
-`workspace.executeCommand.dynamicRegistration`.)
+clients with `codeActionLiteralSupport`. Palette command names are registered
+dynamically when the client declares
+`workspace.executeCommand.dynamicRegistration` — covering the commands a
+downstream server advertised in its initialize result once it reaches Ready;
+commands a downstream registers dynamically afterwards are not routed.)
 
 Bridged features are also limited to **embedded code blocks** in one respect:
 navigation and edits do not cross between blocks — on the

@@ -366,7 +366,9 @@ impl Kakehashi {
                 // their command names aren't known at initialize (and each routed
                 // name embeds a per-document host_uri, so it could never be a
                 // stable advertised entry anyway). Each server's RAW command
-                // names are dynamically registered as it reaches Ready
+                // names — those from its static initialize result; a
+                // downstream's later dynamic command registrations are not
+                // collected — are dynamically registered as it reaches Ready
                 // (`UpstreamRequest::RegisterCommands` below, gated on client
                 // `dynamicRegistration`), which serves palette-fired commands
                 // — via a session-global registry keyed by raw command id, so
