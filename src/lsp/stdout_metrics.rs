@@ -233,14 +233,16 @@ where
         let method = request.method().to_string();
         let future = self.inner.call(request);
         let metrics = Arc::clone(&self.metrics);
-        let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            let response = future.await.map_err(ResponseReadyError::Inner)?;
-            if let Some(response) = response.as_ref() {
-                metrics.record_response_ready(response.id().clone(), method, Instant::now());
-            }
-            Ok(response)
-        }));
-        Box::pin(async move { task.await.map_err(ResponseReadyError::Task)? })
+        Box::pin(async move {
+            let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let response = future.await.map_err(ResponseReadyError::Inner)?;
+                if let Some(response) = response.as_ref() {
+                    metrics.record_response_ready(response.id().clone(), method, Instant::now());
+                }
+                Ok(response)
+            }));
+            task.await.map_err(ResponseReadyError::Task)?
+        })
     }
 }
 
@@ -616,13 +618,17 @@ mod tests {
     async fn service_records_completion_before_its_response_is_consumed() {
         let metrics = Arc::new(StdoutMetrics::new(Instant::now()));
         let mut service = ResponseReadyService::new(EchoService, Arc::clone(&metrics));
-        let response_future = tower::Service::call(
+        let mut response_future = tower::Service::call(
             &mut service,
             Request::build("textDocument/semanticTokens/full")
                 .id(7i64)
                 .finish(),
         );
 
+        tokio::task::yield_now().await;
+        assert_eq!(metrics.ready_count(), 0, "call alone does not admit work");
+
+        assert!(futures::poll!(response_future.as_mut()).is_pending());
         tokio::task::yield_now().await;
 
         assert_eq!(metrics.ready_count(), 1);

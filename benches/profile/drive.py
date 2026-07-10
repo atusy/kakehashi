@@ -132,20 +132,20 @@ def classify_semantic_blocking(
     schedulable = 0
     already_writing = 0
     semantics = [
-        frame
-        for frame in frames
+        (index, frame)
+        for index, frame in enumerate(frames)
         if frame.ready_us is not None
         and (frame.method or "").startswith("textDocument/semanticTokens/")
     ]
-    for semantic in semantics:
+    for semantic_index, semantic in semantics:
         blockers = [
             frame
-            for frame in frames
-            if frame is not semantic
+            for blocker_index, frame in enumerate(frames)
+            if blocker_index < semantic_index
             and frame.request_id is not None
             and frame.ready_us is not None
             and frame.frame_bytes >= large_frame_bytes
-            and frame.write_start_us < semantic.write_start_us
+            and frame.write_start_us <= semantic.write_start_us
             and (
                 frame.flush_complete_us
                 if frame.flush_complete_us is not None
