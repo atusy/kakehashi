@@ -42,9 +42,10 @@ embedded block as a **standalone snippet** and hands it to the matching language
 server. Two consequences follow from this, and they shape what you can expect:
 
 - **Each block is analyzed on its own.** Two Python blocks can each define
-  `main()` without conflicting. But features that need to see across blocks do not
-  work between them — for example, you cannot go to a definition that lives in a
-  *different* block.
+  `main()` without conflicting. But features that need to see across blocks do
+  not work between them — a definition target addressed through a *different*
+  block's virtual document is filtered out (a server pointing at the host
+  file's own URI can still land anywhere in it).
 - **Embedded content is bridged per block; the host document is opt-in.** The
   surrounding document itself (the Markdown prose, the host file as a whole)
   receives the built-in features by default, and can additionally be bridged

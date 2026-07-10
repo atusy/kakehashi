@@ -29,7 +29,7 @@ Current bridge-backed requests include:
 - Rename / Prepare Rename
 - Document Highlight / Document Symbol / Document Link
 - Moniker / Inlay Hint
-- Code Lens (incl. `codeLens/resolve` routed back to the origin server; resolution fails soft when the region was edited since the lens was produced)
+- Code Lens (incl. `codeLens/resolve` routed back to the origin server for injection-layer lenses — host-layer lenses pass through unrouted; resolution fails soft when the region was edited since the lens was produced)
 - Code Action (incl. `codeAction/resolve` routed back to the origin server, host-layer actions via `bridge._self`, and a merged menu across every injection region a multi-fence range overlaps; advertised only to clients with `codeActionLiteralSupport`)
 - `workspace/executeCommand` (commands surfaced through bridged actions route back to their origin server by name; palette-fired commands — those a downstream advertised in its initialize result — route via dynamically registered names when the client supports dynamic registration (a downstream's own later dynamic command registrations are not routed). Known limitations: action-embedded command names are per-document encoded and never registered, so clients that only dispatch command ids from registered lists — VS Code's vscode-languageclient — show such actions without running their command; and the palette registry is session-global by raw command id, so a name advertised by several servers routes to the latest advertiser)
 - `workspace/applyEdit` from downstream servers (virtual-document edits are translated to the host document and relayed to the editor; untranslatable edits answer `applied: false`)
@@ -350,8 +350,10 @@ coordinate translation. All bridged request methods are wired (exceptions:
 semantic tokens; document color stays injection-only; host completion-item
 and code-lens resolves pass through unrouted); by default the host layer is
 tried after
-`virt` (see `layers` above), so injections keep winning inside code fences
-while the host server answers everywhere else. For formatting, combine
+`virt` (see `layers` above), so for `preferred` methods injections keep
+winning inside code fences while the host server answers everywhere else —
+diagnostics/code actions (`concatenated` default) and the formatting
+pipeline combine BOTH layers instead. For formatting, combine
 fence formatters with a whole-document formatter via
 `layers.aggregation."textDocument/formatting".strategy = "concatenated"`.
 
