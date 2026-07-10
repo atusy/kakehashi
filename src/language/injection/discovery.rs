@@ -504,17 +504,16 @@ pub(crate) struct ResolvedInjection {
     pub raw_injection_language: String,
     /// Language of the injection content
     pub injection_language: String,
-    /// Extracted virtual document content. Single regions strip excluded
-    /// prefixes; combined regions mask excluded host gaps with whitespace.
+    /// Extracted virtual document content. Excluded line prefixes are stripped;
+    /// combined regions additionally mask host-only gaps with whitespace.
     pub virtual_content: String,
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.
     pub line_column_offsets: Vec<u32>,
     /// Whether `virtual_content` maps to one contiguous host byte range —
-    /// i.e. no excluded host bytes were whitespace-masked. A combined
-    /// pattern whose captures form one unbroken included range is still
-    /// `true`; any masked gap (between captures or within one) makes it
-    /// `false`.
+    /// i.e. no host-only span between multiple captures was whitespace-masked.
+    /// A combined pattern that currently matches one capture uses the ordinary
+    /// single-region mapping and remains `true`.
     pub contiguous: bool,
 }
 
@@ -644,12 +643,11 @@ impl InjectionResolver {
     }
 
     /// Build one bridge virtual document for all captures of an
-    /// `injection.combined` pattern. Every host byte outside the included
-    /// ranges — the gaps between captures AND excluded bytes inside a
-    /// capture (e.g. non-content child/prefix bytes) — is replaced with
-    /// coordinate-preserving whitespace: the downstream parser sees one
-    /// document and retains cross-block context, while every virtual
-    /// line/column still maps directly back to the host document.
+    /// `injection.combined` pattern. Excluded line prefixes are stripped and
+    /// recorded as per-line offsets, while host-only gaps between captures are
+    /// represented by empty or whitespace-only lines. The downstream parser
+    /// sees one document and retains cross-block context without inheriting
+    /// indentation from host prefixes.
     fn build_combined_injection(
         coordinator: &LanguageCoordinator,
         identity: Option<(&NodeTracker, &Url, u64)>,
@@ -680,6 +678,21 @@ impl InjectionResolver {
         };
         let first = regions[0];
         let first_cacheable = cacheable[0];
+        if regions.len() == 1 {
+            let (virtual_content, line_column_offsets) =
+                extract_virtual_content_and_offsets(first, first_cacheable, text);
+            let injection_language =
+                Self::resolve_language(coordinator, &first.language, &virtual_content);
+            let mut region = first_cacheable.clone();
+            region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
+            return ResolvedInjection {
+                region,
+                injection_language,
+                virtual_content,
+                line_column_offsets,
+                contiguous: true,
+            };
+        }
         let group_start = first_cacheable.byte_range.start;
         let group_end = cacheable
             .iter()
@@ -716,7 +729,8 @@ impl InjectionResolver {
             covered_until = covered_until.max(range.end);
             true
         }) && covered_until >= group_end;
-        let virtual_content = mask_outside_ranges(text, group_start..group_end, &included);
+        let (virtual_content, line_column_offsets) =
+            build_combined_virtual_content(text, group_start..group_end, &included);
 
         let mut combined_region = first_cacheable.clone();
         combined_region.byte_range.end = group_end;
@@ -733,7 +747,7 @@ impl InjectionResolver {
             raw_injection_language: first.language.clone(),
             injection_language: resolved_language,
             virtual_content,
-            line_column_offsets: vec![first_cacheable.start_column],
+            line_column_offsets,
             contiguous,
         })
     }
@@ -900,6 +914,73 @@ fn mask_outside_ranges(text: &str, span: Range<usize>, included: &[Range<usize>]
     }
     push_coordinate_whitespace(&mut output, clamped_slice(text, cursor..span.end));
     output
+}
+
+/// Build a line-preserving combined document while stripping excluded prefixes.
+///
+/// Host-only gaps stay as empty or whitespace-only lines so virtual and host
+/// line numbers remain aligned. On lines containing injected content, bytes
+/// before the first included range are removed and recorded as a UTF-16 column
+/// offset, matching the isolated-region `extract_clean_content` contract. Any
+/// later gaps on the same line remain coordinate-preserving whitespace because
+/// the bridge offset model supports one translation offset per line.
+fn build_combined_virtual_content(
+    text: &str,
+    span: Range<usize>,
+    included: &[Range<usize>],
+) -> (String, Vec<u32>) {
+    let mut output = String::new();
+    let mut offsets = Vec::new();
+    let mut line_start = span.start;
+
+    while line_start < span.end {
+        let remaining = clamped_slice(text, line_start..span.end);
+        let line_end = remaining
+            .find('\n')
+            .map_or(span.end, |newline| line_start + newline + 1);
+        let mut content_end = line_end;
+        if text.as_bytes().get(content_end.saturating_sub(1)) == Some(&b'\n') {
+            content_end -= 1;
+            if text.as_bytes().get(content_end.saturating_sub(1)) == Some(&b'\r') {
+                content_end -= 1;
+            }
+        }
+
+        let first_included = included
+            .iter()
+            .filter_map(|range| {
+                let start = range.start.max(line_start);
+                let end = range.end.min(content_end);
+                (start < end).then_some(start)
+            })
+            .min();
+
+        if let Some(first_included) = first_included {
+            let host_line_start = text[..first_included]
+                .rfind('\n')
+                .map_or(0, |newline| newline + 1);
+            offsets.push(
+                clamped_slice(text, host_line_start..first_included)
+                    .encode_utf16()
+                    .count() as u32,
+            );
+            output.push_str(&mask_outside_ranges(
+                text,
+                first_included..line_end,
+                included,
+            ));
+        } else {
+            offsets.push(0);
+            output.push_str(clamped_slice(text, content_end..line_end));
+        }
+
+        line_start = line_end;
+    }
+
+    if output.ends_with('\n') {
+        offsets.push(0);
+    }
+    (output, offsets)
 }
 
 fn push_coordinate_whitespace(output: &mut String, text: &str) {
@@ -1283,6 +1364,87 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].contiguous);
         assert_eq!(resolved[0].virtual_content, "<div></div>");
+    }
+
+    #[test]
+    fn combined_captures_strip_blockquote_prefixes_and_record_offsets() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = concat!(
+            "> ```python\n",
+            "> if True:\n",
+            ">   print(1)\n",
+            "> ```\n",
+            "> gap\n",
+            "> ```python\n",
+            ">   print(2)\n",
+            "> ```\n",
+        );
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+                ((fenced_code_block
+                   (info_string (language) @injection.language)
+                   (code_fence_content) @injection.content)
+                 (#set! injection.combined))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("combined_blockquote"),
+            &tree,
+            text,
+            &query,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].virtual_content,
+            "if True:\n  print(1)\n\n\n\n  print(2)\n"
+        );
+        assert_eq!(
+            resolved[0].line_column_offsets,
+            vec![2, 2, 0, 0, 0, 2, 0, 0]
+        );
+        assert!(!resolved[0].contiguous);
+    }
+
+    #[test]
+    fn single_combined_blockquote_uses_contiguous_single_region_mapping() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "> ```python\n> if True:\n>   print(1)\n> ```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+                ((fenced_code_block
+                   (info_string (language) @injection.language)
+                   (code_fence_content) @injection.content)
+                 (#set! injection.combined))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("single_combined_blockquote"),
+            &tree,
+            text,
+            &query,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "if True:\n  print(1)\n");
+        assert_eq!(resolved[0].line_column_offsets, vec![2, 2, 0]);
+        assert!(resolved[0].contiguous);
     }
 
     #[test]
