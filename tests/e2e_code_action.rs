@@ -121,6 +121,13 @@ fn literal_support_caps(disabled_support: bool) -> Value {
 /// the applyEdit-relay e2e tests opt in, so every other test keeps the
 /// minimal capability surface.
 fn with_apply_edit(mut caps: Value) -> Value {
+    // A capability set is always a JSON object; fail with a clear message
+    // instead of the opaque panic Value's index-assign raises on, say, an
+    // array.
+    assert!(
+        caps.is_object(),
+        "with_apply_edit expects a capability object, got: {caps:?}"
+    );
     // Merge instead of replacing `workspace`, so a caller that already
     // declares other workspace.* capabilities keeps them.
     match caps.get_mut("workspace") {
