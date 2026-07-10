@@ -680,11 +680,14 @@ impl Kakehashi {
                 // client until the next push. The per-host debt (recorded by
                 // that pull, consumed here exactly once) keys the recovery, so
                 // an ordinary edit cycle — or an unrelated host being dirty —
-                // never turns a parse pass into a refresh trigger; the
-                // request still goes through the coverage + single-flight
-                // gates like every other refresh origin.
+                // never turns a parse pass into a refresh trigger. FORCED past
+                // the coverage gate (still single-flighted): the debt proves
+                // the client holds a non-covering answer, which the
+                // version-based gate cannot see — an edit-race degradation
+                // leaves served == current, so a gated request would be
+                // suppressed while the client displays the region-less set.
                 if diagnostics.take_degraded_pull(&uri) {
-                    publisher.request_pull_diagnostic_refresh(false);
+                    publisher.request_pull_diagnostic_refresh(true);
                 }
 
                 // Schedule the debounced diagnostic HERE, after the reparse restored

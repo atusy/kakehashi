@@ -308,8 +308,10 @@ policy clean:
   push-origin callers treat it like a change for the coverage bump and
   `workspace/diagnostic/refresh` (the cache did change; the retry itself
   nudges only as degraded-pull recovery — a per-host debt recorded by a pull
-  the parse wait failed, consumed by the post-parse pass, gated by coverage
-  and the single-flight like every refresh). Accepted caveat: a parse
+  the parse wait failed, consumed once by the post-parse pass or the
+  pull-side TOCTOU guard, forced past the coverage gate — the debt proves
+  the client holds a non-covering answer that version coverage cannot see —
+  but still single-flighted like every refresh). Accepted caveat: a parse
   give-up (timeout,
   parser gone) leaves the tree absent and both retries deferred until the
   next edit — where the pre-deferral behavior published a region-LESS set,

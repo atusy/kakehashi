@@ -380,12 +380,17 @@ impl Kakehashi {
             // debt consumer already run — in between, leaving this
             // freshly-recorded debt with no consumer until the next edit. If
             // geometry is available NOW, consume the debt here and fire the
-            // recovery refresh ourselves (same coverage + single-flight
-            // gates). `take` on both consumers makes double-firing impossible;
-            // if the snapshot is still absent, the parse that produces it has
-            // not run its post-parse pass yet, so that pass will consume.
-            // Loop-bounded: the refresh-induced re-pull sees the ready
-            // geometry, answers covering, and clears everything.
+            // recovery refresh ourselves. FORCED past the coverage gate (still
+            // single-flighted): the debt itself proves the client just
+            // received a non-covering answer, which the version-based gate
+            // cannot see — an edit-race degradation leaves served == current
+            // (no push-origin change), so a gated request would be suppressed
+            // while the client displays the region-less set. `take` on both
+            // consumers makes double-firing impossible; if the snapshot is
+            // still absent, the parse that produces it has not run its
+            // post-parse pass yet, so that pass will consume. Loop-bounded:
+            // the refresh-induced re-pull sees the ready geometry, answers
+            // covering, and clears everything.
             let geometry_ready = self
                 .documents
                 .get(&uri)
@@ -393,7 +398,7 @@ impl Kakehashi {
                 .is_some();
             if geometry_ready && self.diagnostics.take_degraded_pull(&uri) {
                 crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
-                    .request_pull_diagnostic_refresh(false);
+                    .request_pull_diagnostic_refresh(true);
             }
         } else {
             self.mark_pull_covered(&uri, served_version);
