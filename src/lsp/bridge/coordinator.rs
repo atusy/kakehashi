@@ -795,6 +795,7 @@ impl BridgeCoordinator {
         // runs on the runtime, and starving it delays every handler).
         let mut config_by_lang: HashMap<String, Option<ResolvedServerConfig>> = HashMap::new();
         let mut connection_key_by_lang = HashMap::new();
+        let mut any_resolved = false;
         for injection in injections {
             let resolved = config_by_lang
                 .entry(injection.language.clone())
@@ -802,6 +803,7 @@ impl BridgeCoordinator {
                     self.get_config_for_language(settings, host_language, &injection.language)
                 });
             if let Some(resolved) = resolved {
+                any_resolved = true;
                 let connection_key = match connection_key_by_lang.get(&injection.language) {
                     Some(key) => key,
                     None => {
@@ -830,11 +832,13 @@ impl BridgeCoordinator {
             }
         }
 
-        // Every injection is already claimed/open on its exact target
-        // connection. Keep any active batch: a pre-send claim is visible in the
-        // reverse index, and aborting its owner here would strand the claim
-        // before didOpen reaches the FIFO writer.
+        // Empty means either every resolved injection is already sent/open, or
+        // current settings resolve none. Preserve a batch only in the former
+        // case; in the latter it belongs to removed configuration and must stop.
         if server_groups.is_empty() {
+            if !any_resolved {
+                self.cancel_eager_open(host_uri);
+            }
             return;
         }
 

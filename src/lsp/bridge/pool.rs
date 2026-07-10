@@ -798,11 +798,10 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Whether a document has been claimed or opened on a downstream server (ls-bridge-message-ordering).
+    /// Whether didOpen has been enqueued on at least one downstream connection.
     ///
     /// Fast synchronous check used to gate operations on documents not yet known
-    /// downstream. True once `try_claim_for_open()` has run — claims happen before
-    /// the didOpen send (with rollback on failure), so this can be true pre-send.
+    /// downstream. Pre-send claims deliberately remain invisible.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
@@ -906,10 +905,10 @@ impl LanguageServerPool {
     /// all tracking state on success. Callers handle error cleanup (router entry
     /// and upstream-request registry).
     ///
-    /// Uses `try_claim_for_open()` as a compare-and-swap so concurrent callers
-    /// skip the second didOpen. Registration of `host_to_virtual` happens before
-    /// the send so `close_host_document` can still find the doc if the task is
-    /// aborted between register and send; both are rolled back on send failure.
+    /// Uses `try_claim_for_open()` as a compare-and-swap. Concurrent callers wait
+    /// for the owner to enqueue didOpen or finish rollback, then either reuse the
+    /// sent open or claim and retry. `host_to_virtual` is registered pre-send for
+    /// close cleanup, while routing visibility is promoted only after enqueue.
     ///
     /// Generic over `MessageSender` (channel or `ConnectionHandleSender`) for
     /// the single-writer-loop architecture (ls-bridge-message-ordering).
@@ -921,12 +920,37 @@ impl LanguageServerPool {
         virtual_content: &str,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
-        if !self
-            .document_tracker
-            .try_claim_for_open(virtual_uri, connection_key)
-            .await
-        {
-            return Ok(()); // Already claimed by another caller
+        loop {
+            if self
+                .document_tracker
+                .try_claim_for_open(virtual_uri, connection_key)
+                .await
+            {
+                break;
+            }
+            if self
+                .document_tracker
+                .is_document_opened_on_connection(virtual_uri, connection_key)
+            {
+                return Ok(());
+            }
+            let Some(claim) = self
+                .document_tracker
+                .open_claim_waiter(virtual_uri, connection_key)
+            else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            let notified = claim.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .document_tracker
+                .open_claim_waiter(virtual_uri, connection_key)
+                .is_some_and(|current| Arc::ptr_eq(&current, &claim))
+            {
+                notified.await;
+            }
         }
         let mut claim_guard = OpenClaimGuard {
             tracker: Arc::clone(&self.document_tracker),
@@ -941,7 +965,7 @@ impl LanguageServerPool {
         // any subsequent didClose queued by close_host_document will arrive
         // after didOpen on the wire.
         self.document_tracker
-            .register_opened_document(host_uri, virtual_uri, connection_key)
+            .register_pending_document(host_uri, virtual_uri, connection_key)
             .await;
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
@@ -951,6 +975,8 @@ impl LanguageServerPool {
             claim_guard.disarm();
             return Err(e);
         }
+        self.document_tracker
+            .mark_open_sent(virtual_uri, connection_key);
         claim_guard.disarm();
         // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
         // `Ok`), so seed the content fingerprint with the opened content. Without
@@ -3454,27 +3480,42 @@ mod tests {
         };
 
         entered.notified().await;
-        assert!(pool.is_document_opened(&virtual_uri));
+        assert!(!pool.is_document_opened(&virtual_uri));
+        assert!(
+            pool.document_tracker
+                .open_claim_waiter(&virtual_uri, &connection_key)
+                .is_some()
+        );
+        let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        let retry = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let connection_key = connection_key.clone();
+            tokio::spawn(async move {
+                let mut sender = sender;
+                pool.ensure_document_opened(
+                    &mut sender,
+                    &host_uri,
+                    &virtual_uri,
+                    "print('new')",
+                    &connection_key,
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "retry must wait for the first claim"
+        );
         task.abort();
         let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while pool.is_document_opened(&virtual_uri) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("abort rollback should complete");
-
-        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
-        pool.ensure_document_opened(
-            &mut sender,
-            &host_uri,
-            &virtual_uri,
-            "print('new')",
-            &connection_key,
-        )
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("waiting retry should resume after abort rollback")
+            .expect("retry task should not panic")
+            .expect("retry should enqueue didOpen");
         assert!(rx.try_recv().is_ok(), "a later didOpen must be retryable");
     }
 
