@@ -21,8 +21,9 @@ use tower_lsp_server::ls_types::RenameParams;
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_text_document_position_params, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, workspace_edit_has_effect,
+    build_text_document_position_params, region_host_end, response_has_jsonrpc_error,
+    strip_bridge_local_versions, transform_workspace_edit_to_host, workspace_edit_has_effect,
+    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
 impl LanguageServerPool {
@@ -52,6 +53,7 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/rename") {
             return Ok(None);
         }
+        let region_end = region_host_end(virtual_content, &offset);
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -73,11 +75,12 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                transform_workspace_edit_response_to_host(
+                transform_workspace_edit_response_to_host_bounded(
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
                     ctx.offset,
+                    region_end,
                 )
             },
         )
@@ -112,13 +115,30 @@ fn build_rename_request(
 
 /// Transform a WorkspaceEdit response from virtual to host document coordinates.
 ///
-/// Unwraps the JSON-RPC response, then delegates the coordinate transformation
-/// to [`transform_workspace_edit_to_host`].
+/// Test helper for legacy unit cases whose edits are intentionally unbounded.
+#[cfg(test)]
 fn transform_workspace_edit_response_to_host(
+    response: serde_json::Value,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+) -> Option<WorkspaceEdit> {
+    transform_workspace_edit_response_to_host_bounded(
+        response,
+        request_virtual_uri,
+        host_uri,
+        offset,
+        Position::new(u32::MAX, u32::MAX),
+    )
+}
+
+/// Transform a WorkspaceEdit response and reject edits that escape the region.
+fn transform_workspace_edit_response_to_host_bounded(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
+    region_end: Position,
 ) -> Option<WorkspaceEdit> {
     if response_has_jsonrpc_error(&response, "textDocument/rename") {
         return None;
@@ -139,6 +159,14 @@ fn transform_workspace_edit_response_to_host(
     // those versions are bridge-local (the downstream's own counters) and
     // would read as stale to version-checking editors.
     strip_bridge_local_versions(&mut edit);
+
+    if !workspace_edit_within_region(&edit, host_uri, offset, region_end) {
+        return None;
+    }
+
+    if !workspace_edit_preserves_line_prefixes(&edit, host_uri, offset, region_end) {
+        return None;
+    }
 
     workspace_edit_has_effect(&edit).then_some(edit)
 }
@@ -869,6 +897,74 @@ mod tests {
         assert!(
             edit.is_none(),
             "documentChanges with no edits must fall through to other rename contributors"
+        );
+    }
+
+    #[test]
+    fn workspace_edit_multiline_edit_in_prefixed_region_returns_none() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "changes": {
+                    virtual_uri.clone(): [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 1, "character": 1 }
+                        },
+                        "newText": "renamed"
+                    }]
+                }
+            }
+        });
+
+        let edit = transform_workspace_edit_response_to_host_bounded(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::with_per_line_offsets(3, vec![2, 2, 2]),
+            Position::new(5, 0),
+        );
+
+        assert!(
+            edit.is_none(),
+            "rename must not strip host line prefixes in blockquoted regions"
+        );
+    }
+
+    #[test]
+    fn workspace_edit_newline_insert_in_prefixed_region_returns_none() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "changes": {
+                    virtual_uri.clone(): [{
+                        "range": {
+                            "start": { "line": 0, "character": 1 },
+                            "end": { "line": 0, "character": 1 }
+                        },
+                        "newText": "new\nname"
+                    }]
+                }
+            }
+        });
+
+        let edit = transform_workspace_edit_response_to_host_bounded(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::with_per_line_offsets(3, vec![2, 2]),
+            Position::new(5, 0),
+        );
+
+        assert!(
+            edit.is_none(),
+            "rename must not insert unprefixed lines into blockquoted regions"
         );
     }
 }

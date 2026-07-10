@@ -23,7 +23,6 @@ use serde_json::Value;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::text::PositionMapper;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
     CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
@@ -35,10 +34,10 @@ use url::Url;
 use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
-    host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
-    workspace_edit_has_effect, workspace_edit_within_region,
+    host_position_within_region, region_host_end, response_has_jsonrpc_error,
+    strip_bridge_local_versions, transform_workspace_edit_to_host, translate_host_range_to_virtual,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
+    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 
@@ -322,7 +321,7 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
 /// Translate an action's edit host-ward with resolve-grade validation, in
 /// place. Returns `Err(reason)` (leaving the edit partially mutated — the caller
 /// must discard the action and disable it with `reason`) when the edit can't be
-/// faithfully represented in the host document. The reason distinguishes two
+/// faithfully represented in the host document. The reason distinguishes three
 /// permanent failures the client shows to the user:
 /// - [`REASON_CROSS_REGION`] — the edit touches another injection region (the
 ///   shared transform would silently filter those and partially apply the rest),
@@ -333,6 +332,9 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
 /// - [`REASON_RESOLVE`] — the edit ended up empty: the server produced nothing
 ///   applicable, which reads as "could not be resolved to an applicable edit",
 ///   not "cannot be represented in the host document".
+/// - [`REASON_PREFIXED_REGION`] — the translated edit spans or inserts lines in
+///   a line-prefixed (e.g. blockquote) region; the verbatim newText would strip
+///   the prefixes and corrupt the host document.
 ///
 /// Used by BOTH the initial-response policy and the codeAction/resolve path so
 /// these are rejected uniformly, never partially applied.
@@ -358,6 +360,9 @@ fn translate_edit_host_ward_strict(
     }
     if !workspace_edit_within_region(edit, host_uri, offset, region_end) {
         return Err(REASON_CROSS_REGION);
+    }
+    if !workspace_edit_preserves_line_prefixes(edit, host_uri, offset, region_end) {
+        return Err(REASON_PREFIXED_REGION);
     }
     Ok(())
 }
@@ -396,21 +401,6 @@ fn workspace_edit_touches_foreign_region(edit: &WorkspaceEdit, request_virtual_u
             DocumentChangeOperation::Op(_) => false,
         }),
     }
-}
-
-/// The exclusive host-document end of an injection region: the position just
-/// past its `virtual_content`, mapped back to host coordinates. Bounds the
-/// in-region diagnostic filter position-precisely (line AND column), so a
-/// diagnostic after an inline same-line injection is dropped, not leaked.
-fn region_host_end(virtual_content: &str, offset: &RegionOffset) -> Position {
-    let mut end = PositionMapper::new(virtual_content)
-        .byte_to_position(virtual_content.len())
-        .unwrap_or(Position {
-            line: 0,
-            character: 0,
-        });
-    translate_virtual_position_to_host(&mut end, offset);
-    end
 }
 
 impl LanguageServerPool {
@@ -1186,6 +1176,8 @@ pub(crate) fn bridge_code_actions(
 
 const REASON_RESOLVE: &str = "this action could not be resolved to an applicable edit";
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
+const REASON_PREFIXED_REGION: &str = "the edit would break the host document's line prefixes \
+     (e.g. a blockquote) around the injected region";
 
 fn bridge_code_action(
     item: CodeActionOrCommand,
@@ -1742,9 +1734,22 @@ mod tests {
         upstream_caps: UpstreamCodeActionCaps,
         server_resolves: bool,
     ) -> Option<CodeActionResponse> {
+        transform_impl_with_offset(
+            result,
+            upstream_caps,
+            server_resolves,
+            RegionOffset::new(10, 0),
+        )
+    }
+
+    fn transform_impl_with_offset(
+        result: serde_json::Value,
+        upstream_caps: UpstreamCodeActionCaps,
+        server_resolves: bool,
+        offset: RegionOffset,
+    ) -> Option<CodeActionResponse> {
         let host_uri = make_host_uri();
         let virtual_uri = make_virtual_uri_string();
-        let offset = RegionOffset::new(10, 0);
         let actions = parse_code_action_response_raw(json!({
             "jsonrpc": "2.0", "id": 42, "result": result
         }))?;
@@ -2080,6 +2085,40 @@ mod tests {
             "empty edit must disable as unresolvable, not cross-region"
         );
         assert!(action.edit.is_none(), "unusable edit must not leak");
+    }
+
+    #[test]
+    fn prefix_breaking_edit_disables_the_action() {
+        // A blockquote region (`> ` prefix, width 2, on every line): a
+        // multi-line replacement's host range contains the interior lines'
+        // prefixes, but its verbatim newText carries none — applying it would
+        // strip the prefixes and break the blockquote. The action must be
+        // disabled with the prefix-specific reason, not applied.
+        let action = json!({
+            "title": "Organize imports",
+            "edit": { "changes": { make_virtual_uri_string(): [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 1, "character": 3 }
+                },
+                "newText": "import a\nimport b"
+            }] } }
+        });
+        let actions = transform_impl_with_offset(
+            json!([action]),
+            caps(true),
+            false,
+            RegionOffset::with_per_line_offsets(10, vec![2, 2]),
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            action.disabled.as_ref().unwrap().reason,
+            REASON_PREFIXED_REGION
+        );
+        assert!(action.edit.is_none(), "prefix-breaking edit must not leak");
     }
 
     #[test]

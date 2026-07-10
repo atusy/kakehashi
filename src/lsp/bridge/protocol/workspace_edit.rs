@@ -1,15 +1,19 @@
 //! WorkspaceEdit coordinate transformation from virtual to host documents.
 //!
-//! Shared by response paths that carry a `WorkspaceEdit` produced against a
-//! virtual document — rename today; codeAction and workspace/applyEdit will
-//! reuse it (#568). Per LSP spec a WorkspaceEdit may carry edits via `changes`
-//! (URI→TextEdit map) or `documentChanges`; both are handled.
+//! Shared by the response paths that carry a `WorkspaceEdit` produced against
+//! a virtual document: rename, codeAction, and workspace/applyEdit (#568).
+//! Per LSP spec a WorkspaceEdit may carry edits via `changes` (URI→TextEdit
+//! map) or `documentChanges`; both are handled.
+//!
+//! The guards below ([`workspace_edit_within_region`],
+//! [`workspace_edit_preserves_line_prefixes`]) are enforced by codeAction,
+//! rename, and applyEdit.
 
 use std::collections::HashMap;
 
 use tower_lsp_server::ls_types::{
-    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, Range,
-    ResourceOp, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    AnnotatedTextEdit, DocumentChangeOperation, DocumentChanges, OneOf, Position, ResourceOp,
+    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
 
 use super::translation::{RegionOffset, translate_virtual_range_to_host};
@@ -235,6 +239,21 @@ pub(crate) fn strip_bridge_local_versions(edit: &mut WorkspaceEdit) {
     }
 }
 
+/// The exclusive host-document end of an injection region: the position just
+/// past its `virtual_content`, mapped back to host coordinates — the
+/// position-precise (line AND column) upper bound for
+/// [`workspace_edit_within_region`].
+pub(crate) fn region_host_end(virtual_content: &str, offset: &RegionOffset) -> Position {
+    let mut end = crate::text::PositionMapper::new(virtual_content)
+        .byte_to_position(virtual_content.len())
+        .unwrap_or(Position {
+            line: 0,
+            character: 0,
+        });
+    super::translation::translate_virtual_position_to_host(&mut end, offset);
+    end
+}
+
 /// Whether every text edit targeting `host_uri` in a HOST-coordinate
 /// `WorkspaceEdit` is CONTAINED in the injection region — bounded above by
 /// `region_end` and below, PER LINE, by the region's line offset (`offset`).
@@ -277,27 +296,141 @@ pub(crate) fn workspace_edit_within_region(
             p.character >= offset.column_for_line(virtual_line) && !position_after(p, region_end)
         }
     };
-    let within = |range: Range| in_region(range.start) && in_region(range.end);
+    host_uri_text_edits_all(edit, host_uri, |e| {
+        in_region(e.range.start) && in_region(e.range.end)
+    })
+}
+
+/// Whether every text edit targeting `host_uri` keeps the region's per-line
+/// host prefixes (e.g. a blockquote's `> ` on every line) intact.
+///
+/// The virtual→host transform translates RANGES but emits `newText` verbatim
+/// — nothing re-inserts host line prefixes into replacement text. Two edit
+/// shapes would therefore strip or omit prefixes and structurally corrupt the
+/// host document (a broken blockquote un-fences the injected block):
+/// - a MULTI-LINE range: the host range legitimately contains the interior/end
+///   lines' prefixes, so replacing it deletes them. Unsafe iff any line after
+///   the start line carries a non-zero prefix.
+/// - a `newText` containing a NEWLINE: the inserted lines carry no prefix.
+///   Unsafe iff the insertion point's neighborhood is prefixed (the start line
+///   or the one after it has a non-zero prefix — a single-line inline/
+///   blockquote region has no line after, so the start line's own offset is
+///   the only signal there).
+///
+/// Plain fenced blocks (all-zero column offsets) are unaffected: every edit is
+/// prefix-safe there, which keeps the common case (whole-block refactors like
+/// organize-imports) working. In a prefixed per-line region, the closing-fence
+/// BOUNDARY row (recorded as a trailing zero entry, or falling past the array)
+/// counts as prefixed, and edits touching it are rejected outright — the row's
+/// real prefix is unrecorded, so even a no-newline insertion at its column 0
+/// would land before the `> `. Callers must REJECT unsafe edits, never clamp —
+/// same contract as [`workspace_edit_within_region`]. Positions ABOVE the
+/// region are this predicate's don't-care (the region bound rejects them).
+pub(crate) fn workspace_edit_preserves_line_prefixes(
+    edit: &WorkspaceEdit,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
+    let columns = offset.columns();
+    // In the per-line (blockquote) shape, content ending with a newline puts
+    // the region end at column 0 of the NEXT host row — the closing fence,
+    // whose recorded offset is 0 (`compute_line_column_offsets` leaves a
+    // trailing zero for the row where the included ranges end) even though the
+    // host line carries the `> ` prefix. That row is the prefixed BOUNDARY:
+    // derived from the region end, not the array shape, because a trailing
+    // zero entry can equally be a REAL unprefixed content row when an included
+    // gap ends mid-row (region end at a non-zero character — no boundary row
+    // is reachable then). Single-element arrays are the non-blockquote
+    // fallback whose closing fence carries no prefix, so no boundary
+    // semantics.
+    //
+    // The boundary row can also be the EOF row of an UNCLOSED blockquote fence
+    // (no closing line exists); the offsets cannot distinguish that from the
+    // closed-fence row, so the guard stays fail-closed there — rejecting a
+    // boundary-touching edit in a transient malformed construct is acceptable,
+    // corrupting a well-formed one is not.
+    // Fast path: a region with no prefixes anywhere (plain fenced blocks —
+    // the common case) can't have anything stripped; skip the per-edit line
+    // scans entirely.
+    if columns.iter().all(|&column| column == 0) {
+        return true;
+    }
+    // The all-zero fast path above guarantees SOME column is non-zero here,
+    // so only the shape distinction remains.
+    let content_prefixed = columns.len() > 1;
+    let boundary_at = |host_line: u32| {
+        content_prefixed && region_end.character == 0 && host_line >= region_end.line
+    };
+    let prefix_at = |host_line: u32| {
+        boundary_at(host_line)
+            || host_line
+                .checked_sub(offset.line())
+                .is_some_and(|v| offset.column_for_line(v) > 0)
+    };
+    host_uri_text_edits_all(edit, host_uri, |e| {
+        let (start, end) = (e.range.start, e.range.end);
+        // The boundary row's real prefix is unrecorded (0), so the per-line
+        // floor can't protect it: even a same-line, no-newline insertion at
+        // (fence, 0) lands before the `> `. Reject anything touching it.
+        let touches_boundary = boundary_at(start.line) || boundary_at(end.line);
+        // end.line at character 0 still counts as spanned — deliberately
+        // conservative (REJECT, never clamp): deleting up to (end, 0) removes
+        // the previous line's newline and merges the prefixed line upward.
+        //
+        // The scan is CLAMPED to the explicit per-line array: every line past
+        // it classifies via `boundary_at`, which is monotone in the line
+        // number, so the range's largest line (`end.line`) decides for all of
+        // them — the scan is O(columns.len()), never O(end.line), even for a
+        // malformed edit claiming a huge range.
+        let last_explicit = offset
+            .line()
+            .saturating_add((columns.len() as u32).saturating_sub(1));
+        let spans_prefixed_line = end.line > start.line
+            && ((start.line.saturating_add(1)..=end.line.min(last_explicit)).any(prefix_at)
+                || boundary_at(end.line));
+        // Single-element MULTI-LINE regions are exempt from the newline check:
+        // later lines are designed unprefixed and line 0's region content runs
+        // to end-of-line, so an inserted newline splits nothing. For a
+        // SINGLE-LINE region (region end on the start line — e.g. inline code)
+        // the host line continues past the region and a newline would split
+        // it, so line 0's offset still rejects there.
+        let newline_splits_nothing = columns.len() == 1 && region_end.line > offset.line();
+        let inserts_unprefixed_line = !newline_splits_nothing
+            && (e.new_text.contains('\n') || e.new_text.contains('\r'))
+            && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
+        !touches_boundary && !spans_prefixed_line && !inserts_unprefixed_line
+    })
+}
+
+/// Whether every text edit targeting `host_uri` (across both the `changes` map
+/// and `documentChanges`, unwrapping annotated edits) satisfies `pred`.
+/// Edits to other URIs are ignored; file operations carry no text edit.
+fn host_uri_text_edits_all(
+    edit: &WorkspaceEdit,
+    host_uri: &Uri,
+    pred: impl Fn(&TextEdit) -> bool,
+) -> bool {
     if let Some(changes) = &edit.changes
         && let Some(edits) = changes.get(host_uri)
-        && !edits.iter().all(|e| within(e.range))
+        && !edits.iter().all(&pred)
     {
         return false;
     }
-    let doc_edits_within = |edits: &[OneOf<TextEdit, AnnotatedTextEdit>]| {
+    let doc_edits_all = |edits: &[OneOf<TextEdit, AnnotatedTextEdit>]| {
         edits.iter().all(|one_of| {
-            let range = match one_of {
-                OneOf::Left(text_edit) => text_edit.range,
-                OneOf::Right(annotated) => annotated.text_edit.range,
+            let text_edit = match one_of {
+                OneOf::Left(text_edit) => text_edit,
+                OneOf::Right(annotated) => &annotated.text_edit,
             };
-            within(range)
+            pred(text_edit)
         })
     };
     match &edit.document_changes {
         None => {}
         Some(DocumentChanges::Edits(edits)) => {
             for e in edits {
-                if e.text_document.uri == *host_uri && !doc_edits_within(&e.edits) {
+                if e.text_document.uri == *host_uri && !doc_edits_all(&e.edits) {
                     return false;
                 }
             }
@@ -306,7 +439,7 @@ pub(crate) fn workspace_edit_within_region(
             for op in ops {
                 if let DocumentChangeOperation::Edit(e) = op
                     && e.text_document.uri == *host_uri
-                    && !doc_edits_within(&e.edits)
+                    && !doc_edits_all(&e.edits)
                 {
                     return false;
                 }
@@ -557,6 +690,382 @@ mod tests {
             }
             DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
         }
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_multi_line_edit_spanning_prefixed_lines() {
+        let host_uri = make_host_uri();
+        // A 3-line BLOCKQUOTE region starting at host line 3: every line's
+        // injected content sits behind a `> ` prefix (width 2).
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 2]);
+        // A downstream multi-line replacement (host lines 3-5). The host range
+        // legitimately contains lines 4 and 5's `> ` prefixes, but the verbatim
+        // newText carries no prefixes — applying it would strip them and break
+        // the blockquote.
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 2}, "end": {"line": 5, "character": 6}},
+                  "newText": "import a\nimport b" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 5,
+                character: 8,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_newline_insertion_in_prefixed_region() {
+        let host_uri = make_host_uri();
+        // Single-line blockquote region: `> code` at host line 3, prefix width 2.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2]);
+        // Inserting a newline splits the host line; the continuation line has
+        // no `> ` prefix, so the blockquote breaks.
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 4}},
+                  "newText": "a\nb" }
+            ] }
+        }));
+
+        // Single-LINE region: the region end sits on the start line.
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 3,
+                character: 6,
+            },
+        ));
+    }
+
+    #[rstest::rstest]
+    // The PRODUCTION blockquote shape: included ranges end at column 0 of the
+    // closing-fence line, so `compute_line_column_offsets` leaves a trailing
+    // EXPLICIT zero entry for that row — content on host lines 3-4, fence on
+    // host line 5 recorded as offset 0 despite its real `> ` prefix.
+    #[case::trailing_zero_entry(vec![2, 2, 0], 4, 5)]
+    // Defensive shape: no trailing artifact (content ends mid-line); the
+    // fence line falls PAST the array and must count as prefixed too.
+    #[case::past_the_array(vec![2, 2, 2], 5, 6)]
+    fn preserves_line_prefixes_rejects_edit_reaching_the_boundary_of_prefixed_region(
+        #[case] columns: Vec<u32>,
+        #[case] last_content_line: u32,
+        #[case] fence_line: u32,
+    ) {
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, columns);
+        // "Delete the last line": ends at (fence_line, 0), which the region
+        // end admits. Applying removes the previous line's newline and merges
+        // the PREFIXED fence line up into `> `, yielding `> > ```` —
+        // structural corruption at the boundary row.
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": last_content_line, "character": 2},
+                            "end": {"line": fence_line, "character": 0}},
+                  "newText": "" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: fence_line,
+                character: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_plain_insertion_on_the_boundary_row() {
+        let host_uri = make_host_uri();
+        // Production blockquote shape: trailing zero entry = the closing-fence
+        // row. A same-line, no-newline insertion at (5, 0) — which the region
+        // end admits and the per-line floor (recorded 0) lets through — would
+        // land BEFORE the fence line's `> `, producing `x> ````. No span, no
+        // newline: only boundary awareness catches it.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 0}},
+                  "newText": "x" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 5,
+                character: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_allows_newline_insertion_in_multi_line_single_element_region() {
+        let host_uri = make_host_uri();
+        // Production single-element shape over a MULTI-LINE region: later
+        // lines are designed unprefixed, and line 0's region content runs to
+        // end-of-line (the region continues on the next host line), so a
+        // newline-bearing replacement starting on line 0 splits nothing and
+        // its continuation lines correctly land at column 0.
+        let offset = RegionOffset::new(3, 4);
+        let region_end = Position {
+            line: 5,
+            character: 2,
+        };
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 6}},
+                  "newText": "x\ny" }
+            ] }
+        }));
+
+        assert!(workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset, region_end
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_allows_edit_on_trailing_zero_content_row() {
+        let host_uri = make_host_uri();
+        // A trailing zero entry is NOT always the closing-fence boundary:
+        // custom injection queries can produce an included gap that spans into
+        // a real second row and ends MID-row, yielding [start_column, 0] where
+        // row 1 is genuine unprefixed content. The region end then sits at a
+        // non-zero character on that row — no boundary row is reachable, and
+        // edits touching it must stay allowed.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![4, 0]);
+        let region_end = Position {
+            line: 4,
+            character: 3,
+        };
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 4, "character": 0}, "end": {"line": 4, "character": 2}},
+                  "newText": "x" }
+            ] }
+        }));
+
+        assert!(workspace_edit_preserves_line_prefixes(
+            &edit, &host_uri, &offset, region_end
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_lone_cr_newline_insertion() {
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2]);
+        // LSP admits bare `\r` as an EOL: it inserts an unprefixed line just
+        // like `\n` and must be caught by the same guard.
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 4}},
+                  "newText": "a\rb" }
+            ] }
+        }));
+
+        // Single-LINE region, like the \n sibling above.
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 3,
+                character: 6,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_allows_edits_in_unprefixed_fence() {
+        let host_uri = make_host_uri();
+        // Plain fenced block: content starts at column 0 on every line.
+        let offset = RegionOffset::new(3, 0);
+        // Whole-block multi-line replacement with newlines — the
+        // organize-imports shape. Nothing to corrupt; must stay allowed.
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 6, "character": 0}},
+                  "newText": "import a\nimport b\n" }
+            ] }
+        }));
+
+        assert!(workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 6,
+                character: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_allows_single_line_edit_in_prefixed_region() {
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2]);
+        // A rename-shaped single-line replacement behind the prefix: the
+        // prefix is outside the range and no line structure changes.
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 4, "character": 2}, "end": {"line": 4, "character": 7}},
+                  "newText": "renamed" }
+            ] }
+        }));
+
+        assert!(workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 4,
+                character: 9,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_allows_multi_line_edit_over_unprefixed_tail() {
+        let host_uri = make_host_uri();
+        // The PRODUCTION non-blockquote shape (`vec![start_column]`): per the
+        // RegionOffset contract, lines past the first are DESIGNED unprefixed
+        // — a single-element array never means "blockquote", which always
+        // carries one entry per content line plus the trailing boundary row.
+        // A multi-line edit starting on line 0 never deletes a prefix: line
+        // 0's offset sits before the range start, and the tail carries none.
+        let offset = RegionOffset::new(3, 4);
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 4}, "end": {"line": 5, "character": 2}},
+                  "newText": "x" }
+            ] }
+        }));
+
+        assert!(workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 5,
+                character: 2,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_insertion_when_only_the_next_line_is_prefixed() {
+        let host_uri = make_host_uri();
+        // Start line unprefixed, the FOLLOWING line prefixed (lazy-continuation
+        // first line): an inserted newline puts the new unprefixed line into a
+        // prefixed neighborhood. Pins the second disjunct of the insertion
+        // check — prefix_at(start.line) alone would let this through.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 2]);
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 1}, "end": {"line": 3, "character": 1}},
+                  "newText": "a\nb" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 4,
+                character: 9,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_rejects_span_when_only_the_end_line_is_prefixed() {
+        let host_uri = make_host_uri();
+        // Interior line unprefixed, END line prefixed: the range's tail eats
+        // the end line's prefix. Pins the `..=end.line` inclusivity — an
+        // exclusive range would miss it. Deletion-only (empty newText) shows
+        // the span check is independent of the replacement text.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 2]);
+        let edit = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 0}, "end": {"line": 5, "character": 1}},
+                  "newText": "" }
+            ] }
+        }));
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 5,
+                character: 9,
+            },
+        ));
+    }
+
+    #[test]
+    fn preserves_line_prefixes_checks_annotated_document_changes_operations() {
+        use tower_lsp_server::ls_types::{
+            AnnotatedTextEdit, OptionalVersionedTextDocumentIdentifier, Range, TextDocumentEdit,
+        };
+
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2]);
+        // Typed construction: serde's untagged OneOf never parses Right from
+        // JSON (annotationId is silently dropped), so exercise the annotated
+        // arm and the Operations arm of the shared walk in code. A newline-
+        // bearing annotated edit in a prefixed region must be rejected.
+        let edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: host_uri.clone(),
+                        version: None,
+                    },
+                    edits: vec![OneOf::Right(AnnotatedTextEdit {
+                        text_edit: TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: 3,
+                                    character: 2,
+                                },
+                                end: Position {
+                                    line: 3,
+                                    character: 2,
+                                },
+                            },
+                            new_text: "a\nb".to_string(),
+                        },
+                        annotation_id: "refactor".to_string(),
+                    })],
+                }),
+            ])),
+            ..Default::default()
+        };
+
+        assert!(!workspace_edit_preserves_line_prefixes(
+            &edit,
+            &host_uri,
+            &offset,
+            Position {
+                line: 4,
+                character: 9,
+            },
+        ));
     }
 
     #[test]

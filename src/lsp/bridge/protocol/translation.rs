@@ -15,7 +15,11 @@ use tower_lsp_server::ls_types::{Position, Range};
 /// virtual line 0 gets `start_column`, line 1+ gets `0` (via fallback).
 ///
 /// For blockquoted injections, `columns` has one entry per virtual line,
-/// each representing the width of the blockquote prefix (e.g., `> ` = 2).
+/// each representing the width of the blockquote prefix (e.g., `> ` = 2) —
+/// plus, when the content ends with a newline, a trailing `0` entry for the
+/// row where the included ranges end (the closing-fence line). That row's
+/// real prefix is unrecorded; `workspace_edit_preserves_line_prefixes`
+/// derives its boundary semantics from the region end instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegionOffset {
     /// The starting line of the injection region in the host document.
