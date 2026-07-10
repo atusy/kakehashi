@@ -207,6 +207,7 @@ mod tests {
                     region_id: "r0".to_string(),
                     content_hash: 0,
                 },
+                raw_injection_language: "python".to_string(),
                 injection_language: "python".to_string(),
                 virtual_content: String::new(),
                 line_column_offsets: vec![],

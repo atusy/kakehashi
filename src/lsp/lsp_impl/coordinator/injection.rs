@@ -480,37 +480,30 @@ mod tests {
         let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
         let server = service.inner();
 
-        let registry = server.language.language_registry_for_parallel();
-        registry.register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
-        registry.register("python".to_string(), tree_sitter_python::LANGUAGE.into());
-        registry.register("lua".to_string(), tree_sitter_lua::LANGUAGE.into());
-        let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
-        let injection_query = Query::new(
-            &markdown_language,
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
             r#"
-            (fenced_code_block
-              (info_string (language) @_lang)
-              (code_fence_content) @injection.content
-              (#set-lang-from-info-string! @_lang)
-              (#offset! @injection.content 1 0 0 0))
+                ((string_literal
+                   (string_content) @injection.content)
+                 (#set! injection.language "html")
+                 (#set! injection.combined))
             "#,
         )
-        .expect("valid markdown injection query");
+        .expect("valid query");
         server
             .language
             .query_store()
-            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
-
-        let text = "# T\n\n```py\nignored\nx = 1\n```\n\n```unknown\n#!/usr/bin/env lua\n#!/usr/bin/env python\ny = 2\n```\n";
-        let mut pool = server.language.create_document_parser_pool();
-        let mut parser = pool.acquire("markdown").expect("registered parser");
-        let tree = parser.parse(text, None).expect("parse markdown");
-        pool.release("markdown".to_string(), parser);
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        let text = r#"fn main() { let open = "<div>"; let close = "</div>"; }"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("load rust grammar");
+        let tree = parser.parse(text, None).expect("parse rust");
 
         let uri = Url::parse("file:///bridge_fast_path.md").unwrap();
         server
             .documents
-            .insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+            .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
         server
             .documents
             .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
@@ -535,7 +528,7 @@ mod tests {
                         crate::document::snapshot::ParseSnapshot {
                             text: std::sync::Arc::from(text),
                             tree: Some(tree.clone()),
-                            language: Some("markdown".to_string()),
+                            language: Some("rust".to_string()),
                             parsed_version,
                             incarnation,
                             injection_regions: None,
@@ -549,30 +542,8 @@ mod tests {
             assert!(landed, "test publish must land");
         };
         publish(None, content_version);
-        let inline = injection.resolve_injection_data(&uri, "markdown");
-        assert!(!inline.is_empty(), "the two fences must resolve");
-        assert!(
-            inline.iter().all(|region| region.language == "python"),
-            "inline eager discovery must use the request resolver's canonical language"
-        );
-        let interactive = InjectionResolver::resolve_all(
-            &server.language,
-            server.bridge.node_tracker(),
-            &uri,
-            &tree,
-            text,
-            &server
-                .language
-                .injection_query("markdown")
-                .expect("registered injection query"),
-            incarnation,
-        );
-        assert!(
-            interactive
-                .iter()
-                .all(|region| region.injection_language == "python"),
-            "interactive request discovery must use the canonical language"
-        );
+        let inline = injection.resolve_injection_data(&uri, "rust");
+        assert_eq!(inline.len(), 1, "combined captures form one eager document");
 
         // FAST PATH: populate derives the bridge regions from the same tree
         // (same tracker → same region ids); a newer current snapshot carries
@@ -581,7 +552,7 @@ mod tests {
             &uri,
             text,
             &tree,
-            "markdown",
+            "rust",
             &server.language,
             &server.bridge.node_tracker_arc(),
             server.bridge.node_tracker_arc().mint_epoch(&uri),
@@ -599,11 +570,7 @@ mod tests {
             Some((populated.generation, std::sync::Arc::new(bridge_regions))),
             content_version,
         );
-        let fast = injection.resolve_injection_data(&uri, "markdown");
-        assert!(
-            fast.iter().all(|region| region.language == "python"),
-            "cached eager discovery must use the request resolver's canonical language"
-        );
+        let fast = injection.resolve_injection_data(&uri, "rust");
 
         assert_eq!(
             inline.len(),

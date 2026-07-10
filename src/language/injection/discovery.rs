@@ -474,6 +474,8 @@ fn find_injection_at_position<'a>(
 pub(crate) struct ResolvedInjection {
     /// Cacheable injection region with line range information
     pub region: CacheableInjectionRegion,
+    /// Raw language identifier captured or assigned by the injection query.
+    pub raw_injection_language: String,
     /// Language of the injection content
     pub injection_language: String,
     /// Extracted virtual document content (clean, with blockquote prefixes stripped)
@@ -600,6 +602,7 @@ impl InjectionResolver {
             Self::resolve_language(coordinator, &region.language, &virtual_content);
         Some(ResolvedInjection {
             region: cacheable_region,
+            raw_injection_language: region.language.clone(),
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
@@ -683,6 +686,7 @@ impl InjectionResolver {
             Self::resolve_language(coordinator, &first.language, &virtual_content);
         Some(ResolvedInjection {
             region: combined_region,
+            raw_injection_language: first.language.clone(),
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets: vec![first_cacheable.start_column],
@@ -791,6 +795,7 @@ impl InjectionResolver {
                     Self::resolve_language(coordinator, &region.language, &virtual_content);
                 resolved.push(ResolvedInjection {
                     region: cacheable[index].clone(),
+                    raw_injection_language: region.language.clone(),
                     injection_language: resolved_language,
                     virtual_content,
                     line_column_offsets,
