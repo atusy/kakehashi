@@ -55,6 +55,27 @@ pub(crate) fn transform_workspace_edit_to_host(
     true
 }
 
+/// Whether a `WorkspaceEdit` contains at least one actual change.
+///
+/// Empty `changes` maps, empty edit vectors, and empty `documentChanges` are
+/// no-ops and must not win preferred fan-in over another server or layer that
+/// can return real edits. Resource operations count as changes.
+pub(crate) fn workspace_edit_has_effect(edit: &WorkspaceEdit) -> bool {
+    let changes_has_edit = edit
+        .changes
+        .as_ref()
+        .is_some_and(|changes| changes.values().any(|edits| !edits.is_empty()));
+    let doc_changes_has_edit = match &edit.document_changes {
+        None => false,
+        Some(DocumentChanges::Edits(edits)) => edits.iter().any(|e| !e.edits.is_empty()),
+        Some(DocumentChanges::Operations(ops)) => ops.iter().any(|op| match op {
+            DocumentChangeOperation::Edit(e) => !e.edits.is_empty(),
+            DocumentChangeOperation::Op(_) => true,
+        }),
+    };
+    changes_has_edit || doc_changes_has_edit
+}
+
 /// Transform the `changes` map in a WorkspaceEdit.
 ///
 /// Re-keys virtual URIs to host URI and transforms TextEdit ranges.

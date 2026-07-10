@@ -37,7 +37,8 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
     host_position_within_region, response_has_jsonrpc_error, transform_workspace_edit_to_host,
     translate_host_range_to_virtual, translate_virtual_position_to_host,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_within_region,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
+    workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 
@@ -311,19 +312,7 @@ fn finalize_host_resolved_action(
 /// is an empty `TextEdit[]`, or `documentChanges` whose every entry has empty
 /// `edits`, is still a no-op. A file operation counts as a real change.
 fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
-    let changes_has_edit = edit
-        .changes
-        .as_ref()
-        .is_some_and(|c| c.values().any(|edits| !edits.is_empty()));
-    let doc_changes_has_edit = match &edit.document_changes {
-        None => false,
-        Some(DocumentChanges::Edits(edits)) => edits.iter().any(|e| !e.edits.is_empty()),
-        Some(DocumentChanges::Operations(ops)) => ops.iter().any(|op| match op {
-            DocumentChangeOperation::Edit(e) => !e.edits.is_empty(),
-            DocumentChangeOperation::Op(_) => true, // a create/rename/delete is a real change
-        }),
-    };
-    !changes_has_edit && !doc_changes_has_edit
+    !workspace_edit_has_effect(edit)
 }
 
 /// Translate an action's edit host-ward with resolve-grade validation, in

@@ -5,7 +5,7 @@
 //! of resolving injection context before sending requests. This module extracts
 //! that shared preamble into a reusable method: `resolve_bridge_contexts`.
 
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use tower_lsp_server::ls_types::{Position, Range, Uri, WorkspaceEdit};
 use url::Url;
 
 use crate::config::WorkspaceSettings;
@@ -14,7 +14,7 @@ use crate::config::settings::{
     ResolvedLayerConfig,
 };
 use crate::language::injection::ResolvedInjection;
-use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
+use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId, workspace_edit_has_effect};
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard, current_upstream_id};
 use crate::text::PositionMapper;
 
@@ -188,11 +188,12 @@ pub(crate) fn resolve_layer_config_from_settings(
 /// fan-in: `null` and `[]` are "no result", as are the object-shaped
 /// "empty but valid" responses whose single canonical list field is empty:
 /// `CompletionList.items` when `isIncomplete` is not true,
-/// `SignatureHelp.signatures`, and `LinkedEditingRanges.ranges`. Keep the
-/// completion-list rule in sync with `completion_list_has_result` in the
-/// completion handler. Without the object shapes, a
-/// higher-priority host server's empty list would prematurely win the
-/// fan-in over a lower-priority server with actual results.
+/// `SignatureHelp.signatures`, `LinkedEditingRanges.ranges`, and
+/// `WorkspaceEdit` `changes`/`documentChanges` with no effective edits. Keep
+/// the completion-list rule in sync with `completion_list_has_result` in the
+/// completion handler. Without the object shapes, a higher-priority host
+/// server's empty list or edit would prematurely win the fan-in over a
+/// lower-priority server with actual results.
 pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
     if value.is_null() {
         return true;
@@ -214,8 +215,29 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
                 return list.is_empty();
             }
         }
+        if object.contains_key("changes")
+            || object.contains_key("documentChanges")
+            || object.contains_key("changeAnnotations")
+        {
+            return serde_json::from_value::<WorkspaceEdit>(value.clone())
+                .map(|edit| !workspace_edit_has_effect(&edit))
+                .unwrap_or(false);
+        }
     }
     false
+}
+
+fn is_empty_host_layer_value(request_method: &str, value: &serde_json::Value) -> bool {
+    if request_method == "textDocument/rename" {
+        // This is intentionally stricter than is_empty_layer_value: rename
+        // must reject malformed WorkspaceEdits before host-server preferred
+        // fan-in decides a winner; otherwise a bad higher-priority response
+        // would parse to None later and mask lower-priority edits.
+        return serde_json::from_value::<WorkspaceEdit>(value.clone())
+            .map(|edit| !workspace_edit_has_effect(&edit))
+            .unwrap_or(true);
+    }
+    is_empty_layer_value(value)
 }
 
 /// Race the virt, host, and native layer futures **concurrently** and decide
@@ -931,7 +953,7 @@ impl Kakehashi {
                         .await
                 }
             },
-            |opt| matches!(opt, Some(v) if !is_empty_layer_value(v)),
+            |opt| matches!(opt, Some(v) if !is_empty_host_layer_value(request_method, v)),
             cancel_rx,
         )
         .await;
@@ -1645,6 +1667,104 @@ mod tests {
         assert!(!is_empty_layer_value(&serde_json::json!({
             "isIncomplete": false, "items": [{ "label": "x" }]
         })));
+    }
+
+    #[test]
+    fn empty_layer_value_recognizes_empty_workspace_edits() {
+        assert!(is_empty_layer_value(&serde_json::json!({ "changes": {} })));
+        assert!(is_empty_layer_value(&serde_json::json!({
+            "changes": {
+                "file:///test.md": []
+            }
+        })));
+        assert!(is_empty_layer_value(&serde_json::json!({
+            "documentChanges": []
+        })));
+        assert!(is_empty_layer_value(&serde_json::json!({
+            "changeAnnotations": {
+                "rename": { "label": "rename symbol" }
+            }
+        })));
+    }
+
+    #[test]
+    fn empty_layer_value_treats_workspace_edits_with_effect_as_results() {
+        assert!(!is_empty_layer_value(&serde_json::json!({
+            "changes": {
+                "file:///test.md": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "newText": "x"
+                }]
+            }
+        })));
+        assert!(!is_empty_layer_value(&serde_json::json!({
+            "documentChanges": [{
+                "kind": "rename",
+                "oldUri": "file:///old.md",
+                "newUri": "file:///new.md"
+            }]
+        })));
+    }
+
+    #[test]
+    fn host_layer_rename_treats_bare_empty_workspace_edit_as_empty() {
+        assert!(is_empty_host_layer_value(
+            "textDocument/rename",
+            &serde_json::json!({})
+        ));
+        assert!(is_empty_host_layer_value(
+            "textDocument/rename",
+            &serde_json::json!({
+                "changeAnnotations": {
+                    "rename": { "label": "rename symbol" }
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn host_layer_non_rename_keeps_bare_object_as_result() {
+        assert!(!is_empty_host_layer_value(
+            "textDocument/hover",
+            &serde_json::json!({})
+        ));
+    }
+
+    #[test]
+    fn host_layer_rename_treats_workspace_edit_with_effect_as_result() {
+        assert!(!is_empty_host_layer_value(
+            "textDocument/rename",
+            &serde_json::json!({
+                "changes": {
+                    "file:///test.md": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 1 }
+                        },
+                        "newText": "x"
+                    }]
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn host_layer_rename_treats_malformed_workspace_edit_as_empty() {
+        for value in [
+            serde_json::json!({ "changes": "bad" }),
+            serde_json::json!("bad"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!([{ "not": "a WorkspaceEdit" }]),
+        ] {
+            assert!(
+                is_empty_host_layer_value("textDocument/rename", &value),
+                "{value:?} must not win host rename fan-in"
+            );
+        }
     }
 
     #[test]
