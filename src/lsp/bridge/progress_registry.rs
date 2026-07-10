@@ -8,8 +8,9 @@
 //! upstream token for every downstream-declared token and remembers the mapping
 //! so the bridge can translate in both directions:
 //!
-//! - **downstream → upstream** ([`ProgressRegistry::translate`]): rewrite the
-//!   token on `$/progress` notifications before forwarding to the editor.
+//! - **downstream → upstream** ([`ProgressRegistry::admit`]): decide, per
+//!   `$/progress`, whether to announce/forward/drop, handing back the
+//!   upstream token to rewrite onto forwarded notifications.
 //! - **upstream → downstream** ([`ProgressRegistry::resolve_cancel`]): when the
 //!   editor sends `window/workDoneProgress/cancel` for an upstream token, find
 //!   the owning downstream connection and its original token.

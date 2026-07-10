@@ -1,10 +1,11 @@
 //! `window/workDoneProgress/create` server-request handler.
 //!
 //! Inbound (downstream → bridge → editor). A downstream declares a progress
-//! token; the bridge mints a unique *upstream* token, records the mapping in the
-//! shared [`ProgressRegistry`], and asks the editor to create the progress. The
-//! data half of the feature — translating the downstream's `$/progress` to the
-//! upstream token — lives in [`progress`](super::progress).
+//! token; the bridge mints a unique *upstream* token and records the mapping
+//! in the shared [`ProgressRegistry`]. The editor is NOT asked to create the
+//! progress here: announcement is deferred to the token's first renderable
+//! `begin`, emitted by [`progress`](super::progress) (lazy announcement, see
+//! the registry's module docs).
 //!
 //! [`ProgressRegistry`]: crate::lsp::bridge::ProgressRegistry
 
