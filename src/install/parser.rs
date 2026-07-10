@@ -516,9 +516,17 @@ fn extract_archive<R: std::io::Read>(
             )));
         }
 
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "Link entry rejected in archive: {}",
+                relative.display()
+            )));
+        }
+
         let target = dest.join(&relative);
 
-        if entry.header().entry_type().is_dir() {
+        if entry_type.is_dir() {
             fs::create_dir_all(&target)?;
         } else {
             if let Some(parent) = target.parent() {
@@ -1486,6 +1494,39 @@ mod tests {
             archive_root_dir_name("tree-sitter-json", "0.24.8"),
             "tree-sitter-json-0.24.8"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_archive_rejects_link_entries() {
+        use std::io::Cursor;
+        use tar::{Builder, EntryType, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, "parser-1.0.0/link", "target")
+                .expect("append synthetic link entry");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(Cursor::new(bytes));
+        let result = extract_archive(&mut archive, "parser-1.0.0", temp.path());
+
+        match result {
+            Err(ParserInstallError::ArchiveError(message)) => assert!(
+                message.contains("Link entry rejected in archive: link"),
+                "expected link-entry rejection, got: {message}"
+            ),
+            other => panic!("expected link-entry ArchiveError, got {other:?}"),
+        }
     }
 
     /// Test that download_and_extract_archive downloads and extracts a GitHub archive.
