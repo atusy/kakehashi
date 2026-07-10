@@ -676,6 +676,14 @@ impl InjectionResolver {
             }
         }
         included.sort_by_key(|range| (range.start, range.end));
+        let mut covered_until = group_start;
+        let contiguous = included.iter().all(|range| {
+            if range.start > covered_until {
+                return false;
+            }
+            covered_until = covered_until.max(range.end);
+            true
+        }) && covered_until >= group_end;
         let virtual_content = mask_outside_ranges(text, group_start..group_end, &included);
 
         let mut combined_region = first_cacheable.clone();
@@ -694,7 +702,7 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets: vec![first_cacheable.start_column],
-            contiguous: false,
+            contiguous,
         })
     }
 
@@ -1189,6 +1197,37 @@ mod tests {
         assert!(resolved[0].virtual_content.contains("</div>"));
         assert!(!resolved[0].virtual_content.contains("let close"));
         assert!(!resolved[0].contiguous);
+    }
+
+    #[test]
+    fn single_combined_capture_remains_contiguous() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let html = "<div></div>"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((string_literal
+                   (string_content) @injection.content)
+                 (#set! injection.language "html")
+                 (#set! injection.combined))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("single_combined"),
+            &tree,
+            text,
+            &query,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].contiguous);
+        assert_eq!(resolved[0].virtual_content, "<div></div>");
     }
 
     #[test]
