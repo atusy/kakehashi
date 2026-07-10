@@ -295,9 +295,10 @@ pub(super) fn document_change_count(params: &ApplyWorkspaceEditParams) -> usize 
 /// `kakehashi://` URI could make the client fail the whole apply (or open a
 /// phantom document). Call AFTER version validation: a versioned no-op's
 /// precondition is honored before its carrier is dropped. Dropping a no-op
-/// can skew an editor `failedChange` index relative to what the downstream
-/// sent — the same accepted skew the transform's foreign-empty-entry drop
-/// already has (see the module docs).
+/// shifts the `documentChanges` indices the editor's `failedChange` refers
+/// to; the forwarding loop detects the count change and drops `failedChange`
+/// from the relayed response rather than relaying a misaligned index (see
+/// [`document_change_count`] and the module docs).
 fn remove_empty_virtual_entries(edit: &mut WorkspaceEdit) {
     if let Some(changes) = &mut edit.changes {
         changes.retain(|uri, edits| {
