@@ -682,8 +682,13 @@ fn recover_interrupted_query_install(
     match fs::rename(&backup_dir, queries_dir) {
         Ok(()) => {}
         // The backup vanished after selection (external cleanup — the lock
-        // only serializes kakehashi's own installers): nothing to restore.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // only serializes kakehashi's own installers): nothing to restore,
+        // but drop the now-orphaned ownership sidecar so markers don't
+        // accumulate under queries/ (idempotent if it is already gone).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = fs::remove_file(ownership);
+            return Ok(());
+        }
         Err(e) => return Err(QueryInstallError::IoError(e)),
     }
     let _ = fs::remove_file(ownership);
@@ -845,6 +850,14 @@ fn replace_query_dir(
     write_backup_ownership_marker(&backup_dir)?;
     if let Err(e) = fs::rename(queries_dir, &backup_dir) {
         let _ = fs::remove_file(backup_ownership_sidecar(&backup_dir));
+        // The target vanished between the exists() check above and this
+        // rename (external cleanup — the lock only serializes kakehashi's own
+        // installers): nothing to back up, so publish the staged dir instead
+        // of aborting the install.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            fs::rename(tmp_queries_dir, queries_dir)?;
+            return Ok(ReplaceQueryDirResult::Replaced);
+        }
         return Err(QueryInstallError::IoError(e));
     }
 
