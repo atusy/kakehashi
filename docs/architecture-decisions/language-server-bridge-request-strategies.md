@@ -82,9 +82,9 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 
 **Behavior**:
 1. Fetch Tree-sitter tokens and bridged tokens **in parallel**
-2. If bridged response arrives first → use it directly
-3. If Tree-sitter response arrives first → return it immediately as provisional response
-4. When bridged response arrives → send updated tokens (via `textDocument/semanticTokens/full` refresh mechanism)
+2. When native Tree-sitter tokens participate, return them immediately as the provisional response
+3. When bridged/host tokens arrive, merge them into the native-first result
+4. Send updated tokens through the `textDocument/semanticTokens/full` refresh mechanism
 
 The [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md) ADR
 refines this for the eventual merged semantic-token implementation: the instant
