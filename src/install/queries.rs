@@ -311,6 +311,9 @@ fn install_queries_recursive(
     }
 
     let tmp_queries_dir = create_unique_temp_query_dir(&queries_parent, language)?;
+    let _tmp_guard = TempQueryDirGuard {
+        path: tmp_queries_dir.clone(),
+    };
 
     let mut files_downloaded = Vec::new();
     let mut any_success = false;
@@ -328,17 +331,13 @@ fn install_queries_recursive(
                 }
 
                 let file_path = tmp_queries_dir.join(query_file);
-                if let Err(e) = write_query_file(&file_path, &content) {
-                    let _ = fs::remove_dir_all(&tmp_queries_dir);
-                    return Err(e);
-                }
+                write_query_file(&file_path, &content)?;
                 files_downloaded.push(query_file.to_string());
                 any_success = true;
             }
             Err(e) => {
                 // highlights.scm is required, others are optional
                 if *query_file == "highlights.scm" {
-                    let _ = fs::remove_dir_all(&tmp_queries_dir);
                     return match e {
                         QueryInstallError::HttpStatus { code: 404, .. } => Err(
                             QueryInstallError::LanguageNotSupported(language.to_string()),
@@ -356,32 +355,25 @@ fn install_queries_recursive(
     }
 
     if !any_success {
-        let _ = fs::remove_dir_all(&tmp_queries_dir);
         return Err(QueryInstallError::LanguageNotSupported(
             language.to_string(),
         ));
     }
 
-    if let Err(e) = write_install_marker(&tmp_queries_dir) {
-        let _ = fs::remove_dir_all(&tmp_queries_dir);
-        return Err(e);
-    }
+    write_install_marker(&tmp_queries_dir)?;
 
     match replace_query_dir(&tmp_queries_dir, &queries_dir, language, force) {
         Ok(ReplaceQueryDirResult::Replaced) => {}
         Ok(ReplaceQueryDirResult::AlreadyComplete) => {
-            let _ = fs::remove_dir_all(&tmp_queries_dir);
             return Err(QueryInstallError::AlreadyExists(queries_dir));
         }
         Ok(ReplaceQueryDirResult::Uninstalled) => {
-            let _ = fs::remove_dir_all(&tmp_queries_dir);
             return Err(QueryInstallError::IoError(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 format!("Query install for {language} was superseded by uninstall"),
             )));
         }
         Err(e) => {
-            let _ = fs::remove_dir_all(&tmp_queries_dir);
             return Err(e);
         }
     }
@@ -423,6 +415,20 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     // valid user-managed or pre-marker query directories.
     metadata.is_file()
         && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
+}
+
+/// RAII cleanup for a staging directory: removes it on drop so every error
+/// path (including `?` propagation added later) leaves nothing stranded. On
+/// the success path `replace_query_dir` renames the directory away, making
+/// the drop-time removal a harmless no-op.
+struct TempQueryDirGuard {
+    path: PathBuf,
+}
+
+impl Drop for TempQueryDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn create_unique_temp_query_dir(
@@ -942,6 +948,7 @@ mod tests {
         base_url
     }
 
+    #[cfg(unix)]
     fn dead_test_pid() -> u32 {
         let mut pid = std::process::id().saturating_add(100_000);
         while process_is_running(&pid.to_string()) {
@@ -1072,6 +1079,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn recover_interrupted_query_installs_removes_stranded_tmp_dirs() {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
@@ -1106,6 +1114,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn remove_interrupted_temp_query_install_treats_missing_tmp_as_clean() {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
