@@ -583,8 +583,10 @@ impl LanguageServerPool {
         if failed > 0 {
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction: {failed} of {total} eager resolves failed (transport \
-                 error or malformed result; see debug logs); those actions stay lazy"
+                "codeAction: {failed} of {total} eager resolves failed on {:?} \
+                 (transport error or malformed result; see debug logs); those \
+                 actions stay lazy",
+                handle.key()
             );
         }
     }
@@ -971,7 +973,10 @@ impl LanguageServerPool {
             match handle.register_request_with_upstream(upstream_id.clone()) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    warn!(
+                    // DEBUG: this helper runs once per action on the eager
+                    // fan-out (unbounded by a hostile lazy-action list); the
+                    // callers own the bounded warn (aggregate / per-selection).
+                    log::debug!(
                         target: "kakehashi::bridge",
                         "codeAction/resolve: failed to register request on {connection_key:?}: {e}"
                     );
@@ -986,7 +991,8 @@ impl LanguageServerPool {
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
         if let Err(e) = handle.send_request(request, request_id) {
-            warn!(
+            // DEBUG: see the register-failure note above.
+            log::debug!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: failed to send request on {connection_key:?}: {e}"
             );
@@ -1002,13 +1008,13 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
 
-        // Fail soft, but not silently: surface timeouts / channel-closed like the
-        // sibling codeLens/completion resolve paths so resolve-time issues are
-        // debuggable (qodo review finding).
+        // Fail soft, but not silently. DEBUG here: this helper runs once per
+        // action on the eager fan-out (unbounded by a hostile lazy-action
+        // list); the callers own the bounded warn (aggregate / per-selection).
         let response = match response {
             Ok(r) => r,
             Err(e) => {
-                warn!(
+                log::debug!(
                     target: "kakehashi::bridge",
                     "codeAction/resolve failed for {connection_key:?}: {e}"
                 );

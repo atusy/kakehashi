@@ -73,19 +73,23 @@ pub(crate) fn encode_command(origin: &str, host_uri: &str, command: &str) -> Opt
         static WARNED_ORIGINS: std::sync::LazyLock<
             std::sync::Mutex<std::collections::HashSet<String>>,
         > = std::sync::LazyLock::new(Default::default);
-        let first_for_origin = WARNED_ORIGINS
+        // Recover a poisoned mutex (the set is always in a valid state) so
+        // the dedup invariant survives a panic elsewhere — falling back to
+        // "first" would re-open the warn spam this exists to prevent.
+        let mut warned = WARNED_ORIGINS
             .lock()
-            .map(|mut set| {
-                // Check before allocating: after the first warn, the hot
-                // per-action path pays only a lookup.
-                !set.contains(origin) && set.insert(origin.to_string())
-            })
-            .unwrap_or(true);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Check before allocating: after the first warn, the hot per-action
+        // path pays only a lookup.
+        let first_for_origin = !warned.contains(origin) && warned.insert(origin.to_string());
+        drop(warned);
         if first_for_origin {
+            // {:?} escapes the very control character that triggered this
+            // branch, keeping the log line consumable.
             log::warn!(
                 target: "kakehashi::bridge",
-                "cannot mint routing names for server '{origin}' (first affected \
-                 command: '{command}'): the server name or the host URI contains \
+                "cannot mint routing names for server {origin:?} (first affected \
+                 command: {command:?}): the server name or the host URI contains \
                  the reserved 0x1f separator, so its routed commands are dropped. \
                  If the server name is the culprit, rename it in languageServers; \
                  a separator in a document URI has no config fix"
