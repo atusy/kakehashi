@@ -6,17 +6,18 @@
 //! so [`super::range_formatting`], which shares the same virtual→host hazards,
 //! can reuse them.
 //!
-//! # Known limitation: multi-line edits in prefixed regions are DROPPED
+//! # Known limitation: formatting in prefixed regions can drop WHOLE responses
 //!
 //! [`RegionOffset::column_for_line`] translates positions correctly for both
 //! `new()` (single-column) and `with_per_line_offsets()` (blockquote `> `) shapes.
 //! But `new_text` of a multi-line edit starts at column 0 of the embedded language,
 //! so replacement lines would insert at host column 0 instead of re-applying the
-//! `> ` prefix. Such edits are now dropped by the shared prefix guard
-//! (`text_edit_preserves_line_prefixes`) rather than corrupting the host
-//! document. Single-line edits and zero-width inserts (the common
-//! `trimTrailingWhitespace` cases) pass through, and unprefixed regions are
-//! unaffected. Re-applying prefixes to `new_text` (which would let these
+//! `> ` prefix. A response containing any such edit is dropped WHOLE by the
+//! shared prefix guard (`text_edit_preserves_line_prefixes`) — a formatter
+//! answer is one atomic diff, so applying only its safe edits could
+//! duplicate or lose content. All-safe responses (single-line edits and
+//! zero-width inserts — the common `trimTrailingWhitespace` cases) pass
+//! through, and unprefixed regions are unaffected. Re-applying prefixes to `new_text` (which would let these
 //! edits APPLY instead of dropping) means rewriting it per embedded newline;
 //! deferred because it interacts with `trim_final_newlines` semantics —
 //! the lsp_impl concatenated pipeline's `reapply_host_line_prefixes` is the
