@@ -179,12 +179,24 @@ pub(super) fn transform_completion_item(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
+    let region_prefixed = offset.columns().iter().any(|&column| column != 0);
+    // The literal newline scans below can't see what a SNIPPET expands to at
+    // the client: runtime variables (`${CLIPBOARD}`, `$TM_SELECTED_TEXT`) may
+    // be multiline. In a prefixed region, fail closed on any snippet variable
+    // in the primary insert text (tabstops/placeholders expand from literal
+    // text the scans already cover; additionalTextEdits are never snippets).
+    let snippet =
+        item.insert_text_format == Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET);
+    let snippet_unsafe = |text: &str| region_prefixed && snippet && snippet_contains_variable(text);
+
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
                 translate_virtual_range_to_host(&mut edit.range, offset);
-                if !text_edit_safe_in_region(edit, offset, region_end) {
+                if !text_edit_safe_in_region(edit, offset, region_end)
+                    || snippet_unsafe(&edit.new_text)
+                {
                     return false;
                 }
             }
@@ -201,7 +213,7 @@ pub(super) fn transform_completion_item(
                 probe.range = edit.replace;
                 let replace_ok = text_edit_safe_in_region(&probe, offset, region_end);
                 edit.new_text = probe.new_text;
-                if !insert_ok || !replace_ok {
+                if !insert_ok || !replace_ok || snippet_unsafe(&edit.new_text) {
                     return false;
                 }
             }
@@ -216,9 +228,11 @@ pub(super) fn transform_completion_item(
     // reject signal. All-zero (plain fenced) regions take multi-line
     // insertions safely and stay exempt.
     if item.text_edit.is_none() {
-        let region_prefixed = offset.columns().iter().any(|&column| column != 0);
         let effective = item.insert_text.as_deref().unwrap_or(&item.label);
         if region_prefixed && (effective.contains('\n') || effective.contains('\r')) {
+            return false;
+        }
+        if snippet_unsafe(effective) {
             return false;
         }
     }
@@ -240,6 +254,40 @@ pub(super) fn transform_completion_item(
         }
     }
     true
+}
+
+/// Whether snippet-syntax text references a snippet VARIABLE — `$name` or
+/// `${name...}` with a leading letter/underscore — whose expansion the client
+/// resolves at insert time and may be multiline (`${CLIPBOARD}`,
+/// `$TM_SELECTED_TEXT`). Numeric tabstops/placeholders (`$1`, `${1:text}`)
+/// expand from literal text the caller's newline scans already cover, so they
+/// don't count. An escaped `\\$` is literal per the snippet grammar; a
+/// preceding backslash therefore skips the candidate (an over-escape here
+/// would only reject, never admit).
+fn snippet_contains_variable(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if !escaped => escaped = true,
+            b'$' if !escaped => {
+                let next = bytes.get(i + 1).copied();
+                let starts_name = |c: u8| c.is_ascii_alphabetic() || c == b'_';
+                match next {
+                    Some(b'{') if bytes.get(i + 2).copied().is_some_and(starts_name) => {
+                        return true;
+                    }
+                    Some(c) if starts_name(c) => return true,
+                    _ => {}
+                }
+                escaped = false;
+            }
+            _ => escaped = false,
+        }
+        i += 1;
+    }
+    false
 }
 
 // =============================================================================
@@ -1172,5 +1220,64 @@ mod tests {
         let list =
             transform_completion_response_to_host(response, &plain, region_end, None).unwrap();
         assert_eq!(list.items.len(), 2, "plain regions take multiline inserts");
+    }
+
+    #[test]
+    fn transform_drops_snippet_variables_in_prefixed_regions() {
+        // A snippet VARIABLE (`${CLIPBOARD}`) expands client-side and may be
+        // multiline — the literal newline scan can't see it, so a prefixed
+        // region must fail closed. Numeric tabstops/placeholders expand from
+        // literal text and stay allowed; plain regions are exempt.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "clipboard", "insertTextFormat": 2,
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 3 } },
+                                "newText": "${CLIPBOARD}" } },
+                { "label": "tabstop", "insertTextFormat": 2,
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 3 } },
+                                "newText": "print(${1:msg})" } },
+                { "label": "fallback-variable", "insertTextFormat": 2,
+                  "insertText": "$TM_SELECTED_TEXT" }
+            ]
+        });
+
+        let list =
+            transform_completion_response_to_host(response.clone(), &offset, region_end, None)
+                .unwrap();
+        let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["tabstop"],
+            "snippet variables must drop in prefixed regions (both textEdit and fallback)"
+        );
+
+        // Plain (all-zero) region: everything survives.
+        let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let list =
+            transform_completion_response_to_host(response, &plain, region_end, None).unwrap();
+        assert_eq!(list.items.len(), 3, "plain regions are exempt");
+    }
+
+    #[test]
+    fn snippet_variable_detection_handles_escapes_and_tabstops() {
+        assert!(snippet_contains_variable("${CLIPBOARD}"));
+        assert!(snippet_contains_variable("$TM_SELECTED_TEXT"));
+        assert!(snippet_contains_variable("x${_private}y"));
+        assert!(!snippet_contains_variable("$1"));
+        assert!(!snippet_contains_variable("${1:placeholder}"));
+        assert!(!snippet_contains_variable("plain text"));
+        assert!(!snippet_contains_variable("price: \\$100"));
+        assert!(
+            !snippet_contains_variable("\\$CLIPBOARD"),
+            "escaped dollar is literal per the snippet grammar"
+        );
     }
 }
