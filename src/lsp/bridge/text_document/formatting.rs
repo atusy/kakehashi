@@ -343,8 +343,8 @@ mod tests {
                 { "range": { "start": { "line": 0, "character": 0 },
                              "end": { "line": 1, "character": 4 } },
                   "newText": "formatted\nlines" },
-                { "range": { "start": { "line": 1, "character": 0 },
-                             "end": { "line": 1, "character": 4 } },
+                { "range": { "start": { "line": 1, "character": 6 },
+                             "end": { "line": 1, "character": 8 } },
                   "newText": "safe" }
             ]
         });

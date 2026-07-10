@@ -803,8 +803,8 @@ mod tests {
                         { "range": { "start": { "line": 0, "character": 0 },
                                      "end": { "line": 1, "character": 2 } },
                           "newText": "a\nb" },
-                        { "range": { "start": { "line": 0, "character": 5 },
-                                     "end": { "line": 0, "character": 5 } },
+                        { "range": { "start": { "line": 1, "character": 5 },
+                                     "end": { "line": 1, "character": 5 } },
                           "newText": ": number" }
                     ]
                 }
