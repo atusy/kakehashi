@@ -358,10 +358,15 @@ pub(crate) fn detect_injection<'a>(
     let mut sorted_injections = injections;
     sorted_injections.sort_by(|a, b| {
         // Sort by start byte (ascending), then by end byte (descending)
-        // This ensures outer injections come before inner ones
+        // This ensures outer injections come before inner ones. Same-range
+        // alternate-language layers tie-break by (pattern_index, language) —
+        // the discovery sorts' exact order — so the hierarchy and the
+        // innermost pick stay deterministic regardless of input order.
         a.start_byte
             .cmp(&b.start_byte)
             .then(b.end_byte.cmp(&a.end_byte))
+            .then(a.pattern_index.cmp(&b.pattern_index))
+            .then(a.language.as_str().cmp(b.language.as_str()))
     });
 
     // Build the language hierarchy from outermost to innermost
