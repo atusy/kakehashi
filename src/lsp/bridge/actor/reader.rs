@@ -739,7 +739,7 @@ async fn reader_loop_with_liveness(
                         handle_message(message, &router, &server_prefix, &server_request_deps).await;
 
                         // Check if pending count returned to 0 - stop timer
-                        if liveness.is_active() && router.pending_count() == 0 {
+                        if liveness.is_active() && router.awaiting_downstream_count() == 0 {
                             liveness.stop(&server_prefix, "pending count is 0");
                         }
                     }

@@ -287,12 +287,27 @@ impl ResponseRouter {
     /// Used for liveness timeout management (ls-bridge-async-connection):
     /// - Timer starts when pending transitions 0 -> 1
     /// - Timer stops when pending transitions to 0
+    #[cfg(test)]
     pub(crate) fn pending_count(&self) -> usize {
         let state = self
             .state
             .lock()
             .recover_poison("ResponseRouter::pending_count");
         state.pending.len()
+    }
+
+    /// Requests that can still make downstream progress. Cancelled queued
+    /// entries remain only until the FIFO writer discards them.
+    pub(crate) fn awaiting_downstream_count(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::awaiting_downstream_count");
+        state
+            .pending
+            .values()
+            .filter(|pending| pending.delivery != RequestDelivery::CancelledQueued)
+            .count()
     }
 
     /// Remove a pending request without sending a response.
@@ -654,6 +669,23 @@ mod tests {
         );
         let cancelled = response.await.expect("queued cancellation should answer");
         assert_eq!(cancelled["error"]["code"], -32800);
+    }
+
+    #[test]
+    fn cancelled_queued_entry_does_not_hide_new_downstream_work() {
+        let router = ResponseRouter::new();
+        let cancelled_id = RequestId::new(1);
+        let upstream_id = UpstreamId::Number(10);
+        let _cancelled_rx = router
+            .register_with_upstream(cancelled_id, Some(upstream_id.clone()))
+            .unwrap();
+        router.prepare_cancel_by_upstream(&upstream_id);
+
+        assert_eq!(router.pending_count(), 1);
+        assert_eq!(router.awaiting_downstream_count(), 0);
+        let _live_rx = router.register(RequestId::new(2)).unwrap();
+        assert_eq!(router.pending_count(), 2);
+        assert_eq!(router.awaiting_downstream_count(), 1);
     }
 
     /// Test that register_with_upstream stores upstream->downstream mapping.

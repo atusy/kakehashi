@@ -848,7 +848,7 @@ impl ConnectionHandle {
         // - If thread A sees 0, thread B sees A's registration (count=1), only A notifies,
         //   which is correct behavior.
         // Either way, the timer starts exactly once when pending goes 0->1.
-        let was_empty = self.router().pending_count() == 0;
+        let was_empty = self.router().awaiting_downstream_count() == 0;
 
         let request_id = RequestId::new(self.next_request_id());
         let response_rx = self
