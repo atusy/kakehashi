@@ -1158,7 +1158,8 @@ impl Kakehashi {
         &self,
         race: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         // RAII: sweep upstream-registry entries a dropped (losing or
         // cancelled) layer future did not get to unregister itself.
         // Idempotent; a completed arm already cleaned up its own. A guard
@@ -1166,7 +1167,7 @@ impl Kakehashi {
         // request future is ever dropped mid-race.
         let _sweep = UpstreamRegistrySweepGuard {
             pool: self.bridge.pool_arc(),
-            id: current_upstream_id(),
+            id: upstream_id,
         };
         match cancel_rx {
             Some(mut cancel_rx) => {
