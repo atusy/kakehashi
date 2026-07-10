@@ -19,7 +19,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    region_host_end, response_has_jsonrpc_error, text_edit_preserves_line_prefixes,
+    region_host_end, response_has_jsonrpc_error, text_edit_safe_in_region,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -181,7 +181,7 @@ pub(super) fn transform_completion_item(
         match text_edit {
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
                 translate_virtual_range_to_host(&mut edit.range, offset);
-                if !text_edit_preserves_line_prefixes(edit, offset, region_end) {
+                if !text_edit_safe_in_region(edit, offset, region_end) {
                     return false;
                 }
             }
@@ -194,14 +194,29 @@ pub(super) fn transform_completion_item(
                     range: edit.insert,
                     new_text: std::mem::take(&mut edit.new_text),
                 };
-                let insert_ok = text_edit_preserves_line_prefixes(&probe, offset, region_end);
+                let insert_ok = text_edit_safe_in_region(&probe, offset, region_end);
                 probe.range = edit.replace;
-                let replace_ok = text_edit_preserves_line_prefixes(&probe, offset, region_end);
+                let replace_ok = text_edit_safe_in_region(&probe, offset, region_end);
                 edit.new_text = probe.new_text;
                 if !insert_ok || !replace_ok {
                     return false;
                 }
             }
+        }
+    }
+
+    // No textEdit: the client inserts insertText (or the label) at the
+    // completion position instead. In a prefixed region (per-line `> ` or an
+    // inline region's host-line tail) a multi-line insertion creates
+    // unprefixed/splitting lines — the same class the textEdit guard rejects —
+    // and the transform has no range to check, so the newline itself is the
+    // reject signal. All-zero (plain fenced) regions take multi-line
+    // insertions safely and stay exempt.
+    if item.text_edit.is_none() {
+        let region_prefixed = offset.columns().iter().any(|&column| column != 0);
+        let effective = item.insert_text.as_deref().unwrap_or(&item.label);
+        if region_prefixed && (effective.contains('\n') || effective.contains('\r')) {
+            return false;
         }
     }
 
@@ -212,7 +227,7 @@ pub(super) fn transform_completion_item(
         for edit in additional_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
         }
-        additional_edits.retain(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end));
+        additional_edits.retain(|edit| text_edit_safe_in_region(edit, offset, region_end));
         let dropped = before - additional_edits.len();
         if dropped > 0 {
             log::warn!(
@@ -1091,5 +1106,68 @@ mod tests {
             list.items.is_empty(),
             "item whose replace range spans a prefixed line must be dropped"
         );
+    }
+
+    #[test]
+    fn transform_drops_items_whose_edit_escapes_the_region() {
+        // Plain fenced region (all-zero offsets — the prefix rules fast-path),
+        // content host lines 3-4, region end (5, 0). A stale/oversized range
+        // translates past the closing fence; containment must drop the item.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "escapes",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 9, "character": 0 } },
+                                "newText": "x" } },
+                { "label": "contained",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 3 } },
+                                "newText": "y" } }
+            ]
+        });
+
+        let list =
+            transform_completion_response_to_host(response, &offset, region_end, None).unwrap();
+
+        assert_eq!(list.items.len(), 1, "region-escaping item must drop");
+        assert_eq!(list.items[0].label, "contained");
+    }
+
+    #[test]
+    fn transform_drops_multiline_insert_text_fallback_in_prefixed_regions() {
+        // No textEdit: the client inserts insertText (or the label) at the
+        // completion position. Multi-line fallback text in a prefixed region
+        // creates unprefixed lines — drop the item. Single-line fallbacks and
+        // multi-line fallbacks in plain (all-zero) regions are kept.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "multiline", "insertText": "for x in y:\n    pass" },
+                { "label": "single", "insertText": "print" }
+            ]
+        });
+
+        let list =
+            transform_completion_response_to_host(response.clone(), &offset, region_end, None)
+                .unwrap();
+        assert_eq!(list.items.len(), 1, "multiline fallback must drop");
+        assert_eq!(list.items[0].label, "single");
+
+        // Same response in a plain fenced region: both survive.
+        let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let list =
+            transform_completion_response_to_host(response, &plain, region_end, None).unwrap();
+        assert_eq!(list.items.len(), 2, "plain regions take multiline inserts");
     }
 }

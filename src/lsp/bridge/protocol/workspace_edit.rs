@@ -288,6 +288,21 @@ pub(crate) fn workspace_edit_within_region(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
+    host_uri_text_edits_all(edit, host_uri, |e| {
+        text_edit_within_region(e, offset, region_end)
+    })
+}
+
+/// Whether a single already-host-translated text edit stays inside the region
+/// (see [`workspace_edit_within_region`]). Response transforms use this to
+/// reject a downstream range that — via a stale/malformed virtual range —
+/// lands past the region's content end (the closing fence, or the rest of an
+/// inline region's host line), which range translation alone cannot prevent.
+pub(crate) fn text_edit_within_region(
+    e: &TextEdit,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
     // A host position is in-region iff it's at/after the region's start line, at
     // /after that line's column floor, and at/before the region end.
     let in_region = |p: Position| {
@@ -296,9 +311,22 @@ pub(crate) fn workspace_edit_within_region(
             p.character >= offset.column_for_line(virtual_line) && !position_after(p, region_end)
         }
     };
-    host_uri_text_edits_all(edit, host_uri, |e| {
-        in_region(e.range.start) && in_region(e.range.end)
-    })
+    in_region(e.range.start) && in_region(e.range.end)
+}
+
+/// Combined per-edit safety check for response transforms: an
+/// already-host-translated edit is safe iff it stays inside the region AND
+/// keeps the region's per-line prefixes. Range translation guarantees the
+/// start bound, but not the end: a stale/oversized downstream range still
+/// translates to a host range that overruns the closing fence (or the rest of
+/// an inline region's host line), so containment must be checked explicitly.
+pub(crate) fn text_edit_safe_in_region(
+    e: &TextEdit,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
+    text_edit_within_region(e, offset, region_end)
+        && text_edit_preserves_line_prefixes(e, offset, region_end)
 }
 
 /// Whether every text edit targeting `host_uri` keeps the region's per-line

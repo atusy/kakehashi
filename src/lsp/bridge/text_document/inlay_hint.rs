@@ -27,7 +27,7 @@ use tower_lsp_server::ls_types::{
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
-    response_has_jsonrpc_error, text_edit_preserves_line_prefixes, translate_host_range_to_virtual,
+    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_range_to_virtual,
     translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
@@ -159,7 +159,7 @@ fn transform_inlay_hint_response_to_host(
             }
             if !text_edits
                 .iter()
-                .all(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end))
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
             {
                 log::warn!(
                     target: "kakehashi::bridge",
@@ -823,6 +823,48 @@ mod tests {
         assert!(
             hints[0].text_edits.is_none(),
             "one unsafe edit drops the WHOLE accept-edit set (it applies atomically): {:?}",
+            hints[0].text_edits
+        );
+    }
+
+    #[test]
+    fn inlay_hint_drops_text_edits_that_escape_the_region() {
+        // Plain fenced region (all-zero offsets), region end (5, 0): a
+        // textEdit whose stale range translates past the closing fence must
+        // drop the accept-edit set even though the prefix rules fast-path.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                {
+                    "position": { "line": 0, "character": 5 },
+                    "label": ": number",
+                    "textEdits": [
+                        { "range": { "start": { "line": 0, "character": 0 },
+                                     "end": { "line": 9, "character": 0 } },
+                          "newText": "x" }
+                    ]
+                }
+            ]
+        });
+
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &make_virtual_uri_string(),
+            &make_host_uri(),
+            &offset,
+            region_end,
+        )
+        .unwrap();
+
+        assert_eq!(hints.len(), 1);
+        assert!(
+            hints[0].text_edits.is_none(),
+            "region-escaping accept edits must drop: {:?}",
             hints[0].text_edits
         );
     }

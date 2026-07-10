@@ -13,7 +13,7 @@
 //! But `new_text` of a multi-line edit starts at column 0 of the embedded language,
 //! so replacement lines would insert at host column 0 instead of re-applying the
 //! `> ` prefix. A response containing any such edit is dropped WHOLE by the
-//! shared prefix guard (`text_edit_preserves_line_prefixes`) — a formatter
+//! shared prefix guard (`text_edit_safe_in_region`) — a formatter
 //! answer is one atomic diff, so applying only its safe edits could
 //! duplicate or lose content. All-safe responses (single-line edits and
 //! zero-width inserts — the common `trimTrailingWhitespace` cases) pass
@@ -38,7 +38,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
-    response_has_jsonrpc_error, text_edit_preserves_line_prefixes,
+    response_has_jsonrpc_error, text_edit_safe_in_region,
 };
 
 impl LanguageServerPool {
@@ -245,21 +245,19 @@ pub(super) fn transform_formatting_response_to_host(
     // function-level docs). Checking both endpoints handles both the common
     // "formatter overshoots EOF" case and the malformed `start > virtual_eof`
     // shape that would otherwise sneak through with an in-bounds `end`.
-    let before = edits.len();
-    edits.retain(|edit| {
+    // ALL-OR-NOTHING (like the prefix gate below): a formatter answer is one
+    // atomic diff, so applying only its in-bounds edits could pair-break a
+    // deletion/insertion and duplicate or lose content.
+    if !edits.iter().all(|edit| {
         edit.range.start.line < virtual_line_count && edit.range.end.line < virtual_line_count
-    });
-    // `retain` never grows the vec so this can't underflow today, but
-    // saturating_sub keeps the count valid if the surrounding logic ever
-    // changes (e.g., a new clamping step that re-inserts edits).
-    let dropped = before.saturating_sub(edits.len());
-    if dropped > 0 {
+    }) {
         warn!(
             target: "kakehashi::bridge",
-            "Dropped {} formatting edit(s) extending past virtual EOF (line {}); would corrupt host content beyond injection region",
-            dropped,
+            "Dropped a formatting response ({} edit(s)): an edit extends past virtual EOF (line {}) and would corrupt host content beyond the injection region",
+            edits.len(),
             virtual_line_count
         );
+        return Ok(Vec::new());
     }
 
     for edit in &mut edits {
@@ -278,7 +276,7 @@ pub(super) fn transform_formatting_response_to_host(
     // answer). All-zero regions (plain fences) fast-path the predicate.
     if !edits
         .iter()
-        .all(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end))
+        .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
     {
         warn!(
             target: "kakehashi::bridge",
@@ -707,9 +705,11 @@ mod tests {
     }
 
     #[test]
-    fn formatting_response_keeps_in_bounds_drops_out_of_bounds() {
+    fn formatting_response_with_an_out_of_bounds_edit_drops_whole() {
         // Mixed batch: a valid edit on line 0 and a malformed edit whose end
-        // extends past EOF. Only the valid one survives.
+        // extends past EOF. A formatter answer is one atomic diff, so the
+        // WHOLE response drops — applying only the valid half could
+        // duplicate or lose content.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -739,8 +739,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(edits.len(), 1, "only the in-bounds edit survives");
-        assert_eq!(edits[0].new_text, "    ");
+        assert!(
+            edits.is_empty(),
+            "any out-of-bounds edit must drop the whole response: {edits:?}"
+        );
     }
 
     #[rstest]

@@ -16,7 +16,7 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
-    response_has_jsonrpc_error, text_edit_preserves_line_prefixes, translate_host_range_to_virtual,
+    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_range_to_virtual,
     translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
@@ -134,11 +134,22 @@ fn transform_color_presentation_response_to_host(
     // editor falls back to inserting the label, still at the unguarded
     // range), so an unsafe textEdit drops the whole presentation; unsafe
     // additionalTextEdits are merely stripped.
+    let region_prefixed = offset.columns().iter().any(|column| *column != 0);
     let before = presentations.len();
     presentations.retain_mut(|presentation| {
+        // No textEdit: the client inserts the LABEL at the request range. A
+        // multi-line label in a prefixed region is the same hazard as a
+        // multi-line textEdit (no range to check here — the newline is the
+        // signal). Labels are single-line in practice, so this never bites.
+        if presentation.text_edit.is_none()
+            && region_prefixed
+            && (presentation.label.contains('\n') || presentation.label.contains('\r'))
+        {
+            return false;
+        }
         if let Some(text_edit) = &mut presentation.text_edit {
             translate_virtual_range_to_host(&mut text_edit.range, offset);
-            if !text_edit_preserves_line_prefixes(text_edit, offset, region_end) {
+            if !text_edit_safe_in_region(text_edit, offset, region_end) {
                 return false;
             }
         }
@@ -149,7 +160,7 @@ fn transform_color_presentation_response_to_host(
                 translate_virtual_range_to_host(&mut edit.range, offset);
             }
             additional_edits
-                .retain(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end));
+                .retain(|edit| text_edit_safe_in_region(edit, offset, region_end));
             let stripped = before - additional_edits.len();
             if stripped > 0 {
                 log::warn!(
@@ -639,5 +650,36 @@ mod tests {
             Some(0),
             "prefix-breaking additionalTextEdit is stripped"
         );
+    }
+
+    #[test]
+    fn color_presentation_drops_presentations_whose_edit_escapes_the_region() {
+        // Plain fenced region (all-zero offsets), region end (5, 0): a
+        // textEdit range translating past the closing fence must drop the
+        // presentation even though the prefix rules fast-path.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                { "label": "escapes",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 9, "character": 0 } },
+                                "newText": "#fff" } },
+                { "label": "contained",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 4 } },
+                                "newText": "#fff" } }
+            ]
+        });
+
+        let presentations =
+            transform_color_presentation_response_to_host(response, &offset, region_end);
+
+        assert_eq!(presentations.len(), 1, "region-escaping presentation drops");
+        assert_eq!(presentations[0].label, "contained");
     }
 }
