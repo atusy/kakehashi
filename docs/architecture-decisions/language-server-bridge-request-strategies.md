@@ -10,7 +10,8 @@
 10 of the 11 per-method strategies described below are implemented
 (definition, hover, signatureHelp, completion, references, rename,
 codeAction, formatting, documentHighlight, diagnostics). Bridged semantic
-tokens remain unimplemented.
+tokens remain unimplemented (native tree-sitter tokens are served, but
+downstream-server tokens are not fetched or merged).
 
 ## Context
 
@@ -403,7 +404,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
-| semanticTokens | ❌ Not implemented | Would enable parallel fetch strategy |
+| semanticTokens | ❌ Not bridged | Native tree-sitter tokens ARE served (semantic-token-overlap-resolution); downstream-server tokens are not fetched or merged — doing so would enable the parallel fetch strategy |
 
 ### Original Implementation Priority
 

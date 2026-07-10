@@ -35,7 +35,8 @@
 //! Commands the client fires WITHOUT an action context (from a palette) route
 //! by their RAW advertised names instead, via the pool's command-origin
 //! registry + dynamic `workspace/executeCommand` registration (see
-//! `dispatch_palette_command` in `workspace/execute_command.rs`).
+//! `dispatch_palette_command` in
+//! `src/lsp/bridge/workspace/execute_command.rs`).
 
 /// Marker that identifies a bridge-minted command name.
 const COMMAND_PREFIX: &str = "kakehashi";
