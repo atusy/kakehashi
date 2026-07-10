@@ -108,7 +108,7 @@ priorities = ["virt", "host"]
 
     let mut client = LspClient::builder()
         .arg("--config-file")
-        .arg(config_path.to_str().unwrap())
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
         .build();
     let _init = client.send_request(
         "initialize",
@@ -209,7 +209,7 @@ priorities = ["virt", "host"]
     let cancel_dir = tempfile::TempDir::new().expect("cancel dir");
     let mut client = LspClient::builder()
         .arg("--config-file")
-        .arg(config_path.to_str().unwrap())
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
         .env("MOCK_LSP_CANCEL_DIR", cancel_dir.path().to_string_lossy())
         .build();
     let _init = client.send_request(
