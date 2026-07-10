@@ -850,9 +850,11 @@ async fn deliver_upstream_batch(
             barrier => {
                 if !pushes.is_empty() {
                     if let Some(publisher) = diagnostic_publisher {
-                        publisher
-                            .publish_push_batch(std::mem::take(&mut pushes))
-                            .await;
+                        tokio::select! {
+                            biased;
+                            _ = cancel_token.cancelled() => return,
+                            _ = publisher.publish_push_batch(std::mem::take(&mut pushes)) => {}
+                        }
                     } else {
                         pushes.clear();
                     }
@@ -874,7 +876,11 @@ async fn deliver_upstream_batch(
     if !pushes.is_empty()
         && let Some(publisher) = diagnostic_publisher
     {
-        publisher.publish_push_batch(pushes).await;
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {}
+            _ = publisher.publish_push_batch(pushes) => {}
+        }
     }
 }
 
