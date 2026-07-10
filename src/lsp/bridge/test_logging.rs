@@ -27,13 +27,13 @@ struct CaptureGuard;
 
 impl Drop for CaptureGuard {
     fn drop(&mut self) {
-        CAPTURING.store(false, Ordering::Relaxed);
+        CAPTURING.store(false, Ordering::Release);
     }
 }
 
 impl Log for CapturingLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        CAPTURING.load(Ordering::Relaxed)
+        CAPTURING.load(Ordering::Acquire)
             && metadata.level() <= Level::Warn
             && metadata.target() == "kakehashi::bridge"
     }
@@ -66,7 +66,7 @@ pub(crate) fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
-    CAPTURING.store(true, Ordering::Relaxed);
+    CAPTURING.store(true, Ordering::Release);
     let guard = CaptureGuard;
     f();
     drop(guard);
