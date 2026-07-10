@@ -322,13 +322,19 @@ pub(crate) fn collect_all_injections<'a>(
 
     // Sort by start_byte (primary) and end_byte (secondary) to ensure deterministic ordering
     let mut injections: Vec<_> = injections_map.into_values().collect();
-    injections.sort_by_key(|r| {
+    injections.sort_by(|a, b| {
         (
-            r.content_node.start_byte(),
-            r.content_node.end_byte(),
-            r.pattern_index,
-            r.language.clone(),
+            a.content_node.start_byte(),
+            a.content_node.end_byte(),
+            a.pattern_index,
+            a.language.as_str(),
         )
+            .cmp(&(
+                b.content_node.start_byte(),
+                b.content_node.end_byte(),
+                b.pattern_index,
+                b.language.as_str(),
+            ))
     });
     Some(injections)
 }
@@ -421,13 +427,19 @@ fn collect_injection_regions<'a>(
     }
 
     let mut injections: Vec<_> = injections_map.into_values().collect();
-    injections.sort_by_key(|region| {
+    injections.sort_by(|a, b| {
         (
-            region.start_byte,
-            std::cmp::Reverse(region.end_byte),
-            region.pattern_index,
-            region.language.clone(),
+            a.start_byte,
+            std::cmp::Reverse(a.end_byte),
+            a.pattern_index,
+            a.language.as_str(),
         )
+            .cmp(&(
+                b.start_byte,
+                std::cmp::Reverse(b.end_byte),
+                b.pattern_index,
+                b.language.as_str(),
+            ))
     });
 
     Some(injections)
