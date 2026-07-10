@@ -30,6 +30,7 @@ class RequestSample:
     seconds: float
     wire_bytes: int
     status: str
+    completed_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -306,10 +307,12 @@ def main() -> None:
     def measured_request(method, params):
         started = time.perf_counter()
         response, wire_bytes = request(method, params)
+        completed_at = time.perf_counter()
         request_samples[method].append(RequestSample(
-            seconds=time.perf_counter() - started,
+            seconds=completed_at - started,
             wire_bytes=wire_bytes,
             status=response_status(response),
+            completed_at=completed_at,
         ))
         return response
 
@@ -328,10 +331,12 @@ def main() -> None:
             if request_id not in pending:
                 continue
             method, started = pending.pop(request_id)
+            completed_at = time.perf_counter()
             request_samples[method].append(RequestSample(
-                seconds=time.perf_counter() - started,
+                seconds=completed_at - started,
                 wire_bytes=wire_bytes,
                 status=response_status(message),
+                completed_at=completed_at,
             ))
             responses[method] = message
         return responses
@@ -354,10 +359,12 @@ def main() -> None:
                     if request_id not in pending:
                         continue
                     started = pending.pop(request_id)
+                    completed_at = time.perf_counter()
                     request_samples[method].append(RequestSample(
-                        seconds=time.perf_counter() - started,
+                        seconds=completed_at - started,
                         wire_bytes=wire_bytes,
                         status=response_status(message),
+                        completed_at=completed_at,
                     ))
                     responses[request_id] = message
             except BaseException as error:
@@ -489,7 +496,7 @@ def main() -> None:
                 "textDocument/semanticTokens/full"
             ][semantic_sample_start:]
             successes = [
-                sample.seconds
+                sample.completed_at - t_req
                 for sample in cycle_semantic_samples
                 if sample.status == "ok"
             ]
