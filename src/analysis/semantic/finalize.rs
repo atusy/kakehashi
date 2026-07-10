@@ -427,7 +427,7 @@ fn build_region_intervals_map(
                 return None;
             }
             if line_idx >= lines.len() {
-                continue;
+                break;
             }
             let line_width = utf16_width(lines[line_idx]);
             let start_col = if line_idx == r.start_line {
