@@ -6,9 +6,8 @@
 //! map) or `documentChanges`; both are handled.
 //!
 //! The guards below ([`workspace_edit_within_region`],
-//! [`workspace_edit_preserves_line_prefixes`]) are enforced by codeAction and
-//! applyEdit; rename still calls the bare transform and adopts both guards in
-//! a follow-up PR.
+//! [`workspace_edit_preserves_line_prefixes`]) are enforced by codeAction,
+//! rename, and applyEdit.
 
 use std::collections::HashMap;
 
@@ -365,7 +364,7 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
         // it, so line 0's offset still rejects there.
         let newline_splits_nothing = columns.len() == 1 && region_end.line > offset.line();
         let inserts_unprefixed_line = !newline_splits_nothing
-            && e.new_text.contains(['\n', '\r'])
+            && (e.new_text.contains('\n') || e.new_text.contains('\r'))
             && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
         !touches_boundary && !spans_prefixed_line && !inserts_unprefixed_line
     })
