@@ -1925,6 +1925,111 @@ mod tests {
         std::env::var("TREE_SITTER_GRAMMARS").unwrap_or_else(|_| "deps/tree-sitter".to_string())
     }
 
+    /// Collect the exclusion-range text slices `collect_injection_contexts_sync`
+    /// pushes for a markdown document, or `None` when a required parser is
+    /// unavailable (test skips, matching the file's convention).
+    fn markdown_exclusion_slices(text: &str, extra_langs: &[&str]) -> Option<Vec<String>> {
+        use crate::config::WorkspaceSettings;
+
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _summary = coordinator.load_settings(&settings);
+
+        for lang in ["markdown", "markdown_inline"].iter().chain(extra_langs) {
+            if !coordinator.ensure_language_loaded(lang).success {
+                eprintln!("Skipping: {lang} parser not available");
+                return None;
+            }
+        }
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let mut parser = parser_pool.acquire("markdown")?;
+        let tree = parser.parse(text, None)?;
+        parser_pool.release("markdown".to_string(), parser);
+
+        let (_contexts, exclusion_ranges, _complete) = collect_injection_contexts_sync(
+            text,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+            None,
+            None,
+        );
+
+        Some(
+            exclusion_ranges
+                .iter()
+                .map(|&(start, end)| text[start..end].to_string())
+                .collect(),
+        )
+    }
+
+    /// Prose gaps (markdown_inline in a blockquote paragraph) are trimmed of
+    /// their trailing newline so every gap classifies as the single display
+    /// line it covers — including interior lines, which previously kept the
+    /// newline and classified as multiline container spans.
+    #[test]
+    fn test_exclusion_ranges_blockquote_prose_gaps_trimmed() {
+        let Some(slices) = markdown_exclusion_slices("> foo\n> bar baz\n> qux\n", &[]) else {
+            return;
+        };
+        assert_eq!(
+            slices,
+            ["foo", "bar baz", "qux"],
+            "each prose gap should cover exactly its line's content"
+        );
+    }
+
+    /// CRLF documents trim the full `\r\n` pair, not just the `\n`.
+    #[test]
+    fn test_exclusion_ranges_blockquote_prose_gaps_trimmed_crlf() {
+        let Some(slices) = markdown_exclusion_slices("> foo\r\n> bar\r\n", &[]) else {
+            return;
+        };
+        assert_eq!(
+            slices,
+            ["foo", "bar"],
+            "CRLF prose gaps should lose both the \\r and the \\n"
+        );
+    }
+
+    /// Container content (a closed code fence in a blockquote) keeps its
+    /// newline-terminated gaps: host tokens must not gap-fill code content.
+    #[test]
+    fn test_exclusion_ranges_blockquote_code_fence_untrimmed() {
+        let Some(slices) = markdown_exclusion_slices("> ```lua\n> local x = 1\n> ```\n", &["lua"])
+        else {
+            return;
+        };
+        assert!(
+            slices
+                .iter()
+                .any(|s| s.contains("local x = 1") && s.ends_with('\n')),
+            "closed-fence code gaps should keep their trailing newline; got {slices:?}"
+        );
+    }
+
+    /// Documented edge (accepted, see rebuild_context): a fence left
+    /// unterminated at EOF in a file without a trailing newline ends flush,
+    /// so its gaps classify prose and are trimmed until the fence closes.
+    #[test]
+    fn test_exclusion_ranges_unterminated_fence_at_eof_classifies_prose() {
+        let Some(slices) =
+            markdown_exclusion_slices("> ```lua\n> local x = 1\n> local y = 2", &["lua"])
+        else {
+            return;
+        };
+        assert!(
+            slices.iter().any(|s| s == "local x = 1"),
+            "flush-at-EOF fence gaps are trimmed (prose classification); got {slices:?}"
+        );
+    }
+
     // Tests for parallel token collection
 
     #[test]
