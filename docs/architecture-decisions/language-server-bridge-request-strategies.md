@@ -150,7 +150,10 @@ No position information in response—pass through directly.
 
 ### Strategy 3: Delegation with Edit Filtering
 
-**Applies to**: `textDocument/completion`, `textDocument/rename`, `textDocument/codeAction`, `textDocument/formatting`
+**Applies to**: `textDocument/completion`, `completionItem/resolve`,
+`textDocument/rename`, `textDocument/codeAction`, `textDocument/formatting`,
+`textDocument/rangeFormatting`, `textDocument/onTypeFormatting`,
+`textDocument/inlayHint` (its `textEdits`), `textDocument/colorPresentation`
 
 These methods return edits that must be carefully validated.
 
@@ -223,7 +226,7 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Cross-file | Filter out actions with cross-file edits |
 | Position mapping | All ranges in remaining actions |
 
-#### textDocument/formatting / textDocument/rangeFormatting
+#### textDocument/formatting / rangeFormatting / onTypeFormatting
 
 | Aspect | Handling |
 |--------|----------|

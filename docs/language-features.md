@@ -190,6 +190,12 @@ seeing the previous formatter's output (e.g. `black` then `isort`). The
 pipeline requires explicitly named servers — `"*"` is ignored there, since a
 reproducible pipeline needs a deterministic order.
 
+A response whose edits would corrupt the host document around the embedded
+block (escape the region, break blockquote `> ` prefixes, or merge content
+into the closing fence) is dropped **whole** — a formatter answer is one
+atomic diff, so applying only its safe edits could duplicate or lose content.
+The same rule covers range and on-type formatting.
+
 ### Range formatting
 
 [`textDocument/rangeFormatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rangeFormatting)
@@ -202,7 +208,9 @@ formatting, scoped to the selection.
 [`textDocument/inlayHint`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_inlayHint)
 
 Shows inline hints (types, parameter names) for the embedded block overlapping the
-requested range. Default combine strategy: `preferred`.
+requested range. A hint whose accept-time text edits would corrupt the host
+document around the embedded block is served without them (the edits drop as
+one atomic set). Default combine strategy: `preferred`.
 
 ### Moniker
 
@@ -229,6 +237,8 @@ differently.
 and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
 Shows color swatches and color picker presentations for embedded blocks.
+Presentations whose edits (explicit, or the implicit label replacement) would
+corrupt the host document around the embedded block are dropped fail-closed.
 **Only available with the `KAKEHASHI_EXPERIMENTAL=true` environment variable** —
 without the opt-in the server does not advertise color support.
 
