@@ -18,6 +18,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -235,11 +236,13 @@ def main() -> None:
     notification_bytes = Counter()
     server_request_counts = Counter()
     server_request_bytes = Counter()
+    send_lock = threading.Lock()
 
     def send(obj):
         body = json.dumps(obj).encode()
-        srv.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
-        srv.stdin.flush()
+        with send_lock:
+            srv.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            srv.stdin.flush()
 
     def send_request(method, params):
         nonlocal rid
@@ -334,32 +337,49 @@ def main() -> None:
         return responses
 
     def measured_repeated(method, params, count, before_next=None, delay_seconds=0):
+        nonlocal rid
+        request_ids = list(range(rid + 1, rid + count + 1))
+        rid += count
         pending = {}
-        request_ids = []
-        for index in range(count):
-            request_id = send_request(method, params)
-            request_ids.append(request_id)
+        responses = {}
+        reader_errors = []
+
+        def collect_responses():
+            try:
+                while len(responses) < count:
+                    message, wire_bytes = read_message()
+                    if handle_server_method(message, wire_bytes):
+                        continue
+                    request_id = message.get("id")
+                    if request_id not in pending:
+                        continue
+                    started = pending.pop(request_id)
+                    request_samples[method].append(RequestSample(
+                        seconds=time.perf_counter() - started,
+                        wire_bytes=wire_bytes,
+                        status=response_status(message),
+                    ))
+                    responses[request_id] = message
+            except BaseException as error:
+                reader_errors.append(error)
+
+        reader_thread = threading.Thread(target=collect_responses, daemon=True)
+        reader_thread.start()
+        for index, request_id in enumerate(request_ids):
             pending[request_id] = time.perf_counter()
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            })
             if index + 1 < count and before_next is not None:
                 if delay_seconds > 0:
                     time.sleep(delay_seconds)
                 before_next()
-
-        responses = {}
-        while pending:
-            message, wire_bytes = read_message()
-            if handle_server_method(message, wire_bytes):
-                continue
-            request_id = message.get("id")
-            if request_id not in pending:
-                continue
-            started = pending.pop(request_id)
-            request_samples[method].append(RequestSample(
-                seconds=time.perf_counter() - started,
-                wire_bytes=wire_bytes,
-                status=response_status(message),
-            ))
-            responses[request_id] = message
+        reader_thread.join()
+        if reader_errors:
+            raise reader_errors[0]
         return [responses[request_id] for request_id in request_ids]
 
     # Drive inside try/finally so any error (e.g. a server error raised in the
