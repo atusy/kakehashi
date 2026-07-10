@@ -98,11 +98,15 @@ impl LanguageServerPool {
         scratch_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
     ) {
+        let transition = self.open_transition_lock(scratch_uri, connection_key);
+        let transition_guard = transition.lock().await;
         // Idempotent close: if the scratch document is no longer open, a
         // concurrent cleanup (e.g. `close_host_document`) already closed and
         // untracked it, so another `didClose` would be a redundant notification
         // the downstream server may warn about. Nothing left to do.
         if !self.is_document_opened(scratch_uri) {
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
             return;
         }
         // Remove from ALL tracking BEFORE awaiting the didClose send, to narrow
@@ -134,6 +138,8 @@ impl LanguageServerPool {
                 scratch_uri.to_uri_string(), e
             );
         }
+        drop(transition_guard);
+        self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
     }
 
     /// Close a single virtual document: send didClose and remove from tracking.
@@ -142,6 +148,8 @@ impl LanguageServerPool {
     /// and `close_invalidated_docs`. Errors are logged but do not prevent
     /// cleanup of the document_versions tracking.
     async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
+        let transition = self.open_transition_lock(&doc.virtual_uri, &doc.connection_key);
+        let transition_guard = transition.lock().await;
         if let Err(e) = self
             .send_didclose_notification(&doc.virtual_uri, &doc.connection_key)
             .await
@@ -155,6 +163,12 @@ impl LanguageServerPool {
         // Use the connection key from OpenedVirtualDoc for per-connection tracking
         self.untrack_document(&doc.virtual_uri, &doc.connection_key)
             .await;
+        drop(transition_guard);
+        self.remove_open_transition_lock_if_unshared(
+            &doc.virtual_uri,
+            &doc.connection_key,
+            &transition,
+        );
     }
 
     /// Close all virtual documents associated with a host document, returning them.

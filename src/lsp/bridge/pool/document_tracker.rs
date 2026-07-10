@@ -171,6 +171,7 @@ impl DocumentTracker {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn open_claim_waiter(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -196,8 +197,14 @@ impl DocumentTracker {
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-    ) {
+    ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
+        let Some((_, notify)) = self
+            .open_claims
+            .remove(&(connection_key.clone(), uri_string.clone()))
+        else {
+            return false;
+        };
         let mut servers = self
             .virtual_to_servers
             .entry(uri_string.clone())
@@ -210,12 +217,8 @@ impl DocumentTracker {
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
-        if let Some((_, notify)) = self
-            .open_claims
-            .remove(&(connection_key.clone(), uri_string))
-        {
-            notify.notify_waiters();
-        }
+        notify.notify_waiters();
+        true
     }
 
     /// Roll back a claim made by `try_claim_for_open()`.
@@ -268,7 +271,10 @@ impl DocumentTracker {
     ) {
         self.register_pending_document(host_uri, virtual_uri, connection_key)
             .await;
-        self.mark_open_sent(virtual_uri, connection_key);
+        self.open_claims
+            .entry((connection_key.clone(), virtual_uri.to_uri_string()))
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
+        assert!(self.mark_open_sent(virtual_uri, connection_key));
     }
 
     /// Register close-cleanup ownership without exposing the document to
