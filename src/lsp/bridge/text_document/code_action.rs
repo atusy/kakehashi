@@ -349,6 +349,10 @@ fn translate_edit_host_ward_strict(
     if !transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset) {
         return Err(REASON_CROSS_REGION);
     }
+    // Reached directly by the client-driven resolve path (which bypasses
+    // bridge_code_action's own strip): versions on OTHER real files are
+    // bridge-local too and must not reach the editor.
+    strip_bridge_local_versions(edit);
     if workspace_edit_is_empty(edit) {
         return Err(REASON_RESOLVE);
     }
@@ -2609,6 +2613,63 @@ mod tests {
                 );
             }
             other => panic!("Expected Edits variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_translate_strips_bridge_local_versions_on_real_files() {
+        // The client-driven virt resolve path reaches the shared strict
+        // translate directly (not via bridge_code_action), so the strip must
+        // live inside it too: a resolved multi-file edit's OTHER real files
+        // carry bridge-local versions that would read as stale to the editor.
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit: WorkspaceEdit = serde_json::from_value(json!({
+            "documentChanges": [
+                {
+                    "textDocument": { "uri": virtual_uri, "version": 3 },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "x"
+                    }]
+                },
+                {
+                    "textDocument": { "uri": "file:///other.lua", "version": 7 },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 1, "character": 0 },
+                            "end": { "line": 1, "character": 5 }
+                        },
+                        "newText": "x"
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+
+        translate_edit_host_ward_strict(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+            Position {
+                line: u32::MAX,
+                character: u32::MAX,
+            },
+        )
+        .expect("edit must translate");
+
+        match edit.document_changes.unwrap() {
+            DocumentChanges::Edits(edits) => {
+                assert!(
+                    edits.iter().all(|e| e.text_document.version.is_none()),
+                    "no bridge-local version may reach the editor"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
         }
     }
 

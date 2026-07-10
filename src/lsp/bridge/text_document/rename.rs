@@ -135,6 +135,10 @@ fn transform_workspace_edit_response_to_host(
     if !transform_workspace_edit_to_host(&mut edit, request_virtual_uri, host_uri, offset) {
         return None;
     }
+    // A multi-file rename's OTHER real files can carry versioned entries;
+    // those versions are bridge-local (the downstream's own counters) and
+    // would read as stale to version-checking editors.
+    crate::lsp::bridge::strip_bridge_local_versions(&mut edit);
 
     workspace_edit_has_effect(&edit).then_some(edit)
 }
@@ -248,6 +252,50 @@ mod tests {
             &RegionOffset::new(5, 0),
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn workspace_edit_strips_bridge_local_versions_on_real_files() {
+        // A multi-file rename can carry versioned documentChanges entries for
+        // OTHER real files; those versions are bridge-local (the downstream's
+        // own counters) and would read as stale to version-checking editors,
+        // silently skipping part of the rename.
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "documentChanges": [{
+                    "textDocument": { "uri": "file:///other.lua", "version": 7 },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 1, "character": 0 },
+                            "end": { "line": 1, "character": 5 }
+                        },
+                        "newText": "newName"
+                    }]
+                }]
+            }
+        });
+
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        )
+        .unwrap();
+
+        match edit.document_changes.unwrap() {
+            DocumentChanges::Edits(edits) => {
+                assert_eq!(
+                    edits[0].text_document.version, None,
+                    "bridge-local version must not reach the editor"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("Expected Edits variant"),
+        }
     }
 
     #[test]
