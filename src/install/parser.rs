@@ -640,7 +640,7 @@ fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ArchiveFe
                 escaped_path(safe_relative)
             )));
         }
-        Ok(metadata) if metadata.is_dir() => {}
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
         Ok(_) => {
             return Err(ArchiveFetchError::Unsafe(format!(
                 "Archive directory conflicts with existing non-directory: {}",
@@ -650,7 +650,7 @@ fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ArchiveFe
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(ArchiveFetchError::Io(error)),
     }
-    fs::create_dir_all(&target)?;
+    fs::create_dir(&target)?;
     Ok(())
 }
 
