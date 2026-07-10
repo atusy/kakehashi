@@ -29,7 +29,9 @@ fn default_priorities() -> Vec<String> {
 /// - `Preferred`: Use the first non-empty response (priority-ordered).
 ///   This is the default for most LSP methods.
 /// - `Concatenated`: Collect and merge responses from all servers.
-///   This is the default for `textDocument/diagnostic`.
+///   This is the default for the diagnostics methods
+///   (`textDocument/diagnostic`, `textDocument/publishDiagnostics`) and
+///   `textDocument/codeAction`.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AggregationStrategy {
@@ -157,10 +159,13 @@ pub struct LayerAggregationConfig {
     /// Cross-layer combine strategy: `preferred` (first non-empty layer
     /// wins) or `concatenated`. Consumed by `textDocument/formatting`
     /// (default `concatenated`: the pipeline composes disjoint work across
-    /// layers), diagnostics and codeAction (default `concatenated`: layer
-    /// lists merge), and list-shaped whole-document methods such as
-    /// documentLink, foldingRange, and codeLens when explicitly configured.
-    /// Other methods combine with `preferred` regardless.
+    /// layers), the diagnostics methods (default `concatenated`: virt
+    /// region diagnostics and host-server diagnostics merge into one
+    /// report), `textDocument/codeAction` (default `concatenated`:
+    /// injection-region and host-server actions appear in one menu), and
+    /// list-shaped whole-document methods such as documentLink,
+    /// foldingRange, and codeLens when explicitly configured. Every other
+    /// method combines with `preferred` regardless.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
 }
@@ -290,8 +295,9 @@ impl BridgeLanguageConfig {
     /// - No matching aggregation entry: method default from
     ///   [`default_aggregation_strategy_for_method`]
     /// - Matching entry with `strategy = None`: method default from
-    ///   [`default_aggregation_strategy_for_method`] (`Concatenated` for diagnostics,
-    ///   otherwise `Preferred`)
+    ///   [`default_aggregation_strategy_for_method`] (`Concatenated` for the
+    ///   diagnostics methods and `textDocument/codeAction`, otherwise
+    ///   `Preferred`)
     /// - Matching entry with explicit `strategy`: use that value
     pub(crate) fn resolve_aggregation(&self, method: &str) -> ResolvedAggregationConfig {
         match self.resolve_aggregation_entry(method) {

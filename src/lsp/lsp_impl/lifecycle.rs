@@ -360,18 +360,18 @@ impl Kakehashi {
                 // Bridged commands (a `Command` surfaced in a code action) are
                 // executed via `workspace/executeCommand`, routed back to their
                 // origin server by the encoded command name (#568 PR 6). Gated
-                // on the same literal-support condition as `code_action_provider`
-                // — commands only reach the bridge through a bridged code action.
-                // No advertised `commands`: downstream servers connect lazily so
+                // on the same literal-support condition as `code_action_provider`.
+                // No STATIC `commands` here: downstream servers connect lazily so
                 // their command names aren't known at initialize (and each routed
                 // name embeds a per-document host_uri, so it could never be a
-                // stable advertised entry anyway). A client that dispatches an
-                // action's command on provider PRESENCE (Neovim's built-in client)
-                // executes it regardless; a client that only dispatches command
-                // ids from the advertised `commands` list (VS Code's
-                // vscode-languageclient) would show the action but not run it —
-                // reaching those needs dynamic registration of real names, the
-                // same deferred follow-up as palette-fired commands.
+                // stable advertised entry anyway). Instead, each server's real
+                // command names are dynamically registered as they reach Ready
+                // (`UpstreamRequest::RegisterCommands` below), which serves both
+                // palette-fired commands and clients that only dispatch command
+                // ids from registered lists (VS Code's vscode-languageclient) —
+                // when the client advertises `dynamicRegistration`. A client that
+                // dispatches an action's command on provider PRESENCE (Neovim's
+                // built-in client) executes routed names regardless.
                 execute_command_provider: client_supports_code_action_literals.then(|| {
                     ExecuteCommandOptions {
                         commands: vec![],
