@@ -656,10 +656,6 @@ fn recover_interrupted_query_install(
         return Ok(());
     }
 
-    let Some(backup_dir) = newest_complete_backup_dir(queries_parent, language)? else {
-        return Ok(());
-    };
-
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
     if uninstall_tombstone_path(queries_parent, language).is_file() {
         return Ok(());
@@ -668,8 +664,21 @@ fn recover_interrupted_query_install(
         return Ok(());
     }
 
+    // Select the backup UNDER the lock: chosen before it, a concurrent
+    // uninstall/cleanup could delete the directory between selection and the
+    // rename, turning a clean "nothing to restore" into a NotFound error.
+    let Some(backup_dir) = newest_complete_backup_dir(queries_parent, language)? else {
+        return Ok(());
+    };
+
     let ownership = backup_ownership_sidecar(&backup_dir);
-    fs::rename(&backup_dir, queries_dir)?;
+    match fs::rename(&backup_dir, queries_dir) {
+        Ok(()) => {}
+        // The backup vanished after selection (external cleanup — the lock
+        // only serializes kakehashi's own installers): nothing to restore.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(QueryInstallError::IoError(e)),
+    }
     let _ = fs::remove_file(ownership);
     Ok(())
 }
