@@ -297,7 +297,11 @@ fn merge_upstream_capabilities(
     // create/rename/delete-carrying refactor ("extract into file") — even
     // though the bridge transform handles both (real-file ops pass through;
     // virtual-URI ops reject the whole edit). Mirror the editor's declaration
-    // so downstream servers offer exactly what the editor can apply.
+    // so downstream servers offer exactly what the editor can apply. Unlike
+    // the `window.*` fields below — gated because they invite server-initiated
+    // REQUESTS the bridge must relay — this declares a response SHAPE the
+    // editor ultimately applies, so full-fidelity mirroring (including
+    // `failureHandling`/`normalizesLineEndings`) is the honest semantics.
     // `changeAnnotationSupport` is deliberately withheld: ls-types' untagged
     // `OneOf` drops `annotationId` when deserializing downstream responses, so
     // inviting annotated edits would silently lose `needsConfirmation`.
@@ -882,17 +886,18 @@ mod tests {
             CompletionClientCapabilities, CompletionItemCapability,
             CompletionItemCapabilityResolveSupport, CompletionItemTag, HoverClientCapabilities,
             InsertTextMode, InsertTextModeSupport, MarkupKind, ParameterInformationSettings,
-            SignatureHelpClientCapabilities, SignatureInformationSettings, TagSupport,
-            TextDocumentClientCapabilities,
-        };
-
-        use tower_lsp_server::ls_types::{
-            ResourceOperationKind, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+            ResourceOperationKind, SignatureHelpClientCapabilities, SignatureInformationSettings,
+            TagSupport, TextDocumentClientCapabilities, WorkspaceClientCapabilities,
+            WorkspaceEditClientCapabilities,
         };
 
         // Simulate typical Neovim capabilities
         let upstream = ClientCapabilities {
             workspace: Some(WorkspaceClientCapabilities {
+                // Neovim's default make_client_capabilities() really does omit
+                // `documentChanges` — it advertises only resourceOperations
+                // (in this exact order) even though apply_workspace_edit
+                // handles documentChanges. Mirrored faithfully.
                 workspace_edit: Some(WorkspaceEditClientCapabilities {
                     resource_operations: Some(vec![
                         ResourceOperationKind::Rename,

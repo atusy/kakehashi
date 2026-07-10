@@ -26,6 +26,12 @@
 //! `label` and `changeAnnotations` pass through untouched (the transform only
 //! rewrites URIs/ranges/versions).
 //!
+//! Known degenerate edge: the transform drops a foreign-virtual entry with an
+//! EMPTY edit vector (a no-op), so an editor `failedChange` index can be
+//! skewed by one relative to what the downstream sent. A real (non-empty)
+//! foreign entry rejects the whole edit instead, so indexes never skew for
+//! edits that actually apply anything.
+//!
 //! [`transform_workspace_edit_to_host`]: crate::lsp::bridge::transform_workspace_edit_to_host
 
 use std::sync::Arc;
