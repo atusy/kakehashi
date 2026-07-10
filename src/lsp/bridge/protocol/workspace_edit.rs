@@ -1069,6 +1069,67 @@ mod tests {
     }
 
     #[test]
+    fn within_region_accepts_exact_boundary_positions() {
+        let host_uri = make_host_uri();
+        // Region: blockquote, host lines 3-4 behind a `> ` floor of 2,
+        // region end at (4, 11). Both boundaries are INCLUSIVE: an edit
+        // ending exactly at region_end (whole-region replacement — the
+        // organize-imports shape) and one starting exactly at the column
+        // floor must be accepted; `position_after` is strict and rejecting
+        // equality would silently disable every full-region action.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2]);
+        let region_end = Position {
+            line: 4,
+            character: 11,
+        };
+        let check = |edit: &WorkspaceEdit| {
+            workspace_edit_within_region(edit, &host_uri, &offset, region_end)
+        };
+
+        let ends_at_region_end = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 3, "character": 2}, "end": {"line": 4, "character": 11}}, "newText": "x" }
+            ] }
+        }));
+        assert!(check(&ends_at_region_end), "end == region_end must pass");
+
+        let starts_at_floor = parse_workspace_edit(json!({
+            "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 4, "character": 2}, "end": {"line": 4, "character": 5}}, "newText": "x" }
+            ] }
+        }));
+        assert!(check(&starts_at_floor), "start == column floor must pass");
+    }
+
+    #[test]
+    fn transform_translates_utf16_prefix_widths() {
+        // Per-line offsets are UTF-16 code units. A blockquote prefix built
+        // from a non-ASCII marker (e.g. "＞ " — U+FF1E is ONE UTF-16 unit but
+        // three UTF-8 bytes) must translate by its UTF-16 width; a byte-width
+        // confusion in the offsets would shift every translated column. The
+        // fixture pins the transform against a width that differs between the
+        // two encodings ("＞ " = 2 UTF-16 units, 4 bytes).
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2]);
+        let mut edit = parse_workspace_edit(json!({
+            "changes": { virtual_uri.clone(): [
+                { "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}, "newText": "x" }
+            ] }
+        }));
+
+        transform_workspace_edit_to_host(&mut edit, &virtual_uri, &host_uri, &offset);
+
+        let edits = edit.changes.unwrap().remove(&host_uri).unwrap();
+        assert_eq!(edits[0].range.start.line, 4);
+        assert_eq!(
+            edits[0].range.start.character, 6,
+            "virtual col 4 + UTF-16 prefix width 2 (NOT the 4-byte width)"
+        );
+        assert_eq!(edits[0].range.end.character, 9);
+    }
+
+    #[test]
     fn within_region_bounds_the_host_uri_edits_only() {
         let host_uri = make_host_uri();
         // A 2-line BLOCKQUOTE region: starts at host line 3, and every line has a
