@@ -374,7 +374,7 @@ When multiple language servers can handle the same injection language, `aggregat
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered **allowlist** of server names: listed servers are queried in this order, and servers absent from the list do not run. A `"*"` element stands for every configured-but-unlisted server (first-win among themselves), so `["pyright", "*"]` means "prefer pyright, fall back to the rest" and `["*", "pylsp"]` demotes pylsp below everyone else. Omitted = `["*"]` (all servers, first-win). An explicit `[]` disables the method for this bridge entry. Note: the sequential `concatenated` formatting pipeline requires explicit names and ignores `"*"`. |
-| `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for the diagnostics methods (`textDocument/diagnostic`, `textDocument/publishDiagnostics`) and `textDocument/codeAction` (every server's actions appear in one menu), `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. |
+| `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for the diagnostics methods (`textDocument/diagnostic`, `textDocument/publishDiagnostics`) and `textDocument/codeAction` (every server's actions appear in one menu), `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. Note: only the diagnostics methods, `textDocument/codeAction`, and full `textDocument/formatting` (sequential pipeline) consume `"concatenated"` — every other method dispatches `"preferred"` regardless of this field. |
 | `maxFanOut` | Maximum number of servers to query. `null` or omitted = no limit (default). `0` = disable fan-out entirely. Positive integer = cap at N servers. Priority servers are selected first when limiting. Negative values are treated as no limit. |
 
 > **Migration note**: `priorities` used to be a preference order only — unlisted
@@ -437,9 +437,13 @@ Details:
   `textDocument/publishDiagnostics`. Each layer is gated independently by
   `priorities` membership (host additionally by `bridge._self.enabled`);
   omit both layers (or use `_` with `priorities = []`) to fully turn
-  bridge diagnostics off. With host bridging opted in, host servers are
-  pulled with the real document URI and their diagnostics merge with the
-  injection regions' per the layer `strategy`.
+  bridge-driven diagnostics off. With host bridging opted in, host servers
+  are pulled with the real document URI and their diagnostics merge with
+  the injection regions' per the layer `strategy`. Caveat: SPONTANEOUS
+  pushes a downstream server sends on its own bypass the
+  priorities/strategy machinery — they are cached and always concatenated
+  across servers (host `_self` pushes keep their real host URIs and
+  ranges as-is).
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for every bridged
   request method — including pull/push diagnostics — when host bridging is

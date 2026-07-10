@@ -135,9 +135,9 @@ Request (cursor in injection) ──▶ Forward to language server
 | Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
 | Position mapping | Each same-region location's range virtual → host; real-file ranges untouched |
 
-**Important**: Real-file locations (e.g. library sources on disk) are kept —
-they are valid navigation targets. Only locations in OTHER virtual regions are
-dropped, since their URIs are meaningless to the editor.
+**Important**: References may return many locations. Real-file locations pass
+through as-is; locations in OTHER injection regions of the host document are
+filtered (their virtual URIs would be meaningless to the editor).
 
 #### textDocument/hover
 
@@ -272,6 +272,12 @@ concatenated-formatting-pipeline.
 ### Strategy 4: Background Collection
 
 **Applies to**: `textDocument/publishDiagnostics`
+
+Note: spontaneous pushes bypass the aggregation priorities/strategy machinery
+— the diagnostic cache always concatenates them across servers. Configured
+`_self` host-server pushes carry the real host URI and host-relative ranges,
+so they are republished as-is (no URI filtering or translation step applies
+to them).
 
 ```
                     ┌─────────────────────────────┐

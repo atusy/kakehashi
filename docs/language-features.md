@@ -25,10 +25,11 @@ extra setup:
 
 **Bridged features** cover the rest of kakehashi's supported features (hover,
 completion, go-to-definition, diagnostics, …) — not every LSP method
-(see [Not currently provided](#not-currently-provided)). kakehashi cannot compute
-these itself; instead it forwards your request to a real language server that you
-configure for the embedded language. If no server is configured, these features
-simply return nothing.
+(see [Not currently provided](#not-currently-provided)). kakehashi cannot
+compute these itself; instead it forwards your request to a real language
+server — one you configure for the embedded language, or (for the
+surrounding document) a `bridge._self` host server. If no server is
+configured, these features simply return nothing.
 
 ### Embedded code blocks
 
@@ -56,8 +57,10 @@ diagnostics).
 ### When several servers handle one language
 
 If you configure more than one language server for the same embedded language,
-kakehashi combines their responses using one of two strategies, configurable per
-method (`strategy` in the bridge configuration):
+kakehashi combines their responses using one of two strategies (`strategy` in
+the bridge configuration). Only diagnostics, code actions, and full formatting
+consume `concatenated`; every other method combines with `preferred`
+regardless of the setting:
 
 | Strategy | Behavior |
 |----------|----------|
@@ -237,7 +240,9 @@ Reports errors and warnings from every embedded block, merged into the document.
 The default combine strategy here is **`concatenated`** (shared with code
 actions) — when multiple servers are configured for a block, all of their
 diagnostics are shown. The strategy is resolved per language, so different
-embedded languages can behave differently.
+embedded languages can behave differently. Spontaneous pushes a server sends
+on its own bypass the strategy machinery entirely: they are cached and always
+concatenated across servers.
 
 ### Code actions
 
@@ -246,16 +251,24 @@ embedded languages can behave differently.
 [`workspace/executeCommand`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_executeCommand),
 and [`workspace/applyEdit`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_applyEdit) (relay)
 
-Quick fixes and refactors from every server bridging the block — a range
+Quick fixes and refactors from the servers bridging the block (all of them
+by default; `priorities`/`maxFanOut` can restrict the set) — a range
 spanning several blocks merges each region's actions into one menu. Titles
 are suffixed with "— {server}" so same-named actions stay distinguishable.
 Lazy actions resolve back to their origin server (`codeAction/resolve`);
 command-carrying actions execute through the bridged
-`workspace/executeCommand`; a downstream server's own `workspace/applyEdit`
-requests are translated to the host document and relayed to the editor.
-Edits that cannot be represented in the host document (touching another
-injection region, virtual-document file operations, or escaping the block)
-are rejected — shown as disabled actions where the client supports it.
+`workspace/executeCommand`.
+
+Edit safety differs by layer and direction. An INJECTION-layer action edit
+that cannot be represented in the host document (touching another injection
+region, virtual-document file operations, or escaping the block) is
+rejected — shown as a disabled action where the client supports that,
+dropped otherwise. HOST-layer (`bridge._self`) action edits already target
+the real document and pass through as-is. A downstream server's own
+`workspace/applyEdit` request is translated the same way, but an
+untranslatable one is answered `applied: false` locally — it never reaches
+the editor and no action is involved.
+
 Default combine strategy: `concatenated`, across servers and across the
 virt/host layers. Advertised only to clients with
 `codeActionLiteralSupport`; see the README's bridged-requests list for the
