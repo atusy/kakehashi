@@ -18,6 +18,13 @@ pub(in crate::lsp::bridge) fn test_host_uri() -> tower_lsp_server::ls_types::Uri
     crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
 }
 
+/// A region end far past any test edit: keeps the prefix-safety guard out
+/// of the way for tests that exercise coordinate translation only.
+pub(super) const TEST_REGION_END: Position = Position {
+    line: u32::MAX,
+    character: u32::MAX,
+};
+
 /// Standard test position (line 5, character 10).
 pub(super) fn test_position() -> Position {
     Position {

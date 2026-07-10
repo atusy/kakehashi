@@ -5,7 +5,9 @@
 //!
 //! Unlike position-based requests, inlay hints use a range parameter in the request
 //! that specifies the visible document range. Both request range (host->virtual) and
-//! response positions/textEdits (virtual->host) need transformation.
+//! response positions/textEdits (virtual->host) need transformation. A hint whose
+//! textEdits would break per-line region prefixes (blockquote `> `) is served
+//! without them (see the prefix-safety guard in the response transform).
 //!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
@@ -146,21 +148,25 @@ fn transform_inlay_hint_response_to_host(
         // Transform position to host coordinates
         translate_virtual_position_to_host(&mut hint.position, offset);
 
-        // Transform textEdits ranges, stripping any edit that would break
-        // region line prefixes (e.g. blockquote `> `) if applied verbatim.
-        // The hint itself stays useful without its double-click edit.
+        // Transform textEdits ranges. If ANY edit would break region line
+        // prefixes (e.g. blockquote `> `) when applied verbatim, strip them
+        // ALL: the client applies the whole array on accept (LSP 3.18), so a
+        // partial set could apply half of an interdependent pair. The hint
+        // itself stays useful without its accept edits (textEdits optional).
         if let Some(text_edits) = &mut hint.text_edits {
-            let before = text_edits.len();
             for edit in text_edits.iter_mut() {
                 translate_virtual_range_to_host(&mut edit.range, offset);
             }
-            text_edits.retain(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end));
-            let dropped = before - text_edits.len();
-            if dropped > 0 {
+            if !text_edits
+                .iter()
+                .all(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end))
+            {
                 log::warn!(
                     target: "kakehashi::bridge",
-                    "inlayHint: stripped {dropped} textEdit(s) that would break region line prefixes"
+                    "inlayHint: dropped a hint's textEdits ({}): they would break region line prefixes",
+                    text_edits.len()
                 );
+                hint.text_edits = None;
             }
         }
 
@@ -200,13 +206,6 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
-
-    /// A region end far past any test edit: keeps the prefix-safety guard out
-    /// of the way for tests that exercise coordinate translation only.
-    const TEST_REGION_END: Position = Position {
-        line: u32::MAX,
-        character: u32::MAX,
-    };
 
     // ==========================================================================
     // Inlay hint request builder tests
@@ -783,10 +782,11 @@ mod tests {
     }
 
     #[test]
-    fn inlay_hint_strips_prefix_breaking_text_edits() {
+    fn inlay_hint_drops_all_text_edits_when_any_breaks_prefixes() {
         // Blockquote region, content host lines 3-4, region end (5, 0). A
         // hint textEdit spanning prefixed lines would strip the `> ` prefix
-        // when double-click-applied — strip it; the hint itself is kept.
+        // when accept-applied; the accept set applies atomically, so ALL
+        // textEdits drop while the (display-only) hint itself is kept.
         let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
         let region_end = Position {
             line: 5,
@@ -820,8 +820,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(hints.len(), 1, "the hint itself is kept");
-        let edits = hints[0].text_edits.as_ref().unwrap();
-        assert_eq!(edits.len(), 1, "prefix-breaking textEdit is stripped");
-        assert_eq!(edits[0].new_text, ": number");
+        assert!(
+            hints[0].text_edits.is_none(),
+            "one unsafe edit drops the WHOLE accept-edit set (it applies atomically): {:?}",
+            hints[0].text_edits
+        );
     }
 }

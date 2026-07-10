@@ -2,6 +2,8 @@
 //! host↔virtual coordinate transformation. Like inlay hints, the request carries a
 //! range (where the color was found) and the response may include textEdits and
 //! additionalTextEdits whose ranges must be translated back to host coordinates.
+//! Presentations whose textEdit would break per-line region prefixes
+//! (blockquote `> `) are dropped; unsafe additionalTextEdits are stripped.
 
 use std::io;
 
@@ -171,16 +173,10 @@ fn transform_color_presentation_response_to_host(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::TEST_REGION_END;
     use super::*;
     use rstest::rstest;
     use serde_json::json;
-
-    /// A region end far past any test edit: keeps the prefix-safety guard out
-    /// of the way for tests that exercise coordinate translation only.
-    const TEST_REGION_END: Position = Position {
-        line: u32::MAX,
-        character: u32::MAX,
-    };
 
     // ==========================================================================
     // Color presentation request tests

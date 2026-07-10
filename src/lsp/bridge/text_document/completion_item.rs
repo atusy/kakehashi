@@ -7,6 +7,8 @@
 //! completion that produced this item. If the downstream server has since
 //! restarted (or the connection was recreated), the resolve fails and we
 //! return the unresolved item with envelope intact: graceful degradation.
+//! The same degradation serves a resolved item whose primary edit would break
+//! per-line region prefixes (see `resolve_guard_region_end`).
 
 use std::sync::Arc;
 
@@ -182,15 +184,7 @@ impl LanguageServerPool {
         match parse_completion_resolve_response(response) {
             Some(mut resolved) => {
                 let offset = RegionOffset::from(&envelope.offset);
-                // The envelope has no region-content snapshot, so the real
-                // region end is unknown here. Assume a single-line region —
-                // the strictest setting for the prefix-safety guard (it can
-                // only over-strip in PREFIXED regions; unprefixed regions
-                // pass the guard's fast path untouched).
-                let region_end = Position {
-                    line: offset.line(),
-                    character: u32::MAX,
-                };
+                let region_end = resolve_guard_region_end(&envelope, &offset);
                 if transform_completion_item(&mut resolved, &offset, region_end) {
                     re_envelope_item(&mut resolved, &envelope);
                     resolved
@@ -249,8 +243,31 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         server_name: &envelope.origin,
         host_uri: &envelope.host_uri,
         offset: &RegionOffset::from(&envelope.offset),
+        region_end: envelope
+            .region_end
+            .map(|(line, character)| Position { line, character }),
     };
     envelope_item_data(item, &ctx);
+}
+
+/// The `region_end` the resolve-path prefix guard runs with. Normally the
+/// envelope carries the completion-time snapshot verbatim. A LEGACY envelope
+/// (minted before the field existed) has none, and the resolve path cannot
+/// recompute it — fall back to `(region start line, character 0)`, which is
+/// fully fail-closed: with `character == 0` the guard's boundary rule rejects
+/// every edit at or past the region start in per-line-prefixed regions (the
+/// unresolved item is served instead), while unprefixed regions still pass
+/// via the all-zero fast path. A permissive sentinel here would disable the
+/// boundary rule entirely and let fence-row edits through — never trade that
+/// for fewer over-strips on envelopes that disappear after one session.
+fn resolve_guard_region_end(envelope: &KakehashiEnvelope, offset: &RegionOffset) -> Position {
+    envelope
+        .region_end
+        .map(|(line, character)| Position { line, character })
+        .unwrap_or(Position {
+            line: offset.line(),
+            character: 0,
+        })
 }
 
 #[cfg(test)]
@@ -271,7 +288,72 @@ mod tests {
                 column: 0,
                 line_column_offsets: None,
             },
+            region_end: Some((9, 0)),
         }
+    }
+
+    // ==========================================================================
+    // resolve_guard_region_end tests
+    // ==========================================================================
+
+    #[test]
+    fn guard_region_end_uses_the_envelope_snapshot_when_carried() {
+        let envelope = test_envelope();
+        let offset = RegionOffset::from(&envelope.offset);
+        assert_eq!(
+            resolve_guard_region_end(&envelope, &offset),
+            Position {
+                line: 9,
+                character: 0
+            },
+        );
+    }
+
+    #[test]
+    fn guard_region_end_falls_back_fail_closed_for_legacy_envelopes() {
+        let mut envelope = test_envelope();
+        envelope.region_end = None;
+        envelope.offset.line = 3;
+        envelope.offset.line_column_offsets = Some(vec![2, 2, 0]);
+        let offset = RegionOffset::from(&envelope.offset);
+
+        let region_end = resolve_guard_region_end(&envelope, &offset);
+        assert_eq!(
+            region_end,
+            Position {
+                line: 3,
+                character: 0
+            },
+            "legacy fallback anchors the boundary at the region start"
+        );
+
+        // Fail-closed: with character 0 the guard's boundary rule rejects even
+        // a same-line, newline-free edit in this per-line-prefixed region —
+        // the resolve serves the unresolved item rather than guessing where
+        // the region really ends.
+        let mut resolved = CompletionItem {
+            label: "x".into(),
+            text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
+                tower_lsp_server::ls_types::TextEdit {
+                    range: tower_lsp_server::ls_types::Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 3,
+                        },
+                    },
+                    new_text: "single".into(),
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(
+            !transform_completion_item(&mut resolved, &offset, region_end),
+            "prefixed-region edits must be rejected under the legacy fallback"
+        );
     }
 
     // ==========================================================================
@@ -394,6 +476,7 @@ mod tests {
                 column: 0,
                 line_column_offsets: None,
             },
+            region_end: Some((9, 0)),
         };
         let mut item = CompletionItem {
             label: "print".to_string(),

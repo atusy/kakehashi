@@ -269,17 +269,23 @@ pub(super) fn transform_formatting_response_to_host(
     // WorkspaceEdit form): the transform translates RANGES but emits newText
     // verbatim, so a multi-line replacement or newline insertion in a
     // prefixed (blockquote) region would strip the `> ` prefixes it overlaps.
-    // Drop the unsafe edits — mirroring the past-EOF drop above — rather than
-    // corrupt the host document. All-zero regions (plain fences) fast-path.
-    let before_prefix = edits.len();
-    edits.retain(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end));
-    let dropped_prefix = before_prefix.saturating_sub(edits.len());
-    if dropped_prefix > 0 {
+    // ALL-OR-NOTHING: a formatting response is one atomic diff — formatters
+    // routinely pair a line-deletion with a same-line insertion of the merged
+    // text, so dropping only the unsafe half would duplicate or lose content.
+    // If any edit is unsafe, drop the whole response (an empty edit list —
+    // the document is left untouched, like the null "already formatted"
+    // answer). All-zero regions (plain fences) fast-path the predicate.
+    if !edits
+        .iter()
+        .all(|edit| text_edit_preserves_line_prefixes(edit, offset, region_end))
+    {
         warn!(
             target: "kakehashi::bridge",
-            "Dropped {dropped_prefix} formatting edit(s) that would strip the region's \
-             per-line host prefixes (e.g. a blockquote's `> `)"
+            "Dropped a formatting response ({} edit(s)): it would strip the region's \
+             per-line host prefixes (e.g. a blockquote's `> `)",
+            edits.len()
         );
+        return Ok(Vec::new());
     }
 
     Ok(edits)
@@ -292,20 +298,14 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
-    /// Generous host region end for fixtures that don't exercise the prefix
-    /// guard (their prefixless offsets fast-path it).
-    const TEST_REGION_END: Position = Position {
-        line: u32::MAX,
-        character: u32::MAX,
-    };
-
     #[test]
-    fn transform_drops_prefix_breaking_edits_in_blockquote_regions() {
+    fn transform_drops_the_whole_response_when_any_edit_breaks_prefixes() {
         // Blockquote region (production offsets: per-line `> ` widths plus the
         // trailing boundary-row zero), content host lines 3-4, fence line 5,
-        // region end (5, 0). A whole-block multi-line replacement — the
-        // classic formatter shape — would strip the interior prefixes; it
-        // must be dropped. A single-line edit behind the prefix survives.
+        // region end (5, 0). The response pairs a multi-line prefix-breaking
+        // replacement with a safe single-line edit — the diff halves of one
+        // atomic formatter answer. Applying only the safe half would
+        // duplicate/lose content, so the WHOLE response must drop.
         let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
         let region_end = Position {
             line: 5,
@@ -326,12 +326,37 @@ mod tests {
         let edits =
             transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
 
-        assert_eq!(
-            edits.len(),
-            1,
-            "the multi-line prefix-breaking edit must be dropped: {edits:?}"
+        assert!(
+            edits.is_empty(),
+            "a response with any prefix-breaking edit must drop whole: {edits:?}"
         );
+    }
+
+    #[test]
+    fn transform_keeps_an_all_safe_response_in_blockquote_regions() {
+        // Same region: single-line, newline-free edits behind the prefix are
+        // safe and must pass through (translated), not be caught by the
+        // all-or-nothing drop.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "range": { "start": { "line": 1, "character": 0 },
+                             "end": { "line": 1, "character": 4 } },
+                  "newText": "safe" }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &offset, 2, region_end).unwrap();
+
+        assert_eq!(edits.len(), 1, "all-safe response passes: {edits:?}");
         assert_eq!(edits[0].new_text, "safe");
+        assert_eq!(edits[0].range.start.line, 4, "translated to host line");
     }
 
     fn default_options() -> FormattingOptions {

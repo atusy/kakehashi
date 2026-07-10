@@ -1,6 +1,8 @@
 //! Completion request handling for bridge connections.
 //!
-//! Handles the coordinate transformation between host and virtual documents.
+//! Handles the coordinate transformation between host and virtual documents,
+//! and drops items whose text edits would break per-line region prefixes
+//! (blockquote `> `) if applied verbatim (see `transform_completion_item`).
 //! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
 //! ordering with other messages.
 
@@ -73,6 +75,7 @@ impl LanguageServerPool {
                         server_name,
                         host_uri: host_uri.as_str(),
                         offset: ctx.offset,
+                        region_end: Some(region_end),
                     }),
                 )
             },
@@ -252,6 +255,13 @@ pub(crate) struct KakehashiEnvelope {
     pub inner: Option<Value>,
     /// Region offset snapshot for coordinate transformation of the resolved response.
     pub offset: EnvelopeOffset,
+    /// Region end (host `(line, character)`) snapshot for the resolve-path
+    /// prefix-safety guard — the resolve has no region-content access, so it
+    /// can't recompute this. `None` (via `serde(default)`) for envelopes
+    /// minted before this field existed → the resolve path falls back to a
+    /// fully fail-closed guard in prefixed regions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_end: Option<(u32, u32)>,
 }
 
 /// Offset snapshot stored in the envelope for coordinate back-translation.
@@ -296,6 +306,9 @@ pub(crate) struct EnvelopeContext<'a> {
     /// `completionItem/resolve` can route back to the originating connection.
     pub host_uri: &'a str,
     pub offset: &'a RegionOffset,
+    /// Region end (host coords) snapshot for the resolve-path prefix guard;
+    /// `None` only when re-enveloping a legacy envelope that never carried it.
+    pub region_end: Option<Position>,
 }
 
 /// Wrap `item.data` in a Kakehashi envelope for origin tracking.
@@ -309,6 +322,7 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         host_uri: ctx.host_uri.to_string(),
         inner,
         offset: EnvelopeOffset::from(ctx.offset),
+        region_end: ctx.region_end.map(|end| (end.line, end.character)),
     };
     item.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
 }
@@ -338,13 +352,6 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
-
-    /// A region end far past any test edit: keeps the prefix-safety guard out
-    /// of the way for tests that exercise coordinate translation only.
-    const TEST_REGION_END: Position = Position {
-        line: u32::MAX,
-        character: u32::MAX,
-    };
 
     // ==========================================================================
     // Completion request tests
@@ -848,6 +855,7 @@ mod tests {
             server_name: "lua-ls",
             host_uri: "file:///test/doc.md",
             offset: &offset,
+            region_end: Some(TEST_REGION_END),
         };
         envelope_item_data(&mut item, &ctx);
 
@@ -905,6 +913,7 @@ mod tests {
             server_name: "lua-ls",
             host_uri: "file:///test/doc.md",
             offset: &offset,
+            region_end: Some(TEST_REGION_END),
         };
         envelope_item_data(&mut item, &ctx);
 
