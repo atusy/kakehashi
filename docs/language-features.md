@@ -288,7 +288,7 @@ Edit safety differs by layer and direction. An INJECTION-layer action edit
 that cannot be represented in the host document (touching another injection
 region, virtual-document file operations, or escaping the block) is
 rejected: in the initial response it surfaces as a disabled action where the
-client supports that and is dropped otherwise; during `codeAction/resolve`
+client declares `disabledSupport` and is dropped otherwise; during `codeAction/resolve`
 (where a response cannot be dropped) the unsafe payload is removed and the
 action comes back disabled — or, for clients without `disabledSupport`,
 unresolved. HOST-layer (`bridge._self`) action edits already target the
