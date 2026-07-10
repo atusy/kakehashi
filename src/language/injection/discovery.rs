@@ -487,7 +487,8 @@ pub(crate) struct ResolvedInjection {
     pub raw_injection_language: String,
     /// Language of the injection content
     pub injection_language: String,
-    /// Extracted virtual document content (clean, with blockquote prefixes stripped)
+    /// Extracted virtual document content. Single regions strip excluded
+    /// prefixes; combined regions mask excluded host gaps with whitespace.
     pub virtual_content: String,
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.

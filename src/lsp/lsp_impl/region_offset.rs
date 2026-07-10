@@ -6,8 +6,9 @@
 //! ([`ApplyEditTranslator`]). The offset is rebuilt exactly as the goto request
 //! path does (`region_id → node byte range → resolve injection → RegionOffset`),
 //! so inbound translation can't disagree with goto on the same region. The
-//! region's content-precise host end is returned alongside so an edit translator
-//! can reject a range that escapes the region.
+//! region's content-precise host end and contiguity are returned alongside so
+//! an edit translator can reject a range that escapes the region or targets a
+//! combined document with masked host gaps.
 //!
 //! [`ShowDocumentTranslator`]: super::show_document_translation::ShowDocumentTranslator
 //! [`ApplyEditTranslator`]: super::apply_edit_translation::ApplyEditTranslator
@@ -26,7 +27,8 @@ use crate::text::PositionMapper;
 /// `region_id` (a ULID in production). Returns `None` when the offset can't be
 /// rebuilt: region invalidated by edits (`lookup_node` misses), a `region_id`
 /// that no longer matches the live parse at that byte (edit race), or a missing
-/// document/snapshot/language/query.
+/// document/snapshot/language/query. The third tuple field reports whether the
+/// virtual content maps to one contiguous host span.
 pub(super) fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,

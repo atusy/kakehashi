@@ -119,7 +119,7 @@ impl ShowDocumentTranslator {
     /// shared [`resolve_region_offset`]. On `None` the caller opens the host
     /// document without a selection rather than risk a wrong one. showDocument
     /// only needs the offset (it translates a single selection position, not an
-    /// edit), so the region-end bound is discarded.
+    /// edit), so the region-end bound and contiguity marker are discarded.
     fn region_offset(&self, host_url: &Url, region_id: &str) -> Option<RegionOffset> {
         resolve_region_offset(
             &self.documents,
