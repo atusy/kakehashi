@@ -768,6 +768,288 @@ fn test_language_status_missing_queries() {
     );
 }
 
+/// Test that language status treats zero-byte unmarked queries as incomplete
+#[test]
+fn test_language_status_zero_byte_unmarked_queries_missing() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/partial"))
+        .expect("Failed to create queries dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(
+        test_dir.path().join(format!("parser/partial.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::write(test_dir.path().join("queries/partial/highlights.scm"), "")
+        .expect("Failed to write empty query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        combined.contains("partial") && combined.contains("missing"),
+        "Status should match installer completeness for zero-byte unmarked queries. Got: {combined}"
+    );
+}
+
+/// Test that language status ignores internal query staging directories
+#[test]
+fn test_language_status_ignores_internal_query_dirs() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir_all(test_dir.path().join("queries/.testlang.123.tmp"))
+        .expect("Failed to create internal query dir");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.testlang.123.tmp/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write internal query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    assert!(
+        !combined.contains(".testlang.123.tmp"),
+        "Status must not report internal query dirs as languages. Got: {combined}"
+    );
+    assert!(
+        combined.contains("No languages installed"),
+        "Only internal query dirs should not count as installed languages. Got: {combined}"
+    );
+}
+
+/// Test that language status recovers a query dir stranded as a hidden backup
+#[test]
+fn test_language_status_recovers_internal_query_backup() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/.recover_lang.123.0.backup"))
+        .expect("Failed to create backup query dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(
+        test_dir.path().join(format!("parser/recover_lang.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.123.0.backup/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write backup query");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.123.0.backup/.kakehashi-install-complete"),
+        "ok\n",
+    )
+    .expect("Failed to write backup marker");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.123.0.backup.kakehashi-backup"),
+        "ok\n",
+    )
+    .expect("Failed to write backup ownership marker");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    assert!(
+        output.status.success(),
+        "Status should exit with success. stderr: {stderr}"
+    );
+    assert!(
+        combined.contains("recover_lang") && combined.contains("✓ queries"),
+        "Status should report recovered queries. Got: {combined}"
+    );
+    assert!(
+        test_dir.path().join("queries/recover_lang").exists(),
+        "Backup query dir should be restored to the canonical path"
+    );
+    assert!(
+        !test_dir
+            .path()
+            .join("queries/.recover_lang.123.0.backup")
+            .exists(),
+        "Recovered backup dir should not remain stranded"
+    );
+}
+
+/// Test that status recovery does not delete an incomplete canonical query dir
+#[test]
+fn test_language_status_preserves_incomplete_query_dir_when_backup_exists() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/recover_lang"))
+        .expect("Failed to create canonical query dir");
+    fs::create_dir_all(test_dir.path().join("queries/.recover_lang.123.0.backup"))
+        .expect("Failed to create backup query dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(
+        test_dir.path().join(format!("parser/recover_lang.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join("queries/recover_lang/bindings.scm"),
+        "user managed query",
+    )
+    .expect("Failed to write canonical query");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.123.0.backup/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write backup query");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.123.0.backup/.kakehashi-install-complete"),
+        "ok\n",
+    )
+    .expect("Failed to write backup marker");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.123.0.backup.kakehashi-backup"),
+        "ok\n",
+    )
+    .expect("Failed to write backup ownership marker");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Status should exit with success. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(test_dir.path().join("queries/recover_lang/bindings.scm")).unwrap(),
+        "user managed query",
+        "Status recovery must not delete incomplete canonical query dirs"
+    );
+    assert!(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.123.0.backup")
+            .exists(),
+        "Backup should remain when canonical query dir already exists"
+    );
+}
+
+/// Test that status does not recover user-created hidden backup directories
+#[test]
+fn test_language_status_ignores_manual_query_backup() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/.recover_lang.manual.backup"))
+        .expect("Failed to create manual backup query dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(
+        test_dir.path().join(format!("parser/recover_lang.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.manual.backup/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write manual backup query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        combined.contains("recover_lang") && combined.contains("missing"),
+        "Manual backup should not be restored as installed queries. Got: {combined}"
+    );
+    assert!(
+        !test_dir.path().join("queries/recover_lang").exists(),
+        "Manual backup must not be moved to the canonical query path"
+    );
+    assert!(
+        test_dir
+            .path()
+            .join("queries/.recover_lang.manual.backup")
+            .exists(),
+        "Manual backup should be left untouched"
+    );
+}
+
 /// Test that language uninstall --help shows expected options
 #[test]
 fn test_language_uninstall_help() {
@@ -909,11 +1191,164 @@ fn test_language_uninstall_all() {
         .unwrap_or_default();
     assert!(parsers.is_empty(), "All parsers should be removed");
 
-    // All queries should be removed
+    // All installed query directories should be removed; internal tombstone/lock
+    // files may remain hidden under queries/.
     let queries: Vec<_> = fs::read_dir(test_dir.path().join("queries"))
-        .map(|entries| entries.filter_map(|e| e.ok()).collect())
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_none_or(|name| !name.starts_with('.'))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     assert!(queries.is_empty(), "All queries should be removed");
+}
+
+/// Test that language uninstall --all ignores internal query staging directories
+#[test]
+fn test_language_uninstall_all_ignores_internal_query_dirs() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/lang1")).expect("Failed to create query dir");
+    fs::create_dir_all(test_dir.path().join("queries/.lang1.123.tmp"))
+        .expect("Failed to create internal query dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(test_dir.path().join(format!("parser/lang1.{ext}")), "fake")
+        .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join("queries/lang1/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write query");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.lang1.123.tmp/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write internal query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Uninstall --all should exit with success. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !test_dir.path().join(format!("parser/lang1.{ext}")).exists(),
+        "Installed parser should be removed"
+    );
+    assert!(
+        !test_dir.path().join("queries/lang1").exists(),
+        "Installed query dir should be removed"
+    );
+    assert!(
+        test_dir.path().join("queries/.lang1.123.tmp").exists(),
+        "Internal query dir should not be treated as an installed language"
+    );
+}
+
+/// Test that uninstall removes backups so later status cannot recover them
+#[test]
+fn test_language_uninstall_removes_query_backups() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/lang1")).expect("Failed to create query dir");
+    fs::create_dir_all(test_dir.path().join("queries/.lang1.123.0.backup"))
+        .expect("Failed to create backup query dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(test_dir.path().join(format!("parser/lang1.{ext}")), "fake")
+        .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join("queries/lang1/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write query");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.lang1.123.0.backup/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write backup query");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.lang1.123.0.backup/.kakehashi-install-complete"),
+        "ok\n",
+    )
+    .expect("Failed to write backup marker");
+    fs::write(
+        test_dir
+            .path()
+            .join("queries/.lang1.123.0.backup.kakehashi-backup"),
+        "ok\n",
+    )
+    .expect("Failed to write backup ownership marker");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lang1",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Uninstall should exit with success. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !test_dir.path().join("queries/.lang1.123.0.backup").exists(),
+        "Uninstall must remove query backups so they cannot be recovered later"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    assert!(
+        !combined.contains("lang1"),
+        "Status must not recover an uninstalled language from backup. Got: {combined}"
+    );
 }
 
 /// Test that language uninstall rejects a language together with --all

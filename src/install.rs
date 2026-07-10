@@ -279,6 +279,11 @@ fn install_language_blocking_with_query_installer(
         return result;
     }
 
+    if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
+        let reason = e.to_string();
+        result.queries_error = Some(reason);
+    }
+
     // Install parser
     // For async/auto-install, always use cache (background operation)
     let parser_options = parser::InstallOptions {
@@ -562,7 +567,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(queries::QueryInstallError::LanguageNotSupported(_))
+                Err(queries::QueryInstallError::InvalidLanguageName(_))
             ),
             "unsafe top-level language name must be rejected"
         );
@@ -632,6 +637,7 @@ mod tests {
         let queries_dir = data_dir.join("queries").join("exists_lang");
         std::fs::create_dir_all(&queries_dir).unwrap();
         std::fs::write(queries_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        queries::write_install_marker_for_tests(&queries_dir).unwrap();
 
         // Everything exists, so no download may happen — point the base URL
         // at a closed port to fail loudly if one is attempted anyway.
@@ -673,5 +679,30 @@ mod tests {
             queries_error: Some("Queries failed".to_string()),
         };
         assert!(!failure.is_success());
+    }
+
+    #[test]
+    fn install_language_reports_tombstone_cleanup_as_query_error_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+        std::fs::write(data_dir.join("queries"), "not a directory").unwrap();
+
+        let result = install_language_blocking(
+            "lua",
+            data_dir,
+            false,
+            "http://127.0.0.1:1",
+            parser::ParserCompile::InProcess,
+        );
+
+        assert!(
+            result.parser_error.is_none(),
+            "tombstone cleanup must not be reported as a parser error"
+        );
+        assert!(
+            result.parser_path.is_some(),
+            "query tombstone cleanup failures must not prevent parser installation"
+        );
+        assert!(result.queries_error.is_some());
     }
 }
