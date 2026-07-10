@@ -3180,9 +3180,9 @@ mod tests {
             Some(Duration::from_millis(100)),
         );
         handle.notify_liveness_start(1);
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
         tokio::time::advance(Duration::from_millis(101)).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
 
         assert!(
             !handle.check_liveness_failed(),
@@ -3215,7 +3215,7 @@ mod tests {
             Some(Duration::from_millis(100)),
         );
         handle.notify_liveness_start(old_epoch.unwrap());
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
 
         // Make the old deadline ready without letting the reader poll it, then
         // replace the only progressing request and queue the new epoch wake-up.
@@ -3225,7 +3225,7 @@ mod tests {
             .register_with_upstream_liveness(RequestId::new(2), None)
             .unwrap();
         handle.notify_liveness_start(new_epoch.unwrap());
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
 
         assert!(
             !handle.check_liveness_failed(),
