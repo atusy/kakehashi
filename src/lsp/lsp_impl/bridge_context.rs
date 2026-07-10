@@ -1050,9 +1050,11 @@ impl Kakehashi {
     /// - Native has no contributor for bridged methods.
     ///
     /// A losing in-flight future is dropped; its RAII guards clean up the
-    /// response router and cancel subscription, and the trailing
-    /// `unregister_all_for_upstream_id` sweeps any upstream-registry entries
-    /// the dropped future did not get to remove itself.
+    /// response router and cancel subscription, and the request-scoped
+    /// [`UpstreamRegistrySweepGuard`] in [`run_layer_race`](Self::run_layer_race)
+    /// sweeps any upstream-registry entries the dropped future did not get to
+    /// remove itself — on drop, so the sweep also runs when this whole request
+    /// is cancelled.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn walk_layers<R>(
         &self,
