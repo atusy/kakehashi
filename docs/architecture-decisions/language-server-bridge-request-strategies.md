@@ -220,10 +220,13 @@ But line 0 of the virtual document maps to the injection start line in the host�
 |--------|----------|
 | Input | Position + newName |
 | Output | WorkspaceEdit (changes across files) |
-| Cross-file | **Reject entirely** if any edit outside virtual document |
-| Position mapping | All TextEdit ranges |
+| Cross-file | Real-file edits pass through; same-region virtual edits translate; foreign virtual-region or structurally unsafe edits reject |
+| Position mapping | Same-region TextEdit ranges (real-file ranges untouched) |
 
-Rename can affect multiple files. For injections, only same-document renames are valid.
+Rename can affect multiple files. Real-file edits (a project-aware server's
+cross-file rename) are preserved verbatim; only edits addressed to other
+regions' virtual URIs — meaningless to the editor — or edits that fail the
+region-safety guards are rejected.
 
 #### textDocument/codeAction
 
@@ -231,8 +234,8 @@ Rename can affect multiple files. For injections, only same-document renames are
 |--------|----------|
 | Input | Range + context (diagnostics) |
 | Output | CodeAction[] (each may contain WorkspaceEdit) |
-| Cross-file | Filter out actions with cross-file edits |
-| Position mapping | All ranges in remaining actions |
+| Cross-file | Real-file edits/resource ops pass through; actions with foreign virtual-region or unsafe edits are disabled/dropped |
+| Position mapping | Same-region ranges in remaining actions |
 
 #### textDocument/formatting / rangeFormatting / onTypeFormatting
 
