@@ -101,12 +101,12 @@ impl Kakehashi {
         // initialization with its own INIT_TIMEOUT bound.)
         const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         // Run the open as a SPAWNED task and bound only the wait: a plain
-        // `timeout(fut)` DROPS the future on expiry, and `ensure_document_opened`
-        // has await points between claiming a document for open and registering
-        // it — a drop in that window leaves the doc claimed-but-never-opened
-        // (every later open attempt short-circuits on the claim). Spawning lets
-        // the open run to completion in the background while the command
-        // dispatches.
+        // `timeout(fut)` DROPS the future on expiry, throwing away the
+        // best-effort didOpen mid-flight (the open path itself is
+        // cancellation-safe — `OpenClaimGuard` rolls back an orphaned claim on
+        // drop). Spawning lets the open run to completion in the background
+        // while the command dispatches, so a slow-but-healthy downstream still
+        // ends up with the document open.
         let bridge = std::sync::Arc::clone(&self.bridge);
         let settings = std::sync::Arc::clone(settings);
         let host_language_owned = host_language.clone();
