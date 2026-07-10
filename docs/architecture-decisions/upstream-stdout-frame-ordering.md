@@ -26,7 +26,7 @@ manufacture pipe backpressure.
 
 Measurement provenance:
 
-- source: `df555b55`;
+- source: `420acaf5`;
 - build: `cargo build --release --bin kakehashi`, rustc 1.95.0;
 - host: arm64 macOS 26.5.1 (Darwin 25.5.0, T8132); and
 - configuration: repository default discovery, `deps/test/kakehashi` data dir,
@@ -47,13 +47,13 @@ done
 
 | Scenario | Semantic request p90, three runs | Semantic ready → last byte p90 | Semantic ready → flush p90 |
 | --- | --- | --- | --- |
-| semantic only | 7.1 / 7.3 / 7.4 ms | 0.3 ms | 0.3–0.4 ms |
-| valid captures delta | 7.4 / 7.3 / 7.6 ms | 0.3 ms | 0.4 ms |
-| captures full fallback | 7.4 / 7.5 / 7.6 ms | 0.3 ms | 0.4 ms |
-| diagnostics burst | 9.2 / 9.1 / 9.1 ms | 0.3 ms | 0.3–0.4 ms |
+| semantic only | 7.7 / 7.4 / 7.4 ms | 0.3 ms | 0.4 ms |
+| valid captures delta | 7.5 / 7.5 / 7.5 ms | 0.3 ms | 0.4 ms |
+| captures full fallback | 7.6 / 7.4 / 7.7 ms | 0.3 ms | 0.4 ms |
+| diagnostics burst | 9.3 / 9.4 / 9.3 ms | 0.3 ms | 0.4 ms |
 
 The full captures fallback produced a 4,408.4 KiB frame. Its own
-ready-to-last-byte p90 was 11.4–12.5 ms and ready-to-flush p90 was 11.5–12.6 ms,
+ready-to-last-byte and ready-to-flush p90 were both 11.8–11.9 ms,
 but semantic responses were ready before that frame started in 0 of 60 cycles.
 They completed first, so a pre-write scheduler had no opportunity to improve
 semantic latency. The diagnostic responses in this configuration were valid
@@ -64,9 +64,9 @@ path; it is not a claim that every large-diagnostics configuration has the same
 opportunity rate.
 
 To check observer effect, the captures-full matrix was also run three times
-without `--stdout-metrics`. Instrumented captures p90 was 94.5 / 97.5 / 95.3 ms
+without `--stdout-metrics`. Instrumented captures p90 was 93.9 / 93.2 / 96.4 ms
 versus 90.1 / 94.6 / 93.7 ms uninstrumented; semantic p90 was
-7.4 / 7.5 / 7.6 ms versus 7.2 / 7.6 / 8.5 ms. The differences stayed within
+7.6 / 7.4 / 7.7 ms versus 7.2 / 7.6 / 8.5 ms. The differences stayed within
 run-to-run variation after replacing per-byte tail maintenance with bounded
 slice copies.
 
