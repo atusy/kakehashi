@@ -455,7 +455,10 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
 }
 
 fn archive_error_allows_clone_fallback(error: &ParserInstallError) -> bool {
-    matches!(error, ParserInstallError::ArchiveError(_))
+    matches!(
+        error,
+        ParserInstallError::ArchiveError(_) | ParserInstallError::UnsafeArchive(_)
+    )
 }
 
 /// Download a GitHub archive tarball and extract it to the destination directory.
@@ -1592,8 +1595,8 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_archive_errors_do_not_allow_clone_fallback() {
-        assert!(!archive_error_allows_clone_fallback(
+    fn archive_content_errors_allow_clone_fallback() {
+        assert!(archive_error_allows_clone_fallback(
             &ParserInstallError::UnsafeArchive("unsafe metadata".to_string())
         ));
         assert!(archive_error_allows_clone_fallback(
