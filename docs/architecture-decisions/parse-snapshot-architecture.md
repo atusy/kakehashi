@@ -354,8 +354,8 @@ Any reader that must resolve against **live** positions is position-critical
   remains for the backstop path and non-edit token changes. The `CancelToken`
   bail stays narrowed to reclaiming a superseded compute's CPU (§4).
 - **Serve-stale, passively refreshed** — whole-document, no-position reads:
-  `documentSymbol`, `documentColor`, `documentLink`, `foldingRange`, `codeLens`
-  (the `whole_document_preferred_fan_out` family), and pull-mode
+  `documentSymbol`, `documentColor`, plus the `whole_document_fan_out` family
+  (`documentLink`, `foldingRange`, `codeLens`), and pull-mode
   `textDocument/diagnostic` (the `virt_enabled` branch that calls
   `ensure_document_parsed`). `did_save`'s synthetic-diagnostic effect is likewise
   passive (a notification, not a request — its *diagnostics* may trail a snapshot,

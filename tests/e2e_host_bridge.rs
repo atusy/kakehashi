@@ -90,6 +90,261 @@ fn shutdown(client: &mut LspClient) {
 }
 
 #[test]
+fn e2e_whole_document_links_concatenate_virt_and_host_layers() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("whole_doc_links.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/documentLink"]
+strategy = "concatenated"
+priorities = ["virt", "host"]
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-link": {
+                        "cmd": [mock_bin(), "document-link"],
+                        "languages": ["markdown"]
+                    },
+                    "mock-virt-link": {
+                        "cmd": [mock_bin(), "document-link"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_whole_doc_links.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "# Title\n\n```lua\nprint(1)\n```\n"
+            }
+        }),
+    );
+
+    let links = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/documentLink",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            assert!(
+                response.get("error").is_none(),
+                "documentLink must not surface a top-level error; got: {:?}",
+                response.get("error")
+            );
+            let links = response["result"].as_array().cloned().unwrap_or_default();
+            if links.len() >= 2 {
+                Some(links)
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            }
+        })
+        .expect("concatenated whole-document links should include virt and host results");
+
+    let lines = links
+        .iter()
+        .filter(|link| {
+            link["tooltip"]
+                .as_str()
+                .is_some_and(|tooltip| tooltip.starts_with("mock-link:"))
+        })
+        .filter_map(|link| link.pointer("/range/start/line").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
+
+    assert!(
+        lines.contains(&0),
+        "host-layer documentLink should keep the host range: {links:?}"
+    );
+    assert!(
+        lines.contains(&3),
+        "virt-layer documentLink should be translated to the lua code line (print(1)): {links:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_whole_document_link_cancel_forwards_to_concatenated_layers() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("whole_doc_links_cancel.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/documentLink"]
+strategy = "concatenated"
+priorities = ["virt", "host"]
+"#,
+    )
+    .expect("write config");
+
+    let cancel_dir = tempfile::TempDir::new().expect("cancel dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("MOCK_LSP_CANCEL_DIR", cancel_dir.path().to_string_lossy())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-link": {
+                        "cmd": [mock_bin(), "document-link-slow-host"],
+                        "languages": ["markdown"]
+                    },
+                    "mock-virt-link": {
+                        "cmd": [mock_bin(), "document-link-slow-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_whole_doc_links_cancel.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "# Title\n\n```lua\nprint(1)\n```\n"
+            }
+        }),
+    );
+
+    (0..5)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/documentLink",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            assert!(
+                response.get("error").is_none(),
+                "documentLink must not surface a top-level error; got: {:?}",
+                response.get("error")
+            );
+            let links = response["result"].as_array().cloned().unwrap_or_default();
+            if links.len() >= 2 {
+                Some(())
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                None
+            }
+        })
+        .expect("slow documentLink mocks should warm up with virt and host results");
+
+    let host_request = cancel_dir
+        .path()
+        .join("document-link-slow-host.request.json");
+    let virt_request = cancel_dir
+        .path()
+        .join("document-link-slow-virt.request.json");
+    let host_cancel = cancel_dir
+        .path()
+        .join("document-link-slow-host.cancel.json");
+    let virt_cancel = cancel_dir
+        .path()
+        .join("document-link-slow-virt.cancel.json");
+    for path in [&host_request, &virt_request, &host_cancel, &virt_cancel] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let request_id = client.send_request_async(
+        "textDocument/documentLink",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let saw_requests = (0..60).any(|_| {
+        if host_request.exists() && virt_request.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            false
+        }
+    });
+    assert!(
+        saw_requests,
+        "both downstream documentLink requests should start before cancellation; files in {:?}: {:?}",
+        cancel_dir.path(),
+        std::fs::read_dir(cancel_dir.path())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    );
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32800),
+        "concatenated documentLink must answer RequestCancelled; got {response:?}"
+    );
+
+    let saw_both = (0..60).any(|_| {
+        if host_cancel.exists() && virt_cancel.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            false
+        }
+    });
+    assert!(
+        saw_both,
+        "client cancel should be forwarded to both concatenated layer servers; files in {:?}: {:?}",
+        cancel_dir.path(),
+        std::fs::read_dir(cancel_dir.path())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_host_bridge_definition_uses_real_uri_verbatim() {
     let (mut client, _config_dir) = init_client(
         r#"

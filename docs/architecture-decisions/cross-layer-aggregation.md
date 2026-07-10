@@ -133,7 +133,9 @@ priorities = ["virt", "host", "native"]   # innermost-first; mirrors "deeper win
 # host is listed but contributes nothing until the user opts in via
 # bridge._self.enabled (host-document-bridge) — priorities ranks layers,
 # enabled flags decide whether a bridge target exists at all.
-# strategy: per-method default (concatenated for diagnostics, else preferred)
+# strategy: per-method default (concatenated for diagnostics, codeAction,
+# and formatting; otherwise preferred). List-shaped whole-document methods
+# such as documentLink/foldingRange/codeLens can opt into concatenated.
 
 # ---- User: markdown hover should prefer the host LS, and drop native ----
 [languages.markdown.layers.aggregation."textDocument/hover"]

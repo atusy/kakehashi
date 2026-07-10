@@ -157,9 +157,10 @@ pub struct LayerAggregationConfig {
     /// Cross-layer combine strategy: `preferred` (first non-empty layer
     /// wins) or `concatenated`. Consumed by `textDocument/formatting`
     /// (default `concatenated`: the pipeline composes disjoint work across
-    /// layers) and the diagnostics methods (default `concatenated`: virt
-    /// region diagnostics and host-server diagnostics merge into one
-    /// report). Every other method combines with `preferred` regardless.
+    /// layers), diagnostics and codeAction (default `concatenated`: layer
+    /// lists merge), and list-shaped whole-document methods such as
+    /// documentLink, foldingRange, and codeLens when explicitly configured.
+    /// Other methods combine with `preferred` regardless.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
 }

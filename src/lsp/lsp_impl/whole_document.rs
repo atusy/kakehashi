@@ -8,8 +8,9 @@
 //!
 //! The fan-out is the virt layer of the resolved layer order
 //! (cross-layer-aggregation); the host layer (host-document-bridge) bridges
-//! the host document itself with the real URI and the response verbatim. The
-//! first layer producing a non-empty result wins (`preferred`).
+//! the host document itself with the real URI and the response verbatim.
+//! `preferred` returns the highest-priority non-empty layer, while
+//! `concatenated` merges every selected layer's list in priority order.
 
 use std::future::Future;
 use std::io;
@@ -32,17 +33,19 @@ use super::{Kakehashi, uri_to_url};
 impl Kakehashi {
     /// Fan out a whole-document bridged request to all injection regions.
     ///
-    /// Within a region the preferred strategy picks one server's result;
-    /// across regions results are concatenated (regions are disjoint, so this
-    /// is safe for any item kind). Returns `None` when the document has no
-    /// injection regions, no configured servers, or every region came back
-    /// empty — mirroring the per-method handlers this was extracted from.
+    /// Within the virt layer, each region uses the preferred server strategy
+    /// and the region results are concatenated because regions are disjoint.
+    /// The virt arm returns `None` when there are no injection regions, no
+    /// configured virt servers, or every region returned empty. The final
+    /// cross-layer result still follows the configured layer strategy, so the
+    /// host layer can answer when the virt arm is empty and `concatenated`
+    /// can merge non-empty virt and host lists.
     ///
     /// `client_progress_token` is the editor's `workDoneToken`, if any: when
     /// `Some`, one shared aggregator relays the first region to begin as a single
     /// `Begin → … → End` on that token (ls-bridge-client-progress); `None` (the
     /// fast methods that don't advertise `workDoneProgress`) keeps prior behavior.
-    pub(super) async fn whole_document_preferred_fan_out<T, F, Fut>(
+    pub(super) async fn whole_document_fan_out<T, F, Fut>(
         &self,
         lsp_uri: &Uri,
         method_name: &'static str,
@@ -252,23 +255,127 @@ impl Kakehashi {
             )
             .await;
 
-            let all_items = all_items?;
-            Ok(if all_items.is_empty() {
-                None
-            } else {
-                Some(all_items)
-            })
+            Ok(nonempty_whole_document_items(all_items?))
         };
 
-        self.walk_layers(
-            lsp_uri,
-            method_name,
-            method_name,
-            raw_params,
-            virt,
-            parse_host_verbatim::<Vec<T>>,
-            |items: &Vec<T>| !items.is_empty(),
-        )
-        .await
+        let host = async {
+            match self.resolve_host_bridge_context(lsp_uri, method_name) {
+                Some(ctx) => Ok(self
+                    .host_layer_value_with_ctx(&ctx, method_name, raw_params)
+                    .await?
+                    .and_then(parse_host_verbatim::<Vec<T>>)),
+                None => Ok(None),
+            }
+        };
+
+        let result = self
+            .walk_layers_by_strategy(
+                lsp_uri,
+                method_name,
+                method_name,
+                virt,
+                host,
+                std::future::ready(Ok(None)),
+                |items: &Vec<T>| !items.is_empty(),
+                concat_whole_document_items,
+            )
+            .await?;
+
+        Ok(result.and_then(nonempty_whole_document_items))
+    }
+}
+
+fn concat_whole_document_items<T>(mut acc: Vec<T>, next: Vec<T>) -> Vec<T> {
+    acc.extend(next);
+    acc
+}
+
+fn nonempty_whole_document_items<T>(items: Vec<T>) -> Option<Vec<T>> {
+    if items.is_empty() { None } else { Some(items) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::WorkspaceSettings;
+    use crate::config::settings::{
+        AggregationStrategy, LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig,
+    };
+    use std::collections::HashMap;
+    use std::future::ready;
+    use tower_lsp_server::LspService;
+    use url::Url;
+
+    #[test]
+    fn concatenates_whole_document_layer_items() {
+        assert_eq!(
+            concat_whole_document_items(vec![1, 2], vec![3, 4]),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn empty_whole_document_layer_items_are_absent() {
+        assert_eq!(nonempty_whole_document_items::<i32>(vec![]), None);
+        assert_eq!(nonempty_whole_document_items(vec![1]), Some(vec![1]));
+    }
+
+    #[tokio::test]
+    async fn whole_document_walk_honors_concatenated_layer_strategy() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+
+        let mut aggregation = HashMap::new();
+        aggregation.insert(
+            "textDocument/documentLink".to_string(),
+            LayerAggregationConfig {
+                priorities: Some(vec![LayerSource::Virt, LayerSource::Host]),
+                strategy: Some(AggregationStrategy::Concatenated),
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rust".to_string(),
+            LanguageSettings {
+                layers: Some(LayersConfig {
+                    aggregation: Some(aggregation),
+                }),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            languages,
+            auto_install: false,
+            ..Default::default()
+        });
+
+        let uri = Url::parse("file:///test/whole_document.rs").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".into(),
+            Some("rust".into()),
+            None,
+        );
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+
+        let result = server
+            .walk_layers_by_strategy(
+                &lsp_uri,
+                "textDocument/documentLink",
+                "textDocument/documentLink",
+                ready(Ok(Some(vec!["virt"]))),
+                ready(Ok(Some(vec!["host"]))),
+                ready(Ok(None)),
+                |items: &Vec<&str>| !items.is_empty(),
+                concat_whole_document_items,
+            )
+            .await
+            .expect("layer walk should succeed");
+
+        assert_eq!(result, Some(vec!["virt", "host"]));
     }
 }

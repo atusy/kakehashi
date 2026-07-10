@@ -11,7 +11,7 @@ impl Kakehashi {
         params: DocumentLinkParams,
     ) -> Result<Option<Vec<DocumentLink>>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
-        self.whole_document_preferred_fan_out(
+        self.whole_document_fan_out(
             &params.text_document.uri,
             "textDocument/documentLink",
             raw_params,
