@@ -1054,16 +1054,40 @@ impl LanguageServerPool {
         let request = JsonRpcRequest::new(request_id.as_i64(), "codeAction/resolve", &action);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        if let Err(e) = handle.send_request(request, request_id) {
-            // DEBUG: see the register-failure note above.
-            log::debug!(
-                target: "kakehashi::bridge",
-                "codeAction/resolve: failed to send request on {connection_key:?}: {e}"
-            );
-            if let Some(ref id) = upstream_id {
-                self.unregister_upstream_request(id, connection_key);
+        // Verify `handle` is still the pool's LIVE connection for its key
+        // before sending, under the `connections` lock (the same guard the
+        // executeCommand and generic execute paths use): a respawn between
+        // fetching the handle — earliest on the eager-resolve pass — and this
+        // send would queue the resolve and its cancel bookkeeping on a dead
+        // handle, losing cancel forwarding and waiting out the full timeout.
+        {
+            let connections = self.connections().await;
+            if !connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, handle))
+            {
+                drop(connections);
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve: connection {connection_key} was replaced before send"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
             }
-            return None;
+            if let Err(e) = handle.send_request(request, request_id) {
+                drop(connections);
+                // DEBUG: see the register-failure note above.
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve: failed to send request on {connection_key:?}: {e}"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
+            }
         }
 
         let response = handle.wait_for_response(request_id, response_rx).await;

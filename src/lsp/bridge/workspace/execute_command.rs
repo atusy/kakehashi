@@ -99,8 +99,17 @@ impl LanguageServerPool {
             );
             return None;
         };
+        // Wait through initialization like the palette path: after a respawn
+        // the fail-fast variant hands back an Initializing handle whose
+        // capability probe is still false, spuriously dropping the command
+        // with a misleading "does not advertise executeCommandProvider".
         let handle = match self
-            .get_or_create_connection(&origin, &config, Some(&host_url))
+            .get_or_create_connection_wait_ready(
+                &origin,
+                &config,
+                Some(&host_url),
+                std::time::Duration::from_secs(crate::lsp::bridge::pool::INIT_TIMEOUT_SECS),
+            )
             .await
         {
             Ok(handle) => handle,
@@ -113,9 +122,11 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability(METHOD) {
-            // Should be unreachable — the bridge only mints commands from servers
-            // it bridged — but if it happens, a log entry beats a silent drop
-            // (every other failure branch here warns).
+            // Nearly unreachable: the bridge only mints commands from servers it
+            // bridged, and the wait-ready acquisition above rules out the
+            // still-Initializing false negative. Reaching it means the server
+            // genuinely dropped the capability across a respawn — a log entry
+            // beats a silent drop (every other failure branch here warns).
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: {origin:?} does not advertise executeCommandProvider; ignoring {command:?}"

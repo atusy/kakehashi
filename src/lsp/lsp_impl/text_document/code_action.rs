@@ -211,10 +211,35 @@ impl Kakehashi {
         let settings = self.settings_manager.load_settings();
         let upstream_caps = self.upstream_code_action_caps();
         let upstream_id = crate::lsp::current_upstream_id();
+        // Propagate a client $/cancelRequest as RequestCancelled instead of
+        // masking it as an unresolved-action success (the cancel is forwarded
+        // downstream; the -32800 answer would otherwise be collapsed by the
+        // fail-soft parsing) — mirrors the multi-region codeAction walk.
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
         let pool = self.bridge.pool_arc();
-        Ok(pool
-            .dispatch_code_action_resolve(action, &settings, upstream_caps, upstream_id, region_end)
-            .await)
+        let dispatch = pool.dispatch_code_action_resolve(
+            action,
+            &settings,
+            upstream_caps,
+            upstream_id,
+            region_end,
+        );
+        let result = match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                resolved = dispatch => Ok(resolved),
+            },
+            None => Ok(dispatch.await),
+        };
+        // The cancel arm DROPS the in-flight dispatch, which then never
+        // reaches its own refcounted unregister — sweep the id (idempotent
+        // after normal completion, where the dispatch cleaned up itself).
+        // The CAPTURED id, not a re-read of the task-local: the sweep must
+        // target exactly the id the dispatch registered under.
+        pool.unregister_all_for_upstream_id(sweep_id.as_ref());
+        result
     }
 
     /// The region's current content-precise host-document END position if the
