@@ -82,7 +82,6 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
 
         result
             .handle(&self.client, "completion", None, |v| {

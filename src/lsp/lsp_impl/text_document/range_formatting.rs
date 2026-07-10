@@ -358,7 +358,6 @@ impl Kakehashi {
 
             let response =
                 finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
-            pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
             response
         };
 

@@ -56,6 +56,23 @@ fn capability_prefilter_applies(method: &str) -> bool {
 ///
 /// This is the document-level context (no position). Position-based handlers
 /// use [`PositionRequestContext`] which wraps this struct.
+/// RAII sweep of the upstream-request registry for one request id: on drop,
+/// removes every entry a dropped/aborted layer future did not get to
+/// unregister itself. Idempotent with the arms' own refcounted unregisters.
+/// Hold it across a layer race so the sweep runs on every exit — normal
+/// completion, `?`, cancellation, and even the whole request future being
+/// dropped.
+pub(crate) struct UpstreamRegistrySweepGuard {
+    pub(crate) pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
+    pub(crate) id: Option<UpstreamId>,
+}
+
+impl Drop for UpstreamRegistrySweepGuard {
+    fn drop(&mut self) {
+        self.pool.unregister_all_for_upstream_id(self.id.as_ref());
+    }
+}
+
 pub(crate) struct DocumentRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
@@ -980,7 +997,12 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        // No `unregister_all` here: as a walk arm this future runs
+        // concurrently with the virt/native layers under the SAME upstream id
+        // (`run_layer_race` sweeps after the whole race), and wiping the
+        // registry on this arm's completion would drop a live sibling's
+        // cancel registrations. The one non-walk caller
+        // (`will_save_wait_until`) sweeps for itself.
         // Quieter than `FanInResult::handle`: an all-empty host layer is the
         // normal outcome whenever virt answers, and the virt arm already
         // emits the client-visible "no response" LOG — only real host
@@ -1137,7 +1159,16 @@ impl Kakehashi {
         race: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
-        let result = match cancel_rx {
+        // RAII: sweep upstream-registry entries a dropped (losing or
+        // cancelled) layer future did not get to unregister itself.
+        // Idempotent; a completed arm already cleaned up its own. A guard
+        // (not a trailing statement) so the sweep also runs if this whole
+        // request future is ever dropped mid-race.
+        let _sweep = UpstreamRegistrySweepGuard {
+            pool: self.bridge.pool_arc(),
+            id: current_upstream_id(),
+        };
+        match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
                     biased;
@@ -1146,14 +1177,7 @@ impl Kakehashi {
                 }
             }
             None => race.await,
-        };
-        // Sweep upstream-registry entries a dropped (losing or cancelled) layer
-        // future did not get to unregister itself. Idempotent; a completed arm
-        // already cleaned up its own.
-        self.bridge
-            .pool_arc()
-            .unregister_all_for_upstream_id(current_upstream_id().as_ref());
-        result
+        }
     }
 
     /// Cross-layer walk that picks `preferred` (first-wins) vs `concatenated`

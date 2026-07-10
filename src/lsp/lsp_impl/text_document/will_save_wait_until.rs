@@ -55,7 +55,17 @@ impl Kakehashi {
         let fut =
             self.host_layer_value_with_ctx(&ctx, "textDocument/willSaveWaitUntil", raw_params);
         let value = match tokio::time::timeout(WILL_SAVE_WAIT_UNTIL_BUDGET, fut).await {
-            Ok(result) => result?,
+            Ok(result) => {
+                // Standalone host dispatch (no layer race, so no
+                // `run_layer_race` sweep): `dispatch_host_preferred` aborts
+                // losing per-server tasks without joining them, and an
+                // aborted task may not reach its own unregister — sweep the
+                // id ourselves. Nothing else shares it here.
+                self.bridge
+                    .pool_arc()
+                    .unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+                result?
+            }
             Err(_) => {
                 // Bounded save latency (#357 Q3): abandon the in-flight host
                 // request and let the editor save without save-time edits.
