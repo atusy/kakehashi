@@ -22,7 +22,7 @@ This decision affects:
 
 ## Decision
 
-**Isolate injections by default (`isolation: true`), with configurable non-isolated mode (`isolation: false`) for literate programming.**
+**Isolate injections by default (`isolation: true`), with a proposed (deferred) configurable non-isolated mode (`isolation: false`) for literate programming.**
 
 ### Isolated Mode (Default: `isolation: true`)
 
@@ -47,9 +47,9 @@ Host: file:///docs/tutorial.md
 
 Real-world documentation code blocks are typically **independent examples** that would conflict if combined.
 
-### Non-Isolated Mode (Configurable: `isolation: false`)
+### Non-Isolated Mode (Proposed configuration: `isolation: false` — deferred)
 
-For literate programming workflows, non-isolated mode concatenates all injections of the same language into a single virtual document.
+For literate programming workflows, non-isolated mode would concatenate all injections of the same language into a single virtual document. (Query-controlled `injection.combined` ships today; this user-facing configuration remains deferred — see the note below.)
 
 #### Fine-Grained Control: (Host, Injection) Pairs
 
@@ -94,7 +94,7 @@ The `_` wildcard matches any host or injection language, enabling layered defaul
 
 Precedence: **specific pair > host default > injection default > global default**
 
-Note: The `isolation` field is configured per **host/injection pair** within the `bridge` map, not per server. The same server handles both modes—only the virtual document structure differs.
+Note: In the deferred proposal, the `isolation` field would be configured per **host/injection pair** within the `bridge` map, not per server. The same server would handle both modes—only the virtual document structure differs.
 
 | Isolation | Use Case | Behavior |
 |-----------|----------|----------|
