@@ -266,7 +266,9 @@ and [`workspace/applyEdit`](https://microsoft.github.io/language-server-protocol
 Quick fixes and refactors from the servers bridging the block (all of them
 by default; `priorities`/`maxFanOut` can restrict the set) — a range
 spanning several blocks merges each region's actions into one menu. Titles
-are suffixed with "— {server}" so same-named actions stay distinguishable.
+are suffixed with "— {server}", exposing provenance and distinguishing
+same-titled actions from *different* servers (identically titled actions
+from one server — e.g. across two fences — keep identical titles).
 Lazy actions resolve back to their origin server (`codeAction/resolve`) —
 client-driven resolve routing additionally requires the client to declare
 `dataSupport` and `resolveSupport` covering `"edit"`; without those,
@@ -573,9 +575,12 @@ dynamically and depend only on the client's
 `workspace.executeCommand.dynamicRegistration`.)
 
 Bridged features are also limited to **embedded code blocks** in one respect:
-navigation and edits do not cross between blocks (results addressed to
-another block's virtual URI are filtered out; real-file and — for
-navigation/references/rename — host-URI results pass through, while code
-actions and applyEdit region-bound host-URI edits). The surrounding host
+navigation and edits do not cross between blocks — on the
+goto/references/rename/code-action transforms, results addressed to another
+block's virtual URI are filtered out (document-link targets are the
+exception and pass through untouched). Real-file and — for
+navigation/references/rename — host-URI results pass through, while
+INJECTION-layer code actions (and applyEdit requests that also touch a
+virtual document) region-bound host-URI edits. The surrounding host
 document can be bridged to the host language's own servers via
 `bridge._self` (host-document-bridge).

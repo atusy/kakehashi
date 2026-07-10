@@ -37,7 +37,7 @@ Current bridge-backed requests include:
 - On Type Formatting (config-driven; see `onTypeFormattingTriggers`)
 
 **Limitations:**
-- **No cross-region results within the host document**: a result addressed to a *different* region's virtual URI is filtered out (that URI would be meaningless to the editor). Results in real files — an external definition, a cross-file rename edit — pass through unchanged; for navigation/references/rename, host-URI results are not containment-checked (code actions and applyEdit DO region-bound host-URI edits).
+- **No cross-region results within the host document**: on the goto/references/rename/code-action transforms, a result addressed to a *different* region's virtual URI is filtered out (that URI would be meaningless to the editor; document-link targets are the exception — they pass through untouched). Results in real files — an external definition, a cross-file rename edit — pass through unchanged; for navigation/references/rename, host-URI results are not containment-checked (INJECTION-layer code actions, and applyEdit requests that also touch a virtual document, DO region-bound host-URI edits).
 
 See [Bridge Configuration](#bridge-configuration) for setup instructions.
 
