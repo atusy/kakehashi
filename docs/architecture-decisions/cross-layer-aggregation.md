@@ -66,6 +66,14 @@ Phased roadmap:
    they are not latency-interactive and `concatenated` needs every layer
    anyway, so one code path with a pure combine function replaces the
    `race_layers_preferred` machinery here.
+5. **Layer-level `concatenated` for `textDocument/codeAction`** — ✅
+   implemented (and the DEFAULT for the method): the virt layer's actions
+   (merged across every injection region the request range overlaps) and the
+   host layer's actions appear in one menu via `race_layers_concatenated`,
+   folded in `priorities` order. `isPreferred` collisions on the final menu
+   are collapsed to the first occurrence
+   (`resolve_preferred_collision`); `preferred` returns the first non-empty
+   layer instead.
 
 ## Context
 

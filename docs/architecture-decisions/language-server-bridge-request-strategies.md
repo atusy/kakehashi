@@ -319,6 +319,7 @@ When multiple servers are configured for a language:
 | Completion | Merge completion lists from all servers |
 | Hover | Concatenate hover content with separator |
 | Diagnostics | Merge all, dedupe by range + message |
+| Code Actions | `concatenated` by default: every server's actions in one menu, titles suffixed with "— {server}", no dedup of same-named actions (deliberate), at most one `isPreferred` kept |
 | Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (which is also the membership allowlist — servers not listed do not run) — full formatting only. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
 
 `priorities` lists follow the ordered-allowlist semantics of
@@ -365,7 +366,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | completionItem/resolve | ✅ Implemented | Envelope-routed; an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set |
 | references | ✅ Implemented | Real-file URIs kept, cross-region virtual URIs dropped |
 | rename | ✅ Implemented | With workspace edit validation |
-| codeAction | ✅ Implemented | With edit filtering (incl. resolve + executeCommand routing) |
+| codeAction | ✅ Implemented | Edit-carrying, lazy (`codeAction/resolve` routed to the origin server), command-carrying (`workspace/executeCommand` name-routing + palette dispatch), host layer, multi-region menu merge; strict edit validation (cross-region / region-bounds / prefix preservation) |
 | formatting | ✅ Implemented | Whole-response atomic drop on unsafe edits |
 | rangeFormatting | ✅ Implemented | Shares the formatting guards |
 | onTypeFormatting | ✅ Implemented | Shares the formatting guards |
@@ -373,7 +374,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
-| semanticTokens | ✅ Implemented | Cross-layer merge (see semantic-token merge ADR) |
+| semanticTokens | ❌ Not implemented | Would enable parallel fetch strategy |
 
 ### Original Implementation Priority
 

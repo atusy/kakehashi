@@ -30,10 +30,11 @@ Current bridge-backed requests include:
 - Document Highlight / Document Symbol / Document Link
 - Moniker / Inlay Hint
 - Code Lens (incl. `codeLens/resolve` routed back to the origin server; resolution fails soft when the region was edited since the lens was produced)
+- Code Action (incl. `codeAction/resolve` routed back to the origin server, host-layer actions via `bridge._self`, and a merged menu across every injection region a multi-fence range overlaps; advertised only to clients with `codeActionLiteralSupport`)
+- `workspace/executeCommand` (commands surfaced through bridged actions route back to their origin server by name; palette-fired commands route via dynamically registered names when the client supports dynamic registration)
+- `workspace/applyEdit` from downstream servers (virtual-document edits are translated to the host document and relayed to the editor; untranslatable edits answer `applied: false`)
 - Pull Diagnostics
 - On Type Formatting (config-driven; see `onTypeFormattingTriggers`)
-
-The server does not currently advertise `textDocument/codeAction`.
 
 **Limitations:**
 - **Same-region navigation only**: Cross-region jumps/edits (e.g., go to Definition, rename, ...) are not supported—these results are filtered out.
@@ -373,7 +374,7 @@ When multiple language servers can handle the same injection language, `aggregat
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered **allowlist** of server names: listed servers are queried in this order, and servers absent from the list do not run. A `"*"` element stands for every configured-but-unlisted server (first-win among themselves), so `["pyright", "*"]` means "prefer pyright, fall back to the rest" and `["*", "pylsp"]` demotes pylsp below everyone else. Omitted = `["*"]` (all servers, first-win). An explicit `[]` disables the method for this bridge entry. Note: the sequential `concatenated` formatting pipeline requires explicit names and ignores `"*"`. |
-| `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for `textDocument/diagnostic`, `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. |
+| `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for the diagnostics methods (`textDocument/diagnostic`, `textDocument/publishDiagnostics`) and `textDocument/codeAction` (every server's actions appear in one menu), `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. |
 | `maxFanOut` | Maximum number of servers to query. `null` or omitted = no limit (default). `0` = disable fan-out entirely. Positive integer = cap at N servers. Priority servers are selected first when limiting. Negative values are treated as no limit. |
 
 > **Migration note**: `priorities` used to be a preference order only — unlisted
@@ -423,7 +424,7 @@ the `bridge.<lang>.aggregation` nesting:
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered allowlist of layers, highest priority first (same allowlist rule as the server-name `priorities` above, but over the closed set `virt`/`host`/`native` — no `"*"`). Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
-| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit), by diagnostics and code actions (default `"concatenated"`: layer lists merge), and by list-shaped whole-document methods such as `textDocument/documentLink`, `textDocument/foldingRange`, and `textDocument/codeLens` when explicitly configured. Other methods combine with `"preferred"` regardless of this field. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit), by the diagnostics methods (default `"concatenated"`: the `virt` regions' diagnostics and the host servers' diagnostics for the real document merge into one report/publish; `"preferred"` returns the first non-empty layer instead), by `textDocument/codeAction` (default `"concatenated"`: the injection region's actions and the host servers' actions appear in one menu, with at most one `isPreferred` action kept), and by list-shaped whole-document methods such as `textDocument/documentLink`, `textDocument/foldingRange`, and `textDocument/codeLens` when explicitly configured. Every other method combines with `"preferred"` regardless of this field. |
 
 Details:
 
