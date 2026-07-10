@@ -530,18 +530,7 @@ pub fn remove_query_install_and_backups(
     };
 
     if queries_dir.exists() {
-        // NotFound = the dir vanished between the exists() check and the
-        // removal (external cleanup — the lock only serializes kakehashi's
-        // own installers): already gone is the desired end state, so treat
-        // it as removed rather than failing the uninstall. Re-checked against
-        // the filesystem because remove_dir_all can also surface NotFound for
-        // a child that vanished mid-recursion while the dir itself survives
-        // partially deleted.
-        match fs::remove_dir_all(&queries_dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !queries_dir.exists() => {}
-            Err(e) => return Err(QueryInstallError::IoError(e)),
-        }
+        remove_dir_all_tolerating_vanished(&queries_dir)?;
         removal.removed_queries = true;
     }
 
@@ -558,19 +547,37 @@ pub fn remove_query_install_and_backups(
             && backup_is_owned(&path)
         {
             let ownership = backup_ownership_sidecar(&path);
-            // Same NotFound tolerance as the canonical dir above (including
-            // the gone-for-real re-check): a backup deleted externally after
-            // enumeration is already the end state.
-            match fs::remove_dir_all(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.exists() => {}
-                Err(e) => return Err(QueryInstallError::IoError(e)),
-            }
+            // Same NotFound tolerance as the canonical dir above: a backup
+            // deleted externally after enumeration is already the end state.
+            remove_dir_all_tolerating_vanished(&path)?;
             let _ = fs::remove_file(ownership);
             removal.removed_backups = true;
         }
     }
     Ok(removal)
+}
+
+/// `fs::remove_dir_all` that treats a CONFIRMED-vanished directory as removed.
+///
+/// NotFound = the dir disappeared between the caller's observation and the
+/// removal (external cleanup — the replace lock only serializes kakehashi's
+/// own installers): already gone is the desired end state. Confirmed via
+/// `try_exists` because (a) remove_dir_all can also surface NotFound for a
+/// child that vanished mid-recursion while the dir survives partially
+/// deleted, and (b) `Path::exists()` returns false on ANY metadata error
+/// (e.g. PermissionDenied), which must propagate the original error instead
+/// of being mistaken for absence.
+fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<(), QueryInstallError> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(dir.try_exists(), Ok(false)) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
 }
 
 fn backup_language_name(path: &Path) -> Option<String> {
@@ -959,6 +966,31 @@ fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, Quer
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn remove_dir_all_tolerates_a_confirmed_vanished_dir() {
+        // The dir disappearing between the caller's observation and the
+        // removal (external cleanup) must read as already-removed, not fail
+        // the uninstall.
+        let temp = TempDir::new().unwrap();
+        let gone = temp.path().join("never-created");
+
+        assert!(
+            remove_dir_all_tolerating_vanished(&gone).is_ok(),
+            "a confirmed-absent dir is the desired end state"
+        );
+    }
+
+    #[test]
+    fn remove_dir_all_still_removes_and_propagates_content() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("queries-lang");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("highlights.scm"), "(x) @y").unwrap();
+
+        remove_dir_all_tolerating_vanished(&dir).expect("normal removal succeeds");
+        assert!(!dir.exists(), "the dir and its contents are removed");
+    }
 
     /// Serve canned query files over HTTP from an OS-assigned local port.
     fn spawn_query_file_server(routes: Vec<(&str, &str)>) -> String {
