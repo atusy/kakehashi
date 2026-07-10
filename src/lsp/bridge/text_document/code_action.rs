@@ -201,9 +201,11 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
 /// Policy (mirrors the virt path): a disabled resolve is surfaced disabled; a
 /// materialized command is name-encoded for `executeCommand` routing (dropped
 /// if unencodable); a result with no command and no applicable edit is a no-op
-/// and is disabled as `REASON_RESOLVE`; a still-lazy result is re-enveloped for
-/// a further resolve. Without `disabledSupport` every disable path fails soft to
-/// the unresolved action instead.
+/// and is disabled (`REASON_RESOLVE` for an empty edit, or
+/// `REASON_UNROUTABLE_COMMAND` when the no-op exists only because the command
+/// was dropped above); a still-lazy result is re-enveloped for a further
+/// resolve. Without `disabledSupport` every disable path fails soft to the
+/// unresolved action instead.
 fn finalize_host_resolved_action(
     mut resolved: CodeAction,
     mut action: CodeAction,
@@ -211,8 +213,9 @@ fn finalize_host_resolved_action(
     suffixed_title: String,
     upstream_caps: UpstreamCodeActionCaps,
 ) -> CodeAction {
-    // Clone the origin so later `envelope` mutation (lazy re-envelope) doesn't
-    // conflict with the `&str` borrows below; resolve is a cold path.
+    // Borrowed, not cloned: this `&str` view of the origin is last used
+    // (title resuffixing) before the lazy path's `envelope.original_title`
+    // mutation, so NLL ends the borrow in time and no allocation is needed.
     let server_name = &envelope.origin;
 
     // Disabled resolve → surface disabled (strip payload) with disabledSupport,
