@@ -376,11 +376,15 @@ pub(crate) struct DiagnosticAggregator {
     /// removed — reclamation cannot race a republish into minting a second lock for
     /// the same host.
     republish_locks: Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>,
-    /// The last diagnostic set published to the editor per host, so a republish
-    /// that would re-send an identical set is suppressed — the editor already has
-    /// it, and a redundant `publishDiagnostics` is a needless flicker/noise source
-    /// (#422). Updated under the host's republish lock (same-host republishes are
-    /// serialized), and forgotten on `didClose` ([`Self::forget_published`]).
+    /// The last **merged-and-recorded** diagnostic set per host, so a republish
+    /// producing an identical set is suppressed — a redundant re-emission is
+    /// needless flicker/noise (#422) — and the change signal driving the
+    /// refresh nudging stays exact. The wire send can lag this record (the
+    /// quiet window withholds it, tracked by [`WireGate::dirty`]) or be
+    /// skipped entirely (the publish seal: a pull-first client receives the
+    /// set via re-pull instead). Updated under the host's republish lock
+    /// (same-host republishes are serialized), and forgotten on `didClose`
+    /// ([`Self::forget_published`]).
     last_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
     /// Single-flight guard for the **workspace-wide** `workspace/diagnostic/refresh`
     /// nudge (#497). `workspace/diagnostic/refresh` is param-less and workspace-wide,
@@ -704,10 +708,11 @@ impl DiagnosticAggregator {
         cache.remove(host).is_some()
     }
 
-    /// Whether `diagnostics` differs from the set last published for `host`,
-    /// recording it as the new last when it does. Returns `false` when identical,
-    /// so the caller skips a redundant `publishDiagnostics` the editor already has
-    /// (#422). Called under the host's republish lock, so same-host calls serialize.
+    /// Whether `diagnostics` differs from the last merged-and-recorded set for
+    /// `host` (see the `last_published` field doc — the wire send can lag or be
+    /// sealed), recording it as the new last when it does. Returns `false` when
+    /// identical, so the caller skips a redundant re-emission (#422). Called
+    /// under the host's republish lock, so same-host calls serialize.
     ///
     /// The comparison is **order-independent**: `merge_cached_diagnostics` walks
     /// `HashMap`-keyed sources/servers, so the same logical set can serialize in a

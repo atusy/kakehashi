@@ -778,6 +778,12 @@ fn unchanged_diagnostic_report(result_id: String) -> DocumentDiagnosticReportRes
 }
 
 /// Create an empty diagnostic report (full report with no items).
+///
+/// Deliberately carries no `resultId`: these are the early-return paths
+/// (missing document, undetectable language, no participating layer) that
+/// answer before any merge exists. A tiny Full-empty response costs nothing to
+/// re-ship, and a client `previousResultId` can never match an absent id, so
+/// the unchanged-report machinery simply doesn't engage here.
 fn empty_diagnostic_report() -> DocumentDiagnosticReportResult {
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
