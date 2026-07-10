@@ -244,7 +244,7 @@ a file operation (create/rename/delete) targeting a virtual URI.
 |--------|----------|
 | Input | Range + context (in-region diagnostics, translated) |
 | Output | (CodeAction \| Command)[] — bare Commands are bridged too, their names encoded for executeCommand routing |
-| Cross-file | Real-file edits and file operations are PRESERVED; rejected (action disabled) are: edits touching a foreign injection region, virtual-URI file operations, and host-document edits escaping the source region |
+| Cross-file | Real-file edits and file operations are PRESERVED; rejected are: edits touching a foreign injection region, virtual-URI file operations, and host-document edits escaping the source region — surfaced as a disabled action for `disabledSupport` clients, dropped otherwise |
 | Position mapping | All ranges in surfaced actions (edits via the shared WorkspaceEdit transform) |
 
 #### textDocument/formatting / rangeFormatting / onTypeFormatting
@@ -289,7 +289,7 @@ concatenated-formatting-pipeline.
                     │  ┌─────────────────────┐    │
                     │  │ Filter by URI       │    │
                     │  │ Translate ranges    │────│───▶ publishDiagnostics
-                    │  │ Merge & dedupe      │    │     to editor
+                    │  │ Merge (concatenate) │    │     to editor
                     │  └─────────────────────┘    │
                     └─────────────────────────────┘
 ```
@@ -298,7 +298,8 @@ concatenated-formatting-pipeline.
 - Language servers push diagnostics asynchronously
 - kakehashi filters to virtual document URI only
 - Translate all diagnostic ranges to host coordinates
-- Merge and deduplicate diagnostics from multiple servers
+- Concatenate diagnostics from multiple servers (multiplicity preserved — no
+  deduplication)
 - Forward combined diagnostics to the editor with host document URI
 
 ### Position Mapping Summary
@@ -318,14 +319,14 @@ concatenated-formatting-pipeline.
 
 When multiple servers are configured for a language:
 
-| Method | Merging Strategy |
+| Method | Merging Strategy (as implemented; rows marked *aspirational* never shipped) |
 |--------|------------------|
-| Semantic Tokens | Later server wins for overlapping ranges |
-| Go-to-Definition | Return first non-empty result (query in order) |
-| Find References | Concatenate all results, dedupe by location |
-| Completion | Merge completion lists from all servers |
-| Hover | Concatenate hover content with separator |
-| Diagnostics | Merge all, dedupe by range + message |
+| Semantic Tokens | *Aspirational* — bridged semantic tokens are unimplemented |
+| Go-to-Definition | `preferred`: first non-empty result (query in `priorities` order) |
+| Find References | `preferred` by default (first non-empty); *concatenate + dedupe is aspirational* |
+| Completion | `preferred` by default (first non-empty); *list merging is aspirational* |
+| Hover | `preferred` by default (first non-empty); *content concatenation is aspirational* |
+| Diagnostics | `concatenated` by default — multiplicity preserved, no dedup |
 | Code Actions | `concatenated` by default: every server's actions in one menu, titles suffixed with "— {server}", no dedup of same-named actions (deliberate), at most one `isPreferred` kept |
 | Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (which is also the membership allowlist — servers not listed do not run) — full formatting only. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
 

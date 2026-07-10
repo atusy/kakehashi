@@ -97,11 +97,11 @@ embedded blocks. Works for any grammar, no setup required.
 
 ## Bridged features
 
-All features below require a language server configured for the embedded
-language. Where the request must be inside an embedded code block, placing
-the cursor outside one yields no result from the injection bridges — though
-with `bridge._self` configured, the host language's own servers can still
-answer on the surrounding document.
+The features below are served by a language server configured for the
+embedded language — or, on the surrounding document itself, by a
+`bridge._self` host server. Placing the cursor outside an embedded code
+block yields no result from the injection bridges; with `bridge._self`
+configured, the host language's own servers still answer there.
 
 ### Hover
 
@@ -179,8 +179,10 @@ Collects clickable links from all embedded blocks.
 [`textDocument/rename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rename)
 and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareRename)
 
-Renames a symbol within its embedded block. Because each block is a standalone
-snippet, renames are confined to that block. Default combine strategy: `preferred`.
+Renames a symbol within its embedded block. Edits the server produces for
+OTHER injection regions are filtered out; edits to real files (e.g. a
+cross-file rename from a project-aware server) pass through. Default combine
+strategy: `preferred`.
 
 ### Formatting
 
@@ -205,8 +207,9 @@ The same rule covers range and on-type formatting.
 
 [`textDocument/rangeFormatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rangeFormatting)
 
-Formats the embedded content overlapping the selected range. Behaves like
-formatting, scoped to the selection.
+Formats the embedded content overlapping the selected range. Scoped to the
+selection, and always combined with `preferred` — the sequential
+`concatenated` pipeline applies to full formatting only.
 
 ### Inlay hints
 
@@ -235,6 +238,28 @@ The default combine strategy here is **`concatenated`** (shared with code
 actions) — when multiple servers are configured for a block, all of their
 diagnostics are shown. The strategy is resolved per language, so different
 embedded languages can behave differently.
+
+### Code actions
+
+[`textDocument/codeAction`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_codeAction),
+[`codeAction/resolve`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#codeAction_resolve),
+[`workspace/executeCommand`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_executeCommand),
+and [`workspace/applyEdit`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_applyEdit) (relay)
+
+Quick fixes and refactors from every server bridging the block — a range
+spanning several blocks merges each region's actions into one menu. Titles
+are suffixed with "— {server}" so same-named actions stay distinguishable.
+Lazy actions resolve back to their origin server (`codeAction/resolve`);
+command-carrying actions execute through the bridged
+`workspace/executeCommand`; a downstream server's own `workspace/applyEdit`
+requests are translated to the host document and relayed to the editor.
+Edits that cannot be represented in the host document (touching another
+injection region, virtual-document file operations, or escaping the block)
+are rejected — shown as disabled actions where the client supports it.
+Default combine strategy: `concatenated`, across servers and across the
+virt/host layers. Advertised only to clients with
+`codeActionLiteralSupport`; see the README's bridged-requests list for the
+palette/registered-list caveats.
 
 ### Document color (experimental)
 

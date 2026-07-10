@@ -27,8 +27,9 @@
 //! unroutable command. The `command` is the final segment and taken as the
 //! `splitn(3)` remainder, so even an (LSP-legal but unheard-of) separator inside
 //! a command id round-trips faithfully. Decoding is total: any name that isn't a
-//! well-formed bridge command yields `None`, and the handler fails that command
-//! soft rather than panicking.
+//! well-formed bridge command yields `None` — the handler then tries the raw
+//! palette-command registry, and only a command matching neither route fails
+//! soft (never a panic).
 //!
 //! NOTE: this encoding covers commands surfaced through a bridged action.
 //! Commands the client fires WITHOUT an action context (from a palette) route

@@ -58,12 +58,14 @@ Phased roadmap:
    both layers fan out concurrently, and `combine_layer_diagnostics`
    applies the resolved strategy — `concatenated` (the default) appends
    items in `priorities` order, `preferred` returns the first non-empty
-   layer. The host layer is a `textDocument/diagnostic` pull with the real
-   URI — and host-server `publishDiagnostics` pushes are also accepted and
-   republished (`DiagnosticPublisher::publish_push` classifies non-virtual
-   URIs as `_self` host-layer pushes) — combined within the layer per
-   `bridge._self.aggregation` via `dispatch_host_concatenated` /
-   `dispatch_host_preferred`. Diagnostics are joined rather than raced:
+   layer. The host layer's PULL is a `textDocument/diagnostic` with the real
+   URI, combined within the layer per `bridge._self.aggregation` via
+   `dispatch_host_concatenated` / `dispatch_host_preferred`. Host-server
+   `publishDiagnostics` PUSHES are also accepted and republished
+   (`DiagnosticPublisher::publish_push` classifies non-virtual URIs as
+   `_self` host-layer pushes), but pushes bypass the dispatchers: the cache
+   always concatenates them across servers — preferred-style push election
+   is deferred. Diagnostics are joined rather than raced:
    they are not latency-interactive and `concatenated` needs every layer
    anyway, so one code path with a pure combine function replaces the
    `race_layers_preferred` machinery here.
@@ -252,8 +254,9 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 - **Per-virt-language ordering relative to host**: `priorities` ranks the
   three layer kinds, not individual injection languages ("python virt above
   host, sql virt below host" is not expressible). For position-based requests
-  the virt layer is effectively single-language, and document-wide methods
-  default to `concatenated`, so the practical need is unproven. If it
+  the virt layer is effectively single-language, and the document-wide
+  methods that default to `concatenated` (formatting, diagnostics, code
+  actions) already combine every layer, so the practical need is unproven. If it
   materializes, a host-relative weight on `bridge.<inj>` is the extension
   point — not entries in `priorities`.
 - **Semantic tokens**: the progressive-refinement strategy

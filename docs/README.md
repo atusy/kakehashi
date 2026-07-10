@@ -31,7 +31,7 @@ Current bridge-backed requests include:
 - Moniker / Inlay Hint
 - Code Lens (incl. `codeLens/resolve` routed back to the origin server; resolution fails soft when the region was edited since the lens was produced)
 - Code Action (incl. `codeAction/resolve` routed back to the origin server, host-layer actions via `bridge._self`, and a merged menu across every injection region a multi-fence range overlaps; advertised only to clients with `codeActionLiteralSupport`)
-- `workspace/executeCommand` (commands surfaced through bridged actions route back to their origin server by name; palette-fired commands route via dynamically registered names when the client supports dynamic registration)
+- `workspace/executeCommand` (commands surfaced through bridged actions route back to their origin server by name; palette-fired commands route via dynamically registered names when the client supports dynamic registration. Known limitation: action-embedded command names are per-document encoded and never registered, so clients that only dispatch command ids from registered lists — VS Code's vscode-languageclient — show such actions without running their command)
 - `workspace/applyEdit` from downstream servers (virtual-document edits are translated to the host document and relayed to the editor; untranslatable edits answer `applied: false`)
 - Pull Diagnostics
 - On Type Formatting (config-driven; see `onTypeFormattingTriggers`)
