@@ -182,7 +182,7 @@ These methods return edits that must be carefully validated.
 │    textEdit: { range: ..., newText: "HashMap" },  ──▶ TRANSLATE │
 │    additionalTextEdits: [                                       │
 │      { range: {0,0}-{0,0}, newText: "use std::...\n" }          │
-│    ]  ──────────────────────────────────────────────▶ VALIDATE  │
+│    ]  ─────────────────────────────────────────────▶ TRANSLATE  │
 │  }                                                              │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -245,7 +245,7 @@ a file operation (create/rename/delete) targeting a virtual URI.
 | Input | Range + context (in-region diagnostics, translated) |
 | Output | (CodeAction \| Command)[] — bare Commands are bridged too, their names encoded for executeCommand routing |
 | Cross-file | Real-file edits and file operations are PRESERVED; rejected are: edits touching a foreign injection region, virtual-URI file operations, and host-document edits escaping the source region — surfaced as a disabled action for `disabledSupport` clients, dropped otherwise |
-| Position mapping | All ranges in surfaced actions (edits via the shared WorkspaceEdit transform) |
+| Position mapping | Action edit ranges (shared WorkspaceEdit transform: own virtual URI translated, real URIs pass unchanged, foreign virtual entries filtered/rejected) and diagnostics' primary ranges — diagnostic `relatedInformation` locations are NOT translated (known gap) |
 
 #### textDocument/formatting / rangeFormatting / onTypeFormatting
 
@@ -325,7 +325,7 @@ to them).
 | Hover | range (if present) |
 | CompletionItem | textEdit.range, additionalTextEdits[].range |
 | TextEdit | range |
-| WorkspaceEdit | Same-region virtual entries translated; real-file ranges untouched; foreign virtual entries filtered (or the action rejected) |
+| WorkspaceEdit | The request's own virtual-URI entries (re-keyed + translated); real-URI entries pass unchanged; foreign virtual entries filtered or reject the edit |
 | Diagnostic | range, relatedInformation[].location |
 | CodeAction | Contained edits, same conditional rule |
 

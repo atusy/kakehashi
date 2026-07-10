@@ -574,6 +574,8 @@ dynamically and depend only on the client's
 
 Bridged features are also limited to **embedded code blocks** in one respect:
 navigation and edits do not cross between blocks (results addressed to
-another block's virtual URI are filtered out; real-file and host-URI results
-pass through). The surrounding host document can be bridged to the host
-language's own servers via `bridge._self` (host-document-bridge).
+another block's virtual URI are filtered out; real-file and — for
+navigation/references/rename — host-URI results pass through, while code
+actions and applyEdit region-bound host-URI edits). The surrounding host
+document can be bridged to the host language's own servers via
+`bridge._self` (host-document-bridge).
