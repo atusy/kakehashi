@@ -108,6 +108,10 @@ fn transform_document_highlight_response_to_host(
 
     // Parse into typed Vec<DocumentHighlight>
     let mut highlights: Vec<DocumentHighlight> = serde_json::from_value(result).map_err(|err| {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "malformed textDocument/documentHighlight result from downstream server: {err}"
+        );
         io::Error::other(format!(
             "malformed textDocument/documentHighlight result from downstream server: {err}"
         ))
