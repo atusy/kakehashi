@@ -2,6 +2,7 @@
 
 # Variables
 CARGO = cargo
+PYTHON = python3
 TARGET_DIR = target
 RELEASE_DIR = $(TARGET_DIR)/release
 BINARY_NAME = kakehashi
@@ -62,6 +63,7 @@ check:
 	$(CARGO) check
 	$(CARGO) clippy -- -D warnings
 	$(CARGO) fmt --check
+	$(PYTHON) -m unittest benches/profile/test_drive.py
 
 # Format code
 .PHONY: fmt

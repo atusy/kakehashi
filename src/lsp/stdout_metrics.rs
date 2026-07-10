@@ -15,7 +15,7 @@ use crate::error::LockResultExt;
 
 const HEADER_LIMIT: usize = 8 * 1024;
 const BODY_PREFIX_LIMIT: usize = 512;
-const BODY_TAIL_LIMIT: usize = 256;
+const BODY_TAIL_LIMIT: usize = 1024;
 
 #[derive(Clone, Debug)]
 struct ReadyEvent {
@@ -35,6 +35,16 @@ struct FrameMetric {
     write_start_us: u64,
     last_byte_us: u64,
     flush_complete_us: Option<u64>,
+    id_unattributed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PartialFrameMetric {
+    phase: &'static str,
+    expected_frame_bytes: Option<usize>,
+    accepted_frame_bytes: usize,
+    write_start_us: u64,
+    last_byte_us: u64,
 }
 
 #[derive(Default)]
@@ -42,6 +52,7 @@ struct MetricsState {
     next_sequence: u64,
     response_ready: HashMap<Id, VecDeque<ReadyEvent>>,
     frames: Vec<FrameMetric>,
+    partial_frames: Vec<PartialFrameMetric>,
 }
 
 #[doc(hidden)]
@@ -85,6 +96,15 @@ impl StdoutMetrics {
             .clone()
     }
 
+    #[cfg(test)]
+    fn partial_frames(&self) -> Vec<PartialFrameMetric> {
+        self.state
+            .lock()
+            .expect("stdout metrics lock poisoned")
+            .partial_frames
+            .clone()
+    }
+
     fn finish_frame(&self, mut frame: FrameMetric, id: Option<Id>) {
         let mut state = self
             .state
@@ -109,6 +129,14 @@ impl StdoutMetrics {
         at.saturating_duration_since(self.origin).as_micros() as u64
     }
 
+    fn record_partial_frame(&self, frame: PartialFrameMetric) {
+        self.state
+            .lock()
+            .recover_poison("StdoutMetrics::record_partial_frame")
+            .partial_frames
+            .push(frame);
+    }
+
     pub fn write_jsonl(&self, mut writer: impl io::Write) -> io::Result<()> {
         let state = self
             .state
@@ -118,6 +146,13 @@ impl StdoutMetrics {
             serde_json::to_writer(
                 &mut writer,
                 &serde_json::json!({"event": "stdout_frame", "frame": frame}),
+            )?;
+            writer.write_all(b"\n")?;
+        }
+        for frame in &state.partial_frames {
+            serde_json::to_writer(
+                &mut writer,
+                &serde_json::json!({"event": "stdout_partial_frame", "frame": frame}),
             )?;
             writer.write_all(b"\n")?;
         }
@@ -192,6 +227,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MeasuredStdout<W> {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if !bytes.is_empty() {
+            self.observer.write_attempt(Instant::now());
+        }
         let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
         if let Poll::Ready(Ok(accepted)) = result
             && accepted > 0
@@ -222,14 +260,16 @@ enum DecodeState {
     Header {
         bytes: Vec<u8>,
         write_start: Option<Instant>,
+        last_byte: Option<Instant>,
     },
     Body {
         header_bytes: usize,
         content_length: usize,
         seen: usize,
         prefix: Vec<u8>,
-        tail: VecDeque<u8>,
+        tail: Vec<u8>,
         write_start: Instant,
+        last_byte: Instant,
     },
     Disabled,
 }
@@ -241,8 +281,15 @@ impl FrameObserver {
             decode: DecodeState::Header {
                 bytes: Vec::new(),
                 write_start: None,
+                last_byte: None,
             },
             awaiting_flush: Vec::new(),
+        }
+    }
+
+    fn write_attempt(&mut self, at: Instant) {
+        if let DecodeState::Header { write_start, .. } = &mut self.decode {
+            write_start.get_or_insert(at);
         }
     }
 
@@ -252,8 +299,10 @@ impl FrameObserver {
                 DecodeState::Header {
                     bytes: header,
                     write_start,
+                    last_byte,
                 } => {
                     write_start.get_or_insert(at);
+                    *last_byte = Some(at);
                     let byte = bytes[0];
                     bytes = &bytes[1..];
                     header.push(byte);
@@ -266,13 +315,22 @@ impl FrameObserver {
                             self.decode = DecodeState::Disabled;
                             return;
                         };
+                        let Some(write_start) = *write_start else {
+                            self.decode = DecodeState::Disabled;
+                            return;
+                        };
+                        if content_length == 0 {
+                            self.decode = DecodeState::Disabled;
+                            return;
+                        }
                         self.decode = DecodeState::Body {
                             header_bytes: header.len(),
                             content_length,
                             seen: 0,
                             prefix: Vec::with_capacity(content_length.min(BODY_PREFIX_LIMIT)),
-                            tail: VecDeque::with_capacity(content_length.min(BODY_TAIL_LIMIT)),
-                            write_start: write_start.expect("header start is set before bytes"),
+                            tail: Vec::with_capacity(content_length.min(BODY_TAIL_LIMIT)),
+                            write_start,
+                            last_byte: at,
                         };
                     }
                 }
@@ -283,6 +341,7 @@ impl FrameObserver {
                     prefix,
                     tail,
                     write_start,
+                    last_byte,
                 } => {
                     let take = (*content_length - *seen).min(bytes.len());
                     let accepted = &bytes[..take];
@@ -291,17 +350,13 @@ impl FrameObserver {
                         let prefix_take = (BODY_PREFIX_LIMIT - prefix.len()).min(accepted.len());
                         prefix.extend_from_slice(&accepted[..prefix_take]);
                     }
-                    for byte in accepted {
-                        if tail.len() == BODY_TAIL_LIMIT {
-                            tail.pop_front();
-                        }
-                        tail.push_back(*byte);
-                    }
+                    retain_tail(tail, accepted);
                     *seen += take;
+                    *last_byte = at;
                     if *seen == *content_length {
-                        let tail: Vec<u8> = tail.iter().copied().collect();
-                        let id = response_id(&tail);
+                        let id = response_id(tail);
                         let method = method_name(prefix);
+                        let id_unattributed = method.is_none() && id.is_none();
                         self.awaiting_flush.push((
                             FrameMetric {
                                 ready_sequence: None,
@@ -313,12 +368,14 @@ impl FrameObserver {
                                 write_start_us: self.metrics.timestamp_us(*write_start),
                                 last_byte_us: self.metrics.timestamp_us(at),
                                 flush_complete_us: None,
+                                id_unattributed,
                             },
                             id,
                         ));
                         self.decode = DecodeState::Header {
                             bytes: Vec::new(),
                             write_start: None,
+                            last_byte: None,
                         };
                     }
                 }
@@ -341,7 +398,55 @@ impl Drop for FrameObserver {
         for (frame, id) in self.awaiting_flush.drain(..) {
             self.metrics.finish_frame(frame, id);
         }
+        let partial = match &self.decode {
+            DecodeState::Header {
+                bytes,
+                write_start: Some(write_start),
+                last_byte,
+            } => Some(PartialFrameMetric {
+                phase: "header",
+                expected_frame_bytes: None,
+                accepted_frame_bytes: bytes.len(),
+                write_start_us: self.metrics.timestamp_us(*write_start),
+                last_byte_us: self.metrics.timestamp_us(last_byte.unwrap_or(*write_start)),
+            }),
+            DecodeState::Body {
+                header_bytes,
+                content_length,
+                seen,
+                write_start,
+                last_byte,
+                ..
+            } => Some(PartialFrameMetric {
+                phase: "body",
+                expected_frame_bytes: Some(*header_bytes + *content_length),
+                accepted_frame_bytes: *header_bytes + *seen,
+                write_start_us: self.metrics.timestamp_us(*write_start),
+                last_byte_us: self.metrics.timestamp_us(*last_byte),
+            }),
+            _ => None,
+        };
+        if let Some(partial) = partial {
+            self.metrics.record_partial_frame(partial);
+        }
     }
+}
+
+fn retain_tail(tail: &mut Vec<u8>, accepted: &[u8]) {
+    if accepted.len() >= BODY_TAIL_LIMIT {
+        tail.clear();
+        tail.extend_from_slice(&accepted[accepted.len() - BODY_TAIL_LIMIT..]);
+        return;
+    }
+    let overflow = tail
+        .len()
+        .saturating_add(accepted.len())
+        .saturating_sub(BODY_TAIL_LIMIT);
+    if overflow > 0 {
+        tail.copy_within(overflow.., 0);
+        tail.truncate(tail.len() - overflow);
+    }
+    tail.extend_from_slice(accepted);
 }
 
 fn content_length(header: &[u8]) -> Option<usize> {
@@ -458,6 +563,7 @@ mod tests {
                 write_start_us: 0,
                 last_byte_us: 0,
                 flush_complete_us: None,
+                id_unattributed: false,
             },
             Some(response.id().clone()),
         );
@@ -509,6 +615,7 @@ mod tests {
                 write_start_us: 20,
                 last_byte_us: 30,
                 flush_complete_us: Some(40),
+                id_unattributed: false,
             }]
         );
     }
@@ -593,5 +700,89 @@ mod tests {
         let frames = metrics.frames();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].flush_complete_us, None);
+    }
+
+    #[test]
+    fn long_string_response_id_is_attributed_without_scanning_the_full_body() {
+        let origin = Instant::now();
+        let metrics = Arc::new(StdoutMetrics::new(origin));
+        let id = "x".repeat(300);
+        metrics.record_response_ready(
+            Id::String(id.clone()),
+            "textDocument/semanticTokens/full".to_string(),
+            origin,
+        );
+        let body = format!(r#"{{"jsonrpc":"2.0","result":null,"id":"{id}"}}"#);
+        let frame = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+        let mut observer = FrameObserver::new(Arc::clone(&metrics));
+
+        observer.accepted(frame.as_bytes(), origin + Duration::from_micros(10));
+        observer.flushed(origin + Duration::from_micros(20));
+
+        assert_eq!(metrics.frames()[0].id, Some(Id::String(id)));
+        assert!(!metrics.frames()[0].id_unattributed);
+    }
+
+    #[test]
+    fn oversized_string_response_id_is_explicitly_unattributed() {
+        let origin = Instant::now();
+        let metrics = Arc::new(StdoutMetrics::new(origin));
+        let id = "x".repeat(BODY_TAIL_LIMIT + 100);
+        let body = format!(r#"{{"jsonrpc":"2.0","result":null,"id":"{id}"}}"#);
+        let frame = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+        let mut observer = FrameObserver::new(Arc::clone(&metrics));
+
+        observer.accepted(frame.as_bytes(), origin + Duration::from_micros(10));
+        observer.flushed(origin + Duration::from_micros(20));
+
+        assert_eq!(metrics.frames()[0].id, None);
+        assert!(metrics.frames()[0].id_unattributed);
+    }
+
+    #[test]
+    fn partial_body_is_reported_as_a_censored_frame_on_drop() {
+        let origin = Instant::now();
+        let metrics = Arc::new(StdoutMetrics::new(origin));
+        let body = br#"{"jsonrpc":"2.0","result":null,"id":7}"#;
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+
+        {
+            let mut observer = FrameObserver::new(Arc::clone(&metrics));
+            observer.write_attempt(origin + Duration::from_micros(5));
+            observer.accepted(header.as_bytes(), origin + Duration::from_micros(10));
+            observer.accepted(&body[..5], origin + Duration::from_micros(15));
+        }
+
+        assert_eq!(
+            metrics.partial_frames(),
+            vec![PartialFrameMetric {
+                phase: "body",
+                expected_frame_bytes: Some(header.len() + body.len()),
+                accepted_frame_bytes: header.len() + 5,
+                write_start_us: 5,
+                last_byte_us: 15,
+            }]
+        );
+    }
+
+    #[test]
+    fn pending_first_write_attempt_is_reported_as_a_censored_header() {
+        let origin = Instant::now();
+        let metrics = Arc::new(StdoutMetrics::new(origin));
+        {
+            let mut observer = FrameObserver::new(Arc::clone(&metrics));
+            observer.write_attempt(origin + Duration::from_micros(5));
+        }
+
+        assert_eq!(
+            metrics.partial_frames(),
+            vec![PartialFrameMetric {
+                phase: "header",
+                expected_frame_bytes: None,
+                accepted_frame_bytes: 0,
+                write_start_us: 5,
+                last_byte_us: 5,
+            }]
+        );
     }
 }

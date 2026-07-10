@@ -56,6 +56,7 @@ class TransportFrame:
     write_start_us: int
     last_byte_us: int
     flush_complete_us: int | None
+    id_unattributed: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ def parse_stdout_metric_line(line: str) -> TransportFrame | None:
         write_start_us=frame["write_start_us"],
         last_byte_us=frame["last_byte_us"],
         flush_complete_us=frame.get("flush_complete_us"),
+        id_unattributed=frame.get("id_unattributed", False),
     )
 
 
@@ -142,7 +144,7 @@ def classify_semantic_blocking(
             if frame is not semantic
             and frame.frame_bytes >= large_frame_bytes
             and frame.write_start_us < semantic.write_start_us
-            and frame.last_byte_us >= semantic.ready_us
+            and (frame.flush_complete_us or frame.last_byte_us) >= semantic.ready_us
         ]
         if not blockers:
             continue
@@ -152,6 +154,36 @@ def classify_semantic_blocking(
         else:
             already_writing += 1
     return schedulable, already_writing
+
+
+def validate_transport_metrics(
+    frames: list[TransportFrame],
+    expected_counts: dict[str, int],
+    partial_frame_count: int,
+    collector_errors: list[BaseException],
+) -> None:
+    if collector_errors:
+        raise RuntimeError(f"stdout metric collector failed: {collector_errors[0]}")
+    if partial_frame_count:
+        raise RuntimeError(
+            f"stdout metrics contain {partial_frame_count} partial frames"
+        )
+    unattributed = [frame for frame in frames if frame.id_unattributed]
+    if unattributed:
+        raise RuntimeError(
+            f"stdout metrics contain {len(unattributed)} unattributed frames"
+        )
+    censored = [frame for frame in frames if frame.flush_complete_us is None]
+    if censored:
+        raise RuntimeError(f"stdout metrics contain {len(censored)} censored flushes")
+    for method, expected in expected_counts.items():
+        actual = sum(
+            frame.ready_us is not None and frame.method == method for frame in frames
+        )
+        if actual != expected:
+            raise RuntimeError(
+                f"stdout metric count mismatch for {method}: expected {expected}, got {actual}"
+            )
 
 
 def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
@@ -420,6 +452,8 @@ def main() -> None:
     reader_errors = []
     reader_done = False
     transport_frames = []
+    stderr_reader_errors = []
+    partial_frame_count = 0
 
     def send(obj):
         body = json.dumps(obj).encode()
@@ -502,13 +536,27 @@ def main() -> None:
                 response_condition.notify_all()
 
     def collect_stderr():
+        nonlocal partial_frame_count
         for raw_line in srv.stderr:
-            line = raw_line.decode(errors="replace").rstrip("\n")
-            frame = parse_stdout_metric_line(line)
-            if frame is not None:
-                transport_frames.append(frame)
-            else:
-                sys.stderr.write(line + "\n")
+            try:
+                line = raw_line.decode(errors="replace").rstrip("\n")
+                frame = parse_stdout_metric_line(line)
+                if frame is not None:
+                    transport_frames.append(frame)
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    event = None
+                if (
+                    isinstance(event, dict)
+                    and event.get("event") == "stdout_partial_frame"
+                ):
+                    partial_frame_count += 1
+                else:
+                    sys.stderr.write(line + "\n")
+            except BaseException as error:
+                stderr_reader_errors.append(error)
 
     def wait_response(want_id):
         with response_condition:
@@ -735,6 +783,18 @@ def main() -> None:
                         semantic_request,
                     ]
                 )
+                for response in responses[:-1]:
+                    result = response.get("result")
+                    if response_status(response) != "ok" or not isinstance(
+                        result, dict
+                    ):
+                        raise RuntimeError(
+                            f"diagnostics scenario expected a report, got {response}"
+                        )
+                    if result.get("kind") not in ("full", "unchanged"):
+                        raise RuntimeError(
+                            f"diagnostics scenario returned invalid report kind: {result}"
+                        )
                 semantic_responses = [responses[-1]]
             elif args.burst > 1:
                 if args.burst_edits:
@@ -789,6 +849,17 @@ def main() -> None:
             srv.wait()
         stdout_reader.join(timeout=5)
         stderr_reader.join(timeout=5)
+
+    if args.stdout_metrics:
+        expected_transport_counts = {
+            method: len(samples) for method, samples in request_samples.items()
+        }
+        validate_transport_metrics(
+            transport_frames,
+            expected_transport_counts,
+            partial_frame_count,
+            stderr_reader_errors,
+        )
 
     n_bytes = len(text.encode("utf-8"))
     n_lines = len(text.splitlines())

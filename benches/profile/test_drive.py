@@ -18,6 +18,7 @@ from drive import (
     summarize_samples,
     summarize_samples_by_status,
     summarize_transport_frames,
+    validate_transport_metrics,
 )
 
 
@@ -190,6 +191,41 @@ class RequestSummaryTest(unittest.TestCase):
             classify_semantic_blocking([large, semantic_after_start], 64 * 1024),
             (0, 1),
         )
+
+        semantic_during_flush = dataclasses.replace(semantic, ready_us=455)
+        self.assertEqual(
+            classify_semantic_blocking([large, semantic_during_flush], 64 * 1024),
+            (0, 1),
+        )
+
+    def test_transport_validation_rejects_missing_or_censored_metrics(self):
+        frame = TransportFrame(
+            method="textDocument/semanticTokens/full",
+            request_id=2,
+            frame_bytes=100,
+            ready_us=100,
+            write_start_us=110,
+            last_byte_us=120,
+            flush_complete_us=130,
+        )
+        validate_transport_metrics(
+            [frame], {"textDocument/semanticTokens/full": 1}, 0, []
+        )
+        with self.assertRaises(RuntimeError):
+            validate_transport_metrics(
+                [], {"textDocument/semanticTokens/full": 1}, 0, []
+            )
+        with self.assertRaises(RuntimeError):
+            validate_transport_metrics(
+                [dataclasses.replace(frame, flush_complete_us=None)],
+                {"textDocument/semanticTokens/full": 1},
+                0,
+                [],
+            )
+        with self.assertRaises(RuntimeError):
+            validate_transport_metrics(
+                [frame], {"textDocument/semanticTokens/full": 1}, 1, []
+            )
 
 
 if __name__ == "__main__":
