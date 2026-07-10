@@ -433,12 +433,17 @@ impl ResponseRouter {
         drop(state);
 
         for (id, pending) in entries {
+            let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {
+                (-32800, "bridge: request cancelled before downstream write")
+            } else {
+                (-32603, error_message)
+            };
             let error_response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.as_i64(),
                 "error": {
-                    "code": -32603, // InternalError
-                    "message": error_message
+                    "code": code,
+                    "message": message
                 }
             });
             let _ = pending.response_tx.send(error_response);
@@ -482,12 +487,17 @@ impl ResponseRouter {
         publish_failure();
 
         for (id, pending) in entries {
+            let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {
+                (-32800, "bridge: request cancelled before downstream write")
+            } else {
+                (-32603, error_message)
+            };
             let error_response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.as_i64(),
                 "error": {
-                    "code": -32603,
-                    "message": error_message
+                    "code": code,
+                    "message": message
                 }
             });
             let _ = pending.response_tx.send(error_response);
@@ -645,6 +655,11 @@ mod tests {
 
         let rx1 = router.register(RequestId::new(1)).unwrap();
         let rx2 = router.register(RequestId::new(2)).unwrap();
+        let cancelled_upstream = UpstreamId::Number(3);
+        let rx3 = router
+            .register_with_upstream(RequestId::new(3), Some(cancelled_upstream.clone()))
+            .unwrap();
+        router.prepare_cancel_by_upstream(&cancelled_upstream);
 
         router.fail_all("connection lost");
 
@@ -658,6 +673,9 @@ mod tests {
         let response2 = rx2.await.expect("should receive error response");
         assert_eq!(response2["error"]["code"], -32603);
         assert_eq!(response2["id"], 2);
+
+        let response3 = rx3.await.expect("cancelled waiter should receive response");
+        assert_eq!(response3["error"]["code"], -32800);
     }
 
     #[tokio::test]
@@ -780,6 +798,11 @@ mod tests {
         let (mut rx, epoch) = router
             .register_with_upstream_liveness(RequestId::new(1), None)
             .unwrap();
+        let cancelled_upstream = UpstreamId::Number(2);
+        let mut cancelled_rx = router
+            .register_with_upstream(RequestId::new(2), Some(cancelled_upstream.clone()))
+            .unwrap();
+        router.prepare_cancel_by_upstream(&cancelled_upstream);
         let published = AtomicBool::new(false);
         assert!(matches!(
             router.fail_all_if_awaiting_downstream(epoch.unwrap(), "expired", || {
@@ -793,6 +816,8 @@ mod tests {
             rx.try_recv().is_ok(),
             "waiter should be woken after publish"
         );
+        let cancelled = cancelled_rx.try_recv().unwrap();
+        assert_eq!(cancelled["error"]["code"], -32800);
         assert!(
             router.register(RequestId::new(2)).is_none(),
             "a terminal router must reject new requests"
