@@ -225,7 +225,8 @@ impl InjectionCoordinator {
         };
         tokio::spawn(install_task);
 
-        self.eager_spawn_bridge_servers(uri, &host_language, injections);
+        self.eager_spawn_bridge_servers(uri, &host_language, injections)
+            .await;
     }
 
     /// Check injected languages and handle missing parsers: auto-install when enabled,
@@ -320,7 +321,7 @@ impl InjectionCoordinator {
     /// This warms up language servers (spawn + handshake + didOpen) in the background
     /// for injection regions found in the document. Downstream servers receive
     /// document content immediately, enabling faster diagnostic responses.
-    pub(crate) fn eager_spawn_bridge_servers(
+    pub(crate) async fn eager_spawn_bridge_servers(
         &self,
         uri: &Url,
         host_language: &str,
@@ -328,7 +329,8 @@ impl InjectionCoordinator {
     ) {
         let settings = self.settings_manager.load_settings();
         self.bridge
-            .eager_spawn_and_open_documents(&settings, host_language, uri, injections);
+            .eager_spawn_and_open_documents(&settings, host_language, uri, injections)
+            .await;
     }
 
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {

@@ -861,6 +861,19 @@ impl LanguageServerPool {
             .get_all_connections_for_virtual_uri(virtual_uri)
     }
 
+    /// Resolve the exact `(server, root)` connection a document currently
+    /// routes to, including shared-instance capability fallback.
+    pub(super) async fn resolved_connection_key(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: &Url,
+    ) -> ConnectionKey {
+        self.resolve_acquire(server_name, server_config, Some(document_uri))
+            .await
+            .1
+    }
+
     /// Membership check for the save fan-out liveness recheck (avoids the
     /// reverse-index `Vec<ConnectionKey>` clone): is the virtual document at
     /// `virtual_uri` (its URI string) open on `connection_key`?
