@@ -7,8 +7,9 @@
 Under ls-bridge-work-done-progress, the bridge forwards a downstream's
 server-declared progress to the editor: a downstream requests a token with
 `window/workDoneProgress/create`, the bridge mints a unique upstream token,
-forwards the create, and then relays each `$/progress` (begin → report → end)
-against that token until a terminating `End` clears the mapping.
+and — on the token's first renderable `begin` (lazy announcement) — forwards
+the create followed by each `$/progress` (begin → report → end) against that
+token until a terminating `End` clears the mapping.
 
 A downstream can exit *between* `Begin` and `End` — it crashes, is shut down, or
 is respawned while work is in flight. Before #413 was implemented the bridge
@@ -34,10 +35,12 @@ existing mapping purge and admission cleanup.
 
 - The bridge ends only tokens that are **begun but not yet ended** — those whose
   `Begin` was already forwarded to the editor with no matching `End`. A token
-  whose `window/workDoneProgress/create` the editor accepted but whose `Begin`
-  was never forwarded (the downstream died between create and begin) has no
-  visible progress to terminate, so it gets no synthetic `End` — its mapping is
-  simply purged. This keeps every emitted `End` paired with a real `Begin`; a
+  the editor never saw a `Begin` for — never announced at all under lazy
+  announcement (pending/swallowed), or announced but with the create rejected —
+  has no visible progress to terminate, so it gets no synthetic `End` — its
+  mapping is simply purged. (With lazy announcement the create is enqueued
+  immediately before the begin, so the old create-accepted-but-begin-lost
+  window is nearly gone.) This keeps every emitted `End` paired with a real `Begin`; a
   `window/workDoneProgress/create` request the editor rejected likewise never
   receives a terminal.
 - Tracking the begun-not-ended set is cheap: the forwarding loop already relays

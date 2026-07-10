@@ -26,25 +26,48 @@ so client–kakehashi–downstream stays consistent and collision-free:
 
 - **create** (downstream → bridge request): the reader mints a unique upstream
   token `kakehashi/bridge/progress/{N}`, records the mapping keyed by a
-  per-connection id, acks the downstream immediately, and forwards a
-  `CreateWorkDoneProgress` for the editor. The downstream is acked optimistically
-  (not by relaying the editor's real response) to decouple it from editor
-  latency. The bridge advertises `window.workDoneProgress` to downstreams **only
-  when the real editor advertises it** (the capability merge gates it), so a
-  downstream only sends `create` when the editor can accept it — making the
-  optimistic ack sound.
-- **`$/progress`** (downstream → bridge notification): the reader rewrites the
-  token to the mapped upstream token and forwards it; a terminating `End` clears
-  the mapping.
+  per-connection id (phase `Pending`), and acks the downstream immediately.
+  The editor-facing `CreateWorkDoneProgress` is **deferred to the token's
+  first renderable `begin`** (lazy announcement, below). The downstream is
+  acked optimistically (not by relaying the editor's real response) to
+  decouple it from editor latency. The bridge advertises
+  `window.workDoneProgress` to downstreams **only when the real editor
+  advertises it** (the capability merge gates it), so a downstream only sends
+  `create` when the editor can accept it — making the optimistic ack sound.
+- **`$/progress`** (downstream → bridge notification): the first `begin`
+  decides the token's fate (lazy announcement). A `begin` carrying anything
+  renderable — a non-empty title, message, or a percentage — **announces**:
+  the bridge enqueues the editor-facing create immediately followed by the
+  begin on the same FIFO channel, then rewrites and forwards subsequent
+  progress. A fully blank `begin` (`{"kind":"begin","title":""}`) **swallows**
+  the lifecycle: nothing reaches the editor (a later renderable `begin`
+  reusing the token upgrades it to announced). A `report`/`end` before any
+  `begin` is dropped — the editor has no progress UI to update. A terminating
+  `End` always clears the mapping, forwarded or swallowed.
+
+  Rationale: some downstreams (e.g. basedpyright) declare a fresh token per
+  analysis pass — thousands of `create` → `begin("")` → `end` triples per
+  minute of typing. Each forwarded create is a full editor round-trip that
+  queues ahead of real responses on the shared stdout sink, measurably
+  delaying semantic-token replies. Blank begins give the editor nothing to
+  render, so eliding those lifecycles is pure win; renderable progress
+  (e.g. "Loading workspace") still shows immediately, with no timers or
+  reordering risk. The blank-only gate was verified against a production
+  capture: all 8,134 storm begins in a one-minute basedpyright session were
+  fully blank (empty title, no message, no percentage), while every
+  legitimate begin carried a title.
 - **cancel** (editor → bridge notification): `RequestIdCapture` intercepts
   `window/workDoneProgress/cancel` (as it already does for `$/cancelRequest`),
   resolves the upstream token to the owning downstream and its original token,
   and forwards the cancel there.
 
 Ordering (the editor must see `create` before that token's `$/progress`) is
-preserved because both flow through the single FIFO upstream channel and the
-forwarding loop awaits `create_work_done_progress` inline before draining the
-next item — mirroring the existing `workspace/diagnostic/refresh` forwarding.
+preserved because the announce path enqueues create-then-begin back-to-back on
+the single FIFO upstream channel and the forwarding loop awaits
+`create_work_done_progress` inline before draining the next item — mirroring
+the existing `workspace/diagnostic/refresh` forwarding. A re-`create` of a
+still-live downstream token only tells the forwarding loop to forget the
+evicted upstream token when that token was actually announced.
 
 Mappings are purged when a connection's reader task exits (crash, shutdown,
 respawn), so dead entries never leak and a later cancel cannot route to a dead
@@ -67,9 +90,16 @@ writer.
 - Concurrent downstreams report progress without collisions.
 - Server-declared progress reaches the editor at all (previously dropped).
 - Cancel is routed to the correct downstream with its own token.
+- Per-request blank-progress storms never reach the editor: no create
+  round-trips, no `$/progress` floods competing with responses for the
+  outbound sink.
 
 ### Negative
 
+- Progress whose every `begin` is fully blank is invisible to the editor by
+  design. The editor also cannot cancel a never-announced operation (it never
+  learns the token) — acceptable, since it has nothing to render a cancel
+  affordance on.
 - One registry entry per in-flight server-declared progress. Entries are cleared
   on a terminating `End` or on connection teardown. A misbehaving downstream that
   `create`s tokens (or gets cancelled) but never sends `End`, on a long-lived

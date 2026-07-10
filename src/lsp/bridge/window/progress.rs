@@ -24,10 +24,11 @@ use crate::lsp::bridge::progress_registry::{ProgressAdmission, ProgressSignal};
 /// and forwarding it verbatim risks duplicates under request fan-out.
 ///
 /// Announcement is lazy: the editor-facing `window/workDoneProgress/create` is
-/// enqueued here, immediately before the first titled `begin` (same FIFO
-/// channel, so create-before-progress ordering holds), and untitled progress
-/// lifecycles are swallowed entirely — see [`ProgressRegistry`] module docs
-/// for why (per-request downstream progress storms).
+/// enqueued here, immediately before the first renderable `begin` (same FIFO
+/// channel, so create-before-progress ordering holds), while blank progress
+/// lifecycles are swallowed (a later renderable `begin` reusing the token
+/// still upgrades it) — see [`ProgressRegistry`] module docs for why
+/// (per-request downstream progress storms).
 ///
 /// A terminating `WorkDoneProgress::End` clears the mapping after forwarding.
 ///
@@ -68,10 +69,22 @@ pub(in crate::lsp::bridge) fn forward(
 
     let signal = match &params.value {
         ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(begin)) => {
-            if begin.title.is_empty() {
-                ProgressSignal::UntitledBegin
+            // A begin is renderable when ANY of title/message/percentage gives
+            // the editor something to show — an empty title alone is legal
+            // (title is a required field, "" a legal value) and clients render
+            // message/percentage without one. Only a fully blank begin (the
+            // per-analysis-pass storm shape, `{"kind":"begin","title":""}`)
+            // is swallowed.
+            let renderable = !begin.title.is_empty()
+                || begin
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| !message.is_empty())
+                || begin.percentage.is_some();
+            if renderable {
+                ProgressSignal::RenderableBegin
             } else {
-                ProgressSignal::TitledBegin
+                ProgressSignal::BlankBegin
             }
         }
         _ => ProgressSignal::Other,
@@ -96,7 +109,7 @@ pub(in crate::lsp::bridge) fn forward(
 
     match admission {
         ProgressAdmission::Announce(upstream_token) => {
-            // First titled begin: ask the editor to create the token, then
+            // First renderable begin: ask the editor to create the token, then
             // forward the begin. Same FIFO channel, and the forwarding loop
             // awaits the create inline, so ordering holds.
             let _ = deps
@@ -120,7 +133,7 @@ pub(in crate::lsp::bridge) fn forward(
             }
         }
         ProgressAdmission::Drop => {
-            // Swallowed lifecycle (untitled) or report/end without a begin:
+            // Swallowed lifecycle (blank begin) or report/end without a begin:
             // nothing reaches the editor. An End still clears the mapping.
             if is_end {
                 deps.progress_registry

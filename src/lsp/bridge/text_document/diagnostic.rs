@@ -124,7 +124,7 @@ struct DiagnosticRequestParams {
 
 /// Build a JSON-RPC diagnostic request for a downstream language server.
 ///
-/// Like DocumentSymbolParams, diagnostic params operate on the entire
+/// Like `textDocument/documentSymbol`, this request operates on the entire
 /// document; an optional `previous_result_id` enables incremental updates.
 fn build_diagnostic_request(
     virtual_uri: &VirtualDocumentUri,

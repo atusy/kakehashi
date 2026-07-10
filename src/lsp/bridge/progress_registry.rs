@@ -36,9 +36,10 @@
 //! round-trip that queues ahead of real responses on the shared stdout sink.
 //! Instead the registry tracks a per-token phase and [`ProgressRegistry::admit`]
 //! decides, on the first `$/progress`, whether the token is worth announcing:
-//! a `begin` with a non-empty title announces (create + begin forwarded, in
-//! order, on the same FIFO channel); a `begin` with an empty title has nothing
-//! the editor could render, so the whole lifecycle is swallowed.
+//! a `begin` with anything renderable (title, message, or percentage)
+//! announces — create + begin forwarded, in order, on the same FIFO channel —
+//! while a fully blank `begin` swallows the lifecycle's progress (a later
+//! renderable `begin` reusing the token still upgrades it to announced).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -78,10 +79,12 @@ struct CancelTarget {
 enum Phase {
     /// Registered via `create`, no `$/progress` seen yet; nothing sent upstream.
     Pending,
-    /// A titled `begin` arrived; the editor has been asked to create the token
-    /// and subsequent progress is forwarded.
+    /// A renderable `begin` arrived; the editor has been asked to create the
+    /// token and subsequent progress is forwarded.
     Announced,
-    /// An untitled `begin` arrived; the whole lifecycle is dropped.
+    /// A blank `begin` arrived; the lifecycle's progress is dropped (unless a
+    /// later renderable `begin` reuses the token and upgrades it). Cleared by
+    /// `End`, a re-`create`, or connection purge.
     Swallowed,
 }
 
@@ -93,19 +96,21 @@ struct TokenEntry {
 /// What the first `$/progress` for a token reveals about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProgressSignal {
-    /// `begin` with a non-empty title — renderable, worth announcing.
-    TitledBegin,
-    /// `begin` with an empty title — nothing the editor could render.
-    UntitledBegin,
-    /// `report`/`end` (or anything else).
+    /// `begin` carrying something the editor can render (a non-empty
+    /// title, message, or a percentage) — worth announcing.
+    RenderableBegin,
+    /// `begin` with nothing renderable at all — the per-request storm shape.
+    BlankBegin,
+    /// `report`/`end` (or anything else). `admit` never distinguishes an
+    /// `end` — the caller handles End's mapping cleanup via `complete`.
     Other,
 }
 
 /// Routing decision for one `$/progress` notification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProgressAdmission {
-    /// First titled `begin`: send `window/workDoneProgress/create` for the
-    /// token, then forward this notification with it.
+    /// First renderable `begin`: send `window/workDoneProgress/create` for
+    /// the token, then forward this notification with it.
     Announce(NumberOrString),
     /// Already announced: forward with the token.
     Forward(NumberOrString),
@@ -166,8 +171,8 @@ impl ProgressRegistry {
     /// cancel back to that downstream.
     ///
     /// The token starts [`Phase::Pending`]: nothing is sent to the editor until
-    /// [`ProgressRegistry::admit`] sees a titled `begin` (lazy announcement, see
-    /// module docs).
+    /// [`ProgressRegistry::admit`] sees a renderable `begin` (lazy announcement,
+    /// see module docs).
     ///
     /// Re-registering the same `(connection, downstream_token)` (a downstream that
     /// re-creates a token it already declared) replaces the prior mapping and
@@ -206,6 +211,10 @@ impl ProgressRegistry {
         if let Some(ref stale_upstream) = stale {
             inner.up_to_down.remove(&stale_upstream.token);
         }
+        // Cancel routing is registered eagerly (before announcement): the
+        // editor can only learn announced tokens, but keeping the entry from
+        // birth means the pending→announced transition needs no second write
+        // and a cancel can never race a half-registered token.
         inner.up_to_down.insert(
             upstream_token.clone(),
             CancelTarget {
@@ -220,12 +229,12 @@ impl ProgressRegistry {
     /// its phase (lazy announcement, see module docs). Returns `None` for
     /// tokens this registry never minted.
     ///
-    /// - `Pending` + titled `begin` → `Announce` (create + forward).
-    /// - `Pending` + untitled `begin` → swallow the whole lifecycle.
+    /// - `Pending` + renderable `begin` → `Announce` (create + forward).
+    /// - `Pending` + blank `begin` → swallow the lifecycle.
     /// - `Pending` + `report`/`end` (no `begin` seen) → drop: without a `begin`
     ///   the editor has no progress UI to update.
-    /// - `Swallowed` + titled `begin` (token reuse without an `end`) → upgrade
-    ///   to `Announce` rather than lose renderable progress.
+    /// - `Swallowed` + renderable `begin` (token reuse without an `end`) →
+    ///   upgrade to `Announce` rather than lose renderable progress.
     pub(crate) fn admit(
         &self,
         connection_id: ProgressConnectionId,
@@ -239,11 +248,11 @@ impl ProgressRegistry {
             .and_then(|tokens| tokens.get_mut(downstream_token))?;
         Some(match (entry.phase, signal) {
             (Phase::Announced, _) => ProgressAdmission::Forward(entry.upstream.clone()),
-            (Phase::Pending | Phase::Swallowed, ProgressSignal::TitledBegin) => {
+            (Phase::Pending | Phase::Swallowed, ProgressSignal::RenderableBegin) => {
                 entry.phase = Phase::Announced;
                 ProgressAdmission::Announce(entry.upstream.clone())
             }
-            (Phase::Pending, ProgressSignal::UntitledBegin) => {
+            (Phase::Pending, ProgressSignal::BlankBegin) => {
                 entry.phase = Phase::Swallowed;
                 ProgressAdmission::Drop
             }
@@ -482,6 +491,74 @@ mod tests {
     }
 
     #[test]
+    fn re_register_of_swallowed_token_reports_unannounced() {
+        let reg = ProgressRegistry::new();
+        let conn = reg.new_connection_id();
+        let downstream = NumberOrString::Number(1);
+
+        let (up_first, _) = reg.register(conn, downstream.clone(), dummy_writer());
+        assert_eq!(
+            reg.admit(conn, &downstream, ProgressSignal::BlankBegin),
+            Some(ProgressAdmission::Drop)
+        );
+
+        let (_, stale) = reg.register(conn, downstream.clone(), dummy_writer());
+        assert_eq!(
+            stale,
+            Some(EvictedToken {
+                token: up_first,
+                announced: false,
+            })
+        );
+    }
+
+    #[test]
+    fn admit_is_connection_scoped() {
+        let reg = ProgressRegistry::new();
+        let conn_a = reg.new_connection_id();
+        let conn_b = reg.new_connection_id();
+        let downstream = NumberOrString::Number(1);
+        let (_up, _) = reg.register(conn_a, downstream.clone(), dummy_writer());
+
+        assert_eq!(
+            reg.admit(conn_b, &downstream, ProgressSignal::RenderableBegin),
+            None,
+            "a foreign connection's token must not admit"
+        );
+    }
+
+    /// Purge is deliberately phase-blind: it returns every phase's upstream
+    /// token. The Forget the purge guard sends for never-announced tokens is
+    /// a no-op in the forwarding loop (they were never admitted), so
+    /// filtering here would buy nothing on the rare crash path.
+    #[test]
+    fn purge_connection_returns_tokens_of_every_phase() {
+        let reg = ProgressRegistry::new();
+        let conn = reg.new_connection_id();
+        let pending = NumberOrString::Number(1);
+        let announced = NumberOrString::Number(2);
+        let swallowed = NumberOrString::Number(3);
+        let (up_pending, _) = reg.register(conn, pending.clone(), dummy_writer());
+        let (up_announced, _) = reg.register(conn, announced.clone(), dummy_writer());
+        let (up_swallowed, _) = reg.register(conn, swallowed.clone(), dummy_writer());
+        reg.admit(conn, &announced, ProgressSignal::RenderableBegin);
+        reg.admit(conn, &swallowed, ProgressSignal::BlankBegin);
+
+        let mut purged = reg.purge_connection(conn);
+        purged.sort_by_key(|t| format!("{t:?}"));
+        let mut expected = vec![
+            up_pending.clone(),
+            up_announced.clone(),
+            up_swallowed.clone(),
+        ];
+        expected.sort_by_key(|t| format!("{t:?}"));
+        assert_eq!(purged, expected);
+        for up in [up_pending, up_announced, up_swallowed] {
+            assert!(reg.resolve_cancel(&up).is_none(), "purged token routable");
+        }
+    }
+
+    #[test]
     fn re_register_reports_whether_evicted_token_was_announced() {
         let reg = ProgressRegistry::new();
         let conn = reg.new_connection_id();
@@ -489,7 +566,7 @@ mod tests {
 
         let (up_first, _) = reg.register(conn, downstream.clone(), dummy_writer());
         assert_eq!(
-            reg.admit(conn, &downstream, ProgressSignal::TitledBegin),
+            reg.admit(conn, &downstream, ProgressSignal::RenderableBegin),
             Some(ProgressAdmission::Announce(up_first.clone()))
         );
 
@@ -511,7 +588,7 @@ mod tests {
         let (upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
 
         assert_eq!(
-            reg.admit(conn, &downstream, ProgressSignal::TitledBegin),
+            reg.admit(conn, &downstream, ProgressSignal::RenderableBegin),
             Some(ProgressAdmission::Announce(upstream.clone()))
         );
         // Subsequent report/end forward without re-announcing.
@@ -529,7 +606,7 @@ mod tests {
         let (_upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
 
         assert_eq!(
-            reg.admit(conn, &downstream, ProgressSignal::UntitledBegin),
+            reg.admit(conn, &downstream, ProgressSignal::BlankBegin),
             Some(ProgressAdmission::Drop)
         );
         // report/end for the swallowed token stay dropped.
@@ -560,11 +637,11 @@ mod tests {
         let (upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
 
         assert_eq!(
-            reg.admit(conn, &downstream, ProgressSignal::UntitledBegin),
+            reg.admit(conn, &downstream, ProgressSignal::BlankBegin),
             Some(ProgressAdmission::Drop)
         );
         assert_eq!(
-            reg.admit(conn, &downstream, ProgressSignal::TitledBegin),
+            reg.admit(conn, &downstream, ProgressSignal::RenderableBegin),
             Some(ProgressAdmission::Announce(upstream))
         );
     }
@@ -577,7 +654,7 @@ mod tests {
             reg.admit(
                 conn,
                 &NumberOrString::Number(9),
-                ProgressSignal::TitledBegin
+                ProgressSignal::RenderableBegin
             ),
             None
         );
