@@ -263,8 +263,9 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
 /// recompute it — fall back to `(region start line, character 0)`, which is
 /// fully fail-closed: with `character == 0` the guard's boundary rule rejects
 /// every edit at or past the region start in per-line-prefixed regions (the
-/// unresolved item is served instead), while unprefixed regions still pass
-/// via the all-zero fast path. A permissive sentinel here would disable the
+/// unresolved item is served instead); unprefixed regions skip the prefix
+/// rules but stay subject to containment and the fence-boundary EOL rule,
+/// both fail-closed under this anchor. A permissive sentinel would disable the
 /// boundary rule entirely and let fence-row edits through — never trade that
 /// for fewer over-strips on envelopes that disappear after one session.
 fn resolve_guard_region_end(envelope: &KakehashiEnvelope, offset: &RegionOffset) -> Position {

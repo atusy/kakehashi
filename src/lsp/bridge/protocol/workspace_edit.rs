@@ -360,7 +360,6 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
-    let columns = offset.columns();
     // In the per-line (blockquote) shape, content ending with a newline puts
     // the region end at column 0 of the NEXT host row — the closing fence,
     // whose recorded offset is 0 (`compute_line_column_offsets` leaves a
@@ -378,12 +377,10 @@ pub(crate) fn workspace_edit_preserves_line_prefixes(
     // closed-fence row, so the guard stays fail-closed there — rejecting a
     // boundary-touching edit in a transient malformed construct is acceptable,
     // corrupting a well-formed one is not.
-    // Fast path: a region with no prefixes anywhere (plain fenced blocks —
-    // the common case) can't have anything stripped; skip the per-edit line
-    // scans entirely.
-    if columns.iter().all(|&column| column == 0) {
-        return true;
-    }
+    // No outer all-zero fast path: the per-edit predicate keeps its own for
+    // the prefix rules, but its fence-boundary EOL rule must run even in
+    // plain fenced regions (a boundary edit there can merge content into the
+    // closing fence — "y```").
     host_uri_text_edits_all(edit, host_uri, |e| {
         text_edit_preserves_line_prefixes(e, offset, region_end)
     })
@@ -1314,5 +1311,32 @@ mod tests {
         // Mid-line deletion ending at the boundary eats the separating
         // newline → "x```". Reject.
         assert!(!check(&edit(p(4, 2), p(5, 0), "")));
+    }
+
+    #[test]
+    fn workspace_edit_boundary_rule_applies_to_plain_fenced_regions() {
+        // Regression: the wrapper used to fast-path all-zero regions before
+        // the per-edit predicate ran, so codeAction/rename/applyEdit edits
+        // could still merge content into the closing fence ("y```"). The
+        // fence-boundary EOL rule must fire through the WorkspaceEdit form.
+        let host_uri = make_host_uri();
+        let offset = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let check = |new_text: &str| {
+            let edit = parse_workspace_edit(json!({
+                "changes": { host_uri.as_str(): [
+                    { "range": {"start": {"line": 5, "character": 0},
+                                "end": {"line": 5, "character": 0}},
+                      "newText": new_text }
+                ] }
+            }));
+            workspace_edit_preserves_line_prefixes(&edit, &host_uri, &offset, region_end)
+        };
+
+        assert!(!check("y"), "non-newline boundary insert must reject");
+        assert!(check("\n"), "insertFinalNewline must pass");
     }
 }
