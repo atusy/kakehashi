@@ -960,7 +960,7 @@ fn build_combined_virtual_content(
             range_index += 1;
         }
         let first_included = included.get(range_index).and_then(|range| {
-            let start = range.start.max(line_start);
+            let start = ceil_char_boundary(text, range.start.max(line_start));
             let end = range.end.min(content_end);
             (start < end).then_some(start)
         });
@@ -1422,6 +1422,16 @@ mod tests {
             vec![2, 2, 0, 0, 0, 2, 0, 0]
         );
         assert!(!resolved[0].contiguous);
+    }
+
+    #[test]
+    fn combined_content_snaps_stale_included_start_to_char_boundary() {
+        let text = "éx\n";
+        let (content, offsets) =
+            build_combined_virtual_content(text, 0..text.len(), &[1..usize::MAX]);
+
+        assert_eq!(content, "x\n");
+        assert_eq!(offsets, vec![1, 0]);
     }
 
     #[test]
