@@ -21,7 +21,10 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 
 ### Injection Isolation Constraint
 
-**Critical insight**: Injection regions are isolated code fragments. They exist within a single host document and have no relationship to other files. This affects how we handle features that can return cross-file results.
+**Critical insight**: Injection regions are isolated code fragments with no
+relationship to OTHER VIRTUAL REGIONS — each is analyzed on its own. Real
+files on disk (library sources, workspace files) remain valid targets. This
+affects how we handle features that can return cross-file results.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -289,8 +292,8 @@ concatenated-formatting-pipeline.
 
 | Response Type | Fields to Map |
 |---------------|---------------|
-| Location | uri (rewrite to host), range |
-| Location[] | Each location |
+| Location | same-region virtual targets: uri rewritten to host + range translated; real-file targets: untouched |
+| Location[] | Each location, same rule |
 | Hover | range (if present) |
 | CompletionItem | textEdit.range, additionalTextEdits[].range |
 | TextEdit | range |
@@ -329,7 +332,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 ### Negative
 
 - **Implementation complexity**: Four different strategies to implement and maintain
-- **Feature limitations**: Some features degraded (no auto-import in completion)
+- **Feature limitations**: Some features degraded (auto-imports may be dropped when unsafe for the region)
 - **Inconsistent latency**: Some features instant (semantic tokens), others have server latency
 - **Refresh mechanism dependency**: Progressive refinement requires editor support for token refresh
 
