@@ -239,6 +239,21 @@ pub(crate) fn strip_bridge_local_versions(edit: &mut WorkspaceEdit) {
     }
 }
 
+/// The exclusive host-document end of an injection region: the position just
+/// past its `virtual_content`, mapped back to host coordinates — the
+/// position-precise (line AND column) upper bound for
+/// [`workspace_edit_within_region`].
+pub(crate) fn region_host_end(virtual_content: &str, offset: &RegionOffset) -> Position {
+    let mut end = crate::text::PositionMapper::new(virtual_content)
+        .byte_to_position(virtual_content.len())
+        .unwrap_or(Position {
+            line: 0,
+            character: 0,
+        });
+    super::translation::translate_virtual_position_to_host(&mut end, offset);
+    end
+}
+
 /// Whether every text edit targeting `host_uri` in a HOST-coordinate
 /// `WorkspaceEdit` is CONTAINED in the injection region — bounded above by
 /// `region_end` and below, PER LINE, by the region's line offset (`offset`).

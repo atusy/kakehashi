@@ -23,7 +23,6 @@ use serde_json::Value;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::text::PositionMapper;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
     CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
@@ -35,11 +34,10 @@ use url::Url;
 use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
-    host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
-    workspace_edit_has_effect, workspace_edit_preserves_line_prefixes,
-    workspace_edit_within_region,
+    host_position_within_region, region_host_end, response_has_jsonrpc_error,
+    strip_bridge_local_versions, transform_workspace_edit_to_host, translate_host_range_to_virtual,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
+    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 
@@ -403,21 +401,6 @@ fn workspace_edit_touches_foreign_region(edit: &WorkspaceEdit, request_virtual_u
             DocumentChangeOperation::Op(_) => false,
         }),
     }
-}
-
-/// The exclusive host-document end of an injection region: the position just
-/// past its `virtual_content`, mapped back to host coordinates. Bounds the
-/// in-region diagnostic filter position-precisely (line AND column), so a
-/// diagnostic after an inline same-line injection is dropped, not leaked.
-fn region_host_end(virtual_content: &str, offset: &RegionOffset) -> Position {
-    let mut end = PositionMapper::new(virtual_content)
-        .byte_to_position(virtual_content.len())
-        .unwrap_or(Position {
-            line: 0,
-            character: 0,
-        });
-    translate_virtual_position_to_host(&mut end, offset);
-    end
 }
 
 impl LanguageServerPool {

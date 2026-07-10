@@ -11,7 +11,6 @@
 use std::io;
 
 use crate::config::settings::BridgeServerConfig;
-use crate::text::PositionMapper;
 use tower_lsp_server::ls_types::{
     NumberOrString, Position, Uri, WorkDoneProgressParams, WorkspaceEdit,
 };
@@ -22,10 +21,9 @@ use tower_lsp_server::ls_types::RenameParams;
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_text_document_position_params, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, translate_virtual_position_to_host,
-    workspace_edit_has_effect, workspace_edit_preserves_line_prefixes,
-    workspace_edit_within_region,
+    build_text_document_position_params, region_host_end, response_has_jsonrpc_error,
+    strip_bridge_local_versions, transform_workspace_edit_to_host, workspace_edit_has_effect,
+    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
 impl LanguageServerPool {
@@ -88,17 +86,6 @@ impl LanguageServerPool {
         )
         .await
     }
-}
-
-fn region_host_end(virtual_content: &str, offset: &RegionOffset) -> Position {
-    let mut end = PositionMapper::new(virtual_content)
-        .byte_to_position(virtual_content.len())
-        .unwrap_or(Position {
-            line: 0,
-            character: 0,
-        });
-    translate_virtual_position_to_host(&mut end, offset);
-    end
 }
 
 /// Build a JSON-RPC rename request for a downstream language server.
