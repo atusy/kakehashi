@@ -95,9 +95,11 @@ impl LanguageServerPool {
 /// `io::Result<Option<Vec<Location>>>`, applying the same URI filter as goto:
 /// keep real-file URIs, translate matches on the request's virtual URI, drop
 /// other virtual URIs (cross-region offsets are unsafe). `Ok(Some(vec))` may
-/// be empty — preserved so callers can tell "no results" from a downstream
-/// error response (`Ok(None)`). A malformed success response is a protocol
-/// violation and returns `Err`, letting callers surface a warning.
+/// be empty — an empty array from the server is preserved as-is, while
+/// `Ok(None)` covers everything the server did not answer with an array: a
+/// JSON-RPC error response, a `null` result, or a missing `result` field. A
+/// malformed success response is a protocol violation and returns `Err`,
+/// letting callers surface a warning.
 fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
