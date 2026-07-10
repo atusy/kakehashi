@@ -122,9 +122,9 @@ type MatchBlock = {
   matches: MatchColumns;
   captures: CaptureColumns;
   metadata?: MetadataTable;
-  // `matchId` values are rebased to 0-based within the block; the client
-  // offsets them by the edit's `start` on splice. All legend indices reference
-  // the result-wide legend.
+  // `matchId` values and metadata table keys are rebased to 0-based within the
+  // block; the client offsets them by the edit's `start` on splice. All legend
+  // indices reference the result-wide legend.
 };
 
 type PackedDelta = {
