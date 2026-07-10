@@ -19,6 +19,7 @@ from drive import (
     summarize_samples_by_status,
     summarize_transport_frames,
     validate_transport_metrics,
+    validate_diagnostic_report,
 )
 
 
@@ -197,6 +198,16 @@ class RequestSummaryTest(unittest.TestCase):
             classify_semantic_blocking([large, semantic_during_flush], 64 * 1024),
             (0, 1),
         )
+        notification = dataclasses.replace(
+            large,
+            method="textDocument/publishDiagnostics",
+            request_id=None,
+            ready_us=None,
+        )
+        self.assertEqual(
+            classify_semantic_blocking([notification, semantic], 64 * 1024),
+            (0, 0),
+        )
 
     def test_transport_validation_rejects_missing_or_censored_metrics(self):
         frame = TransportFrame(
@@ -226,6 +237,17 @@ class RequestSummaryTest(unittest.TestCase):
             validate_transport_metrics(
                 [frame], {"textDocument/semanticTokens/full": 1}, 1, []
             )
+
+    def test_diagnostic_scenario_requires_a_full_items_report(self):
+        validate_diagnostic_report({"result": {"kind": "full", "items": []}})
+        for response in (
+            {"result": {"kind": "unchanged", "resultId": "1"}},
+            {"result": {"kind": "full"}},
+            {"result": None},
+            {"error": {"code": -32603}},
+        ):
+            with self.assertRaises(RuntimeError):
+                validate_diagnostic_report(response)
 
 
 if __name__ == "__main__":

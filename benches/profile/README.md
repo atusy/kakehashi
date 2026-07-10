@@ -53,7 +53,8 @@ large captures or diagnostic output that may dominate a cycle.
 
 `--stdout-metrics` also reports exact framed bytes and p50/p90
 response-ready→last-byte-accepted and response-ready→flush-complete latency.
-For semantic responses delayed behind a frame of at least 64 KiB, it separates
+For semantic responses delayed behind an attributed response frame of at least
+64 KiB, it separates
 cases where semantic work was ready before that frame started (a bounded writer
 scheduler could help) from cases where the frame was already being written (it
 cannot be safely interrupted). Change the classification threshold with
@@ -63,6 +64,8 @@ pipe backpressure or hide out-of-order responses.
 Metrics mode fails rather than reporting a zero opportunity count if attributed
 responses are missing, counts do not match, metadata is unattributed, or any
 frame is partial/censored.
+Notifications and server requests are not labeled schedulable because overtaking
+their stateful effects requires a separate protocol-safety decision.
 
 With full Xcode installed, Instruments' Time Profiler can also be used from the
 CLI:
