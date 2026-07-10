@@ -1,6 +1,5 @@
 ---
 source: tests/e2e_lsp_lua_diagnostic.rs
-assertion_line: 113
 expression: result
 ---
 {

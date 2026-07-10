@@ -667,6 +667,10 @@ impl Kakehashi {
                 // (which re-anchors region push slots against the now-current
                 // injection geometry).
                 injection.process_injections(&uri, true).await;
+                // This gate is the geometry-deferral's retry backstop: keep it
+                // in lockstep with `republish`'s `needs_geometry` predicate
+                // (both mean "non-empty Region slots"), or a deferred publish
+                // loses its retry (diagnostic_publisher.rs).
                 if diagnostics.has_region_slots(&uri) {
                     publisher.republish(&uri).await;
                 }

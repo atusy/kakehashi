@@ -406,9 +406,13 @@ pub(crate) struct DiagnosticAggregator {
     /// Per-host coalescing state for the editor-facing `publishDiagnostics`
     /// wire sends (the quiet window): see [`WireGate`] and
     /// [`Self::wire_gate_admit`]. Mutated under the host's republish lock
-    /// (same-host republishes are serialized) except the trailing task's
-    /// [`Self::wire_gate_take_pending`], which flips only `pending`; the inner
-    /// mutex is held briefly, never across an await. Forgotten on `didClose`.
+    /// (same-host republishes are serialized) with two off-lock exceptions:
+    /// the trailing task's [`Self::wire_gate_take_pending`] (flips only
+    /// `pending`) and `clear_host`'s [`Self::forget_wire_gate`] (idempotent
+    /// removal; a republish for a closed host never touches the gate, so the
+    /// off-lock forget cannot race state back in). The inner mutex is held
+    /// briefly, never across an await. Forgotten on `didClose` and under the
+    /// publish seal.
     wire_gate: Mutex<HashMap<Url, WireGate>>,
     /// Always-on counters for the diagnostic path (#533): push-origin republishes
     /// in, `workspace/diagnostic/refresh` requested vs actually sent (the gap is
@@ -440,11 +444,12 @@ struct RefreshFlight {
 /// every state change inside the window collapses into one send. An isolated
 /// change (window already elapsed, or first publish) passes through
 /// immediately — the gate adds no latency outside bursts.
-#[derive(Default)]
 struct WireGate {
-    /// When the last `publishDiagnostics` was actually written to the wire.
-    /// `None` until the first send (which therefore always passes).
-    last_sent_at: Option<tokio::time::Instant>,
+    /// When the last `publishDiagnostics` was actually written to the wire —
+    /// entries are minted by [`DiagnosticAggregator::wire_gate_commit_send`]
+    /// right after a completed send, so an entry always has one (a host with
+    /// no committed send yet simply has no entry, and its publish passes).
+    last_sent_at: tokio::time::Instant,
     /// A trailing republish task is scheduled; bounds the tasks to one per
     /// host per window.
     pending: bool,
@@ -462,8 +467,9 @@ pub(crate) enum WireAdmit {
     /// Window clear: write to the wire now.
     SendNow,
     /// Inside the quiet window: withhold. `schedule_trailing` is `true` for
-    /// exactly one caller per window (it must spawn the trailing republish
-    /// after `remaining`); later attempts in the same window get `false`.
+    /// at most one caller at a time — the first defer while no trailing task
+    /// is parked (it must spawn the trailing republish after `remaining`);
+    /// attempts while one is parked get `false`.
     Defer {
         schedule_trailing: bool,
         remaining: std::time::Duration,
@@ -740,8 +746,8 @@ impl DiagnosticAggregator {
         true
     }
 
-    /// Forget the last-published set for `host` (host `didClose`), so its entry
-    /// does not linger and a later re-open publishes afresh.
+    /// Forget the last-recorded set for `host` (host `didClose`), so its entry
+    /// does not linger and a later re-open starts change detection afresh.
     pub(crate) fn forget_published(&self, host: &Url) {
         self.last_published
             .lock()
@@ -902,47 +908,65 @@ impl DiagnosticAggregator {
     }
 
     /// Decide whether a wire `publishDiagnostics` for `host` may be written
-    /// now, given the per-host quiet `window` (see [`WireGate`]). `SendNow`
-    /// stamps the send time and clears `dirty`; `Defer` marks `dirty` (a
-    /// changed merge is being withheld) and hands exactly one caller per
-    /// window the duty to schedule the trailing republish. Called under the
-    /// host's republish lock, so same-host decisions are serialized.
+    /// now, given the per-host quiet `window` (see [`WireGate`]). `SendNow` is
+    /// a pure decision — the caller stamps it with
+    /// [`Self::wire_gate_commit_send`] only **after** the send actually
+    /// completed, so a republish aborted at the send await (the synthetic pull
+    /// task is abortable on supersession) leaves no gate state claiming a send
+    /// that never happened, and a withheld `dirty` debt is not consumed by it.
+    /// `Defer` marks `dirty` (a changed merge is being withheld) and hands the
+    /// trailing-republish duty to at most one caller at a time (the first
+    /// defer while no trailing task is parked). Called under the host's
+    /// republish lock, so same-host decisions are serialized — including the
+    /// decide→commit pair.
     pub(crate) fn wire_gate_admit(&self, host: &Url, window: std::time::Duration) -> WireAdmit {
         let now = tokio::time::Instant::now();
         let mut gates = self
             .wire_gate
             .lock()
             .recover_poison("DiagnosticAggregator::wire_gate");
-        // Look up by `&Url` first, cloning the host key only on first insert
-        // (matching `bump_current`'s convention): a fresh host has no prior
-        // send, so its first publish always passes.
-        if !gates.contains_key(host) {
+        // A host with no entry has no prior committed send, so its publish
+        // always passes; the entry is minted by the commit.
+        let Some(gate) = gates.get_mut(host) else {
+            return WireAdmit::SendNow;
+        };
+        let elapsed = now.duration_since(gate.last_sent_at);
+        if elapsed < window {
+            gate.dirty = true;
+            let schedule_trailing = !gate.pending;
+            gate.pending = true;
+            WireAdmit::Defer {
+                schedule_trailing,
+                remaining: window - elapsed,
+            }
+        } else {
+            WireAdmit::SendNow
+        }
+    }
+
+    /// Record that a wire `publishDiagnostics` for `host` was actually sent:
+    /// stamp the send time (opening a fresh quiet window) and clear the
+    /// withheld-send `dirty` marker. Called right after the send await, under
+    /// the same republish-lock hold as the [`Self::wire_gate_admit`] that
+    /// admitted it. Clones the key only on first insert.
+    pub(crate) fn wire_gate_commit_send(&self, host: &Url) {
+        let now = tokio::time::Instant::now();
+        let mut gates = self
+            .wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate");
+        if let Some(gate) = gates.get_mut(host) {
+            gate.last_sent_at = now;
+            gate.dirty = false;
+        } else {
             gates.insert(
                 host.clone(),
                 WireGate {
-                    last_sent_at: Some(now),
-                    ..WireGate::default()
+                    last_sent_at: now,
+                    pending: false,
+                    dirty: false,
                 },
             );
-            return WireAdmit::SendNow;
-        }
-        let gate = gates.get_mut(host).expect("present: checked above");
-        let elapsed = gate.last_sent_at.map(|at| now.duration_since(at));
-        match elapsed {
-            Some(elapsed) if elapsed < window => {
-                gate.dirty = true;
-                let schedule_trailing = !gate.pending;
-                gate.pending = true;
-                WireAdmit::Defer {
-                    schedule_trailing,
-                    remaining: window - elapsed,
-                }
-            }
-            _ => {
-                gate.last_sent_at = Some(now);
-                gate.dirty = false;
-                WireAdmit::SendNow
-            }
         }
     }
 
@@ -957,11 +981,17 @@ impl DiagnosticAggregator {
             .is_some_and(|gate| gate.dirty)
     }
 
-    /// Clear the trailing-task marker for `host`: called by the trailing
-    /// republish task right before it re-runs `republish`, so a defer that
-    /// races the re-run schedules a fresh trailing task instead of being
-    /// silently absorbed by one that already woke.
-    pub(crate) fn wire_gate_take_pending(&self, host: &Url) {
+    /// Clear the trailing-task marker for `host`, returning whether gate state
+    /// still existed. Called by the trailing republish task right before it
+    /// re-runs `republish`, so a defer that races the re-run schedules a fresh
+    /// trailing task instead of being silently absorbed by one that already
+    /// woke. `false` means the entry was forgotten while the task was parked
+    /// (`didClose`, or the seal) — the withheld debt was cancelled, and the
+    /// task must bail rather than republish: a stale task from a previous
+    /// document incarnation would otherwise clobber the reopened incarnation's
+    /// `pending` marker and publish/stamp state the fresh incarnation never
+    /// owed.
+    pub(crate) fn wire_gate_take_pending(&self, host: &Url) -> bool {
         if let Some(gate) = self
             .wire_gate
             .lock()
@@ -969,12 +999,18 @@ impl DiagnosticAggregator {
             .get_mut(host)
         {
             gate.pending = false;
+            true
+        } else {
+            false
         }
     }
 
-    /// Forget the wire-gate state for `host` (`didClose`, next to
-    /// [`Self::forget_coverage`]) so the entry doesn't linger; a re-open's
-    /// first publish passes through immediately (`last_sent_at` reset).
+    /// Forget the wire-gate state for `host` so the entry doesn't linger and a
+    /// parked trailing task bails ([`Self::wire_gate_take_pending`] returns
+    /// `false`). Called on `didClose` (`clear_host`, next to
+    /// [`Self::forget_coverage`] — after the clearing republish, which
+    /// bypasses the gate for closed hosts) and when the publish seal renders
+    /// the gate state moot.
     pub(crate) fn forget_wire_gate(&self, host: &Url) {
         self.wire_gate
             .lock()
@@ -1091,6 +1127,7 @@ mod tests {
             WireAdmit::SendNow,
             "the first send always passes (no prior send to be quiet after)"
         );
+        agg.wire_gate_commit_send(&host());
 
         // Within the window: withheld, and exactly the FIRST defer is handed
         // the trailing-task duty.
@@ -1121,17 +1158,26 @@ mod tests {
             "later in-window attempts must not schedule a second task, got {second:?}"
         );
 
-        // Window elapsed: pass again, clearing the dirty marker.
+        // Window elapsed: pass again; the COMMIT (post-send) clears dirty.
         tokio::time::advance(window).await;
-        agg.wire_gate_take_pending(&host());
+        assert!(
+            agg.wire_gate_take_pending(&host()),
+            "the gate entry still exists while the host is open"
+        );
         assert_eq!(
             agg.wire_gate_admit(&host(), window),
             WireAdmit::SendNow,
             "the trailing attempt after the window sends"
         );
         assert!(
+            agg.wire_gate_is_dirty(&host()),
+            "the admit DECISION alone must not consume the withheld-send debt \
+             (an aborted send would otherwise lose it)"
+        );
+        agg.wire_gate_commit_send(&host());
+        assert!(
             !agg.wire_gate_is_dirty(&host()),
-            "a send clears the dirty marker"
+            "the post-send commit clears the dirty marker"
         );
     }
 
@@ -1143,6 +1189,7 @@ mod tests {
         let agg = DiagnosticAggregator::new();
         let window = std::time::Duration::from_secs(1);
         assert_eq!(agg.wire_gate_admit(&host(), window), WireAdmit::SendNow);
+        agg.wire_gate_commit_send(&host());
         assert!(matches!(
             agg.wire_gate_admit(&host(), window),
             WireAdmit::Defer {
@@ -1151,7 +1198,7 @@ mod tests {
             }
         ));
 
-        agg.wire_gate_take_pending(&host());
+        assert!(agg.wire_gate_take_pending(&host()));
         assert!(matches!(
             agg.wire_gate_admit(&host(), window),
             WireAdmit::Defer {
@@ -1159,6 +1206,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_gate_uncommitted_send_leaves_no_state_behind() {
+        // The admit decision is pure for SendNow: a republish aborted at the
+        // send await (synthetic pull tasks are abortable on supersession)
+        // commits nothing, so the next attempt passes again instead of being
+        // deferred behind a send that never reached the wire.
+        let agg = DiagnosticAggregator::new();
+        let window = std::time::Duration::from_secs(1);
+
+        assert_eq!(agg.wire_gate_admit(&host(), window), WireAdmit::SendNow);
+        // (no commit: the send was aborted)
+        assert_eq!(
+            agg.wire_gate_admit(&host(), window),
+            WireAdmit::SendNow,
+            "an uncommitted send must not open a quiet window"
+        );
+        assert!(
+            !agg.wire_gate_take_pending(&host()),
+            "no entry was minted; a parked trailing task for a forgotten gate bails"
+        );
     }
 
     #[tokio::test]

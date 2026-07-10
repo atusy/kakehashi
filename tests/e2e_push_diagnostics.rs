@@ -528,6 +528,128 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
 }
 
 #[test]
+fn e2e_publish_seal_via_language_wildcard_reaches_configured_languages() {
+    // The `languages._` wildcard's layers are field-merged into every
+    // configured language by Phase 2 base resolution (resolve_base_configs),
+    // so a wildcard seal reaches the markdown host even though this config
+    // also has explicit language entries via built-in defaults. Same shape as
+    // the exact-language seal e2e, minus the follow-up pull.
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("publish_seal_wildcard.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": { "workspace": { "diagnostics": { "refreshSupport": true } } },
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                },
+                "languages": {
+                    "_": {
+                        "layers": {
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "priorities": [] }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    let (refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(15),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("a wildcard-sealed setup must still drive workspace/diagnostic/refresh");
+    let host_publishes: Vec<_> = publishes
+        .iter()
+        .filter(|(_, params)| params["uri"] == json!(MD_URI))
+        .collect();
+    assert!(
+        host_publishes.is_empty(),
+        "a languages._ seal must reach the markdown host (got {host_publishes:?})"
+    );
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_didclose_clears_promptly_even_within_the_quiet_window() {
+    // The regression this pins: a clearing push withheld by the quiet window
+    // must not be dropped when the document closes — didClose's clearing
+    // publish bypasses the window and the withheld `dirty` debt forces it past
+    // the unchanged-skip, so a push-mode editor never keeps a closed buffer's
+    // diagnostics. Positive assertion: an empty publish for the host arrives
+    // regardless of whether the mock's clearing push raced the close.
+    let (mut client, _config_dir) = init_client();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("editor should receive the pushed diagnostic");
+
+    // The edit drives the mock's clearing `[]` push; within 1 s of the last
+    // publish it is withheld by the quiet window. Closing right away must
+    // still clear the editor.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
+        }),
+    );
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+
+    let cleared = client.wait_for_notification_where(
+        &["textDocument/publishDiagnostics"],
+        Duration::from_secs(15),
+        cleared_host_diag,
+    );
+    assert!(
+        cleared.is_some(),
+        "closing within the quiet window must still deliver a clearing publish"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
 fn e2e_pull_result_id_roundtrip_reports_unchanged() {
     // LSP 3.17 pull diagnostics: the full report carries a resultId; a re-pull
     // echoing it as previousResultId while the set is unchanged is answered

@@ -78,8 +78,9 @@ Phased roadmap:
    anyway, so one code path with a pure combine function replaces the
    `race_layers_preferred` machinery here. For
    `textDocument/publishDiagnostics`, `priorities = []` additionally seals
-   the editor-facing wire sends entirely (the pull-first opt-out; delivery
-   continues via `workspace/diagnostic/refresh` → re-pull) — see
+   the editor-facing wire sends (the pull-first opt-out; delivery continues
+   via `workspace/diagnostic/refresh` → re-pull, and `didClose`'s clearing
+   publish still fails open) — prerequisites and caveats in
    push-propagation-diagnostic-forwarding "Config wire seal".
 5. **Layer-level `concatenated` for `textDocument/codeAction`** — ✅
    implemented (and the DEFAULT for the method): the virt layer's actions
