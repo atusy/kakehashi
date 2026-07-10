@@ -18,6 +18,27 @@ benches/profile/profile.sh --lang rust --size 150 --requests 150
 # -> $TMPDIR/kakehashi-profile/flamegraph.svg  (+ a top-functions report on stdout)
 ```
 
+For bridge-level latency and output-volume measurements on a real document,
+build a release binary and use the synchronous driver directly:
+
+```sh
+cargo build --release --bin kakehashi
+python3 benches/profile/drive.py \
+  --bin ./target/release/kakehashi \
+  --file path/to/input.md --requests 20 --edits 1
+
+# Queue captures first, then semantic tokens, to reproduce shared-pool and
+# response-output contention from an already-busy highlighter client.
+python3 benches/profile/drive.py \
+  --bin ./target/release/kakehashi \
+  --file path/to/input.md --requests 20 --edits 1 --concurrent-captures
+```
+
+The driver reports per-method p50/p90/max request-to-response latency, exact
+JSON response-body bytes, cancellations/errors, cycle time, and server
+notification bytes grouped by method. This keeps semantic compute latency
+separate from large captures or diagnostic output that may dominate a cycle.
+
 With full Xcode installed, Instruments' Time Profiler can also be used from the
 CLI:
 
@@ -63,6 +84,7 @@ the kakehashi/tree-sitter/regex frames for the actual CPU cost.
 | ---- | ---- |
 | `profile.sh` | end-to-end: build → dSYM → samply record → analyze → SVG |
 | `xctrace.sh` | end-to-end: build → Instruments Time Profiler → XML summary |
-| `drive.py` | synchronous LSP driver (no request coalescing) |
+| `drive.py` | synchronous/batched LSP driver with per-method latency and wire-volume output |
+| `test_drive.py` | unit tests for driver metric aggregation |
 | `gen_session.py` | document generators + a framed-session emitter |
 | `analyze.py` | atos symbolication, self/inclusive report, collapsed stacks |
