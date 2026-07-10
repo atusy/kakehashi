@@ -377,7 +377,7 @@ fn ensure_editable_region(contiguous: bool) -> Result<(), String> {
     if contiguous {
         Ok(())
     } else {
-        Err("kakehashi: the edit targets a non-contiguous combined injection; it cannot be applied without overwriting host text between injected regions".to_string())
+        Err("kakehashi: the edit targets a non-contiguous virtual document (whitespace-masked host bytes — gaps between combined captures, stripped prefixes, or excluded child ranges); it cannot be applied without overwriting that host text".to_string())
     }
 }
 
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn non_contiguous_combined_region_rejects_apply_edit() {
         let reason = ensure_editable_region(false).expect_err("masked gaps are not editable");
-        assert!(reason.contains("non-contiguous combined injection"));
+        assert!(reason.contains("non-contiguous virtual document"));
         assert!(ensure_editable_region(true).is_ok());
     }
 
