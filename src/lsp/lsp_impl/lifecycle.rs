@@ -688,7 +688,9 @@ async fn forward_upstream_request(
 ///   Every region slot is retained and barriers remain FIFO, so
 ///   `publish`↔`evict` order and create-before-progress hold.
 /// - `upstream_request_rx` (unbounded): downstream-initiated *requests*
-///   (`window/showMessageRequest`, `window/showDocument`) forwarded with the
+///   (`window/showMessageRequest`, `window/showDocument`,
+///   `workspace/applyEdit` — the latter answered `applied: false` locally
+///   when the editor never declared the capability) forwarded with the
 ///   editor's response relayed back; loss-intolerant (a dropped request hangs
 ///   the downstream). Serviced via [`spawn_upstream_request`] so a slow/human
 ///   editor never stalls the loop.
@@ -2943,7 +2945,7 @@ mod tests {
     async fn apply_edit_answers_applied_false_when_editor_lacks_capability() {
         use crate::lsp::bridge::UpstreamRequest;
 
-        let (client, _requests, _responses) = init_client_and_socket().await;
+        let (client, mut requests, _responses) = init_client_and_socket().await;
 
         let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
@@ -2990,6 +2992,18 @@ mod tests {
         // The reply arrives WITHOUT any editor round-trip (no response is ever
         // fed to `_responses`), proving the request was answered locally.
         let response = reply_rx.await.expect("reply delivered");
+        // And nothing was emitted toward the editor: the request stream must
+        // be empty (a regression that both forwards and answers locally would
+        // otherwise pass).
+        let no_request = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            futures::StreamExt::next(&mut requests),
+        )
+        .await;
+        assert!(
+            no_request.is_err(),
+            "no editor-bound request may be emitted, got: {no_request:?}"
+        );
         assert!(!response.applied);
         assert!(
             response

@@ -318,7 +318,9 @@ pub struct LanguageServerPool {
     /// Receiver for window notifications, taken once by the forwarding task.
     window_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<UpstreamNotification>>>,
     /// Sender for downstream-initiated requests forwarded to the editor with a
-    /// response relayed back (`window/showMessageRequest`, `window/showDocument`).
+    /// response relayed back (`window/showMessageRequest`, `window/showDocument`,
+    /// `workspace/applyEdit` — answered locally when the editor lacks the
+    /// capability).
     ///
     /// Cloned into each reader task. Unbounded: a dropped request would hang the
     /// downstream waiting for a response (loss-intolerant, like `upstream_tx`).
