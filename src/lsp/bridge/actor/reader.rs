@@ -693,10 +693,19 @@ async fn reader_loop_with_liveness(
 
             // Check for liveness timeout (if timer is active)
             _ = liveness.wait() => {
+                // A queued request can be cancelled and removed by the writer
+                // without producing downstream stdout. The timer notification
+                // was already enqueued at registration, so re-check the router
+                // at expiry before declaring a healthy idle server hung.
+                let pending_count = router.pending_count();
+                if pending_count == 0 {
+                    liveness.stop(&server_prefix, "pending count is 0 at expiry");
+                    continue;
+                }
+
                 // Liveness timeout fired - server is unresponsive
                 // This warn! is the primary observability signal for production debugging.
                 // The pending_count is included for debugging stuck request scenarios.
-                let pending_count = router.pending_count();
                 warn!(
                     target: "kakehashi::bridge::reader",
                     "{}Liveness timeout expired after {:?}, server appears hung - failing {} pending request(s)",
@@ -3105,6 +3114,49 @@ mod tests {
             router.pending_count(),
             0,
             "Pending should be 0 after timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_timeout_ignores_request_cancelled_before_write() {
+        use crate::lsp::bridge::UpstreamId;
+        use crate::lsp::bridge::protocol::RequestId;
+        use std::time::Duration;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+        let (_writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let request_id = RequestId::new(1);
+        let upstream_id = UpstreamId::Number(7);
+        let _rx = router
+            .register_with_upstream(request_id, Some(upstream_id.clone()))
+            .unwrap();
+        assert_eq!(
+            router.prepare_cancel_by_upstream(&upstream_id),
+            (true, vec![])
+        );
+        assert!(!router.claim_for_write(request_id));
+        assert_eq!(router.pending_count(), 0);
+
+        let handle = spawn_reader_task_with_liveness(
+            reader,
+            Arc::clone(&router),
+            Some(Duration::from_millis(100)),
+        );
+        handle.notify_liveness_start();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !handle.check_liveness_failed(),
+            "an empty router must not fail an otherwise healthy idle connection"
         );
     }
 
