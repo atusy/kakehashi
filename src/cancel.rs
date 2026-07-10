@@ -7,12 +7,12 @@
 //! typing on a large document that turns into a pile-up: every keystroke
 //! supersedes the previous request, but the superseded compute keeps running.
 //!
-//! [`CancelToken`] is the escape hatch. A compute polls it at coarse boundaries
-//! (between the host pass and the injection pass, and once per injection region
-//! during discovery/tokenization) and bails early once it is set. The token is
-//! flipped when the request is superseded by a newer one for the same document,
-//! when the client sends `$/cancelRequest`, or when the document closes — so an
-//! obsolete compute stops instead of running to completion (see
+//! [`CancelToken`] is the escape hatch. A compute polls it during the host-query
+//! walk, between major passes, and once per injection region during
+//! discovery/tokenization, then bails early once it is set. The token is flipped
+//! when the request is superseded by a newer one for the same document, when the
+//! client sends `$/cancelRequest`, or when the document closes — so an obsolete
+//! compute stops instead of running to completion (see
 //! `lsp::semantic_request_tracker::SemanticRequestTracker`).
 
 /// A shared cancellation signal: cheap to poll from blocking compute AND

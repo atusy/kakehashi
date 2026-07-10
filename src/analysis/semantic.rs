@@ -72,12 +72,11 @@ use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::Semanti
 /// cancellation/failure. `text` and `tree` are moved into the work-unit.
 ///
 /// `cancel` (when provided) doubles as the work-unit's dequeue hook (a request
-/// superseded while queued never starts) and is polled at coarse boundaries —
-/// after the host pass, after the injection pass, and per region inside the
-/// injection pass — so a superseded/cancelled request stops instead of running
-/// to completion. Returns `None` once cancelled: the caller drops the
-/// (partial) result rather than storing it (see the compute-superseded
-/// checkpoints in the handlers).
+/// superseded while queued never starts) and is polled during the host-query
+/// walk, after each major pass, and per region inside the injection pass, so a
+/// superseded/cancelled request stops instead of running to completion. Returns
+/// `None` once cancelled: the caller drops the (partial) result rather than
+/// storing it (see the compute-superseded checkpoints in the handlers).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
     pool: &crate::compute_pool::ComputePool,
@@ -100,7 +99,7 @@ pub(crate) async fn handle_semantic_tokens_full(
         let line_starts = build_line_start_bytes(&text);
 
         // Collect host document tokens first (no exclusion — finalize handles it).
-        collect_host_tokens(
+        if !collect_host_tokens(
             &text,
             &tree,
             &query,
@@ -114,13 +113,16 @@ pub(crate) async fn handle_semantic_tokens_full(
             supports_multiline,
             &[],
             &[],
+            cancel.as_ref(),
             &mut all_tokens,
-        );
+        ) {
+            return None;
+        }
 
         let host_elapsed = t_start.elapsed();
 
-        // Bail before the injection pass — the dominant cost on a large document
-        // — if this request has already been superseded.
+        // The host collector polls mid-query; this boundary also catches a
+        // supersede that lands after its last poll and before injection work.
         if is_cancelled() {
             return None;
         }

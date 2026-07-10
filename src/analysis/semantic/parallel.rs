@@ -319,6 +319,7 @@ pub(crate) fn process_injection_sync(
         supports_multiline && !ctx.combined,
         &nested_exclusion_ranges,
         &ctx.prefix_byte_widths,
+        None,
         &mut tokens,
     );
     if ctx.combined {
