@@ -158,7 +158,7 @@ fn transform_completion_response_to_host(
     if dropped > 0 {
         log::warn!(
             target: "kakehashi::bridge",
-            "completion: dropped {dropped} item(s) whose text edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)"
+            "completion: dropped {dropped} item(s) whose primary insertion/edit is unsafe for the injection region (escapes it, breaks line prefixes, splits the host line, or merges content into the closing fence)"
         );
     }
 
@@ -170,7 +170,8 @@ fn transform_completion_response_to_host(
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
 /// additionalTextEdits if present.
 ///
-/// Returns `false` when the item's primary text edit is unsafe for the
+/// Returns `false` when the item's primary insertion — its text edit, or the
+/// insertText/label fallback applied at the request position — is unsafe for the
 /// injection region — escapes it, corrupts per-line `> ` prefixes, or merges
 /// content into the closing fence — if applied verbatim; the caller must
 /// drop the whole item (same fail-closed rule as WorkspaceEdit bridging).
@@ -191,8 +192,8 @@ pub(super) fn transform_completion_item(
     // region-wide any-prefix: fail-closed.
     let prefixed_at_insertion = |host_line: Option<u32>| match host_line {
         Some(line) => {
-            insertion_point_prefixed(offset, line)
-                || insertion_point_prefixed(offset, line.saturating_add(1))
+            insertion_point_prefixed(offset, region_end, line)
+                || insertion_point_prefixed(offset, region_end, line.saturating_add(1))
         }
         None => offset.columns().iter().any(|&column| column != 0),
     };
@@ -232,12 +233,13 @@ pub(super) fn transform_completion_item(
                 probe.range = edit.replace;
                 let replace_ok = text_edit_safe_in_region(&probe, offset, region_end);
                 edit.new_text = probe.new_text;
+                // Check BOTH client-selectable ranges: with unequal starts,
+                // the minimum line could be unprefixed while the other range
+                // starts on a prefixed line.
                 if !insert_ok
                     || !replace_ok
-                    || snippet_unsafe(
-                        &edit.new_text,
-                        Some(edit.insert.start.line.min(edit.replace.start.line)),
-                    )
+                    || snippet_unsafe(&edit.new_text, Some(edit.insert.start.line))
+                    || snippet_unsafe(&edit.new_text, Some(edit.replace.start.line))
                 {
                     return false;
                 }
@@ -283,18 +285,24 @@ pub(super) fn transform_completion_item(
     true
 }
 
-/// Whether the host line carries a region prefix an unprefixed insertion
-/// would break. Lines before the region are fail-closed `true`. Lines past
+/// Whether the host line carries region-adjacent host content an unprefixed
+/// insertion would break. Lines before the region are fail-closed `true`.
+/// Lines past
 /// the recorded per-line array are the BOUNDARY in per-line (blockquote)
 /// regions — fail-closed `true` (their real prefix is unrecorded) — but in
 /// the single-element fallback shape (`[start_column]`: only line 0 starts
 /// mid-host-line) later lines are whole and unprefixed: `false`.
-fn insertion_point_prefixed(offset: &RegionOffset, host_line: u32) -> bool {
+fn insertion_point_prefixed(offset: &RegionOffset, region_end: Position, host_line: u32) -> bool {
     let columns = offset.columns();
     match host_line.checked_sub(offset.line()) {
         None => true,
         Some(virtual_line) => match columns.get(virtual_line as usize) {
-            Some(&column) => column != 0,
+            // Single-element shape on line 0: the captured content runs to
+            // end-of-line in a MULTI-LINE region, so an inserted newline
+            // splits only injected content — mirror the shared guard's
+            // `newline_splits_nothing`. Only a same-line inline region (the
+            // host line continues past the region) counts as prefixed.
+            Some(&column) => column != 0 && (columns.len() > 1 || region_end.line == offset.line()),
             None => columns.len() > 1,
         },
     }
@@ -1373,13 +1381,32 @@ mod tests {
         .unwrap();
         assert_eq!(list.items.len(), 1, "later-line insertion is safe");
 
-        // Requested on host line 3 (virtual line 0, mid-host-line): dropped.
+        // Requested on host line 3 (virtual line 0): in a MULTI-LINE region
+        // line 0's captured content runs to end-of-line, so the inserted
+        // newline splits only injected content — kept.
+        let list = transform_completion_response_to_host(
+            response.clone(),
+            &offset,
+            region_end,
+            Some(3),
+            None,
+        )
+        .unwrap();
+        assert_eq!(list.items.len(), 1, "multi-line region line 0 is safe");
+
+        // Same shape but a SAME-LINE inline region (region end on the start
+        // line): the host line continues past the region, so a newline
+        // splits it — dropped.
+        let inline_end = Position {
+            line: 3,
+            character: 20,
+        };
         let list =
-            transform_completion_response_to_host(response, &offset, region_end, Some(3), None)
+            transform_completion_response_to_host(response, &offset, inline_end, Some(3), None)
                 .unwrap();
         assert!(
             list.items.is_empty(),
-            "line-0 insertion would split the host line"
+            "inline-region line-0 insertion would split the host line"
         );
     }
 }

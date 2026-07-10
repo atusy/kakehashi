@@ -421,7 +421,7 @@ pub(crate) fn text_edit_preserves_line_prefixes(
     // lines removed; the preceding newline survives). Reject everything
     // else. The canonical insertFinalNewline ("\n" at the boundary) passes.
     if region_end.character == 0 && e.range.end == region_end {
-        let ends_with_newline = e.new_text.ends_with('\n');
+        let ends_with_newline = e.new_text.ends_with('\n') || e.new_text.ends_with('\r');
         let whole_line_deletion = e.new_text.is_empty() && e.range.start.character == 0;
         if !ends_with_newline && !whole_line_deletion {
             return false;
