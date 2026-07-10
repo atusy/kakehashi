@@ -965,7 +965,9 @@ fn build_combined_virtual_content(
         let first_included = included.get(range_index).and_then(|range| {
             let start = ceil_char_boundary(text, range.start.max(line_start));
             let end = range.end.min(content_end);
-            (start < end).then_some(start)
+            let includes_line_break =
+                content_end < line_end && start == content_end && range.end > content_end;
+            (start < end || includes_line_break).then_some(start)
         });
 
         if let Some(first_included) = first_included {
@@ -1436,6 +1438,16 @@ mod tests {
 
         assert_eq!(content, "x\n");
         assert_eq!(offsets, vec![1, 0]);
+    }
+
+    #[test]
+    fn combined_blank_included_line_records_its_prefix_offset() {
+        let text = "> \n";
+        let (content, offsets) =
+            build_combined_virtual_content(text, 0..text.len(), &[2..text.len()]);
+
+        assert_eq!(content, "\n");
+        assert_eq!(offsets, vec![2, 0]);
     }
 
     #[test]
