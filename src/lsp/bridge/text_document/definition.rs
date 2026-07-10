@@ -539,7 +539,7 @@ mod tests {
                         "start": { "line": 2, "character": 4 },
                         "end": { "line": 2, "character": 9 }
                     },
-                    "targetUri": target_uri,
+                    "targetUri": target_uri.as_str(),
                     "targetRange": {
                         "start": { "line": 20, "character": 0 },
                         "end": { "line": 22, "character": 1 }

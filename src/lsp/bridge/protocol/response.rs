@@ -150,17 +150,18 @@ pub(crate) fn transform_location_for_goto(
 /// `originSelectionRange` belongs to the requesting virtual document, so it is
 /// always translated to host coordinates. Target ranges are translated only when
 /// the target points back to the same virtual document; real-file targets are
-/// preserved as-is.
+/// preserved as-is. Targets pointing at a different virtual URI are filtered
+/// out because cross-region offsets are unsafe.
 fn transform_location_link_for_goto(
     mut link: LocationLink,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> Option<LocationLink> {
-    let uri_str = link.target_uri.as_str();
     if let Some(ref mut origin_range) = link.origin_selection_range {
         translate_virtual_range_to_host(origin_range, offset);
     }
+    let uri_str = link.target_uri.as_str();
 
     // Case 1: NOT a virtual URI (real file reference) → preserve as-is
     if !VirtualDocumentUri::is_virtual_uri(uri_str) {
