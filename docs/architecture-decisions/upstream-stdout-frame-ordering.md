@@ -26,13 +26,14 @@ that would introduce the very head-of-line cost being measured.
 The release workload used `__ignored/example.md`, a 5,088-line, 37,940-byte
 Markdown document matching the captured editor session's scale. Its SHA-256 is
 `bad443ab7b8d4328e1b255f90db65ee9c83353394e1db9f84f57b371972777f6`.
-Each scenario ran 20 edit/recompute cycles, repeated three times in interleaved
-A/A runs. The profile driver continuously drained stdout so the client did not
-manufacture pipe backpressure.
+Each scenario ran 20 edit/recompute cycles and was repeated three times. The
+captures-full observer check additionally interleaved three instrumented and
+three uninstrumented runs. The profile driver continuously drained stdout so
+the client did not manufacture pipe backpressure.
 
 Measurement provenance:
 
-- source: `420acaf5`;
+- source: `ea372f821`;
 - build: `cargo build --release --bin kakehashi`, rustc 1.95.0;
 - host: arm64 macOS 26.5.1 (Darwin 25.5.0, T8132); and
 - configuration: repository default discovery, `deps/test/kakehashi` data dir,
@@ -53,13 +54,14 @@ done
 
 | Scenario | Semantic request p90, three runs | Semantic ready → last byte p90 | Semantic ready → flush p90 |
 | --- | --- | --- | --- |
-| semantic only | 7.7 / 7.4 / 7.4 ms | 0.3 ms | 0.4 ms |
-| valid captures delta | 7.5 / 7.5 / 7.5 ms | 0.3 ms | 0.4 ms |
-| captures full fallback | 7.6 / 7.4 / 7.7 ms | 0.3 ms | 0.4 ms |
-| diagnostics burst | 9.3 / 9.4 / 9.3 ms | 0.3 ms | 0.4 ms |
+| semantic only | 7.9 / 11.7 / 8.5 ms | 0.3 / 0.6 / 0.3 ms | 0.4 / 0.7 / 0.4 ms |
+| valid captures delta | 7.6 / 15.1 / 10.0 ms | 0.3 / 0.6 / 0.4 ms | 0.4 / 0.7 / 0.5 ms |
+| captures full fallback | 9.1 / 9.6 / 9.0 ms | 0.4 / 0.4 / 0.4 ms | 0.4 / 0.5 / 0.5 ms |
+| diagnostics burst | 11.1 / 9.6 / 11.6 ms | 0.4 / 0.3 / 0.4 ms | 0.4 / 0.4 / 0.5 ms |
 
 The full captures fallback produced a 4,408.4 KiB frame. Its own
-ready-to-last-byte and ready-to-flush p90 were both 11.8–11.9 ms,
+ready-to-last-byte p90 was 14.2 / 15.8 / 14.3 ms and ready-to-flush
+p90 was 14.3 / 15.9 / 14.4 ms,
 but semantic responses were ready before that frame started in 0 of 60 cycles.
 They completed first, so a pre-write scheduler had no opportunity to improve
 semantic latency. The diagnostic responses in this configuration were valid
@@ -70,9 +72,10 @@ path; it is not a claim that every large-diagnostics configuration has the same
 opportunity rate.
 
 To check observer effect, the captures-full matrix was also run three times
-without `--stdout-metrics`. Instrumented captures p90 was 93.9 / 93.2 / 96.4 ms
-versus 90.1 / 94.6 / 93.7 ms uninstrumented; semantic p90 was
-7.6 / 7.4 / 7.7 ms versus 7.2 / 7.6 / 8.5 ms. The differences stayed within
+without `--stdout-metrics`. Instrumented captures p90 was
+110.3 / 125.3 / 110.3 ms versus 129.4 / 119.2 / 116.1 ms uninstrumented;
+semantic p90 was 9.1 / 9.6 / 9.0 ms versus 10.2 / 9.0 / 9.4 ms. The
+differences stayed within
 run-to-run variation after replacing per-byte tail maintenance with bounded
 slice copies.
 
@@ -105,7 +108,7 @@ must not hold service futures or consume ingress concurrency slots while queued.
 
 ### Keep FIFO and retain opt-in measurement
 
-Chosen. The measured semantic transport p90 is 0.3 ms and no schedulable
+Chosen. The measured semantic transport p90 is 0.3–0.6 ms and no schedulable
 large-frame overlap occurred, giving a very low current improvement ceiling.
 
 ### Add a bounded pre-write priority scheduler
