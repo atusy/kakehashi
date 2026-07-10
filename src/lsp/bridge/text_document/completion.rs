@@ -270,8 +270,10 @@ pub(super) fn transform_completion_item(
     // Transform additional_text_edits if present. ALL-OR-NOTHING: the array
     // can carry paired halves of one operation (a deletion plus a
     // reinsertion), so stripping only the unsafe member could apply half and
-    // lose content — if any member is unsafe, drop the whole array. The
-    // primary insertion still works without it.
+    // lose content — if any member is unsafe, drop the whole array. The item
+    // is kept: its primary insertion still applies, though possibly
+    // semantically incomplete (e.g. without its auto-import) — availability
+    // over fidelity, never corruption.
     if let Some(ref mut additional_edits) = item.additional_text_edits {
         for edit in additional_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
@@ -1472,9 +1474,10 @@ mod tests {
     fn mixed_offset_boundary_rows_reject_multiline_fallbacks() {
         // Mixed per-line offsets [2,0,0] (a blockquote with a lazy
         // continuation line): the trailing recorded zeros are BOUNDARY rows
-        // whose real prefix is unrecorded. A multi-line fallback insertion on
-        // the last content row (host 4 — its following row is the boundary)
-        // must reject; the same shape in an all-zero region has no boundary
+        // whose real prefix is unrecorded: host 4 is the lazy-continuation
+        // CONTENT row (recorded 0), host 5 the boundary. A multi-line
+        // fallback insertion on host 4 must reject — its following row is
+        // the boundary; the same shape in an all-zero region has no boundary
         // semantics and passes.
         let region_end = Position {
             line: 5,

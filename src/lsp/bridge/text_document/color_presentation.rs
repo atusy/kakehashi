@@ -165,7 +165,9 @@ fn transform_color_presentation_response_to_host(
 
         // ALL-OR-NOTHING (same reasoning as completion): the array can carry
         // paired halves of one operation, so any unsafe member drops the
-        // whole array rather than half-applying it.
+        // whole array rather than half-applying it. The presentation is kept:
+        // its textEdit still applies, though possibly semantically incomplete
+        // — availability over fidelity, never corruption.
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
             for edit in additional_edits.iter_mut() {
                 translate_virtual_range_to_host(&mut edit.range, offset);
@@ -663,8 +665,8 @@ mod tests {
                                            "end": { "line": 0, "character": 4 } },
                                 "newText": "#fff" },
                   "additionalTextEdits": [
-                      { "range": { "start": { "line": 0, "character": 0 },
-                                   "end": { "line": 0, "character": 2 } },
+                      { "range": { "start": { "line": 1, "character": 3 },
+                                   "end": { "line": 1, "character": 5 } },
                         "newText": "safe-sibling" },
                       { "range": { "start": { "line": 1, "character": 0 },
                                    "end": { "line": 1, "character": 0 } },
