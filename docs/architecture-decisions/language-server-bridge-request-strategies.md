@@ -224,9 +224,11 @@ But line 0 of the virtual document maps to the injection start line in the host�
 | Position mapping | Same-region TextEdit ranges (real-file ranges untouched) |
 
 Rename can affect multiple files. Real-file edits (a project-aware server's
-cross-file rename) are preserved verbatim; only edits addressed to other
-regions' virtual URIs — meaningless to the editor — or edits that fail the
-region-safety guards are rejected.
+cross-file rename) are preserved — content and ranges untouched, though
+bridge-local `TextDocumentEdit.version` values are cleared before relaying —
+while entries addressed to other regions' virtual URIs (meaningless to the
+editor) are FILTERED out with usable siblings surviving. Only edits that fail
+the region-safety guards reject the result.
 
 #### textDocument/codeAction
 
@@ -300,9 +302,9 @@ concatenated-formatting-pipeline.
 | Hover | range (if present) |
 | CompletionItem | textEdit.range, additionalTextEdits[].range |
 | TextEdit | range |
-| WorkspaceEdit | All documentChanges/changes entries |
+| WorkspaceEdit | Same-region virtual entries translated; real-file ranges untouched; foreign virtual entries filtered (or the action rejected) |
 | Diagnostic | range, relatedInformation[].location |
-| CodeAction | All contained edits |
+| CodeAction | Contained edits, same conditional rule |
 
 ### Multi-Server Merging Rules
 
@@ -329,7 +331,7 @@ stands for the unlisted rest, and absence of the list means `["*"]`.
 - **Optimized UX per feature**: Each method gets the strategy that best fits its characteristics
 - **Fast visual feedback**: Semantic tokens appear instantly via parallel fetch
 - **Accurate navigation**: Go-to-definition uses authoritative language server
-- **Safe editing**: Cross-file edits are filtered to prevent corruption
+- **Safe editing**: real-file edits/resource operations are retained; foreign virtual-region or structurally unsafe edits are filtered/rejected to prevent corruption
 - **Comprehensive diagnostics**: Aggregated from multiple sources
 
 ### Negative
