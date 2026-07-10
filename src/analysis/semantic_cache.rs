@@ -221,13 +221,15 @@ impl SemanticTokenCache {
     /// - No tokens are cached for this URI
     /// - The cached result_id doesn't match the expected one
     pub fn get_if_valid(&self, uri: &Url, expected_result_id: &str) -> Option<Arc<SemanticTokens>> {
-        let mut document = self.documents.get_mut(uri)?;
-        if let Some(tokens) = document.current.as_ref().and_then(|entry| {
-            (entry.tokens.result_id.as_deref() == Some(expected_result_id))
-                .then(|| Arc::clone(&entry.tokens))
-        }) {
+        if let Some(document) = self.documents.get(uri)
+            && let Some(tokens) = document.current.as_ref().and_then(|entry| {
+                (entry.tokens.result_id.as_deref() == Some(expected_result_id))
+                    .then(|| Arc::clone(&entry.tokens))
+            })
+        {
             return Some(tokens);
         }
+        let mut document = self.documents.get_mut(uri)?;
         let tokens = document.baselines.get(expected_result_id).map(Arc::clone);
         if tokens.is_some() {
             Self::touch_baseline(&mut document, expected_result_id);
