@@ -1428,8 +1428,11 @@ mod tests {
     #[test]
     fn combined_content_snaps_stale_included_start_to_char_boundary() {
         let text = "éx\n";
-        let (content, offsets) =
-            build_combined_virtual_content(text, 0..text.len(), &[1..usize::MAX]);
+        let (content, offsets) = build_combined_virtual_content(
+            text,
+            0..text.len(),
+            std::slice::from_ref(&(1..usize::MAX)),
+        );
 
         assert_eq!(content, "x\n");
         assert_eq!(offsets, vec![1, 0]);
