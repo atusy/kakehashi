@@ -176,7 +176,9 @@ fn build_baseline_capabilities(
 /// tagSupport, commitCharactersSupport, resolveSupport, insertTextModeSupport,
 /// labelDetailsSupport, preselectSupport}`, `hover.contentFormat`,
 /// `signatureHelp.signatureInformation`, `window.workDoneProgress`,
-/// `window.showDocument`, `window.showMessage`.
+/// `window.showDocument`, `window.showMessage`,
+/// `workspace.workspaceEdit` (mirrored minus `changeAnnotationSupport` — see
+/// the merge site for why annotations are withheld).
 ///
 /// `window.workDoneProgress` and `window.showDocument` are gated on the real
 /// upstream editor so the bridge only invites a downstream server-initiated
@@ -288,6 +290,29 @@ fn merge_upstream_capabilities(
         }
     }
 
+    // --- workspace.workspaceEdit (mirror, minus changeAnnotationSupport) ---
+    // A client that omits `workspace.workspaceEdit` implies
+    // `documentChanges: false` and no `resourceOperations`, so a spec-compliant
+    // downstream withholds documentChanges-shaped edits and every
+    // create/rename/delete-carrying refactor ("extract into file") — even
+    // though the bridge transform handles both (real-file ops pass through;
+    // virtual-URI ops reject the whole edit). Mirror the editor's declaration
+    // so downstream servers offer exactly what the editor can apply.
+    // `changeAnnotationSupport` is deliberately withheld: ls-types' untagged
+    // `OneOf` drops `annotationId` when deserializing downstream responses, so
+    // inviting annotated edits would silently lose `needsConfirmation`.
+    if let Some(upstream_workspace_edit) = upstream
+        .workspace
+        .as_ref()
+        .and_then(|w| w.workspace_edit.as_ref())
+    {
+        let mut mirrored = upstream_workspace_edit.clone();
+        mirrored.change_annotation_support = None;
+        base.workspace
+            .get_or_insert_with(Default::default)
+            .workspace_edit = Some(mirrored);
+    }
+
     // --- window.workDoneProgress (gated on real upstream support) ---
     // Advertise server-initiated progress downstream ONLY when the editor
     // genuinely supports it (`Some(true)`), so the bridge never invites progress
@@ -370,6 +395,74 @@ mod tests {
                 insta::assert_json_snapshot!(capabilities);
             });
         }
+    }
+
+    #[test]
+    fn merge_mirrors_workspace_edit_capability_without_annotations() {
+        use tower_lsp_server::ls_types::{
+            ChangeAnnotationWorkspaceEditClientCapabilities, FailureHandlingKind,
+            ResourceOperationKind, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+        };
+
+        let upstream = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                workspace_edit: Some(WorkspaceEditClientCapabilities {
+                    document_changes: Some(true),
+                    resource_operations: Some(vec![
+                        ResourceOperationKind::Create,
+                        ResourceOperationKind::Rename,
+                        ResourceOperationKind::Delete,
+                    ]),
+                    failure_handling: Some(FailureHandlingKind::Abort),
+                    normalizes_line_endings: Some(true),
+                    change_annotation_support: Some(
+                        ChangeAnnotationWorkspaceEditClientCapabilities {
+                            groups_on_label: Some(true),
+                        },
+                    ),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        let workspace_edit = merged
+            .workspace
+            .as_ref()
+            .and_then(|w| w.workspace_edit.as_ref())
+            .expect("the editor's workspaceEdit capability must be mirrored downstream");
+        assert_eq!(workspace_edit.document_changes, Some(true));
+        assert_eq!(
+            workspace_edit
+                .resource_operations
+                .as_ref()
+                .map(|ops| ops.len()),
+            Some(3)
+        );
+        assert_eq!(
+            workspace_edit.failure_handling,
+            Some(FailureHandlingKind::Abort)
+        );
+        assert_eq!(workspace_edit.normalizes_line_endings, Some(true));
+        assert_eq!(
+            workspace_edit.change_annotation_support, None,
+            "annotation support must be withheld: ls-types drops annotationId on parse"
+        );
+    }
+
+    #[test]
+    fn merge_without_upstream_workspace_edit_advertises_none() {
+        let merged =
+            build_bridge_client_capabilities(Some(&ClientCapabilities::default()), true, false);
+        assert!(
+            merged
+                .workspace
+                .as_ref()
+                .and_then(|w| w.workspace_edit.as_ref())
+                .is_none(),
+            "an editor that omits workspaceEdit implies documentChanges:false — do not overclaim"
+        );
     }
 
     #[test]
@@ -793,8 +886,23 @@ mod tests {
             TextDocumentClientCapabilities,
         };
 
+        use tower_lsp_server::ls_types::{
+            ResourceOperationKind, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+        };
+
         // Simulate typical Neovim capabilities
         let upstream = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                workspace_edit: Some(WorkspaceEditClientCapabilities {
+                    resource_operations: Some(vec![
+                        ResourceOperationKind::Rename,
+                        ResourceOperationKind::Create,
+                        ResourceOperationKind::Delete,
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             text_document: Some(TextDocumentClientCapabilities {
                 completion: Some(CompletionClientCapabilities {
                     completion_item: Some(CompletionItemCapability {

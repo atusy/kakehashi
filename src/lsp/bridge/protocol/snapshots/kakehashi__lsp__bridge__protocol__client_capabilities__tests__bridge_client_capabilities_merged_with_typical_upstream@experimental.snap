@@ -5,6 +5,13 @@ expression: merged
 {
   "workspace": {
     "applyEdit": true,
+    "workspaceEdit": {
+      "resourceOperations": [
+        "rename",
+        "create",
+        "delete"
+      ]
+    },
     "executeCommand": {
       "dynamicRegistration": false
     },
