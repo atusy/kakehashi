@@ -574,9 +574,11 @@ fn apply_none_preprocessing(
 /// - Fully-contained tokens are removed (prevents code block host token leaks).
 /// - Single-line partial overlaps are kept whole so the sweep line can use the
 ///   host token as a gap filler (e.g., a heading token covering plain text that
-///   markdown_inline doesn't capture).
+///   markdown_inline doesn't capture; blockquote prose gaps are trimmed to this
+///   shape at the push site — see `rebuild_context`).
 /// - Multiline partial overlaps are split; only fragments outside the region
-///   are kept (e.g., blockquote `> ` prefix survives, content is removed).
+///   are kept (e.g., in a blockquoted code fence the `> ` prefix survives,
+///   the code content is removed).
 fn filter_by_injection_regions(
     tokens: Vec<RawToken>,
     regions: &[ActiveInjectionBounds],
@@ -626,9 +628,10 @@ fn filter_by_injection_regions(
         }
         // Partial overlap: check if any overlapping region is single-line.
         // Single-line regions indicate a direct child injection (e.g.,
-        // markdown_inline within a heading) where the host token should
-        // fill gaps. Multiline regions indicate container injections
-        // (e.g., blockquote content) where the host should not leak.
+        // markdown_inline within a heading, or a newline-trimmed blockquote
+        // prose gap) where the host token should fill gaps. Multiline
+        // regions indicate container injections (e.g., blockquoted code
+        // fence content) where the host should not leak.
         //
         // Note: a token overlapping both single-line and multiline regions
         // simultaneously is not a practical concern — the hierarchical

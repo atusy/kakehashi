@@ -100,11 +100,11 @@ Host tokens (depth=0) overlapping **active** injection regions are handled with 
 | **Fully inside** | Token bounds ⊂ region bounds (strict) | Remove | Code block content line inside blockquote injection |
 | **Exact match** | Token bounds = region bounds | Keep for sweep line | Fish `(comment) @comment` + `(comment) @injection.content` |
 | **Partial overlap, single-line region** | Token extends beyond a single-line region | Keep entire token for sweep line | Heading `## foo **bar**` overlapping `(inline)` injection |
-| **Partial overlap, multiline region** | Token extends beyond a multiline region | Split, keep outside fragments only | Blockquote `> ` prefix survives, content removed |
+| **Partial overlap, multiline region** | Token extends beyond a multiline region | Split, keep outside fragments only | In a blockquoted code fence, `> ` prefix survives, code content removed |
 
 The single-line/multiline distinction for partial overlaps identifies the injection's nature:
-- **Single-line regions** arise from direct child injections (e.g., `markdown_inline` within a heading). The host token should fill gaps where the injection produces no tokens (e.g., plain text in headings).
-- **Multiline regions** arise from container injections (e.g., blockquote content). The host token should not leak into the container's content.
+- **Single-line regions** arise from direct child injections (e.g., `markdown_inline` within a heading). The host token should fill gaps where the injection produces no tokens (e.g., plain text in headings). Blockquote *prose* gaps are trimmed of their trailing newline at the exclusion-range push site (`rebuild_context`) precisely so they classify here and gap-fill uniformly on every paragraph line.
+- **Multiline regions** arise from container injections (e.g., blockquoted code fence content). The host token should not leak into the container's content.
 
 Key concepts:
 

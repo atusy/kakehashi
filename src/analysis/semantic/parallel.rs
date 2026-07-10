@@ -851,14 +851,19 @@ fn rebuild_context<'a>(
     // start (inj_start_byte).
     if let Some(ref ranges) = region.included_ranges {
         // Prose-style content (e.g. markdown_inline) ends flush with its last
-        // character, while container content (e.g. code_fence_content) is
-        // newline-terminated. Interior prose gaps still carry their line's
-        // newline, spanning (L, col)..(L+1, 0) — which finalize's region
-        // classifier reads as a multiline CONTAINER, stripping host gap-fill
-        // tokens (e.g. markup.quote) from every paragraph line except the
-        // last, so identical lines render differently. Trim the newline from
-        // prose gaps so each classifies as the single display line it covers.
-        // Containers keep their newlines: their host tokens must not leak.
+        // character, while container content (e.g. code_fence_content) is in
+        // practice newline-terminated. Interior prose gaps still carry their
+        // line's newline, spanning (L, col)..(L+1, 0) — which
+        // filter_by_injection_regions (finalize.rs) reads as a multiline
+        // CONTAINER, stripping host gap-fill tokens (e.g. markup.quote) from
+        // every paragraph line except the last, so identical lines rendered
+        // differently. Trim the newline from prose gaps so each classifies as
+        // the single display line it covers. Containers keep their newlines:
+        // their host tokens must not leak into code content. Known edge: a
+        // container left unterminated at EOF in a file without a trailing
+        // newline ends flush and classifies prose until the fence closes — a
+        // transient, self-healing mis-render accepted over a per-language
+        // node-kind discriminator.
         // `get` instead of indexing: like the content re-slice above, a
         // corrupt reuse-path entry must degrade (here: to the untrimmed
         // container classification), not panic.
@@ -1160,6 +1165,9 @@ fn build_combined_context<'a>(
     };
 
     // Suppress this layer's parent tokens within every combined block.
+    // No prose newline-trim here (cf. rebuild_context): every shipped
+    // injection.combined capture (html_block etc.) is container content whose
+    // ranges are newline-terminated, so the trim would never apply.
     for r in &included_ranges {
         exclusion_ranges.push((group_start + r.start_byte, group_start + r.end_byte));
     }
