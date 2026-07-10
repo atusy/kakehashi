@@ -356,9 +356,7 @@ impl Kakehashi {
                 )
             });
 
-            let response =
-                finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
-            response
+            finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await
         };
 
         // layer_method keys off "textDocument/formatting" ON PURPOSE: range
