@@ -599,16 +599,25 @@ fn unpack_archive_file_entry<R: Read>(
                 escaped_path(safe_relative)
             )));
         }
-        Ok(_) => {}
+        Ok(_) => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive contains a duplicate file path: {}",
+                escaped_path(safe_relative)
+            )));
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(ArchiveFetchError::Io(e)),
     }
-    let mut output = fs::File::create(&target).map_err(|e| {
-        ArchiveFetchError::Io(io::Error::new(
-            e.kind(),
-            format!("Failed to create {}: {}", escaped_path(safe_relative), e),
-        ))
-    })?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|e| {
+            ArchiveFetchError::Io(io::Error::new(
+                e.kind(),
+                format!("Failed to create {}: {}", escaped_path(safe_relative), e),
+            ))
+        })?;
     let mut buffer = [0; 8192];
     loop {
         let read = entry.read(&mut buffer).map_err(|e| {
