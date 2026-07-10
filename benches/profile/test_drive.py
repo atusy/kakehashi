@@ -107,6 +107,7 @@ class RequestSummaryTest(unittest.TestCase):
                 "frame": {
                     "ready_sequence": 3,
                     "write_sequence": 4,
+                    "flush_sequence": 5,
                     "method": "textDocument/semanticTokens/full",
                     "id": 9,
                     "body_bytes": 100,
@@ -133,6 +134,7 @@ class RequestSummaryTest(unittest.TestCase):
                 flush_complete_us=3000,
                 ready_sequence=3,
                 write_sequence=4,
+                flush_sequence=5,
             ),
         )
         summary = summarize_transport_frames([frame])
@@ -177,6 +179,7 @@ class RequestSummaryTest(unittest.TestCase):
             flush_complete_us=520,
             ready_sequence=1,
             write_sequence=4,
+            flush_sequence=6,
         )
         large = TransportFrame(
             method="kakehashi/captures/full/delta",
@@ -188,6 +191,7 @@ class RequestSummaryTest(unittest.TestCase):
             flush_complete_us=460,
             ready_sequence=0,
             write_sequence=2,
+            flush_sequence=4,
         )
 
         self.assertEqual(
@@ -239,6 +243,9 @@ class RequestSummaryTest(unittest.TestCase):
             write_start_us=110,
             last_byte_us=120,
             flush_complete_us=130,
+            ready_sequence=1,
+            write_sequence=2,
+            flush_sequence=3,
         )
         validate_transport_metrics(
             [frame], {"textDocument/semanticTokens/full": 1}, 0, []
@@ -257,6 +264,13 @@ class RequestSummaryTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             validate_transport_metrics(
                 [frame], {"textDocument/semanticTokens/full": 1}, 1, []
+            )
+        with self.assertRaises(RuntimeError):
+            validate_transport_metrics(
+                [dataclasses.replace(frame, flush_sequence=None)],
+                {"textDocument/semanticTokens/full": 1},
+                0,
+                [],
             )
 
     def test_diagnostic_scenario_requires_a_full_items_report(self):

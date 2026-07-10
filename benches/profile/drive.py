@@ -58,7 +58,8 @@ class TransportFrame:
     flush_complete_us: int | None
     id_unattributed: bool = False
     ready_sequence: int | None = None
-    write_sequence: int = 0
+    write_sequence: int | None = None
+    flush_sequence: int | None = None
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,8 @@ def parse_stdout_metric_line(line: str) -> TransportFrame | None:
         flush_complete_us=frame.get("flush_complete_us"),
         id_unattributed=frame.get("id_unattributed", False),
         ready_sequence=frame.get("ready_sequence"),
-        write_sequence=frame.get("write_sequence", 0),
+        write_sequence=frame.get("write_sequence"),
+        flush_sequence=frame.get("flush_sequence"),
     )
 
 
@@ -149,14 +151,11 @@ def classify_semantic_blocking(
             if blocker_index < semantic_index
             and frame.request_id is not None
             and frame.ready_us is not None
+            and frame.write_sequence is not None
+            and frame.flush_sequence is not None
             and frame.frame_bytes >= large_frame_bytes
             and frame.write_start_us <= semantic.write_start_us
-            and (
-                frame.flush_complete_us
-                if frame.flush_complete_us is not None
-                else frame.last_byte_us
-            )
-            >= semantic.ready_us
+            and frame.flush_sequence > semantic.ready_sequence
         ]
         if not blockers:
             continue
@@ -188,6 +187,20 @@ def validate_transport_metrics(
     censored = [frame for frame in frames if frame.flush_complete_us is None]
     if censored:
         raise RuntimeError(f"stdout metrics contain {len(censored)} censored flushes")
+    incomplete_sequences = [
+        frame
+        for frame in frames
+        if frame.ready_us is not None
+        and (
+            frame.ready_sequence is None
+            or frame.write_sequence is None
+            or frame.flush_sequence is None
+        )
+    ]
+    if incomplete_sequences:
+        raise RuntimeError(
+            f"stdout metrics contain {len(incomplete_sequences)} incomplete event sequences"
+        )
     for method, expected in expected_counts.items():
         actual = sum(
             frame.ready_us is not None and frame.method == method for frame in frames

@@ -37,6 +37,7 @@ struct FrameMetric {
     write_start_us: u64,
     last_byte_us: u64,
     flush_complete_us: Option<u64>,
+    flush_sequence: Option<u64>,
     id_unattributed: bool,
 }
 
@@ -433,6 +434,7 @@ impl FrameObserver {
                                 write_start_us: self.metrics.timestamp_us(write_start.at),
                                 last_byte_us: self.metrics.timestamp_us(at),
                                 flush_complete_us: None,
+                                flush_sequence: None,
                                 id_unattributed,
                             },
                             id,
@@ -451,8 +453,10 @@ impl FrameObserver {
 
     fn flushed(&mut self, at: Instant) {
         let flush_complete_us = self.metrics.timestamp_us(at);
+        let flush_sequence = self.metrics.next_event_sequence();
         for (mut frame, id) in self.awaiting_flush.drain(..) {
             frame.flush_complete_us = Some(flush_complete_us);
+            frame.flush_sequence = Some(flush_sequence);
             self.metrics.finish_frame(frame, id);
         }
     }
@@ -631,6 +635,7 @@ mod tests {
                 write_start_us: 0,
                 last_byte_us: 0,
                 flush_complete_us: None,
+                flush_sequence: None,
                 id_unattributed: false,
             },
             Some(response.id().clone()),
@@ -705,6 +710,7 @@ mod tests {
                 write_start_us: 20,
                 last_byte_us: 30,
                 flush_complete_us: Some(40),
+                flush_sequence: Some(3),
                 id_unattributed: false,
             }]
         );
