@@ -1263,7 +1263,8 @@ fn spawn_upstream_request(
                     let _ = reply.send(ApplyWorkspaceEditResponse {
                         applied: false,
                         failure_reason: Some(
-                            "kakehashi: the editor does not support workspace/applyEdit"
+                            "kakehashi: the editor did not declare the workspace.applyEdit \
+                             capability"
                                 .to_string(),
                         ),
                         failed_change: None,
@@ -3022,7 +3023,7 @@ mod tests {
             response
                 .failure_reason
                 .as_deref()
-                .is_some_and(|r| r.contains("does not support workspace/applyEdit")),
+                .is_some_and(|r| r.contains("workspace.applyEdit")),
             "failureReason should name the missing capability: {:?}",
             response.failure_reason
         );
