@@ -183,7 +183,7 @@ priorities = ["virt", "host"]
     );
     assert!(
         lines.contains(&3),
-        "virt-layer documentLink should be translated to the lua fence line: {links:?}"
+        "virt-layer documentLink should be translated to the lua code line (print(1)): {links:?}"
     );
 
     shutdown(&mut client);
@@ -253,6 +253,11 @@ priorities = ["virt", "host"]
             let response = client.send_request(
                 "textDocument/documentLink",
                 json!({ "textDocument": { "uri": uri } }),
+            );
+            assert!(
+                response.get("error").is_none(),
+                "documentLink must not surface a top-level error; got: {:?}",
+                response.get("error")
             );
             let links = response["result"].as_array().cloned().unwrap_or_default();
             if links.len() >= 2 {
