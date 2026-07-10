@@ -265,11 +265,15 @@ region, virtual-document file operations, or escaping the block) is
 rejected: in the initial response it surfaces as a disabled action where the
 client supports that and is dropped otherwise; during `codeAction/resolve`
 (where a response cannot be dropped) the unsafe payload is removed and the
-action is returned unresolved. HOST-layer (`bridge._self`) action edits
-already target the real document and pass through as-is. A downstream server's own
-`workspace/applyEdit` request is translated the same way, but an
-untranslatable one is answered `applied: false` locally — it never reaches
-the editor and no action is involved.
+action comes back disabled — or, for clients without `disabledSupport`,
+unresolved. HOST-layer (`bridge._self`) action edits already target the
+real document and pass through as-is. A downstream server's own
+`workspace/applyEdit` request has its own policy built on the same
+underlying transform: virtual-document edits are translated (real-file-only
+requests pass through verbatim), and an untranslatable one — unknown or
+stale region, multi-region edit, virtual-URI file operation — is answered
+`applied: false` locally; it never reaches the editor and no action is
+involved.
 
 Default combine strategy: `concatenated`, across servers and across the
 virt/host layers. Advertised only to clients with
