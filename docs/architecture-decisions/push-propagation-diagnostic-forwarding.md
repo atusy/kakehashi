@@ -224,6 +224,15 @@ policy clean:
   offset re-positions an unchanged region's diagnostics after an edit *above* it
   with no re-push and no flicker — provided the epoch keys on content, not geometry
   (above), so a position-only edit does not advance it.
+- **Geometry-unknown deferral**: between `did_change` clearing the visible tree
+  and the off-ingress reparse landing, the regions' current offsets cannot be
+  computed. A republish in that window **defers** (publishes nothing, records
+  nothing) rather than merging with empty offsets — that would silently drop
+  every region push slot and flap the editor between the full and the
+  region-less set on each edit cycle (~2 × ~1 MB publishes per keystroke settle
+  on a diagnostics-heavy host, plus visible flicker). The reparse loop's
+  post-parse republish (gated on the same non-empty-region-slots predicate)
+  is the guaranteed retry that publishes with real offsets.
 - **Version gate**: a slot whose epoch lags the source's current `content_epoch`
   is held (not published) until that server re-publishes at the current epoch,
   bounding the wrong-position window to the re-parse gap and self-healing. The virt

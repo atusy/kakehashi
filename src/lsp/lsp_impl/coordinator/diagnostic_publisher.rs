@@ -469,10 +469,12 @@ impl DiagnosticPublisher {
     /// offsets; an empty merge clears the editor's diagnostics for the host.
     ///
     /// Returns `true` when a *changed* set was published to the editor, `false`
-    /// when nothing was sent (bad URI, or the merged set was identical to the
-    /// last publish). Push-origin callers ([`Self::publish_host_push`],
-    /// [`Self::publish_region_push`]) use this to decide whether to also nudge
-    /// pull-mode clients with [`Self::request_pull_diagnostic_refresh`].
+    /// when nothing was sent (bad URI, the merged set was identical to the last
+    /// publish, or the publish was **deferred** because the document's region
+    /// geometry is unknown mid-reparse — see the deferral below). Push-origin
+    /// callers ([`Self::publish_host_push`], [`Self::publish_region_push`]) use
+    /// this to decide whether to also nudge pull-mode clients with
+    /// [`Self::request_pull_diagnostic_refresh`].
     pub(crate) async fn republish(&self, host: &Url) -> bool {
         // Serialize the whole snapshot→merge→publish so concurrent republishes
         // (region push vs host-event pull) emit in order and a stale snapshot can
@@ -504,12 +506,38 @@ impl DiagnosticPublisher {
         // Recompute injection offsets only when there are region push slots to
         // transform. A PullLayer-only snapshot (the common pull-driven case) needs
         // none, so skip the whole-document injection resolution — and shorten the
-        // time this host's republish lock is held.
-        let region_offsets = if snapshot
-            .keys()
-            .any(|source| matches!(source, DiagnosticSource::Region(_)))
-        {
-            self.current_region_offsets(host)
+        // time this host's republish lock is held. The predicate deliberately
+        // mirrors `DiagnosticAggregator::has_region_slots` (non-empty slots only):
+        // the geometry-unknown deferral below relies on the reparse loop's
+        // post-parse republish, which is gated on exactly that check.
+        let needs_geometry = snapshot.iter().any(|(source, servers)| {
+            matches!(source, DiagnosticSource::Region(_))
+                && servers.values().any(|slot| !slot.diagnostics.is_empty())
+        });
+        let region_offsets = if needs_geometry {
+            match self.current_region_offsets(host) {
+                Some(offsets) => offsets,
+                // The document is open but has no parse snapshot: `did_change`
+                // cleared the tree and the off-ingress reparse hasn't landed yet,
+                // so the regions' current offsets are UNKNOWN — not gone. Merging
+                // now would silently drop every region push slot and publish a
+                // set missing whole servers, which the post-parse republish then
+                // reverts: on a diagnostics-heavy host that flapped the editor
+                // between the full and the region-less set on every edit cycle
+                // (~2 × ~1 MB publishes per keystroke settle, plus visible
+                // flicker for push-mode clients). Defer instead: publish nothing,
+                // record nothing. The reparse loop always re-runs `republish`
+                // after the parse lands whenever non-empty region slots exist
+                // (`has_region_slots` — same predicate as `needs_geometry`), so
+                // the deferred publish is guaranteed to happen with real offsets.
+                None => {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "defer republish for {host}: tree pending, region geometry unknown"
+                    );
+                    return false;
+                }
+            }
         } else {
             HashMap::new()
         };
@@ -669,25 +697,31 @@ impl DiagnosticPublisher {
 
     /// Map each currently-resolvable injection region of the host document to its
     /// offset, recomputed from the live document so region push slots re-anchor
-    /// after edits above them. Empty when the document is missing or has no
-    /// injections.
-    fn current_region_offsets(&self, host: &Url) -> HashMap<String, RegionOffset> {
+    /// after edits above them.
+    ///
+    /// `None` means the geometry is **unknown**: the document is open but has no
+    /// parse snapshot (`did_change` cleared the tree; the off-ingress reparse
+    /// hasn't landed) — the caller must defer publishing rather than treat the
+    /// regions as gone. `Some(empty)` means there legitimately are no regions to
+    /// anchor: the document is closed, or its language resolves to no injection
+    /// query — stale region slots drop from the merge.
+    fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
         let mut offsets = HashMap::new();
 
         let Some(doc) = self.documents.get(host) else {
-            return offsets;
+            return Some(offsets); // closed host: nothing to anchor against
         };
         let Some(snapshot) = doc.snapshot() else {
-            return offsets;
+            return None; // open but tree pending: geometry unknown, defer
         };
         let Some(language_name) =
             self.language
                 .detect_language(host.path(), snapshot.text(), None, doc.language_id())
         else {
-            return offsets;
+            return Some(offsets);
         };
         let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return offsets;
+            return Some(offsets);
         };
 
         let resolved_regions = match self
@@ -714,7 +748,7 @@ impl DiagnosticPublisher {
                 ),
             );
         }
-        offsets
+        Some(offsets)
     }
 }
 
@@ -1037,6 +1071,107 @@ mod tests {
         assert!(
             !publisher.republish(&uri).await,
             "re-publishing the identical set must report unchanged (no redundant refresh)"
+        );
+    }
+
+    #[tokio::test]
+    async fn republish_defers_while_region_geometry_is_unknown() {
+        // `did_change` clears the visible tree; until the off-ingress reparse
+        // lands, `doc.snapshot()` is `None` and the regions' current offsets are
+        // unknown. A republish in that window must DEFER (publish nothing,
+        // record nothing) instead of merging with empty offsets — which silently
+        // dropped every region push slot and flapped the editor between the full
+        // and the region-less set on each edit cycle. The document here is
+        // inserted with no tree, modelling exactly that window.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/host_geometry_unknown.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "```lua\nlocal x = 1\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None, // no tree: snapshot() is None
+        );
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Region("region-1".to_string()),
+            "lua_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("unused variable")],
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        assert!(
+            !publisher.republish(&uri).await,
+            "a republish with live region slots but no parse snapshot must defer"
+        );
+        // Nothing was recorded as last-published: once the parse lands, the same
+        // merged set must still count as a change (the deferred publish happens).
+        assert!(
+            server.diagnostics.published_set_changed(&uri, &[]),
+            "deferral must not record a last-published set"
+        );
+    }
+
+    #[tokio::test]
+    async fn republish_proceeds_without_a_tree_when_region_slots_are_empty() {
+        // The deferral is keyed on NON-EMPTY region slots (mirroring
+        // `has_region_slots`, the reparse loop's backstop gate). A host whose
+        // only region slot is an empty clearing push needs no geometry — its
+        // merge drops nothing real — so it publishes even while the tree is
+        // pending. If this deferred instead, the post-parse backstop would skip
+        // it (`has_region_slots` is false) and the publish would be lost.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/host_empty_region_slot.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "```lua\nlocal x = 1\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Region("region-1".to_string()),
+            "lua_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            Vec::new(), // a clearing push: nothing to anchor
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        assert!(
+            publisher.republish(&uri).await,
+            "an all-empty region snapshot needs no geometry; the (empty) merge publishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_region_offsets_distinguishes_unknown_from_absent_geometry() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let publisher = DiagnosticPublisher::new(server);
+
+        // Open document without a tree: geometry UNKNOWN → None (defer).
+        let pending = Url::parse("file:///test/pending.md").unwrap();
+        server.documents.insert(
+            pending.clone(),
+            "# doc".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert!(
+            publisher.current_region_offsets(&pending).is_none(),
+            "an open document with no parse snapshot has unknown geometry"
+        );
+
+        // Closed (never-opened) document: geometry ABSENT → Some(empty) (stale
+        // region slots legitimately drop; didClose's clearing publish proceeds).
+        let closed = Url::parse("file:///test/closed.md").unwrap();
+        assert!(
+            publisher
+                .current_region_offsets(&closed)
+                .is_some_and(|offsets| offsets.is_empty()),
+            "a closed document has no regions to anchor, not unknown geometry"
         );
     }
 
