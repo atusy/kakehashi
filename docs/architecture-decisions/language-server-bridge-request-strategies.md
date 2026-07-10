@@ -40,7 +40,8 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 │         │  on "Serialize"              │                        │
 │         └──────────────────────────────┘                        │
 │                                                                 │
-│  Result: Location in serde crate → FILTER OUT (not in injection)│
+│  Result: Location in serde crate → KEPT (real file on disk);   │
+│  only OTHER VIRTUAL-REGION locations are filtered out           │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -91,7 +92,9 @@ Request (cursor in injection) ──▶ Forward to language server
                                          │
                                          ▼
                                   Filter response
-                                  (remove cross-file locations)
+                                  (translate same-region virtual URIs,
+                                   keep real-file URIs, drop other
+                                   virtual-region URIs)
                                          │
                                          ▼
                                   Translate positions
@@ -106,7 +109,7 @@ Request (cursor in injection) ──▶ Forward to language server
 |--------|----------|
 | Input | Position (host → virtual translation) |
 | Output | Location or Location[] |
-| Cross-file | Filter out locations outside virtual document |
+| Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
 | Position mapping | Range start/end: virtual → host |
 
 #### textDocument/references
@@ -115,10 +118,12 @@ Request (cursor in injection) ──▶ Forward to language server
 |--------|----------|
 | Input | Position + includeDeclaration flag |
 | Output | Location[] |
-| Cross-file | **Filter out** locations outside virtual document |
+| Cross-file | Keep real-file locations; translate same-region virtual URIs; drop other virtual regions |
 | Position mapping | Each location's range: virtual → host |
 
-**Important**: References may return many locations from external files. Only references within the same injection region are meaningful.
+**Important**: Real-file locations (e.g. library sources on disk) are kept —
+they are valid navigation targets. Only locations in OTHER virtual regions are
+dropped, since their URIs are meaningless to the editor.
 
 #### textDocument/hover
 
@@ -340,12 +345,12 @@ foldingRange, linkedEditingRange, … — are implemented and documented in
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| definition | ✅ Implemented | Full delegation with response filtering |
+| definition | ✅ Implemented | Full delegation; real-file URIs kept, cross-region virtual URIs dropped |
 | hover | ✅ Implemented | Pass-through with position translation |
 | signatureHelp | ✅ Implemented | Pass-through |
 | completion | ✅ Implemented | Fail-closed edit guards; atomic additionalTextEdits drop |
 | completionItem/resolve | ✅ Implemented | Envelope-routed; an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set |
-| references | ✅ Implemented | With cross-file filtering |
+| references | ✅ Implemented | Real-file URIs kept, cross-region virtual URIs dropped |
 | rename | ✅ Implemented | With workspace edit validation |
 | codeAction | ✅ Implemented | With edit filtering (incl. resolve + executeCommand routing) |
 | formatting | ✅ Implemented | Whole-response atomic drop on unsafe edits |
