@@ -593,7 +593,8 @@ block that prompted the server's request (edits spanning multiple virtual
 URIs are rejected on cardinality grounds; single-target requests can still
 be rejected on the usual grounds — unknown/stale URI, virtual-URI file
 operation, region escape). Real-file and — for navigation/references/rename — host-URI
-results pass through, while INJECTION-layer code actions (and applyEdit
-requests that also touch a virtual document) region-bound host-URI edits.
+results pass through, while injection-layer code actions (and applyEdit
+requests that also touch a virtual document) bound host-URI edits to the
+region.
 The surrounding host document can be bridged to the host language's own
 servers via `bridge._self` (host-document-bridge).
