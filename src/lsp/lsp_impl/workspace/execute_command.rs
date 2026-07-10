@@ -31,6 +31,13 @@ impl Kakehashi {
         // and may queue nothing). Fail-soft: any gap (foreign command, unparseable
         // host URI, undetectable host language, no matching injection) just skips
         // the sync and dispatches as before.
+        // Subscribe for the client's $/cancelRequest BEFORE the first await:
+        // the forwarder does not buffer cancels that arrive pre-subscribe, so
+        // subscribing after the (up to SYNC_TIMEOUT) pre-sync would silently
+        // drop a cancel fired while it runs. Subscribed here, such a cancel is
+        // latched in the receiver and the select below sees it immediately.
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+
         self.sync_origin_documents_before_execute(&params, &settings)
             .await;
 
@@ -39,14 +46,13 @@ impl Kakehashi {
         // the registry, the downstream answers -32800, and fail-soft parsing
         // would otherwise collapse that to `Ok(None)` (the same masking the
         // multi-region codeAction walk already fixed).
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let pool = self.bridge.pool_arc();
         let dispatch = pool.dispatch_execute_command(params, &settings, upstream_id);
         let result = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
-                result = dispatch => Ok(result),
+                outcome = dispatch => Ok(outcome),
             },
             None => Ok(dispatch.await),
         };
