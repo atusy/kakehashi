@@ -118,9 +118,10 @@ the isolated snippet, any edits it returns — including auto-import edits — a
 placed relative to the embedded block, so file-level imports may not land where they
 would in a standalone file. Edits that would corrupt the host document around the
 embedded block (escape the region, break blockquote `> ` prefixes, or merge content
-into the closing fence) are dropped fail-closed: an unsafe primary edit drops the
-completion item, an unsafe auto-import set is dropped whole while the completion
-itself still applies. Default combine strategy: `preferred`.
+into the closing fence) are dropped fail-closed: at completion time an unsafe
+primary edit drops the item and an unsafe auto-import set is dropped whole while
+the completion itself still applies; at resolve time an unsafe resolved response
+is discarded and the unresolved item is served instead. Default combine strategy: `preferred`.
 
 ### Signature help
 

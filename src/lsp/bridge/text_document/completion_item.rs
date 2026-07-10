@@ -18,7 +18,10 @@ use tower_lsp_server::ls_types::{CompletionItem, Position};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error};
+use super::super::protocol::{
+    JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
+    translate_host_range_to_virtual,
+};
 use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
     transform_completion_item,
@@ -144,7 +147,15 @@ impl LanguageServerPool {
                 }
             };
 
-        let request = build_completion_resolve_request(&item, request_id);
+        // Forward with the item's edit ranges restored to VIRTUAL coordinates
+        // (the served item is host-translated; a downstream that echoes the
+        // ranges verbatim would otherwise get them re-translated on the way
+        // back — a double shift the safety guard can't always catch). The
+        // original host-coordinate `item` is kept untouched for the
+        // fail-soft returns below. Mirrors the codeAction resolve path.
+        let mut outgoing = item.clone();
+        translate_item_ranges_host_to_virtual(&mut outgoing, &RegionOffset::from(&envelope.offset));
+        let request = build_completion_resolve_request(&outgoing, request_id);
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
@@ -233,6 +244,28 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
         return None;
     }
     serde_json::from_value(result).ok()
+}
+
+/// Translate a served (host-coordinate) item's edit ranges back to virtual
+/// coordinates before forwarding it in a `completionItem/resolve` request —
+/// the inverse of `transform_completion_item`'s range translation.
+fn translate_item_ranges_host_to_virtual(item: &mut CompletionItem, offset: &RegionOffset) {
+    if let Some(text_edit) = &mut item.text_edit {
+        match text_edit {
+            tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
+                translate_host_range_to_virtual(&mut edit.range, offset);
+            }
+            tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                translate_host_range_to_virtual(&mut edit.insert, offset);
+                translate_host_range_to_virtual(&mut edit.replace, offset);
+            }
+        }
+    }
+    if let Some(additional_edits) = &mut item.additional_text_edits {
+        for edit in additional_edits.iter_mut() {
+            translate_host_range_to_virtual(&mut edit.range, offset);
+        }
+    }
 }
 
 /// Restore the envelope into a resolved item's `data` field.
@@ -636,5 +669,42 @@ mod tests {
                 line_column_offsets: Some(vec![0])
             }
         );
+    }
+
+    #[test]
+    fn resolve_forwards_edit_ranges_in_virtual_coordinates() {
+        // The served item is host-translated (region at host line 5); the
+        // outgoing resolve must restore virtual coordinates or a downstream
+        // echoing the ranges verbatim gets them double-shifted on return.
+        let mut item = CompletionItem {
+            label: "print".to_string(),
+            text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
+                tower_lsp_server::ls_types::TextEdit {
+                    range: tower_lsp_server::ls_types::Range {
+                        start: Position {
+                            line: 5,
+                            character: 2,
+                        },
+                        end: Position {
+                            line: 5,
+                            character: 7,
+                        },
+                    },
+                    new_text: "print".to_string(),
+                },
+            )),
+            ..Default::default()
+        };
+        let envelope = test_envelope();
+        let offset = RegionOffset::from(&envelope.offset);
+
+        translate_item_ranges_host_to_virtual(&mut item, &offset);
+
+        let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &item.text_edit
+        else {
+            panic!("edit variant preserved");
+        };
+        assert_eq!(edit.range.start.line, 0, "host line 5 → virtual line 0");
+        assert_eq!(edit.range.end.line, 0);
     }
 }

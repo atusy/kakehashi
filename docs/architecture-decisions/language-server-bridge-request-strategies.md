@@ -195,7 +195,9 @@ But line 0 of the virtual document maps to the injection start line in the host�
   fallback, and snippet variables whose client-side expansion is unknowable)
   is validated against the injection region — containment, per-line prefix
   preservation, and the fence-boundary rule. An unsafe primary drops the
-  whole item.
+  whole item at completion time; at `completionItem/resolve` time the unsafe
+  resolved response is discarded and the original (already-validated)
+  unresolved item is served instead.
 - `additionalTextEdits` are validated as one atomic set: any unsafe member
   drops the entire array (never a subset — the array can carry paired halves
   of one operation). The item is kept; its primary insertion stays
