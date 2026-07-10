@@ -218,6 +218,23 @@ impl BridgeCoordinator {
         self.pool.resolve_virtual_uri(virtual_uri).await
     }
 
+    /// The version currently tracked for a virtual document on one connection
+    /// (didOpen = 1, each content-changing didChange bumps it; the bridge's
+    /// own revision counter, not a delivery receipt — see
+    /// `DocumentTracker::document_version`). `None` when the document is not
+    /// tracked for this connection. Used by the inbound `workspace/applyEdit`
+    /// translation to validate downstream-supplied `TextDocumentEdit.version`s.
+    /// Delegates to the pool.
+    pub(crate) async fn virtual_document_version(
+        &self,
+        virtual_uri: &str,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+    ) -> Option<i32> {
+        self.pool
+            .virtual_document_version(virtual_uri, connection_key)
+            .await
+    }
+
     /// Access the underlying node tracker.
     ///
     /// Used by handlers for `InjectionResolver::resolve_at_byte_offset()`.
@@ -305,6 +322,20 @@ impl BridgeCoordinator {
     ) {
         self.pool
             .register_opened_document(host_uri, virtual_uri, connection_key)
+            .await
+    }
+
+    /// Bump a virtual document's tracked version, as a content-changing
+    /// `didChange` forward would (test helper for the applyEdit version
+    /// validation).
+    #[cfg(test)]
+    pub(crate) async fn increment_document_version_for_test(
+        &self,
+        virtual_uri: &crate::lsp::bridge::protocol::VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+    ) -> Option<i32> {
+        self.pool
+            .increment_document_version(virtual_uri, connection_key)
             .await
     }
 

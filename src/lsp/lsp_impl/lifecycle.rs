@@ -1255,6 +1255,7 @@ fn spawn_upstream_request(
             }
             UpstreamRequest::ApplyEdit {
                 params,
+                connection,
                 reply,
                 cancel,
             } => {
@@ -1284,11 +1285,24 @@ fn spawn_upstream_request(
                 // Translate virtual-document edits back to host coordinates
                 // before forwarding (#568). Unlike showDocument there is no
                 // safe degraded forward: an untranslatable edit (unknown/stale
-                // region, virtual-URI file ops, multi-region edit) is answered
-                // `applied: false` locally with a failureReason, never sent to
-                // the editor. See `ApplyEditTranslator::translate`.
+                // region, virtual-URI file ops, multi-region edit, or a
+                // versioned edit whose version no longer matches what the
+                // bridge tracks for `connection`) is answered `applied: false`
+                // locally with a failureReason, never sent to the editor. See
+                // `ApplyEditTranslator::translate`.
+                // The editor answers `failedChange` as an index into the
+                // FORWARDED documentChanges array; the downstream interprets
+                // it against the array it SENT. Translation can REMOVE no-op
+                // entries (never reorder or insert), so a changed entry count
+                // means the two index spaces diverged and the index must be
+                // dropped rather than relayed misaligned — `applied` and
+                // `failureReason` still relay.
+                let sent_change_count =
+                    super::apply_edit_translation::document_change_count(&params);
                 let params = match &translators {
-                    Some(translators) => translators.apply_edit.translate(params).await,
+                    Some(translators) => {
+                        translators.apply_edit.translate(params, &connection).await
+                    }
                     None => Ok(params),
                 };
                 let response = match params {
@@ -1311,43 +1325,55 @@ fn spawn_upstream_request(
                     // but forwarding `params: null` on the off chance it did
                     // would send the editor an invalid request; answer local
                     // applied:false with a serialization reason instead.
-                    Ok(params) => match serde_json::to_value(params) {
-                        Ok(value) => {
-                            let id = client.next_request_id();
-                            forward_with_cancel(
-                                &client,
-                                id,
-                                "workspace/applyEdit",
-                                value,
-                                &cancel.token,
-                            )
-                            .await
-                            .and_then(|v| {
-                                serde_json::from_value::<ApplyWorkspaceEditResponse>(v).ok()
-                            })
-                            // Editor error/cancel, or a response that didn't
-                            // parse as an ApplyWorkspaceEditResponse: the
-                            // protocol default — the edit was not applied.
-                            .unwrap_or(ApplyWorkspaceEditResponse {
+                    Ok(params) => {
+                        let forwarded_change_count =
+                            super::apply_edit_translation::document_change_count(&params);
+                        match serde_json::to_value(params) {
+                            Ok(value) => {
+                                let id = client.next_request_id();
+                                let mut response = forward_with_cancel(
+                                    &client,
+                                    id,
+                                    "workspace/applyEdit",
+                                    value,
+                                    &cancel.token,
+                                )
+                                .await
+                                .and_then(|v| {
+                                    serde_json::from_value::<ApplyWorkspaceEditResponse>(v).ok()
+                                })
+                                // Editor error/cancel, or a response that didn't
+                                // parse as an ApplyWorkspaceEditResponse: the
+                                // protocol default — the edit was not applied.
+                                .unwrap_or(
+                                    ApplyWorkspaceEditResponse {
+                                        applied: false,
+                                        // Covers editor error, cancellation, AND an
+                                        // unparseable response — neutral wording (like
+                                        // the reader drop-path) so a cancel/transport
+                                        // failure isn't misattributed to the editor.
+                                        failure_reason: Some(
+                                            "kakehashi: no valid workspace/applyEdit response"
+                                                .to_string(),
+                                        ),
+                                        failed_change: None,
+                                    },
+                                );
+                                if forwarded_change_count != sent_change_count {
+                                    // Index spaces diverged; see above.
+                                    response.failed_change = None;
+                                }
+                                response
+                            }
+                            Err(e) => ApplyWorkspaceEditResponse {
                                 applied: false,
-                                // Covers editor error, cancellation, AND an
-                                // unparseable response — neutral wording (like
-                                // the reader drop-path) so a cancel/transport
-                                // failure isn't misattributed to the editor.
-                                failure_reason: Some(
-                                    "kakehashi: no valid workspace/applyEdit response".to_string(),
-                                ),
+                                failure_reason: Some(format!(
+                                    "kakehashi: could not serialize the workspace/applyEdit request: {e}"
+                                )),
                                 failed_change: None,
-                            })
+                            },
                         }
-                        Err(e) => ApplyWorkspaceEditResponse {
-                            applied: false,
-                            failure_reason: Some(format!(
-                                "kakehashi: could not serialize the workspace/applyEdit request: {e}"
-                            )),
-                            failed_change: None,
-                        },
-                    },
+                    }
                 };
                 inbound_request_registry.unregister(
                     cancel.connection_id,
@@ -3003,6 +3029,7 @@ mod tests {
                     "edit": { "changes": { "file:///x.rs": [] } }
                 }))
                 .unwrap(),
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 reply: reply_tx,
                 cancel: forwarded_cancel,
             })
@@ -3079,6 +3106,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { "file:///x.rs": [] } }
                 }))
@@ -3101,6 +3129,132 @@ mod tests {
         let response = reply_rx.await.expect("reply delivered");
         assert!(response.applied);
         assert_eq!(response.failure_reason, None);
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    /// The editor's `failedChange` indexes the FORWARDED documentChanges
+    /// array. When translation removed an entry (here: a no-op virtual
+    /// entry), the index spaces diverge and the relayed response must DROP
+    /// the index instead of misindexing the downstream's original array;
+    /// with no removal the index must relay untouched.
+    #[tokio::test]
+    async fn forwarding_loop_drops_failed_change_only_when_translation_removed_entries() {
+        use crate::lsp::bridge::{BridgeCoordinator, UpstreamRequest, VirtualDocumentUri};
+        use futures::{SinkExt, StreamExt};
+        use std::str::FromStr;
+        use tower_lsp_server::jsonrpc::Response;
+
+        let (client, mut requests, mut responses) = init_client_and_socket().await;
+
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let translators = Some(Arc::new(UpstreamRequestTranslators {
+            show_document: ShowDocumentTranslator::new(
+                Arc::new(crate::document::DocumentStore::new()),
+                Arc::new(crate::language::LanguageCoordinator::new()),
+                Arc::new(BridgeCoordinator::new()),
+            ),
+            apply_edit: ApplyEditTranslator::new(
+                Arc::new(crate::document::DocumentStore::new()),
+                Arc::new(crate::language::LanguageCoordinator::new()),
+                Arc::new(BridgeCoordinator::new()),
+            ),
+        }));
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            translators,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+            true,
+        ));
+
+        let host = tower_lsp_server::ls_types::Uri::from_str("file:///project/doc.md").unwrap();
+        let virtual_uri =
+            VirtualDocumentUri::new(&host, "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV").to_uri_string();
+        let real_edit = serde_json::json!({
+            "textDocument": { "uri": "file:///x.rs", "version": null },
+            "edits": [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                },
+                "newText": "x"
+            }]
+        });
+
+        // Round 1: [no-op virtual entry, real edit] — the no-op is removed
+        // before forwarding, so the editor's failedChange: 0 (the real edit,
+        // index 0 FORWARDED) would misindex the downstream's array (where
+        // index 0 is the virtual no-op). It must be dropped.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ApplyEdit {
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                params: serde_json::from_value(serde_json::json!({
+                    "edit": { "documentChanges": [
+                        {
+                            "textDocument": { "uri": virtual_uri, "version": null },
+                            "edits": []
+                        },
+                        real_edit.clone()
+                    ] }
+                }))
+                .unwrap(),
+                reply: reply_tx,
+                cancel: test_forwarded_cancel(),
+            })
+            .unwrap();
+        let req = requests.next().await.expect("applyEdit emitted");
+        let id = req.id().expect("request has an id").clone();
+        let _ = responses
+            .send(Response::from_ok(
+                id,
+                serde_json::json!({ "applied": false, "failedChange": 0 }),
+            ))
+            .await;
+        let response = reply_rx.await.expect("reply delivered");
+        assert!(!response.applied);
+        assert_eq!(
+            response.failed_change, None,
+            "a failedChange computed against a shrunken array must be dropped"
+        );
+
+        // Round 2 (control): real-only edit, nothing removed — the index
+        // spaces align and failedChange must relay untouched.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ApplyEdit {
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
+                params: serde_json::from_value(serde_json::json!({
+                    "edit": { "documentChanges": [real_edit] }
+                }))
+                .unwrap(),
+                reply: reply_tx,
+                cancel: test_forwarded_cancel(),
+            })
+            .unwrap();
+        let req = requests.next().await.expect("applyEdit emitted");
+        let id = req.id().expect("request has an id").clone();
+        let _ = responses
+            .send(Response::from_ok(
+                id,
+                serde_json::json!({ "applied": false, "failedChange": 0 }),
+            ))
+            .await;
+        let response = reply_rx.await.expect("reply delivered");
+        assert_eq!(
+            response.failed_change,
+            Some(0),
+            "with aligned index spaces the editor's failedChange must relay"
+        );
 
         cancel.cancel();
         let _ = loop_handle.await;
@@ -3154,10 +3308,11 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 // A NON-empty edit against a virtual URI that resolves to no open
                 // document: the translator can't map it, so the loop must reject
-                // it locally. (An empty edit array would be a no-op forwarded
-                // verbatim — see `collect_virtual_uris`.)
+                // it locally. (An empty edit array would be a no-op removed
+                // before forwarding — see `remove_empty_virtual_entries`.)
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { virtual_uri: [
                         { "range": {
