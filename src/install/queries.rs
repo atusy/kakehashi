@@ -535,12 +535,11 @@ pub fn remove_query_install_and_backups(
         // own installers): already gone is the desired end state, so treat
         // it as removed rather than failing the uninstall.
         match fs::remove_dir_all(&queries_dir) {
-            Ok(()) => removal.removed_queries = true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                removal.removed_queries = true;
-            }
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(QueryInstallError::IoError(e)),
         }
+        removal.removed_queries = true;
     }
 
     // Propagate per-entry read_dir errors: uninstall must not report success
