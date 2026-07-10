@@ -67,9 +67,9 @@ pub(crate) fn workspace_edit_has_effect(edit: &WorkspaceEdit) -> bool {
         .is_some_and(|changes| changes.values().any(|edits| !edits.is_empty()));
     let doc_changes_has_edit = match &edit.document_changes {
         None => false,
-        Some(DocumentChanges::Edits(edits)) => edits.iter().any(|edit| !edit.edits.is_empty()),
+        Some(DocumentChanges::Edits(edits)) => edits.iter().any(|e| !e.edits.is_empty()),
         Some(DocumentChanges::Operations(ops)) => ops.iter().any(|op| match op {
-            DocumentChangeOperation::Edit(edit) => !edit.edits.is_empty(),
+            DocumentChangeOperation::Edit(e) => !e.edits.is_empty(),
             DocumentChangeOperation::Op(_) => true,
         }),
     };

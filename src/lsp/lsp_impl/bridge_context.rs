@@ -215,7 +215,10 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
                 return list.is_empty();
             }
         }
-        if object.contains_key("changes") || object.contains_key("documentChanges") {
+        if object.contains_key("changes")
+            || object.contains_key("documentChanges")
+            || object.contains_key("changeAnnotations")
+        {
             return serde_json::from_value::<WorkspaceEdit>(value.clone())
                 .map(|edit| !workspace_edit_has_effect(&edit))
                 .unwrap_or(false);
@@ -226,9 +229,10 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
 
 fn is_empty_host_layer_value(request_method: &str, value: &serde_json::Value) -> bool {
     if request_method == "textDocument/rename" {
-        // Rename must reject malformed WorkspaceEdits before host-server
-        // preferred fan-in decides a winner; otherwise a bad higher-priority
-        // response would parse to None later and mask lower-priority edits.
+        // This is intentionally stricter than is_empty_layer_value: rename
+        // must reject malformed WorkspaceEdits before host-server preferred
+        // fan-in decides a winner; otherwise a bad higher-priority response
+        // would parse to None later and mask lower-priority edits.
         return serde_json::from_value::<WorkspaceEdit>(value.clone())
             .map(|edit| !workspace_edit_has_effect(&edit))
             .unwrap_or(true);
@@ -1675,6 +1679,11 @@ mod tests {
         })));
         assert!(is_empty_layer_value(&serde_json::json!({
             "documentChanges": []
+        })));
+        assert!(is_empty_layer_value(&serde_json::json!({
+            "changeAnnotations": {
+                "rename": { "label": "rename symbol" }
+            }
         })));
     }
 
