@@ -116,7 +116,11 @@ Additional details for a highlighted item (documentation, extra edits) are resol
 on demand from the server that produced it. Because the language server only sees
 the isolated snippet, any edits it returns — including auto-import edits — are
 placed relative to the embedded block, so file-level imports may not land where they
-would in a standalone file. Default combine strategy: `preferred`.
+would in a standalone file. Edits that would corrupt the host document around the
+embedded block (escape the region, break blockquote `> ` prefixes, or merge content
+into the closing fence) are dropped fail-closed: an unsafe primary edit drops the
+completion item, an unsafe auto-import set is dropped whole while the completion
+itself still applies. Default combine strategy: `preferred`.
 
 ### Signature help
 

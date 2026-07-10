@@ -186,12 +186,22 @@ fn main() {
 
 But line 0 of the virtual document maps to the injection start line in the host—**inside the code fence**, not at the file top where imports belong.
 
-**Solutions**:
-1. **Filter out**: Remove additionalTextEdits outside injection range (loses auto-import)
-2. **Warn user**: Apply main edit, show message about skipped import
-3. **Smart placement**: Detect import patterns and place at injection start (complex)
+**Implemented policy** (fail-closed, atomic):
 
-Recommended: Option 1 or 2 for initial implementation.
+- The primary `textEdit`/`InsertReplaceEdit` (or the insertText/label
+  fallback, and snippet variables whose client-side expansion is unknowable)
+  is validated against the injection region — containment, per-line prefix
+  preservation, and the fence-boundary rule. An unsafe primary drops the
+  whole item.
+- `additionalTextEdits` are validated as one atomic set: any unsafe member
+  drops the entire array (never a subset — the array can carry paired halves
+  of one operation). The item is kept; its primary insertion stays
+  mechanically applicable, though possibly semantically incomplete without
+  its auto-import (availability over fidelity, with a warn log).
+- The same guards apply to inlay-hint `textEdits` (the hint is kept, its
+  accept-edit set drops whole) and color presentations (an unsafe explicit or
+  implicit label-replacement edit drops the presentation; unsafe
+  additionalTextEdits drop as an array).
 
 #### textDocument/rename
 
@@ -223,7 +233,10 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Position mapping | All edit ranges |
 | Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline over `priorities` (also the membership allowlist — unlisted servers do not run). `textDocument/rangeFormatting`: `preferred` only |
 
-Single-server formatting is simple—all edits are within the virtual document.
+Formatting responses are validated per edit (virtual-EOF bounds, region
+containment, prefix preservation, fence-boundary rule) and dropped **whole**
+when any edit is unsafe — a formatter answer is one atomic diff, so applying
+only its safe edits could duplicate or lose content.
 For multiple servers, the `concatenated`
 behavior does **not** concatenate edit lists (that would overlap); it runs a
 sequential formatter pipeline over `priorities`, which is both the
