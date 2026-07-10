@@ -95,7 +95,7 @@ pub struct QueryInstallResult {
 /// segments, so anything outside nvim-treesitter's `[a-z0-9_]+` naming is
 /// rejected: a name like `../../x` (from a caller or a `; inherits:` line in
 /// a compromised or custom query source) must not escape the data dir.
-pub(crate) fn is_safe_language_name(name: &str) -> bool {
+pub fn is_safe_language_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -471,10 +471,11 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
         if !path.is_dir() {
             continue;
         }
-        let Some(language) = backup_language_name(&path) else {
-            continue;
-        };
-        recover_interrupted_query_install(queries_parent, &language)?;
+        if let Some(language) = backup_language_name(&path) {
+            recover_interrupted_query_install(queries_parent, &language)?;
+        } else if let Some(language) = temp_language_name(&path) {
+            remove_interrupted_temp_query_install(queries_parent, &language, &path)?;
+        }
     }
 
     Ok(())
@@ -539,10 +540,27 @@ fn backup_language_name(path: &Path) -> Option<String> {
     }
 }
 
+fn temp_language_name(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let (language, _, _) = generated_temp_parts(name)?;
+    if is_safe_language_name(language) {
+        Some(language.to_string())
+    } else {
+        None
+    }
+}
+
 fn generated_backup_matches_language(name: &str, language: &str) -> bool {
     matches!(
         generated_backup_parts(name),
         Some((backup_language, _, _)) if backup_language == language
+    )
+}
+
+fn generated_temp_matches_language(name: &str, language: &str) -> bool {
+    matches!(
+        generated_temp_parts(name),
+        Some((tmp_language, _, _)) if tmp_language == language
     )
 }
 
@@ -560,6 +578,37 @@ fn generated_backup_parts(name: &str) -> Option<(&str, &str, &str)> {
     } else {
         None
     }
+}
+
+fn generated_temp_parts(name: &str) -> Option<(&str, &str, &str)> {
+    let rest = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let mut parts = rest.split('.');
+    let language = parts.next()?;
+    let pid = parts.next()?;
+    let counter = parts.next()?;
+    if parts.next().is_none()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && counter.bytes().all(|b| b.is_ascii_digit())
+    {
+        Some((language, pid, counter))
+    } else {
+        None
+    }
+}
+
+fn remove_interrupted_temp_query_install(
+    queries_parent: &Path,
+    language: &str,
+    tmp_dir: &Path,
+) -> Result<(), QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
+    if let Some(name) = tmp_dir.file_name().and_then(|name| name.to_str())
+        && generated_temp_matches_language(name, language)
+    {
+        fs::remove_dir_all(tmp_dir)?;
+    }
+    Ok(())
 }
 
 fn recover_interrupted_query_install(
@@ -612,6 +661,11 @@ fn clear_uninstall_tombstone(
     language: &str,
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
+    let _replace_lock = if queries_parent.exists() {
+        Some(QueryReplaceLockGuard::acquire(queries_parent, language)?)
+    } else {
+        None
+    };
     match fs::remove_file(uninstall_tombstone_path(queries_parent, language)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -760,8 +814,9 @@ fn replace_query_dir(
         return Err(QueryInstallError::IoError(e));
     }
 
-    let _ = fs::remove_dir_all(&backup_dir);
-    let _ = fs::remove_file(backup_ownership_sidecar(&backup_dir));
+    if fs::remove_dir_all(&backup_dir).is_ok() {
+        let _ = fs::remove_file(backup_ownership_sidecar(&backup_dir));
+    }
     Ok(ReplaceQueryDirResult::Replaced)
 }
 
@@ -979,6 +1034,39 @@ mod tests {
         assert!(
             !queries_parent.exists(),
             "unsafe cleanup must not even create the queries directory"
+        );
+    }
+
+    #[test]
+    fn recover_interrupted_query_installs_removes_stranded_tmp_dirs() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tmp = queries_parent.join(".lua.123.0.tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("highlights.scm"), "(comment) @comment\n").unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            !tmp.exists(),
+            "generated staging dirs from crashed installs should be collected"
+        );
+    }
+
+    #[test]
+    fn recover_interrupted_query_installs_ignores_unsafe_tmp_language_names() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tmp = queries_parent.join(".bad-name.123.0.tmp");
+        fs::create_dir_all(&tmp).unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            tmp.exists(),
+            "tmp cleanup must only derive paths from safe generated language names"
         );
     }
 

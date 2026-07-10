@@ -281,7 +281,6 @@ fn install_language_blocking_with_query_installer(
 
     if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
         let reason = e.to_string();
-        result.parser_error = Some(reason.clone());
         result.queries_error = Some(reason);
         return result;
     }
@@ -681,5 +680,26 @@ mod tests {
             queries_error: Some("Queries failed".to_string()),
         };
         assert!(!failure.is_success());
+    }
+
+    #[test]
+    fn install_language_reports_tombstone_cleanup_as_query_error_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+        std::fs::write(data_dir.join("queries"), "not a directory").unwrap();
+
+        let result = install_language_blocking(
+            "lua",
+            data_dir,
+            false,
+            "http://127.0.0.1:1",
+            parser::ParserCompile::InProcess,
+        );
+
+        assert!(
+            result.parser_error.is_none(),
+            "parser install was never attempted, so tombstone cleanup must not be reported as a parser error"
+        );
+        assert!(result.queries_error.is_some());
     }
 }

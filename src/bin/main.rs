@@ -474,6 +474,9 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
     if name.starts_with('.') {
         return None;
     }
+    if !queries::is_safe_language_name(&name) {
+        return None;
+    }
     Some(name.to_string())
 }
 
@@ -1060,4 +1063,27 @@ async fn run_lsp_server() {
         .concurrency_level(INGRESS_CONCURRENCY)
         .serve(service)
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_query_language_name_filters_unsafe_dirs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let safe = temp.path().join("lua");
+        let unsafe_name = temp.path().join("foo.bar");
+        let hidden = temp.path().join(".lua");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&unsafe_name).unwrap();
+        std::fs::create_dir_all(&hidden).unwrap();
+
+        assert_eq!(
+            installed_query_language_name(&safe),
+            Some("lua".to_string())
+        );
+        assert_eq!(installed_query_language_name(&unsafe_name), None);
+        assert_eq!(installed_query_language_name(&hidden), None);
+    }
 }
