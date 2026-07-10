@@ -165,17 +165,20 @@ impl DiagnosticPublisher {
     }
 
     async fn publish_recorded_hosts(&self, hosts: Vec<Url>) -> usize {
-        let mut published = 0;
+        // Counts hosts whose republish warrants the pull-client nudge (Changed
+        // or Deferred) — not wire sends, which the quiet window/seal may
+        // withhold.
+        let mut nudged = 0;
         for host in hosts {
             if self.republish(&host).await.nudges_pull_clients() {
                 self.bump_current_if_open(&host);
-                published += 1;
+                nudged += 1;
             }
         }
-        if published > 0 {
+        if nudged > 0 {
             self.request_pull_diagnostic_refresh(false);
         }
-        published
+        nudged
     }
 
     /// Record a `_self` host-layer push and republish the host (host-document-bridge).
@@ -691,7 +694,9 @@ impl DiagnosticPublisher {
         // `clear_host`'s forget, which does not hold the republish lock) would
         // be exactly what defers that clearing publish. Both republishes are
         // serialized on the per-host lock, so the clearing (empty) publish
-        // always lands last.
+        // always lands last. (This ungated send shares the pre-existing
+        // record-before-send hazard: an abort landing exactly at the send
+        // below loses it — same class as main, bounded to closed-host races.)
         if self.documents.get(host).is_none() {
             log::debug!(
                 target: LOG_TARGET,
@@ -762,9 +767,9 @@ impl DiagnosticPublisher {
     /// re-running, so a defer racing the re-run schedules a fresh task rather
     /// than being absorbed by one that already woke — and BAILS when the gate
     /// entry is gone (`didClose` or the seal forgot it while this task was
-    /// parked): the debt was cancelled, and a stale task from a previous
-    /// document incarnation must not republish/stamp state a reopened
-    /// incarnation never owed.
+    /// parked): the debt was cancelled. (A stale task waking against a
+    /// reopened incarnation's fresh entry is instead kept safe by the
+    /// defer-reschedule design — see `wire_gate_take_pending`.)
     ///
     /// Shutdown: a task parked at teardown fires up to one window later and
     /// sends a fire-and-forget notification into a closing client — tower-lsp
@@ -1308,8 +1313,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn republish_reports_whether_the_published_set_changed() {
-        // `republish` returns whether it published a *changed* set — the gate the
+    async fn republish_reports_whether_the_recorded_set_changed() {
+        // `republish` reports whether the merged-and-RECORDED set changed (the
+        // wire send may be withheld by the quiet window or sealed) — the gate the
         // push-origin paths use to decide whether to also emit
         // `workspace/diagnostic/refresh` (so a pull-mode editor re-pulls and sees an
         // async host push; push/pull-divergence, #422). A non-empty first publish is
@@ -1386,9 +1392,10 @@ mod tests {
     #[tokio::test]
     async fn republish_under_seal_keeps_the_change_contract() {
         // With the wire sealed, the merge and the last-published recording must
-        // behave exactly as in publish mode: a changed set reports true (drives
-        // the coverage bump + refresh — the sealed setup's delivery signal), an
-        // identical re-merge reports false. If the seal skipped the recording,
+        // behave exactly as in publish mode: a changed set reports Changed
+        // (drives the coverage bump + refresh — the sealed setup's delivery
+        // signal), an identical re-merge reports Unchanged. If the seal skipped
+        // the recording,
         // every push would re-report "changed" and spam refreshes forever.
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();

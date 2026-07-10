@@ -151,9 +151,12 @@ Seal prerequisites and caveats:
   host-bridge requests. Don't seal a language that relies on a push-only
   `_self` server.
 - Apply the seal at startup. A mid-session seal (via
-  `didChangeConfiguration`) leaves the last pre-seal set frozen in the
-  editor's push namespace until `didClose` — config changes do not republish
-  open hosts (a pre-existing property of this pipeline).
+  `didChangeConfiguration`) leaves the last set that actually reached the
+  wire frozen in the editor's push namespace until `didClose` (a send
+  withheld by the quiet window at seal time is dropped with the gate state,
+  so the frozen view can be one window older than the last recorded set) —
+  config changes do not republish open hosts (a pre-existing property of
+  this pipeline).
 - Prior to this decision `priorities = []` on this method gated only the
   pull feed; existing configs using it now also stop the wire sends.
 

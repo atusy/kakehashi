@@ -445,17 +445,22 @@ struct RefreshFlight {
 /// change (window already elapsed, or first publish) passes through
 /// immediately — the gate adds no latency outside bursts.
 struct WireGate {
-    /// When the last `publishDiagnostics` was actually written to the wire —
-    /// entries are minted by [`DiagnosticAggregator::wire_gate_commit_send`]
-    /// right after a completed send, so an entry always has one (a host with
-    /// no committed send yet simply has no entry, and its publish passes).
-    last_sent_at: tokio::time::Instant,
+    /// When the last `publishDiagnostics` was actually **committed** (written
+    /// to the wire and stamped by [`DiagnosticAggregator::wire_gate_commit_send`]).
+    /// `None` means the entry was minted by an admit whose send has not
+    /// committed (yet, or ever — an aborted send): such a host's next publish
+    /// passes immediately, and the `dirty` debt below records that the
+    /// last-recorded set may never have reached the wire.
+    last_sent_at: Option<tokio::time::Instant>,
     /// A trailing republish task is scheduled; bounds the tasks to one per
     /// host per window.
     pending: bool,
-    /// A *changed* merge was withheld from the wire: the editor's
-    /// push-namespace view lags the recorded last-published set, so a later
-    /// republish must send even if its own merge compares unchanged.
+    /// The recorded last-published set may not have reached the editor's
+    /// push namespace: either a changed merge was withheld by the quiet
+    /// window, or a send was admitted but its commit never happened (aborted
+    /// at the send await). A later republish must send even if its own merge
+    /// compares unchanged. Set on every admit, cleared only by the post-send
+    /// commit.
     dirty: bool,
 }
 
@@ -821,9 +826,11 @@ impl DiagnosticAggregator {
 
     /// Bump a host's `current` coverage version (#497) — a **push-origin** change the
     /// editor doesn't know about just landed, so its last-pulled view is now stale.
-    /// Called only from the push/eviction paths (`publish_host_push`,
-    /// `publish_region_push`, `evict_connection_diagnostics`) when their `republish`
-    /// published a changed set — paired with the gated `request_pull_diagnostic_refresh`.
+    /// Called only from the push/eviction paths (`publish_recorded_hosts`,
+    /// `evict_connection_diagnostics`) when their `republish` reported Changed
+    /// (a changed merge was recorded; the wire send may be withheld or sealed)
+    /// or Deferred (the cache changed but region geometry was pending) —
+    /// paired with the gated `request_pull_diagnostic_refresh`.
     ///
     /// Deliberately **not** bumped on editor-originated republishes (`publish_pull_layer`
     /// /`clear_pull_layer`/edit-remerge/`clear_host`): those are answered by the
@@ -908,12 +915,13 @@ impl DiagnosticAggregator {
     }
 
     /// Decide whether a wire `publishDiagnostics` for `host` may be written
-    /// now, given the per-host quiet `window` (see [`WireGate`]). `SendNow` is
-    /// a pure decision — the caller stamps it with
-    /// [`Self::wire_gate_commit_send`] only **after** the send actually
-    /// completed, so a republish aborted at the send await (the synthetic pull
-    /// task is abortable on supersession) leaves no gate state claiming a send
-    /// that never happened, and a withheld `dirty` debt is not consumed by it.
+    /// now, given the per-host quiet `window` (see [`WireGate`]). A `SendNow`
+    /// decision marks the `dirty` debt and opens no quiet window — the caller
+    /// stamps the send with [`Self::wire_gate_commit_send`] only **after** it
+    /// actually completed, so a republish aborted at the send await (the
+    /// synthetic pull task is abortable on supersession) leaves the debt in
+    /// place: the recorded-but-unsent set forces the next republish past the
+    /// unchanged check and onto the wire.
     /// `Defer` marks `dirty` (a changed merge is being withheld) and hands the
     /// trailing-republish duty to at most one caller at a time (the first
     /// defer while no trailing task is parked). Called under the host's
@@ -925,30 +933,47 @@ impl DiagnosticAggregator {
             .wire_gate
             .lock()
             .recover_poison("DiagnosticAggregator::wire_gate");
-        // A host with no entry has no prior committed send, so its publish
-        // always passes; the entry is minted by the commit.
-        let Some(gate) = gates.get_mut(host) else {
+        // A host with no entry has no prior committed send: mint the entry
+        // with the debt already marked and pass. Marking `dirty` on EVERY
+        // admit (not just Defer) is what makes an aborted send recoverable —
+        // `published_set_changed` recorded the merge before the send, so
+        // without the debt a later identical merge would skip past the
+        // unchanged check while the editor never received the set.
+        if !gates.contains_key(host) {
+            gates.insert(
+                host.clone(),
+                WireGate {
+                    last_sent_at: None,
+                    pending: false,
+                    dirty: true,
+                },
+            );
             return WireAdmit::SendNow;
-        };
-        let elapsed = now.duration_since(gate.last_sent_at);
-        if elapsed < window {
-            gate.dirty = true;
-            let schedule_trailing = !gate.pending;
-            gate.pending = true;
-            WireAdmit::Defer {
-                schedule_trailing,
-                remaining: window - elapsed,
+        }
+        let gate = gates.get_mut(host).expect("present: checked above");
+        let elapsed = gate.last_sent_at.map(|at| now.duration_since(at));
+        match elapsed {
+            Some(elapsed) if elapsed < window => {
+                gate.dirty = true;
+                let schedule_trailing = !gate.pending;
+                gate.pending = true;
+                WireAdmit::Defer {
+                    schedule_trailing,
+                    remaining: window - elapsed,
+                }
             }
-        } else {
-            WireAdmit::SendNow
+            _ => {
+                gate.dirty = true;
+                WireAdmit::SendNow
+            }
         }
     }
 
     /// Record that a wire `publishDiagnostics` for `host` was actually sent:
-    /// stamp the send time (opening a fresh quiet window) and clear the
-    /// withheld-send `dirty` marker. Called right after the send await, under
-    /// the same republish-lock hold as the [`Self::wire_gate_admit`] that
-    /// admitted it. Clones the key only on first insert.
+    /// stamp the send time (opening a fresh quiet window) and settle the
+    /// `dirty` debt. Called right after the send await, under the same
+    /// republish-lock hold as the [`Self::wire_gate_admit`] that admitted it.
+    /// Clones the key only on first insert.
     pub(crate) fn wire_gate_commit_send(&self, host: &Url) {
         let now = tokio::time::Instant::now();
         let mut gates = self
@@ -956,13 +981,15 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::wire_gate");
         if let Some(gate) = gates.get_mut(host) {
-            gate.last_sent_at = now;
+            gate.last_sent_at = Some(now);
             gate.dirty = false;
         } else {
+            // The admit minted an entry, but a `forget_wire_gate` (seal) can
+            // race in off the happy path; re-minting settled is fine.
             gates.insert(
                 host.clone(),
                 WireGate {
-                    last_sent_at: now,
+                    last_sent_at: Some(now),
                     pending: false,
                     dirty: false,
                 },
@@ -986,11 +1013,12 @@ impl DiagnosticAggregator {
     /// re-runs `republish`, so a defer that races the re-run schedules a fresh
     /// trailing task instead of being silently absorbed by one that already
     /// woke. `false` means the entry was forgotten while the task was parked
-    /// (`didClose`, or the seal) — the withheld debt was cancelled, and the
-    /// task must bail rather than republish: a stale task from a previous
-    /// document incarnation would otherwise clobber the reopened incarnation's
-    /// `pending` marker and publish/stamp state the fresh incarnation never
-    /// owed.
+    /// (`didClose`, or the seal) — the withheld debt was cancelled and the
+    /// task must bail rather than republish. (The bail covers only the
+    /// entry-gone case: a stale task waking against a reopened incarnation's
+    /// fresh entry gets `true` and clears its `pending`, which at worst
+    /// schedules one extra trailing task — the defer-reschedule design, not
+    /// this bail, is what keeps that safe.)
     pub(crate) fn wire_gate_take_pending(&self, host: &Url) -> bool {
         if let Some(gate) = self
             .wire_gate
@@ -1209,24 +1237,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wire_gate_uncommitted_send_leaves_no_state_behind() {
-        // The admit decision is pure for SendNow: a republish aborted at the
-        // send await (synthetic pull tasks are abortable on supersession)
-        // commits nothing, so the next attempt passes again instead of being
-        // deferred behind a send that never reached the wire.
+    async fn wire_gate_uncommitted_send_keeps_the_debt() {
+        // A republish aborted at the send await (synthetic pull tasks are
+        // abortable on supersession) commits nothing: the next attempt must
+        // pass again (no phantom quiet window) AND the dirty debt minted at
+        // admit must survive — `published_set_changed` recorded the merge
+        // before the send, so without the debt a later identical merge would
+        // skip the unchanged check while the editor never received the set.
         let agg = DiagnosticAggregator::new();
         let window = std::time::Duration::from_secs(1);
 
         assert_eq!(agg.wire_gate_admit(&host(), window), WireAdmit::SendNow);
         // (no commit: the send was aborted)
+        assert!(
+            agg.wire_gate_is_dirty(&host()),
+            "the admitted-but-uncommitted send leaves its debt marked"
+        );
         assert_eq!(
             agg.wire_gate_admit(&host(), window),
             WireAdmit::SendNow,
             "an uncommitted send must not open a quiet window"
         );
+        agg.wire_gate_commit_send(&host());
         assert!(
-            !agg.wire_gate_take_pending(&host()),
-            "no entry was minted; a parked trailing task for a forgotten gate bails"
+            !agg.wire_gate_is_dirty(&host()),
+            "the completed send settles the debt"
         );
     }
 
