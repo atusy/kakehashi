@@ -86,8 +86,8 @@ driver so future reports can be evaluated with the same metrics.
 
 Reconsider scheduling only if a representative trace shows both:
 
-1. semantic responses repeatedly become ready before a competing large frame
-   starts writing; and
+1. semantic responses repeatedly become ready before a competing large response
+   frame starts writing; and
 2. ready-to-last-byte semantic p90 has at least 1 ms of avoidable delay beyond
    A/A variation.
 
@@ -145,7 +145,7 @@ compatibility path; pagination would change the protocol result and clients.
 Run the release driver three or more times for each scenario documented in
 `benches/profile/README.md`. Confirm exact response shapes, zero censored samples,
 per-method payload sizes, semantic ready-to-write/flush percentiles, and the
-`semantic-large-frame-overlap` classification. Open a new transport optimization
+`semantic-large-response-overlap` classification. Open a new transport optimization
 only when the reconsideration thresholds above are met on a representative
 configuration.
 Do not generalize this decision to large diagnostic frames until a downstream

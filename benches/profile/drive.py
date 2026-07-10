@@ -128,7 +128,7 @@ def summarize_transport_frames(frames: list[TransportFrame]) -> TransportSummary
 def classify_semantic_blocking(
     frames: list[TransportFrame], large_frame_bytes: int
 ) -> tuple[int, int]:
-    """Return (schedulable-before-start, already-writing) semantic blockers."""
+    """Classify semantic blocking behind attributed, reorderable responses."""
     schedulable = 0
     already_writing = 0
     semantics = [
@@ -142,9 +142,16 @@ def classify_semantic_blocking(
             frame
             for frame in frames
             if frame is not semantic
+            and frame.request_id is not None
+            and frame.ready_us is not None
             and frame.frame_bytes >= large_frame_bytes
             and frame.write_start_us < semantic.write_start_us
-            and (frame.flush_complete_us or frame.last_byte_us) >= semantic.ready_us
+            and (
+                frame.flush_complete_us
+                if frame.flush_complete_us is not None
+                else frame.last_byte_us
+            )
+            >= semantic.ready_us
         ]
         if not blockers:
             continue
@@ -184,6 +191,16 @@ def validate_transport_metrics(
             raise RuntimeError(
                 f"stdout metric count mismatch for {method}: expected {expected}, got {actual}"
             )
+
+
+def validate_diagnostic_report(response: dict) -> None:
+    result = response.get("result")
+    if response_status(response) != "ok" or not isinstance(result, dict):
+        raise RuntimeError(
+            f"diagnostics scenario expected a full report, got {response}"
+        )
+    if result.get("kind") != "full" or not isinstance(result.get("items"), list):
+        raise RuntimeError(f"diagnostics scenario expected full items, got {result}")
 
 
 def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
@@ -784,17 +801,7 @@ def main() -> None:
                     ]
                 )
                 for response in responses[:-1]:
-                    result = response.get("result")
-                    if response_status(response) != "ok" or not isinstance(
-                        result, dict
-                    ):
-                        raise RuntimeError(
-                            f"diagnostics scenario expected a report, got {response}"
-                        )
-                    if result.get("kind") not in ("full", "unchanged"):
-                        raise RuntimeError(
-                            f"diagnostics scenario returned invalid report kind: {result}"
-                        )
+                    validate_diagnostic_report(response)
                 semantic_responses = [responses[-1]]
             elif args.burst > 1:
                 if args.burst_edits:
@@ -949,7 +956,7 @@ def main() -> None:
             transport_frames, int(args.large_frame_kib * 1024)
         )
         sys.stderr.write(
-            f"[stdout] semantic-large-frame-overlap "
+            f"[stdout] semantic-large-response-overlap "
             f"threshold={args.large_frame_kib:g}KiB "
             f"schedulable-before-write={schedulable} "
             f"already-writing={already_writing}\n"
