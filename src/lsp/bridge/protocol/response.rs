@@ -35,7 +35,7 @@ pub(crate) fn transform_goto_response_to_host(
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
         log::warn!(
             target: "kakehashi::bridge",
-            "goto response carries neither result nor error"
+            "goto response is missing result and has no non-null error"
         );
         return None;
     };
@@ -224,13 +224,14 @@ mod tests {
         }
 
         fn log(&self, record: &Record<'_>) {
-            if CAPTURING.load(Ordering::Relaxed) && self.enabled(record.metadata()) {
-                self.messages.lock().unwrap().push(format!(
-                    "{}:{}:{}",
-                    record.level(),
-                    record.target(),
-                    record.args()
-                ));
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let message = format!("{}:{}:{}", record.level(), record.target(), record.args());
+            if CAPTURING.load(Ordering::Relaxed) {
+                self.messages.lock().unwrap().push(message);
+            } else {
+                eprintln!("{message}");
             }
         }
 
@@ -240,13 +241,14 @@ mod tests {
     fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
         INIT_LOGGER.call_once(|| {
             log::set_logger(&LOGGER).expect("test logger should install once");
-            log::set_max_level(LevelFilter::Trace);
+            log::set_max_level(LevelFilter::Warn);
         });
         let _capture = CAPTURE_LOCK.lock().unwrap();
         LOGGER.messages.lock().unwrap().clear();
         CAPTURING.store(true, Ordering::Relaxed);
-        let _guard = CaptureGuard;
+        let guard = CaptureGuard;
         f();
+        drop(guard);
         let captured = LOGGER.messages.lock().unwrap().clone();
         LOGGER.messages.lock().unwrap().clear();
         captured
@@ -303,7 +305,7 @@ mod tests {
         assert!(
             warnings.iter().any(|message| {
                 message.contains("kakehashi::bridge")
-                    && message.contains("goto response carries neither result nor error")
+                    && message.contains("goto response is missing result and has no non-null error")
             }),
             "expected missing-result goto response warning, got {warnings:?}"
         );
