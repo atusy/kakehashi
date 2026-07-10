@@ -277,27 +277,39 @@ pub(crate) fn workspace_edit_within_region(
             p.character >= offset.column_for_line(virtual_line) && !position_after(p, region_end)
         }
     };
-    let within = |range: Range| in_region(range.start) && in_region(range.end);
+    host_uri_text_edits_all(edit, host_uri, |e| {
+        in_region(e.range.start) && in_region(e.range.end)
+    })
+}
+
+/// Whether every text edit targeting `host_uri` (across both the `changes` map
+/// and `documentChanges`, unwrapping annotated edits) satisfies `pred`.
+/// Edits to other URIs are ignored; file operations carry no text edit.
+fn host_uri_text_edits_all(
+    edit: &WorkspaceEdit,
+    host_uri: &Uri,
+    pred: impl Fn(&TextEdit) -> bool,
+) -> bool {
     if let Some(changes) = &edit.changes
         && let Some(edits) = changes.get(host_uri)
-        && !edits.iter().all(|e| within(e.range))
+        && !edits.iter().all(&pred)
     {
         return false;
     }
-    let doc_edits_within = |edits: &[OneOf<TextEdit, AnnotatedTextEdit>]| {
+    let doc_edits_all = |edits: &[OneOf<TextEdit, AnnotatedTextEdit>]| {
         edits.iter().all(|one_of| {
-            let range = match one_of {
-                OneOf::Left(text_edit) => text_edit.range,
-                OneOf::Right(annotated) => annotated.text_edit.range,
+            let text_edit = match one_of {
+                OneOf::Left(text_edit) => text_edit,
+                OneOf::Right(annotated) => &annotated.text_edit,
             };
-            within(range)
+            pred(text_edit)
         })
     };
     match &edit.document_changes {
         None => {}
         Some(DocumentChanges::Edits(edits)) => {
             for e in edits {
-                if e.text_document.uri == *host_uri && !doc_edits_within(&e.edits) {
+                if e.text_document.uri == *host_uri && !doc_edits_all(&e.edits) {
                     return false;
                 }
             }
@@ -306,7 +318,7 @@ pub(crate) fn workspace_edit_within_region(
             for op in ops {
                 if let DocumentChangeOperation::Edit(e) = op
                     && e.text_document.uri == *host_uri
-                    && !doc_edits_within(&e.edits)
+                    && !doc_edits_all(&e.edits)
                 {
                     return false;
                 }
