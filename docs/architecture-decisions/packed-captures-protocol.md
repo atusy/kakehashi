@@ -58,6 +58,9 @@ The method family:
 | `kakehashi/captures/packed/full/delta` | `{ textDocument, kind, previousResultId, nodes?: false }` | `PackedResult \| PackedDelta \| null` |
 | `kakehashi/captures/packed/range` | `{ textDocument, kind, range, injection?, nodes?: false }` | `PackedRangeResult \| null` |
 
+The delta request intentionally omits `injection`: the mode is selected by the
+lineage behind `previousResultId`, matching the verbose captures protocol.
+
 `nodes` is a reserved request flag in this ADR, but only `false`/omitted is
 accepted in the initial version. A future `nodes: true` extension is described
 below and lives in a separate lineage slot.
