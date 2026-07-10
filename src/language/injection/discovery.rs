@@ -906,6 +906,12 @@ fn mask_outside_ranges(text: &str, span: Range<usize>, included: &[Range<usize>]
     let mut output = String::with_capacity(span.len());
     let mut cursor = span.start;
     for range in included {
+        if range.end <= cursor {
+            continue;
+        }
+        if range.start >= span.end {
+            break;
+        }
         let start = range.start.clamp(cursor, span.end);
         let end = range.end.clamp(start, span.end);
         push_coordinate_whitespace(&mut output, clamped_slice(text, cursor..start));
@@ -932,6 +938,7 @@ fn build_combined_virtual_content(
     let mut output = String::new();
     let mut offsets = Vec::new();
     let mut line_start = span.start;
+    let mut range_index = 0;
 
     while line_start < span.end {
         let remaining = clamped_slice(text, line_start..span.end);
@@ -946,14 +953,17 @@ fn build_combined_virtual_content(
             }
         }
 
-        let first_included = included
-            .iter()
-            .filter_map(|range| {
-                let start = range.start.max(line_start);
-                let end = range.end.min(content_end);
-                (start < end).then_some(start)
-            })
-            .min();
+        while included
+            .get(range_index)
+            .is_some_and(|range| range.end <= line_start)
+        {
+            range_index += 1;
+        }
+        let first_included = included.get(range_index).and_then(|range| {
+            let start = range.start.max(line_start);
+            let end = range.end.min(content_end);
+            (start < end).then_some(start)
+        });
 
         if let Some(first_included) = first_included {
             let host_line_start = text[..first_included]
@@ -967,7 +977,7 @@ fn build_combined_virtual_content(
             output.push_str(&mask_outside_ranges(
                 text,
                 first_included..line_end,
-                included,
+                &included[range_index..],
             ));
         } else {
             offsets.push(0);
