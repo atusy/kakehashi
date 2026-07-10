@@ -56,6 +56,17 @@ pub(crate) fn is_cancelled(token: Option<&CancelToken>) -> bool {
     token.is_some_and(|t| t.is_cancelled())
 }
 
+/// Check one out of every 64 units of linear work. Callers keep the counter
+/// local to a pass and use [`is_cancelled`] for its entry/exit checkpoints.
+#[inline]
+pub(crate) fn is_cancelled_periodically(
+    token: Option<&CancelToken>,
+    work_items: &mut usize,
+) -> bool {
+    *work_items = work_items.wrapping_add(1);
+    *work_items & 63 == 0 && is_cancelled(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

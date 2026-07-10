@@ -3,6 +3,7 @@
 //! This module handles the collection of raw tokens from a single document's
 //! highlight query, including multiline token handling and byte-to-UTF16 conversion.
 
+use crate::cancel::is_cancelled_periodically;
 use crate::config::CaptureMappings;
 use crate::text::position::Utf16LineIndex;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
@@ -369,10 +370,6 @@ pub(super) fn collect_host_tokens(
     // One atomic cancellation load per 64 query/capture/line work items keeps
     // cancellation latency bounded without putting an atomic on every token.
     let mut work_items = 0usize;
-    let mut cancellation_requested = || {
-        work_items = work_items.wrapping_add(1);
-        work_items & 63 == 0 && crate::cancel::is_cancelled(cancel)
-    };
 
     // Calculate position mapping from content-local to host document.
     // Largest line whose start byte is <= content_start_byte; line_starts[0] == 0,
@@ -398,14 +395,14 @@ pub(super) fn collect_host_tokens(
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
     while let Some(m) = matches.next() {
-        if cancellation_requested() {
+        if is_cancelled_periodically(cancel, &mut work_items) {
             return false;
         }
         let priority = parse_priority_for_pattern(query, m.pattern_index);
         let filtered_captures = crate::language::filter_captures(query, m, text);
 
         for c in filtered_captures {
-            if cancellation_requested() {
+            if is_cancelled_periodically(cancel, &mut work_items) {
                 return false;
             }
             let node = c.node;
@@ -493,7 +490,7 @@ pub(super) fn collect_host_tokens(
 
                     let mut total_length_utf16 = 0usize;
                     for row in start_pos.row..=end_pos.row {
-                        if cancellation_requested() {
+                        if is_cancelled_periodically(cancel, &mut work_items) {
                             return false;
                         }
                         let host_row = content_start_line + row;
@@ -540,7 +537,7 @@ pub(super) fn collect_host_tokens(
                     // Either no multiline support OR prefix widths present:
                     // split into per-line tokens.
                     for row in start_pos.row..=end_pos.row {
-                        if cancellation_requested() {
+                        if is_cancelled_periodically(cancel, &mut work_items) {
                             return false;
                         }
                         let host_row = content_start_line + row;

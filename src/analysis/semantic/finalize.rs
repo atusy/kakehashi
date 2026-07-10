@@ -23,8 +23,7 @@ fn cancellation_requested(
     cancel: Option<&crate::cancel::CancelToken>,
     work_items: &mut usize,
 ) -> bool {
-    *work_items = work_items.wrapping_add(1);
-    *work_items & 63 == 0 && crate::cancel::is_cancelled(cancel)
+    crate::cancel::is_cancelled_periodically(cancel, work_items)
 }
 
 /// Priority key for token comparison. Higher values win.
