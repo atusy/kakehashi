@@ -18,6 +18,10 @@ use tower_lsp_server::ls_types::{Range, SemanticTokens};
 use url::Url;
 
 const SEMANTIC_BASELINE_HISTORY: usize = 8;
+/// Retain roughly three generations of the 40,480-u32 profiling payload
+/// (~162 KiB each), while small documents may still use the count cap above.
+/// The newest baseline is always kept even when one result alone exceeds this.
+const SEMANTIC_BASELINE_BYTES_PER_DOCUMENT: usize = 512 * 1024;
 
 /// Identity of one immutable parse snapshot under one settings generation.
 /// Parsed versions restart when a URI closes and reopens, so incarnation is
@@ -68,6 +72,7 @@ struct SemanticDocumentCache {
     baselines: HashMap<String, Arc<SemanticTokens>>,
     /// Baseline IDs from least to most recently stored or read.
     baseline_order: VecDeque<String>,
+    baseline_bytes: usize,
     /// Highest closed lifetime. Kept as a tombstone so a late store from that
     /// lifetime cannot recreate state after didClose atomically cleared it.
     closed_incarnation: Option<u64>,
@@ -117,16 +122,32 @@ impl SemanticTokenCache {
         result_id: String,
         tokens: Arc<SemanticTokens>,
     ) {
-        document.baselines.insert(result_id.clone(), tokens);
+        if let Some(previous) = document.baselines.insert(result_id.clone(), tokens.clone()) {
+            document.baseline_bytes = document
+                .baseline_bytes
+                .saturating_sub(Self::token_bytes(&previous));
+        }
+        document.baseline_bytes += Self::token_bytes(&tokens);
         document.baseline_order.retain(|id| id != &result_id);
         document.baseline_order.push_back(result_id);
-        while document.baseline_order.len() > SEMANTIC_BASELINE_HISTORY {
+        while document.baseline_order.len() > 1
+            && (document.baseline_order.len() > SEMANTIC_BASELINE_HISTORY
+                || document.baseline_bytes > SEMANTIC_BASELINE_BYTES_PER_DOCUMENT)
+        {
             let evicted = document
                 .baseline_order
                 .pop_front()
                 .expect("length checked above");
-            document.baselines.remove(&evicted);
+            if let Some(tokens) = document.baselines.remove(&evicted) {
+                document.baseline_bytes = document
+                    .baseline_bytes
+                    .saturating_sub(Self::token_bytes(&tokens));
+            }
         }
+    }
+
+    fn token_bytes(tokens: &SemanticTokens) -> usize {
+        tokens.data.len() * std::mem::size_of::<tower_lsp_server::ls_types::SemanticToken>()
     }
 
     fn touch_baseline(document: &mut SemanticDocumentCache, result_id: &str) {
@@ -204,6 +225,7 @@ impl SemanticTokenCache {
             document.current = None;
             document.baselines.clear();
             document.baseline_order.clear();
+            document.baseline_bytes = 0;
         }
     }
 
@@ -233,6 +255,7 @@ impl SemanticTokenCache {
         document.current = None;
         document.baselines.clear();
         document.baseline_order.clear();
+        document.baseline_bytes = 0;
         if let Some(incarnation) = incarnation {
             document.closed_incarnation = Some(
                 document
@@ -893,6 +916,36 @@ mod tests {
             cache.get_if_valid(&uri, "new").is_some(),
             "the latest baseline must remain available"
         );
+    }
+
+    #[test]
+    fn semantic_baselines_obey_per_document_byte_budget() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///large.rs").unwrap();
+        let token = SemanticToken {
+            delta_line: 0,
+            delta_start: 0,
+            length: 1,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        };
+        let tokens_per_result =
+            SEMANTIC_BASELINE_BYTES_PER_DOCUMENT / std::mem::size_of::<SemanticToken>() * 3 / 4;
+        for (version, id) in [(0, "old"), (1, "new")] {
+            cache.store(
+                uri.clone(),
+                SemanticTokens {
+                    result_id: Some(id.to_string()),
+                    data: vec![token; tokens_per_result],
+                },
+                "rust".to_string(),
+                version,
+                snapshot(version, 0, 0),
+            );
+        }
+
+        assert!(cache.get_if_valid(&uri, "old").is_none());
+        assert!(cache.get_if_valid(&uri, "new").is_some());
     }
 
     #[test]
