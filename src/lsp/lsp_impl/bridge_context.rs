@@ -1337,9 +1337,10 @@ impl Kakehashi {
             injection_query.as_ref(),
         );
 
-        // One upstream request ID for the whole scan: every overlapping region's
-        // context shares it, and the virt codeAction path unregisters it ONCE
-        // (`unregister_all_for_upstream_id`) after fanning out to all regions.
+        // One upstream request ID for the whole scan: every overlapping
+        // region's context shares it — with the OTHER layers too, so nothing
+        // in the virt walk may wipe the registry for it; `run_layer_race`'s
+        // request-wide sweep guard owns the cleanup after all layers finish.
         // Hoisted out of the loop so that shared-ID invariant is explicit and
         // can't drift if this scan is reused under a different request-id scope.
         let upstream_request_id = current_upstream_id();
