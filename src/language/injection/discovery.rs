@@ -510,8 +510,11 @@ pub(crate) struct ResolvedInjection {
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.
     pub line_column_offsets: Vec<u32>,
-    /// Whether `virtual_content` maps to one contiguous host byte range.
-    /// `false` for `injection.combined`, whose host-only gaps are masked.
+    /// Whether `virtual_content` maps to one contiguous host byte range —
+    /// i.e. no excluded host bytes were whitespace-masked. A combined
+    /// pattern whose captures form one unbroken included range is still
+    /// `true`; any masked gap (between captures or within one) makes it
+    /// `false`.
     pub contiguous: bool,
 }
 
@@ -641,9 +644,11 @@ impl InjectionResolver {
     }
 
     /// Build one bridge virtual document for all captures of an
-    /// `injection.combined` pattern. Non-content bytes between captures are
-    /// replaced with coordinate-preserving whitespace: the downstream parser
-    /// sees one document and retains cross-block context, while every virtual
+    /// `injection.combined` pattern. Every host byte outside the included
+    /// ranges — the gaps between captures AND excluded bytes inside a
+    /// capture (e.g. non-content child/prefix bytes) — is replaced with
+    /// coordinate-preserving whitespace: the downstream parser sees one
+    /// document and retains cross-block context, while every virtual
     /// line/column still maps directly back to the host document.
     fn build_combined_injection(
         coordinator: &LanguageCoordinator,
