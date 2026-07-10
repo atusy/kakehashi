@@ -529,10 +529,11 @@ pub fn remove_query_install_and_backups(
         removed_backups: false,
     };
 
-    if queries_dir.exists() {
-        remove_dir_all_tolerating_vanished(&queries_dir)?;
-        removal.removed_queries = true;
-    }
+    // No exists() pre-check: Path::exists() reads false on metadata errors
+    // (e.g. PermissionDenied), which would skip removal and report "not
+    // installed" over a still-present unreadable dir. The tolerant removal
+    // reports whether anything was actually removed.
+    removal.removed_queries = remove_dir_all_tolerating_vanished(&queries_dir)?;
 
     // Propagate per-entry read_dir errors: uninstall must not report success
     // while backups it could not even enumerate stay behind.
@@ -542,22 +543,28 @@ pub fn remove_query_install_and_backups(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if path.is_dir()
+        // file_type() over path.is_dir(): is_dir() swallows metadata errors
+        // as "not a directory", which could leave an unreadable backup behind
+        // while uninstall reports success.
+        if entry.file_type()?.is_dir()
             && generated_backup_matches_language(name, language)
             && backup_is_owned(&path)
         {
             let ownership = backup_ownership_sidecar(&path);
             // Same NotFound tolerance as the canonical dir above: a backup
             // deleted externally after enumeration is already the end state.
-            remove_dir_all_tolerating_vanished(&path)?;
+            if remove_dir_all_tolerating_vanished(&path)? {
+                removal.removed_backups = true;
+            }
             let _ = fs::remove_file(ownership);
-            removal.removed_backups = true;
         }
     }
     Ok(removal)
 }
 
-/// `fs::remove_dir_all` that treats a CONFIRMED-vanished directory as removed.
+/// `fs::remove_dir_all` that treats a CONFIRMED-vanished directory as the
+/// desired end state. Returns whether this call actually removed anything
+/// (`false` = the dir was already gone).
 ///
 /// NotFound = the dir disappeared between the caller's observation and the
 /// removal (external cleanup — the replace lock only serializes kakehashi's
@@ -567,14 +574,14 @@ pub fn remove_query_install_and_backups(
 /// deleted, and (b) `Path::exists()` returns false on ANY metadata error
 /// (e.g. PermissionDenied), which must propagate the original error instead
 /// of being mistaken for absence.
-fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<(), QueryInstallError> {
+fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<bool, QueryInstallError> {
     match fs::remove_dir_all(dir) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(e)
             if e.kind() == std::io::ErrorKind::NotFound
                 && matches!(dir.try_exists(), Ok(false)) =>
         {
-            Ok(())
+            Ok(false)
         }
         Err(e) => Err(QueryInstallError::IoError(e)),
     }
@@ -976,19 +983,22 @@ mod tests {
         let gone = temp.path().join("never-created");
 
         assert!(
-            remove_dir_all_tolerating_vanished(&gone).is_ok(),
-            "a confirmed-absent dir is the desired end state"
+            matches!(remove_dir_all_tolerating_vanished(&gone), Ok(false)),
+            "a confirmed-absent dir is the desired end state (nothing removed)"
         );
     }
 
     #[test]
-    fn remove_dir_all_still_removes_and_propagates_content() {
+    fn remove_dir_all_removes_a_dir_with_contents() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path().join("queries-lang");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("highlights.scm"), "(x) @y").unwrap();
 
-        remove_dir_all_tolerating_vanished(&dir).expect("normal removal succeeds");
+        assert!(
+            remove_dir_all_tolerating_vanished(&dir).expect("normal removal succeeds"),
+            "an actual removal reports true"
+        );
         assert!(!dir.exists(), "the dir and its contents are removed");
     }
 
