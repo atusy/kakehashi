@@ -220,7 +220,9 @@ mod tests {
 
     impl Log for CapturingLogger {
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.level() <= Level::Warn
+            CAPTURING.load(Ordering::Relaxed)
+                && metadata.level() <= Level::Warn
+                && metadata.target() == "kakehashi::bridge"
         }
 
         fn log(&self, record: &Record<'_>) {
@@ -228,11 +230,7 @@ mod tests {
                 return;
             }
             let message = format!("{}:{}:{}", record.level(), record.target(), record.args());
-            if CAPTURING.load(Ordering::Relaxed) && record.target() == "kakehashi::bridge" {
-                self.messages.lock().unwrap().push(message);
-            } else {
-                eprintln!("{message}");
-            }
+            self.messages.lock().unwrap().push(message);
         }
 
         fn flush(&self) {}
