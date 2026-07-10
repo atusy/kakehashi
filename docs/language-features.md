@@ -270,10 +270,11 @@ unresolved. HOST-layer (`bridge._self`) action edits already target the
 real document and pass through as-is. A downstream server's own
 `workspace/applyEdit` request has its own policy built on the same
 underlying transform: virtual-document edits are translated (real-file-only
-requests pass through verbatim), and an untranslatable one — unknown or
-stale region, multi-region edit, virtual-URI file operation — is answered
-`applied: false` locally; it never reaches the editor and no action is
-involved.
+requests pass through verbatim), and an untranslatable one — e.g. an unknown
+or stale region, a multi-region edit, a virtual-URI file operation, or a
+translated edit escaping the region or its per-line prefix floor — is
+answered `applied: false` locally; it never reaches the editor and no action
+is involved.
 
 Default combine strategy: `concatenated`, across servers and across the
 virt/host layers. Advertised only to clients with
