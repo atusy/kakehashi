@@ -797,7 +797,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 42,
             "result": [
                 {
-                    "position": { "line": 0, "character": 5 },
+                    "position": { "line": 1, "character": 4 },
                     "label": ": number",
                     "textEdits": [
                         { "range": { "start": { "line": 0, "character": 0 },
@@ -842,7 +842,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 42,
             "result": [
                 {
-                    "position": { "line": 0, "character": 5 },
+                    "position": { "line": 1, "character": 4 },
                     "label": ": number",
                     "textEdits": [
                         { "range": { "start": { "line": 0, "character": 0 },

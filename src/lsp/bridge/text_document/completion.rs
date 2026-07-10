@@ -1184,7 +1184,8 @@ mod tests {
         // An import-style additionalTextEdit that inserts a raw newline at a
         // prefixed line would break the `> ` prefix — the array drops WHOLE
         // (it can carry paired halves of one operation); the item's primary
-        // insertion still works.
+        // insertion stays mechanically applicable, though possibly
+        // semantically incomplete without its auxiliaries.
         let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
         let region_end = Position {
             line: 5,
