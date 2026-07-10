@@ -29,11 +29,13 @@ python3 benches/profile/drive.py \
 
 # Measure the four stdout head-of-line scenarios from issue #665. The captures
 # modes verify that the response is a real delta or the intended full fallback.
-for scenario in semantic-only captures-delta captures-full diagnostics-burst; do
-  python3 benches/profile/drive.py \
-    --bin ./target/release/kakehashi \
-    --file path/to/input.md --requests 20 --edits 1 \
-    --stdout-metrics --scenario "$scenario"
+for repeat in 1 2 3; do
+  for scenario in semantic-only captures-delta captures-full diagnostics-burst; do
+    python3 benches/profile/drive.py \
+      --bin ./target/release/kakehashi \
+      --file path/to/input.md --requests 20 --edits 1 \
+      --stdout-metrics --scenario "$scenario"
+  done
 done
 
 # Send superseding requests in bursts to measure cancellation pressure.
@@ -58,6 +60,9 @@ cannot be safely interrupted). Change the classification threshold with
 `--large-frame-kib`. The driver's dedicated reader thread continuously drains
 stdout in every mode, so waiting for one request ID does not create artificial
 pipe backpressure or hide out-of-order responses.
+Metrics mode fails rather than reporting a zero opportunity count if attributed
+responses are missing, counts do not match, metadata is unattributed, or any
+frame is partial/censored.
 
 With full Xcode installed, Instruments' Time Profiler can also be used from the
 CLI:

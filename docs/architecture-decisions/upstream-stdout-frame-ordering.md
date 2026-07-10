@@ -13,29 +13,62 @@ blocking to justify such a scheduler for semantic-token responses.
 The transport observer records, on a shared monotonic clock:
 
 - handler response-ready time and originating method;
-- first and last byte accepted by stdout, plus successful flush completion;
+- first write attempt, last byte accepted by stdout, and successful flush completion;
 - response ID and exact header + body byte count; and
 - censored frames whose final flush is not observed.
 
-The release workload used a 5,088-line, 37,940-byte Markdown document matching
-the captured editor session's scale. Each scenario ran 20 edit/recompute cycles,
-repeated three times in interleaved A/A runs. The profile driver continuously
-drained stdout so the client did not manufacture pipe backpressure.
+The release workload used `__ignored/example.md`, a 5,088-line, 37,940-byte
+Markdown document matching the captured editor session's scale. Its SHA-256 is
+`bad443ab7b8d4328e1b255f90db65ee9c83353394e1db9f84f57b371972777f6`.
+Each scenario ran 20 edit/recompute cycles, repeated three times in interleaved
+A/A runs. The profile driver continuously drained stdout so the client did not
+manufacture pipe backpressure.
+
+Measurement provenance:
+
+- source: `feb35ab2`;
+- build: `cargo build --release --bin kakehashi`, rustc 1.95.0;
+- host: arm64 macOS 26.5.1 (Darwin 25.5.0, T8132); and
+- configuration: repository default discovery, `deps/test/kakehashi` data dir,
+  no extra server arguments.
+
+The exact interleaved matrix was:
+
+```sh
+for repeat in 1 2 3; do
+  for scenario in semantic-only captures-delta captures-full diagnostics-burst; do
+    benches/profile/drive.py \
+      --bin ./target/release/kakehashi \
+      --file __ignored/example.md --requests 20 --edits 1 --settle 0.3 \
+      --stdout-metrics --scenario "$scenario"
+  done
+done
+```
 
 | Scenario | Semantic request p90, three runs | Semantic ready → last byte p90 | Semantic ready → flush p90 |
 | --- | --- | --- | --- |
-| semantic only | 7.5 / 7.3 / 7.3 ms | 0.3 ms | 0.5–0.6 ms |
-| valid captures delta | 7.1 / 7.3 / 7.2 ms | 0.3 ms | 0.5–0.6 ms |
-| captures full fallback | 7.1 / 7.2 / 7.5 ms | 0.3 ms | 0.6 ms |
-| diagnostics burst | 18.2 / 18.1 / 18.2 ms | 0.3 ms | 0.5–0.6 ms |
+| semantic only | 7.4 / 7.4 / 7.1 ms | 0.3 ms | 0.3–0.4 ms |
+| valid captures delta | 7.4 / 7.4 / 7.3 ms | 0.3 ms | 0.4 ms |
+| captures full fallback | 7.3 / 7.4 / 7.5 ms | 0.3 ms | 0.4 ms |
+| diagnostics burst | 18.4 / 17.9 / 17.8 ms | 0.3 ms | 0.3–0.4 ms |
 
 The full captures fallback produced a 4,408.4 KiB frame. Its own
-ready-to-last-byte p90 was 22.3–23.2 ms and ready-to-flush p90 was 23.2–24.1 ms,
+ready-to-last-byte p90 was 11.0–12.0 ms and ready-to-flush p90 was 11.0–12.1 ms,
 but semantic responses were ready before that frame started in 0 of 60 cycles.
 They completed first, so a pre-write scheduler had no opportunity to improve
-semantic latency. The diagnostic responses in this configuration were small;
-the transport instrumentation remains available for configurations with large
-downstream diagnostic payloads.
+semantic latency. The diagnostic responses in this configuration were valid
+full reports but only about 0.1 KiB. They exercise burst ordering and metric
+attribution, not the large diagnostic payload from the captured editor log. The
+scheduling defer is therefore supported by the representative captures-full
+path; it is not a claim that every large-diagnostics configuration has the same
+opportunity rate.
+
+To check observer effect, the captures-full matrix was also run three times
+without `--stdout-metrics`. Instrumented captures p90 was 93.6 / 89.8 / 90.7 ms
+versus 90.1 / 94.6 / 93.7 ms uninstrumented; semantic p90 was
+7.3 / 7.4 / 7.5 ms versus 7.2 / 7.6 / 8.5 ms. The differences stayed within
+run-to-run variation after replacing per-byte tail maintenance with bounded
+slice copies.
 
 ## Decision Drivers
 
@@ -115,3 +148,5 @@ per-method payload sizes, semantic ready-to-write/flush percentiles, and the
 `semantic-large-frame-overlap` classification. Open a new transport optimization
 only when the reconsideration thresholds above are met on a representative
 configuration.
+Do not generalize this decision to large diagnostic frames until a downstream
+fixture or real configuration produces a representative diagnostic payload.
