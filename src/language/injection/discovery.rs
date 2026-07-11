@@ -24,6 +24,11 @@ use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_
 // alternate language layers at identical host coordinates distinct ULIDs.
 const REGION_IDENTITY_LAYER_BASE: usize = usize::MAX / 2 + 1;
 
+fn region_identity_slot(pattern_index: usize, language: &str) -> usize {
+    ((fnv1a_hash(language) as usize) ^ pattern_index.wrapping_mul(0x9e37_79b9))
+        & (REGION_IDENTITY_LAYER_BASE - 1)
+}
+
 /// Iterates over the `@injection.content` captures in a query match.
 fn iter_injection_content_captures<'a, 'b>(
     match_: &'b QueryMatch<'_, 'a>,
@@ -347,10 +352,12 @@ pub(crate) fn collect_all_injections<'a>(
             ))
     });
     for region in &mut injections {
-        // Pattern indexes remain stable when another same-range pattern stops
-        // matching. An ordinal among only the current matches would let the
-        // survivor inherit the removed pattern's tracked region identity.
-        region.identity_slot = region.pattern_index;
+        // Derive identity from both stable query position and language. Dynamic
+        // `@injection.language` captures can produce several language layers
+        // from one pattern at the same range, so the pattern index alone aliases
+        // their virtual documents. A current-match ordinal is also unsuitable:
+        // removing one match would shift every later identity.
+        region.identity_slot = region_identity_slot(region.pattern_index, &region.language);
     }
     Some(injections)
 }
@@ -1674,8 +1681,16 @@ mod tests {
 
         assert_eq!(regions.len(), 2);
         assert_ne!(regions[0].include_children, regions[1].include_children);
-        assert_eq!(regions[0].identity_slot, 0);
-        assert_eq!(regions[1].identity_slot, 1);
+        assert_ne!(regions[0].identity_slot, regions[1].identity_slot);
+    }
+
+    #[test]
+    fn dynamic_languages_from_one_pattern_get_distinct_identity_slots() {
+        assert_ne!(
+            region_identity_slot(7, "javascript"),
+            region_identity_slot(7, "typescript"),
+            "one dynamic-language pattern must not alias distinct virtual documents"
+        );
     }
 
     #[test]
