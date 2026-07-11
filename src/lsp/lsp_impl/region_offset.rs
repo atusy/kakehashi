@@ -37,7 +37,7 @@ pub(super) fn resolve_region_offset(
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool)> {
     let ulid = ulid::Ulid::from_string(region_id).ok()?;
-    let (start_byte, _end, _kind, _layer, tracked_incarnation) =
+    let (_start_byte, _end, _kind, _layer, tracked_incarnation) =
         bridge.node_tracker().lookup_node(host_url, &ulid)?;
     // Snapshot is owned, so the document handle (a store lock) is released
     // before `detect_document_language` reaches back into the store.
@@ -47,27 +47,20 @@ pub(super) fn resolve_region_offset(
     }
     let language_name = super::detect_document_language(language, documents, host_url)?;
     let injection_query = language.injection_query(&language_name)?;
-    let resolved = InjectionResolver::resolve_at_byte_offset(
+    let resolved = InjectionResolver::resolve_by_region_id(
         language,
         bridge.node_tracker(),
         host_url,
         snapshot.tree(),
         snapshot.text(),
         injection_query.as_ref(),
-        start_byte,
+        region_id,
         snapshot.incarnation(),
     )?;
-    // `region_id`/`start_byte` came from the tracker + node map, but
-    // `resolved` came from a separately-fetched snapshot. If an edit landed
-    // in between, `start_byte` could fall inside a *different* live region —
-    // `resolve_at_byte_offset` returns whichever region contains the byte. A
-    // mismatched `region_id` means we'd translate coordinates against the
-    // wrong region, so return `None` (no offset); callers fall back to their
-    // safe default rather than risk a wrong translation. (The goto path can't
-    // hit this: there `resolved` and `region_id` come from one call.)
-    if resolved.region.region_id != region_id {
-        return None;
-    }
+    // Exact-ID resolution also rejects an edit race: if the separately-fetched
+    // snapshot no longer contains the tracked layer, no resolved region has
+    // this ID and callers fall back safely instead of translating another
+    // same-range language layer.
     Some(resolved_region_geometry(resolved))
 }
 

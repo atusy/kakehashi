@@ -19,6 +19,11 @@ use crate::language::node_tracker::NodeTracker;
 use crate::language::query_predicates::check_match_predicates;
 use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_hash};
 
+// Keep bridge-region identities in a namespace disjoint from real parse-tree
+// injection depths (0..=MAX_INJECTION_DEPTH). The per-range slot then gives
+// alternate language layers at identical host coordinates distinct ULIDs.
+const REGION_IDENTITY_LAYER_BASE: usize = usize::MAX / 2 + 1;
+
 /// Iterates over the `@injection.content` captures in a query match.
 fn iter_injection_content_captures<'a, 'b>(
     match_: &'b QueryMatch<'_, 'a>,
@@ -57,6 +62,9 @@ pub(crate) struct InjectionRegionInfo<'a> {
     pub offset: Option<InjectionOffset>,
     /// Whether this pattern's captures form one virtual document.
     pub combined: bool,
+    /// Deterministic identity slot among alternate layers with this exact host
+    /// byte range. Zero for the common single-layer case.
+    pub identity_slot: usize,
 }
 
 /// Owned injection region for caching (no lifetime dependency on parse tree)
@@ -313,6 +321,7 @@ pub(crate) fn collect_all_injections<'a>(
                         // multi-region grouping do not compose safely.
                         combined: has_combined_for_pattern(query, match_.pattern_index)
                             && offset.is_none(),
+                        identity_slot: 0,
                         offset,
                     }
                 });
@@ -336,6 +345,21 @@ pub(crate) fn collect_all_injections<'a>(
                 b.language.as_str(),
             ))
     });
+    let mut previous_range = None;
+    let mut identity_slot = 0usize;
+    for region in &mut injections {
+        let range = (
+            region.content_node.start_byte(),
+            region.content_node.end_byte(),
+        );
+        if previous_range == Some(range) {
+            identity_slot = identity_slot.saturating_add(1);
+        } else {
+            previous_range = Some(range);
+            identity_slot = 0;
+        }
+        region.identity_slot = identity_slot;
+    }
     Some(injections)
 }
 
@@ -566,26 +590,25 @@ impl InjectionResolver {
     ///
     /// Phase 2 (lazy-node-identity-tracking): keyed on position (start_byte,
     /// end_byte, kind, layer), so the ULID stays constant for the same position
-    /// key. Region IDs always use `layer = 0` (see below).
+    /// and same-range identity slot.
     ///
-    /// Minted via the host-layer `get_or_create` (`layer = 0`) **by design**:
-    /// `content_node` comes from the host document's injection query, so it is a
-    /// host-tree node. The `layer` discriminator (lazy-node-identity-tracking
-    /// §"Node Uniqueness Key") only needs to separate host from injected nodes,
-    /// and a region's content node is always the host side. If a navigation
-    /// `kakehashi/node` call resolves that same host node it dedups to this same
-    /// ULID, which is correct.
+    /// Region IDs use a reserved tracker-layer namespace plus the deterministic
+    /// same-range identity slot. This keeps alternate language/query layers at
+    /// identical host coordinates distinct without colliding with real parse
+    /// injection depths used by `kakehashi/node`.
     pub(crate) fn calculate_region_id(
         tracker: &NodeTracker,
         uri: &Url,
         injection: &InjectionRegionInfo,
         incarnation: u64,
     ) -> Option<Ulid> {
-        tracker.get_or_create_for_incarnation(
+        let identity_layer = REGION_IDENTITY_LAYER_BASE.checked_add(injection.identity_slot)?;
+        tracker.get_or_create_in_layer_for_incarnation(
             uri,
             injection.content_node.start_byte(),
             injection.content_node.end_byte(),
             injection.content_node.kind(),
+            identity_layer,
             incarnation,
         )
     }
@@ -768,6 +791,34 @@ impl InjectionResolver {
         };
 
         Self::resolve_from_regions(coordinator, tracker, uri, &injections, text, incarnation)
+    }
+
+    /// Resolve the exact bridge layer identified by an opaque region ID.
+    ///
+    /// A byte lookup alone is ambiguous when multiple query patterns assign
+    /// alternate languages or geometry to the same host node.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_by_region_id(
+        coordinator: &LanguageCoordinator,
+        tracker: &NodeTracker,
+        uri: &Url,
+        tree: &Tree,
+        text: &str,
+        injection_query: &Query,
+        region_id: &str,
+        incarnation: u64,
+    ) -> Option<ResolvedInjection> {
+        Self::resolve_all(
+            coordinator,
+            tracker,
+            uri,
+            tree,
+            text,
+            injection_query,
+            incarnation,
+        )
+        .into_iter()
+        .find(|resolved| resolved.region.region_id == region_id)
     }
 
     /// [`resolve_all`](Self::resolve_all) minus the injection-query run, for a
@@ -1602,10 +1653,38 @@ mod tests {
             2,
             "both same-range languages remain discoverable"
         );
+        let tracker = NodeTracker::new();
+        let uri = test_uri("same_range_priority");
+        let resolved_all = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            0,
+        );
+        assert_ne!(
+            resolved_all[0].region.region_id, resolved_all[1].region.region_id,
+            "alternate language layers at one host range need distinct identities"
+        );
+        let second_id = resolved_all[1].region.region_id.clone();
+        let second = InjectionResolver::resolve_by_region_id(
+            &test_coordinator(),
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            &second_id,
+            0,
+        )
+        .expect("the exact alternate layer resolves from its region ID");
+        assert_eq!(second.injection_language, "comment");
         let resolved = InjectionResolver::resolve_at_byte_offset(
             &test_coordinator(),
-            &NodeTracker::new(),
-            &test_uri("same_range_priority"),
+            &tracker,
+            &uri,
             &tree,
             text,
             &query,
@@ -1973,6 +2052,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                identity_slot: 0,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
@@ -1981,6 +2061,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                identity_slot: 0,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
@@ -1989,6 +2070,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                identity_slot: 0,
             },
         ];
 
@@ -2061,6 +2143,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                identity_slot: 0,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
@@ -2069,6 +2152,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                identity_slot: 0,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
@@ -2077,6 +2161,7 @@ mod tests {
                 include_children: false,
                 offset: None,
                 combined: false,
+                identity_slot: 0,
             },
         ];
 

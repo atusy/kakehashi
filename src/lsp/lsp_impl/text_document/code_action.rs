@@ -36,9 +36,8 @@ use crate::lsp::aggregation::server::{
 };
 use crate::lsp::bridge::{
     CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps, bridge_code_actions,
-    extract_code_action_envelope, parse_code_actions_leniently,
+    extract_code_action_envelope, parse_code_actions_leniently, region_host_end,
 };
-use crate::text::PositionMapper;
 
 const METHOD: &str = "textDocument/codeAction";
 
@@ -307,7 +306,7 @@ impl Kakehashi {
         // Re-resolve the region from the LIVE parse (same construction as the
         // goto/showDocument offset path), yielding the current per-line offset
         // AND the content-precise host byte range.
-        let (start_byte, _end, _kind, _layer, tracked_incarnation) =
+        let (_start_byte, _end, _kind, _layer, tracked_incarnation) =
             self.bridge.node_tracker().lookup_node(host_url, &ulid)?;
         let snapshot = self.documents.get(host_url)?.snapshot()?;
         if snapshot.incarnation() != tracked_incarnation {
@@ -315,14 +314,14 @@ impl Kakehashi {
         }
         let language_name = detect_document_language(&self.language, &self.documents, host_url)?;
         let injection_query = self.language.injection_query(&language_name)?;
-        let resolved = InjectionResolver::resolve_at_byte_offset(
+        let resolved = InjectionResolver::resolve_by_region_id(
             &self.language,
             self.bridge.node_tracker(),
             host_url,
             snapshot.tree(),
             snapshot.text(),
             injection_query.as_ref(),
-            start_byte,
+            &envelope.region_id,
             snapshot.incarnation(),
         )?;
         // The action may have been created while a single combined capture was
@@ -332,20 +331,11 @@ impl Kakehashi {
         if !resolved.contiguous {
             return None;
         }
-        // The tracker byte and the freshly-resolved region can disagree after an
-        // edit (the byte now falls in a different live region); a mismatched
-        // region_id means we'd bound/translate against the wrong region.
-        if resolved.region.region_id != envelope.region_id {
-            return None;
-        }
-        // Content-precise host end (matches applyEdit) — compute before moving
-        // `line_column_offsets` out of `resolved`.
-        let region_end = PositionMapper::new(snapshot.text())
-            .byte_to_position(resolved.region.byte_range.end)?;
         let live_offset = RegionOffset::with_per_line_offsets(
             resolved.region.line_range.start,
             resolved.line_column_offsets,
         );
+        let region_end = region_host_end(&resolved.virtual_content, &live_offset);
         // Compare the WHOLE offset, not just the start: a diverged interior
         // per-line column offset (e.g. a blockquote-prefix edit that left the
         // start line intact) would translate the resolved edit to wrong host
