@@ -446,8 +446,11 @@ Example with per-method priorities, strategy, and maxFanOut:
 A request to kakehashi can be answered by up to three *result layers*:
 `virt` (the injection bridges above), `host` (a host-document language
 server — opt-in via `bridge._self` above), and `native` (kakehashi's
-own features). `layers.aggregation` orders them per LSP method, mirroring
-the `bridge.<lang>.aggregation` nesting:
+own features). `layers.aggregation` prioritizes which layer contributions are
+selected and staged per LSP method, mirroring the
+`bridge.<lang>.aggregation` nesting. Methods with a deterministic wire-order
+contract, such as diagnostics, normalize those staged contributions before
+returning the response:
 
 ```json
 {
