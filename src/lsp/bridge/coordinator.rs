@@ -51,6 +51,23 @@ pub(crate) struct ResolvedServerConfig {
     pub(crate) config: Arc<BridgeServerConfig>,
 }
 
+fn resolve_reload_server_config(
+    settings: &WorkspaceSettings,
+    server_name: &str,
+) -> Option<BridgeServerConfig> {
+    // A wildcard supplies defaults to concrete entries; it must not keep a
+    // deleted concrete server alive merely because its old name is known by a
+    // live connection.
+    if !settings.language_servers.contains_key(server_name) {
+        return None;
+    }
+    resolve_with_wildcard(
+        &settings.language_servers,
+        server_name,
+        merge_bridge_server_configs,
+    )
+}
+
 /// A batch of eager-open task handles with a generation counter.
 ///
 /// The generation counter enables detection of stale pushes: when a concurrent
@@ -265,21 +282,14 @@ impl BridgeCoordinator {
         Arc::clone(&self.pool)
     }
 
-    /// Propagate a merged-settings change to every live downstream connection
-    /// (downstream-settings-propagation, path c). Each server's settings are
-    /// re-resolved through the same wildcard merge used at spawn, so an
-    /// unchanged config yields identical values and pushes nothing. Returns the
-    /// number of connections pushed.
+    /// Apply merged server-config changes to live downstream connections.
+    /// Runtime `settings` changes are pushed in place; removed servers and
+    /// spawn-time config changes evict and shut down their connections so the
+    /// next use spawns from the new config. Returns the number of settings
+    /// notifications pushed (evictions are not counted).
     pub(crate) async fn propagate_settings(&self, settings: &WorkspaceSettings) -> usize {
         self.pool
-            .propagate_settings(|server_name| {
-                resolve_with_wildcard(
-                    &settings.language_servers,
-                    server_name,
-                    merge_bridge_server_configs,
-                )
-                .and_then(|config| config.settings)
-            })
+            .propagate_settings(|server_name| resolve_reload_server_config(settings, server_name))
             .await
     }
 
@@ -1316,6 +1326,20 @@ mod tests {
     use super::*;
     use crate::config::LanguageSettings;
     use crate::config::settings::BridgeLanguageConfig;
+
+    #[test]
+    fn reload_resolution_does_not_resurrect_deleted_server_from_wildcard() {
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            crate::config::WILDCARD_KEY.to_string(),
+            BridgeServerConfig {
+                cmd: vec!["shared-server".into()],
+                ..Default::default()
+            },
+        );
+
+        assert!(resolve_reload_server_config(&settings, "deleted").is_none());
+    }
 
     /// Shutdown's `abort_all_eager_open` must drain the host-layer eager-open
     /// batch too (#429), not only the virt `eager_open_tasks`.

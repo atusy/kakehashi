@@ -139,6 +139,11 @@ pub(crate) struct ConnectionHandle {
     /// re-stores it here on a merge change (path c) so a re-pull reflects the
     /// current config. `None` slot = no settings configured for this server.
     settings: Arc<arc_swap::ArcSwapOption<serde_json::Value>>,
+    /// Resolved server configuration that created this process.
+    ///
+    /// `settings` is ignored when comparing this snapshot on reload because it
+    /// can be propagated at runtime; every other field is spawn-time state.
+    launch_config: OnceLock<crate::config::settings::BridgeServerConfig>,
 }
 
 impl ConnectionHandle {
@@ -206,7 +211,29 @@ impl ConnectionHandle {
             workspace_folders,
             incapable_fallback_logged: AtomicBool::new(false),
             settings,
+            launch_config: OnceLock::new(),
         }
+    }
+
+    pub(super) fn record_launch_config(
+        &self,
+        config: &crate::config::settings::BridgeServerConfig,
+    ) {
+        let snapshot = crate::config::settings::BridgeServerConfig {
+            cmd: config.cmd.clone(),
+            languages: config.languages.clone(),
+            initialization_options: config.initialization_options.clone(),
+            settings: None,
+            workspace_markers: config.workspace_markers.clone(),
+            on_type_formatting_triggers: config.on_type_formatting_triggers.clone(),
+            prefer_shared_instance: config.prefer_shared_instance,
+            enabled: config.enabled,
+        };
+        let _ = self.launch_config.set(snapshot);
+    }
+
+    pub(super) fn launch_config(&self) -> Option<&crate::config::settings::BridgeServerConfig> {
+        self.launch_config.get()
     }
 
     /// This connection's current workspace settings, if any
@@ -419,6 +446,23 @@ impl ConnectionHandle {
         // Notify watchers of state change. send_replace() is non-blocking and
         // always succeeds (it replaces the current value regardless of receivers).
         self.state_watch.send_replace(new_state);
+    }
+
+    /// Complete initialization only while this handle still belongs to its
+    /// original lifecycle. A reload or global shutdown may move an
+    /// initializing handle to `Closing`; the handshake task must not resurrect
+    /// it as `Ready` afterwards.
+    pub(super) fn transition_initializing_to_ready(&self) -> bool {
+        let mut state = self
+            .state
+            .write()
+            .recover_poison("ConnectionHandle::transition_initializing_to_ready");
+        if *state != ConnectionState::Initializing {
+            return false;
+        }
+        *state = ConnectionState::Ready;
+        self.state_watch.send_replace(ConnectionState::Ready);
+        true
     }
 
     /// Store server capabilities from the initialize response.
