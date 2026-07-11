@@ -99,6 +99,12 @@ pub(super) struct ReloadLanguageState<'a> {
     request_semantic_refresh: bool,
 }
 
+/// One server process owns one effective workspace settings snapshot. Keep the
+/// complete async reload transaction ordered across didChangeConfiguration and
+/// post-install reloads, including downstream propagation and SettingsManager
+/// publication after the synchronous language/query swap.
+static SETTINGS_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub(super) async fn apply_shared_settings(
     client: &Client,
     language_state: ReloadLanguageState<'_>,
@@ -108,6 +114,7 @@ pub(super) async fn apply_shared_settings(
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
 ) {
+    let _reload = SETTINGS_RELOAD_LOCK.lock().await;
     // TRANSITIONAL generation bump BEFORE any query/config mutation: from
     // this instant, every generation-stamped product built from the OLD
     // queries (snapshot-riding discovery/bridge/resolved regions, layer
