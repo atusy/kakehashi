@@ -171,7 +171,7 @@ impl ApplyEditTranslator {
                 "kakehashi: the virtual document's host URI is unmappable: {host_url}"
             ));
         };
-        let Some((offset, region_end)) = resolve_region_offset(
+        let Some((offset, region_end, contiguous)) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
@@ -186,6 +186,7 @@ impl ApplyEditTranslator {
                     .to_string(),
             );
         };
+        ensure_editable_region(contiguous)?;
 
         transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset, region_end)?;
         Ok(params)
@@ -372,6 +373,14 @@ fn versioned_virtual_text_document_edits(edit: &WorkspaceEdit) -> Vec<(&str, i32
     versioned
 }
 
+fn ensure_editable_region(contiguous: bool) -> Result<(), String> {
+    if contiguous {
+        Ok(())
+    } else {
+        Err("kakehashi: the edit targets a non-contiguous virtual document (whitespace-masked host bytes — gaps between combined captures, stripped prefixes, or excluded child ranges); it cannot be applied without overwriting that host text".to_string())
+    }
+}
+
 /// Rewrite `params.edit` to host coordinates via the shared WorkspaceEdit
 /// transform. Pure mutation, split out so it can be unit-tested without a live
 /// parse. `Err` when the edit performs file operations on a virtual document
@@ -483,6 +492,13 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::str::FromStr;
+
+    #[test]
+    fn non_contiguous_combined_region_rejects_apply_edit() {
+        let reason = ensure_editable_region(false).expect_err("masked gaps are not editable");
+        assert!(reason.contains("non-contiguous virtual document"));
+        assert!(ensure_editable_region(true).is_ok());
+    }
 
     fn translator() -> ApplyEditTranslator {
         translator_with_bridge(Arc::new(BridgeCoordinator::new()))

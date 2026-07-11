@@ -26,7 +26,7 @@ impl Drop for LifecycleCleanup<'_> {
 }
 
 impl LanguageServerPool {
-    /// Fire `didOpen` for every injection region's virtual URI so the downstream
+    /// Fire `didOpen` for every resolved bridge virtual URI so the downstream
     /// server starts analyzing immediately instead of waiting for the first
     /// user request. Fire-and-forget: per-document failures are logged at
     /// debug level and never propagated; one open failing leaves the others

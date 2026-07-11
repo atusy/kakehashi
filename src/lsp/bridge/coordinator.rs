@@ -19,17 +19,17 @@ use crate::lsp::request_id::CancelForwarder;
 
 use super::LanguageServerPool;
 
-/// An injection region resolved from a host document.
+/// A resolved bridge virtual-document payload from a host document.
 ///
-/// Represents a single code block embedded in a host document (e.g., a Lua
-/// code fence in a markdown file) along with its stable region ID (lazy-node-identity-tracking).
+/// Usually represents one injected region; an `injection.combined` payload can
+/// span multiple captures and uses the first capture's stable region ID.
 #[derive(Debug, Clone)]
 pub(crate) struct BridgeInjection {
     /// The injection language (e.g., "lua", "python", "rust")
     pub(crate) language: String,
     /// Stable ULID-based region ID (lazy-node-identity-tracking)
     pub(crate) region_id: String,
-    /// The text content of the injection region
+    /// The text content of the bridge virtual document
     pub(crate) content: String,
 }
 

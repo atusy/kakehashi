@@ -1,7 +1,7 @@
 //! Virtual→host translation for inbound `window/showDocument` requests.
 //!
 //! A bridged downstream server only knows the *virtual* document it was handed
-//! (one per injected region), so a `window/showDocument` it issues carries a
+//! (one per isolated region or combined group), so a `window/showDocument` carries a
 //! virtual URI and a `selection` in virtual coordinates. Before the bridge
 //! forwards the request to the editor, [`ShowDocumentTranslator`] rewrites the
 //! URI back to the host document and the selection back to host coordinates —
@@ -119,7 +119,7 @@ impl ShowDocumentTranslator {
     /// shared [`resolve_region_offset`]. On `None` the caller opens the host
     /// document without a selection rather than risk a wrong one. showDocument
     /// only needs the offset (it translates a single selection position, not an
-    /// edit), so the region-end bound is discarded.
+    /// edit), so the region-end bound and contiguity marker are discarded.
     fn region_offset(&self, host_url: &Url, region_id: &str) -> Option<RegionOffset> {
         resolve_region_offset(
             &self.documents,
@@ -128,7 +128,7 @@ impl ShowDocumentTranslator {
             host_url,
             region_id,
         )
-        .map(|(offset, _region_end)| offset)
+        .map(|(offset, _region_end, _contiguous)| offset)
     }
 }
 

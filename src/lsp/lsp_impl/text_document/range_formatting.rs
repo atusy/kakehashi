@@ -36,7 +36,7 @@ use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, parse_host_ve
 use crate::text::PositionMapper;
 
 use super::super::{Kakehashi, uri_to_url};
-use super::formatting::finalize_formatting_edits;
+use super::formatting::{RegionFormatPlan, finalize_formatting_edits, plan_region_format};
 
 impl Kakehashi {
     pub(crate) async fn range_formatting_impl(
@@ -177,7 +177,14 @@ impl Kakehashi {
             });
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
+            let mut seen_edit_ranges = std::collections::HashSet::new();
             for resolved in all_regions.iter() {
+                // Non-contiguous combined injections contain masked host-only
+                // gaps. Even a covering range may fall back to full formatting,
+                // whose single replacement would overwrite those real gaps.
+                if !resolved.contiguous {
+                    continue;
+                }
                 // A covering request (its byte span encloses the whole region)
                 // prefers full formatting; a partial request range-formats the
                 // clipped span. Either way we compute the clipped+content-clamped
@@ -214,7 +221,6 @@ impl Kakehashi {
                 if configs.is_empty() {
                     continue;
                 }
-
                 // Resolve aggregation under "textDocument/formatting", not
                 // "textDocument/rangeFormatting". Range formatting is the
                 // partial-document counterpart of full formatting and shares its
@@ -229,6 +235,41 @@ impl Kakehashi {
                     &resolved.injection_language,
                     "textDocument/formatting",
                 );
+                match plan_region_format(agg.strategy, &agg.priorities, &configs, agg.max_fan_out) {
+                    RegionFormatPlan::Skip => {
+                        log::warn!(
+                            target: "kakehashi::formatting",
+                            "concatenated formatting for {}->{} lists only unconfigured \
+                             server(s) {:?}; none are configured for this region, so it \
+                             is left unformatted (priorities is an allowlist — \
+                             non-listed servers are not run)",
+                            language_name,
+                            resolved.injection_language,
+                            agg.priorities,
+                        );
+                        continue;
+                    }
+                    RegionFormatPlan::Disabled => {
+                        log::debug!(
+                            target: "kakehashi::formatting",
+                            "formatting disabled for {}->{} (priorities = [])",
+                            language_name,
+                            resolved.injection_language,
+                        );
+                        continue;
+                    }
+                    RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
+                }
+                // Preserve discovery priority among executable same-range
+                // alternatives. Unconfigured/disabled layers deliberately do
+                // not reserve the span, allowing the first configured layer to
+                // format it while preventing overlapping edits from later ones.
+                if !seen_edit_ranges.insert((
+                    resolved.region.byte_range.start,
+                    resolved.region.byte_range.end,
+                )) {
+                    continue;
+                }
                 let region_ctx = DocumentRequestContext {
                     uri: uri.clone(),
                     resolved: resolved.clone(),
@@ -239,7 +280,6 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
-
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning
                 // downstream).

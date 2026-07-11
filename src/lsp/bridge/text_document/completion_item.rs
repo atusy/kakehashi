@@ -285,6 +285,7 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     let ctx = EnvelopeContext {
         server_name: &envelope.origin,
         host_uri: &envelope.host_uri,
+        region_id: &envelope.region_id,
         offset: &RegionOffset::from(&envelope.offset),
         region_end: envelope
             .region_end
@@ -333,6 +334,7 @@ mod tests {
         KakehashiEnvelope {
             origin: "lua-ls".to_string(),
             host_uri: "file:///test/doc.md".to_string(),
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
             inner: Some(json!({"resolve_id": 99})),
             offset: EnvelopeOffset {
                 line: 5,
@@ -521,6 +523,7 @@ mod tests {
         let envelope = KakehashiEnvelope {
             origin: server.to_string(),
             host_uri: "file:///test/doc.md".to_string(),
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
             inner: Some(json!({"resolve_id": 42})),
             offset: EnvelopeOffset {
                 line: 5,

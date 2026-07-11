@@ -6,8 +6,9 @@
 //! ([`ApplyEditTranslator`]). The offset is rebuilt exactly as the goto request
 //! path does (`region_id → node byte range → resolve injection → RegionOffset`),
 //! so inbound translation can't disagree with goto on the same region. The
-//! region's content-precise host end is returned alongside so an edit translator
-//! can reject a range that escapes the region.
+//! region's content-precise host end and contiguity are returned alongside so
+//! an edit translator can reject a range that escapes the region or targets a
+//! combined document with masked host gaps.
 //!
 //! [`ShowDocumentTranslator`]: super::show_document_translation::ShowDocumentTranslator
 //! [`ApplyEditTranslator`]: super::apply_edit_translation::ApplyEditTranslator
@@ -18,65 +19,78 @@ use tower_lsp_server::ls_types::Position;
 use url::Url;
 
 use crate::document::DocumentStore;
+use crate::language::injection::ResolvedInjection;
 use crate::language::{InjectionResolver, LanguageCoordinator};
-use crate::lsp::bridge::{BridgeCoordinator, RegionOffset};
-use crate::text::PositionMapper;
+use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, region_host_end};
 
 /// Rebuild the region's current host offset from the live parse, keyed by its
 /// `region_id` (a ULID in production). Returns `None` when the offset can't be
 /// rebuilt: region invalidated by edits (`lookup_node` misses), a `region_id`
-/// that no longer matches the live parse at that byte (edit race), or a missing
-/// document/snapshot/language/query.
+/// whose tracked geometry/layer no longer exists in the live parse, or a
+/// missing document/snapshot/language/query. The third tuple field reports
+/// whether the virtual content maps to one contiguous host span.
 pub(super) fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
     bridge: &BridgeCoordinator,
     host_url: &Url,
     region_id: &str,
-) -> Option<(RegionOffset, Position)> {
-    let ulid = ulid::Ulid::from_string(region_id).ok()?;
-    let (start_byte, _end, _kind, _layer, tracked_incarnation) =
-        bridge.node_tracker().lookup_node(host_url, &ulid)?;
+) -> Option<(RegionOffset, Position, bool)> {
     // Snapshot is owned, so the document handle (a store lock) is released
     // before `detect_document_language` reaches back into the store.
     let snapshot = documents.get(host_url)?.snapshot()?;
-    if snapshot.incarnation() != tracked_incarnation {
-        return None;
-    }
     let language_name = super::detect_document_language(language, documents, host_url)?;
     let injection_query = language.injection_query(&language_name)?;
-    let resolved = InjectionResolver::resolve_at_byte_offset(
+    let resolved = InjectionResolver::resolve_by_region_id(
         language,
         bridge.node_tracker(),
         host_url,
         snapshot.tree(),
         snapshot.text(),
         injection_query.as_ref(),
-        start_byte,
+        region_id,
         snapshot.incarnation(),
     )?;
-    // `region_id`/`start_byte` came from the tracker + node map, but
-    // `resolved` came from a separately-fetched snapshot. If an edit landed
-    // in between, `start_byte` could fall inside a *different* live region —
-    // `resolve_at_byte_offset` returns whichever region contains the byte. A
-    // mismatched `region_id` means we'd translate coordinates against the
-    // wrong region, so return `None` (no offset); callers fall back to their
-    // safe default rather than risk a wrong translation. (The goto path can't
-    // hit this: there `resolved` and `region_id` come from one call.)
-    if resolved.region.region_id != region_id {
-        return None;
-    }
-    // The region's exclusive host-document end, content-precise (the injection
-    // region's own byte range mapped through the live host text). Callers that
-    // translate an inbound edit use it to reject a range that runs past the
-    // region into unrelated host text.
-    let region_end =
-        PositionMapper::new(snapshot.text()).byte_to_position(resolved.region.byte_range.end)?;
-    // `start` is `Copy`; move `line_column_offsets` out (no clone — `resolved`
-    // is dropped after this).
+    // Exact-ID resolution also validates the tracker incarnation and rejects
+    // an edit race: if this snapshot no longer contains the tracked layer, no
+    // candidate has the ID and callers fall back safely.
+    Some(resolved_region_geometry(resolved))
+}
+
+/// Consume a resolved region into the geometry shared by freshness and edit
+/// validation. The end is derived from the exact virtual content rather than
+/// the raw content-node range, whose trailing named children may be excluded.
+fn resolved_region_geometry(resolved: ResolvedInjection) -> (RegionOffset, Position, bool) {
     let start_line = resolved.region.line_range.start;
-    Some((
-        RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets),
-        region_end,
-    ))
+    let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets);
+    let region_end = region_host_end(&resolved.virtual_content, &offset);
+    (offset, region_end, resolved.contiguous)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::injection::{CacheableInjectionRegion, ResolvedInjection};
+
+    #[test]
+    fn geometry_uses_virtual_content_end_not_raw_node_end() {
+        let resolved = ResolvedInjection {
+            region: CacheableInjectionRegion {
+                language: "rust".to_string(),
+                byte_range: 10..99,
+                line_range: 2..3,
+                start_column: 3,
+                region_id: "region".to_string(),
+                content_hash: 0,
+            },
+            injection_language: "rust".to_string(),
+            virtual_content: "x".to_string(),
+            line_column_offsets: vec![3],
+            contiguous: true,
+        };
+
+        let (_, region_end, _) = resolved_region_geometry(resolved);
+
+        assert_eq!(region_end, Position::new(2, 4));
+    }
 }

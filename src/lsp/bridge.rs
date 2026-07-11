@@ -69,6 +69,7 @@ pub(crate) use protocol::RequestId;
 pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::decode_command;
 pub(crate) use protocol::location_link_to_location;
+pub(crate) use protocol::region_host_end;
 pub(crate) use protocol::strip_bridge_local_versions;
 pub(crate) use protocol::transform_workspace_edit_to_host;
 pub(crate) use protocol::translate_virtual_range_to_host;
@@ -80,6 +81,7 @@ pub(crate) use text_document::{
     CodeActionEnvelope, CodeLensEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
     extract_code_action_envelope, extract_code_lens_envelope, parse_code_actions_leniently,
 };
+pub(crate) use text_document::{KakehashiEnvelope, extract_envelope};
 pub(crate) use workspace::WorkspaceFolderSet;
 
 /// Integration tests for the bridge module.

@@ -1,10 +1,10 @@
 //! `textDocument/formatting` handler and helpers shared with
 //! `textDocument/rangeFormatting`.
 //!
-//! `textDocument/formatting` resolves every injection region in the document
-//! and asks the configured downstream language servers to format each one.
-//! Across regions the resulting [`TextEdit`] lists are concatenated, since each
-//! region edits a disjoint span of the host document.
+//! `textDocument/formatting` resolves bridge virtual documents in the host and
+//! asks the configured downstream language servers to format each safe,
+//! contiguous one. Their [`TextEdit`] lists are concatenated because the
+//! remaining documents edit disjoint host spans.
 //!
 //! Within a region, the aggregation strategy decides how multiple servers
 //! combine:
@@ -39,6 +39,8 @@ use crate::config::settings::AggregationStrategy;
 use crate::config::settings::{LayerSource, PRIORITIES_WILDCARD};
 use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
+#[cfg(test)]
+use crate::language::injection::ResolvedInjection;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
@@ -237,9 +239,9 @@ impl Kakehashi {
         Ok(result)
     }
 
-    /// Format every injection region (the **virt** layer): resolve regions
-    /// from the parsed snapshot, format each one per its aggregation config,
-    /// and concatenate the per-region edits (disjoint spans).
+    /// Format every safe bridge virtual document (the **virt** layer): resolve
+    /// from the parsed snapshot, skip non-contiguous groups, format each
+    /// remaining document, and concatenate its disjoint edits.
     #[allow(clippy::too_many_arguments)]
     async fn virt_format_edits(
         &self,
@@ -301,18 +303,62 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
+        let mut seen_edit_ranges = std::collections::HashSet::new();
         for resolved in all_regions.iter() {
+            // Non-contiguous combined injections contain masked host-only gaps.
+            // A formatter returns a contiguous whole-document replacement, which
+            // would replace those real host gaps as well and corrupt the document.
+            if !resolved.contiguous {
+                continue;
+            }
             let configs = self
                 .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
             if configs.is_empty() {
                 continue;
             }
-
             let agg = self.resolve_aggregation_config(
                 language_name,
                 &resolved.injection_language,
                 "textDocument/formatting",
             );
+            let pipeline =
+                plan_region_format(agg.strategy, &agg.priorities, &configs, agg.max_fan_out);
+            match &pipeline {
+                RegionFormatPlan::Skip => {
+                    log::warn!(
+                        target: "kakehashi::formatting",
+                        "concatenated formatting for {}->{} lists only unconfigured \
+                         server(s) {:?}; none are configured for this region, so it \
+                         is left unformatted (priorities is an allowlist — \
+                         non-listed servers are not run)",
+                        language_name,
+                        resolved.injection_language,
+                        agg.priorities,
+                    );
+                    continue;
+                }
+                RegionFormatPlan::Disabled => {
+                    log::debug!(
+                        target: "kakehashi::formatting",
+                        "formatting disabled for {}->{} (priorities = [])",
+                        language_name,
+                        resolved.injection_language,
+                    );
+                    continue;
+                }
+                RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
+            }
+            // Same-range query alternatives are tried in discovery priority
+            // order, but an unconfigured or explicitly disabled language is
+            // not a winner. Reserve the span only after planning so the first
+            // executable alternative formats it; later executable layers are
+            // suppressed to keep emitted edits non-overlapping.
+            if !seen_edit_ranges.insert((
+                resolved.region.byte_range.start,
+                resolved.region.byte_range.end,
+            )) {
+                continue;
+            }
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved: resolved.clone(),
@@ -350,12 +396,7 @@ impl Kakehashi {
                     PRIORITIES_WILDCARD,
                 );
             }
-            let pipeline = match plan_region_format(
-                region_ctx.strategy,
-                &region_ctx.priorities,
-                &region_ctx.configs,
-                region_ctx.max_fan_out,
-            ) {
+            let pipeline = match pipeline {
                 RegionFormatPlan::Concatenated(servers) => {
                     // Capture the region's per-line host prefixes now, while
                     // the host snapshot is at hand: the pipeline's whole-region
@@ -375,39 +416,8 @@ impl Kakehashi {
                     Some((servers, host_line_prefixes))
                 }
                 RegionFormatPlan::Preferred => None,
-                RegionFormatPlan::Skip => {
-                    // `concatenated` with a non-empty `priorities` that names only
-                    // unconfigured servers: the allowlist resolved to nothing, so
-                    // running the region's other servers would violate it. Leave
-                    // the region unformatted and warn so the typo'd/missing name
-                    // surfaces instead of silently formatting with the wrong
-                    // server.
-                    log::warn!(
-                        target: "kakehashi::formatting",
-                        "concatenated formatting for {}->{} lists only unconfigured \
-                         server(s) {:?}; none are configured for this region, so it \
-                         is left unformatted (priorities is an allowlist — \
-                         non-listed servers are not run)",
-                        language_name,
-                        region_ctx.resolved.injection_language,
-                        region_ctx.priorities,
-                    );
-                    continue;
-                }
-                RegionFormatPlan::Disabled => {
-                    // priorities = []: the per-method fan-out kill switch
-                    // (aggregation-priorities-wildcard). Deliberate config, so
-                    // no warning — just skip the region.
-                    log::debug!(
-                        target: "kakehashi::formatting",
-                        "formatting disabled for {}->{} (priorities = [])",
-                        language_name,
-                        region_ctx.resolved.injection_language,
-                    );
-                    continue;
-                }
+                RegionFormatPlan::Skip | RegionFormatPlan::Disabled => unreachable!(),
             };
-
             // Mint this region's tracked-source token into the shared
             // aggregator ONLY for the preferred branch. Concatenated regions
             // (`pipeline.is_some()`) get no token — concatenated client progress
@@ -562,6 +572,26 @@ impl Kakehashi {
     }
 }
 
+/// Select one deterministic edit-producing layer for each host byte range.
+///
+/// Discovery orders same-range alternate languages by query-pattern priority.
+/// This helper selects the first raw layer for tests of geometric deduplication;
+/// production formatting applies config/plan eligibility first and selects the
+/// first executable layer so an unconfigured alternative does not block a
+/// configured one for the same span.
+#[cfg(test)]
+pub(super) fn unique_edit_regions(
+    regions: &[ResolvedInjection],
+) -> impl Iterator<Item = &ResolvedInjection> {
+    let mut seen = std::collections::HashSet::new();
+    regions.iter().filter(move |resolved| {
+        seen.insert((
+            resolved.region.byte_range.start,
+            resolved.region.byte_range.end,
+        ))
+    })
+}
+
 /// Collapse a formatted text into a single whole-document replacement edit
 /// against `original` (the same overlap-free output shape as the
 /// within-region pipeline, concatenated-formatting-pipeline Decision
@@ -596,7 +626,7 @@ fn whole_document_replacement(original: &str, formatted: &str) -> Option<Vec<Tex
 /// How a single injection region should be formatted, derived from its resolved
 /// aggregation config. Extracted so the gating rule lives in one testable place.
 #[derive(Debug, PartialEq, Eq)]
-enum RegionFormatPlan {
+pub(super) enum RegionFormatPlan {
     /// Run the sequential concatenated pipeline over these effective servers
     /// (explicit `priorities` names filtered to configured servers, deduped,
     /// order preserved — the `"*"` wildcard is excluded, see
@@ -639,7 +669,7 @@ enum RegionFormatPlan {
 ///   allowlist forbids running the non-listed servers `preferred` would pick.
 ///   A `"*"` mixed into the list is ignored (no deterministic expansion order
 ///   for a sequential pipeline); the caller warns.
-fn plan_region_format(
+pub(super) fn plan_region_format(
     strategy: AggregationStrategy,
     priorities: &[String],
     configs: &[ResolvedServerConfig],
@@ -1836,6 +1866,41 @@ pub(super) async fn finalize_formatting_edits(
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range};
+
+    fn resolved_region(
+        language: &str,
+        byte_range: std::ops::Range<usize>,
+    ) -> crate::language::injection::ResolvedInjection {
+        crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: language.to_string(),
+                byte_range,
+                line_range: 0..1,
+                start_column: 0,
+                region_id: language.to_string(),
+                content_hash: 0,
+            },
+            injection_language: language.to_string(),
+            virtual_content: String::new(),
+            line_column_offsets: vec![0],
+            contiguous: true,
+        }
+    }
+
+    #[test]
+    fn edit_regions_keep_first_language_for_identical_host_range() {
+        let regions = vec![
+            resolved_region("first", 10..20),
+            resolved_region("second", 10..20),
+            resolved_region("third", 30..40),
+        ];
+
+        let selected: Vec<_> = unique_edit_regions(&regions)
+            .map(|region| region.injection_language.as_str())
+            .collect();
+
+        assert_eq!(selected, ["first", "third"]);
+    }
 
     fn edit(start_line: u32, start_char: u32, new_text: &str) -> TextEdit {
         TextEdit {

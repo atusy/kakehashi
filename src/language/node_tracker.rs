@@ -70,6 +70,12 @@ struct UriEntries {
     /// comparison alone cannot: with two mid-pass edits, an entry minted
     /// between them is shifted by the second yet still missed the first).
     shift_gen: u64,
+    /// Collision-free discriminators for bridge injection alternatives. Kept
+    /// with the URI lifecycle so document-controlled dynamic language names
+    /// are reclaimed on close instead of accumulating process-wide.
+    named_layers: HashMap<usize, HashMap<String, usize>>,
+    next_named_layer: usize,
+    free_named_layers: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +91,76 @@ struct TrackedPosition {
 }
 
 impl UriEntries {
+    fn named_layer(
+        &mut self,
+        pattern_index: usize,
+        language: &str,
+        incarnation: u64,
+    ) -> Option<usize> {
+        if incarnation < self.latest_incarnation {
+            return None;
+        }
+        if incarnation > self.latest_incarnation {
+            self.named_layers.clear();
+            self.next_named_layer = 0;
+            self.free_named_layers.clear();
+        }
+        self.latest_incarnation = incarnation;
+        let languages = self.named_layers.entry(pattern_index).or_default();
+        if let Some(slot) = languages.get(language) {
+            return Some(*slot);
+        }
+        let slot = if let Some(slot) = self.free_named_layers.pop() {
+            slot
+        } else {
+            let slot = self.next_named_layer;
+            if slot > usize::MAX / 2 {
+                return None;
+            }
+            self.next_named_layer += 1;
+            slot
+        };
+        languages.insert(language.to_owned(), slot);
+        Some(slot)
+    }
+
+    fn reconcile_named_layers(
+        &mut self,
+        active: &std::collections::HashSet<(usize, &str)>,
+        layer_base: usize,
+    ) {
+        let mut retired = Vec::new();
+        self.named_layers.retain(|pattern, languages| {
+            languages.retain(|language, slot| {
+                let keep = active.contains(&(*pattern, language.as_str()));
+                if !keep {
+                    retired.push(*slot);
+                }
+                keep
+            });
+            !languages.is_empty()
+        });
+        if retired.is_empty() {
+            return;
+        }
+        let retired_layers: std::collections::HashSet<_> = retired
+            .iter()
+            .filter_map(|slot| layer_base.checked_add(*slot))
+            .collect();
+        let mut retired_ids = Vec::new();
+        self.forward.retain(|key, tracked| {
+            let keep = !retired_layers.contains(&key.layer);
+            if !keep {
+                retired_ids.push(tracked.ulid);
+            }
+            keep
+        });
+        for id in retired_ids {
+            self.reverse.remove(&id);
+        }
+        self.free_named_layers.extend(retired);
+    }
+
     /// Get or insert a ULID for a position key, keeping both maps in sync.
     fn get_or_insert(&mut self, key: PositionKey, incarnation: u64) -> Option<Ulid> {
         if incarnation < self.latest_incarnation {
@@ -147,6 +223,11 @@ impl UriEntries {
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
         self.reverse
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
+        if self.latest_incarnation <= closing_incarnation {
+            self.named_layers.clear();
+            self.next_named_layer = 0;
+            self.free_named_layers.clear();
+        }
     }
 }
 
@@ -335,12 +416,40 @@ impl NodeTracker {
             .is_none_or(|current| *current == Some(incarnation))
     }
 
+    /// Allocate a collision-free, URI-lifecycle-owned layer discriminator for
+    /// an injection query pattern and its (possibly dynamic) language.
+    pub(crate) fn named_layer_for_incarnation(
+        &self,
+        uri: &Url,
+        pattern_index: usize,
+        language: &str,
+        incarnation: u64,
+    ) -> Option<usize> {
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            if !self.admits_incarnation(uri, incarnation) {
+                return None;
+            }
+            return entry.named_layer(pattern_index, language, incarnation);
+        }
+        let mut entry = self.entries.entry(uri.clone()).or_default();
+        if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
+            return None;
+        }
+        entry.named_layer(pattern_index, language, incarnation)
+    }
+
     /// Reclaim an entry this call materialized only to lose the lifecycle
     /// admission race. A concurrent reopen may already have edited or minted;
     /// retain either signal (`shift_gen > 0` or non-empty ids).
     fn remove_pristine_entry(&self, uri: &Url) {
-        self.entries
-            .remove_if(uri, |_, entry| entry.shift_gen == 0 && entry.len() == 0);
+        self.entries.remove_if(uri, |_, entry| {
+            entry.shift_gen == 0 && entry.len() == 0 && entry.named_layers.is_empty()
+        });
     }
 
     /// Get or create a stable ULID for a **host-layer** tree-sitter node.
@@ -745,6 +854,9 @@ impl NodeTracker {
             reverse: HashMap::with_capacity(entries.len()),
             latest_incarnation: entries.latest_incarnation,
             shift_gen: entries.shift_gen + 1,
+            named_layers: std::mem::take(&mut entries.named_layers),
+            next_named_layer: entries.next_named_layer,
+            free_named_layers: std::mem::take(&mut entries.free_named_layers),
         };
 
         for (key, tracked) in entries.drain() {
@@ -832,7 +944,7 @@ impl NodeTracker {
             .or_insert(None);
         self.entries.remove_if_mut(uri, |_, entries| {
             entries.retain_newer_than(closing_incarnation);
-            entries.len() == 0
+            entries.len() == 0 && entries.named_layers.is_empty()
         });
     }
 
@@ -948,6 +1060,72 @@ impl NodeTracker {
         self.mint_batch_in_entry(&mut entry, expected, incarnation, keys)
     }
 
+    /// Atomically allocate named layer discriminators and mint their position
+    /// keys under the same parse-snapshot latch. A rejected stale batch leaves
+    /// neither ULIDs nor dynamic-language reservations behind.
+    pub(crate) fn mint_named_batch_if_unshifted_for_incarnation<'a>(
+        &self,
+        uri: &Url,
+        expected: (u64, u64),
+        incarnation: u64,
+        layer_base: usize,
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize, &'a str)>,
+    ) -> Option<Vec<Ulid>> {
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            if !self.admits_incarnation(uri, incarnation) {
+                drop(entry);
+                self.remove_pristine_entry(uri);
+                return None;
+            }
+            return self.mint_named_batch_in_entry(
+                &mut entry,
+                expected,
+                incarnation,
+                layer_base,
+                keys,
+            );
+        }
+        let mut entry = self.entries.entry(uri.clone()).or_default();
+        if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
+            return None;
+        }
+        self.mint_named_batch_in_entry(&mut entry, expected, incarnation, layer_base, keys)
+    }
+
+    fn mint_named_batch_in_entry<'a>(
+        &self,
+        entry: &mut UriEntries,
+        expected: (u64, u64),
+        incarnation: u64,
+        layer_base: usize,
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize, &'a str)>,
+    ) -> Option<Vec<Ulid>> {
+        let epoch = self
+            .cleanup_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if (entry.shift_gen, epoch) != expected {
+            return None;
+        }
+        let keys: Vec<_> = keys.into_iter().collect();
+        let active = keys
+            .iter()
+            .map(|(_, _, _, pattern, language)| (*pattern, *language))
+            .collect();
+        entry.reconcile_named_layers(&active, layer_base);
+        keys.into_iter()
+            .map(|(start, end, kind, pattern_index, language)| {
+                let slot = entry.named_layer(pattern_index, language, incarnation)?;
+                let layer = layer_base.checked_add(slot)?;
+                entry.get_or_insert(PositionKey::new(start, end, kind, layer), incarnation)
+            })
+            .collect()
+    }
+
     /// The latch check + mint body of
     /// [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted), run while
     /// the caller holds `entry`'s exclusive lock.
@@ -1006,6 +1184,85 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
+    }
+
+    #[test]
+    fn stale_cleanup_preserves_newer_named_layers() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("named_layer_cleanup");
+        tracker.open_incarnation(&uri, 2);
+        let javascript = tracker
+            .named_layer_for_incarnation(&uri, 0, "javascript", 2)
+            .unwrap();
+
+        tracker.cleanup(&uri, 1);
+
+        assert_eq!(
+            tracker.named_layer_for_incarnation(&uri, 0, "javascript", 2),
+            Some(javascript)
+        );
+        assert_ne!(
+            tracker.named_layer_for_incarnation(&uri, 0, "typescript", 2),
+            Some(javascript)
+        );
+    }
+
+    #[test]
+    fn rejected_named_batch_reserves_no_language_slots() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("stale_named_batch");
+        tracker.open_incarnation(&uri, 1);
+        let stale_epoch = (1, tracker.mint_epoch(&uri).1);
+
+        assert!(
+            tracker
+                .mint_named_batch_if_unshifted_for_incarnation(
+                    &uri,
+                    stale_epoch,
+                    1,
+                    usize::MAX / 2 + 1,
+                    [(0, 4, "word", 0, "javascript")],
+                )
+                .is_none()
+        );
+        assert!(
+            tracker
+                .entries
+                .get(&uri)
+                .is_none_or(|entry| entry.named_layers.is_empty())
+        );
+    }
+
+    #[test]
+    fn successful_named_batch_retires_obsolete_languages() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("named_layer_reconcile");
+        tracker.open_incarnation(&uri, 1);
+        let epoch = tracker.mint_epoch(&uri);
+        let old = tracker
+            .mint_named_batch_if_unshifted_for_incarnation(
+                &uri,
+                epoch,
+                1,
+                usize::MAX / 2 + 1,
+                [(0, 4, "word", 0, "old-language")],
+            )
+            .unwrap()[0];
+
+        tracker
+            .mint_named_batch_if_unshifted_for_incarnation(
+                &uri,
+                epoch,
+                1,
+                usize::MAX / 2 + 1,
+                [(0, 4, "word", 0, "new-language")],
+            )
+            .unwrap();
+
+        assert!(tracker.lookup_node(&uri, &old).is_none());
+        let entry = tracker.entries.get(&uri).unwrap();
+        assert!(!entry.named_layers[&0].contains_key("old-language"));
+        assert!(entry.named_layers[&0].contains_key("new-language"));
     }
 
     /// The batch reconciliation mint reuses an existing id by position and

@@ -11,12 +11,18 @@ use super::content::{compute_line_column_offsets, extract_clean_content};
 use super::language::extract_injection_language;
 use super::offset::{InjectionOffset, effective_offset_for_pattern};
 use super::ranges::{
-    compute_included_ranges, compute_included_ranges_clipped, has_include_children_for_pattern,
+    compute_included_ranges, compute_included_ranges_clipped, has_combined_for_pattern,
+    has_include_children_for_pattern,
 };
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
 use crate::language::query_predicates::check_match_predicates;
 use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_hash};
+
+// Keep bridge-region identities in a namespace disjoint from real parse-tree
+// injection depths (0..=MAX_INJECTION_DEPTH). The per-range slot then gives
+// alternate language layers at identical host coordinates distinct ULIDs.
+pub(crate) const REGION_IDENTITY_LAYER_BASE: usize = usize::MAX / 2 + 1;
 
 /// Iterates over the `@injection.content` captures in a query match.
 fn iter_injection_content_captures<'a, 'b>(
@@ -54,6 +60,10 @@ pub(crate) struct InjectionRegionInfo<'a> {
     /// `CacheableInjectionRegion::from_region_info` run). `None` when the
     /// pattern has no directive.
     pub offset: Option<InjectionOffset>,
+    /// Whether this pattern's captures form one virtual document.
+    pub combined: bool,
+    /// Stable query pattern index used as part of tracker identity.
+    pub identity_slot: usize,
 }
 
 /// Owned injection region for caching (no lifetime dependency on parse tree)
@@ -273,42 +283,73 @@ pub(crate) fn collect_all_injections<'a>(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, *root, text.as_bytes());
 
-    // Use a map to deduplicate by content node range
+    // Deduplicate repeated matches of the same language layer while preserving
+    // distinct languages assigned to the same content range (#598).
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
         if !check_match_predicates(query, match_, text) {
             continue;
         }
+        let Some(language) = extract_injection_language(query, match_, text) else {
+            continue;
+        };
         for capture in iter_injection_content_captures(match_, query) {
             if capture.node.start_byte() >= capture.node.end_byte() {
                 continue;
             }
-            if let Some(language) = extract_injection_language(query, match_, text) {
-                let key = (capture.node.start_byte(), capture.node.end_byte());
-                // `or_insert_with` so the per-pattern predicate scans
-                // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
-                // are skipped when this content-node range was already inserted by
-                // an earlier matching pattern. Same resulting map, fewer scans.
-                injections_map
-                    .entry(key)
-                    .or_insert_with(|| InjectionRegionInfo {
-                        language,
-                        content_node: capture.node,
-                        pattern_index: match_.pattern_index,
-                        include_children: has_include_children_for_pattern(
-                            query,
-                            match_.pattern_index,
-                        ),
-                        offset: effective_offset_for_pattern(query, match_.pattern_index),
-                    });
-            }
+            let key = (
+                capture.node.start_byte(),
+                capture.node.end_byte(),
+                language.clone(),
+                match_.pattern_index,
+            );
+            // `or_insert_with` so the per-pattern predicate scans
+            // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
+            // are skipped when this content-node range was already inserted by
+            // an earlier matching pattern for the same language. Same
+            // resulting language layers, fewer scans.
+            injections_map.entry(key).or_insert_with(|| {
+                let offset = effective_offset_for_pattern(query, match_.pattern_index);
+                InjectionRegionInfo {
+                    language: language.clone(),
+                    content_node: capture.node,
+                    pattern_index: match_.pattern_index,
+                    include_children: has_include_children_for_pattern(query, match_.pattern_index),
+                    // Match the semantic path: effective offsets and
+                    // multi-region grouping do not compose safely.
+                    combined: has_combined_for_pattern(query, match_.pattern_index)
+                        && offset.is_none(),
+                    identity_slot: 0,
+                    offset,
+                }
+            });
         }
     }
 
     // Sort by start_byte (primary) and end_byte (secondary) to ensure deterministic ordering
     let mut injections: Vec<_> = injections_map.into_values().collect();
-    injections.sort_by_key(|r| (r.content_node.start_byte(), r.content_node.end_byte()));
+    injections.sort_by(|a, b| {
+        (
+            a.content_node.start_byte(),
+            a.content_node.end_byte(),
+            a.pattern_index,
+            a.language.as_str(),
+        )
+            .cmp(&(
+                b.content_node.start_byte(),
+                b.content_node.end_byte(),
+                b.pattern_index,
+                b.language.as_str(),
+            ))
+    });
+    for region in &mut injections {
+        // Retain the stable query-position component for discovery tests. The
+        // collision-free language component is allocated later by
+        // `NodeTracker::named_layer_for_incarnation`, where URI lifecycle state
+        // can own and reclaim dynamic language names.
+        region.identity_slot = region.pattern_index;
+    }
     Some(injections)
 }
 
@@ -331,10 +372,30 @@ pub(crate) fn detect_injection<'a>(
     let mut sorted_injections = injections;
     sorted_injections.sort_by(|a, b| {
         // Sort by start byte (ascending), then by end byte (descending)
-        // This ensures outer injections come before inner ones
+        // This ensures outer injections come before inner ones. Same-range
+        // alternate-language layers tie-break by (pattern_index, language) —
+        // the discovery sorts' exact order — so the hierarchy and the
+        // innermost pick stay deterministic regardless of input order.
         a.start_byte
             .cmp(&b.start_byte)
             .then(b.end_byte.cmp(&a.end_byte))
+            .then(a.pattern_index.cmp(&b.pattern_index))
+            .then(a.language.as_str().cmp(b.language.as_str()))
+    });
+
+    // Equal spans are alternative interpretations, not nested syntax. Keep
+    // the first query-pattern candidate for single-hierarchy consumers (the
+    // same priority used by bridge position resolution) while preserving real
+    // geometric nesting across different spans.
+    let mut previous_range = None;
+    sorted_injections.retain(|region| {
+        let range = (region.start_byte, region.end_byte);
+        if previous_range == Some(range) {
+            false
+        } else {
+            previous_range = Some(range);
+            true
+        }
     });
 
     // Build the language hierarchy from outermost to innermost
@@ -373,17 +434,23 @@ fn collect_injection_regions<'a>(
     let mut matches = cursor.matches(query, *root, text.as_bytes());
 
     // Collect all injection regions that contain our node
-    // Use a map to deduplicate by node range (start, end)
+    // Deduplicate by node range and language so alternate language layers on
+    // the same node remain discoverable.
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
         if let Some((content_node, language, pattern_index)) =
             extract_content_and_language(node, match_, query, text)
         {
-            let key = (content_node.start_byte(), content_node.end_byte());
+            let key = (
+                content_node.start_byte(),
+                content_node.end_byte(),
+                language.clone(),
+                pattern_index,
+            );
 
-            // Only keep the first injection for each unique range
-            // This handles cases where multiple patterns match the same node
+            // Keep the first match for each range/language pair; distinct
+            // languages on the same range remain separate layers.
             injections_map.entry(key).or_insert(RawInjectionRegion {
                 start_byte: content_node.start_byte(),
                 end_byte: content_node.end_byte(),
@@ -394,8 +461,21 @@ fn collect_injection_regions<'a>(
         }
     }
 
-    // Convert to vector
-    let injections: Vec<_> = injections_map.into_values().collect();
+    let mut injections: Vec<_> = injections_map.into_values().collect();
+    injections.sort_by(|a, b| {
+        (
+            a.start_byte,
+            std::cmp::Reverse(a.end_byte),
+            a.pattern_index,
+            a.language.as_str(),
+        )
+            .cmp(&(
+                b.start_byte,
+                std::cmp::Reverse(b.end_byte),
+                b.pattern_index,
+                b.language.as_str(),
+            ))
+    });
 
     Some(injections)
 }
@@ -428,6 +508,10 @@ fn extract_content_and_language<'a>(
 
 /// Find the injection region containing the given byte offset.
 ///
+/// Regions are sorted by query pattern index, so same-range alternate
+/// languages use explicit query-order priority for single-result bridge APIs.
+/// Whole-document and hierarchy discovery still retain every language layer.
+///
 /// Returns `(index, region)` for use with `calculate_region_id`, or `None` when the
 /// position is not within any injection region.
 fn find_injection_at_position<'a>(
@@ -448,11 +532,19 @@ pub(crate) struct ResolvedInjection {
     pub region: CacheableInjectionRegion,
     /// Language of the injection content
     pub injection_language: String,
-    /// Extracted virtual document content (clean, with blockquote prefixes stripped)
+    /// Extracted virtual document content. Excluded line prefixes are stripped;
+    /// combined regions additionally retain host line layout with empty or
+    /// whitespace-only gaps.
     pub virtual_content: String,
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.
     pub line_column_offsets: Vec<u32>,
+    /// Whether `virtual_content` maps through the ordinary single-region path.
+    /// For a multi-capture combined document this is `false` whenever the union
+    /// of included ranges leaves uncovered host bytes, including inter-capture
+    /// gaps and excluded prefix/child bytes. A combined pattern that currently
+    /// matches one capture uses the ordinary mapping and remains `true`.
+    pub contiguous: bool,
 }
 
 /// Central service for resolving injection regions at LSP positions
@@ -477,35 +569,70 @@ impl InjectionResolver {
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
         let (_region_index, region) = find_injection_at_position(&injections, byte_offset)?;
-        Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+        if region.combined {
+            let group: Vec<_> = injections
+                .iter()
+                .filter(|candidate| {
+                    candidate.combined
+                        && candidate.pattern_index == region.pattern_index
+                        && candidate.language == region.language
+                })
+                .collect();
+            Self::build_combined_injection(
+                coordinator,
+                Some((tracker, uri, incarnation)),
+                &group,
+                None,
+                text,
+            )
+        } else {
+            Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+        }
     }
 
     /// Calculate a stable ULID-based region_id for an injection.
     ///
     /// Phase 2 (lazy-node-identity-tracking): keyed on position (start_byte,
     /// end_byte, kind, layer), so the ULID stays constant for the same position
-    /// key. Region IDs always use `layer = 0` (see below).
+    /// and same-range identity slot.
     ///
-    /// Minted via the host-layer `get_or_create` (`layer = 0`) **by design**:
-    /// `content_node` comes from the host document's injection query, so it is a
-    /// host-tree node. The `layer` discriminator (lazy-node-identity-tracking
-    /// §"Node Uniqueness Key") only needs to separate host from injected nodes,
-    /// and a region's content node is always the host side. If a navigation
-    /// `kakehashi/node` call resolves that same host node it dedups to this same
-    /// ULID, which is correct.
+    /// Region IDs use a reserved tracker-layer namespace plus the deterministic
+    /// same-range identity slot. This keeps alternate language/query layers at
+    /// identical host coordinates distinct without colliding with real parse
+    /// injection depths used by `kakehashi/node`.
     pub(crate) fn calculate_region_id(
         tracker: &NodeTracker,
         uri: &Url,
         injection: &InjectionRegionInfo,
         incarnation: u64,
     ) -> Option<Ulid> {
-        tracker.get_or_create_for_incarnation(
+        let identity_layer = Self::region_identity_layer(tracker, uri, injection, incarnation)?;
+        tracker.get_or_create_in_layer_for_incarnation(
             uri,
             injection.content_node.start_byte(),
             injection.content_node.end_byte(),
             injection.content_node.kind(),
+            identity_layer,
             incarnation,
         )
+    }
+
+    /// Tracker-layer key used by both inline and batch region-ID minting. The
+    /// slot is collision-free and stable within one URI incarnation; its
+    /// numeric value depends on first-observation order.
+    pub(crate) fn region_identity_layer(
+        tracker: &NodeTracker,
+        uri: &Url,
+        injection: &InjectionRegionInfo,
+        incarnation: u64,
+    ) -> Option<usize> {
+        let slot = tracker.named_layer_for_incarnation(
+            uri,
+            injection.pattern_index,
+            &injection.language,
+            incarnation,
+        )?;
+        REGION_IDENTITY_LAYER_BASE.checked_add(slot)
     }
 
     /// Derive a parser-independent canonical injection language for bridge
@@ -550,11 +677,122 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
+            contiguous: true,
         })
     }
 
-    /// Resolve every injection region in the document (whole-doc operations
-    /// like `documentLink` use this rather than a position lookup). Holds no
+    /// Build one bridge virtual document for all captures of an
+    /// `injection.combined` pattern. Excluded line prefixes are stripped and
+    /// recorded as per-line offsets, while host-only gaps between captures are
+    /// represented by empty or whitespace-only lines. The downstream parser
+    /// sees one document and retains cross-block context without inheriting
+    /// indentation from host prefixes.
+    fn build_combined_injection(
+        coordinator: &LanguageCoordinator,
+        identity: Option<(&NodeTracker, &Url, u64)>,
+        regions: &[&InjectionRegionInfo<'_>],
+        prebuilt: Option<&[&CacheableInjectionRegion]>,
+        text: &str,
+    ) -> Option<ResolvedInjection> {
+        debug_assert!(!regions.is_empty());
+        let owned_cacheable;
+        let cacheable: Vec<&CacheableInjectionRegion> = match prebuilt {
+            Some(cacheable) => cacheable.to_vec(),
+            None => {
+                let (tracker, uri, incarnation) =
+                    identity.expect("non-prebuilt regions require identity");
+                owned_cacheable = regions
+                    .iter()
+                    .map(|region| {
+                        let id = Self::calculate_region_id(tracker, uri, region, incarnation)?;
+                        Some(CacheableInjectionRegion::from_region_info(
+                            region,
+                            &id.to_string(),
+                            text,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                owned_cacheable.iter().collect()
+            }
+        };
+        let first = regions[0];
+        let first_cacheable = cacheable[0];
+        if regions.len() == 1 {
+            let (virtual_content, line_column_offsets) =
+                extract_virtual_content_and_offsets(first, first_cacheable, text);
+            let injection_language =
+                Self::resolve_language(coordinator, &first.language, &virtual_content);
+            let mut region = first_cacheable.clone();
+            region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
+            return Some(ResolvedInjection {
+                region,
+                injection_language,
+                virtual_content,
+                line_column_offsets,
+                contiguous: true,
+            });
+        }
+        let group_start = first_cacheable.byte_range.start;
+        let group_end = cacheable
+            .iter()
+            .map(|region| region.byte_range.end)
+            .max()
+            .unwrap_or(group_start);
+
+        let mut included = Vec::new();
+        for (region, cacheable) in regions.iter().zip(&cacheable) {
+            let ranges = if region.offset.is_some() {
+                compute_included_ranges_clipped(
+                    &region.content_node,
+                    region.include_children,
+                    text,
+                    cacheable.byte_range.clone(),
+                )
+            } else {
+                compute_included_ranges(&region.content_node, region.include_children)
+            };
+            match ranges {
+                Some(ranges) => included.extend(ranges.into_iter().map(|range| {
+                    cacheable.byte_range.start + range.start_byte
+                        ..cacheable.byte_range.start + range.end_byte
+                })),
+                None => included.push(cacheable.byte_range.clone()),
+            }
+        }
+        included.sort_by_key(|range| (range.start, range.end));
+        let mut covered_until = group_start;
+        let contiguous = included.iter().all(|range| {
+            if range.start > covered_until {
+                return false;
+            }
+            covered_until = covered_until.max(range.end);
+            true
+        }) && covered_until >= group_end;
+        let (virtual_content, line_column_offsets) =
+            build_combined_virtual_content(text, group_start..group_end, &included);
+
+        let mut combined_region = first_cacheable.clone();
+        combined_region.byte_range.end = group_end;
+        combined_region.line_range.end = cacheable
+            .iter()
+            .map(|region| region.line_range.end)
+            .max()
+            .unwrap_or(combined_region.line_range.end);
+        combined_region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
+        let resolved_language =
+            Self::resolve_language(coordinator, &first.language, &virtual_content);
+        Some(ResolvedInjection {
+            region: combined_region,
+            injection_language: resolved_language,
+            virtual_content,
+            line_column_offsets,
+            contiguous,
+        })
+    }
+
+    /// Resolve every bridge virtual document in the host (whole-doc operations
+    /// like `documentLink` use this rather than a position lookup). Combined
+    /// capture groups produce one resolved document. Holds no
     /// Document lock — `tree`/`text` must already be cloned, typically via
     /// `DocumentSnapshot`. Empty vec when nothing matches.
     pub(crate) fn resolve_all(
@@ -575,6 +813,70 @@ impl InjectionResolver {
         Self::resolve_from_regions(coordinator, tracker, uri, &injections, text, incarnation)
     }
 
+    /// Resolve the exact bridge layer identified by an opaque region ID.
+    ///
+    /// A byte lookup alone is ambiguous when multiple query patterns assign
+    /// alternate languages or geometry to the same host node.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_by_region_id(
+        coordinator: &LanguageCoordinator,
+        tracker: &NodeTracker,
+        uri: &Url,
+        tree: &Tree,
+        text: &str,
+        injection_query: &Query,
+        region_id: &str,
+        incarnation: u64,
+    ) -> Option<ResolvedInjection> {
+        let ulid = Ulid::from_string(region_id).ok()?;
+        let (start, end, kind, identity_layer, tracked_incarnation) =
+            tracker.lookup_node(uri, &ulid)?;
+        if tracked_incarnation != incarnation {
+            return None;
+        }
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
+        let region = regions.iter().find(|candidate| {
+            candidate.content_node.start_byte() == start
+                && candidate.content_node.end_byte() == end
+                && candidate.content_node.kind() == kind
+                && Self::region_identity_layer(tracker, uri, candidate, incarnation)
+                    == Some(identity_layer)
+        })?;
+
+        if region.combined {
+            let group: Vec<_> = regions
+                .iter()
+                .filter(|candidate| {
+                    candidate.combined
+                        && candidate.pattern_index == region.pattern_index
+                        && candidate.language == region.language
+                })
+                .collect();
+            // Every capture in a combined group has a tracker ID, while the
+            // virtual document uses the first capture's ID as its canonical
+            // identity. Resolving any member ID must still reach that shared
+            // document rather than rejecting non-first captures below.
+            Self::build_combined_injection(
+                coordinator,
+                Some((tracker, uri, incarnation)),
+                &group,
+                None,
+                text,
+            )
+        } else {
+            let resolved = Self::build_resolved_injection(
+                coordinator,
+                tracker,
+                uri,
+                region,
+                text,
+                incarnation,
+            )?;
+            (resolved.region.region_id == region_id).then_some(resolved)
+        }
+    }
+
     /// [`resolve_all`](Self::resolve_all) minus the injection-query run, for a
     /// caller that already collected the regions (the populate pass — never
     /// discover twice, parse-snapshot ADR §3).
@@ -586,12 +888,13 @@ impl InjectionResolver {
         text: &str,
         incarnation: u64,
     ) -> Vec<ResolvedInjection> {
-        regions
-            .iter()
-            .filter_map(|region| {
-                Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
-            })
-            .collect()
+        Self::resolve_grouped(
+            coordinator,
+            Some((tracker, uri, incarnation)),
+            regions,
+            None,
+            text,
+        )
     }
 
     /// [`resolve_from_regions`](Self::resolve_from_regions) fed with the
@@ -607,22 +910,207 @@ impl InjectionResolver {
         cacheable: &[CacheableInjectionRegion],
         text: &str,
     ) -> Vec<ResolvedInjection> {
-        regions
-            .iter()
-            .zip(cacheable.iter())
-            .map(|(region, cacheable_region)| {
+        Self::resolve_grouped(coordinator, None, regions, Some(cacheable), text)
+    }
+
+    fn resolve_grouped(
+        coordinator: &LanguageCoordinator,
+        identity: Option<(&NodeTracker, &Url, u64)>,
+        regions: &[InjectionRegionInfo<'_>],
+        prebuilt: Option<&[CacheableInjectionRegion]>,
+        text: &str,
+    ) -> Vec<ResolvedInjection> {
+        enum Slot {
+            Single(usize),
+            Combined(Vec<usize>),
+        }
+
+        // Partition once in document order. A per-group scan makes dynamic
+        // language captures quadratic when nearly every region is its own
+        // (language, pattern) group.
+        let mut slots = Vec::new();
+        let mut combined_slots: std::collections::HashMap<(&str, usize), usize> =
+            std::collections::HashMap::new();
+        for (index, region) in regions.iter().enumerate() {
+            if region.combined {
+                let key = (region.language.as_str(), region.pattern_index);
+                if let Some(&slot_index) = combined_slots.get(&key) {
+                    let Slot::Combined(indices) = &mut slots[slot_index] else {
+                        unreachable!("combined slot index must identify a combined slot")
+                    };
+                    indices.push(index);
+                } else {
+                    combined_slots.insert(key, slots.len());
+                    slots.push(Slot::Combined(vec![index]));
+                }
+            } else {
+                slots.push(Slot::Single(index));
+            }
+        }
+
+        let mut resolved = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let index = match slot {
+                Slot::Combined(indices) => {
+                    let group: Vec<_> = indices.iter().map(|&i| &regions[i]).collect();
+                    let prebuilt_group = prebuilt.map(|cacheable| {
+                        indices.iter().map(|&i| &cacheable[i]).collect::<Vec<_>>()
+                    });
+                    if let Some(combined) = Self::build_combined_injection(
+                        coordinator,
+                        identity,
+                        &group,
+                        prebuilt_group.as_deref(),
+                        text,
+                    ) {
+                        resolved.push(combined);
+                    }
+                    continue;
+                }
+                Slot::Single(index) => index,
+            };
+            let region = &regions[index];
+            if let Some(cacheable) = prebuilt {
                 let (virtual_content, line_column_offsets) =
-                    extract_virtual_content_and_offsets(region, cacheable_region, text);
+                    extract_virtual_content_and_offsets(region, &cacheable[index], text);
                 let resolved_language =
                     Self::resolve_language(coordinator, &region.language, &virtual_content);
-                ResolvedInjection {
-                    region: cacheable_region.clone(),
+                resolved.push(ResolvedInjection {
+                    region: cacheable[index].clone(),
                     injection_language: resolved_language,
                     virtual_content,
                     line_column_offsets,
+                    contiguous: true,
+                });
+            } else {
+                let (tracker, uri, incarnation) =
+                    identity.expect("non-prebuilt regions require identity");
+                if let Some(single) = Self::build_resolved_injection(
+                    coordinator,
+                    tracker,
+                    uri,
+                    region,
+                    text,
+                    incarnation,
+                ) {
+                    resolved.push(single);
                 }
-            })
-            .collect()
+            }
+        }
+        resolved
+    }
+}
+
+fn mask_outside_ranges(text: &str, span: Range<usize>, included: &[Range<usize>]) -> String {
+    // The output is the span verbatim with excluded bytes turned to spaces
+    // (multi-byte chars can shrink it, never grow it) — preallocate the span.
+    let mut output = String::with_capacity(span.len());
+    let mut cursor = span.start;
+    for range in included {
+        if range.end <= cursor {
+            continue;
+        }
+        if range.start >= span.end {
+            break;
+        }
+        let start = range.start.clamp(cursor, span.end);
+        let end = range.end.clamp(start, span.end);
+        push_coordinate_whitespace(&mut output, clamped_slice(text, cursor..start));
+        output.push_str(clamped_slice(text, start..end));
+        cursor = end;
+    }
+    push_coordinate_whitespace(&mut output, clamped_slice(text, cursor..span.end));
+    output
+}
+
+/// Build a line-preserving combined document while stripping excluded prefixes.
+///
+/// Host-only gaps stay as empty or whitespace-only lines so virtual and host
+/// line numbers remain aligned. On lines containing injected content, bytes
+/// before the first included range are removed and recorded as a UTF-16 column
+/// offset, matching the isolated-region `extract_clean_content` contract. Any
+/// later gaps on the same line remain coordinate-preserving whitespace because
+/// the bridge offset model supports one translation offset per line.
+fn build_combined_virtual_content(
+    text: &str,
+    span: Range<usize>,
+    included: &[Range<usize>],
+) -> (String, Vec<u32>) {
+    // Tree-sitter byte ranges are only valid for the exact parsed text. A
+    // stale tree must not turn a combined-document rebuild into an invalid
+    // UTF-8 slice or an oversized allocation.
+    let span = ceil_char_boundary(text, span.start)..floor_char_boundary(text, span.end);
+    if span.start >= span.end {
+        return (String::new(), Vec::new());
+    }
+    let mut output = String::with_capacity(span.len());
+    let mut offsets = Vec::new();
+    let mut line_start = span.start;
+    let mut range_index = 0;
+    let mut host_line_start = text[..line_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+
+    while line_start < span.end {
+        let remaining = clamped_slice(text, line_start..span.end);
+        let line_end = remaining
+            .find('\n')
+            .map_or(span.end, |newline| line_start + newline + 1);
+        let mut content_end = line_end;
+        if text.as_bytes().get(content_end.saturating_sub(1)) == Some(&b'\n') {
+            content_end -= 1;
+            if text.as_bytes().get(content_end.saturating_sub(1)) == Some(&b'\r') {
+                content_end -= 1;
+            }
+        }
+
+        while included
+            .get(range_index)
+            .is_some_and(|range| range.end <= line_start)
+        {
+            range_index += 1;
+        }
+        let first_included = included.get(range_index).and_then(|range| {
+            let start = ceil_char_boundary(text, range.start.max(line_start));
+            let end = range.end.min(content_end);
+            let includes_line_break =
+                content_end < line_end && start == content_end && range.end > content_end;
+            (start < end || includes_line_break).then_some(start)
+        });
+
+        if let Some(first_included) = first_included {
+            offsets.push(
+                clamped_slice(text, host_line_start..first_included)
+                    .encode_utf16()
+                    .count() as u32,
+            );
+            output.push_str(&mask_outside_ranges(
+                text,
+                first_included..line_end,
+                &included[range_index..],
+            ));
+        } else {
+            offsets.push(0);
+            output.push_str(clamped_slice(text, content_end..line_end));
+        }
+
+        line_start = line_end;
+        host_line_start = line_end;
+    }
+
+    if output.ends_with('\n') {
+        offsets.push(0);
+    }
+    (output, offsets)
+}
+
+fn push_coordinate_whitespace(output: &mut String, text: &str) {
+    for character in text.chars() {
+        if matches!(character, '\n' | '\r') {
+            output.push(character);
+        } else {
+            output.extend(std::iter::repeat_n(' ', character.len_utf16()));
+        }
     }
 }
 
@@ -939,9 +1427,238 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_injections_same_node() {
-        // Test that multiple injection patterns matching the same node
-        // should only result in one injection (not nested)
+    fn resolve_all_combines_regions_marked_combined() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let open = "<div>"; let close = "</div>"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((string_literal
+                   (string_content) @injection.content)
+                 (#set! injection.language "html")
+                 (#set! injection.combined))
+            "#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("combined");
+
+        let resolved =
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query, 0);
+
+        assert_eq!(resolved.len(), 1, "combined captures form one document");
+        assert!(resolved[0].virtual_content.contains("<div>"));
+        assert!(resolved[0].virtual_content.contains("</div>"));
+        assert!(!resolved[0].virtual_content.contains("let close"));
+        assert!(!resolved[0].contiguous);
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+        let second_id = InjectionResolver::calculate_region_id(&tracker, &uri, &regions[1], 0)
+            .unwrap()
+            .to_string();
+        let via_second = InjectionResolver::resolve_by_region_id(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            &second_id,
+            0,
+        )
+        .expect("a non-first combined capture resolves the shared document");
+        assert_eq!(via_second.region.region_id, resolved[0].region.region_id);
+        assert_eq!(via_second.virtual_content, resolved[0].virtual_content);
+    }
+
+    #[test]
+    fn single_combined_capture_remains_contiguous() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let html = "<div></div>"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((string_literal
+                   (string_content) @injection.content)
+                 (#set! injection.language "html")
+                 (#set! injection.combined))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("single_combined"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].contiguous);
+        assert_eq!(resolved[0].virtual_content, "<div></div>");
+    }
+
+    #[test]
+    fn combined_captures_strip_blockquote_prefixes_and_record_offsets() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = concat!(
+            "> ```python\n",
+            "> if True:\n",
+            ">   print(1)\n",
+            "> ```\n",
+            "> gap\n",
+            "> ```python\n",
+            ">   print(2)\n",
+            "> ```\n",
+        );
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+                ((fenced_code_block
+                   (info_string (language) @injection.language)
+                   (code_fence_content) @injection.content)
+                 (#set! injection.combined))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("combined_blockquote"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].virtual_content,
+            "if True:\n  print(1)\n\n\n\n  print(2)\n"
+        );
+        assert_eq!(
+            resolved[0].line_column_offsets,
+            vec![2, 2, 0, 0, 0, 2, 0, 0]
+        );
+        assert!(!resolved[0].contiguous);
+    }
+
+    #[test]
+    fn combined_content_snaps_stale_included_start_to_char_boundary() {
+        let text = "éx\n";
+        let (content, offsets) = build_combined_virtual_content(
+            text,
+            0..text.len(),
+            std::slice::from_ref(&(1..usize::MAX)),
+        );
+
+        assert_eq!(content, "x\n");
+        assert_eq!(offsets, vec![1, 0]);
+    }
+
+    #[test]
+    fn combined_content_snaps_stale_span_start_before_slicing() {
+        let text = "éx\n";
+
+        let (content, offsets) =
+            build_combined_virtual_content(text, 1..text.len(), &[1..text.len()]);
+
+        assert_eq!(content, "x\n");
+        assert_eq!(offsets, vec![1, 0]);
+    }
+
+    #[test]
+    fn combined_blank_included_line_records_its_prefix_offset() {
+        let text = "> \n";
+        let (content, offsets) =
+            build_combined_virtual_content(text, 0..text.len(), &[2..text.len()]);
+
+        assert_eq!(content, "\n");
+        assert_eq!(offsets, vec![2, 0]);
+    }
+
+    #[test]
+    fn single_combined_blockquote_uses_contiguous_single_region_mapping() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "> ```python\n> if True:\n>   print(1)\n> ```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+                ((fenced_code_block
+                   (info_string (language) @injection.language)
+                   (code_fence_content) @injection.content)
+                 (#set! injection.combined))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("single_combined_blockquote"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "if True:\n  print(1)\n");
+        assert_eq!(resolved[0].line_column_offsets, vec![2, 2, 0]);
+        assert!(resolved[0].contiguous);
+    }
+
+    #[test]
+    fn combined_patterns_with_offsets_remain_separate() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "abc"; let b = "def"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((string_literal
+                   (string_content) @injection.content)
+                 (#set! injection.language "html")
+                 (#set! injection.combined)
+                 (#offset! @injection.content 0 1 0 -1))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("combined_offset"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].virtual_content, "b");
+        assert_eq!(resolved[1].virtual_content, "e");
+        assert!(resolved.iter().all(|region| region.contiguous));
+    }
+
+    #[test]
+    fn same_range_injections_keep_distinct_languages() {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { /* comment */ }"#;
         let tree = parse_rust_code(&mut parser, text);
@@ -977,15 +1694,119 @@ mod tests {
         let node_in_comment = find_node_at_byte(&root, 14).expect("node in comment");
         let result = detect_injection(&node_in_comment, &root, text, Some(&query), "rust");
 
-        // Should detect only one injection (first pattern takes precedence)
         assert!(result.is_some(), "Should find injection");
         let (hierarchy, _, _) = result.unwrap();
-        // Should only use the first matching pattern, not both
         assert_eq!(
             hierarchy,
             vec!["rust", "doc"],
-            "Should only show first injection"
+            "same-range alternatives use the first query pattern instead of fabricating nesting"
         );
+    }
+
+    #[test]
+    fn same_range_same_language_keeps_distinct_pattern_semantics() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { /* comment */ }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+            ((block_comment) @injection.content
+             (#set! injection.language "comment"))
+            ((block_comment) @injection.content
+             (#set! injection.language "comment")
+             (#set! injection.include-children))
+            "#,
+        )
+        .expect("valid query");
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+
+        assert_eq!(regions.len(), 2);
+        assert_ne!(regions[0].include_children, regions[1].include_children);
+        assert_ne!(regions[0].identity_slot, regions[1].identity_slot);
+    }
+
+    #[test]
+    fn dynamic_languages_from_one_pattern_get_distinct_identity_slots() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("dynamic_identity");
+        assert_ne!(
+            tracker
+                .named_layer_for_incarnation(&uri, 7, "javascript", 0)
+                .unwrap(),
+            tracker
+                .named_layer_for_incarnation(&uri, 7, "typescript", 0)
+                .unwrap(),
+            "one dynamic-language pattern must not alias distinct virtual documents"
+        );
+    }
+
+    #[test]
+    fn same_range_bridge_resolution_uses_query_pattern_priority() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { /* comment */ }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((block_comment) @injection.content
+                 (#set! injection.language "doc"))
+                ((block_comment) @injection.content
+                 (#set! injection.language "comment"))
+            "#,
+        )
+        .expect("valid query");
+
+        let all = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "both same-range languages remain discoverable"
+        );
+        let tracker = NodeTracker::new();
+        let uri = test_uri("same_range_priority");
+        let resolved_all = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            0,
+        );
+        assert_ne!(
+            resolved_all[0].region.region_id, resolved_all[1].region.region_id,
+            "alternate language layers at one host range need distinct identities"
+        );
+        let second_id = resolved_all[1].region.region_id.clone();
+        let second = InjectionResolver::resolve_by_region_id(
+            &test_coordinator(),
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            &second_id,
+            0,
+        )
+        .expect("the exact alternate layer resolves from its region ID");
+        assert_eq!(second.injection_language, "comment");
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &test_coordinator(),
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            15,
+            0,
+        )
+        .expect("comment position resolves");
+
+        assert_eq!(resolved.region.language, "doc");
     }
 
     #[test]
@@ -1343,6 +2164,8 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
+                identity_slot: 0,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
@@ -1350,6 +2173,8 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
+                identity_slot: 0,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
@@ -1357,6 +2182,8 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
+                identity_slot: 0,
             },
         ];
 
@@ -1428,6 +2255,8 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
+                identity_slot: 0,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
@@ -1435,6 +2264,8 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
+                identity_slot: 0,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
@@ -1442,6 +2273,8 @@ mod tests {
                 pattern_index: 0,
                 include_children: false,
                 offset: None,
+                combined: false,
+                identity_slot: 0,
             },
         ];
 

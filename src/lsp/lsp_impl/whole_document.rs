@@ -1,9 +1,9 @@
 //! Shared fan-out for whole-document bridged requests.
 //!
 //! documentLink, foldingRange, and codeLens all follow the same shape: no
-//! position parameter, so the request fans out to *every* injection region,
-//! uses the preferred strategy within each region, and concatenates the
-//! per-region results. This module hosts that shape once; the per-method
+//! position parameter, so the request fans out to every resolved bridge
+//! virtual document, uses the preferred strategy within each document, and
+//! concatenates those results. This module hosts that shape once; the per-method
 //! handlers supply only the LSP method name and the downstream send call.
 //!
 //! The fan-out is the virt layer of the resolved layer order

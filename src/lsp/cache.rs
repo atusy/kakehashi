@@ -279,18 +279,24 @@ impl CacheCoordinator {
             // pre-lever path) and defer identity to the next current pass —
             // the tracker is meanwhile kept live by the ordinary didChange
             // edit-shift.
-            let region_ids = tracker.mint_batch_if_unshifted_for_incarnation(
-                uri,
-                entry_mint_epoch,
-                incarnation,
-                regions.iter().map(|info| {
+            let region_keys = regions
+                .iter()
+                .map(|info| {
                     (
                         info.content_node.start_byte(),
                         info.content_node.end_byte(),
                         info.content_node.kind(),
-                        0,
+                        info.pattern_index,
+                        info.language.as_str(),
                     )
-                }),
+                })
+                .collect::<Vec<_>>();
+            let region_ids = tracker.mint_named_batch_if_unshifted_for_incarnation(
+                uri,
+                entry_mint_epoch,
+                incarnation,
+                crate::language::injection::REGION_IDENTITY_LAYER_BASE,
+                region_keys,
             )?;
 
             // Convert to CacheableInjectionRegion pairing each region with
@@ -973,12 +979,15 @@ print("hello")
             true,
         );
 
-        // Verify the region still exists with the same region_id (position-based stability)
+        // The region still exists, but changing its dynamic language creates a
+        // different virtual-document layer at the same host position. Region
+        // identity includes that language discriminator so simultaneous
+        // same-range languages cannot alias; the old ID must not be reused.
         let regions_after = cache.get_injections(&uri).expect("should have injections");
         assert_eq!(regions_after.len(), 1);
-        assert_eq!(
+        assert_ne!(
             regions_after[0].region_id, initial_region_id,
-            "region_id should be stable (same position)"
+            "a language change must remint the virtual-document identity"
         );
         assert_eq!(
             regions_after[0].language, "python",

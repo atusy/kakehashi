@@ -23,8 +23,8 @@ pub(crate) use content::{
     parse_with_ranges,
 };
 pub(crate) use discovery::{
-    CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, ResolvedInjection,
-    collect_all_injections, detect_injection,
+    CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, REGION_IDENTITY_LAYER_BASE,
+    ResolvedInjection, collect_all_injections, detect_injection,
 };
 pub(crate) use offset::{InjectionOffset, effective_offset_for_pattern};
 pub(crate) use ranges::{

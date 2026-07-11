@@ -210,6 +210,7 @@ mod tests {
                 injection_language: "python".to_string(),
                 virtual_content: String::new(),
                 line_column_offsets: vec![],
+                contiguous: true,
             },
             configs: vec![ResolvedServerConfig {
                 server_name: server.to_string(),

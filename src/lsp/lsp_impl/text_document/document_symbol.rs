@@ -1,7 +1,7 @@
 //! Document symbol method for Kakehashi.
 //!
 //! Walks the resolved layer order (cross-layer-aggregation): the virt layer
-//! bridges every injection region and concatenates the per-region symbols,
+//! bridges every resolved virtual document and concatenates their symbols,
 //! the host layer (host-document-bridge) bridges the host document itself
 //! with the real URI and the response verbatim. The first layer producing a
 //! non-empty result wins (`preferred`).
@@ -52,7 +52,7 @@ impl Kakehashi {
         .await
     }
 
-    /// Virt layer: bridge every injection region and concatenate symbols.
+    /// Virt layer: bridge every resolved virtual document and concatenate symbols.
     async fn document_symbol_virt_layer(
         &self,
         lsp_uri: &Uri,
