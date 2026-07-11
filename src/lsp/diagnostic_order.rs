@@ -1,4 +1,4 @@
-use tower_lsp_server::ls_types::{Diagnostic, NumberOrString};
+use tower_lsp_server::ls_types::Diagnostic;
 
 pub(crate) fn sort_diagnostics_deterministically(diagnostics: &mut [Diagnostic]) {
     // Establish the common-case order without allocating. Only true ties on
@@ -28,24 +28,6 @@ fn diagnostic_cheap_cmp(left: &Diagnostic, right: &Diagnostic) -> std::cmp::Orde
         .then_with(|| left.message.cmp(&right.message))
         .then_with(|| left.source.cmp(&right.source))
         .then_with(|| left.severity.cmp(&right.severity))
-        .then_with(|| diagnostic_code_cmp(left.code.as_ref(), right.code.as_ref()))
-}
-
-fn diagnostic_code_cmp(
-    left: Option<&NumberOrString>,
-    right: Option<&NumberOrString>,
-) -> std::cmp::Ordering {
-    use NumberOrString::{Number, String};
-
-    match (left, right) {
-        (Some(Number(left)), Some(Number(right))) => left.cmp(right),
-        (Some(String(left)), Some(String(right))) => left.cmp(right),
-        (Some(Number(_)), Some(String(_))) => std::cmp::Ordering::Less,
-        (Some(String(_)), Some(Number(_))) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (Some(_), None) => std::cmp::Ordering::Greater,
-    }
 }
 
 fn diagnostic_position_key(diagnostic: &Diagnostic) -> (u32, u32, u32, u32) {
@@ -90,7 +72,7 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::{DiagnosticSeverity, Position, Range};
+    use tower_lsp_server::ls_types::{Position, Range};
 
     fn diag(message: &str) -> Diagnostic {
         Diagnostic {
@@ -117,54 +99,6 @@ mod tests {
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["second", "first"]
-        );
-    }
-
-    #[test]
-    fn orders_tied_diagnostics_by_code_without_canonical_json() {
-        let mut later = diag("same");
-        later.code = Some(NumberOrString::String("B".to_string()));
-
-        let mut earlier = diag("same");
-        earlier.code = Some(NumberOrString::String("A".to_string()));
-
-        let mut diagnostics = vec![later, earlier];
-        sort_diagnostics_deterministically(&mut diagnostics);
-
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter_map(|diagnostic| diagnostic.code.clone())
-                .collect::<Vec<_>>(),
-            vec![
-                NumberOrString::String("A".to_string()),
-                NumberOrString::String("B".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn preserves_severity_precedence_before_code() {
-        let mut later_severity = diag("same");
-        later_severity.severity = Some(DiagnosticSeverity::WARNING);
-        later_severity.code = Some(NumberOrString::String("A".to_string()));
-
-        let mut earlier_severity = diag("same");
-        earlier_severity.severity = Some(DiagnosticSeverity::ERROR);
-        earlier_severity.code = Some(NumberOrString::String("B".to_string()));
-
-        let mut diagnostics = vec![later_severity, earlier_severity];
-        sort_diagnostics_deterministically(&mut diagnostics);
-
-        assert_eq!(
-            diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.severity)
-                .collect::<Vec<_>>(),
-            vec![
-                Some(DiagnosticSeverity::ERROR),
-                Some(DiagnosticSeverity::WARNING),
-            ]
         );
     }
 
