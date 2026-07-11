@@ -417,6 +417,14 @@ mod tests {
     }
 
     #[test]
+    fn clamped_snaps_overlong_character_before_crlf() {
+        let text = "hello\r\nworld\r\n";
+        let mapper = PositionMapper::new(text);
+
+        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 5);
+    }
+
+    #[test]
     fn clamped_floors_utf16_position_inside_surrogate_pair() {
         let text = "👋x\n";
         let mapper = PositionMapper::new(text);
