@@ -1122,6 +1122,8 @@ impl Kakehashi {
             .await
             .success
         {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
