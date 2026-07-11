@@ -62,8 +62,8 @@ pub(crate) struct InjectionRegionInfo<'a> {
     pub offset: Option<InjectionOffset>,
     /// Whether this pattern's captures form one virtual document.
     pub combined: bool,
-    /// Deterministic identity slot among alternate layers with this exact host
-    /// byte range. Zero for the common single-layer case.
+    /// Stable identity slot derived from the query pattern index. Unlike a
+    /// current-match ordinal, it does not shift when another pattern stops matching.
     pub identity_slot: usize,
 }
 
@@ -346,20 +346,11 @@ pub(crate) fn collect_all_injections<'a>(
                 b.language.as_str(),
             ))
     });
-    let mut previous_range = None;
-    let mut identity_slot = 0usize;
     for region in &mut injections {
-        let range = (
-            region.content_node.start_byte(),
-            region.content_node.end_byte(),
-        );
-        if previous_range == Some(range) {
-            identity_slot = identity_slot.saturating_add(1);
-        } else {
-            previous_range = Some(range);
-            identity_slot = 0;
-        }
-        region.identity_slot = identity_slot;
+        // Pattern indexes remain stable when another same-range pattern stops
+        // matching. An ordinal among only the current matches would let the
+        // survivor inherit the removed pattern's tracked region identity.
+        region.identity_slot = region.pattern_index;
     }
     Some(injections)
 }
@@ -1683,6 +1674,8 @@ mod tests {
 
         assert_eq!(regions.len(), 2);
         assert_ne!(regions[0].include_children, regions[1].include_children);
+        assert_eq!(regions[0].identity_slot, 0);
+        assert_eq!(regions[1].identity_slot, 1);
     }
 
     #[test]
