@@ -73,6 +73,10 @@ pub(crate) struct LanguageCoordinator {
     /// re-poisoning — no clear-vs-store ordering to get right. The clear on
     /// `load_settings` is memory hygiene, not the correctness mechanism.
     failed_loads: dashmap::DashMap<String, u64>,
+    /// Explicit configured parser failures override same-generation dynamic
+    /// discovery. This closes the reload window where fallback publication can
+    /// race ahead of validating `languages.<id>.parser`.
+    configured_load_failures: dashmap::DashMap<String, u64>,
     /// Reload-scoped registry entries, tagged with the settings generation that
     /// resolved their library path. Manually pre-registered/built-in entries are
     /// untagged; configured and dynamically discovered parsers must match the
@@ -120,6 +124,7 @@ impl LanguageCoordinator {
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
             failed_loads: dashmap::DashMap::new(),
+            configured_load_failures: dashmap::DashMap::new(),
             dynamically_loaded: dashmap::DashMap::new(),
             registration_lock: Mutex::new(()),
             settings_reload_lock: Mutex::new(()),
@@ -171,6 +176,13 @@ impl LanguageCoordinator {
         language_id: &str,
         current_generation: u64,
     ) -> Option<LanguageLoadResult> {
+        if self
+            .configured_load_failures
+            .get(language_id)
+            .is_some_and(|generation| *generation == current_generation)
+        {
+            return Some(LanguageLoadResult::default());
+        }
         if self.has_current_parser_registration(language_id, current_generation) {
             return Some(LanguageLoadResult::success_with(Vec::new()));
         }
@@ -389,6 +401,7 @@ impl LanguageCoordinator {
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         self.failed_loads.clear();
+        self.configured_load_failures.clear();
 
         // Build base map from language configs
         self.build_base_map(&settings.languages);
@@ -1485,6 +1498,8 @@ impl LanguageCoordinator {
                 let generation = self
                     .load_generation
                     .load(std::sync::atomic::Ordering::Acquire);
+                self.configured_load_failures
+                    .insert(lang_name.to_string(), generation);
                 self.record_failed_load(lang_name, generation);
                 return result;
             }
@@ -1507,6 +1522,7 @@ impl LanguageCoordinator {
             .recover_poison("LanguageCoordinator::register_configured_language");
         self.language_registry
             .register(language_id.to_string(), language);
+        self.configured_load_failures.remove(language_id);
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -3297,6 +3313,18 @@ mod tests {
             search_paths: vec![grammar_dir],
             ..Default::default()
         });
+        let generation = coordinator
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            coordinator.publish_dynamic_language(
+                "markdown",
+                tree_sitter_rust::LANGUAGE.into(),
+                generation,
+                || {},
+            ),
+            "simulate dynamic fallback winning the publication race"
+        );
 
         assert!(
             !coordinator.ensure_language_loaded("markdown").success,
