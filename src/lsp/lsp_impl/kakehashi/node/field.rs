@@ -68,7 +68,7 @@ impl Kakehashi {
                 index.and_then(|i| n.field_name_for_child(i))
             })
             .await
-            .map(|(_uri, _layer, field)| json!({ "fieldName": field }))
+            .map(|(_uri, _layer, _incarnation, field)| json!({ "fieldName": field }))
             .unwrap_or(Value::Null);
         Ok(value)
     }
@@ -86,7 +86,7 @@ impl Kakehashi {
                 index.and_then(|i| n.field_name_for_named_child(i))
             })
             .await
-            .map(|(_uri, _layer, field)| json!({ "fieldName": field }))
+            .map(|(_uri, _layer, _incarnation, field)| json!({ "fieldName": field }))
             .unwrap_or(Value::Null);
         Ok(value)
     }

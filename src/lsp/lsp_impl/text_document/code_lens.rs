@@ -98,7 +98,7 @@ impl Kakehashi {
         let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
             return false;
         };
-        let Some((start_byte, _end, _kind)) =
+        let Some((start_byte, _end, _kind, tracked_incarnation)) =
             self.bridge.node_tracker().lookup_position(&uri, &ulid)
         else {
             return false;
@@ -106,6 +106,9 @@ impl Kakehashi {
         let Some(doc) = self.documents.get(&uri) else {
             return false;
         };
+        if doc.incarnation() != tracked_incarnation {
+            return false;
+        }
         let mapper = PositionMapper::new(doc.text());
         let Some(position) = mapper.byte_to_position(start_byte) else {
             return false;

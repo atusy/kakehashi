@@ -194,7 +194,13 @@ impl DocumentStore {
     }
 
     // Lock safety: Single insert() call - no read lock held before or during write
-    pub fn insert(&self, uri: Url, text: String, language_id: Option<String>, tree: Option<Tree>) {
+    pub fn insert(
+        &self,
+        uri: Url,
+        text: String,
+        language_id: Option<String>,
+        tree: Option<Tree>,
+    ) -> u64 {
         let has_tree = tree.is_some();
         // didOpen registers a fresh lifetime → a fresh incarnation, so an
         // in-flight parse from a prior open of this URI can't publish against it.
@@ -214,6 +220,7 @@ impl DocumentStore {
         // entry being present. A reopen replaces any leftover prior-lifetime channel.
         self.ensure_watermark_entry(&uri, incarnation);
         self.documents.insert(uri, document);
+        incarnation
     }
 
     // Lock safety: Returns DocumentHandle wrapping Ref - caller holds read lock until drop

@@ -62,7 +62,8 @@ impl Kakehashi {
         // has no entries. `layer` pins resolution to the language tree that
         // minted the node so navigation stays in-layer (node-reference-protocol
         // Scope rule).
-        let Some((start, end, kind, layer)) = self.bridge.node_tracker().lookup_node(&uri, &ulid)
+        let Some((start, end, kind, layer, tracked_incarnation)) =
+            self.bridge.node_tracker().lookup_node(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -79,6 +80,10 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::node::parent", "no current parse snapshot for {}", uri);
             return Ok(Value::Null);
         };
+        let incarnation = snapshot.incarnation;
+        if incarnation != tracked_incarnation {
+            return Ok(Value::Null);
+        }
         let host_text: &str = &snapshot.text;
         let Some(host_tree) = snapshot.tree.as_ref() else {
             return Ok(Value::Null);
@@ -125,7 +130,17 @@ impl Kakehashi {
         let parent_ulid = self
             .bridge
             .node_tracker()
-            .get_or_create_in_layer(&uri, p_start, p_end, p_kind, layer);
+            .get_or_create_in_layer_for_incarnation(
+                &uri,
+                p_start,
+                p_end,
+                p_kind,
+                layer,
+                incarnation,
+            );
+        let Some(parent_ulid) = parent_ulid else {
+            return Ok(Value::Null);
+        };
 
         Ok(json!({
             "id": parent_ulid.to_string(),

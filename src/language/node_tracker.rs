@@ -20,8 +20,8 @@ use url::Url;
 /// Protocol ([node-reference-protocol](../../docs/architecture-decisions/node-reference-protocol.md)).
 ///
 /// Maintains a bidirectional index per URI:
-/// - forward (`PositionKey -> Ulid`) for assignment / dedup on `get_or_create`
-/// - reverse (`Ulid -> PositionKey`) for resolving a held ULID back to a node
+/// - forward (`PositionKey -> (Ulid, incarnation)`) for assignment / dedup
+/// - reverse (`Ulid -> (PositionKey, incarnation)`) for resolving a held ULID back to a node
 ///   range (used by `kakehashi/node/text` and future navigation methods).
 ///
 /// Both directions are kept in sync across `get_or_create`, `adjust_for_edits`,
@@ -29,12 +29,20 @@ use url::Url;
 /// one (per lazy-node-identity-tracking "no tombstone" rule).
 pub(crate) struct NodeTracker {
     entries: DashMap<Url, UriEntries>,
+    /// Current document lifetime for URIs managed by the LSP lifecycle.
+    /// `None` is a close tombstone: it prevents a direct mint that passed its
+    /// last reader-side liveness check before didClose from recreating an old
+    /// entry after cleanup. Markers are retained at one `(Url, Option<u64>)`
+    /// per distinct URI for process lifetime; they contain no node IDs or
+    /// document data. An absent key keeps standalone/test trackers usable.
+    incarnations: DashMap<Url, Option<u64>>,
     /// Bumped by every [`cleanup`](Self::cleanup) (didClose). Folded into the
     /// mint latch ([`mint_epoch`](Self::mint_epoch)) so a close/reopen —
     /// which removes the per-URI index and would reset its `shift_gen` to 0
     /// (ABA) — can never make an old-lifetime latch compare equal. Global
-    /// (not per-URI) so closed documents leave NO retained state; the cost
-    /// is that a close of any document mid-pass refuses that pass's
+    /// (not per-URI) so closed documents leave no retained node-id state
+    /// (only the small lifecycle marker documented on `incarnations`); the
+    /// cost is that a close of any document mid-pass refuses that pass's
     /// remaining mint batches — a rare event with a one-null-re-sync
     /// consequence.
     cleanup_epoch: std::sync::atomic::AtomicU64,
@@ -48,8 +56,12 @@ pub(crate) struct NodeTracker {
 /// directly.
 #[derive(Default)]
 struct UriEntries {
-    forward: HashMap<PositionKey, Ulid>,
-    reverse: HashMap<Ulid, PositionKey>,
+    forward: HashMap<PositionKey, TrackedUlid>,
+    reverse: HashMap<Ulid, TrackedPosition>,
+    /// Highest document incarnation that has minted into this URI index.
+    /// Once a reopen mints, a straggling older-lifetime reader must not evict
+    /// or append entries behind it.
+    latest_incarnation: u64,
     /// Count of coordinate shifts (edit applications) this index has
     /// received. Read/written under the same DashMap entry lock as the maps,
     /// so [`mint_batch_if_unshifted`](NodeTracker::mint_batch_if_unshifted)
@@ -60,21 +72,36 @@ struct UriEntries {
     shift_gen: u64,
 }
 
+#[derive(Clone, Copy)]
+struct TrackedUlid {
+    ulid: Ulid,
+    incarnation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TrackedPosition {
+    key: PositionKey,
+    incarnation: u64,
+}
+
 impl UriEntries {
     /// Get or insert a ULID for a position key, keeping both maps in sync.
-    fn get_or_insert(&mut self, key: PositionKey) -> Ulid {
+    fn get_or_insert(&mut self, key: PositionKey, incarnation: u64) -> Option<Ulid> {
+        if incarnation < self.latest_incarnation {
+            return None;
+        }
+        self.latest_incarnation = incarnation;
         if let Some(existing) = self.forward.get(&key) {
-            return *existing;
+            if existing.incarnation == incarnation {
+                return Some(existing.ulid);
+            }
+            self.reverse.remove(&existing.ulid);
         }
         let ulid = Ulid::new();
-        self.forward.insert(key, ulid);
-        self.reverse.insert(ulid, key);
-        ulid
-    }
-
-    /// Lookup a position key by ULID.
-    fn lookup(&self, ulid: &Ulid) -> Option<&PositionKey> {
-        self.reverse.get(ulid)
+        self.forward.insert(key, TrackedUlid { ulid, incarnation });
+        self.reverse
+            .insert(ulid, TrackedPosition { key, incarnation });
+        Some(ulid)
     }
 
     /// Returns the number of (key, ulid) pairs currently tracked.
@@ -88,7 +115,7 @@ impl UriEntries {
     }
 
     /// Drain all (key, ulid) entries, clearing both maps.
-    fn drain(&mut self) -> impl Iterator<Item = (PositionKey, Ulid)> + '_ {
+    fn drain(&mut self) -> impl Iterator<Item = (PositionKey, TrackedUlid)> + '_ {
         self.reverse.clear();
         self.forward.drain()
     }
@@ -98,15 +125,28 @@ impl UriEntries {
     /// Returns `Err(existing_ulid)` if a different ULID already occupies the
     /// position. Caller decides what to do with the collision (the current
     /// adjust_for_edits policy is "first wins").
-    fn insert(&mut self, key: PositionKey, ulid: Ulid) -> std::result::Result<(), Ulid> {
+    fn insert(&mut self, key: PositionKey, tracked: TrackedUlid) -> std::result::Result<(), Ulid> {
         match self.forward.entry(key) {
             Entry::Vacant(e) => {
-                e.insert(ulid);
-                self.reverse.insert(ulid, key);
+                e.insert(tracked);
+                self.reverse.insert(
+                    tracked.ulid,
+                    TrackedPosition {
+                        key,
+                        incarnation: tracked.incarnation,
+                    },
+                );
                 Ok(())
             }
-            Entry::Occupied(e) => Err(*e.get()),
+            Entry::Occupied(e) => Err(e.get().ulid),
         }
+    }
+
+    fn retain_newer_than(&mut self, closing_incarnation: u64) {
+        self.forward
+            .retain(|_, tracked| tracked.incarnation > closing_incarnation);
+        self.reverse
+            .retain(|_, tracked| tracked.incarnation > closing_incarnation);
     }
 }
 
@@ -279,8 +319,28 @@ impl NodeTracker {
     pub(crate) fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            incarnations: DashMap::new(),
             cleanup_epoch: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Register the current open lifetime before any request can mint for it.
+    pub(crate) fn open_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.incarnations.insert(uri.clone(), Some(incarnation));
+    }
+
+    fn admits_incarnation(&self, uri: &Url, incarnation: u64) -> bool {
+        self.incarnations
+            .get(uri)
+            .is_none_or(|current| *current == Some(incarnation))
+    }
+
+    /// Reclaim an entry this call materialized only to lose the lifecycle
+    /// admission race. A concurrent reopen may already have edited or minted;
+    /// retain either signal (`shift_gen > 0` or non-empty ids).
+    fn remove_pristine_entry(&self, uri: &Url) {
+        self.entries
+            .remove_if(uri, |_, entry| entry.shift_gen == 0 && entry.len() == 0);
     }
 
     /// Get or create a stable ULID for a **host-layer** tree-sitter node.
@@ -290,6 +350,7 @@ impl NodeTracker {
     /// with `layer = 0`. Injection-aware call sites that mint nodes from a
     /// deeper layer MUST use `get_or_create_in_layer` so host and injected
     /// nodes sharing `(start, end, kind)` receive distinct ULIDs.
+    #[cfg(test)]
     pub(crate) fn get_or_create(
         &self,
         uri: &Url,
@@ -297,18 +358,31 @@ impl NodeTracker {
         end: usize,
         kind: &'static str,
     ) -> Ulid {
-        self.get_or_create_in_layer(uri, start, end, kind, 0)
+        self.get_or_create_for_incarnation(uri, start, end, kind, 0)
+            .expect("unmanaged test incarnation is admitted")
+    }
+
+    pub(crate) fn get_or_create_for_incarnation(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        incarnation: u64,
+    ) -> Option<Ulid> {
+        self.get_or_create_in_layer_for_incarnation(uri, start, end, kind, 0, incarnation)
     }
 
     /// Get or create a stable ULID for a tree-sitter node at injection `layer`.
     ///
     /// Uses lazy-node-identity-tracking composite key `(start_byte, end_byte,
-    /// kind, layer)`: the same key always returns the same ULID, while
-    /// different nodes — including a host vs injected node that share an
+    /// kind, layer)`: the same key returns the same ULID within one document
+    /// incarnation, while a reopen remints it. Different nodes — including a host vs injected node that share an
     /// identical span and kind (`layer` differs) — receive distinct ULIDs.
     ///
     /// Updates both the forward and reverse index so the returned ULID can be
     /// resolved back to its position via [`lookup_node`](Self::lookup_node).
+    #[cfg(test)]
     pub(crate) fn get_or_create_in_layer(
         &self,
         uri: &Url,
@@ -317,16 +391,46 @@ impl NodeTracker {
         kind: &'static str,
         layer: usize,
     ) -> Ulid {
+        self.get_or_create_in_layer_for_incarnation(uri, start, end, kind, layer, 0)
+            .expect("unmanaged test incarnation is admitted")
+    }
+
+    pub(crate) fn get_or_create_in_layer_for_incarnation(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        layer: usize,
+        incarnation: u64,
+    ) -> Option<Ulid> {
         let key = PositionKey::new(start, end, kind, layer);
+
+        // Reject a known-closed/wrong lifetime before materializing an empty
+        // tracker entry. Re-check under the entry lock below: didClose can
+        // change lifecycle admission between this fast rejection and locking.
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
 
         // `get_mut` first: the hot path (index already exists) avoids the
         // `Url` clone `entry()` needs for its owned key. (Explicit two-step
         // pattern to avoid DashMap lifetime ambiguity.)
         if let Some(mut entry) = self.entries.get_mut(uri) {
-            return entry.get_or_insert(key);
+            if !self.admits_incarnation(uri, incarnation) {
+                drop(entry);
+                self.remove_pristine_entry(uri);
+                return None;
+            }
+            return entry.get_or_insert(key, incarnation);
         }
         let mut entry = self.entries.entry(uri.clone()).or_default();
-        entry.get_or_insert(key)
+        if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
+            return None;
+        }
+        entry.get_or_insert(key, incarnation)
     }
 
     /// The count of coordinate shifts (edit applications) `uri`'s index has
@@ -352,9 +456,9 @@ impl NodeTracker {
         &self,
         uri: &Url,
         ulid: &Ulid,
-    ) -> Option<(usize, usize, &'static str)> {
-        let (start, end, kind, _layer) = self.lookup_node(uri, ulid)?;
-        Some((start, end, kind))
+    ) -> Option<(usize, usize, &'static str, u64)> {
+        let (start, end, kind, _layer, incarnation) = self.lookup_node(uri, ulid)?;
+        Some((start, end, kind, incarnation))
     }
 
     /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind, layer)`.
@@ -367,10 +471,17 @@ impl NodeTracker {
         &self,
         uri: &Url,
         ulid: &Ulid,
-    ) -> Option<(usize, usize, &'static str, usize)> {
+    ) -> Option<(usize, usize, &'static str, usize, u64)> {
         let entries = self.entries.get(uri)?;
-        let key = entries.lookup(ulid)?;
-        Some((key.start_byte, key.end_byte, key.kind, key.layer))
+        let tracked = entries.reverse.get(ulid)?;
+        let key = tracked.key;
+        Some((
+            key.start_byte,
+            key.end_byte,
+            key.kind,
+            key.layer,
+            tracked.incarnation,
+        ))
     }
 
     /// Get the ULID for a position in a layer if it exists, without creating
@@ -380,6 +491,7 @@ impl NodeTracker {
     /// of positions the intervening edits did not shift (keeping the delta
     /// lineage minimal) without ever writing its stale coordinates into this
     /// live-coordinate index.
+    #[cfg(test)]
     pub(crate) fn lookup_in_layer(
         &self,
         uri: &Url,
@@ -389,7 +501,29 @@ impl NodeTracker {
         layer: usize,
     ) -> Option<Ulid> {
         let key = PositionKey::new(start, end, kind, layer);
-        self.entries.get(uri)?.forward.get(&key).copied()
+        self.entries
+            .get(uri)?
+            .forward
+            .get(&key)
+            .map(|entry| entry.ulid)
+    }
+
+    /// Incarnation-filtered read-only lookup for stale-serving paths. A pass
+    /// from an older lifetime must never reuse a reopened lifetime's ID even
+    /// when its position key is byte-identical.
+    pub(crate) fn lookup_in_layer_for_incarnation(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        layer: usize,
+        incarnation: u64,
+    ) -> Option<Ulid> {
+        let key = PositionKey::new(start, end, kind, layer);
+        let entries = self.entries.get(uri)?;
+        let tracked = entries.forward.get(&key)?;
+        (tracked.incarnation == incarnation).then_some(tracked.ulid)
     }
 
     /// Get the ULID for a host-layer position if it exists, without creating it.
@@ -609,18 +743,19 @@ impl NodeTracker {
         let mut new_entries = UriEntries {
             forward: HashMap::with_capacity(entries.len()),
             reverse: HashMap::with_capacity(entries.len()),
+            latest_incarnation: entries.latest_incarnation,
             shift_gen: entries.shift_gen + 1,
         };
 
-        for (key, ulid) in entries.drain() {
+        for (key, tracked) in entries.drain() {
             if Self::should_invalidate_node(&key, edit) {
-                invalidated.push(ulid);
+                invalidated.push(tracked.ulid);
                 continue; // INVALIDATE
             }
 
             // Position adjustment (returns None if range collapsed)
             let Some(new_key) = adjust_position_for_edit(key, edit, delta) else {
-                invalidated.push(ulid);
+                invalidated.push(tracked.ulid);
                 continue; // INVALIDATE: range collapsed
             };
 
@@ -637,14 +772,14 @@ impl NodeTracker {
             // 3. Collisions may indicate a bug in invalidation logic anyway
             //
             // Log at warn level for observability and debugging.
-            if let Err(_existing) = new_entries.insert(new_key, ulid) {
+            if let Err(_existing) = new_entries.insert(new_key, tracked) {
                 warn!(
                     target: "kakehashi::node_tracker",
                     "Position collision after edit - ULID mapping dropped: ulid={}, start={}, end={}, kind={}, layer={}",
-                    ulid, new_key.start_byte, new_key.end_byte, new_key.kind, new_key.layer
+                    tracked.ulid, new_key.start_byte, new_key.end_byte, new_key.kind, new_key.layer
                 );
                 // Note: Collided ULID is also invalidated (both nodes can't coexist)
-                invalidated.push(ulid);
+                invalidated.push(tracked.ulid);
             }
         }
 
@@ -652,70 +787,53 @@ impl NodeTracker {
         invalidated
     }
 
-    /// Remove all tracked regions for a document.
+    /// Remove tracked nodes minted by the closing document lifetime.
     ///
-    /// Called on didClose to prevent memory leaks. The removal resets the
-    /// URI's `shift_gen`, so the global [`cleanup_epoch`](Self::cleanup_epoch)
-    /// is bumped instead: the latch-gated passes fold it into their latch
-    /// ([`mint_epoch`](Self::mint_epoch)), making an old-lifetime latch
-    /// unequal to any post-close/reopen observation without retaining any
-    /// per-closed-URI state.
+    /// Each bidirectional entry carries the document incarnation that minted
+    /// it. A raced reopen may have already minted newer entries before this
+    /// didClose reaches cleanup, so cleanup retains only entries whose
+    /// incarnation is newer than `closing_incarnation`. This simultaneously
+    /// invalidates every pre-close id and preserves every published reopened id.
+    /// When no newer entries remain, the whole URI index is removed.
+    /// The lifecycle map keeps a lightweight close tombstone so a direct mint
+    /// that passed its reader-side check before didClose cannot recreate the
+    /// just-removed lifetime afterward; didOpen replaces it with the new
+    /// incarnation before that lifetime starts minting.
     ///
-    /// The bump runs BEFORE the removal, and the order is load-bearing: a
+    /// The global epoch bump runs BEFORE retention, and the order is
+    /// load-bearing: a
     /// latch check that passes reads the pre-bump epoch, so it strictly
     /// precedes this close in epoch order, and whatever it minted is wiped
-    /// by the removal that follows — a closed document still leaves no
-    /// state. Removing FIRST would open a gap where a pre-close latch
+    /// by the retention that follows. Retaining FIRST would open a gap where a pre-close latch
     /// `(0, E)` re-materializes the just-removed entry (`or_default`,
     /// `shift_gen` back at 0) and passes against the not-yet-bumped epoch,
-    /// leaving stale-lifetime coordinates alive in a reopened document's
-    /// index with nothing left to reclaim them.
-    ///
-    /// `reopened` guards the removal against the inverse race: didClose
-    /// runs this AFTER removing the document and OUTSIDE `edit_lock`, so a
-    /// fast reopen's parse may already have minted the NEW lifetime's ids
-    /// into this entry — an unconditional wipe would publish a snapshot
-    /// whose ids immediately resolve `null`. The probe is evaluated under
-    /// the entry's exclusive lock: probe-sees-open ⇒ the entry is the
-    /// reopened document's live index, keep it (the epoch bump above still
-    /// refuses any old-lifetime latch; old-lifetime entries it may carry
-    /// are position-keyed and bounded, invalidated by the new lifetime's
-    /// edits like any other). ACCEPTED residual of that keep: a pre-close
-    /// id can stay resolvable against the reopened document instead of
-    /// degrading to `null` — this is the didOpen-racing-didClose lifecycle
-    /// class the close path deliberately defers to a per-document
-    /// lifecycle-epoch gate (see the residual notes in `did_close.rs`);
-    /// separating the lifetimes here would need incarnation-tagged
-    /// entries, while the alternative (unconditional wipe) nulls the
-    /// reopened snapshot's ENTIRE id set — strictly worse.
-    /// Probe-sees-closed ⇒ no new-lifetime mint can
-    /// have happened — mints are liveness-gated on the reopened snapshot,
-    /// whose insert happens-before any mint that passed the gate, which
-    /// happens-before this probe under the same entry lock — so the removal
-    /// reclaims only old-lifetime state.
-    ///
-    /// Lock-order contract: `reopened` runs while this method holds `uri`'s
-    /// entry (shard) lock, so it MUST NOT touch this tracker (self-deadlock)
-    /// and may only take locks that never call back into the tracker while
-    /// held — the document-store read the didClose probe performs is fine
-    /// (the store never re-enters the tracker under its own locks); a future
-    /// probe must preserve that one-way ordering.
+    /// leaving stale-lifetime coordinates alive after cleanup.
     ///
     /// Memory-ordering note (why `Release` on the bump suffices, no
     /// `SeqCst` needed): the only way another thread can OBSERVE the
-    /// removal is through the entry's shard lock (`get_mut` /
+    /// retention is through the entry's shard lock (`get_mut` /
     /// `entry().or_default()`), and that lock's release/acquire pair makes
-    /// every write sequenced before the removal — including this bump —
+    /// every write sequenced before retention — including this bump —
     /// visible to the observer, so a check that finds the entry gone always
     /// reads the bumped epoch and refuses. A check that instead wins the
-    /// shard lock BEFORE the removal may still read the pre-bump epoch and
+    /// shard lock BEFORE retention may still read the pre-bump epoch and
     /// pass, but it then minted into the still-present entry, which the
-    /// removal (queued behind that same lock) wipes — a closed document
-    /// leaves no state on either interleaving.
-    pub(crate) fn cleanup(&self, uri: &Url, reopened: impl FnOnce() -> bool) {
+    /// retention (queued behind that same lock) removes it.
+    pub(crate) fn cleanup(&self, uri: &Url, closing_incarnation: u64) {
         self.cleanup_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        self.entries.remove_if(uri, |_, _| !reopened());
+        self.incarnations
+            .entry(uri.clone())
+            .and_modify(|current| {
+                if *current == Some(closing_incarnation) {
+                    *current = None;
+                }
+            })
+            .or_insert(None);
+        self.entries.remove_if_mut(uri, |_, entries| {
+            entries.retain_newer_than(closing_incarnation);
+            entries.len() == 0
+        });
     }
 
     /// Run `commit` only if `uri`'s (shift generation, cleanup epoch) still
@@ -738,9 +856,18 @@ impl NodeTracker {
         &self,
         uri: &Url,
         expected: (u64, u64),
+        incarnation: u64,
         commit: impl FnOnce() -> R,
     ) -> Option<R> {
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
         let entry = self.entries.entry(uri.clone()).or_default();
+        if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
+            return None;
+        }
         let epoch = self
             .cleanup_epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -777,22 +904,48 @@ impl NodeTracker {
     /// [`commit_if_unshifted`](Self::commit_if_unshifted) documents.
     ///
     /// Returns the ids aligned with `keys`' iteration order.
+    #[cfg(test)]
     pub(crate) fn mint_batch_if_unshifted(
         &self,
         uri: &Url,
         expected: (u64, u64),
         keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
     ) -> Option<Vec<Ulid>> {
+        self.mint_batch_if_unshifted_for_incarnation(uri, expected, 0, keys)
+    }
+
+    pub(crate) fn mint_batch_if_unshifted_for_incarnation(
+        &self,
+        uri: &Url,
+        expected: (u64, u64),
+        incarnation: u64,
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
+    ) -> Option<Vec<Ulid>> {
+        // Avoid leaving an empty `entries` slot for a known-stale batch. The
+        // under-lock checks below remain load-bearing against a raced close.
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
         // `get_mut` first: the hot path (index already exists — every batch
         // after a document's first) avoids the `Url` clone `entry()` needs
         // for its owned key. The absent-entry `entry().or_default()`
         // fallback stays load-bearing: it serializes the latch check with a
         // concurrent FIRST edit on a never-minted URI.
         if let Some(mut entry) = self.entries.get_mut(uri) {
-            return self.mint_batch_in_entry(&mut entry, expected, keys);
+            if !self.admits_incarnation(uri, incarnation) {
+                drop(entry);
+                self.remove_pristine_entry(uri);
+                return None;
+            }
+            return self.mint_batch_in_entry(&mut entry, expected, incarnation, keys);
         }
         let mut entry = self.entries.entry(uri.clone()).or_default();
-        self.mint_batch_in_entry(&mut entry, expected, keys)
+        if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
+            return None;
+        }
+        self.mint_batch_in_entry(&mut entry, expected, incarnation, keys)
     }
 
     /// The latch check + mint body of
@@ -802,6 +955,7 @@ impl NodeTracker {
         &self,
         entry: &mut UriEntries,
         expected: (u64, u64),
+        incarnation: u64,
         keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
     ) -> Option<Vec<Ulid>> {
         let epoch = self
@@ -810,13 +964,11 @@ impl NodeTracker {
         if (entry.shift_gen, epoch) != expected {
             return None;
         }
-        Some(
-            keys.into_iter()
-                .map(|(start, end, kind, layer)| {
-                    entry.get_or_insert(PositionKey::new(start, end, kind, layer))
-                })
-                .collect(),
-        )
+        keys.into_iter()
+            .map(|(start, end, kind, layer)| {
+                entry.get_or_insert(PositionKey::new(start, end, kind, layer), incarnation)
+            })
+            .collect()
     }
 
     /// The (per-URI shift generation, global cleanup epoch) pair a pass
@@ -902,23 +1054,104 @@ mod tests {
     /// ids must survive — while the epoch bump still refuses any
     /// old-lifetime latch.
     #[test]
-    fn cleanup_keeps_reopened_index_but_still_bumps_epoch() {
+    fn cleanup_invalidates_closed_incarnation_but_keeps_reopened_entries() {
         let tracker = NodeTracker::new();
         let uri = test_uri("cleanup_reopen");
-        // Stands in for the reopened lifetime's first mint, which the raced
-        // didClose's cleanup must not wipe.
-        let id = tracker.get_or_create_in_layer(&uri, 0, 4, "word", 0);
+        let old_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1)
+            .unwrap();
         let pre_close_latch = tracker.mint_epoch(&uri);
-        tracker.cleanup(&uri, || true);
+        let reopened_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 10, 14, "word", 0, 2)
+            .unwrap();
+
+        tracker.cleanup(&uri, 1);
+
         assert_eq!(
-            tracker.lookup_in_layer(&uri, 0, 4, "word", 0),
-            Some(id),
-            "a reopened document's index survives the raced close"
+            tracker.lookup_node(&uri, &old_id),
+            None,
+            "the closed lifetime's id is invalidated"
+        );
+        assert_eq!(
+            tracker.lookup_node(&uri, &reopened_id),
+            Some((10, 14, "word", 0, 2)),
+            "the reopened lifetime's id survives the raced close"
         );
         assert_eq!(
             tracker.mint_batch_if_unshifted(&uri, pre_close_latch, [(10, 14, "word", 0)]),
             None,
             "the epoch bump still refuses latches taken before the close"
+        );
+    }
+
+    #[test]
+    fn reopened_incarnation_remints_same_position_with_a_fresh_id() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("same_position_reopen");
+        let old_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1)
+            .unwrap();
+        let reopened_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2)
+            .unwrap();
+
+        assert_ne!(old_id, reopened_id);
+        assert_eq!(tracker.lookup_node(&uri, &old_id), None);
+        assert_eq!(
+            tracker.lookup_node(&uri, &reopened_id),
+            Some((0, 4, "word", 0, 2))
+        );
+    }
+
+    #[test]
+    fn stale_incarnation_cannot_evict_reopened_entry() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("stale_after_reopen");
+        tracker.open_incarnation(&uri, 2);
+        let reopened_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2)
+            .unwrap();
+
+        let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
+
+        assert_eq!(stale_id, None);
+        assert_eq!(
+            tracker.lookup_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1),
+            None,
+            "an older lifetime cannot reuse the reopened lifetime's position ID"
+        );
+        assert_eq!(
+            tracker.lookup_node(&uri, &reopened_id),
+            Some((0, 4, "word", 0, 2))
+        );
+    }
+
+    #[test]
+    fn direct_mint_cannot_resurrect_closed_incarnation_after_cleanup() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("stale_after_cleanup");
+        tracker.open_incarnation(&uri, 1);
+        let stale_latch = tracker.mint_epoch(&uri);
+        tracker.cleanup(&uri, 1);
+
+        assert_eq!(
+            tracker.commit_if_unshifted(&uri, stale_latch, 1, || "committed"),
+            None
+        );
+        let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
+        assert_eq!(stale_id, None);
+        assert!(
+            tracker.entries.get(&uri).is_none(),
+            "a denied stale mint must not materialize an empty node index"
+        );
+
+        tracker.open_incarnation(&uri, 2);
+        let reopened_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2)
+            .unwrap();
+        assert_eq!(
+            tracker.lookup_node(&uri, &reopened_id),
+            Some((0, 4, "word", 0, 2))
         );
     }
 
@@ -931,7 +1164,7 @@ mod tests {
         let uri = test_uri("batch_mint_cleanup");
         let other = test_uri("batch_mint_other");
         let latch = tracker.mint_epoch(&uri);
-        tracker.cleanup(&other, || false);
+        tracker.cleanup(&other, 0);
         assert_eq!(
             tracker.mint_batch_if_unshifted(&uri, latch, [(0, 4, "word", 0)]),
             None
@@ -976,7 +1209,7 @@ mod tests {
         // to a post-reopen observation — including for a URI that never
         // tracked a node.
         let (_, epoch_before) = tracker.mint_epoch(&uri);
-        tracker.cleanup(&uri, || false);
+        tracker.cleanup(&uri, 0);
         let (gen_after, epoch_after) = tracker.mint_epoch(&uri);
         assert_eq!(gen_after, 0, "the fresh index restarts at generation 0");
         assert!(
@@ -1095,13 +1328,13 @@ mod tests {
 
         assert_eq!(
             tracker.lookup_node(&uri, &ulid),
-            Some((5, 15, "block", 3)),
+            Some((5, 15, "block", 3, 0)),
             "lookup_node should round-trip the layer discriminator"
         );
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
-            Some((5, 15, "block")),
-            "lookup_position should drop the layer"
+            Some((5, 15, "block", 0)),
+            "lookup_position should drop the layer but retain incarnation"
         );
     }
 
@@ -1126,9 +1359,10 @@ mod tests {
         let ulid_before = tracker.get_or_create(&uri, 0, 10, "code_block");
 
         // Cleanup
-        tracker.cleanup(&uri, || false);
+        tracker.cleanup(&uri, 0);
 
         // After cleanup, same key should create NEW ULID
+        tracker.open_incarnation(&uri, 0);
         let ulid_after = tracker.get_or_create(&uri, 0, 10, "code_block");
 
         assert_ne!(
@@ -1148,7 +1382,7 @@ mod tests {
         let _ulid2 = tracker.get_or_create(&uri2, 0, 10, "code_block");
 
         // Cleanup only uri2
-        tracker.cleanup(&uri2, || false);
+        tracker.cleanup(&uri2, 0);
 
         // uri1 should still have its ULID
         let ulid1_after = tracker.get_or_create(&uri1, 0, 10, "code_block");
@@ -1168,7 +1402,7 @@ mod tests {
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
-            Some((30, 50, "block")),
+            Some((30, 50, "block", 0)),
             "Newly issued ULID must be resolvable via reverse index"
         );
     }
@@ -1196,7 +1430,7 @@ mod tests {
         let ulid = tracker.get_or_create(&uri, 10, 20, "block");
         assert!(tracker.lookup_position(&uri, &ulid).is_some());
 
-        tracker.cleanup(&uri, || false);
+        tracker.cleanup(&uri, 0);
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
@@ -1223,7 +1457,7 @@ mod tests {
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
-            Some((55, 75, "block")),
+            Some((55, 75, "block", 0)),
             "lookup_position should follow adjusted node range"
         );
     }

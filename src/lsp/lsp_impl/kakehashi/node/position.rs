@@ -45,7 +45,7 @@ impl Kakehashi {
                 ))
             })
             .await
-            .and_then(|(_uri, _layer, span)| span)
+            .and_then(|(_uri, _layer, _incarnation, span)| span)
             .map(|(start, end)| json!({ "start": start, "end": end }))
             .unwrap_or(Value::Null);
         Ok(value)
@@ -60,7 +60,7 @@ impl Kakehashi {
                 PositionMapper::new(text).byte_to_position(n.start_byte())
             })
             .await
-            .and_then(|(_uri, _layer, pos)| pos)
+            .and_then(|(_uri, _layer, _incarnation, pos)| pos)
             .map(|pos| json!({ "startPosition": pos }))
             .unwrap_or(Value::Null);
         Ok(value)
@@ -74,7 +74,7 @@ impl Kakehashi {
                 PositionMapper::new(text).byte_to_position(n.end_byte())
             })
             .await
-            .and_then(|(_uri, _layer, pos)| pos)
+            .and_then(|(_uri, _layer, _incarnation, pos)| pos)
             .map(|pos| json!({ "endPosition": pos }))
             .unwrap_or(Value::Null);
         Ok(value)
@@ -151,7 +151,9 @@ impl Kakehashi {
             .await;
 
         let value = match resolved {
-            Some((uri, layer, Some(triple))) => self.mint_node_info(&uri, layer, triple),
+            Some((uri, layer, incarnation, Some(triple))) => {
+                self.mint_node_info(&uri, layer, incarnation, triple)
+            }
             _ => Value::Null,
         };
         Ok(value)

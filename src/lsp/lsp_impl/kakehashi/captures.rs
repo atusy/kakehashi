@@ -1240,6 +1240,7 @@ impl Kakehashi {
                     &tracker,
                     &documents,
                     entry_mint_epoch,
+                    incarnation,
                     mint_into_tracker,
                     generation,
                     &match_cache,
@@ -1359,6 +1360,7 @@ fn execute_captures_walk(
     tracker: &crate::language::NodeTracker,
     documents: &crate::document::DocumentStore,
     entry_mint_epoch: (u64, u64),
+    incarnation: u64,
     mint_into_tracker: bool,
     generation: u64,
     match_cache: &super::captures_match_cache::CapturesMatchCache,
@@ -1535,7 +1537,12 @@ fn execute_captures_walk(
             })
         };
         let layer_ulids: Vec<ulid::Ulid> = if mint_into_tracker {
-            tracker.mint_batch_if_unshifted(uri, entry_mint_epoch, capture_keys())
+            tracker.mint_batch_if_unshifted_for_incarnation(
+                uri,
+                entry_mint_epoch,
+                incarnation,
+                capture_keys(),
+            )
         } else {
             None
         }
@@ -1547,7 +1554,14 @@ fn execute_captures_walk(
             // unregistered ids must still be unique per capture.
             capture_keys()
                 .map(|(start, end, kind, layer)| {
-                    match tracker.lookup_in_layer(uri, start, end, kind, layer) {
+                    match tracker.lookup_in_layer_for_incarnation(
+                        uri,
+                        start,
+                        end,
+                        kind,
+                        layer,
+                        incarnation,
+                    ) {
                         Some(live) => live,
                         None => ulid::Ulid::new(),
                     }
@@ -2775,6 +2789,7 @@ mod tests {
             &tracker,
             &store,
             tracker.mint_epoch(&uri),
+            0,
             true,
             0,
             &match_cache,
@@ -2805,6 +2820,7 @@ mod tests {
             &tracker,
             &store,
             tracker.mint_epoch(&uri),
+            0,
             false,
             0,
             &match_cache,
@@ -2837,6 +2853,7 @@ mod tests {
             &stale_tracker,
             &store,
             stale_tracker.mint_epoch(&uri),
+            0,
             false,
             0,
             &match_cache,
@@ -2991,6 +3008,7 @@ mod tests {
                 &self.tracker,
                 &self.store,
                 entry_mint_epoch,
+                incarnation,
                 mint_into_tracker,
                 generation,
                 &self.match_cache,
@@ -3026,7 +3044,7 @@ mod tests {
         for m in &matches {
             for c in m["captures"].as_array().unwrap() {
                 let id: ulid::Ulid = c["node"]["id"].as_str().unwrap().parse().unwrap();
-                let (s, e, kind, _layer) = rig
+                let (s, e, kind, _layer, _incarnation) = rig
                     .tracker
                     .lookup_node(&rig.uri, &id)
                     .expect("a current serve mints resolvable ids");
@@ -3132,9 +3150,10 @@ mod tests {
         assert_eq!(captures.len(), 1, "the unmappable capture is dropped");
         assert_eq!(captures[0]["name"], "survivor");
         let id: ulid::Ulid = captures[0]["node"]["id"].as_str().unwrap().parse().unwrap();
+        let incarnation = rig.store.get(&rig.uri).unwrap().incarnation();
         assert_eq!(
             rig.tracker.lookup_node(&rig.uri, &id),
-            Some((3, 4, "identifier", 0)),
+            Some((3, 4, "identifier", 0, incarnation)),
             "the survivor must keep ITS OWN id, not inherit the dropped capture's"
         );
     }

@@ -144,7 +144,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         id: &str,
         mut f: impl FnMut(tree_sitter::Node<'_>) -> R + Send + 'static,
-    ) -> Option<(Url, usize, R)> {
+    ) -> Option<(Url, usize, u64, R)> {
         // Most accessors don't need the document text; ignore it.
         self.with_node_text(lsp_uri, id, move |node, _text| f(node))
             .await
@@ -165,7 +165,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         id: &str,
         mut f: impl FnMut(tree_sitter::Node<'_>, &str) -> R + Send + 'static,
-    ) -> Option<(Url, usize, R)> {
+    ) -> Option<(Url, usize, u64, R)> {
         // Most accessors don't need the minting layer's included ranges.
         self.with_node_text_ranges(lsp_uri, id, move |node, text, _ranges| f(node, text))
             .await
@@ -182,7 +182,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         id: &str,
         mut f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> R + Send + 'static,
-    ) -> Option<(Url, usize, R)> {
+    ) -> Option<(Url, usize, u64, R)> {
         // An unparseable URI signals a misbehaving client; warn for parity with
         // `node` / `node/text` / `node/parent` / `node/children` while still
         // collapsing to `null`.
@@ -196,7 +196,8 @@ impl Kakehashi {
 
         // Tracked `(start, end, kind, layer)`. `layer` pins resolution to the
         // language tree that minted the node so navigation stays in-layer.
-        let (start, end, kind, layer) = self.bridge.node_tracker().lookup_node(&uri, &ulid)?;
+        let (start, end, kind, layer, tracked_incarnation) =
+            self.bridge.node_tracker().lookup_node(&uri, &ulid)?;
 
         // Resolve a CURRENT snapshot (parse-snapshot ADR §3): the tracked
         // `(start, end)` lives at the current `content_version` (the tracker
@@ -204,6 +205,9 @@ impl Kakehashi {
         // tree would be wrong, not merely late — reject immediately with the
         // universal null; only the bounded first-parse wait applies.
         let snapshot = self.current_snapshot(&uri).await?;
+        if snapshot.incarnation != tracked_incarnation {
+            return None;
+        }
         let host_text = std::sync::Arc::clone(&snapshot.text);
         let host_tree = snapshot.tree.clone()?;
 
@@ -253,7 +257,7 @@ impl Kakehashi {
             );
             return None;
         };
-        Some((uri, layer, result))
+        Some((uri, layer, snapshot.incarnation, result))
     }
 
     /// Mint (or reuse) a stable ULID for a related node in `layer` and shape it
@@ -263,13 +267,17 @@ impl Kakehashi {
         &self,
         uri: &Url,
         layer: usize,
+        incarnation: u64,
         triple: NodeTriple,
     ) -> Value {
         let (start, end, kind) = triple;
         let ulid = self
             .bridge
             .node_tracker()
-            .get_or_create_in_layer(uri, start, end, kind, layer);
+            .get_or_create_in_layer_for_incarnation(uri, start, end, kind, layer, incarnation);
+        let Some(ulid) = ulid else {
+            return Value::Null;
+        };
         json!({ "id": ulid.to_string(), "kind": kind })
     }
 
@@ -288,11 +296,12 @@ impl Kakehashi {
         id: &str,
         f: impl FnMut(tree_sitter::Node<'_>) -> Option<NodeTriple> + Send + 'static,
     ) -> Value {
-        let Some((uri, layer, picked)) = self.with_node_by_id(lsp_uri, id, f).await else {
+        let Some((uri, layer, incarnation, picked)) = self.with_node_by_id(lsp_uri, id, f).await
+        else {
             return Value::Null;
         };
         match picked {
-            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            Some(triple) => self.mint_node_info(&uri, layer, incarnation, triple),
             None => Value::Null,
         }
     }
@@ -309,11 +318,13 @@ impl Kakehashi {
         + Send
         + 'static,
     ) -> Value {
-        let Some((uri, layer, picked)) = self.with_node_text_ranges(lsp_uri, id, f).await else {
+        let Some((uri, layer, incarnation, picked)) =
+            self.with_node_text_ranges(lsp_uri, id, f).await
+        else {
             return Value::Null;
         };
         match picked {
-            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            Some(triple) => self.mint_node_info(&uri, layer, incarnation, triple),
             None => Value::Null,
         }
     }
@@ -352,17 +363,18 @@ impl Kakehashi {
         };
 
         let tracker = self.bridge.node_tracker();
-        let Some((start, end, kind, layer)) = tracker.lookup_node(&uri, &ulid) else {
+        let Some((start, end, kind, layer, tracked_incarnation)) = tracker.lookup_node(&uri, &ulid)
+        else {
             return Value::Null;
         };
-        let Some((desc_start, desc_end, desc_kind, desc_layer)) =
+        let Some((desc_start, desc_end, desc_kind, desc_layer, desc_incarnation)) =
             tracker.lookup_node(&uri, &descendant_ulid)
         else {
             return Value::Null;
         };
         // Two-id same-layer contract: ids minted in different layers never
         // share a tree, so the relation is undefined — null, not an error.
-        if layer != desc_layer {
+        if layer != desc_layer || tracked_incarnation != desc_incarnation {
             return Value::Null;
         }
 
@@ -370,6 +382,9 @@ impl Kakehashi {
         let Some(snapshot) = self.current_snapshot(&uri).await else {
             return Value::Null;
         };
+        if snapshot.incarnation != tracked_incarnation {
+            return Value::Null;
+        }
         let host_text: &str = &snapshot.text;
         let Some(host_tree) = snapshot.tree.as_ref() else {
             return Value::Null;
@@ -414,7 +429,7 @@ impl Kakehashi {
             return Value::Null;
         };
         match picked {
-            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            Some(triple) => self.mint_node_info(&uri, layer, snapshot.incarnation, triple),
             None => Value::Null,
         }
     }
@@ -431,13 +446,17 @@ impl Kakehashi {
         id: &str,
         f: impl FnMut(tree_sitter::Node<'_>) -> Vec<NodeTriple> + Send + 'static,
     ) -> Value {
-        let Some((uri, layer, items)) = self.with_node_by_id(lsp_uri, id, f).await else {
+        let Some((uri, layer, incarnation, items)) = self.with_node_by_id(lsp_uri, id, f).await
+        else {
             return Value::Null;
         };
-        let infos: Vec<Value> = items
+        let infos: Option<Vec<Value>> = items
             .into_iter()
-            .map(|triple| self.mint_node_info(&uri, layer, triple))
+            .map(|triple| {
+                let info = self.mint_node_info(&uri, layer, incarnation, triple);
+                (!info.is_null()).then_some(info)
+            })
             .collect();
-        Value::Array(infos)
+        infos.map_or(Value::Null, Value::Array)
     }
 }

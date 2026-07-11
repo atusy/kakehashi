@@ -136,6 +136,7 @@ impl InjectionCoordinator {
             return Vec::new();
         };
         let text = doc.text_arc();
+        let incarnation = doc.incarnation();
         drop(doc);
 
         let Some(regions) =
@@ -150,9 +151,13 @@ impl InjectionCoordinator {
 
         regions
             .iter()
-            .map(|region| {
-                let region_id =
-                    InjectionResolver::calculate_region_id(self.bridge.node_tracker(), uri, region);
+            .filter_map(|region| {
+                let region_id = InjectionResolver::calculate_region_id(
+                    self.bridge.node_tracker(),
+                    uri,
+                    region,
+                    incarnation,
+                )?;
                 let included_ranges = crate::language::injection::compute_included_ranges(
                     &region.content_node,
                     region.include_children,
@@ -162,11 +167,11 @@ impl InjectionCoordinator {
                     region.content_node.byte_range(),
                     included_ranges.as_deref(),
                 );
-                BridgeInjection {
+                Some(BridgeInjection {
                     language: region.language.clone(),
                     region_id: region_id.to_string(),
                     content,
-                }
+                })
             })
             .collect()
     }
@@ -455,6 +460,7 @@ mod tests {
             &server.language,
             &server.bridge.node_tracker_arc(),
             server.bridge.node_tracker_arc().mint_epoch(&uri),
+            incarnation,
             true,
             true,
         );

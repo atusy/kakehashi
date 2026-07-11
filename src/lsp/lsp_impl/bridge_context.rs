@@ -726,6 +726,7 @@ impl Kakehashi {
             snapshot.text(),
             injection_query.as_ref(),
             byte_offset,
+            snapshot.incarnation(),
         ) else {
             // Not in an injection region - return None
             return None;
@@ -1344,6 +1345,7 @@ impl Kakehashi {
             snapshot.tree(),
             snapshot.text(),
             injection_query.as_ref(),
+            snapshot.incarnation(),
         );
 
         // One upstream request ID for the whole scan: every overlapping

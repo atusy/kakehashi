@@ -135,6 +135,7 @@ impl Kakehashi {
                 snapshot.tree(),
                 snapshot.text(),
                 injection_query.as_ref(),
+                snapshot.incarnation(),
             );
             for resolved in regions {
                 configs.extend(self.bridge_configs_for_injection_language(

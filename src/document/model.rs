@@ -9,6 +9,7 @@ use super::snapshot::{ParseSnapshot, SnapshotSlot};
 pub(crate) struct DocumentSnapshot {
     text: Arc<str>,
     tree: Tree,
+    incarnation: u64,
 }
 
 impl DocumentSnapshot {
@@ -27,6 +28,10 @@ impl DocumentSnapshot {
     /// Get the parse tree
     pub(crate) fn tree(&self) -> &Tree {
         &self.tree
+    }
+
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 }
 
@@ -216,6 +221,7 @@ impl Document {
         Some(DocumentSnapshot {
             text: self.text.clone(),
             tree: self.tree.as_ref()?.clone(),
+            incarnation: self.incarnation,
         })
     }
 

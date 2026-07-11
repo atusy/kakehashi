@@ -48,7 +48,8 @@ impl Kakehashi {
 
         // Look up the tracked range. None means: never issued, invalidated by a
         // prior edit, or this URI's tracker entries have been cleared.
-        let Some((start, end, _kind)) = self.bridge.node_tracker().lookup_position(&uri, &ulid)
+        let Some((start, end, _kind, tracked_incarnation)) =
+            self.bridge.node_tracker().lookup_position(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -63,6 +64,9 @@ impl Kakehashi {
             let Some(doc) = self.documents.get(&uri) else {
                 return Ok(Value::Null);
             };
+            if doc.incarnation() != tracked_incarnation {
+                return Ok(Value::Null);
+            }
             let text = doc.text();
             if end > text.len() || start > end {
                 log::warn!(

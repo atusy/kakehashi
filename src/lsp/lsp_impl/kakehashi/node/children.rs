@@ -61,7 +61,8 @@ impl Kakehashi {
         // None means: never issued, invalidated by a prior edit, or this URI
         // has no entries. `layer` pins resolution and child minting to the
         // language tree that minted the node (node-reference-protocol Scope rule).
-        let Some((start, end, kind, layer)) = self.bridge.node_tracker().lookup_node(&uri, &ulid)
+        let Some((start, end, kind, layer, tracked_incarnation)) =
+            self.bridge.node_tracker().lookup_node(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -81,6 +82,10 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::node::children", "no current parse snapshot for {}", uri);
             return Ok(Value::Null);
         };
+        let incarnation = snapshot.incarnation;
+        if incarnation != tracked_incarnation {
+            return Ok(Value::Null);
+        }
         let host_text: &str = &snapshot.text;
         let Some(host_tree) = snapshot.tree.as_ref() else {
             return Ok(Value::Null);
@@ -126,19 +131,28 @@ impl Kakehashi {
         };
 
         let tracker = self.bridge.node_tracker();
-        let infos: Vec<Value> = child_infos
+        let infos: Option<Vec<Value>> = child_infos
             .into_iter()
             .map(|(c_start, c_end, c_kind)| {
                 // Children live in the same tree as their parent, so they are
                 // minted in the same `layer`.
-                let child_ulid =
-                    tracker.get_or_create_in_layer(&uri, c_start, c_end, c_kind, layer);
-                json!({
+                let child_ulid = tracker.get_or_create_in_layer_for_incarnation(
+                    &uri,
+                    c_start,
+                    c_end,
+                    c_kind,
+                    layer,
+                    incarnation,
+                )?;
+                Some(json!({
                     "id": child_ulid.to_string(),
                     "kind": c_kind,
-                })
+                }))
             })
             .collect();
+        let Some(infos) = infos else {
+            return Ok(Value::Null);
+        };
 
         Ok(Value::Array(infos))
     }

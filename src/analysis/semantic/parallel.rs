@@ -66,6 +66,7 @@ pub(crate) struct InjectionCacheCtx<'a> {
     pub tracker: &'a NodeTracker,
     pub cache: &'a InjectionTokenCache,
     pub generation: u64,
+    pub incarnation: u64,
     /// Whether the snapshot this compute serves was current when the
     /// work-unit started: only then may region ids be MINTED into the
     /// live-coordinate tracker. A stale serve reuses existing ids read-only
@@ -467,7 +468,7 @@ fn collect_injection_contexts_sync<'a>(
     coordinator: &LanguageCoordinator,
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
-    cache_ctx: Option<(&Url, &NodeTracker, bool)>,
+    cache_ctx: Option<(&Url, &NodeTracker, u64, bool)>,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>, bool) {
     use crate::language::injection::collect_all_injections;
@@ -632,7 +633,7 @@ fn discover_single_region(
     text: &str,
     coordinator: &LanguageCoordinator,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
-    cache_for_singles: Option<(&Url, &NodeTracker, bool)>,
+    cache_for_singles: Option<(&Url, &NodeTracker, u64, bool)>,
     // The producer path's already-built cache identity for THIS region
     // (populate minted the id and hashed the content moments earlier):
     // reused instead of a second tracker op + content hash on the
@@ -752,7 +753,7 @@ fn discover_single_region(
     // eviction itself is content-addressed and needs no id). Eligibility
     // is this request's translation predicate: column-0 start AND no per-row
     // prefixes (singles are never injection.combined).
-    let token_cache = cache_for_singles.and_then(|(uri, tracker, mint_regions)| {
+    let token_cache = cache_for_singles.and_then(|(uri, tracker, incarnation, mint_regions)| {
         let cacheable_owned;
         let cacheable = match prebuilt_cacheable {
             Some(prebuilt) => prebuilt,
@@ -763,19 +764,21 @@ fn discover_single_region(
                 // cache warm for regions the edits did not shift; an unknown
                 // region simply goes uncached for this stale serve.
                 let region_id = if mint_regions {
-                    tracker.get_or_create(
+                    tracker.get_or_create_for_incarnation(
                         uri,
                         injection.content_node.start_byte(),
                         injection.content_node.end_byte(),
                         injection.content_node.kind(),
-                    )
+                        incarnation,
+                    )?
                 } else {
-                    tracker.lookup_in_layer(
+                    tracker.lookup_in_layer_for_incarnation(
                         uri,
                         injection.content_node.start_byte(),
                         injection.content_node.end_byte(),
                         injection.content_node.kind(),
                         0,
+                        incarnation,
                     )?
                 }
                 .to_string();
@@ -974,6 +977,7 @@ pub(crate) fn build_document_discovery(
     uri: &Url,
     tracker: &NodeTracker,
     generation: u64,
+    incarnation: u64,
 ) -> Option<DiscoveredInjections> {
     // Partition exactly as collect_injection_contexts_sync does: an
     // injection.combined pattern (with no effective #offset!) → drop the
@@ -1026,7 +1030,7 @@ pub(crate) fn build_document_discovery(
             text,
             coordinator,
             None,
-            Some((uri, tracker, true)),
+            Some((uri, tracker, incarnation, true)),
             Some(prebuilt),
             false,
         ) {
@@ -1295,7 +1299,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                 coordinator,
                 0,
                 None,
-                cache_ctx.map(|c| (c.uri, c.tracker, c.mint_regions)),
+                cache_ctx.map(|c| (c.uri, c.tracker, c.incarnation, c.mint_regions)),
                 // `cancel` is polled inside the per-region discovery loop — that
                 // resolve loop is the dominant cost on a large document, so a
                 // supersede must be able to abort it mid-loop.
@@ -2937,6 +2941,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            incarnation: 0,
             mint_regions: false,
             discovery: None,
         };
@@ -2967,6 +2972,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            incarnation: 0,
             mint_regions: true,
             discovery: None,
         };
@@ -3041,6 +3047,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            incarnation: 0,
             mint_regions: true,
             discovery: None,
         };
@@ -3143,6 +3150,7 @@ local b = 2
             &uri,
             &tracker,
             0,
+            0,
         )
         .expect("eight single lua blocks clear the gate and discovery completes");
         assert_eq!(discovery.regions.len(), 8);
@@ -3153,6 +3161,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            incarnation: 0,
             mint_regions: true,
             discovery: Some(&discovery),
         };
@@ -3211,6 +3220,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 1,
+            incarnation: 0,
             mint_regions: true,
             discovery: Some(&discovery),
         };
@@ -3304,6 +3314,7 @@ local b = 2
             &uri,
             &tracker,
             0,
+            0,
         )
         .expect("gate-clearing singles must store a (partial) discovery");
         assert!(
@@ -3377,6 +3388,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            incarnation: 0,
             mint_regions: true,
             discovery: Some(&discovery),
         };
@@ -3444,6 +3456,7 @@ local b = 2
             &coordinator,
             &uri,
             &tracker,
+            0,
             0,
         )
         .expect("discovery is stored with the unresolvable regions dropped");
@@ -3540,6 +3553,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            incarnation: 0,
             mint_regions: true,
             discovery: None,
         };
@@ -3589,6 +3603,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            incarnation: 0,
             mint_regions: true,
             discovery: None,
         };
@@ -3667,6 +3682,7 @@ local b = 2
             tracker: &tracker,
             cache: &cache,
             generation: 0,
+            incarnation: 0,
             mint_regions: true,
             discovery: None,
         };
