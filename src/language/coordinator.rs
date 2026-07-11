@@ -891,6 +891,7 @@ impl LanguageCoordinator {
             .register(language_id.to_string(), language);
         self.dynamically_loaded
             .insert(language_id.to_string(), expected_generation);
+        self.query_store.remove_queries(language_id);
         publish_queries();
         true
     }
@@ -1499,6 +1500,9 @@ impl LanguageCoordinator {
         config: &LanguageSettings,
         search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
+        // Query kinds absent from the new configuration must disappear; the
+        // insertion helpers only replace kinds that successfully load.
+        self.query_store.remove_queries(lang_name);
         // Error: parser was explicitly configured but can't be found
         let language = match self.load_parser(
             lang_name,
@@ -3303,6 +3307,13 @@ mod tests {
     #[test]
     fn configured_parser_failure_blocks_dynamic_fallback() {
         let coordinator = LanguageCoordinator::new();
+        let rust_language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        coordinator.query_store.insert_highlight_query(
+            "markdown".to_string(),
+            std::sync::Arc::new(
+                tree_sitter::Query::new(&rust_language, "(identifier) @variable").unwrap(),
+            ),
+        );
         let cwd = std::env::current_dir().expect("cwd");
         let grammar_dir = std::env::var("TREE_SITTER_GRAMMARS")
             .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
@@ -3343,6 +3354,10 @@ mod tests {
             "configured failure must reject same-generation dynamic publication"
         );
         assert!(!coordinator.language_registry.contains("markdown"));
+        assert!(
+            coordinator.highlight_query("markdown").is_none(),
+            "queries from the previous configured grammar must be removed"
+        );
 
         assert!(
             !coordinator.ensure_language_loaded("markdown").success,
