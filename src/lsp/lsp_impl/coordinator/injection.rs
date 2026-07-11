@@ -149,35 +149,21 @@ impl InjectionCoordinator {
             return Vec::new();
         }
 
-        regions
-            .iter()
-            .filter_map(|region| {
-                let region_id = InjectionResolver::calculate_region_id(
-                    self.bridge.node_tracker(),
-                    uri,
-                    region,
-                    incarnation,
-                )?;
-                let included_ranges = crate::language::injection::compute_included_ranges(
-                    &region.content_node,
-                    region.include_children,
-                );
-                let content = crate::language::injection::extract_clean_content(
-                    &text,
-                    region.content_node.byte_range(),
-                    included_ranges.as_deref(),
-                );
-                Some(BridgeInjection {
-                    language: InjectionResolver::resolve_language(
-                        &self.language,
-                        &region.language,
-                        &content,
-                    ),
-                    region_id: region_id.to_string(),
-                    content,
-                })
-            })
-            .collect()
+        InjectionResolver::resolve_from_regions(
+            &self.language,
+            self.bridge.node_tracker(),
+            uri,
+            &regions,
+            &text,
+            incarnation,
+        )
+        .into_iter()
+        .map(|region| BridgeInjection {
+            language: region.injection_language,
+            region_id: region.region.region_id,
+            content: region.virtual_content,
+        })
+        .collect()
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
@@ -402,7 +388,8 @@ mod tests {
             (fenced_code_block
               (info_string (language) @_lang)
               (code_fence_content) @injection.content
-              (#set-lang-from-info-string! @_lang))
+              (#set-lang-from-info-string! @_lang)
+              (#offset! @injection.content 1 0 0 0))
             "#,
         )
         .expect("valid markdown injection query");
@@ -411,7 +398,7 @@ mod tests {
             .query_store()
             .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
 
-        let text = "# T\n\n```py\nx = 1\n```\n\n```py\ny = 2\n```\n";
+        let text = "# T\n\n```py\nignored\nx = 1\n```\n\n```unknown\n#!/usr/bin/env lua\n#!/usr/bin/env python\ny = 2\n```\n";
         let mut pool = server.language.create_document_parser_pool();
         let mut parser = pool.acquire("markdown").expect("registered parser");
         let tree = parser.parse(text, None).expect("parse markdown");
