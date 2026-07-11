@@ -235,11 +235,30 @@ impl Kakehashi {
                     &resolved.injection_language,
                     "textDocument/formatting",
                 );
-                if matches!(
-                    plan_region_format(agg.strategy, &agg.priorities, &configs, agg.max_fan_out,),
-                    RegionFormatPlan::Skip | RegionFormatPlan::Disabled
-                ) {
-                    continue;
+                match plan_region_format(agg.strategy, &agg.priorities, &configs, agg.max_fan_out) {
+                    RegionFormatPlan::Skip => {
+                        log::warn!(
+                            target: "kakehashi::formatting",
+                            "concatenated formatting for {}->{} lists only unconfigured \
+                             server(s) {:?}; none are configured for this region, so it \
+                             is left unformatted (priorities is an allowlist — \
+                             non-listed servers are not run)",
+                            language_name,
+                            resolved.injection_language,
+                            agg.priorities,
+                        );
+                        continue;
+                    }
+                    RegionFormatPlan::Disabled => {
+                        log::debug!(
+                            target: "kakehashi::formatting",
+                            "formatting disabled for {}->{} (priorities = [])",
+                            language_name,
+                            resolved.injection_language,
+                        );
+                        continue;
+                    }
+                    RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
                 }
                 // Preserve discovery priority among executable same-range
                 // alternatives. Unconfigured/disabled layers deliberately do
