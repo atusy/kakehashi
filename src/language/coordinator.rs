@@ -1959,7 +1959,7 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
         coordinator
             .language_registry_for_parallel()
-            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
         coordinator.build_base_map(&HashMap::from([(
             "plaintext".to_string(),
             crate::config::settings::LanguageSettings {
