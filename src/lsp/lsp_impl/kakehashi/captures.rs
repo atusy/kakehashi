@@ -2287,6 +2287,111 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn closed_captures_loser_does_not_revive_walk_memo() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///captures_closed_loser.rs").unwrap();
+        let text = "fn main() {}";
+        service.inner().documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let incarnation = service
+            .inner()
+            .documents
+            .latest_snapshot(&uri)
+            .unwrap()
+            .slot
+            .current_incarnation;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        assert!(
+            service
+                .inner()
+                .documents
+                .get(&uri)
+                .unwrap()
+                .publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some("rust".to_string()),
+                        parsed_version: 0,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+        );
+
+        let generation = service.inner().cache.semantic_token_generation();
+        let key = (uri.clone(), "highlights".to_string(), false);
+        service.inner().captures_walk_inflight.insert(
+            key.clone(),
+            std::sync::Arc::new(CapturesWalkFlight::new(
+                CapturesWalkTag {
+                    incarnation,
+                    generation,
+                    parsed_version: 0,
+                },
+                crate::cancel::CancelToken::default(),
+            )),
+        );
+
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .kakehashi_captures_full(CapturesFullParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                        },
+                        kind: "highlights".to_string(),
+                        injection: false,
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!request.is_finished(), "the loser must park on the flight");
+
+        // Exercise didClose's lock-ordered captures teardown without its
+        // unrelated bridge/server shutdown work. Before c38af9a3f, the woken
+        // loser could reclaim the vacant flight and store its old snapshot
+        // after this retain/remove sequence.
+        {
+            let edit_lock = service.inner().documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            service
+                .inner()
+                .captures_walk_cache
+                .retain(|cache_key, _| cache_key.0 != uri);
+            service.inner().cancel_captures_walks_for_document(&uri);
+            service.inner().documents.remove(&uri);
+        }
+
+        let result = request
+            .await
+            .unwrap()
+            .expect("a close-raced captures request returns protocol null");
+        assert!(result.is_none());
+        assert!(service.inner().documents.latest_snapshot(&uri).is_none());
+        assert!(
+            service.inner().captures_walk_cache.get(&key).is_none(),
+            "a loser woken by didClose must not resurrect the cleared walk memo"
+        );
+    }
+
     #[tokio::test]
     async fn captures_lineage_rejects_pre_reload_generation() {
         let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
