@@ -435,6 +435,23 @@ impl ConnectionHandle {
         self.state_watch.send_replace(new_state);
     }
 
+    /// Complete initialization only while this handle still belongs to its
+    /// original lifecycle. A reload or global shutdown may move an
+    /// initializing handle to `Closing`; the handshake task must not resurrect
+    /// it as `Ready` afterwards.
+    pub(super) fn transition_initializing_to_ready(&self) -> bool {
+        let mut state = self
+            .state
+            .write()
+            .recover_poison("ConnectionHandle::transition_initializing_to_ready");
+        if *state != ConnectionState::Initializing {
+            return false;
+        }
+        *state = ConnectionState::Ready;
+        self.state_watch.send_replace(ConnectionState::Ready);
+        true
+    }
+
     /// Store server capabilities from the initialize response.
     ///
     /// Called once after successful LSP handshake, before transitioning to Ready.

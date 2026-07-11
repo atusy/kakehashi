@@ -2040,7 +2040,12 @@ impl LanguageServerPool {
                             build_did_change_configuration_notification(payload),
                         );
                     }
-                    handle_for_handshake.set_state(ConnectionState::Ready);
+                    if !handle_for_handshake.transition_initializing_to_ready() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "bridge: connection was invalidated during initialization",
+                        ));
+                    }
                     // Record advertised palette command names AFTER Ready, so a
                     // command fired without an action context (raw name) routes
                     // back to a Ready connection (#628). Dedup is by name across
@@ -6344,7 +6349,8 @@ mod tests {
         let changed_key = ConnectionKey::for_server("changed");
         let removed_key = ConnectionKey::for_server("removed");
         let unchanged_key = ConnectionKey::for_server("unchanged");
-        let changed = create_handle_with_key(ConnectionState::Ready, changed_key.clone()).await;
+        let changed =
+            create_handle_with_key(ConnectionState::Initializing, changed_key.clone()).await;
         let removed = create_handle_with_key(ConnectionState::Ready, removed_key.clone()).await;
         let unchanged = create_handle_with_key(ConnectionState::Ready, unchanged_key.clone()).await;
 
@@ -6390,6 +6396,10 @@ mod tests {
             changed.state(),
             ConnectionState::Closing | ConnectionState::Closed
         ));
+        assert!(
+            !changed.transition_initializing_to_ready(),
+            "a completing handshake must not resurrect an invalidated connection"
+        );
         assert!(matches!(
             removed.state(),
             ConnectionState::Closing | ConnectionState::Closed
