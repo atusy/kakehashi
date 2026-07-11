@@ -1,22 +1,33 @@
 use tower_lsp_server::ls_types::Diagnostic;
 
 pub(crate) fn sort_diagnostics_deterministically(diagnostics: &mut [Diagnostic]) {
-    // Cached key: the canonical-JSON tiebreaker serializes the whole
-    // diagnostic, so computing it per COMPARISON (O(n log n) times, twice
-    // each) would dominate the sort — compute every component once per
-    // element instead. The key components compare in the same order as the
-    // previous comparator; the final tiebreaker is canonical JSON (sorted
-    // object keys), stronger than the old serde_json::to_string whose key
-    // order could differ between equal-content diagnostics.
-    diagnostics.sort_by_cached_key(|d| {
-        (
-            diagnostic_position_key(d),
-            d.message.clone(),
-            d.source.clone(),
-            d.severity,
-            canonical_json_string(d),
-        )
-    });
+    // Establish the common-case order without allocating. Only true ties on
+    // every cheap field need the full-value tiebreaker; caching that key within
+    // each tie group avoids both serializing unrelated diagnostics and
+    // repeating serialization per comparison for tie-heavy inputs.
+    diagnostics.sort_by(diagnostic_cheap_cmp);
+
+    let mut start = 0;
+    while start < diagnostics.len() {
+        let mut end = start + 1;
+        while end < diagnostics.len()
+            && diagnostic_cheap_cmp(&diagnostics[start], &diagnostics[end]).is_eq()
+        {
+            end += 1;
+        }
+        if end - start > 1 {
+            diagnostics[start..end].sort_by_cached_key(canonical_json_string);
+        }
+        start = end;
+    }
+}
+
+fn diagnostic_cheap_cmp(left: &Diagnostic, right: &Diagnostic) -> std::cmp::Ordering {
+    diagnostic_position_key(left)
+        .cmp(&diagnostic_position_key(right))
+        .then_with(|| left.message.cmp(&right.message))
+        .then_with(|| left.source.cmp(&right.source))
+        .then_with(|| left.severity.cmp(&right.severity))
 }
 
 fn diagnostic_position_key(diagnostic: &Diagnostic) -> (u32, u32, u32, u32) {
