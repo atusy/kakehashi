@@ -1235,7 +1235,8 @@ impl LanguageCoordinator {
     /// token normalization and then first-line fallback. Consequently,
     /// registering a parser under a non-canonical key such as `py` or `js` does
     /// not change bridge keys/URIs: bridge configuration uses
-    /// `python`/`javascript` unless that key has a registered base mapping.
+    /// `python`/`javascript` unless the explicit identifier itself has an
+    /// eligible base mapping (for example, `py.base`).
     pub(crate) fn canonical_injection_language(&self, identifier: &str, content: &str) -> String {
         if let Some(base) = self.resolve_base(identifier) {
             return base;
@@ -1884,7 +1885,7 @@ mod tests {
         // Register "python" parser
         coordinator
             .language_registry_for_parallel()
-            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
 
         // Direct identifier "python" should work
         let result = coordinator.resolve_injection_language("python", "print('hello')");
@@ -1900,7 +1901,7 @@ mod tests {
         // Register "python" parser (not "py")
         coordinator
             .language_registry_for_parallel()
-            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
 
         // Token "py" should resolve to "python" via syntect's detect_from_token
         let result = coordinator.resolve_injection_language("py", "print('hello')");
