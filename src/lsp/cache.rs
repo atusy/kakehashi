@@ -242,7 +242,7 @@ impl CacheCoordinator {
                 // aborts the pass (`None`): reporting ran-and-empty while
                 // the old entries survive would leave them unreclaimed
                 // until another parse.
-                tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                tracker.commit_if_unshifted(uri, entry_mint_epoch, incarnation, || {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
                 })?;
@@ -259,7 +259,7 @@ impl CacheCoordinator {
                 // epoch-gated like the commit below, and aborting (`None`)
                 // on refusal like it too: ran-and-empty must only be
                 // reported after the clear actually landed.
-                tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+                tracker.commit_if_unshifted(uri, entry_mint_epoch, incarnation, || {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
                 })?;
@@ -407,7 +407,7 @@ impl CacheCoordinator {
             // correct-at-birth — the intervening edit shifts it like any
             // live entry. The token-cache sweep runs inside the commit
             // closure, so a stale pass performs no eviction at all.
-            let committed = tracker.commit_if_unshifted(uri, entry_mint_epoch, || {
+            let committed = tracker.commit_if_unshifted(uri, entry_mint_epoch, incarnation, || {
                 // Commit point: record the committed pass's region set (test
                 // observability today; no production reader since token
                 // eviction went content-addressed — a plain move), and run

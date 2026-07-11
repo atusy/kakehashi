@@ -821,9 +821,16 @@ impl NodeTracker {
         &self,
         uri: &Url,
         expected: (u64, u64),
+        incarnation: u64,
         commit: impl FnOnce() -> R,
     ) -> Option<R> {
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
         let entry = self.entries.entry(uri.clone()).or_default();
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
         let epoch = self
             .cleanup_epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1070,8 +1077,13 @@ mod tests {
         let tracker = NodeTracker::new();
         let uri = test_uri("stale_after_cleanup");
         tracker.open_incarnation(&uri, 1);
+        let stale_latch = tracker.mint_epoch(&uri);
         tracker.cleanup(&uri, 1);
 
+        assert_eq!(
+            tracker.commit_if_unshifted(&uri, stale_latch, 1, || "committed"),
+            None
+        );
         let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
         assert_eq!(tracker.lookup_node(&uri, &stale_id), None);
         assert!(
