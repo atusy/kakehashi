@@ -534,8 +534,8 @@ impl ParseCoordinator {
             let auto_install = self.auto_install.clone();
             let language_name_clone = language_name.clone();
 
-            let parsed_tree = self
-                .parse_with_pool(
+            let parsed_tree = if load_result.success {
+                self.parse_with_pool(
                     &language_name,
                     &uri,
                     text.len(),
@@ -547,7 +547,10 @@ impl ParseCoordinator {
                         (parser, parse_result)
                     },
                 )
-                .await;
+                .await
+            } else {
+                None
+            };
 
             if let Some(tree) = parsed_tree {
                 // Legacy tree CAS BEFORE the snapshot publish: a legacy-store
@@ -772,6 +775,11 @@ impl ParseCoordinator {
             .ensure_language_loaded_async(&language_name)
             .await;
         let mut events = load_result.events;
+        if !load_result.success {
+            self.documents.publish_giveup_snapshot(&uri);
+            self.notifier().log_language_events(&events).await;
+            return;
+        }
 
         for _ in 0..MAX_REPARSE_ATTEMPTS {
             // Re-read the latest text each attempt. Gone => closed (no resurrect);
@@ -984,6 +992,14 @@ impl ParseCoordinator {
             .language
             .ensure_language_loaded_async(&language_name)
             .await;
+        if !load_result.success {
+            self.documents.publish_giveup_snapshot(uri);
+            advance_watermark();
+            self.notifier()
+                .log_language_events(&load_result.events)
+                .await;
+            return;
+        }
 
         let text_len = text.len();
         let auto_install = self.auto_install.clone();
