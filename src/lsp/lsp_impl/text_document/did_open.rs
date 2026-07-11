@@ -905,15 +905,19 @@ print("hello")
         .await
         .expect("released debounce body should finish");
 
-        assert_eq!(
-            server
-                .bridge
-                .pool()
-                .host_document_version(&uri, "rust_ls")
-                .await,
-            None,
-            "a timer cancelled after firing must not reopen a closed host"
-        );
+        let observation_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while tokio::time::Instant::now() < observation_deadline {
+            assert_eq!(
+                server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await,
+                None,
+                "a timer cancelled after firing must not reopen a closed host"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Locks the load-bearing property behind #431: `prepare_diagnostic_snapshot`
