@@ -96,6 +96,7 @@ pub(super) fn bridge_configs_for_injection_language(
 pub(super) struct ReloadLanguageState<'a> {
     language: &'a LanguageCoordinator,
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
+    documents: &'a DocumentStore,
     request_semantic_refresh: bool,
 }
 
@@ -113,7 +114,7 @@ pub(super) async fn apply_shared_settings(
     bridge: &BridgeCoordinator,
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
-) {
+) -> Vec<Url> {
     let _reload = SETTINGS_RELOAD_LOCK.lock().await;
     // TRANSITIONAL generation bump BEFORE any query/config mutation: from
     // this instant, every generation-stamped product built from the OLD
@@ -131,6 +132,7 @@ pub(super) async fn apply_shared_settings(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .begin_reload();
     let mut summary = language_state.language.load_settings(&settings);
+    let reparse_uris = language_state.documents.invalidate_all_parses();
     // Invalidate again after the synchronous swap: the first bump rejects
     // pre-reload checkouts, while this one rejects parsers acquired while the
     // registry and query stores were being replaced.
@@ -206,6 +208,7 @@ pub(super) async fn apply_shared_settings(
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
+    reparse_uris
 }
 
 /// Convert url::Url to ls_types::Uri, the reverse conversion for bridge protocol
@@ -456,6 +459,7 @@ impl Kakehashi {
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
+                documents: &self.documents,
                 request_semantic_refresh: true,
             },
             &self.settings_manager,
@@ -464,7 +468,9 @@ impl Kakehashi {
             Some(raw_settings),
             settings,
         )
-        .await;
+        .await
+        .into_iter()
+        .for_each(|uri| self.schedule_reparse(uri, None));
         self.warn_on_misconfigured_settings().await;
     }
 
@@ -478,6 +484,7 @@ impl Kakehashi {
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
+                documents: &self.documents,
                 request_semantic_refresh: false,
             },
             &self.settings_manager,
@@ -486,7 +493,9 @@ impl Kakehashi {
             Some(raw_settings),
             settings,
         )
-        .await;
+        .await
+        .into_iter()
+        .for_each(|uri| self.schedule_reparse(uri, None));
         self.warn_on_misconfigured_settings().await;
     }
 

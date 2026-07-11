@@ -114,6 +114,18 @@ impl DocumentStore {
         Self::default()
     }
 
+    pub(crate) fn invalidate_all_parses(&self) -> Vec<Url> {
+        let mut uris = Vec::with_capacity(self.documents.len());
+        for mut entry in self.documents.iter_mut() {
+            uris.push(entry.key().clone());
+            entry.value_mut().invalidate_parse();
+        }
+        for uri in &uris {
+            self.update_tree_availability(uri, false);
+        }
+        uris
+    }
+
     /// Update tree availability without affecting parse-in-progress tracking.
     /// The `in_progress` state is owned exclusively by mark_parse_started/mark_parse_finished.
     fn update_tree_availability(&self, uri: &Url, has_tree: bool) {
@@ -840,6 +852,30 @@ pub(crate) struct SnapshotView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_invalidation_clears_open_document_trees() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///reload.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+        assert!(store.get(&uri).unwrap().tree().is_some());
+
+        assert_eq!(store.invalidate_all_parses(), vec![uri.clone()]);
+
+        let document = store.get(&uri).unwrap();
+        assert!(document.tree().is_none());
+        assert!(document.latest_snapshot_slot().snapshot.is_none());
+    }
 
     mod snapshot_cell {
         use super::super::*;

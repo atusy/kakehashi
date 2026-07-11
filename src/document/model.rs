@@ -252,6 +252,13 @@ impl Document {
         self.pending_seed = None;
     }
 
+    pub(crate) fn invalidate_parse(&mut self) {
+        self.tree = None;
+        self.pending_seed = None;
+        self.snapshot_tx
+            .send_replace(SnapshotSlot::bootstrap(self.incarnation));
+    }
+
     /// Store the open-time parse result — the detected `language` and the parsed
     /// `tree` (`None` for a parsed-to-nothing / no-language / crashed-parser open) —
     /// **preserving the existing text**.
