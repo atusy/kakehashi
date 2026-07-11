@@ -34,7 +34,48 @@ pub(crate) struct BridgeResponseContext<'a> {
     pub offset: &'a RegionOffset,
 }
 
+struct RequestHostLifecycle<'a> {
+    pool: &'a LanguageServerPool,
+    host_uri: &'a Url,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for RequestHostLifecycle<'_> {
+    fn drop(&mut self) {
+        self.guard.take();
+        self.pool
+            .remove_host_lifecycle_lock_if_unshared(self.host_uri, &self.lifecycle);
+    }
+}
+
 impl LanguageServerPool {
+    async fn request_host_lifecycle<'a>(
+        &'a self,
+        host_uri: &'a Url,
+    ) -> io::Result<RequestHostLifecycle<'a>> {
+        let lifecycle = self.existing_host_lifecycle_lock(host_uri).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("bridge: host document is closed: {host_uri}"),
+            )
+        })?;
+        let guard = Arc::clone(&lifecycle).lock_owned().await;
+        let lifecycle = RequestHostLifecycle {
+            pool: self,
+            host_uri,
+            lifecycle,
+            guard: Some(guard),
+        };
+        if self.current_host_incarnation(host_uri).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("bridge: host document is closed: {host_uri}"),
+            ));
+        }
+        Ok(lifecycle)
+    }
+
     /// Drive a bridge request end-to-end on a pre-fetched `ConnectionHandle`
     /// (callers obtain it via `get_or_create_connection`, usually because they
     /// need capability checks first). `build_request` shapes the JSON-RPC body
@@ -101,8 +142,11 @@ impl LanguageServerPool {
         // Build virtual document URI
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
 
-        // Register in the upstream request registry FIRST for cancel lookup.
-        // This order matters: if a cancel arrives between pool and router registration,
+        let host_lifecycle = self.request_host_lifecycle(host_uri).await?;
+
+        // Register in the upstream request registry before downstream router
+        // registration for cancel lookup. This relative order matters: if a
+        // cancel arrives between pool and router registration,
         // the cancel will fail at the router lookup (which is acceptable for best-effort
         // cancel semantics) rather than finding the server but no downstream ID.
         if let Some(ref id) = upstream_request_id {
@@ -193,6 +237,7 @@ impl LanguageServerPool {
                 return Err(e.into());
             }
         }
+        drop(host_lifecycle);
 
         // Wait for response via oneshot channel (no Mutex held) with timeout.
         // After this returns (success, channel-closed, or timeout),
@@ -311,6 +356,29 @@ mod tests {
     use crate::lsp::bridge::pool::ConnectionState;
     use crate::lsp::bridge::pool::test_helpers::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn host_close_waits_for_request_enqueue_guard() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/guarded-close.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let guard = pool.request_host_lifecycle(&host_uri).await.unwrap();
+
+        let close = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            tokio::spawn(async move { pool.close_host_incarnation(&host_uri, 1).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!close.is_finished());
+
+        drop(guard);
+        close.await.unwrap();
+        let Err(error) = pool.request_host_lifecycle(&host_uri).await else {
+            panic!("closed host must reject a late request");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
 
     /// Test that send_hover_request returns Ok(None) when server lacks hover capability.
     ///
