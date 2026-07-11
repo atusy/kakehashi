@@ -555,8 +555,15 @@ pub fn remove_query_install_and_backups(
             // deleted externally after enumeration is already the end state.
             let removed_dir = remove_dir_all_tolerating_vanished(&path)?;
             // The sidecar is a kakehashi-owned artifact too: deleting it
-            // counts as removal even when the dir itself vanished first.
-            let removed_sidecar = fs::remove_file(ownership).is_ok();
+            // counts as removal even when the dir itself vanished first —
+            // and, like every other I/O in this loop, only NotFound is
+            // tolerated (an unremovable marker must fail the uninstall, not
+            // linger behind a success report).
+            let removed_sidecar = match fs::remove_file(ownership) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(QueryInstallError::IoError(e)),
+            };
             if removed_dir || removed_sidecar {
                 removal.removed_backups = true;
             }
