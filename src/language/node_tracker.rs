@@ -32,14 +32,17 @@ pub(crate) struct NodeTracker {
     /// Current document lifetime for URIs managed by the LSP lifecycle.
     /// `None` is a close tombstone: it prevents a direct mint that passed its
     /// last reader-side liveness check before didClose from recreating an old
-    /// entry after cleanup. An absent key keeps standalone/test trackers usable.
+    /// entry after cleanup. Markers are retained at one `(Url, Option<u64>)`
+    /// per distinct URI for process lifetime; they contain no node IDs or
+    /// document data. An absent key keeps standalone/test trackers usable.
     incarnations: DashMap<Url, Option<u64>>,
     /// Bumped by every [`cleanup`](Self::cleanup) (didClose). Folded into the
     /// mint latch ([`mint_epoch`](Self::mint_epoch)) so a close/reopen —
     /// which removes the per-URI index and would reset its `shift_gen` to 0
     /// (ABA) — can never make an old-lifetime latch compare equal. Global
-    /// (not per-URI) so closed documents leave NO retained state; the cost
-    /// is that a close of any document mid-pass refuses that pass's
+    /// (not per-URI) so closed documents leave no retained node-id state
+    /// (only the small lifecycle marker documented on `incarnations`); the
+    /// cost is that a close of any document mid-pass refuses that pass's
     /// remaining mint batches — a rare event with a one-null-re-sync
     /// consequence.
     cleanup_epoch: std::sync::atomic::AtomicU64,
@@ -397,6 +400,13 @@ impl NodeTracker {
         incarnation: u64,
     ) -> Ulid {
         let key = PositionKey::new(start, end, kind, layer);
+
+        // Reject a known-closed/wrong lifetime before materializing an empty
+        // tracker entry. Re-check under the entry lock below: didClose can
+        // change lifecycle admission between this fast rejection and locking.
+        if !self.admits_incarnation(uri, incarnation) {
+            return Ulid::new();
+        }
 
         // `get_mut` first: the hot path (index already exists) avoids the
         // `Url` clone `entry()` needs for its owned key. (Explicit two-step
@@ -867,6 +877,11 @@ impl NodeTracker {
         incarnation: u64,
         keys: impl IntoIterator<Item = (usize, usize, &'static str, usize)>,
     ) -> Option<Vec<Ulid>> {
+        // Avoid leaving an empty `entries` slot for a known-stale batch. The
+        // under-lock checks below remain load-bearing against a raced close.
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
         // `get_mut` first: the hot path (index already exists — every batch
         // after a document's first) avoids the `Url` clone `entry()` needs
         // for its owned key. The absent-entry `entry().or_default()`
@@ -1059,6 +1074,10 @@ mod tests {
 
         let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
         assert_eq!(tracker.lookup_node(&uri, &stale_id), None);
+        assert!(
+            tracker.entries.get(&uri).is_none(),
+            "a denied stale mint must not materialize an empty node index"
+        );
 
         tracker.open_incarnation(&uri, 2);
         let reopened_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2);

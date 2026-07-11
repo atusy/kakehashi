@@ -179,6 +179,11 @@ The tracker also records the URI's current open incarnation (or a lightweight
 closed marker). This closes the post-cleanup window where a direct reader that
 passed liveness before `didClose` could otherwise recreate an old-lifetime
 entry; the closed marker contains no node IDs and is replaced on `didOpen`.
+Markers are deliberately retained for the process lifetime: one `Url` plus one
+optional `u64` per distinct URI ever closed (`O(U_closed)`), with no node IDs,
+text, trees, or per-edit growth. Removing a marker would reopen the exact stale
+direct-mint resurrection window it guards; a future bounded lifecycle-epoch
+store may replace this conservative trade-off if URI churn becomes measurable.
 
 **Invalidate semantics**: When a node's START falls inside the edit range, both entries are removed. After removal, the ULID is **indistinguishable from "never issued"** — by design, no tombstone is kept, so memory stays bounded to live nodes only.
 
@@ -214,7 +219,8 @@ More text
 - **Memory efficient**: Only requested nodes are tracked (O(k) where k = tracked nodes)
 - **Container stability**: Parent nodes retain ID when contents change
 - **Correct invalidation**: Nodes whose START lies inside the old edit range are explicitly removed
-- **Clean lifecycle**: `NodeTracker` dies with `Document` on `didClose`
+- **Clean node lifecycle**: node-ID entries die with `Document` on `didClose`;
+  only the bounded-per-URI lifecycle marker described above remains
 - **AST-aligned semantics**: START-based identity matches structural intuition
 
 ### Negative
