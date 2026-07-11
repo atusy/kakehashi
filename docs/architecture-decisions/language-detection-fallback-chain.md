@@ -14,7 +14,10 @@ Additionally, PBI-061 removed the `filetypes` configuration field entirely, elim
 
 The key insight is: **detection should find an *available* Tree-sitter parser, not just identify a language name**. If the detected language has no parser loaded, detection should continue to the next method.
 
-This applies to both document-level language detection and injected language resolution (e.g., code blocks in Markdown).
+This applies to parser selection for both document-level language detection and
+injected-language analysis. Bridge selection has a separate stability
+constraint: its canonical language key and virtual URI must be known before a
+parser is installed and must not change when parser availability changes.
 
 ## Decision
 
@@ -22,6 +25,10 @@ This applies to both document-level language detection and injected language res
 
 1. **Document-level**: Detecting the primary language when a file is opened
 2. **Injection-level**: Resolving embedded languages within a parsed document
+
+For bridge routing and virtual-document identity, first derive a
+parser-independent canonical injection candidate. Parser loading remains a
+later, separate decision.
 
 ```
 1. LSP languageId  →  Try direct  →  Try alias  →  If available: use it
@@ -134,12 +141,24 @@ Document (markdown) ──parse──▶ AST ──injection query──▶ "py"
                                                       ▶ "sh" ──detect──▶ bash
 ```
 
-For example, a Markdown code fence with ` ```py ` provides the identifier `"py"`, which must be resolved to an available parser. This resolution follows a fallback pattern:
+For example, a Markdown code fence with ` ```py ` provides the identifier
+`"py"`. Two related operations intentionally have different acceptance rules:
+
+- **Bridge canonicalization** produces a stable language key even when no
+  parser exists yet. It checks an explicit configured base, then syntect token
+  normalization, then first-line detection, and finally the raw identifier.
+  Thus `py` remains `python` before and after parser installation.
+- **Parser resolution** may then load or select the canonical language/base and
+  can still fail when no grammar is available.
+
+Parser resolution follows this fallback pattern:
 
 1. **Try the identifier directly**: Check if a parser named `"py"` is available
 2. **Normalize via syntect**: Use `detect_from_token("py")` which returns `"python"`
 3. **Try config-based alias**: If syntect doesn't recognize it, check user-configured aliases
-4. **Skip if unavailable**: If no parser matches, the region is skipped
+4. **Skip parser-backed analysis if unavailable**: Bridge routing can still use
+   the canonical candidate, but semantic/parser work skips the region when no
+   parser matches
 
 This means:
 - Injected languages benefit from the same graceful degradation
@@ -159,14 +178,16 @@ This means:
 ### Negative
 
 - **Heuristic overhead**: Reading file content for shebang detection adds I/O
-- **Non-deterministic**: Same file might use different parsers on different systems (based on available parsers)
+- **Parser selection can vary**: Same file might use different parsers on
+  different systems, while bridge language keys and virtual URIs remain stable
 - **Heuristic maintenance**: Shebang patterns need ongoing updates
 - **languageId naming variance**: Clients may send languageIds that differ from parser names (e.g., `shellscript` vs `bash`); normalization may be needed later
 
 ### Neutral
 
 - **Token-based detection includes extensions**: Extensions are treated as tokens, not a separate detection step
-- **Parser availability matters**: Detection result depends on what's installed
+- **Parser availability is scoped**: Parser-backed detection depends on what's
+  installed; bridge canonicalization does not
 - **Auto-install interaction**: Detection completes first (returning None if no parser found); auto-install runs asynchronously afterward, making the parser available for subsequent requests
 - **Caching**: Detection result is stored per-document; cache invalidates on content change or `languageId` change from client
 - **syntect dependency**: Uses syntect's Sublime Text syntax definitions for token normalization and first-line detection
