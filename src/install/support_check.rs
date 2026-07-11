@@ -50,16 +50,33 @@ impl SkipReason {
 // Default timeout for metadata support checks; keeps the LSP path responsive
 const METADATA_CHECK_TIMEOUT: Duration = Duration::from_secs(65);
 
-/// Check if a language should be skipped during auto-install because it's not supported.
+/// Support-check result plus work that outlived the timeout.
 ///
-/// Skips (returns `should_skip = true`) when the language is unsupported by
-/// nvim-treesitter or when metadata can't be fetched within the timeout. Uses
-/// cached metadata to avoid repeated HTTP requests.
-pub async fn should_skip_unsupported_language(
+/// `completion` is present when the check times out. It finishes after the
+/// blocking task is cancelled before starting or, if already running, after
+/// the lookup exits. Auto-install retains its per-language claim until then.
+pub(crate) struct TrackedSupportCheck {
+    pub(crate) should_skip: bool,
+    pub(crate) reason: Option<SkipReason>,
+    pub(crate) completion: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TrackedSupportCheck {
+    pub(crate) fn completed(should_skip: bool, reason: Option<SkipReason>) -> Self {
+        Self {
+            should_skip,
+            reason,
+            completion: None,
+        }
+    }
+}
+
+/// Check support while retaining completion for blocking work that times out.
+pub(crate) async fn should_skip_unsupported_language_tracked(
     language: &str,
     options: Option<&FetchOptions<'_>>,
-) -> (bool, Option<SkipReason>) {
-    should_skip_unsupported_language_with_checker(
+) -> TrackedSupportCheck {
+    should_skip_unsupported_language_with_checker_tracked(
         language,
         options,
         METADATA_CHECK_TIMEOUT,
@@ -100,12 +117,12 @@ fn default_support_check(
     is_language_supported(&language, options.as_ref())
 }
 
-async fn should_skip_unsupported_language_with_checker<F>(
+async fn should_skip_unsupported_language_with_checker_tracked<F>(
     language: &str,
     options: Option<&FetchOptions<'_>>,
     timeout: Duration,
     check_fn: F,
-) -> (bool, Option<SkipReason>)
+) -> TrackedSupportCheck
 where
     F: FnOnce(String, Option<FetchOptionsOwned>) -> Result<bool, MetadataError> + Send + 'static,
 {
@@ -121,21 +138,21 @@ where
     tokio::select! {
         result = &mut check => {
             match result {
-                Ok(Ok(true)) => (false, None),
-                Ok(Ok(false)) => (
+                Ok(Ok(true)) => TrackedSupportCheck::completed(false, None),
+                Ok(Ok(false)) => TrackedSupportCheck::completed(
                     true,
                     Some(SkipReason::UnsupportedLanguage {
                         language: owned_language,
                     }),
                 ),
-                Ok(Err(error)) => (
+                Ok(Err(error)) => TrackedSupportCheck::completed(
                     true,
                     Some(SkipReason::MetadataUnavailable {
                         language: owned_language,
                         error,
                     }),
                 ),
-                Err(err) => (
+                Err(err) => TrackedSupportCheck::completed(
                     true,
                     Some(SkipReason::MetadataUnavailable {
                         language: owned_language,
@@ -148,16 +165,34 @@ where
             }
         }
         _ = &mut timeout_fut => {
-            // The task is still running; abort to avoid leaking blocking work
-            // and report the timeout to the caller.
+            // Abort prevents a queued blocking task from starting. Once a
+            // blocking closure has started Tokio cannot stop it, so expose a
+            // completion waiter to callers that must retain an in-flight claim.
             check.abort();
-            (
-                true,
-                Some(SkipReason::MetadataUnavailable {
+            let completion = tokio::spawn(async move {
+                if let Err(join_error) = check.await {
+                    if join_error.is_panic() {
+                        log::error!(
+                            target: "kakehashi::auto_install",
+                            "Timed-out metadata support check panicked: {}",
+                            join_error
+                        );
+                    } else {
+                        log::debug!(
+                            target: "kakehashi::auto_install",
+                            "Timed-out metadata support-check handle was cancelled"
+                        );
+                    }
+                }
+            });
+            TrackedSupportCheck {
+                should_skip: true,
+                reason: Some(SkipReason::MetadataUnavailable {
                     language: owned_language,
                     error: MetadataError::Timeout,
                 }),
-            )
+                completion: Some(completion),
+            }
         }
     }
 }
@@ -191,13 +226,13 @@ return {
             use_cache: true,
         };
 
-        let (should_skip, reason) =
-            should_skip_unsupported_language("fake_lang_xyz", Some(&options)).await;
+        let result =
+            should_skip_unsupported_language_tracked("fake_lang_xyz", Some(&options)).await;
         assert!(
-            should_skip,
+            result.should_skip,
             "Expected to skip unsupported language 'fake_lang_xyz'"
         );
-        let reason = reason.expect("Expected a reason for skipping");
+        let reason = result.reason.expect("Expected a reason for skipping");
         assert!(
             matches!(reason, SkipReason::UnsupportedLanguage { language } if language == "fake_lang_xyz"),
             "Expected UnsupportedLanguage reason"
@@ -229,12 +264,15 @@ return {
             use_cache: true,
         };
 
-        let (should_skip, reason) = should_skip_unsupported_language("lua", Some(&options)).await;
+        let result = should_skip_unsupported_language_tracked("lua", Some(&options)).await;
         assert!(
-            !should_skip,
+            !result.should_skip,
             "Expected NOT to skip supported language 'lua'"
         );
-        assert!(reason.is_none(), "Expected no reason when not skipping");
+        assert!(
+            result.reason.is_none(),
+            "Expected no reason when not skipping"
+        );
     }
 
     #[tokio::test]
@@ -250,20 +288,20 @@ return {
             use_cache: true,
         };
 
-        let (should_skip, reason) = should_skip_unsupported_language("lua", Some(&options)).await;
+        let result = should_skip_unsupported_language_tracked("lua", Some(&options)).await;
         assert!(
-            should_skip,
+            result.should_skip,
             "Metadata errors should prevent auto-install attempts"
         );
         assert!(
-            matches!(reason, Some(SkipReason::MetadataUnavailable { .. })),
+            matches!(result.reason, Some(SkipReason::MetadataUnavailable { .. })),
             "Expected MetadataUnavailable reason"
         );
     }
 
     #[tokio::test]
     async fn test_should_skip_unsupported_language_times_out_and_skips() {
-        let (should_skip, reason) = should_skip_unsupported_language_with_checker(
+        let result = should_skip_unsupported_language_with_checker_tracked(
             "lua",
             None,
             Duration::from_millis(20),
@@ -274,11 +312,48 @@ return {
         )
         .await;
 
-        assert!(should_skip, "Timeouts should skip auto-install attempts");
         assert!(
-            matches!(reason, Some(SkipReason::MetadataUnavailable { language, .. }) if language == "lua"),
+            result.should_skip,
+            "Timeouts should skip auto-install attempts"
+        );
+        assert!(
+            matches!(result.reason, Some(SkipReason::MetadataUnavailable { language, .. }) if language == "lua"),
             "Timeouts should report metadata unavailable for the language"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_blocking_check_exposes_its_completion() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let check = tokio::spawn(async move {
+            should_skip_unsupported_language_with_checker_tracked(
+                "lua",
+                None,
+                Duration::from_millis(20),
+                move |_lang, _options| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(true)
+                },
+            )
+            .await
+        });
+
+        started_rx
+            .await
+            .expect("blocking checker must start before timing out");
+        tokio::time::advance(Duration::from_millis(20)).await;
+        let mut result = check.await.expect("support check task must finish");
+        let completion = result
+            .completion
+            .take()
+            .expect("a timed-out blocking checker must expose completion");
+        assert!(!completion.is_finished());
+
+        let _ = release_tx.send(());
+        completion.await.expect("completion waiter must finish");
     }
 
     #[test]

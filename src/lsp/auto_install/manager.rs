@@ -8,10 +8,12 @@
 //! calls `try_install()`, dispatches the events, and then handles
 //! post-install coordination (settings update, language reload).
 
-use std::path::PathBuf;
+use std::{future::Future, path::PathBuf};
 use tower_lsp_server::ls_types::MessageType;
 
-use crate::install::support_check::should_skip_unsupported_language;
+use crate::install::support_check::{
+    TrackedSupportCheck, should_skip_unsupported_language_tracked,
+};
 use crate::language::FailedParserRegistry;
 
 use super::{InstallingLanguages, InstallingLanguagesExt};
@@ -122,9 +124,9 @@ impl std::fmt::Debug for AutoInstallManager {
 /// entry on drop. Manual `finish_install` calls would leak the marker if the
 /// calling future were dropped at an await, leaving the language stuck
 /// `AlreadyInstalling` (and, via `should_skip_parse`, never parsed) for the
-/// server's lifetime. For the install itself the guard moves into the
-/// spawned install task, so it tracks the blocking work's true lifetime
-/// rather than the caller's.
+/// server's lifetime. The guard first moves into the support-check task, then
+/// into the install task on success, so it tracks detached work's true
+/// lifetime rather than the caller's.
 struct InstallMarkerGuard {
     installing: InstallingLanguages,
     language: String,
@@ -226,6 +228,28 @@ impl AutoInstallManager {
     /// `SettingsManager` (Kakehashi checks settings first), or reload the
     /// language (Kakehashi handles post-install).
     pub async fn try_install(&self, language: &str) -> InstallResult {
+        self.try_install_with_support_check(language, |language, default_data_dir| async move {
+            let fetch_options =
+                default_data_dir
+                    .as_ref()
+                    .map(|dir| crate::install::metadata::FetchOptions {
+                        data_dir: Some(dir.as_path()),
+                        use_cache: true,
+                    });
+            should_skip_unsupported_language_tracked(&language, fetch_options.as_ref()).await
+        })
+        .await
+    }
+
+    async fn try_install_with_support_check<F, Fut>(
+        &self,
+        language: &str,
+        support_check: F,
+    ) -> InstallResult
+    where
+        F: FnOnce(String, Option<PathBuf>) -> Fut + Send + 'static,
+        Fut: Future<Output = TrackedSupportCheck> + Send + 'static,
+    {
         let mut events = Vec::new();
 
         // Check if parser previously failed (crash protection)
@@ -244,18 +268,79 @@ impl AutoInstallManager {
             };
         }
 
+        // Claim before the network-backed support lookup so concurrent calls
+        // for the same language do not all fetch metadata. Ordinary early
+        // returns release the RAII claim; a timeout transfers it to a detached
+        // keeper until the still-running blocking lookup exits.
+        if !self.installing_languages.try_start_install(language) {
+            events.push(InstallEvent::Log {
+                level: MessageType::INFO,
+                message: format!(
+                    "Language '{}' support is already being checked or installed",
+                    language
+                ),
+            });
+            return InstallResult {
+                outcome: InstallOutcome::AlreadyInstalling,
+                events,
+            };
+        }
+        let install_marker = InstallMarkerGuard {
+            installing: self.installing_languages.clone(),
+            language: language.to_string(),
+        };
+
         // Check if language is supported by nvim-treesitter
         let default_data_dir = crate::install::default_data_dir();
-        let fetch_options =
-            default_data_dir
-                .as_ref()
-                .map(|dir| crate::install::metadata::FetchOptions {
-                    data_dir: Some(dir.as_path()),
-                    use_cache: true,
+        // The task owns the claim so cancellation of this caller cannot release
+        // it while the lookup (which contains spawn_blocking work) continues.
+        // On normal completion the claim returns here and is either dropped by
+        // an early return or transferred to the parser-install task below.
+        let lookup_language = language.to_string();
+        let lookup_data_dir = default_data_dir.clone();
+        let support_task = tokio::spawn(async move {
+            let mut result = support_check(lookup_language, lookup_data_dir).await;
+            if let Some(completion) = result.completion.take() {
+                // Start the keeper inside this detached task. If the caller
+                // dropped our JoinHandle while the check was running, task
+                // output would be discarded and could not safely carry the
+                // marker/completion pair back to it.
+                tokio::spawn(async move {
+                    let _marker = install_marker;
+                    if let Err(join_error) = completion.await {
+                        log::error!(
+                            target: "kakehashi::auto_install",
+                            "Metadata support-check completion task failed: {}",
+                            join_error
+                        );
+                    }
                 });
-
-        let (should_skip, reason) =
-            should_skip_unsupported_language(language, fetch_options.as_ref()).await;
+                (result, None)
+            } else {
+                (result, Some(install_marker))
+            }
+        });
+        let (support_result, install_marker) = match support_task.await {
+            Ok(result) => result,
+            Err(join_error) => {
+                events.push(InstallEvent::Log {
+                    level: MessageType::ERROR,
+                    message: format!(
+                        "Support check task for '{}' failed: {}",
+                        language, join_error
+                    ),
+                });
+                return InstallResult {
+                    outcome: InstallOutcome::Failed,
+                    events,
+                };
+            }
+        };
+        let TrackedSupportCheck {
+            should_skip,
+            reason,
+            completion: _,
+        } = support_result;
 
         if let Some(reason) = &reason {
             events.push(InstallEvent::Log {
@@ -270,21 +355,18 @@ impl AutoInstallManager {
                 events,
             };
         }
-
-        // Try to start installation (deduplication)
-        if !self.installing_languages.try_start_install(language) {
+        let Some(install_marker) = install_marker else {
             events.push(InstallEvent::Log {
-                level: MessageType::INFO,
-                message: format!("Language '{}' is already being installed", language),
+                level: MessageType::ERROR,
+                message: format!(
+                    "Support check for '{}' completed without its install claim",
+                    language
+                ),
             });
             return InstallResult {
-                outcome: InstallOutcome::AlreadyInstalling,
+                outcome: InstallOutcome::Failed,
                 events,
             };
-        }
-        let install_marker = InstallMarkerGuard {
-            installing: self.installing_languages.clone(),
-            language: language.to_string(),
         };
 
         // Progress begin
@@ -485,20 +567,224 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_install_returns_already_installing_on_duplicate() {
+    async fn concurrent_duplicate_install_skips_support_lookup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
         let (manager, _temp) = create_test_manager();
+        let lookup_count = Arc::new(AtomicUsize::new(0));
+        let first_manager = manager.clone();
+        let first_lookup_count = Arc::clone(&lookup_count);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
-        // Manually mark as installing
-        manager.installing_languages.try_start_install("lua");
+        let first = tokio::spawn(async move {
+            first_manager
+                .try_install_with_support_check("lua", |_, _| async move {
+                    first_lookup_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    TrackedSupportCheck::completed(true, None)
+                })
+                .await
+        });
+        started_rx.await.expect("first support lookup must start");
 
-        // Try to install same language
-        let result = manager.try_install("lua").await;
+        let duplicate_lookup_count = Arc::clone(&lookup_count);
+        let result = manager
+            .try_install_with_support_check("lua", move |_, _| {
+                duplicate_lookup_count.fetch_add(1, Ordering::SeqCst);
+                async { TrackedSupportCheck::completed(false, None) }
+            })
+            .await;
 
         assert_eq!(result.outcome, InstallOutcome::AlreadyInstalling);
+        assert_eq!(lookup_count.load(Ordering::SeqCst), 1);
         assert!(result.events.iter().any(|e| matches!(
             e,
-            InstallEvent::Log { level: MessageType::INFO, message } if message.contains("already being installed")
+            InstallEvent::Log { level: MessageType::INFO, message }
+                if message.contains("already being checked or installed")
         )));
+
+        let _ = release_tx.send(());
+        assert_eq!(
+            first.await.expect("first install task must finish").outcome,
+            InstallOutcome::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_support_lookup_releases_install_claim() {
+        let (manager, _temp) = create_test_manager();
+
+        let result = manager
+            .try_install_with_support_check("unsupported", |_, _| async {
+                TrackedSupportCheck::completed(true, None)
+            })
+            .await;
+
+        assert_eq!(result.outcome, InstallOutcome::Unsupported);
+        assert!(
+            manager
+                .installing_languages
+                .try_start_install("unsupported"),
+            "unsupported and metadata-error exits share this skip path and must release the claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_support_work_keeps_claim_until_completion() {
+        let (manager, _temp) = create_test_manager();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let result = manager
+            .try_install_with_support_check("lua", |_, _| async move {
+                TrackedSupportCheck {
+                    should_skip: true,
+                    reason: None,
+                    completion: Some(tokio::spawn(async move {
+                        let _ = release_rx.await;
+                    })),
+                }
+            })
+            .await;
+        assert_eq!(result.outcome, InstallOutcome::Unsupported);
+
+        let duplicate = manager
+            .try_install_with_support_check("lua", |_, _| async {
+                TrackedSupportCheck::completed(false, None)
+            })
+            .await;
+        assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.installing_languages.try_start_install("lua") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("claim keeper must release after timed-out work finishes");
+    }
+
+    #[tokio::test]
+    async fn supported_result_without_returned_claim_fails_closed() {
+        let (manager, _temp) = create_test_manager();
+
+        let result = manager
+            .try_install_with_support_check("lua", |_, _| async {
+                TrackedSupportCheck {
+                    should_skip: false,
+                    reason: None,
+                    completion: Some(tokio::spawn(async {})),
+                }
+            })
+            .await;
+
+        assert_eq!(result.outcome, InstallOutcome::Failed);
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            InstallEvent::Log { level: MessageType::ERROR, message }
+                if message.contains("completed without its install claim")
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_keeps_claim_until_support_lookup_finishes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let (manager, _temp) = create_test_manager();
+        let task_manager = manager.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            task_manager
+                .try_install_with_support_check("lua", |_, _| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    TrackedSupportCheck::completed(true, None)
+                })
+                .await
+        });
+        started_rx.await.expect("support lookup must start");
+        task.abort();
+        let _ = task.await;
+
+        let duplicate_lookups = Arc::new(AtomicUsize::new(0));
+        let duplicate_count = Arc::clone(&duplicate_lookups);
+        let duplicate = manager
+            .try_install_with_support_check("lua", move |_, _| {
+                duplicate_count.fetch_add(1, Ordering::SeqCst);
+                async { TrackedSupportCheck::completed(false, None) }
+            })
+            .await;
+        assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
+        assert_eq!(duplicate_lookups.load(Ordering::SeqCst), 0);
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.installing_languages.try_start_install("lua") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached lookup task must release the claim after its support check finishes");
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_keeps_claim_after_lookup_timeout() {
+        let (manager, _temp) = create_test_manager();
+        let task_manager = manager.clone();
+        let (lookup_started_tx, lookup_started_rx) = tokio::sync::oneshot::channel();
+        let (timeout_tx, timeout_rx) = tokio::sync::oneshot::channel();
+        let (timed_out_tx, timed_out_rx) = tokio::sync::oneshot::channel();
+        let (work_release_tx, work_release_rx) = tokio::sync::oneshot::channel();
+
+        let caller = tokio::spawn(async move {
+            task_manager
+                .try_install_with_support_check("lua", |_, _| async move {
+                    let _ = lookup_started_tx.send(());
+                    let _ = timeout_rx.await;
+                    let completion = tokio::spawn(async move {
+                        let _ = work_release_rx.await;
+                    });
+                    let _ = timed_out_tx.send(());
+                    TrackedSupportCheck {
+                        should_skip: true,
+                        reason: None,
+                        completion: Some(completion),
+                    }
+                })
+                .await
+        });
+        lookup_started_rx.await.expect("support lookup must start");
+        caller.abort();
+        let _ = caller.await;
+
+        let _ = timeout_tx.send(());
+        timed_out_rx
+            .await
+            .expect("detached support lookup must report timeout");
+        tokio::task::yield_now().await;
+        assert!(
+            !manager.installing_languages.try_start_install("lua"),
+            "timeout completion must retain the claim after caller cancellation"
+        );
+
+        let _ = work_release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.installing_languages.try_start_install("lua") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("claim keeper must release after timed-out blocking work finishes");
     }
 
     #[tokio::test]
