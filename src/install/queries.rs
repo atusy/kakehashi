@@ -529,10 +529,11 @@ pub fn remove_query_install_and_backups(
         removed_backups: false,
     };
 
-    if queries_dir.exists() {
-        fs::remove_dir_all(&queries_dir)?;
-        removal.removed_queries = true;
-    }
+    // No exists() pre-check: Path::exists() reads false on metadata errors
+    // (e.g. PermissionDenied), which would skip removal and report "not
+    // installed" over a still-present unreadable dir. The tolerant removal
+    // reports whether anything was actually removed.
+    removal.removed_queries = remove_dir_all_tolerating_vanished(&queries_dir)?;
 
     // Propagate per-entry read_dir errors: uninstall must not report success
     // while backups it could not even enumerate stay behind.
@@ -542,17 +543,58 @@ pub fn remove_query_install_and_backups(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if path.is_dir()
+        // file_type() over path.is_dir(): is_dir() swallows metadata errors
+        // as "not a directory", which could leave an unreadable backup behind
+        // while uninstall reports success.
+        if entry.file_type()?.is_dir()
             && generated_backup_matches_language(name, language)
             && backup_is_owned(&path)
         {
             let ownership = backup_ownership_sidecar(&path);
-            fs::remove_dir_all(path)?;
-            let _ = fs::remove_file(ownership);
-            removal.removed_backups = true;
+            // Same NotFound tolerance as the canonical dir above: a backup
+            // deleted externally after enumeration is already the end state.
+            let removed_dir = remove_dir_all_tolerating_vanished(&path)?;
+            // The sidecar is a kakehashi-owned artifact too: deleting it
+            // counts as removal even when the dir itself vanished first —
+            // and, like every other I/O in this loop, only NotFound is
+            // tolerated (an unremovable marker must fail the uninstall, not
+            // linger behind a success report).
+            let removed_sidecar = match fs::remove_file(ownership) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(QueryInstallError::IoError(e)),
+            };
+            if removed_dir || removed_sidecar {
+                removal.removed_backups = true;
+            }
         }
     }
     Ok(removal)
+}
+
+/// `fs::remove_dir_all` that treats a CONFIRMED-vanished directory as the
+/// desired end state. Returns whether this call actually removed anything
+/// (`false` = the dir was already gone).
+///
+/// NotFound = the dir disappeared between the caller's observation and the
+/// removal (external cleanup — the replace lock only serializes kakehashi's
+/// own installers): already gone is the desired end state. Confirmed via
+/// `try_exists` because (a) remove_dir_all can also surface NotFound for a
+/// child that vanished mid-recursion while the dir survives partially
+/// deleted, and (b) `Path::exists()` returns false on ANY metadata error
+/// (e.g. PermissionDenied), which must propagate the original error instead
+/// of being mistaken for absence.
+fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<bool, QueryInstallError> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(true),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(dir.try_exists(), Ok(false)) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
 }
 
 fn backup_language_name(path: &Path) -> Option<String> {
@@ -941,6 +983,34 @@ fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, Quer
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn remove_dir_all_tolerates_a_confirmed_vanished_dir() {
+        // The dir disappearing between the caller's observation and the
+        // removal (external cleanup) must read as already-removed, not fail
+        // the uninstall.
+        let temp = TempDir::new().unwrap();
+        let gone = temp.path().join("never-created");
+
+        assert!(
+            matches!(remove_dir_all_tolerating_vanished(&gone), Ok(false)),
+            "a confirmed-absent dir is the desired end state (nothing removed)"
+        );
+    }
+
+    #[test]
+    fn remove_dir_all_removes_a_dir_with_contents() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("queries-lang");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("highlights.scm"), "(x) @y").unwrap();
+
+        assert!(
+            remove_dir_all_tolerating_vanished(&dir).expect("normal removal succeeds"),
+            "an actual removal reports true"
+        );
+        assert!(!dir.exists(), "the dir and its contents are removed");
+    }
 
     /// Serve canned query files over HTTP from an OS-assigned local port.
     fn spawn_query_file_server(routes: Vec<(&str, &str)>) -> String {
