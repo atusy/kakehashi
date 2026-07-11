@@ -381,6 +381,7 @@ impl BridgeCoordinator {
         settings: &Arc<WorkspaceSettings>,
         host_language: &str,
         host_uri: &Url,
+        host_incarnation: u64,
         injections: Vec<BridgeInjection>,
         server_name: &str,
     ) {
@@ -398,7 +399,7 @@ impl BridgeCoordinator {
                 &config,
                 host_uri,
                 &host_uri_lsp,
-                None,
+                Some(host_incarnation),
                 for_server,
             )
             .await;
@@ -1611,6 +1612,7 @@ mod tests {
                 &settings,
                 "markdown",
                 &host_uri,
+                1,
                 injections,
                 "other-server",
             ),
