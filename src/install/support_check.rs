@@ -180,7 +180,7 @@ where
                     } else {
                         log::debug!(
                             target: "kakehashi::auto_install",
-                            "Timed-out metadata support check was cancelled before starting"
+                            "Timed-out metadata support-check handle was cancelled"
                         );
                     }
                 }
