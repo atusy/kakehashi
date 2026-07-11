@@ -183,10 +183,27 @@ impl ParseCoordinator {
                 let mut parse_fn = parse_fn;
                 let mut language_name_owned = language_name_owned;
                 for attempt in 0..2 {
-                    let (parser, parser_generation) = parser_pool
-                        .lock()
-                        .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
-                        .acquire_versioned(&language_name_owned)?;
+                    let (parser, parser_generation) = loop {
+                        match parser_pool
+                            .lock()
+                            .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
+                            .acquire_versioned(&language_name_owned)
+                        {
+                            crate::language::parser_pool::ParserCheckout::Acquired(
+                                parser,
+                                generation,
+                            ) => break (parser, generation),
+                            crate::language::parser_pool::ParserCheckout::Reloading => {
+                                // A reload is synchronous and normally brief. Keep this
+                                // transient state inside the bounded work unit instead
+                                // of publishing a terminal tree-less result.
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            crate::language::parser_pool::ParserCheckout::Unavailable => {
+                                return None;
+                            }
+                        }
+                    };
                     // The in-parse abort deadline is anchored at DEQUEUE, not
                     // submission: a parse that sat in the pool queue behind other
                     // documents' work still gets its full budget of actual parse

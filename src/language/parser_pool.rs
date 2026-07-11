@@ -35,6 +35,12 @@ pub struct DocumentParserPool {
     reload_depth: usize,
 }
 
+pub(crate) enum ParserCheckout {
+    Acquired(Parser, u64),
+    Reloading,
+    Unavailable,
+}
+
 impl DocumentParserPool {
     /// Create a new parser pool with the given factory
     pub fn new(factory: ParserFactory) -> Self {
@@ -58,12 +64,15 @@ impl DocumentParserPool {
         self.reload_depth = self.reload_depth.saturating_sub(1);
     }
 
-    pub(crate) fn acquire_versioned(&mut self, language_id: &str) -> Option<(Parser, u64)> {
+    pub(crate) fn acquire_versioned(&mut self, language_id: &str) -> ParserCheckout {
         if self.reload_depth != 0 {
-            return None;
+            return ParserCheckout::Reloading;
         }
         let generation = self.generation;
-        self.acquire(language_id).map(|parser| (parser, generation))
+        match self.acquire(language_id) {
+            Some(parser) => ParserCheckout::Acquired(parser, generation),
+            None => ParserCheckout::Unavailable,
+        }
     }
 
     pub(crate) fn release_versioned(
