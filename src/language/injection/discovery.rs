@@ -508,26 +508,20 @@ impl InjectionResolver {
         )
     }
 
-    /// Resolve injection language using the unified detection chain (language-detection-fallback-chain).
+    /// Derive a parser-independent canonical injection language for bridge
+    /// selection and stable virtual-document identity.
     ///
-    /// This normalizes raw fence identifiers (e.g., "py") to canonical language names
-    /// (e.g., "python") that match bridge server configurations.
+    /// This derives the stable bridge key from an explicit configured base or
+    /// heuristic normalization (for example, `py` to `python`).
     ///
-    /// Falls back to the raw identifier if no resolution is found, allowing the
-    /// bridge lookup to fail gracefully with a clear error message.
+    /// Falls back to the raw identifier when no configured or heuristic
+    /// canonical candidate exists; bridge matching then uses that explicit key.
     fn resolve_language(
         coordinator: &LanguageCoordinator,
         raw_identifier: &str,
         content: &str,
     ) -> String {
-        coordinator
-            .detect_language_hot(
-                raw_identifier, // Use identifier as path for token extraction
-                content,
-                Some(raw_identifier), // Explicit token
-                Some(raw_identifier), // Also try as languageId
-            )
-            .unwrap_or_else(|| raw_identifier.to_string())
+        coordinator.canonical_injection_language(raw_identifier, content)
     }
 
     /// Build a [`ResolvedInjection`] from a raw injection region.
@@ -664,6 +658,109 @@ mod tests {
 
     fn test_coordinator() -> LanguageCoordinator {
         LanguageCoordinator::new()
+    }
+
+    #[test]
+    fn canonicalizes_token_independently_of_parser_availability() {
+        let coordinator = LanguageCoordinator::new();
+
+        assert_eq!(
+            InjectionResolver::resolve_language(&coordinator, "py", "print('hello')"),
+            "python"
+        );
+
+        coordinator
+            .language_registry_for_parallel()
+            .register("py".to_string(), tree_sitter_python::LANGUAGE.into());
+        assert_eq!(
+            InjectionResolver::resolve_language(&coordinator, "py", "print('hello')"),
+            "python"
+        );
+    }
+
+    #[test]
+    fn explicit_token_beats_loaded_first_line_language() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry_for_parallel()
+            .register("lua".to_string(), tree_sitter_lua::LANGUAGE.into());
+
+        assert_eq!(
+            InjectionResolver::resolve_language(
+                &coordinator,
+                "py",
+                "#!/usr/bin/env lua\nprint('hello')",
+            ),
+            "python"
+        );
+    }
+
+    #[test]
+    fn configured_base_beats_syntect_token_normalization_without_parser() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&crate::config::WorkspaceSettings {
+            languages: std::collections::HashMap::from([(
+                "py".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("custom-python".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            InjectionResolver::resolve_language(&coordinator, "py", ""),
+            "custom-python"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_first_line_without_loaded_parser() {
+        let coordinator = LanguageCoordinator::new();
+
+        assert_eq!(
+            InjectionResolver::resolve_language(
+                &coordinator,
+                "unknown",
+                "#!/usr/bin/env python\nprint('hello')",
+            ),
+            "python"
+        );
+    }
+
+    #[test]
+    fn configured_plaintext_base_is_canonical_for_bridge() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&crate::config::WorkspaceSettings {
+            languages: std::collections::HashMap::from([(
+                "plaintext".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("python".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            InjectionResolver::resolve_language(&coordinator, "plaintext", ""),
+            "python"
+        );
+    }
+
+    #[test]
+    fn explicit_plaintext_ignores_first_line_heuristics() {
+        let coordinator = LanguageCoordinator::new();
+
+        assert_eq!(
+            InjectionResolver::resolve_language(
+                &coordinator,
+                "plaintext",
+                "#!/usr/bin/env python\nprint('hello')",
+            ),
+            "plaintext"
+        );
     }
 
     /// Helper: parse `text` with tree-sitter Rust, match `string_content` nodes

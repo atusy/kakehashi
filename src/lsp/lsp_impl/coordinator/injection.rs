@@ -311,7 +311,10 @@ impl InjectionCoordinator {
         // an already-registered language returns no events).
         let mut load_events: Vec<LanguageEvent> = Vec::new();
 
-        for lang in languages {
+        for lang in languages
+            .iter()
+            .filter(|lang| parser_enabled_injection_language(lang))
+        {
             let resolved_lang = if self.language.has_parser_available(lang) {
                 lang.clone()
             } else if let Some(normalized) = crate::language::heuristic::detect_from_token(lang) {
@@ -402,9 +405,21 @@ impl InjectionCoordinator {
     }
 }
 
+fn parser_enabled_injection_language(language: &str) -> bool {
+    // Explicit, unconfigured plaintext is deliberately featureless. An eligible
+    // configured plaintext base is canonicalized before reaching this loop.
+    language != "plaintext"
+}
+
 #[cfg(test)]
 mod tests {
-    use super::InjectionResolver;
+    use super::{InjectionResolver, parser_enabled_injection_language};
+
+    #[test]
+    fn explicit_plaintext_does_not_request_a_parser() {
+        assert!(!parser_enabled_injection_language("plaintext"));
+        assert!(parser_enabled_injection_language("python"));
+    }
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tower_lsp_server::LspService;

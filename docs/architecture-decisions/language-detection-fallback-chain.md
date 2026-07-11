@@ -14,7 +14,10 @@ Additionally, PBI-061 removed the `filetypes` configuration field entirely, elim
 
 The key insight is: **detection should find an *available* Tree-sitter parser, not just identify a language name**. If the detected language has no parser loaded, detection should continue to the next method.
 
-This applies to both document-level language detection and injected language resolution (e.g., code blocks in Markdown).
+This applies to parser selection for both document-level language detection and
+injected-language analysis. Bridge selection has a separate stability
+constraint: its canonical language key and virtual URI must be known before a
+parser is installed and must not change when parser availability changes.
 
 ## Decision
 
@@ -23,19 +26,23 @@ This applies to both document-level language detection and injected language res
 1. **Document-level**: Detecting the primary language when a file is opened
 2. **Injection-level**: Resolving embedded languages within a parsed document
 
-```
-1. LSP languageId  →  Try direct  →  Try alias  →  If available: use it
+For bridge routing and virtual-document identity, first derive a
+parser-independent canonical injection candidate. Parser loading remains a
+later, separate decision.
+
+```text
+1. LSP languageId  →  Try direct  →  Try base   →  If available: use it
                                                 →  If no: continue
-2. Token detection →  syntect     →  Try alias  →  If available: use it
-                  →  raw token   →  Try alias  →  If available: use it
+2. Token detection →  syntect     →  Try base   →  If available: use it
+                  →  raw token   →  Try base   →  If available: use it
                                                 →  If no: continue
-3. First line      →  Try direct  →  Try alias  →  If available: use it
+3. First line      →  Try direct  →  Try base   →  If available: use it
                                                 →  If no: return None
 ```
 
 ### Priority Order Rationale
 
-Each detection method follows the **detect → alias resolution → availability check** pattern:
+Each detection method follows the **detect → base resolution → availability check** pattern:
 
 1. **LSP languageId (highest priority)**
    - Client has full context: file path, content, user preferences, workspace settings
@@ -52,9 +59,9 @@ Each detection method follows the **detect → alias resolution → availability
    - `py` → `python`, `js` → `javascript`, `rs` → `rust`
    - `Makefile` → `make`, `.bashrc` → `bash`
 
-   If syntect doesn't recognize the token, it's tried directly as an alias candidate.
+   If syntect doesn't recognize the token, it's tried directly as a base candidate.
    This handles extensions like `jsx`, `tsx` that syntect doesn't know but may be
-   configured as aliases (e.g., `jsx` → `javascript`).
+   configured with a base (e.g., `[languages.jsx] base = "javascript"`).
 
 3. **First-line detection (lowest priority)**
    - Shebang detection: `#!/usr/bin/env python` → python
@@ -62,84 +69,106 @@ Each detection method follows the **detect → alias resolution → availability
    - Implementation: syntect's `find_syntax_by_first_line`
    - Fallback when token detection fails (e.g., extensionless files without special names)
 
-### Alias Resolution as Sub-step
+### Base Resolution as Sub-step
 
-Alias resolution is applied **after each detection method**, not as a separate step in the chain. This is configured via the `aliases` field in language config:
+Base resolution is applied **after each detection method**, not as a separate
+step in the chain. This is configured via the `base` field:
 
 ```toml
-[languages.markdown]
-aliases = ["rmd", "qmd"]
+[languages.rmd]
+base = "markdown"
 ```
 
 This ensures:
-- **Consistent behavior**: All detection paths apply the same alias logic
+- **Consistent behavior**: All detection paths apply the same base logic
 - **User control**: Users can define mappings that work at any detection level
-- **Alignment with injection**: Document-level and injection-level detection behave the same way
+- **Shared base semantics**: Document parser resolution and injection bridge
+  canonicalization both honor eligible bases, while their surrounding fallback
+  chains intentionally differ as described below (including explicit `plaintext`).
 
 Example scenarios:
-- Editor sends `languageId: "rmd"` → alias resolves to `markdown` → parser found
+- Editor sends `languageId: "rmd"` → base resolves to `markdown` → parser found
 - Token `py` (from code fence or `.py` extension) → syntect normalizes to `python` → parser found
-- Token `jsx` (from `.jsx` extension) → syntect unknown → direct alias to `javascript` → parser found
+- Token `jsx` (from `.jsx` extension) → syntect unknown → configured base `javascript` → parser found
 - Shebang `#!/usr/bin/env python3` → syntect returns `python` → parser found
 
 ### Availability Check
 
-Each detection method tries direct match first, then alias resolution:
+Each detection method tries a direct match first, then base resolution:
 
-```
+```text
 detect_language(path, content, token, language_id):
     // 1. Try languageId (skip "plaintext")
     if language_id exists and != "plaintext":
-        if try_with_alias_fallback(language_id) succeeds:
+        if result = try_with_base_fallback(language_id):
             return result
 
     // 2. Token-based detection
     effective_token = token OR extract_token_from_path(path)
     if effective_token exists:
         // Try syntect normalization (py → python, Makefile → make)
-        if syntect recognizes token:
-            if try_with_alias_fallback(normalized) succeeds:
+        if normalized = syntect_detect(effective_token):
+            if result = try_with_base_fallback(normalized):
                 return result
-        // Try raw token as alias (handles jsx, tsx that syntect doesn't know)
-        if try_with_alias_fallback(raw_token) succeeds:
+        // Try raw token with base fallback (handles jsx, tsx)
+        if result = try_with_base_fallback(effective_token):
             return result
 
     // 3. First-line detection (shebang, mode line)
-    if syntect detects from first line:
-        if try_with_alias_fallback(detected) succeeds:
+    if detected = syntect_detect_first_line(content):
+        if result = try_with_base_fallback(detected):
             return result
 
     return None
 
-try_with_alias_fallback(candidate):
+try_with_base_fallback(candidate):
     if parser_available(candidate):
         return candidate
-    if alias_configured(candidate) AND parser_available(alias):
-        return alias
+    if base = configured_base(candidate) AND parser_available(base):
+        return base
     return None
 ```
 
 This means:
-- If client sends `languageId: "rmd"` and alias maps `rmd` → `markdown`, use the markdown parser
+- If client sends `languageId: "rmd"` and its base is `markdown`, use the markdown parser
 - If token `py` is normalized by syntect to `python`, use the python parser
-- If token `jsx` is not recognized by syntect but alias maps `jsx` → `javascript`, use the javascript parser
+- If token `jsx` is not recognized by syntect but its base is `javascript`, use the javascript parser
 - If no match, continue to the next detection method
 
 ### Language Injection
 
 The fallback chain also applies to **injected languages** (e.g., code blocks in Markdown, JavaScript inside HTML). Injection queries extract a language identifier, but this identifier needs resolution:
 
-```
+```text
 Document (markdown) ──parse──▶ AST ──injection query──▶ "py" ──detect──▶ python
                                                       ▶ "sh" ──detect──▶ bash
 ```
 
-For example, a Markdown code fence with ` ```py ` provides the identifier `"py"`, which must be resolved to an available parser. This resolution follows a fallback pattern:
+For example, a Markdown code fence with ` ```py ` provides the identifier
+`"py"`. Two related operations intentionally have different acceptance rules:
 
-1. **Try the identifier directly**: Check if a parser named `"py"` is available
-2. **Normalize via syntect**: Use `detect_from_token("py")` which returns `"python"`
-3. **Try config-based alias**: If syntect doesn't recognize it, check user-configured aliases
-4. **Skip if unavailable**: If no parser matches, the region is skipped
+- **Bridge canonicalization** produces a stable language key even when no
+  parser exists yet. It checks an eligible configured base mapping first. An
+  explicit unconfigured `plaintext` identifier then remains `plaintext` rather
+  than acquiring language features from its content. Other identifiers proceed
+  through syntect token normalization (and that candidate's base), then
+  first-line detection (and that candidate's base), and finally the raw
+  identifier. Without an eligible `py` base override, `py` remains `python`
+  before and after parser installation.
+- **Parser resolution** may then load or select the canonical language/base and
+  can still fail when no grammar is available.
+
+Parser resolution follows this fallback pattern:
+
+1. **Try identifier then configured base**: Load `"py"` directly, then its
+   configured base before considering generic normalization
+2. **Normalize via syntect, then try its base**: Use `detect_from_token("py")`
+   which returns `"python"`, and load that candidate or its configured base
+3. **Try first-line candidate then its base**: Use shebang/mode-line detection
+   only after the explicit identifier paths fail
+4. **Skip parser-backed analysis if unavailable**: Bridge routing can still use
+   the canonical candidate, but semantic/parser work skips the region when no
+   parser matches
 
 This means:
 - Injected languages benefit from the same graceful degradation
@@ -159,14 +188,16 @@ This means:
 ### Negative
 
 - **Heuristic overhead**: Reading file content for shebang detection adds I/O
-- **Non-deterministic**: Same file might use different parsers on different systems (based on available parsers)
+- **Parser selection can vary**: Same file might use different parsers on
+  different systems, while bridge language keys and virtual URIs remain stable
 - **Heuristic maintenance**: Shebang patterns need ongoing updates
 - **languageId naming variance**: Clients may send languageIds that differ from parser names (e.g., `shellscript` vs `bash`); normalization may be needed later
 
 ### Neutral
 
 - **Token-based detection includes extensions**: Extensions are treated as tokens, not a separate detection step
-- **Parser availability matters**: Detection result depends on what's installed
+- **Parser availability is scoped**: Parser-backed detection depends on what's
+  installed; bridge canonicalization does not
 - **Auto-install interaction**: Detection completes first (returning None if no parser found); auto-install runs asynchronously afterward, making the parser available for subsequent requests
 - **Caching**: Detection result is stored per-document; cache invalidates on content change or `languageId` change from client
 - **syntect dependency**: Uses syntect's Sublime Text syntax definitions for token normalization and first-line detection

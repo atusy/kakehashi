@@ -778,8 +778,10 @@ impl LanguageCoordinator {
 
     /// Resolve a derived languageId to its base language name.
     ///
-    /// Returns the base name if the input has a base declaration, otherwise None.
-    /// Example: "rmd" → Some("markdown") if rmd has `base = "markdown"`
+    /// Returns the registered base mapping, otherwise `None`. A declaration is
+    /// intentionally not registered when the derived language owns a distinct
+    /// parser; see [`Self::build_base_map`].
+    /// Example: "rmd" → Some("markdown") when its base mapping is eligible.
     fn resolve_base(&self, language_id: &str) -> Option<String> {
         let base_map = self
             .base_map
@@ -1206,15 +1208,13 @@ impl LanguageCoordinator {
             && self.has_current_parser_registration(language_name, generation)
     }
 
-    /// language-detection-fallback-chain unified detection chain for host docs and injections; returns
-    /// the first language with an available parser. Each stage is
+    /// Parser-aware language-detection fallback chain for host documents;
+    /// returns the first language with an available parser. Each stage is
     /// detect → base resolution → availability:
     /// (1) LSP `languageId` (if not `"plaintext"`); (2) heuristics — explicit
     /// token (`"py"`, `"js"`), path token via `extract_token_from_path`, then
     /// first-line content (shebang, mode line, Emacs markers).
-    /// Host call: `detect_language(path, content, None, language_id)`;
-    /// injection call: `detect_language_hot(token, content, Some(token),
-    /// Some(token))` — the per-region hot path logs at TRACE.
+    /// Host call: `detect_language(path, content, None, language_id)`.
     pub(crate) fn detect_language(
         &self,
         path: &str,
@@ -1225,21 +1225,32 @@ impl LanguageCoordinator {
         self.detect_language_logged(path, content, token, language_id, log::Level::Debug)
     }
 
-    /// Hot-path variant of [`Self::detect_language`] that logs at TRACE.
+    /// Canonical injection language for bridge selection and virtual URIs.
     ///
-    /// Per-injection-region resolution runs this once per region per walk —
-    /// thousands of calls per second during a typing storm — and per-call
-    /// DEBUG formatting/writes flood stderr (measured ~16k lines/sec, dwarfing
-    /// the detection chain itself). The chain is identical; only the log level
-    /// differs, matching `resolve_injection_language`'s TRACE convention.
-    pub(crate) fn detect_language_hot(
-        &self,
-        path: &str,
-        content: &str,
-        token: Option<&str>,
-        language_id: Option<&str>,
-    ) -> Option<String> {
-        self.detect_language_logged(path, content, token, language_id, log::Level::Trace)
+    /// Candidate selection deliberately does not inspect parser state: eager
+    /// bridge selection and virtual URIs must stay stable before and after a
+    /// parser loads. An eligible configured base mapping for the explicit
+    /// identifier takes precedence. An otherwise unconfigured explicit
+    /// `plaintext` remains `plaintext`; other identifiers proceed through syntect
+    /// token normalization and then first-line fallback. Consequently,
+    /// registering a parser under a non-canonical key such as `py` or `js` does
+    /// not change bridge keys/URIs: bridge configuration uses
+    /// `python`/`javascript` unless the explicit identifier itself has an
+    /// eligible base mapping (for example, `py.base`).
+    pub(crate) fn canonical_injection_language(&self, identifier: &str, content: &str) -> String {
+        if let Some(base) = self.resolve_base(identifier) {
+            return base;
+        }
+        if identifier == "plaintext" {
+            return identifier.to_string();
+        }
+        if let Some(candidate) = super::heuristic::detect_from_token(identifier) {
+            return self.resolve_base(&candidate).unwrap_or(candidate);
+        }
+        if let Some(candidate) = super::heuristic::detect_from_first_line(content) {
+            return self.resolve_base(&candidate).unwrap_or(candidate);
+        }
+        identifier.to_string()
     }
 
     fn detect_language_logged(
@@ -1360,12 +1371,14 @@ impl LanguageCoordinator {
         (None, "none", last_candidate)
     }
 
-    /// language-detection-fallback-chain injection-language detection. Same chain as `detect_language`
+    /// language-detection-fallback-chain injection-language detection. Normally uses the same chain as `detect_language`
     /// (1: direct id, 2: syntect normalisation `py→python`, `js→javascript`,
     /// 3: first-line shebang/mode-line) but *loads* the parser instead of
     /// only checking availability — injection discovery runs before we know
     /// which parsers are needed. Each step runs through `try_load_with_base`
-    /// for config-based base resolution (e.g. `rmd→markdown`).
+    /// for config-based base resolution (e.g. `rmd→markdown`). Explicit
+    /// `plaintext` is the exception: only an eligible configured base is loaded,
+    /// otherwise it remains featureless and returns `None` without heuristics.
     pub(crate) fn resolve_injection_language(
         &self,
         identifier: &str,
@@ -1381,10 +1394,20 @@ impl LanguageCoordinator {
             content.len()
         );
 
-        // 1. Try direct identifier first (skip "plaintext")
-        if identifier != "plaintext"
-            && let Some(found) = self.try_load_with_base(identifier)
-        {
+        // 1. Try the identifier first. Explicit plaintext remains featureless
+        // unless it has an eligible configured base mapping; loading plaintext
+        // itself or applying content heuristics would violate that explicit key.
+        if identifier == "plaintext" {
+            let base = self.resolve_base(identifier)?;
+            let found = self.try_load_with_base(&base)?;
+            log::trace!(
+                target: "kakehashi::language_detection",
+                "Resolved injection '{}' -> '{}' via configured plaintext base",
+                identifier, found.0
+            );
+            return Some(found);
+        }
+        if let Some(found) = self.try_load_with_base(identifier) {
             log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via identifier (direct or base)",
@@ -1862,7 +1885,7 @@ mod tests {
         // Register "python" parser
         coordinator
             .language_registry_for_parallel()
-            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
 
         // Direct identifier "python" should work
         let result = coordinator.resolve_injection_language("python", "print('hello')");
@@ -1878,7 +1901,7 @@ mod tests {
         // Register "python" parser (not "py")
         coordinator
             .language_registry_for_parallel()
-            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
 
         // Token "py" should resolve to "python" via syntect's detect_from_token
         let result = coordinator.resolve_injection_language("py", "print('hello')");
@@ -1932,6 +1955,42 @@ mod tests {
     }
 
     #[test]
+    fn test_injection_plaintext_uses_eligible_config_base() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
+        coordinator.build_base_map(&HashMap::from([(
+            "plaintext".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("python".to_string()),
+                ..Default::default()
+            },
+        )]));
+
+        let (resolved, load_result) = coordinator
+            .resolve_injection_language("plaintext", "#!/usr/bin/env ruby")
+            .expect("eligible plaintext base must drive parser resolution");
+
+        assert_eq!(resolved, "python");
+        assert!(load_result.success);
+    }
+
+    #[test]
+    fn test_injection_plaintext_without_base_stays_featureless() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
+
+        assert!(
+            coordinator
+                .resolve_injection_language("plaintext", "#!/usr/bin/env python")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_injection_prefers_direct_over_base() {
         let coordinator = LanguageCoordinator::new();
         // Register both "js" and "javascript" as separate parsers
@@ -1958,7 +2017,7 @@ mod tests {
         // Register "python" parser
         coordinator
             .language_registry_for_parallel()
-            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
 
         // Injection with unknown identifier but Python shebang in content
         let content = "#!/usr/bin/env python\nprint('hello')";
