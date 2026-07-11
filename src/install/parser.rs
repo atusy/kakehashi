@@ -492,13 +492,17 @@ fn fail_terminal_archive_error(
     error: ParserInstallError,
     dest: &Path,
 ) -> Result<(), ParserInstallError> {
-    if let Err(cleanup_error) = fs::remove_dir_all(dest) {
-        return Err(ParserInstallError::ArchiveError(format!(
-            "{}; failed to remove partial destination {}: {}",
-            error,
-            dest.display(),
-            cleanup_error
-        )));
+    match fs::remove_dir_all(dest) {
+        Ok(()) => {}
+        Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {}
+        Err(cleanup_error) => {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "{}; failed to remove partial destination {}: {}",
+                error,
+                dest.display(),
+                cleanup_error
+            )));
+        }
     }
     Err(error)
 }
