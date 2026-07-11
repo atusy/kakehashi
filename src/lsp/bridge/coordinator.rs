@@ -381,6 +381,7 @@ impl BridgeCoordinator {
         settings: &Arc<WorkspaceSettings>,
         host_language: &str,
         host_uri: &Url,
+        host_incarnation: u64,
         injections: Vec<BridgeInjection>,
         server_name: &str,
     ) {
@@ -393,7 +394,14 @@ impl BridgeCoordinator {
             return;
         };
         self.pool
-            .eager_open_virtual_documents(server_name, &config, host_uri, &host_uri_lsp, for_server)
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                host_uri,
+                &host_uri_lsp,
+                host_incarnation,
+                for_server,
+            )
             .await;
     }
 
@@ -792,11 +800,20 @@ impl BridgeCoordinator {
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         uri: &Url,
+        incarnation: u64,
         injections: &[BridgeInjection],
     ) {
         self.pool
-            .forward_didchange_to_opened_docs(uri, injections)
+            .forward_didchange_to_opened_docs(uri, incarnation, injections)
             .await;
+    }
+
+    pub(crate) async fn open_host_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.pool.open_host_incarnation(uri, incarnation).await;
+    }
+
+    pub(crate) async fn close_host_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.pool.close_host_incarnation(uri, incarnation).await;
     }
 
     // ========================================
@@ -812,6 +829,7 @@ impl BridgeCoordinator {
         settings: &WorkspaceSettings,
         host_language: &str,
         host_uri: &Url,
+        incarnation: u64,
         injections: Vec<BridgeInjection>,
     ) {
         // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
@@ -917,6 +935,7 @@ impl BridgeCoordinator {
                         &config,
                         &host_uri_owned,
                         &host_uri_lsp,
+                        incarnation,
                         group_injections,
                     ) => {}
                 }
@@ -1593,6 +1612,7 @@ mod tests {
                 &settings,
                 "markdown",
                 &host_uri,
+                1,
                 injections,
                 "other-server",
             ),

@@ -89,6 +89,13 @@ impl Kakehashi {
         // silently skip the heal (the request paths await the fresh tree the
         // same way).
         self.ensure_document_parsed(&host_url).await;
+        let Some(host_incarnation) = self
+            .documents
+            .get(&host_url)
+            .map(|document| document.incarnation())
+        else {
+            return;
+        };
         let Some((host_language, injections)) =
             self.injection_coordinator().bridge_injections(&host_url)
         else {
@@ -122,6 +129,7 @@ impl Kakehashi {
                     &settings,
                     &host_language_owned,
                     &host_url_owned,
+                    host_incarnation,
                     injections,
                     &origin,
                 )

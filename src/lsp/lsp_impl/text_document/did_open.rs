@@ -49,6 +49,7 @@ impl Kakehashi {
             self.documents
                 .insert(uri.clone(), text.clone(), language_name.clone(), None);
         self.bridge.open_tracker_incarnation(&uri, incarnation);
+        self.bridge.open_host_incarnation(&uri, incarnation).await;
         drop(edit_guard);
 
         // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
