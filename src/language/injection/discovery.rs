@@ -15,10 +15,10 @@ use super::ranges::{
 };
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
-use crate::language::query_predicates::check_predicate;
+use crate::language::query_predicates::check_match_predicates;
 use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_hash};
 
-/// Iterates over `@injection.content` captures that pass general predicate filtering.
+/// Iterates over `@injection.content` captures from predicate-valid matches.
 ///
 /// Combines predicate evaluation (e.g., `#lua-match?`) and capture name checking
 /// into a single iterator, eliminating duplication between `collect_all_injections`
@@ -28,8 +28,9 @@ fn iter_valid_injection_content_captures<'a, 'b>(
     query: &'b Query,
     text: &'b str,
 ) -> impl Iterator<Item = QueryCapture<'a>> + 'b {
+    let predicates_match = check_match_predicates(query, match_, text);
     match_.captures.iter().copied().filter(move |capture| {
-        if !check_predicate(query, match_, capture, text) {
+        if !predicates_match {
             return false;
         }
         query
@@ -1428,6 +1429,32 @@ mod tests {
             content.starts_with(';'),
             "Injected content should start with ';', got: {:?}",
             content
+        );
+    }
+
+    #[test]
+    fn test_collect_all_injections_respects_predicate_on_helper_capture() {
+        let mut parser = create_rust_parser();
+        let text = "foo!(x)";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let query_str = r#"
+            ((macro_invocation
+                macro: (identifier) @_macro
+                (token_tree) @injection.content)
+              (#lua-match? @_macro "^html$")
+              (#set! injection.language "html"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let injections =
+            collect_all_injections(&root, text, Some(&query)).expect("injection collection");
+
+        assert!(
+            injections.is_empty(),
+            "a failed helper-capture predicate must reject the whole match"
         );
     }
 
