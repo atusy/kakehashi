@@ -15,23 +15,15 @@ use super::ranges::{
 };
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
-use crate::language::query_predicates::check_predicate;
+use crate::language::query_predicates::check_match_predicates;
 use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_hash};
 
-/// Iterates over `@injection.content` captures that pass general predicate filtering.
-///
-/// Combines predicate evaluation (e.g., `#lua-match?`) and capture name checking
-/// into a single iterator, eliminating duplication between `collect_all_injections`
-/// and `extract_content_and_language`.
-fn iter_valid_injection_content_captures<'a, 'b>(
+/// Iterates over the `@injection.content` captures in a query match.
+fn iter_injection_content_captures<'a, 'b>(
     match_: &'b QueryMatch<'_, 'a>,
     query: &'b Query,
-    text: &'b str,
 ) -> impl Iterator<Item = QueryCapture<'a>> + 'b {
-    match_.captures.iter().copied().filter(move |capture| {
-        if !check_predicate(query, match_, capture, text) {
-            return false;
-        }
+    match_.captures.iter().copied().filter(|capture| {
         query
             .capture_names()
             .get(capture.index as usize)
@@ -285,7 +277,10 @@ pub(crate) fn collect_all_injections<'a>(
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
-        for capture in iter_valid_injection_content_captures(match_, query, text) {
+        if !check_match_predicates(query, match_, text) {
+            continue;
+        }
+        for capture in iter_injection_content_captures(match_, query) {
             if capture.node.start_byte() >= capture.node.end_byte() {
                 continue;
             }
@@ -413,11 +408,14 @@ fn extract_content_and_language<'a>(
     query: &Query,
     text: &str,
 ) -> Option<(Node<'a>, String, usize)> {
-    for capture in iter_valid_injection_content_captures(match_, query, text) {
+    for capture in iter_injection_content_captures(match_, query) {
         let content_node = capture.node;
 
         // Check if our node is within this injection region
         if is_node_within(node, &content_node) {
+            if !check_match_predicates(query, match_, text) {
+                return None;
+            }
             // Extract the injection language
             if let Some(language) = extract_injection_language(query, match_, text) {
                 return Some((content_node, language, match_.pattern_index));
@@ -1428,6 +1426,58 @@ mod tests {
             content.starts_with(';'),
             "Injected content should start with ';', got: {:?}",
             content
+        );
+    }
+
+    #[test]
+    fn test_collect_all_injections_respects_predicate_on_helper_capture() {
+        let mut parser = create_rust_parser();
+        let text = "foo!(x)";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let query_str = r#"
+            ((macro_invocation
+                macro: (identifier) @_macro
+                (token_tree) @injection.content)
+              (#lua-match? @_macro "^html$")
+              (#set! injection.language "html"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let injections =
+            collect_all_injections(&root, text, Some(&query)).expect("injection collection");
+
+        assert!(
+            injections.is_empty(),
+            "a failed helper-capture predicate must reject the whole match"
+        );
+    }
+
+    #[test]
+    fn test_detect_injection_respects_predicate_on_helper_capture() {
+        let mut parser = create_rust_parser();
+        let text = "foo!(x)";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        let node = find_node_at_byte(&root, 5).expect("node inside macro token tree");
+
+        let query_str = r#"
+            ((macro_invocation
+                macro: (identifier) @_macro
+                (token_tree) @injection.content)
+              (#lua-match? @_macro "^html$")
+              (#set! injection.language "html"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let injection = detect_injection(&node, &root, text, Some(&query), "rust");
+
+        assert!(
+            injection.is_none(),
+            "a failed helper-capture predicate must reject point detection"
         );
     }
 
