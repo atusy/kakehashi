@@ -346,11 +346,10 @@ pub(crate) fn collect_all_injections<'a>(
             ))
     });
     for region in &mut injections {
-        // Derive identity from both stable query position and language. Dynamic
-        // `@injection.language` captures can produce several language layers
-        // from one pattern at the same range, so the pattern index alone aliases
-        // their virtual documents. A current-match ordinal is also unsuitable:
-        // removing one match would shift every later identity.
+        // Retain the stable query-position component for discovery tests. The
+        // collision-free language component is allocated later by
+        // `NodeTracker::named_layer_for_incarnation`, where URI lifecycle state
+        // can own and reclaim dynamic language names.
         region.identity_slot = region.pattern_index;
     }
     Some(injections)
