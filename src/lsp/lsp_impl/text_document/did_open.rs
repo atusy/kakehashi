@@ -893,10 +893,17 @@ print("hello")
             Arc::clone(&server.documents),
         );
         gate.entered.notified().await;
+        let timer = manager.timer_abort_handle(&uri).unwrap();
 
         server.documents.remove(&uri);
         gate.release.notify_one();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        timeout(Duration::from_secs(1), async {
+            while !timer.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released debounce body should finish");
 
         assert_eq!(
             server

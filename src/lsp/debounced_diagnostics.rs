@@ -248,6 +248,13 @@ impl DebouncedDiagnosticsManager {
     pub(crate) fn active_timer_count(&self) -> usize {
         self.active_timers.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn timer_abort_handle(&self, uri: &Url) -> Option<AbortHandle> {
+        self.active_timers
+            .get(uri)
+            .map(|entry| entry.value().clone())
+    }
 }
 
 /// Execute diagnostic collection and publishing after debounce timer expires.
