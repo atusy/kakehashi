@@ -56,12 +56,17 @@ impl LanguageServerPool {
             // this entry, so it either linearizes after this open (and closes the
             // tracked virtual document) or wins first and makes this stale batch
             // stop without opening old content.
-            let host_incarnation_guard = expected_incarnation.and_then(|incarnation| {
-                self.latest_virtual_contents
+            let lifecycle = expected_incarnation.map(|_| self.host_lifecycle_lock(host_uri));
+            let _lifecycle_guard = match &lifecycle {
+                Some(lifecycle) => Some(lifecycle.lock().await),
+                None => None,
+            };
+            if let Some(expected) = expected_incarnation
+                && self
+                    .latest_virtual_contents
                     .get(host_uri)
-                    .filter(|host| host.incarnation == incarnation)
-            });
-            if expected_incarnation.is_some() && host_incarnation_guard.is_none() {
+                    .is_none_or(|host| host.incarnation != expected)
+            {
                 return;
             }
             let virtual_uri =

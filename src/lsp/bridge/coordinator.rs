@@ -807,12 +807,12 @@ impl BridgeCoordinator {
             .await;
     }
 
-    pub(crate) fn open_host_incarnation(&self, uri: &Url, incarnation: u64) {
-        self.pool.open_host_incarnation(uri, incarnation);
+    pub(crate) async fn open_host_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.pool.open_host_incarnation(uri, incarnation).await;
     }
 
-    pub(crate) fn close_host_incarnation(&self, uri: &Url, incarnation: u64) {
-        self.pool.close_host_incarnation(uri, incarnation);
+    pub(crate) async fn close_host_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.pool.close_host_incarnation(uri, incarnation).await;
     }
 
     // ========================================
