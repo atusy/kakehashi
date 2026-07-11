@@ -1233,9 +1233,7 @@ impl LanguageCoordinator {
     /// does not change bridge keys/URIs: bridge configuration uses the canonical
     /// `python`/`javascript` name unless that alias has an explicit base.
     pub(crate) fn canonical_injection_language(&self, identifier: &str, content: &str) -> String {
-        if identifier != "plaintext"
-            && let Some(base) = self.resolve_base(identifier)
-        {
+        if let Some(base) = self.resolve_base(identifier) {
             return base;
         }
         if let Some(candidate) = super::heuristic::detect_from_token(identifier) {

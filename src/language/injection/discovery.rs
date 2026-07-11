@@ -728,6 +728,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_plaintext_base_is_canonical_for_bridge() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&crate::config::WorkspaceSettings {
+            languages: std::collections::HashMap::from([(
+                "plaintext".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("python".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            InjectionResolver::resolve_language(&coordinator, "plaintext", ""),
+            "python"
+        );
+    }
+
     /// Helper: parse `text` with tree-sitter Rust, match `string_content` nodes
     /// via injection query, and return the `CacheableInjectionRegion` for the first match.
     fn cacheable_from_first_injection(text: &str) -> CacheableInjectionRegion {
