@@ -116,7 +116,12 @@ The language detection fallback chain from language-detection-fallback-chain cha
 
 The key difference: with `base`, the language `rmd` is a first-class entry in the config, not a reverse lookup in an alias map. Detection finds `rmd` directly, and the base chain handles parser resolution. This also applies to injection language resolution — injected language identifiers are looked up directly in the config, and the base chain handles parser fallback.
 
-Syntect-based token normalization (e.g., `py` -> `python`) remains unchanged — it operates before the base chain.
+Parser-loading detection retains its documented fallback chain. Bridge/URI
+canonicalization is intentionally different: it first honors an explicit
+configured base for the raw identifier, then applies Syntect token or
+first-line normalization with base fallback. This keeps configured injection
+keys authoritative while still canonicalizing unconfigured aliases such as
+`py` -> `python` without requiring a parser to be loaded.
 
 ### Removed: `aliases` Field
 
