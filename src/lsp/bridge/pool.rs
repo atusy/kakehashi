@@ -1364,6 +1364,24 @@ impl LanguageServerPool {
         }
     }
 
+    pub(crate) fn clear_replaced_virtual_contents(
+        &self,
+        host_uri: &Url,
+        replaced: &[OpenedVirtualDoc],
+    ) {
+        if let Some(host) = self.latest_virtual_contents.get(host_uri) {
+            for doc in replaced {
+                let language = doc.virtual_uri.language();
+                let region_id = doc.virtual_uri.region_id();
+                if let Some(regions) = host.contents.get(language) {
+                    regions.remove(region_id);
+                }
+                host.contents
+                    .remove_if(language, |_, regions| regions.is_empty());
+            }
+        }
+    }
+
     /// Increment the version of a virtual document and return the new version,
     /// or `None` if the document has not been opened.
     ///
@@ -3969,6 +3987,30 @@ mod tests {
                 .unwrap()
                 .contents
                 .get("lua")
+                .is_some_and(|regions| regions.contains_key(TEST_ULID_LUA_0))
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_reclaims_only_old_language_virtual_content() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/cache-replacement.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "old");
+        pool.record_latest_virtual_content(&host_uri, 1, "python", TEST_ULID_LUA_0, "new");
+        let replaced = OpenedVirtualDoc {
+            virtual_uri: VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0),
+            connection_key: ConnectionKey::for_server("lua"),
+            connection_generation: 0,
+        };
+
+        pool.clear_replaced_virtual_contents(&host_uri, &[replaced]);
+
+        let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
+        assert!(!host.contents.contains_key("lua"));
+        assert!(
+            host.contents
+                .get("python")
                 .is_some_and(|regions| regions.contains_key(TEST_ULID_LUA_0))
         );
     }

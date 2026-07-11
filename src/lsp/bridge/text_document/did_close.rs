@@ -261,6 +261,7 @@ impl LanguageServerPool {
         let to_close = self
             .remove_replaced_virtual_docs(host_uri, &expected_uris)
             .await;
+        self.clear_replaced_virtual_contents(host_uri, &to_close);
         let replaced_regions = to_close
             .iter()
             .map(|doc| doc.virtual_uri.region_id().to_string())
