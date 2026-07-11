@@ -273,13 +273,27 @@ fn find_matching_brace(s: &str) -> Option<&str> {
     let mut quote = None;
     let mut escaped = false;
     let mut line_comment = false;
-    let mut chars = s[start..].char_indices().peekable();
+    let mut long_bracket = None;
+    let mut offset = start;
 
-    while let Some((i, c)) = chars.next() {
+    while offset < s.len() {
+        if let Some(equals) = long_bracket {
+            if is_long_bracket_close(&s[offset..], equals) {
+                offset += equals + 2;
+                long_bracket = None;
+            } else {
+                offset += s[offset..].chars().next()?.len_utf8();
+            }
+            continue;
+        }
+
+        let c = s[offset..].chars().next()?;
+        let char_len = c.len_utf8();
         if line_comment {
             if c == '\n' {
                 line_comment = false;
             }
+            offset += char_len;
             continue;
         }
         if let Some(delimiter) = quote {
@@ -290,25 +304,39 @@ fn find_matching_brace(s: &str) -> Option<&str> {
             } else if c == delimiter {
                 quote = None;
             }
+            offset += char_len;
             continue;
         }
-        if c == '-' && chars.peek().is_some_and(|(_, next)| *next == '-') {
-            chars.next();
-            line_comment = true;
+
+        if s[offset..].starts_with("--") {
+            offset += 2;
+            if let Some(equals) = long_bracket_open(&s[offset..]) {
+                offset += equals + 2;
+                long_bracket = Some(equals);
+            } else {
+                line_comment = true;
+            }
             continue;
         }
+        if let Some(equals) = long_bracket_open(&s[offset..]) {
+            offset += equals + 2;
+            long_bracket = Some(equals);
+            continue;
+        }
+
         match c {
             '\'' | '"' => quote = Some(c),
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    end = start + i + 1;
+                    end = offset + char_len;
                     break;
                 }
             }
             _ => {}
         }
+        offset += char_len;
     }
 
     if depth == 0 {
@@ -316,6 +344,22 @@ fn find_matching_brace(s: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn long_bracket_open(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let equals = bytes[1..].iter().take_while(|byte| **byte == b'=').count();
+    (bytes.get(equals + 1) == Some(&b'[')).then_some(equals)
+}
+
+fn is_long_bracket_close(s: &str, equals: usize) -> bool {
+    let bytes = s.as_bytes();
+    bytes.first() == Some(&b']')
+        && bytes[1..].iter().take(equals).all(|byte| *byte == b'=')
+        && bytes.get(equals + 1) == Some(&b']')
 }
 
 /// Fetch parser metadata for a language from nvim-treesitter.
@@ -416,6 +460,15 @@ mod tests {
     #[test]
     fn braces_in_strings_and_comments_do_not_hide_truncation() {
         let partial = "return {\n-- } is not the table end\nlua = { url = 'https://example/}', revision = 'ok' },";
+        assert!(matches!(
+            parse_complete_parsers_lua(partial),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn braces_in_long_strings_and_comments_do_not_hide_truncation() {
+        let partial = "return {\n--[=[ } is not the table end ]=]\nlua = { note = [==[ } is data ]==], install_info = { url = 'https://example/lua', revision = 'ok' } },";
         assert!(matches!(
             parse_complete_parsers_lua(partial),
             Err(MetadataError::ParseError(_))
