@@ -783,7 +783,7 @@ async fn dispatch_preferred_diagnostics(
 /// handler cannot hash unsorted items — an order-unstable id would make
 /// `unchanged` reports silently never fire on multi-server hosts.
 fn finalize_pull_items(mut items: Vec<Diagnostic>) -> (Vec<Diagnostic>, String) {
-    crate::lsp::diagnostic_cache::sort_diagnostics(&mut items);
+    crate::lsp::diagnostic_order::sort_diagnostics_deterministically(&mut items);
     let id = diagnostic_result_id(&items);
     (items, id)
 }
@@ -808,7 +808,7 @@ impl std::io::Write for FnvWriter {
 }
 
 /// Content-address a **sorted** pull result: the deterministic sort
-/// ([`sort_diagnostics`], applied by [`finalize_pull_items`]) makes the
+/// ([`sort_diagnostics_deterministically`], applied by [`finalize_pull_items`]) makes the
 /// serialization canonical, so the same logical set always hashes to the same
 /// id and any field change produces a different one. The length suffix is
 /// cheap insurance against a 64-bit collision making a changed set read as
@@ -816,7 +816,7 @@ impl std::io::Write for FnvWriter {
 /// content fingerprint). Stateless: the client echoes the id back as
 /// `previousResultId` and the handler just recomputes — nothing to invalidate.
 ///
-/// [`sort_diagnostics`]: crate::lsp::diagnostic_cache::sort_diagnostics
+/// [`sort_diagnostics_deterministically`]: crate::lsp::diagnostic_order::sort_diagnostics_deterministically
 fn diagnostic_result_id(items: &[Diagnostic]) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     let mut writer = FnvWriter(FNV_OFFSET);
