@@ -51,20 +51,20 @@ impl LanguageServerPool {
         let connection_key = handle.key().clone();
         let mut sender = ConnectionHandleSender(&handle);
 
-        for injection in &injections {
+        let lifecycle = match expected_incarnation {
+            Some(_) => {
+                let Some(lifecycle) = self.existing_host_lifecycle_lock(host_uri) else {
+                    return;
+                };
+                Some(lifecycle)
+            }
+            None => None,
+        };
+        for injection in injections {
             // Hold the host cache guard through didOpen. didClose/reopen replaces
             // this entry, so it either linearizes after this open (and closes the
             // tracked virtual document) or wins first and makes this stale batch
             // stop without opening old content.
-            let lifecycle = match expected_incarnation {
-                Some(_) => {
-                    let Some(lifecycle) = self.existing_host_lifecycle_lock(host_uri) else {
-                        return;
-                    };
-                    Some(lifecycle)
-                }
-                None => None,
-            };
             let lifecycle_guard = match &lifecycle {
                 Some(lifecycle) => Some(lifecycle.lock().await),
                 None => None,
