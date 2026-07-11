@@ -1280,6 +1280,15 @@ impl LanguageServerPool {
         )
     }
 
+    pub(crate) fn existing_host_lifecycle_lock(
+        &self,
+        host_uri: &Url,
+    ) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.host_lifecycle_locks
+            .get(host_uri)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
     pub(crate) async fn open_host_incarnation(&self, host_uri: &Url, incarnation: u64) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
         let _guard = lifecycle.lock().await;
@@ -3818,6 +3827,22 @@ mod tests {
             message["params"]["textDocument"]["text"],
             "print('new lifetime')"
         );
+
+        pool.close_host_incarnation(&host_uri, 2).await;
+        pool.eager_open_virtual_documents(
+            "lua",
+            &devnull_config(),
+            &host_uri,
+            &host_uri_lsp,
+            Some(1),
+            vec![super::super::coordinator::BridgeInjection {
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_0.to_string(),
+                content: "print('old lifetime')".to_string(),
+            }],
+        )
+        .await;
+        assert!(pool.host_lifecycle_locks.is_empty());
     }
 
     #[tokio::test]
