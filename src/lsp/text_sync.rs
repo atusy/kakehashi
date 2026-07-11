@@ -243,8 +243,8 @@ mod tests {
         // derived from the clamped byte offsets, not the original out-of-bounds
         // LSP positions — otherwise byte and point disagree and incremental
         // parsing corrupts. Base "local x = {\n}\n" (14 bytes): line 1 is "}"
-        // (one char), so character 2/3 are past it. Both ends clamp to byte 14,
-        // which is row 2, col 0 — NOT the raw position's row 1.
+        // (one char), so character 2/3 are past it. Both ends clamp to byte 13,
+        // immediately before the newline — NOT the next line's byte 14.
         let old_text = "local x = {\n}\n";
         let changes = vec![TextDocumentContentChangeEvent {
             range: Some(Range {
@@ -281,11 +281,11 @@ mod tests {
             point_of(edit.old_end_byte),
             "old_end_position must correspond to old_end_byte"
         );
-        // Concretely: both ends clamped to byte 14 → row 2, col 0.
-        assert_eq!(edit.old_end_byte, 14);
+        // Concretely: both ends clamp to byte 13 → row 1, col 1.
+        assert_eq!(edit.old_end_byte, 13);
         assert_eq!(
             (edit.old_end_position.row, edit.old_end_position.column),
-            (2, 0)
+            (1, 1)
         );
     }
 
