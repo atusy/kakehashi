@@ -189,8 +189,8 @@ impl InjectionCoordinator {
         F: std::future::Future<Output = ()>,
     {
         // Serialize the complete tree-derived downstream pass with didClose and
-        // didOpen. A parse task belongs to the document incarnation that exists
-        // when it acquires this guard; holding the same lifecycle lock through
+        // didOpen. The pass uses the document state observed after it acquires
+        // this guard; holding the same lifecycle lock through
         // cancellation, close/update, and eager-open prevents an old task from
         // mutating a fast-reopened lifetime between check and side effect.
         let edit_lock = self.documents.edit_lock(uri);
