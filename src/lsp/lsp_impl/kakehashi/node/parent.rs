@@ -138,6 +138,9 @@ impl Kakehashi {
                 layer,
                 incarnation,
             );
+        let Some(parent_ulid) = parent_ulid else {
+            return Ok(Value::Null);
+        };
 
         Ok(json!({
             "id": parent_ulid.to_string(),

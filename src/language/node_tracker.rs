@@ -359,6 +359,7 @@ impl NodeTracker {
         kind: &'static str,
     ) -> Ulid {
         self.get_or_create_for_incarnation(uri, start, end, kind, 0)
+            .expect("unmanaged test incarnation is admitted")
     }
 
     pub(crate) fn get_or_create_for_incarnation(
@@ -368,7 +369,7 @@ impl NodeTracker {
         end: usize,
         kind: &'static str,
         incarnation: u64,
-    ) -> Ulid {
+    ) -> Option<Ulid> {
         self.get_or_create_in_layer_for_incarnation(uri, start, end, kind, 0, incarnation)
     }
 
@@ -391,6 +392,7 @@ impl NodeTracker {
         layer: usize,
     ) -> Ulid {
         self.get_or_create_in_layer_for_incarnation(uri, start, end, kind, layer, 0)
+            .expect("unmanaged test incarnation is admitted")
     }
 
     pub(crate) fn get_or_create_in_layer_for_incarnation(
@@ -401,14 +403,14 @@ impl NodeTracker {
         kind: &'static str,
         layer: usize,
         incarnation: u64,
-    ) -> Ulid {
+    ) -> Option<Ulid> {
         let key = PositionKey::new(start, end, kind, layer);
 
         // Reject a known-closed/wrong lifetime before materializing an empty
         // tracker entry. Re-check under the entry lock below: didClose can
         // change lifecycle admission between this fast rejection and locking.
         if !self.admits_incarnation(uri, incarnation) {
-            return Ulid::new();
+            return None;
         }
 
         // `get_mut` first: the hot path (index already exists) avoids the
@@ -418,17 +420,17 @@ impl NodeTracker {
             if !self.admits_incarnation(uri, incarnation) {
                 drop(entry);
                 self.remove_pristine_entry(uri);
-                return Ulid::new();
+                return None;
             }
-            return entry.get_or_insert(key, incarnation);
+            return Some(entry.get_or_insert(key, incarnation));
         }
         let mut entry = self.entries.entry(uri.clone()).or_default();
         if !self.admits_incarnation(uri, incarnation) {
             drop(entry);
             self.remove_pristine_entry(uri);
-            return Ulid::new();
+            return None;
         }
-        entry.get_or_insert(key, incarnation)
+        Some(entry.get_or_insert(key, incarnation))
     }
 
     /// The count of coordinate shifts (edit applications) `uri`'s index has
@@ -1038,10 +1040,13 @@ mod tests {
     fn cleanup_invalidates_closed_incarnation_but_keeps_reopened_entries() {
         let tracker = NodeTracker::new();
         let uri = test_uri("cleanup_reopen");
-        let old_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
+        let old_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1)
+            .unwrap();
         let pre_close_latch = tracker.mint_epoch(&uri);
-        let reopened_id =
-            tracker.get_or_create_in_layer_for_incarnation(&uri, 10, 14, "word", 0, 2);
+        let reopened_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 10, 14, "word", 0, 2)
+            .unwrap();
 
         tracker.cleanup(&uri, 1);
 
@@ -1066,8 +1071,12 @@ mod tests {
     fn reopened_incarnation_remints_same_position_with_a_fresh_id() {
         let tracker = NodeTracker::new();
         let uri = test_uri("same_position_reopen");
-        let old_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
-        let reopened_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2);
+        let old_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1)
+            .unwrap();
+        let reopened_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2)
+            .unwrap();
 
         assert_ne!(old_id, reopened_id);
         assert_eq!(tracker.lookup_node(&uri, &old_id), None);
@@ -1081,11 +1090,14 @@ mod tests {
     fn stale_incarnation_cannot_evict_reopened_entry() {
         let tracker = NodeTracker::new();
         let uri = test_uri("stale_after_reopen");
-        let reopened_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2);
+        tracker.open_incarnation(&uri, 2);
+        let reopened_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2)
+            .unwrap();
 
         let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
 
-        assert_eq!(tracker.lookup_node(&uri, &stale_id), None);
+        assert_eq!(stale_id, None);
         assert_eq!(
             tracker.lookup_node(&uri, &reopened_id),
             Some((0, 4, "word", 0, 2))
@@ -1105,14 +1117,16 @@ mod tests {
             None
         );
         let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
-        assert_eq!(tracker.lookup_node(&uri, &stale_id), None);
+        assert_eq!(stale_id, None);
         assert!(
             tracker.entries.get(&uri).is_none(),
             "a denied stale mint must not materialize an empty node index"
         );
 
         tracker.open_incarnation(&uri, 2);
-        let reopened_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2);
+        let reopened_id = tracker
+            .get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2)
+            .unwrap();
         assert_eq!(
             tracker.lookup_node(&uri, &reopened_id),
             Some((0, 4, "word", 0, 2))
@@ -1326,6 +1340,7 @@ mod tests {
         tracker.cleanup(&uri, 0);
 
         // After cleanup, same key should create NEW ULID
+        tracker.open_incarnation(&uri, 0);
         let ulid_after = tracker.get_or_create(&uri, 0, 10, "code_block");
 
         assert_ne!(

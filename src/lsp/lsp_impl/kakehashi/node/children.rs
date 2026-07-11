@@ -131,7 +131,7 @@ impl Kakehashi {
         };
 
         let tracker = self.bridge.node_tracker();
-        let infos: Vec<Value> = child_infos
+        let infos: Option<Vec<Value>> = child_infos
             .into_iter()
             .map(|(c_start, c_end, c_kind)| {
                 // Children live in the same tree as their parent, so they are
@@ -143,13 +143,16 @@ impl Kakehashi {
                     c_kind,
                     layer,
                     incarnation,
-                );
-                json!({
+                )?;
+                Some(json!({
                     "id": child_ulid.to_string(),
                     "kind": c_kind,
-                })
+                }))
             })
             .collect();
+        let Some(infos) = infos else {
+            return Ok(Value::Null);
+        };
 
         Ok(Value::Array(infos))
     }

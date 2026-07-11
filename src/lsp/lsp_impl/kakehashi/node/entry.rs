@@ -301,6 +301,9 @@ impl Kakehashi {
                     layer_index,
                     incarnation,
                 );
+                let Some(ulid) = ulid else {
+                    return Value::Null;
+                };
 
                 json!({
                     "id": ulid.to_string(),
@@ -334,6 +337,9 @@ impl Kakehashi {
             node.kind(),
             incarnation,
         );
+        let Some(ulid) = ulid else {
+            return Value::Null;
+        };
 
         json!({
             "id": ulid.to_string(),

@@ -479,14 +479,7 @@ impl InjectionResolver {
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
         let (_region_index, region) = find_injection_at_position(&injections, byte_offset)?;
-        Some(Self::build_resolved_injection(
-            coordinator,
-            tracker,
-            uri,
-            region,
-            text,
-            incarnation,
-        ))
+        Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
     }
 
     /// Calculate a stable ULID-based region_id for an injection.
@@ -507,7 +500,7 @@ impl InjectionResolver {
         uri: &Url,
         injection: &InjectionRegionInfo,
         incarnation: u64,
-    ) -> Ulid {
+    ) -> Option<Ulid> {
         tracker.get_or_create_for_incarnation(
             uri,
             injection.content_node.start_byte(),
@@ -551,8 +544,8 @@ impl InjectionResolver {
         region: &InjectionRegionInfo,
         text: &str,
         incarnation: u64,
-    ) -> ResolvedInjection {
-        let region_id = Self::calculate_region_id(tracker, uri, region, incarnation);
+    ) -> Option<ResolvedInjection> {
+        let region_id = Self::calculate_region_id(tracker, uri, region, incarnation)?;
         let region_id_str = region_id.to_string();
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
@@ -560,12 +553,12 @@ impl InjectionResolver {
             extract_virtual_content_and_offsets(region, &cacheable_region, text);
         let resolved_language =
             Self::resolve_language(coordinator, &region.language, &virtual_content);
-        ResolvedInjection {
+        Some(ResolvedInjection {
             region: cacheable_region,
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
-        }
+        })
     }
 
     /// Resolve every injection region in the document (whole-doc operations
@@ -603,7 +596,7 @@ impl InjectionResolver {
     ) -> Vec<ResolvedInjection> {
         regions
             .iter()
-            .map(|region| {
+            .filter_map(|region| {
                 Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
             })
             .collect()

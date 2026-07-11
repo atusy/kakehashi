@@ -770,7 +770,7 @@ fn discover_single_region(
                         injection.content_node.end_byte(),
                         injection.content_node.kind(),
                         incarnation,
-                    )
+                    )?
                 } else {
                     tracker.lookup_in_layer(
                         uri,

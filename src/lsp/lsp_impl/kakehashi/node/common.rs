@@ -275,6 +275,9 @@ impl Kakehashi {
             .bridge
             .node_tracker()
             .get_or_create_in_layer_for_incarnation(uri, start, end, kind, layer, incarnation);
+        let Some(ulid) = ulid else {
+            return Value::Null;
+        };
         json!({ "id": ulid.to_string(), "kind": kind })
     }
 
