@@ -97,6 +97,7 @@ pub(super) struct ReloadLanguageState<'a> {
     language: &'a LanguageCoordinator,
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
     documents: &'a DocumentStore,
+    invalidate_documents: bool,
     request_semantic_refresh: bool,
 }
 
@@ -132,7 +133,11 @@ pub(super) async fn apply_shared_settings(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .begin_reload();
     let mut summary = language_state.language.load_settings(&settings);
-    let reparse_uris = language_state.documents.invalidate_all_parses();
+    let reparse_uris = if language_state.invalidate_documents {
+        language_state.documents.invalidate_all_parses()
+    } else {
+        Vec::new()
+    };
     // Invalidate again after the synchronous swap: the first bump rejects
     // pre-reload checkouts, while this one rejects parsers acquired while the
     // registry and query stores were being replaced.
@@ -460,6 +465,7 @@ impl Kakehashi {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
+                invalidate_documents: true,
                 request_semantic_refresh: true,
             },
             &self.settings_manager,
@@ -485,6 +491,7 @@ impl Kakehashi {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
+                invalidate_documents: false,
                 request_semantic_refresh: false,
             },
             &self.settings_manager,

@@ -227,12 +227,13 @@ impl InstallCoordinator {
         raw_settings: crate::config::RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        let reparse_uris = apply_shared_settings(
+        let _reparse_uris = apply_shared_settings(
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
+                invalidate_documents: false,
                 request_semantic_refresh: true,
             },
             &self.settings_manager,
@@ -242,10 +243,6 @@ impl InstallCoordinator {
             settings,
         )
         .await;
-        let parse = self.parse_coordinator();
-        for uri in reparse_uris {
-            parse.reparse_latest(&uri, None).await;
-        }
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {
