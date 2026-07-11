@@ -348,6 +348,11 @@ impl Kakehashi {
                 }
                 RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
             }
+            // Same-range query alternatives are tried in discovery priority
+            // order, but an unconfigured or explicitly disabled language is
+            // not a winner. Reserve the span only after planning so the first
+            // executable alternative formats it; later executable layers are
+            // suppressed to keep emitted edits non-overlapping.
             if !seen_edit_ranges.insert((
                 resolved.region.byte_range.start,
                 resolved.region.byte_range.end,
@@ -570,8 +575,10 @@ impl Kakehashi {
 /// Select one deterministic edit-producing layer for each host byte range.
 ///
 /// Discovery orders same-range alternate languages by query-pattern priority.
-/// Formatting must preserve that first winner because dispatching every layer
-/// would concatenate overlapping edits for the identical host span.
+/// This helper selects the first raw layer for tests of geometric deduplication;
+/// production formatting applies config/plan eligibility first and selects the
+/// first executable layer so an unconfigured alternative does not block a
+/// configured one for the same span.
 #[cfg(test)]
 pub(super) fn unique_edit_regions(
     regions: &[ResolvedInjection],

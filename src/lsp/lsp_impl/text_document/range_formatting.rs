@@ -241,6 +241,10 @@ impl Kakehashi {
                 ) {
                     continue;
                 }
+                // Preserve discovery priority among executable same-range
+                // alternatives. Unconfigured/disabled layers deliberately do
+                // not reserve the span, allowing the first configured layer to
+                // format it while preventing overlapping edits from later ones.
                 if !seen_edit_ranges.insert((
                     resolved.region.byte_range.start,
                     resolved.region.byte_range.end,
