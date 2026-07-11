@@ -3143,9 +3143,10 @@ mod tests {
         assert_eq!(captures.len(), 1, "the unmappable capture is dropped");
         assert_eq!(captures[0]["name"], "survivor");
         let id: ulid::Ulid = captures[0]["node"]["id"].as_str().unwrap().parse().unwrap();
+        let incarnation = rig.store.get(&rig.uri).unwrap().incarnation();
         assert_eq!(
             rig.tracker.lookup_node(&rig.uri, &id),
-            Some((3, 4, "identifier", 0, 0)),
+            Some((3, 4, "identifier", 0, incarnation)),
             "the survivor must keep ITS OWN id, not inherit the dropped capture's"
         );
     }
