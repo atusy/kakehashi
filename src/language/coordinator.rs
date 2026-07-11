@@ -1513,6 +1513,12 @@ impl LanguageCoordinator {
             config.parser.is_none() && self.has_current_parser_registration(lang_name, generation);
         let pre_registered_is_builtin =
             pre_registered && self.reload_scoped_registrations.get(lang_name).is_none();
+        let configured_query_kinds = config.queries.as_ref().map(|queries| {
+            queries
+                .iter()
+                .filter_map(|query| query.kind.or_else(|| infer_query_kind(&query.path)))
+                .collect::<HashSet<_>>()
+        });
         if pre_registered_is_builtin {
             for kind in QueryKind::ALL {
                 let key = (lang_name.to_string(), kind);
@@ -1530,6 +1536,14 @@ impl LanguageCoordinator {
         } else {
             self.query_store.remove_queries(lang_name);
             for kind in QueryKind::ALL {
+                let restore_kind = match &configured_query_kinds {
+                    None => true,
+                    Some(kinds) if kinds.is_empty() => false,
+                    Some(kinds) => !kinds.contains(&kind),
+                };
+                if !restore_kind {
+                    continue;
+                }
                 if let Some(query) = self
                     .builtin_queries
                     .get(&(lang_name.to_string(), kind))
@@ -3526,6 +3540,19 @@ mod tests {
             &coordinator.injection_query("builtin").unwrap(),
             &builtin_injection
         ));
+
+        coordinator.load_settings(&WorkspaceSettings {
+            languages: HashMap::from([(
+                "builtin".to_string(),
+                LanguageSettings {
+                    queries: Some(Vec::new()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        assert!(coordinator.highlight_query("builtin").is_none());
+        assert!(coordinator.injection_query("builtin").is_none());
     }
 
     #[test]
