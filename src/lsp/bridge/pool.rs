@@ -39,6 +39,17 @@ pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
+fn same_launch_config(
+    old: &crate::config::settings::BridgeServerConfig,
+    new: &crate::config::settings::BridgeServerConfig,
+) -> bool {
+    let mut old = old.clone();
+    let mut new = new.clone();
+    old.settings = None;
+    new.settings = None;
+    old == new
+}
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -551,12 +562,13 @@ impl LanguageServerPool {
         self.connections.lock().await
     }
 
-    /// Propagate a workspace-settings change to every live connection whose
-    /// settings changed (downstream-settings-propagation, path c).
+    /// Apply a resolved server-config reload to every live connection.
     ///
-    /// `resolve` maps a server name to its newly merged settings. For each
-    /// connection the resolved value is diffed against the connection's current
-    /// settings cell; on a change the cell is re-stored — so a later
+    /// `resolve` maps a server name to its newly merged config. A server that
+    /// vanished, or whose spawn-time config changed, is removed and shut down;
+    /// its next use therefore spawns from the new config. `settings` is the one
+    /// runtime-mutable field: it is diffed against the connection's current
+    /// settings cell and, on a change, the cell is re-stored — so a later
     /// `workspace/configuration` re-pull reflects it — and a best-effort
     /// `workspace/didChangeConfiguration` is pushed (carrying the new value, or
     /// `null` when settings were cleared). Unchanged servers get nothing, so a
@@ -567,12 +579,44 @@ impl LanguageServerPool {
     /// anti-storm behavior is observable to callers and tests.
     pub(crate) async fn propagate_settings(
         &self,
-        resolve: impl Fn(&str) -> Option<serde_json::Value>,
+        resolve: impl Fn(&str) -> Option<crate::config::settings::BridgeServerConfig>,
     ) -> usize {
-        let connections = self.connections.lock().await;
+        let mut connections = self.connections.lock().await;
+        let mut invalidated = Vec::new();
+        let mut resolved = HashMap::new();
+        for (key, handle) in connections.iter() {
+            let config = resolve(key.server());
+            let launch_changed = match (handle.launch_config(), config.as_ref()) {
+                (Some(old), Some(new)) => !same_launch_config(old, new),
+                (Some(_), None) => true,
+                // Test-only handles created without a spawn snapshot retain the
+                // legacy settings-propagation behavior.
+                (None, _) => false,
+            };
+            if launch_changed {
+                invalidated.push(key.clone());
+            } else {
+                resolved.insert(key.clone(), config.and_then(|config| config.settings));
+            }
+        }
+
+        let mut stale_handles = Vec::new();
+        for key in invalidated {
+            self.host_documents
+                .lock()
+                .await
+                .retain(|(_, connection_key), _| connection_key != &key);
+            self.document_tracker.purge_connection(&key).await;
+            self.purge_open_transition_locks(&key).await;
+            if let Some(handle) = connections.remove(&key) {
+                handle.begin_shutdown();
+                stale_handles.push((key, handle));
+            }
+        }
+
         let mut pushed = 0;
-        for handle in connections.values() {
-            let resolved = resolve(handle.key().server());
+        for (key, handle) in connections.iter() {
+            let resolved = resolved.remove(key).flatten();
             // Diff by value (Arc identity is irrelevant); skip unchanged servers
             // so an unchanged config reload pushes nothing.
             if resolved.as_ref() == handle.current_settings().as_deref() {
@@ -606,6 +650,23 @@ impl LanguageServerPool {
                     pushed += 1;
                 }
             }
+        }
+        drop(connections);
+        for (key, handle) in stale_handles {
+            tokio::spawn(async move {
+                const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+                if tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, handle.graceful_shutdown())
+                    .await
+                    .is_err()
+                {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Timed out shutting down invalidated {} connection",
+                        key
+                    );
+                    handle.complete_shutdown();
+                }
+            });
         }
         pushed
     }
@@ -1883,6 +1944,7 @@ impl LanguageServerPool {
             workspace_folders,
             settings_cell,
         ));
+        handle.record_launch_config(server_config.clone());
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
@@ -6161,6 +6223,8 @@ mod tests {
         let lua_value = Arc::new(json!({ "Lua": { "telemetry": { "enable": false } } }));
         let lua =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
+        ra.record_launch_config(crate::config::settings::BridgeServerConfig::default());
+        lua.record_launch_config(crate::config::settings::BridgeServerConfig::default());
         lua.store_settings(Some(Arc::clone(&lua_value)));
         {
             let mut conns = pool.connections().await;
@@ -6173,8 +6237,14 @@ mod tests {
         let lua_value_for_resolve = (*lua_value).clone();
         let pushed = pool
             .propagate_settings(move |name| match name {
-                "rust-analyzer" => Some(ra_value_for_resolve.clone()),
-                "lua" => Some(lua_value_for_resolve.clone()),
+                "rust-analyzer" => Some(crate::config::settings::BridgeServerConfig {
+                    settings: Some(ra_value_for_resolve.clone()),
+                    ..Default::default()
+                }),
+                "lua" => Some(crate::config::settings::BridgeServerConfig {
+                    settings: Some(lua_value_for_resolve.clone()),
+                    ..Default::default()
+                }),
                 _ => None,
             })
             .await;
@@ -6199,8 +6269,14 @@ mod tests {
         let ra_again = ra_value.clone();
         let pushed_again = pool
             .propagate_settings(move |name| match name {
-                "rust-analyzer" => Some(ra_again.clone()),
-                "lua" => Some(lua_again.clone()),
+                "rust-analyzer" => Some(crate::config::settings::BridgeServerConfig {
+                    settings: Some(ra_again.clone()),
+                    ..Default::default()
+                }),
+                "lua" => Some(crate::config::settings::BridgeServerConfig {
+                    settings: Some(lua_again.clone()),
+                    ..Default::default()
+                }),
                 _ => None,
             })
             .await;
@@ -6228,7 +6304,12 @@ mod tests {
         let value = json!({ "rust-analyzer": { "cargo": { "features": "all" } } });
         let value_for_resolve = value.clone();
         let pushed = pool
-            .propagate_settings(move |_| Some(value_for_resolve.clone()))
+            .propagate_settings(move |_| {
+                Some(crate::config::settings::BridgeServerConfig {
+                    settings: Some(value_for_resolve.clone()),
+                    ..Default::default()
+                })
+            })
             .await;
 
         assert_eq!(pushed, 0, "an initializing connection is not notified");
@@ -6245,8 +6326,74 @@ mod tests {
     async fn propagate_settings_no_connections_is_noop() {
         let pool = LanguageServerPool::new();
         let pushed = pool
-            .propagate_settings(|_| Some(serde_json::json!({ "x": 1 })))
+            .propagate_settings(|_| {
+                Some(crate::config::settings::BridgeServerConfig {
+                    settings: Some(serde_json::json!({ "x": 1 })),
+                    ..Default::default()
+                })
+            })
             .await;
         assert_eq!(pushed, 0, "no live connections → nothing pushed");
+    }
+
+    #[tokio::test]
+    async fn propagate_settings_invalidates_changed_and_removed_launch_configs() {
+        use crate::config::settings::BridgeServerConfig;
+
+        let pool = LanguageServerPool::new();
+        let changed_key = ConnectionKey::for_server("changed");
+        let removed_key = ConnectionKey::for_server("removed");
+        let unchanged_key = ConnectionKey::for_server("unchanged");
+        let changed = create_handle_with_key(ConnectionState::Ready, changed_key.clone()).await;
+        let removed = create_handle_with_key(ConnectionState::Ready, removed_key.clone()).await;
+        let unchanged = create_handle_with_key(ConnectionState::Ready, unchanged_key.clone()).await;
+
+        let old_changed = BridgeServerConfig {
+            cmd: vec!["old-server".into()],
+            ..Default::default()
+        };
+        let old_removed = BridgeServerConfig {
+            cmd: vec!["removed-server".into()],
+            ..Default::default()
+        };
+        let stable = BridgeServerConfig {
+            cmd: vec!["stable-server".into()],
+            ..Default::default()
+        };
+        changed.record_launch_config(old_changed);
+        removed.record_launch_config(old_removed);
+        unchanged.record_launch_config(stable.clone());
+        {
+            let mut connections = pool.connections().await;
+            connections.insert(changed_key.clone(), Arc::clone(&changed));
+            connections.insert(removed_key.clone(), Arc::clone(&removed));
+            connections.insert(unchanged_key.clone(), Arc::clone(&unchanged));
+        }
+
+        let stable_for_resolve = stable.clone();
+        pool.propagate_settings(move |name| match name {
+            "changed" => Some(BridgeServerConfig {
+                cmd: vec!["new-server".into()],
+                ..Default::default()
+            }),
+            "removed" => None,
+            "unchanged" => Some(stable_for_resolve.clone()),
+            _ => unreachable!(),
+        })
+        .await;
+
+        let connections = pool.connections().await;
+        assert!(!connections.contains_key(&changed_key));
+        assert!(!connections.contains_key(&removed_key));
+        assert!(connections.contains_key(&unchanged_key));
+        assert!(matches!(
+            changed.state(),
+            ConnectionState::Closing | ConnectionState::Closed
+        ));
+        assert!(matches!(
+            removed.state(),
+            ConnectionState::Closing | ConnectionState::Closed
+        ));
+        assert_eq!(unchanged.state(), ConnectionState::Ready);
     }
 }

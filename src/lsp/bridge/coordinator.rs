@@ -278,7 +278,6 @@ impl BridgeCoordinator {
                     server_name,
                     merge_bridge_server_configs,
                 )
-                .and_then(|config| config.settings)
             })
             .await
     }

@@ -139,6 +139,11 @@ pub(crate) struct ConnectionHandle {
     /// re-stores it here on a merge change (path c) so a re-pull reflects the
     /// current config. `None` slot = no settings configured for this server.
     settings: Arc<arc_swap::ArcSwapOption<serde_json::Value>>,
+    /// Resolved server configuration that created this process.
+    ///
+    /// `settings` is ignored when comparing this snapshot on reload because it
+    /// can be propagated at runtime; every other field is spawn-time state.
+    launch_config: OnceLock<crate::config::settings::BridgeServerConfig>,
 }
 
 impl ConnectionHandle {
@@ -206,7 +211,16 @@ impl ConnectionHandle {
             workspace_folders,
             incapable_fallback_logged: AtomicBool::new(false),
             settings,
+            launch_config: OnceLock::new(),
         }
+    }
+
+    pub(super) fn record_launch_config(&self, config: crate::config::settings::BridgeServerConfig) {
+        let _ = self.launch_config.set(config);
+    }
+
+    pub(super) fn launch_config(&self) -> Option<&crate::config::settings::BridgeServerConfig> {
+        self.launch_config.get()
     }
 
     /// This connection's current workspace settings, if any
