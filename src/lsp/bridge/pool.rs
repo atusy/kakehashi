@@ -3617,6 +3617,21 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &after));
     }
 
+    #[tokio::test]
+    async fn invalidation_reclaims_only_matching_latest_virtual_content() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/cache-invalidation.md").unwrap();
+        pool.record_latest_virtual_content(&host_uri, "lua", TEST_ULID_LUA_0, "first");
+        pool.record_latest_virtual_content(&host_uri, "lua", TEST_ULID_LUA_1, "second");
+
+        pool.close_invalidated_docs(&host_uri, &[TEST_ULID_LUA_0.parse::<ulid::Ulid>().unwrap()])
+            .await;
+
+        let contents = pool.latest_virtual_contents.get(&host_uri).unwrap();
+        assert!(!contents.contains_key(&("lua".to_string(), TEST_ULID_LUA_0.to_string())));
+        assert!(contents.contains_key(&("lua".to_string(), TEST_ULID_LUA_1.to_string())));
+    }
+
     /// Test that ensure_document_opened skips didOpen when document is already opened.
     ///
     /// Already opened path: Document already claimed
