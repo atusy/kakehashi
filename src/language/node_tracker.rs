@@ -86,14 +86,14 @@ struct TrackedPosition {
 
 impl UriEntries {
     /// Get or insert a ULID for a position key, keeping both maps in sync.
-    fn get_or_insert(&mut self, key: PositionKey, incarnation: u64) -> Ulid {
+    fn get_or_insert(&mut self, key: PositionKey, incarnation: u64) -> Option<Ulid> {
         if incarnation < self.latest_incarnation {
-            return Ulid::new();
+            return None;
         }
         self.latest_incarnation = incarnation;
         if let Some(existing) = self.forward.get(&key) {
             if existing.incarnation == incarnation {
-                return existing.ulid;
+                return Some(existing.ulid);
             }
             self.reverse.remove(&existing.ulid);
         }
@@ -101,7 +101,7 @@ impl UriEntries {
         self.forward.insert(key, TrackedUlid { ulid, incarnation });
         self.reverse
             .insert(ulid, TrackedPosition { key, incarnation });
-        ulid
+        Some(ulid)
     }
 
     /// Returns the number of (key, ulid) pairs currently tracked.
@@ -422,7 +422,7 @@ impl NodeTracker {
                 self.remove_pristine_entry(uri);
                 return None;
             }
-            return Some(entry.get_or_insert(key, incarnation));
+            return entry.get_or_insert(key, incarnation);
         }
         let mut entry = self.entries.entry(uri.clone()).or_default();
         if !self.admits_incarnation(uri, incarnation) {
@@ -430,7 +430,7 @@ impl NodeTracker {
             self.remove_pristine_entry(uri);
             return None;
         }
-        Some(entry.get_or_insert(key, incarnation))
+        entry.get_or_insert(key, incarnation)
     }
 
     /// The count of coordinate shifts (edit applications) `uri`'s index has
@@ -945,13 +945,11 @@ impl NodeTracker {
         if (entry.shift_gen, epoch) != expected {
             return None;
         }
-        Some(
-            keys.into_iter()
-                .map(|(start, end, kind, layer)| {
-                    entry.get_or_insert(PositionKey::new(start, end, kind, layer), incarnation)
-                })
-                .collect(),
-        )
+        keys.into_iter()
+            .map(|(start, end, kind, layer)| {
+                entry.get_or_insert(PositionKey::new(start, end, kind, layer), incarnation)
+            })
+            .collect()
     }
 
     /// The (per-URI shift generation, global cleanup epoch) pair a pass
