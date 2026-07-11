@@ -838,6 +838,77 @@ print("hello")
         );
     }
 
+    #[tokio::test]
+    async fn fired_debounce_cannot_resync_document_closed_before_body_runs() {
+        use std::sync::Arc;
+
+        use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
+        use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
+        use crate::lsp::lsp_impl::DiagnosticPublisher;
+        use crate::lsp::lsp_impl::bridge_context::HostRequestContext;
+        use crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshot;
+        use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        let uri = Url::parse("file:///test/closed_debounce.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn stale() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let configs = server
+            .bridge
+            .get_host_configs_for_language(&server.settings_manager.load_settings(), "rust");
+        let snapshot = DiagnosticSnapshot {
+            virt_contexts: vec![],
+            host_pull_enabled: true,
+            host: Some(HostRequestContext {
+                uri: uri.clone(),
+                language_id: "rust".to_string(),
+                text: Arc::from("fn stale() {}"),
+                configs,
+                priorities: vec![],
+                strategy: AggregationStrategy::Concatenated,
+                max_fan_out: None,
+                upstream_request_id: None,
+            }),
+            layer_cfg: ResolvedLayerConfig {
+                priorities: vec![LayerSource::Host],
+                strategy: AggregationStrategy::Concatenated,
+            },
+        };
+        let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);
+        let gate = manager.install_execution_gate();
+        manager.schedule(
+            uri.clone(),
+            Some(snapshot),
+            server.bridge.pool_arc(),
+            Arc::clone(&server.bridge),
+            Arc::new(SyntheticDiagnosticsManager::new()),
+            Arc::new(DiagnosticPublisher::new(server)),
+            Arc::clone(&server.documents),
+        );
+        gate.entered.notified().await;
+
+        server.documents.remove(&uri);
+        gate.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            server
+                .bridge
+                .pool()
+                .host_document_version(&uri, "rust_ls")
+                .await,
+            None,
+            "a timer cancelled after firing must not reopen a closed host"
+        );
+    }
+
     /// Locks the load-bearing property behind #431: `prepare_diagnostic_snapshot`
     /// builds the host context for a `_self`-bridged doc WITHOUT gating on the
     /// server advertising `diagnosticProvider`. A push-only `rust_ls` (no

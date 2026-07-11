@@ -54,11 +54,22 @@ struct DebouncedDiagnosticData {
     /// text at sync time (under the bridge's `host_documents` lock) so a late
     /// re-sync sends the latest text rather than this fire's snapshot (#422).
     documents: Arc<crate::document::DocumentStore>,
+    /// Open lifetime captured when the timer was scheduled. A close/reopen at
+    /// the same URI must not let this prior lifetime register new work.
+    incarnation: u64,
     /// Reference to synthetic diagnostics manager for task registration
     synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: feeds the pull result into the cache and
     /// republishes the merged set (push-propagation-diagnostic-forwarding).
     publisher: Arc<DiagnosticPublisher>,
+    #[cfg(test)]
+    execution_gate: Option<Arc<DebounceExecutionGate>>,
+}
+
+#[cfg(test)]
+pub(crate) struct DebounceExecutionGate {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 
 /// Manager for debounced diagnostic triggers.
@@ -76,6 +87,8 @@ pub(crate) struct DebouncedDiagnosticsManager {
     /// schedules without rebuilding the manager (it lives behind an `Arc`). Read at
     /// schedule time; in-flight timers keep the value they were spawned with.
     debounce_millis: AtomicU64,
+    #[cfg(test)]
+    execution_gate: std::sync::Mutex<Option<Arc<DebounceExecutionGate>>>,
 }
 
 impl Default for DebouncedDiagnosticsManager {
@@ -95,6 +108,8 @@ impl DebouncedDiagnosticsManager {
         Self {
             active_timers: DashMap::new(),
             debounce_millis: AtomicU64::new(debounce_duration.as_millis() as u64),
+            #[cfg(test)]
+            execution_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -108,6 +123,16 @@ impl DebouncedDiagnosticsManager {
     #[cfg(test)]
     pub(crate) fn debounce_millis(&self) -> u64 {
         self.debounce_millis.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_execution_gate(&self) -> Arc<DebounceExecutionGate> {
+        let gate = Arc::new(DebounceExecutionGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.execution_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
     }
 
     /// Schedule a debounced diagnostic for a document.
@@ -142,6 +167,9 @@ impl DebouncedDiagnosticsManager {
                 uri
             );
         }
+        let Some(incarnation) = documents.get(&uri).map(|doc| doc.incarnation()) else {
+            return;
+        };
 
         let data = DebouncedDiagnosticData {
             uri: uri.clone(),
@@ -151,6 +179,9 @@ impl DebouncedDiagnosticsManager {
             synthetic_diagnostics,
             publisher,
             documents,
+            incarnation,
+            #[cfg(test)]
+            execution_gate: self.execution_gate.lock().unwrap().clone(),
         };
 
         let duration = Duration::from_millis(self.debounce_millis.load(Ordering::Relaxed));
@@ -233,7 +264,31 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         synthetic_diagnostics,
         publisher,
         documents,
+        incarnation,
+        #[cfg(test)]
+        execution_gate,
     } = data;
+
+    #[cfg(test)]
+    if let Some(gate) = execution_gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
+
+    // Serialize timer side effects with didClose's document removal. If this
+    // body wins, it registers eager/synthetic work before close performs its
+    // cancellation cleanup; if close wins, liveness/incarnation rejects this
+    // prior timer. The new await is also a cancellation checkpoint after sleep.
+    let edit_lock = documents.edit_lock(&uri);
+    let edit_guard = edit_lock.lock().await;
+    let current_incarnation = documents.get(&uri).map(|doc| doc.incarnation());
+    if current_incarnation != Some(incarnation) {
+        drop(edit_guard);
+        if current_incarnation.is_none() {
+            documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
+        }
+        return;
+    }
 
     // #431: re-sync the host document to its `_self` host servers at this debounced
     // cadence (after the user stops typing), so a push-only host server — which the
@@ -311,6 +366,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     // If a didSave or another debounced didChange triggers while this is running,
     // the new task will supersede this one
     synthetic_diagnostics.register_task(uri, task.abort_handle());
+    drop(edit_guard);
 }
 
 #[cfg(test)]
