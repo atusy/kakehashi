@@ -81,6 +81,10 @@ pub(crate) struct LanguageCoordinator {
     /// load resolved under an old configuration cannot overwrite or retag a
     /// parser registered by a newer reload.
     registration_lock: Mutex<()>,
+    /// Makes each config/query/registry reload one state transition. Without
+    /// this, concurrent didChangeConfiguration and post-install reloads can
+    /// combine one settings payload's languages with another's search paths.
+    settings_reload_lock: Mutex<()>,
     /// Bumped by every `load_settings` (the only event that can make a
     /// failed load succeed) before the hygiene clear. Read-validated against
     /// `failed_loads` entries; see there.
@@ -117,6 +121,7 @@ impl LanguageCoordinator {
             failed_loads: dashmap::DashMap::new(),
             dynamically_loaded: dashmap::DashMap::new(),
             registration_lock: Mutex::new(()),
+            settings_reload_lock: Mutex::new(()),
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
@@ -361,6 +366,10 @@ impl LanguageCoordinator {
     /// Visibility: pub(crate) - called by LSP layer during initialization and
     /// settings updates to configure language support.
     pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
+        let _reload = self
+            .settings_reload_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::load_settings(reload)");
         self.config_store.update_from_settings(settings);
         self.clear_derived_languages();
         // A reload (new search paths, or the post-install reload) is the only
