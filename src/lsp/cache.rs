@@ -982,12 +982,15 @@ print("hello")
             true,
         );
 
-        // Verify the region still exists with the same region_id (position-based stability)
+        // The region still exists, but changing its dynamic language creates a
+        // different virtual-document layer at the same host position. Region
+        // identity includes that language discriminator so simultaneous
+        // same-range languages cannot alias; the old ID must not be reused.
         let regions_after = cache.get_injections(&uri).expect("should have injections");
         assert_eq!(regions_after.len(), 1);
-        assert_eq!(
+        assert_ne!(
             regions_after[0].region_id, initial_region_id,
-            "region_id should be stable (same position)"
+            "a language change must remint the virtual-document identity"
         );
         assert_eq!(
             regions_after[0].language, "python",
