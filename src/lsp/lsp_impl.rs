@@ -1084,6 +1084,26 @@ mod tests {
         assert_eq!(parsed, Some(1));
     }
 
+    #[tokio::test]
+    async fn parse_gives_up_when_reload_never_finishes() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        service.inner().parser_pool.lock().unwrap().begin_reload();
+
+        let parsed = service
+            .inner()
+            .parse_coordinator()
+            .parse_with_pool(
+                "test",
+                &url::Url::parse("file:///stuck-reload.test").unwrap(),
+                0,
+                |parser, _deadline, _generation_retry| (parser, Some(1)),
+            )
+            .await;
+
+        service.inner().parser_pool.lock().unwrap().finish_reload();
+        assert_eq!(parsed, None);
+    }
+
     #[test]
     fn test_check_injected_languages_identifies_missing_parsers() {
         // Test that check_injected_languages_auto_install correctly identifies

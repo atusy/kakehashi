@@ -42,6 +42,11 @@ const PARSE_TIMEOUT: std::time::Duration = crate::language::injection::NATIVE_PA
 /// pool thread itself is protected by the in-parse abort, not by this.
 const PARSE_AWAIT_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[cfg(not(test))]
+const RELOAD_WAIT_BACKSTOP: std::time::Duration = PARSE_TIMEOUT;
+#[cfg(test)]
+const RELOAD_WAIT_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Host-parse with a wall-clock abort — the shared
 /// [`parse_with_deadline`](crate::language::injection::parse_with_deadline)
 /// primitive under the name the parse-loop call sites use.
@@ -184,6 +189,7 @@ impl ParseCoordinator {
                 let mut parse_fn = parse_fn;
                 let mut language_name_owned = language_name_owned;
                 for attempt in 0..2 {
+                    let reload_wait_deadline = std::time::Instant::now() + RELOAD_WAIT_BACKSTOP;
                     let (parser, parser_generation) = loop {
                         match parser_pool
                             .lock()
@@ -198,6 +204,9 @@ impl ParseCoordinator {
                                 // A reload is synchronous and normally brief. Keep this
                                 // transient state inside the bounded work unit instead
                                 // of publishing a terminal tree-less result.
+                                if std::time::Instant::now() >= reload_wait_deadline {
+                                    return None;
+                                }
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                             crate::language::parser_pool::ParserCheckout::Unavailable => {

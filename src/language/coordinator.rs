@@ -81,10 +81,11 @@ pub(crate) struct LanguageCoordinator {
     /// resolved their library path. Manually pre-registered/built-in entries are
     /// untagged; configured and dynamically discovered parsers must match the
     /// current generation before they are cache hits.
-    dynamically_loaded: dashmap::DashMap<String, u64>,
-    /// Languages whose current query set came from an explicit configured
-    /// override while their parser remained an untagged built-in registration.
-    configured_query_overrides: dashmap::DashSet<String>,
+    reload_scoped_registrations: dashmap::DashMap<String, u64>,
+    /// Original query kinds displaced by configured overrides on untagged
+    /// built-in registrations. Keeping each kind separately lets a partial
+    /// override preserve and later restore all other built-in query kinds.
+    builtin_queries: dashmap::DashMap<(String, QueryKind), Arc<tree_sitter::Query>>,
     /// Serializes settings-generation changes with registry publication so a
     /// load resolved under an old configuration cannot overwrite or retag a
     /// parser registered by a newer reload.
@@ -128,8 +129,8 @@ impl LanguageCoordinator {
             derived_languages: RwLock::new(HashSet::new()),
             failed_loads: dashmap::DashMap::new(),
             configured_load_failures: dashmap::DashMap::new(),
-            dynamically_loaded: dashmap::DashMap::new(),
-            configured_query_overrides: dashmap::DashSet::new(),
+            reload_scoped_registrations: dashmap::DashMap::new(),
+            builtin_queries: dashmap::DashMap::new(),
             registration_lock: Mutex::new(()),
             settings_reload_lock: Mutex::new(()),
             load_generation: std::sync::atomic::AtomicU64::new(0),
@@ -208,7 +209,7 @@ impl LanguageCoordinator {
     fn has_current_parser_registration(&self, language_id: &str, current_generation: u64) -> bool {
         self.language_registry.contains(language_id)
             && self
-                .dynamically_loaded
+                .reload_scoped_registrations
                 .get(language_id)
                 .is_none_or(|generation| *generation == current_generation)
     }
@@ -894,7 +895,7 @@ impl LanguageCoordinator {
         }
         self.language_registry
             .register(language_id.to_string(), language);
-        self.dynamically_loaded
+        self.reload_scoped_registrations
             .insert(language_id.to_string(), expected_generation);
         self.query_store.remove_queries(language_id);
         publish_queries();
@@ -1511,14 +1512,33 @@ impl LanguageCoordinator {
         let pre_registered =
             config.parser.is_none() && self.has_current_parser_registration(lang_name, generation);
         let pre_registered_is_builtin =
-            pre_registered && self.dynamically_loaded.get(lang_name).is_none();
-        let had_configured_query_override = self.configured_query_overrides.contains(lang_name);
-        let preserve_builtin_queries =
-            pre_registered_is_builtin && config.queries.is_none() && !had_configured_query_override;
-        if !preserve_builtin_queries {
+            pre_registered && self.reload_scoped_registrations.get(lang_name).is_none();
+        if pre_registered_is_builtin {
+            for kind in QueryKind::ALL {
+                let key = (lang_name.to_string(), kind);
+                if !self.builtin_queries.contains_key(&key)
+                    && let Some(query) = self.query_store.get_query(kind, lang_name)
+                {
+                    self.builtin_queries.insert(key, query);
+                }
+            }
+        }
+        if !pre_registered_is_builtin {
             // Query kinds absent from the new configuration must disappear; the
             // insertion helpers only replace kinds that successfully load.
             self.query_store.remove_queries(lang_name);
+        } else {
+            self.query_store.remove_queries(lang_name);
+            for kind in QueryKind::ALL {
+                if let Some(query) = self
+                    .builtin_queries
+                    .get(&(lang_name.to_string(), kind))
+                    .map(|entry| Arc::clone(entry.value()))
+                {
+                    self.query_store
+                        .insert_query(kind, lang_name.to_string(), query);
+                }
+            }
         }
         let language = if pre_registered {
             self.language_registry
@@ -1544,13 +1564,6 @@ impl LanguageCoordinator {
         }
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
-        if pre_registered_is_builtin && config.queries.is_some() {
-            self.configured_query_overrides
-                .insert(lang_name.to_string());
-        } else {
-            self.configured_query_overrides.remove(lang_name);
-        }
-
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
             format!("Language {lang_name} loaded."),
@@ -1569,7 +1582,7 @@ impl LanguageCoordinator {
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        self.dynamically_loaded
+        self.reload_scoped_registrations
             .insert(language_id.to_string(), generation);
     }
 
@@ -1581,7 +1594,7 @@ impl LanguageCoordinator {
         self.configured_load_failures
             .insert(language_id.to_string(), generation);
         self.language_registry.unregister(language_id);
-        self.dynamically_loaded.remove(language_id);
+        self.reload_scoped_registrations.remove(language_id);
         self.query_store.remove_queries(language_id);
     }
 
@@ -3284,7 +3297,7 @@ mod tests {
             .language_registry
             .register("dynamic".to_string(), tree_sitter_rust::LANGUAGE.into());
         coordinator
-            .dynamically_loaded
+            .reload_scoped_registrations
             .insert("dynamic".to_string(), 0);
         assert!(
             coordinator.ensure_language_loaded("dynamic").success,
@@ -3325,7 +3338,7 @@ mod tests {
         assert!(coordinator.language_registry.contains("dynamic"));
         assert!(
             coordinator
-                .dynamically_loaded
+                .reload_scoped_registrations
                 .get("dynamic")
                 .is_some_and(|generation| *generation == 1),
             "the current configured parser must keep its newer generation"
@@ -3424,12 +3437,17 @@ mod tests {
         coordinator.record_configured_load_failure("racing", generation);
 
         assert!(!coordinator.language_registry.contains("racing"));
-        assert!(coordinator.dynamically_loaded.get("racing").is_none());
+        assert!(
+            coordinator
+                .reload_scoped_registrations
+                .get("racing")
+                .is_none()
+        );
         assert!(coordinator.configured_load_failed("racing", generation));
     }
 
     #[test]
-    fn removing_builtin_query_override_clears_configured_queries() {
+    fn reload_without_override_preserves_builtin_queries() {
         let coordinator = LanguageCoordinator::new();
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         coordinator
@@ -3441,9 +3459,6 @@ mod tests {
                 tree_sitter::Query::new(&language, "(identifier) @variable").unwrap(),
             ),
         );
-        coordinator
-            .configured_query_overrides
-            .insert("builtin".to_string());
         let mut languages = HashMap::new();
         languages.insert("builtin".to_string(), LanguageSettings::default());
 
@@ -3452,9 +3467,65 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(coordinator.highlight_query("builtin").is_none());
-        assert!(!coordinator.configured_query_overrides.contains("builtin"));
+        assert!(coordinator.highlight_query("builtin").is_some());
         assert!(coordinator.has_parser_available("builtin"));
+    }
+
+    #[test]
+    fn partial_builtin_query_override_preserves_and_restores_other_kinds() {
+        let coordinator = LanguageCoordinator::new();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        coordinator
+            .language_registry
+            .register("builtin".to_string(), language.clone());
+        let builtin_highlight =
+            Arc::new(tree_sitter::Query::new(&language, "(identifier) @variable").unwrap());
+        let builtin_injection = Arc::new(
+            tree_sitter::Query::new(&language, "(string_literal) @injection.content").unwrap(),
+        );
+        coordinator
+            .query_store
+            .insert_highlight_query("builtin".to_string(), Arc::clone(&builtin_highlight));
+        coordinator
+            .query_store
+            .insert_injection_query("builtin".to_string(), Arc::clone(&builtin_injection));
+
+        let dir = tempdir().unwrap();
+        let configured_highlight_path = dir.path().join("highlights.scm");
+        fs::write(&configured_highlight_path, "(identifier) @function").unwrap();
+        let configured = LanguageSettings {
+            queries: Some(vec![crate::config::settings::QueryItem {
+                path: configured_highlight_path.to_string_lossy().into_owned(),
+                kind: Some(QueryKind::Highlights),
+            }]),
+            ..Default::default()
+        };
+        coordinator.load_settings(&WorkspaceSettings {
+            languages: HashMap::from([("builtin".to_string(), configured)]),
+            ..Default::default()
+        });
+
+        assert!(Arc::ptr_eq(
+            &coordinator.injection_query("builtin").unwrap(),
+            &builtin_injection
+        ));
+        assert!(!Arc::ptr_eq(
+            &coordinator.highlight_query("builtin").unwrap(),
+            &builtin_highlight
+        ));
+
+        coordinator.load_settings(&WorkspaceSettings {
+            languages: HashMap::from([("builtin".to_string(), LanguageSettings::default())]),
+            ..Default::default()
+        });
+        assert!(Arc::ptr_eq(
+            &coordinator.highlight_query("builtin").unwrap(),
+            &builtin_highlight
+        ));
+        assert!(Arc::ptr_eq(
+            &coordinator.injection_query("builtin").unwrap(),
+            &builtin_injection
+        ));
     }
 
     #[test]
