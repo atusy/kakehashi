@@ -24,9 +24,22 @@ use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_
 // alternate language layers at identical host coordinates distinct ULIDs.
 const REGION_IDENTITY_LAYER_BASE: usize = usize::MAX / 2 + 1;
 
-fn region_identity_slot(pattern_index: usize, language: &str) -> usize {
-    ((fnv1a_hash(language) as usize) ^ pattern_index.wrapping_mul(0x9e37_79b9))
-        & (REGION_IDENTITY_LAYER_BASE - 1)
+fn region_identity_slot(pattern_index: usize, language: &str) -> Option<usize> {
+    type IdentitySlots = std::collections::HashMap<(usize, String), usize>;
+    static SLOTS: std::sync::OnceLock<std::sync::Mutex<IdentitySlots>> = std::sync::OnceLock::new();
+
+    let slots = SLOTS.get_or_init(Default::default);
+    let mut slots = slots.lock().ok()?;
+    let next = slots.len();
+    match slots.entry((pattern_index, language.to_owned())) {
+        std::collections::hash_map::Entry::Occupied(entry) => Some(*entry.get()),
+        std::collections::hash_map::Entry::Vacant(entry) => (next < REGION_IDENTITY_LAYER_BASE)
+            .then(|| {
+                let slot = next;
+                entry.insert(slot);
+                slot
+            }),
+    }
 }
 
 /// Iterates over the `@injection.content` captures in a query match.
@@ -67,8 +80,9 @@ pub(crate) struct InjectionRegionInfo<'a> {
     pub offset: Option<InjectionOffset>,
     /// Whether this pattern's captures form one virtual document.
     pub combined: bool,
-    /// Stable identity slot derived from the query pattern index. Unlike a
-    /// current-match ordinal, it does not shift when another pattern stops matching.
+    /// Stable, collision-free identity slot interned from query pattern and
+    /// language. Unlike a current-match ordinal, it does not shift when
+    /// another pattern stops matching.
     pub identity_slot: usize,
 }
 
@@ -357,7 +371,7 @@ pub(crate) fn collect_all_injections<'a>(
         // from one pattern at the same range, so the pattern index alone aliases
         // their virtual documents. A current-match ordinal is also unsuitable:
         // removing one match would shift every later identity.
-        region.identity_slot = region_identity_slot(region.pattern_index, &region.language);
+        region.identity_slot = region_identity_slot(region.pattern_index, &region.language)?;
     }
     Some(injections)
 }
@@ -1702,8 +1716,8 @@ mod tests {
     #[test]
     fn dynamic_languages_from_one_pattern_get_distinct_identity_slots() {
         assert_ne!(
-            region_identity_slot(7, "javascript"),
-            region_identity_slot(7, "typescript"),
+            region_identity_slot(7, "javascript").unwrap(),
+            region_identity_slot(7, "typescript").unwrap(),
             "one dynamic-language pattern must not alias distinct virtual documents"
         );
     }
