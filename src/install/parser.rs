@@ -648,7 +648,17 @@ fn extract_archive_with_limits<R: Read>(
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            unpack_entry_atomically(&mut entry, &target, &relative)?;
+            if entry.header().entry_type().is_file() {
+                unpack_entry_atomically(&mut entry, &target, &relative)?;
+            } else {
+                // Atomic publication pre-creates a regular tempfile, which is
+                // incompatible with link and other non-file tar entries. Keep
+                // the pre-existing unpack behavior for those entry types;
+                // archive confinement is handled separately by #600.
+                entry.unpack(&target).map_err(|error| {
+                    archive_io_error(&format!("Failed to extract {}", relative.display()), error)
+                })?;
+            }
         }
     }
 
