@@ -520,14 +520,7 @@ impl InjectionResolver {
         raw_identifier: &str,
         content: &str,
     ) -> String {
-        coordinator
-            .detect_language_hot(
-                raw_identifier, // Use identifier as path for token extraction
-                content,
-                Some(raw_identifier), // Explicit token
-                Some(raw_identifier), // Also try as languageId
-            )
-            .unwrap_or_else(|| raw_identifier.to_string())
+        coordinator.canonical_injection_language(raw_identifier, content)
     }
 
     /// Build a [`ResolvedInjection`] from a raw injection region.
@@ -664,6 +657,16 @@ mod tests {
 
     fn test_coordinator() -> LanguageCoordinator {
         LanguageCoordinator::new()
+    }
+
+    #[test]
+    fn canonicalizes_token_without_loaded_parser() {
+        let coordinator = LanguageCoordinator::new();
+
+        assert_eq!(
+            InjectionResolver::resolve_language(&coordinator, "py", "print('hello')"),
+            "python"
+        );
     }
 
     /// Helper: parse `text` with tree-sitter Rust, match `string_content` nodes

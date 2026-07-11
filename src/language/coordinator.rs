@@ -1242,6 +1242,29 @@ impl LanguageCoordinator {
         self.detect_language_logged(path, content, token, language_id, log::Level::Trace)
     }
 
+    /// Canonical injection language for bridge selection and virtual URIs.
+    ///
+    /// Prefer the established parser-aware detection result. When no parser is
+    /// available yet, retain a normalized token, configured base, or first-line
+    /// candidate so eager bridge selection does not fall back to a raw alias.
+    pub(crate) fn canonical_injection_language(&self, identifier: &str, content: &str) -> String {
+        if let Some(language) =
+            self.detect_language_hot(identifier, content, Some(identifier), Some(identifier))
+        {
+            return language;
+        }
+        if let Some(candidate) = super::heuristic::detect_from_token(identifier) {
+            return self.resolve_base(&candidate).unwrap_or(candidate);
+        }
+        if let Some(base) = self.resolve_base(identifier) {
+            return base;
+        }
+        if let Some(candidate) = super::heuristic::detect_from_first_line(content) {
+            return self.resolve_base(&candidate).unwrap_or(candidate);
+        }
+        identifier.to_string()
+    }
+
     fn detect_language_logged(
         &self,
         path: &str,
