@@ -178,9 +178,9 @@ impl Kakehashi {
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
             for resolved in unique_edit_regions(&all_regions) {
-                // Combined injections are non-contiguous in the host. Even a
-                // covering range may fall back to full formatting, whose single
-                // replacement would overwrite the masked host-only gaps.
+                // Non-contiguous combined injections contain masked host-only
+                // gaps. Even a covering range may fall back to full formatting,
+                // whose single replacement would overwrite those real gaps.
                 if !resolved.contiguous {
                     continue;
                 }

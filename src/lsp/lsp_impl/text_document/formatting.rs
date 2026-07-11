@@ -303,9 +303,9 @@ impl Kakehashi {
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
         for resolved in unique_edit_regions(&all_regions) {
-            // Combined injections mask host-only gaps with whitespace. A formatter
-            // returns a contiguous whole-document replacement, which would replace
-            // those real host gaps as well and corrupt the document.
+            // Non-contiguous combined injections contain masked host-only gaps.
+            // A formatter returns a contiguous whole-document replacement, which
+            // would replace those real host gaps as well and corrupt the document.
             if !resolved.contiguous {
                 continue;
             }
