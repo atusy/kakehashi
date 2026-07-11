@@ -75,7 +75,7 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
         }
         serde_json::Value::Object(map) => {
             let mut entries: Vec<_> = map.into_iter().collect();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
 
             let mut sorted = serde_json::Map::new();
             for (key, value) in entries {
