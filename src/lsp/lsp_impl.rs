@@ -96,6 +96,7 @@ pub(super) fn bridge_configs_for_injection_language(
 pub(super) struct ReloadLanguageState<'a> {
     language: &'a LanguageCoordinator,
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
+    request_semantic_refresh: bool,
 }
 
 pub(super) async fn apply_shared_settings(
@@ -177,11 +178,24 @@ pub(super) async fn apply_shared_settings(
     // Query removal/replacement affects unchanged documents too. Request one
     // workspace refresh for every reload; ClientNotifier capability-gates and
     // coalesces it with any language-specific refresh events in this batch.
-    summary
-        .events
-        .push(crate::language::LanguageEvent::semantic_tokens_refresh(
-            "workspace settings reload",
-        ));
+    if language_state.request_semantic_refresh {
+        summary
+            .events
+            .push(crate::language::LanguageEvent::semantic_tokens_refresh(
+                "workspace settings reload",
+            ));
+    } else {
+        // Initialization may produce language-specific refresh events (for
+        // example while registering a derived language). No refresh request is
+        // valid before InitializeResult/initialized, and no document has yet
+        // consumed tokens, so keep the logs while stripping every refresh.
+        summary.events.retain(|event| {
+            !matches!(
+                event,
+                crate::language::LanguageEvent::SemanticTokensRefresh { .. }
+            )
+        });
+    }
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
@@ -435,6 +449,29 @@ impl Kakehashi {
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
+                request_semantic_refresh: true,
+            },
+            &self.settings_manager,
+            &self.cache,
+            &self.bridge,
+            Some(raw_settings),
+            settings,
+        )
+        .await;
+        self.warn_on_misconfigured_settings().await;
+    }
+
+    async fn apply_initial_settings(
+        &self,
+        raw_settings: RawWorkspaceSettings,
+        settings: WorkspaceSettings,
+    ) {
+        apply_shared_settings(
+            &self.client,
+            ReloadLanguageState {
+                language: &self.language,
+                parser_pool: &self.parser_pool,
+                request_semantic_refresh: false,
             },
             &self.settings_manager,
             &self.cache,

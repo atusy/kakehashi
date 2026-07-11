@@ -249,7 +249,7 @@ impl Kakehashi {
         //   every save on a round trip that can only return "no edits".
         let host_bridging_enabled = settings.any_host_bridging_enabled();
         let will_save_advertised = host_bridging_enabled || settings.any_bridge_server_runnable();
-        self.apply_raw_settings(raw_settings, settings).await;
+        self.apply_initial_settings(raw_settings, settings).await;
 
         self.notifier().log_info("server initialized!").await;
         Ok(InitializeResult {

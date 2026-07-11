@@ -232,6 +232,7 @@ impl InstallCoordinator {
             ReloadLanguageState {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
+                request_semantic_refresh: true,
             },
             &self.settings_manager,
             &self.cache,
