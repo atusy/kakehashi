@@ -687,9 +687,19 @@ impl DocumentStore {
     }
 
     // Lock safety: Single remove() call - no read lock held before or during write
+    #[cfg(test)]
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
-        self.parse_states.remove(uri);
         self.edit_locks.remove(uri);
+        self.remove_preserving_edit_lock(uri)
+    }
+
+    /// Remove a document while retaining its per-URI edit lock entry.
+    ///
+    /// Lifecycle teardown holds that lock across cleanup after the document is
+    /// gone. Keeping the map entry makes a fast reopen wait on the same mutex
+    /// instead of creating a fresh lock and racing the old lifetime's cleanup.
+    pub(crate) fn remove_preserving_edit_lock(&self, uri: &Url) -> Option<Document> {
+        self.parse_states.remove(uri);
         // Dropping the watermark sender wakes any reader still blocked on
         // the watermark for this document, so a reader racing the close
         // proceeds into the empty fallback instead of stalling to the timeout.

@@ -5,16 +5,23 @@ use tower_lsp_server::ls_types::DidCloseTextDocumentParams;
 use super::super::{Kakehashi, uri_to_url};
 
 impl Kakehashi {
+    #[cfg(test)]
     pub(in crate::lsp::lsp_impl) async fn clear_document_state_on_close(&self, uri: &url::Url) {
         let edit_lock = self.documents.edit_lock(uri);
-        let _edit_guard = edit_lock.lock().await;
+        let edit_guard = edit_lock.lock().await;
+        self.clear_document_state_on_close_locked(uri);
+        drop(edit_guard);
+        self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+    }
+
+    fn clear_document_state_on_close_locked(&self, uri: &url::Url) {
         // Captures lineage and walk memos are installed under this same lock,
         // so a store that won first is cleared while one arriving later sees
         // the document gone and refuses to install obsolete state.
         self.captures_cache.retain(|key, _| key.0 != *uri);
         self.captures_walk_cache.retain(|key, _| key.0 != *uri);
         self.cancel_captures_walks_for_document(uri);
-        self.documents.remove(uri);
+        self.documents.remove_preserving_edit_lock(uri);
         self.cache.remove_document(uri);
         // The match cache uses insert-then-verify. Clearing after document
         // removal ensures a straggler either inserted before this clear or
@@ -42,7 +49,9 @@ impl Kakehashi {
         // across the whole in-helper teardown (captures/walk cache clears,
         // walk cancellation, document + cache removal); only the cleanups
         // BELOW this call run outside the edit-lock section.
-        self.clear_document_state_on_close(&uri).await;
+        let edit_lock = self.documents.edit_lock(&uri);
+        let edit_guard = edit_lock.lock().await;
+        self.clear_document_state_on_close_locked(&uri);
 
         // Clean up region ID mappings for this document
         // (lazy-node-identity-tracking). This runs AFTER the removal above
@@ -99,6 +108,10 @@ impl Kakehashi {
             .pool_arc()
             .close_host_bridge_document(&uri)
             .await;
+
+        drop(edit_guard);
+        self.documents
+            .remove_edit_lock_if_unshared(&uri, &edit_lock);
 
         self.notifier().log_info("file closed!").await;
     }

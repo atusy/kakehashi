@@ -25,11 +25,19 @@ impl Kakehashi {
             Some(language_id.clone())
         };
 
+        // Serialize reopen insertion behind the prior lifetime's complete
+        // didClose cleanup. didClose deliberately retains this map entry while
+        // the document itself is absent, so reopening cannot mint a fresh mutex
+        // and expose new state to URI-scoped old-lifetime teardown.
+        let edit_lock = self.documents.edit_lock(&uri);
+        let edit_guard = edit_lock.lock().await;
+
         // Insert document immediately (without tree) so concurrent requests can find it.
         // This handles race conditions where semanticTokens/full arrives before
         // parse_document completes. The tree will be updated by parse_document.
         self.documents
             .insert(uri.clone(), text.clone(), language_name.clone(), None);
+        drop(edit_guard);
 
         // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
         // host document to any `_self` host-bridge server *before* the parser load,
@@ -253,6 +261,7 @@ impl Kakehashi {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
     use crate::config::WorkspaceSettings;
@@ -278,6 +287,62 @@ mod tests {
         })
         .await
         .expect("condition should become true");
+    }
+
+    #[tokio::test]
+    async fn did_open_waits_for_prior_lifetime_close_cleanup() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = Arc::new(service);
+        let server = service.inner();
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        });
+        let uri = Url::parse("file:///test/fast-reopen.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "old".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+
+        let lifecycle = server.documents.edit_lock(&uri);
+        let close_guard = lifecycle.lock().await;
+        server.documents.remove_preserving_edit_lock(&uri);
+
+        let reopen = {
+            let service = Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .did_open_impl(DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem {
+                            uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                            language_id: "plaintext".to_string(),
+                            version: 1,
+                            text: "new".to_string(),
+                        },
+                    })
+                    .await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !reopen.is_finished(),
+            "reopen must wait until all old-lifetime cleanup releases the lifecycle lock"
+        );
+
+        drop(close_guard);
+        wait_until(|| {
+            server
+                .documents
+                .get(&uri)
+                .is_some_and(|doc| doc.text() == "new")
+        })
+        .await;
+        reopen.abort();
+        assert_eq!(server.documents.get(&uri).unwrap().text(), "new");
     }
 
     #[tokio::test]
