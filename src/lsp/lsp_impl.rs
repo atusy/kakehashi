@@ -879,12 +879,17 @@ mod tests {
                 WorkspaceSettings::default(),
             )
             .await;
-        service
+        let parser_is_current = service
             .inner()
             .parser_pool
             .lock()
             .unwrap()
             .release_versioned("stale".to_string(), parser, generation);
+
+        assert!(
+            !parser_is_current,
+            "a parse from the previous pool generation must not publish its result"
+        );
 
         assert!(
             service

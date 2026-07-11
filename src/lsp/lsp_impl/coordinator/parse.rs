@@ -156,6 +156,8 @@ impl ParseCoordinator {
     ///   a pinned thread would stall every document's tree-CPU)
     /// - The `PARSE_AWAIT_BACKSTOP` awaiter timeout fired (extreme queue
     ///   pressure; the work-unit still self-bounds)
+    /// - Settings changed while the parser was checked out, so the result was
+    ///   produced by the previous parser generation
     /// - The closure returned `None`
     pub(crate) async fn parse_with_pool<T, F>(
         &self,
@@ -190,11 +192,11 @@ impl ParseCoordinator {
                 // queue + parse with slack, so the result is not dropped.
                 let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
                 let (parser, value) = parse_fn(parser, deadline);
-                parser_pool
+                let parser_is_current = parser_pool
                     .lock()
                     .recover_poison("ParseCoordinator::parse_with_pool(release)")
                     .release_versioned(language_name_owned, parser, parser_generation);
-                value
+                parser_is_current.then_some(value).flatten()
             }),
         )
         .await;
