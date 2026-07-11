@@ -26,9 +26,9 @@ use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, region_host_end};
 /// Rebuild the region's current host offset from the live parse, keyed by its
 /// `region_id` (a ULID in production). Returns `None` when the offset can't be
 /// rebuilt: region invalidated by edits (`lookup_node` misses), a `region_id`
-/// that no longer matches the live parse at that byte (edit race), or a missing
-/// document/snapshot/language/query. The third tuple field reports whether the
-/// virtual content maps to one contiguous host span.
+/// whose tracked geometry/layer no longer exists in the live parse, or a
+/// missing document/snapshot/language/query. The third tuple field reports
+/// whether the virtual content maps to one contiguous host span.
 pub(super) fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
