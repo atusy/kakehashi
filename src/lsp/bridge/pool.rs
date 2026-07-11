@@ -261,6 +261,10 @@ pub struct LanguageServerPool {
     /// Serializes didOpen enqueue/promotion, rollback, and didClose per exact
     /// downstream document so wire order matches tracker state transitions.
     open_transition_locks: Arc<OpenTransitionLocks>,
+    /// Latest extracted content observed from host didChange for each injection.
+    /// Interactive requests may carry an older snapshot while awaiting server
+    /// startup; the didOpen path reads this after claiming the transition.
+    latest_virtual_contents: DashMap<(Url, String, String), Arc<str>>,
     /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
@@ -372,6 +376,7 @@ impl LanguageServerPool {
             shutting_down: AtomicBool::new(false),
             document_tracker: Arc::new(DocumentTracker::new()),
             open_transition_locks: Arc::new(DashMap::new()),
+            latest_virtual_contents: DashMap::new(),
             host_documents: Mutex::new(HashMap::new()),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
@@ -1069,6 +1074,15 @@ impl LanguageServerPool {
             connection_key: connection_key.clone(),
             armed: true,
         };
+        let current_content = self
+            .latest_virtual_contents
+            .get(&(
+                host_uri.clone(),
+                virtual_uri.language().to_string(),
+                virtual_uri.region_id().to_string(),
+            ))
+            .map(|entry| Arc::clone(entry.value()));
+        let virtual_content = current_content.as_deref().unwrap_or(virtual_content);
         // Register host_to_virtual BEFORE send so that close_host_document
         // can find this document even if the task is aborted after send.
         // The single-writer loop (ls-bridge-message-ordering) guarantees FIFO ordering, so
@@ -1111,6 +1125,39 @@ impl LanguageServerPool {
             .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content)
             .await;
         Ok(())
+    }
+
+    pub(crate) fn record_latest_virtual_content(
+        &self,
+        host_uri: &Url,
+        language: &str,
+        region_id: &str,
+        content: &str,
+    ) {
+        self.latest_virtual_contents.insert(
+            (
+                host_uri.clone(),
+                language.to_string(),
+                region_id.to_string(),
+            ),
+            Arc::<str>::from(content),
+        );
+    }
+
+    pub(crate) fn clear_latest_virtual_contents(&self, host_uri: &Url) {
+        self.latest_virtual_contents
+            .retain(|(uri, _, _), _| uri != host_uri);
+    }
+
+    pub(crate) fn clear_invalidated_virtual_contents(
+        &self,
+        host_uri: &Url,
+        invalidated_ulids: &[ulid::Ulid],
+    ) {
+        let invalidated: std::collections::HashSet<String> =
+            invalidated_ulids.iter().map(ToString::to_string).collect();
+        self.latest_virtual_contents
+            .retain(|(uri, _, region_id), _| uri != host_uri || !invalidated.contains(region_id));
     }
 
     /// Increment the version of a virtual document and return the new version,
@@ -3472,6 +3519,64 @@ mod tests {
             }
             _ => panic!("Expected Notification, got Request"),
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_document_opened_uses_edit_that_arrived_while_server_was_starting() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/stale-open.md").unwrap();
+        let host_uri_lsp = url_to_uri(&host_uri);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+
+        pool.forward_didchange_to_opened_docs(
+            &host_uri,
+            &[super::super::coordinator::BridgeInjection {
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_0.to_string(),
+                content: "print('current')".to_string(),
+            }],
+        )
+        .await;
+
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "print('stale')",
+            &connection_key,
+        )
+        .await
+        .unwrap();
+
+        let OutboundMessage::Untracked(message) = rx.try_recv().unwrap() else {
+            panic!("didOpen must be an untracked notification");
+        };
+        assert_eq!(
+            message["params"]["textDocument"]["text"],
+            "print('current')"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_close_reclaims_unopened_latest_virtual_content() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/cache-close.md").unwrap();
+        pool.forward_didchange_to_opened_docs(
+            &host_uri,
+            &[super::super::coordinator::BridgeInjection {
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_0.to_string(),
+                content: "print('cached')".to_string(),
+            }],
+        )
+        .await;
+        assert_eq!(pool.latest_virtual_contents.len(), 1);
+
+        assert!(pool.close_host_document(&host_uri).await.is_empty());
+
+        assert!(pool.latest_virtual_contents.is_empty());
     }
 
     /// Test that ensure_document_opened skips didOpen when document is already opened.

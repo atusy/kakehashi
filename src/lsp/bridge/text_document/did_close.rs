@@ -189,6 +189,7 @@ impl LanguageServerPool {
     /// The connection to downstream language servers remains open — only the
     /// virtual documents are closed.
     pub(crate) async fn close_host_document(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
+        self.clear_latest_virtual_contents(host_uri);
         // 1. Remove and get all virtual docs for this host
         let virtual_docs = self.remove_host_virtual_docs(host_uri).await;
 
@@ -210,6 +211,7 @@ impl LanguageServerPool {
     /// orphaned in downstream LSs. Matching docs are atomically removed from
     /// tracking and sent didClose (best effort); docs never opened are skipped.
     pub(crate) async fn close_invalidated_docs(&self, host_uri: &Url, invalidated_ulids: &[Ulid]) {
+        self.clear_invalidated_virtual_contents(host_uri, invalidated_ulids);
         // Atomically remove matching docs from host_to_virtual
         let to_close = self
             .remove_matching_virtual_docs(host_uri, invalidated_ulids)
