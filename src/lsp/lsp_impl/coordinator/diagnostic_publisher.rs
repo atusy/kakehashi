@@ -535,7 +535,8 @@ impl DiagnosticPublisher {
         self.aggregator.forget_coverage(host);
         // And any degraded-pull debt — a closed doc owes no recovery refresh.
         self.aggregator.forget_degraded_pull(host);
-        // And the wire-gate entry the clearing republish itself just stamped.
+        // And any wire-gate state left by earlier open-host publishes. The
+        // clearing republish above bypasses the gate because the host is closed.
         self.aggregator.forget_wire_gate(host);
         // didClose is off the hot path: reclaim republish-lock entries whose lock
         // now has no live holder — this host's, once the clear-republish above
