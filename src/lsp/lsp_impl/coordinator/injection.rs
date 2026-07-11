@@ -406,8 +406,8 @@ impl InjectionCoordinator {
 }
 
 fn parser_enabled_injection_language(language: &str) -> bool {
-    // Explicit, unconfigured plaintext is deliberately featureless. A configured
-    // plaintext base is canonicalized to that base before reaching this loop.
+    // Explicit, unconfigured plaintext is deliberately featureless. An eligible
+    // configured plaintext base is canonicalized before reaching this loop.
     language != "plaintext"
 }
 
