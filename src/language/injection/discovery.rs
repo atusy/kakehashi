@@ -301,6 +301,7 @@ pub(crate) fn collect_all_injections<'a>(
                     capture.node.start_byte(),
                     capture.node.end_byte(),
                     language.clone(),
+                    match_.pattern_index,
                 );
                 // `or_insert_with` so the per-pattern predicate scans
                 // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
@@ -441,6 +442,7 @@ fn collect_injection_regions<'a>(
                 content_node.start_byte(),
                 content_node.end_byte(),
                 language.clone(),
+                pattern_index,
             );
 
             // Keep the first match for each range/language pair; distinct
@@ -1657,6 +1659,30 @@ mod tests {
             vec!["rust", "doc", "comment"],
             "distinct language layers on the same node must survive discovery"
         );
+    }
+
+    #[test]
+    fn same_range_same_language_keeps_distinct_pattern_semantics() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { /* comment */ }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+            ((block_comment) @injection.content
+             (#set! injection.language "comment"))
+            ((block_comment) @injection.content
+             (#set! injection.language "comment")
+             (#set! injection.include-children))
+            "#,
+        )
+        .expect("valid query");
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+
+        assert_eq!(regions.len(), 2);
+        assert_ne!(regions[0].include_children, regions[1].include_children);
     }
 
     #[test]
