@@ -10,6 +10,21 @@ use std::time::Duration;
 use super::super::pool::{ConnectionHandleSender, INIT_TIMEOUT_SECS, LanguageServerPool};
 use super::super::protocol::VirtualDocumentUri;
 
+struct LifecycleCleanup<'a> {
+    pool: &'a LanguageServerPool,
+    host_uri: &'a url::Url,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for LifecycleCleanup<'_> {
+    fn drop(&mut self) {
+        if self.pool.current_host_incarnation(self.host_uri).is_none() {
+            self.pool
+                .remove_host_lifecycle_lock_if_unshared(self.host_uri, &self.lifecycle);
+        }
+    }
+}
+
 impl LanguageServerPool {
     /// Fire `didOpen` for every injection region's virtual URI so the downstream
     /// server starts analyzing immediately instead of waiting for the first
@@ -22,7 +37,7 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         host_uri: &url::Url,
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
-        expected_incarnation: Option<u64>,
+        expected_incarnation: u64,
         injections: Vec<crate::lsp::bridge::coordinator::BridgeInjection>,
     ) {
         // Wait for the server to be ready (handshake complete)
@@ -51,36 +66,25 @@ impl LanguageServerPool {
         let connection_key = handle.key().clone();
         let mut sender = ConnectionHandleSender(&handle);
 
-        let lifecycle = match expected_incarnation {
-            Some(_) => {
-                let Some(lifecycle) = self.existing_host_lifecycle_lock(host_uri) else {
-                    return;
-                };
-                Some(lifecycle)
-            }
-            None => None,
+        let Some(lifecycle) = self.existing_host_lifecycle_lock(host_uri) else {
+            return;
+        };
+        let _lifecycle_cleanup = LifecycleCleanup {
+            pool: self,
+            host_uri,
+            lifecycle: Arc::clone(&lifecycle),
         };
         for injection in injections {
             // Hold the host cache guard through didOpen. didClose/reopen replaces
             // this entry, so it either linearizes after this open (and closes the
             // tracked virtual document) or wins first and makes this stale batch
             // stop without opening old content.
-            let lifecycle_guard = match &lifecycle {
-                Some(lifecycle) => Some(lifecycle.lock().await),
-                None => None,
-            };
-            let current_incarnation = self
-                .latest_virtual_contents
-                .get(host_uri)
-                .map(|host| host.incarnation);
-            if let Some(expected) = expected_incarnation
-                && current_incarnation != Some(expected)
-            {
+            let lifecycle_guard = lifecycle.lock().await;
+            let current_incarnation = self.current_host_incarnation(host_uri);
+            if current_incarnation != Some(expected_incarnation) {
                 drop(lifecycle_guard);
-                if current_incarnation.is_none()
-                    && let Some(lifecycle) = &lifecycle
-                {
-                    self.remove_host_lifecycle_lock_if_unshared(host_uri, lifecycle);
+                if current_incarnation.is_none() {
+                    self.remove_host_lifecycle_lock_if_unshared(host_uri, &lifecycle);
                 }
                 return;
             }
@@ -239,6 +243,7 @@ mod tests {
 
         let host_uri = test_host_uri("eager_open");
         let host_uri_lsp = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
 
         use super::super::super::coordinator::BridgeInjection;
         let injections = vec![
@@ -259,7 +264,7 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
-            None,
+            1,
             injections,
         )
         .await;
@@ -298,6 +303,7 @@ mod tests {
 
         let host_uri = test_host_uri("idempotent");
         let host_uri_lsp = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
 
         use super::super::super::coordinator::BridgeInjection;
         let injections = vec![BridgeInjection {
@@ -312,7 +318,7 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
-            None,
+            1,
             injections.clone(),
         )
         .await;
@@ -329,7 +335,7 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
-            None,
+            1,
             injections,
         )
         .await;

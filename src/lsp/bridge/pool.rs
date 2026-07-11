@@ -340,7 +340,7 @@ pub struct LanguageServerPool {
     /// Latest extracted content observed from host didChange for each injection.
     /// Interactive requests may carry an older snapshot while awaiting server
     /// startup; the didOpen path reads this after claiming the transition.
-    pub(crate) latest_virtual_contents: LatestVirtualContents,
+    latest_virtual_contents: LatestVirtualContents,
     /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
@@ -1283,6 +1283,12 @@ impl LanguageServerPool {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .value(),
         )
+    }
+
+    pub(crate) fn current_host_incarnation(&self, host_uri: &Url) -> Option<u64> {
+        self.latest_virtual_contents
+            .get(host_uri)
+            .map(|host| host.incarnation)
     }
 
     pub(crate) fn existing_host_lifecycle_lock(
@@ -3812,7 +3818,7 @@ mod tests {
             &devnull_config(),
             &host_uri,
             &host_uri_lsp,
-            Some(1),
+            1,
             vec![super::super::coordinator::BridgeInjection {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
@@ -3848,7 +3854,7 @@ mod tests {
             &devnull_config(),
             &host_uri,
             &host_uri_lsp,
-            Some(1),
+            1,
             vec![super::super::coordinator::BridgeInjection {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),

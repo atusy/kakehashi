@@ -399,7 +399,7 @@ impl BridgeCoordinator {
                 &config,
                 host_uri,
                 &host_uri_lsp,
-                Some(host_incarnation),
+                host_incarnation,
                 for_server,
             )
             .await;
@@ -935,7 +935,7 @@ impl BridgeCoordinator {
                         &config,
                         &host_uri_owned,
                         &host_uri_lsp,
-                        Some(incarnation),
+                        incarnation,
                         group_injections,
                     ) => {}
                 }
