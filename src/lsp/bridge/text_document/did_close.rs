@@ -222,8 +222,8 @@ impl LanguageServerPool {
         }
 
         // Send didClose and clean up tracking for each closed doc
-        for doc in &to_close {
-            self.close_single_virtual_doc(doc).await;
+        for doc in to_close {
+            self.close_single_virtual_doc(&doc).await;
         }
     }
 
@@ -265,8 +265,8 @@ impl LanguageServerPool {
             .iter()
             .map(|doc| doc.virtual_uri.region_id().to_string())
             .collect();
-        for doc in &to_close {
-            self.close_single_virtual_doc(doc).await;
+        for doc in to_close {
+            self.close_single_virtual_doc(&doc).await;
         }
         replaced_regions
     }
