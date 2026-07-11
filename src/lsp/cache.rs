@@ -305,7 +305,7 @@ impl CacheCoordinator {
                 })
                 .collect();
 
-            // Resolve once for every consumer that needs canonical language /
+            // Resolve once for every consumer that needs resolved language /
             // virtual content. In production the bridge and whole-document
             // gates rise together, so resolving independently would duplicate
             // the language-detection chain on the parse critical path.
@@ -320,7 +320,7 @@ impl CacheCoordinator {
 
             // Bridge-downstream regions from the SAME collected `regions`
             // (parse-snapshot ADR §3, never discover twice): the exact
-            // (canonical language, region_id, clean content) triple
+            // (resolved language, region_id, clean content) triple
             // `resolve_injection_data` used to re-derive by re-running the
             // injection query per downstream pass. Gated on a bridge server
             // actually being configured: populate runs on the pre-publish
