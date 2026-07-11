@@ -173,9 +173,14 @@ fn validate_utf16_encoding(
     announced: Option<&serde_json::Value>,
     field: &str,
 ) -> std::io::Result<()> {
-    let Some(announced) = announced.filter(|value| !value.is_null()) else {
+    let Some(announced) = announced else {
         return Ok(());
     };
+    if announced.is_null() {
+        return Err(std::io::Error::other(format!(
+            "bridge: downstream initialize {field} is null; UTF-16 is required"
+        )));
+    }
     let Some(encoding) = announced.as_str() else {
         return Err(std::io::Error::other(format!(
             "bridge: downstream initialize {field} is non-string; UTF-16 is required"
@@ -510,6 +515,20 @@ mod tests {
         }),
         "positionEncoding",
         "non-string",
+    )]
+    #[case::null_standard_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {"positionEncoding": null}}
+        }),
+        "positionEncoding",
+        "null",
+    )]
+    #[case::null_legacy_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {}, "offsetEncoding": null}
+        }),
+        "offsetEncoding",
+        "null",
     )]
     #[trace]
     fn validate_rejects_non_utf16_position_encoding(
