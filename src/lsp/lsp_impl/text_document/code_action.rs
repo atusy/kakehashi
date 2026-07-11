@@ -283,14 +283,14 @@ impl Kakehashi {
             );
             return Err(RegionEndUnavailable::MalformedEnvelope);
         };
-        let Ok(_ulid) = envelope.region_id.parse::<Ulid>() else {
+        if envelope.region_id.parse::<Ulid>().is_err() {
             log::warn!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: envelope region_id {:?} is not a valid ULID",
                 envelope.region_id
             );
             return Err(RegionEndUnavailable::MalformedEnvelope);
-        };
+        }
         self.code_action_region_end_live(envelope, &host_url)
             .ok_or(RegionEndUnavailable::Stale)
     }
