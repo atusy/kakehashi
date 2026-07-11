@@ -683,7 +683,15 @@ fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ArchiveFe
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(ArchiveFetchError::Io(error)),
     }
-    fs::create_dir(&target)?;
+    fs::create_dir(&target).map_err(|e| {
+        ArchiveFetchError::Io(io::Error::new(
+            e.kind(),
+            format!(
+                "failed to create archive dir {}: {e}",
+                escaped_path(safe_relative)
+            ),
+        ))
+    })?;
     Ok(())
 }
 
@@ -712,7 +720,17 @@ fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, A
                     escaped_path(safe_relative)
                 )));
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|e| {
+                    ArchiveFetchError::Io(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to create ancestor of archive path {}: {e}",
+                            escaped_path(safe_relative)
+                        ),
+                    ))
+                })?;
+            }
             Err(e) => return Err(ArchiveFetchError::Io(e)),
         }
     }
