@@ -1506,9 +1506,9 @@ impl LanguageCoordinator {
             .load(std::sync::atomic::Ordering::Acquire);
         let pre_registered =
             config.parser.is_none() && self.has_current_parser_registration(lang_name, generation);
-        let preserve_builtin_queries = pre_registered
-            && self.dynamically_loaded.get(lang_name).is_none()
-            && config.queries.is_none();
+        let pre_registered_is_builtin =
+            pre_registered && self.dynamically_loaded.get(lang_name).is_none();
+        let preserve_builtin_queries = pre_registered_is_builtin && config.queries.is_none();
         if !preserve_builtin_queries {
             // Query kinds absent from the new configuration must disappear; the
             // insertion helpers only replace kinds that successfully load.
@@ -1533,7 +1533,9 @@ impl LanguageCoordinator {
                 }
             }
         };
-        self.register_configured_language(lang_name, language.clone());
+        if !pre_registered_is_builtin {
+            self.register_configured_language(lang_name, language.clone());
+        }
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
 
@@ -3180,6 +3182,10 @@ mod tests {
             languages: reloaded_languages,
             ..Default::default()
         });
+        assert!(
+            coordinator.has_parser_available("markdown"),
+            "an untagged pre-registered base must survive repeated reloads"
+        );
 
         assert!(
             !coordinator.has_parser_available("rmd"),
