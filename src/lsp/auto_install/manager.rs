@@ -266,6 +266,24 @@ impl AutoInstallManager {
             };
         }
 
+        // Claim before the network-backed support lookup so concurrent calls
+        // for the same language do not all fetch metadata. The RAII guard
+        // releases the claim on every lookup/error early return.
+        if !self.installing_languages.try_start_install(language) {
+            events.push(InstallEvent::Log {
+                level: MessageType::INFO,
+                message: format!("Language '{}' is already being installed", language),
+            });
+            return InstallResult {
+                outcome: InstallOutcome::AlreadyInstalling,
+                events,
+            };
+        }
+        let install_marker = InstallMarkerGuard {
+            installing: self.installing_languages.clone(),
+            language: language.to_string(),
+        };
+
         // Check if language is supported by nvim-treesitter
         let default_data_dir = crate::install::default_data_dir();
         let (should_skip, reason) =
@@ -284,22 +302,6 @@ impl AutoInstallManager {
                 events,
             };
         }
-
-        // Try to start installation (deduplication)
-        if !self.installing_languages.try_start_install(language) {
-            events.push(InstallEvent::Log {
-                level: MessageType::INFO,
-                message: format!("Language '{}' is already being installed", language),
-            });
-            return InstallResult {
-                outcome: InstallOutcome::AlreadyInstalling,
-                events,
-            };
-        }
-        let install_marker = InstallMarkerGuard {
-            installing: self.installing_languages.clone(),
-            language: language.to_string(),
-        };
 
         // Progress begin
         events.push(InstallEvent::ProgressBegin);
@@ -499,20 +501,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_install_returns_already_installing_on_duplicate() {
+    async fn concurrent_duplicate_install_skips_support_lookup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
         let (manager, _temp) = create_test_manager();
+        let lookup_count = Arc::new(AtomicUsize::new(0));
+        let first_manager = manager.clone();
+        let first_lookup_count = Arc::clone(&lookup_count);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
-        // Manually mark as installing
-        manager.installing_languages.try_start_install("lua");
+        let first = tokio::spawn(async move {
+            first_manager
+                .try_install_with_support_check("lua", |_, _| async move {
+                    first_lookup_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    (true, None)
+                })
+                .await
+        });
+        started_rx.await.expect("first support lookup must start");
 
-        // Try to install same language
-        let result = manager.try_install("lua").await;
+        let duplicate_lookup_count = Arc::clone(&lookup_count);
+        let result = manager
+            .try_install_with_support_check("lua", move |_, _| {
+                duplicate_lookup_count.fetch_add(1, Ordering::SeqCst);
+                async { (false, None) }
+            })
+            .await;
 
         assert_eq!(result.outcome, InstallOutcome::AlreadyInstalling);
+        assert_eq!(lookup_count.load(Ordering::SeqCst), 1);
         assert!(result.events.iter().any(|e| matches!(
             e,
             InstallEvent::Log { level: MessageType::INFO, message } if message.contains("already being installed")
         )));
+
+        let _ = release_tx.send(());
+        assert_eq!(
+            first.await.expect("first install task must finish").outcome,
+            InstallOutcome::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_support_lookup_releases_install_claim() {
+        let (manager, _temp) = create_test_manager();
+
+        let result = manager
+            .try_install_with_support_check("unsupported", |_, _| async { (true, None) })
+            .await;
+
+        assert_eq!(result.outcome, InstallOutcome::Unsupported);
+        assert!(
+            manager
+                .installing_languages
+                .try_start_install("unsupported"),
+            "unsupported and metadata-error exits share this skip path and must release the claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_support_lookup_releases_install_claim() {
+        let (manager, _temp) = create_test_manager();
+        let task_manager = manager.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            task_manager
+                .try_install_with_support_check("lua", |_, _| async move {
+                    let _ = started_tx.send(());
+                    std::future::pending::<(bool, Option<SkipReason>)>().await
+                })
+                .await
+        });
+        started_rx.await.expect("support lookup must start");
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            manager.installing_languages.try_start_install("lua"),
+            "cancelling during metadata lookup must release the claim"
+        );
     }
 
     #[tokio::test]
