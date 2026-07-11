@@ -54,10 +54,13 @@ pub(crate) fn apply_content_changes_with_edits(
             // shorter base text is edited with a range authored against a later
             // document state (concurrent `didChange` processing). Clamping keeps
             // the splice in bounds; `start <= end` is enforced so the range never
-            // inverts.
+            // inverts. Clamping to line content also keeps an overlong column
+            // from consuming that line's terminator (#707).
             let mapper = PositionMapper::new(&text);
-            let start_offset = mapper.position_to_byte_clamped(range.start);
-            let end_offset = mapper.position_to_byte_clamped(range.end).max(start_offset);
+            let start_offset = mapper.position_to_byte_clamped(&text, range.start);
+            let end_offset = mapper
+                .position_to_byte_clamped(&text, range.end)
+                .max(start_offset);
 
             // Once a full replacement has landed in this batch the edits will be
             // discarded at the end (the batch is a full sync), so skip building the
@@ -212,6 +215,26 @@ mod tests {
         // The offsets are clamped to the text length, so the edit stays in bounds
         // and the resulting text is well-formed (no slice panic).
         assert!(new_text.starts_with("local x = {"));
+    }
+
+    #[test]
+    fn test_overlong_column_does_not_consume_line_terminator() {
+        let old_text = "hello\nworld\n";
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position::new(0, 5),
+                end: Position::new(0, 999),
+            }),
+            range_length: None,
+            text: String::new(),
+        }];
+
+        let (new_text, edits) = apply_content_changes_with_edits(old_text, changes);
+
+        assert_eq!(new_text, old_text);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].start_byte, 5);
+        assert_eq!(edits[0].old_end_byte, 5);
     }
 
     #[test]

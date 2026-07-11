@@ -38,22 +38,28 @@ impl PositionMapper {
     /// line's end yields a byte offset running past that line (it is computed
     /// as `line_start + character`), and a `line` past EOF yields `None`.
     /// Both must be reined in, and *differently*:
-    /// - **character past the line's end** → clamp to the end of that line
-    ///   (`line(l).end()`, which is the start of the next line, i.e. just
-    ///   past this line's terminator). The request stays within its own line
-    ///   and never reaches a later line's content or injection region —
-    ///   unlike snapping to the document end, which would.
+    /// - **character past the line's end** → clamp to the end of that line's
+    ///   content, before its `\n` or `\r\n` terminator. The request stays
+    ///   within its own line and cannot consume the terminator or reach a later
+    ///   line's content — unlike snapping to the document end, which would.
     /// - **line past the last line** → clamp to the document's end.
     ///
     /// An in-bounds position maps exactly (identical to `position_to_byte`):
     /// the largest in-bounds offset on a line is its end-of-content, which is
     /// `<= line(l).end()`, so the `min` never alters it.
-    pub fn position_to_byte_clamped(&self, position: Position) -> usize {
+    pub fn position_to_byte_clamped(&self, text: &str, position: Position) -> usize {
         match self.line_index.line(position.line) {
             // Line exists: take the mapped offset but clamp it to the line's
             // end so an over-long character can't spill past this line.
             Some(line_range) => {
-                let line_end: usize = line_range.end().into();
+                let line_start: usize = line_range.start().into();
+                let line_range_end: usize = line_range.end().into();
+                let line = &text[line_start..line_range_end];
+                let content = line
+                    .strip_suffix('\n')
+                    .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                    .unwrap_or(line);
+                let line_end = line_start + content.len();
                 self.position_to_byte(position)
                     .unwrap_or(line_end)
                     .min(line_end)
@@ -390,20 +396,22 @@ mod tests {
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
         assert_eq!(
-            mapper.position_to_byte_clamped(Position::new(1, 2)),
+            mapper.position_to_byte_clamped(text, Position::new(1, 2)),
             mapper.position_to_byte(Position::new(1, 2)).unwrap()
         );
     }
 
     #[test]
     fn clamped_snaps_overlong_character_to_line_end_not_document_end() {
-        // Line 0 is "hello\n" (bytes 0..6); `line(0).end()` is byte 6, the
-        // start of line 1. A character far past the line end clamps there —
-        // within line 0's bounds, NOT the document end (12) — so a
-        // single-line range can never spill into later lines.
+        // LineIndex includes the terminator in line 0's byte range (0..6), but
+        // the valid LSP end position is byte 5, before `\n`. A far-past column
+        // clamps there, not to the start of line 1 or the document end.
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
-        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 6);
+        assert_eq!(
+            mapper.position_to_byte_clamped(text, Position::new(0, 999)),
+            5
+        );
     }
 
     #[test]
@@ -438,7 +446,7 @@ mod tests {
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
         assert_eq!(
-            mapper.position_to_byte_clamped(Position::new(99, 0)),
+            mapper.position_to_byte_clamped(text, Position::new(99, 0)),
             text.len()
         );
     }

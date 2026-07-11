@@ -36,8 +36,8 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
             // `text.len()` and floors a mid-codepoint offset to a char boundary,
             // so a buggy out-of-range/mid-codepoint offset can't make the slices
             // below panic.
-            let a = floor_char_boundary(text, mapper.position_to_byte_clamped(e.range.start));
-            let b = floor_char_boundary(text, mapper.position_to_byte_clamped(e.range.end));
+            let a = floor_char_boundary(text, mapper.position_to_byte_clamped(text, e.range.start));
+            let b = floor_char_boundary(text, mapper.position_to_byte_clamped(text, e.range.end));
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
             (start, end, e.new_text.as_str())
         })
