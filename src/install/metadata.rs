@@ -113,18 +113,32 @@ fn load_parsers_lua(
 ) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
     if let Some(cache) = cache
         && let Some(cached_content) = cache.read()
-        && let Ok(parsers) = parse_parsers_lua(&cached_content)
+        && let Ok(parsers) = parse_complete_parsers_lua(&cached_content)
     {
         return Ok(parsers);
     }
 
     let content = fetch()?;
-    let parsers = parse_parsers_lua(&content)?;
+    let parsers = parse_complete_parsers_lua(&content)?;
     if let Some(cache) = cache {
         // Ignore cache write errors - caching is best-effort
         let _ = cache.write(&content);
     }
     Ok(parsers)
+}
+
+fn parse_complete_parsers_lua(
+    content: &str,
+) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
+    // A prefix ending after one complete language entry can still yield a
+    // non-empty map. Require the outer `return { ... }` table to close before
+    // accepting or publishing metadata.
+    if find_matching_brace(content).is_none() {
+        return Err(MetadataError::ParseError(
+            "incomplete parsers.lua document".to_string(),
+        ));
+    }
+    parse_parsers_lua(content)
 }
 
 fn fetch_parsers_lua() -> Result<String, MetadataError> {
@@ -321,7 +335,10 @@ mod tests {
 
         let parsers = load_parsers_lua(Some(&cache), || {
             fetched.store(true, Ordering::Relaxed);
-            Ok("lua = { url = 'https://example.com/lua', revision = 'abc' }".to_string())
+            Ok(
+                "return {\nlua = { url = 'https://example.com/lua', revision = 'abc' },\n}"
+                    .to_string(),
+            )
         })
         .expect("corrupt cache should be repaired from the source");
 
@@ -334,6 +351,26 @@ mod tests {
                 .is_some_and(|cached| cached.contains_key("lua")),
             "successful recovery must replace the corrupt cache"
         );
+    }
+
+    #[test]
+    fn cache_truncated_after_complete_entry_falls_back_to_fetch() {
+        let temp = tempdir().expect("temp dir");
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache
+            .write("return {\nlua = { url = 'https://stale/lua', revision = 'old' },")
+            .expect("write partial cache");
+
+        let parsers = load_parsers_lua(Some(&cache), || {
+            Ok(
+                "return {\nrust = { url = 'https://example.com/rust', revision = 'new' },\n}"
+                    .to_string(),
+            )
+        })
+        .expect("partial document must be refetched");
+
+        assert!(parsers.contains_key("rust"));
+        assert!(!parsers.contains_key("lua"));
     }
 
     #[test]
