@@ -481,11 +481,12 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
                         "Archive fetch failed or was rejected, falling back to git clone: {}",
                         error
                     );
-                    // Clean up partial extraction before fallback
-                    let _ = fs::remove_dir_all(dest);
+                    // Never let git consume a partially extracted archive tree.
+                    // A cleanup failure is local I/O, not recoverable content.
+                    remove_partial_archive_destination(dest)?;
                 }
                 ArchiveRecovery::Fail(error) => {
-                    let _ = fs::remove_dir_all(dest);
+                    remove_partial_archive_destination(dest)?;
                     return Err(ParserInstallError::IoError(error));
                 }
             },
@@ -500,6 +501,14 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         revision
     );
     clone_repo(url, revision, dest)
+}
+
+fn remove_partial_archive_destination(dest: &Path) -> Result<(), ParserInstallError> {
+    match fs::remove_dir_all(dest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ParserInstallError::IoError(error)),
+    }
 }
 
 /// Download a GitHub archive tarball and extract it to the destination directory.
