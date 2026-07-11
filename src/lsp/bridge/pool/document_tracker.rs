@@ -740,7 +740,7 @@ impl DocumentTracker {
         to_close
     }
 
-    /// Take opened documents whose URI no longer matches the canonical URI for
+    /// Take opened documents whose URI no longer matches the expected URI for
     /// their still-live region. A content-based language change can preserve
     /// the region ULID while changing the language-derived URI extension.
     pub(crate) async fn remove_replaced_virtual_docs(

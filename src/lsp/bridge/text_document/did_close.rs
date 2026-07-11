@@ -228,7 +228,7 @@ impl LanguageServerPool {
     }
 
     /// Close the old language-bearing URI when a live region keeps its ULID but
-    /// resolves to a different canonical language after an edit.
+    /// resolves to a different language after an edit.
     pub(crate) async fn close_replaced_docs(
         &self,
         host_uri: &Url,
