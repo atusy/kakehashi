@@ -154,6 +154,9 @@ impl LanguageCoordinator {
             {
                 continue;
             }
+            if self.configured_load_failed(language_id, current_generation) {
+                return LanguageLoadResult::default();
+            }
             if !result.success {
                 self.record_failed_load(language_id, current_generation);
             }
@@ -176,11 +179,7 @@ impl LanguageCoordinator {
         language_id: &str,
         current_generation: u64,
     ) -> Option<LanguageLoadResult> {
-        if self
-            .configured_load_failures
-            .get(language_id)
-            .is_some_and(|generation| *generation == current_generation)
-        {
+        if self.configured_load_failed(language_id, current_generation) {
             return Some(LanguageLoadResult::default());
         }
         if self.has_current_parser_registration(language_id, current_generation) {
@@ -194,6 +193,12 @@ impl LanguageCoordinator {
             return Some(LanguageLoadResult::default());
         }
         None
+    }
+
+    fn configured_load_failed(&self, language_id: &str, current_generation: u64) -> bool {
+        self.configured_load_failures
+            .get(language_id)
+            .is_some_and(|generation| *generation == current_generation)
     }
 
     fn has_current_parser_registration(&self, language_id: &str, current_generation: u64) -> bool {
@@ -331,6 +336,9 @@ impl LanguageCoordinator {
                             != current_generation
                         {
                             continue;
+                        }
+                        if self.configured_load_failed(language_id, current_generation) {
+                            return LanguageLoadResult::default();
                         }
                         return result;
                     }
