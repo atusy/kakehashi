@@ -234,8 +234,15 @@ impl LanguageServerPool {
         host_uri: &Url,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
     ) -> std::collections::HashSet<String> {
-        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return std::collections::HashSet::new();
+        let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
+            Ok(uri) => uri,
+            Err(error) => {
+                log::error!(
+                    target: "kakehashi::bridge",
+                    "Failed to convert host URI; replaced virtual documents remain open: {error}"
+                );
+                return std::collections::HashSet::new();
+            }
         };
         let expected_uris = injections
             .iter()
