@@ -331,7 +331,12 @@ impl CacheCoordinator {
                                 included_ranges.as_deref(),
                             );
                             crate::document::DiscoveredBridgeRegion {
-                                raw_language: info.language.clone(),
+                                raw_language:
+                                    crate::language::injection::InjectionResolver::resolve_language(
+                                        language,
+                                        &info.language,
+                                        &content,
+                                    ),
                                 region_id: cacheable.region_id.clone(),
                                 content,
                             }

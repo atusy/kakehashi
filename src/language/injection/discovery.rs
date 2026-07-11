@@ -515,7 +515,7 @@ impl InjectionResolver {
     ///
     /// Falls back to the raw identifier if no resolution is found, allowing the
     /// bridge lookup to fail gracefully with a clear error message.
-    fn resolve_language(
+    pub(crate) fn resolve_language(
         coordinator: &LanguageCoordinator,
         raw_identifier: &str,
         content: &str,
