@@ -166,20 +166,34 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     // Pattern to match parser entries in main branch format: lang = { ... }
     // The pattern matches language names at the start of a line (with optional indentation)
     // followed by = {
-    let lang_pattern = Regex::new(r#"(?m)^\s*([a-zA-Z][a-zA-Z0-9_]*)\s*=\s*\{"#)
+    let lang_pattern = Regex::new(r#"(?m)^([ \t]*)([a-zA-Z][a-zA-Z0-9_]*)\s*=\s*\{"#)
         .expect("valid regex for lang pattern");
 
-    // Find all language names first
-    let lang_names: Vec<String> = lang_pattern
+    // Language entries share the table's minimum indentation. Restricting to
+    // that level keeps nested install_info fields from looking like languages.
+    let candidates: Vec<(usize, String)> = lang_pattern
         .captures_iter(content)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .filter_map(|cap| Some((cap.get(1)?.as_str().len(), cap.get(2)?.as_str().to_string())))
         // Filter out non-language keys like "return", "install_info", etc.
-        .filter(|name| !is_reserved_key(name))
+        .filter(|(_, name)| !is_reserved_key(name))
         .collect();
+    let top_level_indent = candidates.iter().map(|(indent, _)| *indent).min();
+    let lang_names = candidates
+        .into_iter()
+        .filter(|(indent, _)| Some(*indent) == top_level_indent)
+        .map(|(_, name)| name);
 
     // For each language, find its block and extract metadata
     for lang in lang_names {
-        if let Some(info) = extract_parser_metadata(content, &lang) {
+        let block = parser_metadata_block(content, &lang).ok_or_else(|| {
+            MetadataError::ParseError(format!("incomplete parser block for {lang}"))
+        })?;
+        // Query-only entries (for example upstream `ecma`) intentionally have
+        // no install_info and are not installable parsers.
+        if block.contains("install_info") {
+            let info = extract_parser_metadata(content, &lang).ok_or_else(|| {
+                MetadataError::ParseError(format!("incomplete parser metadata for {lang}"))
+            })?;
             parsers.insert(lang, info);
         }
     }
@@ -208,16 +222,7 @@ fn is_reserved_key(name: &str) -> bool {
 
 /// Extract parser metadata for a specific language from parsers.lua content.
 fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetadata> {
-    // Find the start of this language's block
-    // Use word boundary to avoid matching substrings (e.g., "c" matching "cpp")
-    let block_start_pattern = format!(r#"(?m)^\s*{}\s*=\s*\{{"#, regex::escape(language));
-    let block_start_re = Regex::new(&block_start_pattern).ok()?;
-
-    let block_start = block_start_re.find(content)?;
-    let start_pos = block_start.start();
-
-    // Find the end of this block by counting braces
-    let block_content = find_matching_brace(&content[start_pos..])?;
+    let block_content = parser_metadata_block(content, language)?;
 
     // Extract URL (required)
     let url_re = Regex::new(r#"url\s*=\s*'([^']+)'"#).ok()?;
@@ -247,14 +252,53 @@ fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetada
     })
 }
 
+fn parser_metadata_block<'a>(content: &'a str, language: &str) -> Option<&'a str> {
+    // Find the start of this language's block
+    // Use word boundary to avoid matching substrings (e.g., "c" matching "cpp")
+    let block_start_pattern = format!(r#"(?m)^\s*{}\s*=\s*\{{"#, regex::escape(language));
+    let block_start_re = Regex::new(&block_start_pattern).ok()?;
+
+    let block_start = block_start_re.find(content)?;
+    let start_pos = block_start.start();
+
+    // Find the end of this block by counting braces
+    find_matching_brace(&content[start_pos..])
+}
+
 /// Find the content within matching braces starting from the first `{`.
 fn find_matching_brace(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let mut depth = 0;
     let mut end = start;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut chars = s[start..].char_indices().peekable();
 
-    for (i, c) in s[start..].char_indices() {
+    while let Some((i, c)) = chars.next() {
+        if line_comment {
+            if c == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '-' && chars.peek().is_some_and(|(_, next)| *next == '-') {
+            chars.next();
+            line_comment = true;
+            continue;
+        }
         match c {
+            '\'' | '"' => quote = Some(c),
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -335,10 +379,8 @@ mod tests {
 
         let parsers = load_parsers_lua(Some(&cache), || {
             fetched.store(true, Ordering::Relaxed);
-            Ok(
-                "return {\nlua = { url = 'https://example.com/lua', revision = 'abc' },\n}"
-                    .to_string(),
-            )
+            Ok("return {\nlua = { install_info = { url = 'https://example.com/lua', revision = 'abc' } },\n}"
+                .to_string())
         })
         .expect("corrupt cache should be repaired from the source");
 
@@ -358,19 +400,35 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let cache = MetadataCache::with_default_ttl(temp.path());
         cache
-            .write("return {\nlua = { url = 'https://stale/lua', revision = 'old' },")
+            .write("return {\nlua = { install_info = { url = 'https://stale/lua', revision = 'old' } },")
             .expect("write partial cache");
 
         let parsers = load_parsers_lua(Some(&cache), || {
-            Ok(
-                "return {\nrust = { url = 'https://example.com/rust', revision = 'new' },\n}"
-                    .to_string(),
-            )
+            Ok("return {\nrust = { install_info = { url = 'https://example.com/rust', revision = 'new' } },\n}"
+                .to_string())
         })
         .expect("partial document must be refetched");
 
         assert!(parsers.contains_key("rust"));
         assert!(!parsers.contains_key("lua"));
+    }
+
+    #[test]
+    fn braces_in_strings_and_comments_do_not_hide_truncation() {
+        let partial = "return {\n-- } is not the table end\nlua = { url = 'https://example/}', revision = 'ok' },";
+        assert!(matches!(
+            parse_complete_parsers_lua(partial),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_top_level_entry_rejects_the_whole_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = { install_info = { url = 'https://example/rust' } },\n}";
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
     }
 
     #[test]
