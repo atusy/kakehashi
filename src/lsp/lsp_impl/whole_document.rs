@@ -305,7 +305,7 @@ fn nonempty_whole_document_items<T>(items: Vec<T>) -> Option<Vec<T>> {
 pub(super) fn flatten_ordered_region_items<T>(
     mut region_items: Vec<(usize, Option<Vec<T>>)>,
 ) -> Vec<T> {
-    region_items.sort_by_key(|(region_index, _)| *region_index);
+    region_items.sort_unstable_by_key(|(region_index, _)| *region_index);
     region_items
         .into_iter()
         .filter_map(|(_, items)| items)
