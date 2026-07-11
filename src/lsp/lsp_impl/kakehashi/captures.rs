@@ -2365,20 +2365,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!request.is_finished(), "the loser must park on the flight");
 
-        // Exercise didClose's lock-ordered captures teardown without its
-        // unrelated bridge/server shutdown work. Before c38af9a3f, the woken
-        // loser could reclaim the vacant flight and store its old snapshot
-        // after this retain/remove sequence.
-        {
-            let edit_lock = service.inner().documents.edit_lock(&uri);
-            let _edit_guard = edit_lock.lock().await;
-            service
-                .inner()
-                .captures_walk_cache
-                .retain(|cache_key, _| cache_key.0 != uri);
-            service.inner().cancel_captures_walks_for_document(&uri);
-            service.inner().documents.remove(&uri);
-        }
+        // Exercise didClose's lock-ordered teardown without its unrelated
+        // bridge/server shutdown work. Before c38af9a3f, the woken loser could
+        // reclaim the vacant flight and store its old snapshot after this.
+        service.inner().clear_document_state_on_close(&uri).await;
 
         let result = request
             .await
