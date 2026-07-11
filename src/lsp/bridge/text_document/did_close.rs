@@ -226,6 +226,43 @@ impl LanguageServerPool {
             self.close_single_virtual_doc(doc).await;
         }
     }
+
+    /// Close the old language-bearing URI when a live region keeps its ULID but
+    /// resolves to a different canonical language after an edit.
+    pub(crate) async fn close_replaced_docs(
+        &self,
+        host_uri: &Url,
+        injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
+    ) -> std::collections::HashSet<String> {
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return std::collections::HashSet::new();
+        };
+        let expected_uris = injections
+            .iter()
+            .map(|injection| {
+                (
+                    injection.region_id.clone(),
+                    VirtualDocumentUri::new(
+                        &host_uri_lsp,
+                        &injection.language,
+                        &injection.region_id,
+                    )
+                    .to_uri_string(),
+                )
+            })
+            .collect();
+        let to_close = self
+            .remove_replaced_virtual_docs(host_uri, &expected_uris)
+            .await;
+        let replaced_regions = to_close
+            .iter()
+            .map(|doc| doc.virtual_uri.region_id().to_string())
+            .collect();
+        for doc in &to_close {
+            self.close_single_virtual_doc(doc).await;
+        }
+        replaced_regions
+    }
 }
 
 #[cfg(test)]

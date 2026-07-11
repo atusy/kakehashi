@@ -759,6 +759,14 @@ impl BridgeCoordinator {
         self.pool.close_invalidated_docs(uri, ulids).await;
     }
 
+    pub(crate) async fn close_replaced_docs(
+        &self,
+        uri: &Url,
+        injections: &[BridgeInjection],
+    ) -> std::collections::HashSet<String> {
+        self.pool.close_replaced_docs(uri, injections).await
+    }
+
     /// Take the upstream notification receiver for forwarding to the editor.
     ///
     /// Returns `Some(receiver)` on first call, `None` on subsequent calls.

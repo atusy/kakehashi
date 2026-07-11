@@ -913,6 +913,16 @@ impl LanguageServerPool {
             .await
     }
 
+    pub(crate) async fn remove_replaced_virtual_docs(
+        &self,
+        host_uri: &Url,
+        expected_uris: &std::collections::HashMap<String, String>,
+    ) -> Vec<OpenedVirtualDoc> {
+        self.document_tracker
+            .remove_replaced_virtual_docs(host_uri, expected_uris)
+            .await
+    }
+
     /// Remove a document from all tracking state (version tracking and opened state).
     pub(crate) async fn untrack_document(
         &self,

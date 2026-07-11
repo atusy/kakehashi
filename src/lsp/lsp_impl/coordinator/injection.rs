@@ -186,6 +186,12 @@ impl InjectionCoordinator {
             return;
         }
 
+        let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
+        for region_id in replaced_regions {
+            self.diagnostics
+                .evict_source(uri, &DiagnosticSource::Region(region_id));
+        }
+
         if forward_did_change {
             self.bridge
                 .forward_didchange_to_opened_docs(uri, incarnation, &injections)
