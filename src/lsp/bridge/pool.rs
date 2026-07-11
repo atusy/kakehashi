@@ -3040,6 +3040,7 @@ mod tests {
         }
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let host_position = Position {
             line: 3,
             character: 5,
@@ -3114,6 +3115,7 @@ mod tests {
         }
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let host_position = Position {
             line: 3,
             character: 5,
@@ -3187,6 +3189,7 @@ mod tests {
         let config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let host_position = Position {
             line: 3,
             character: 5,
@@ -3515,6 +3518,7 @@ mod tests {
         let config = lua_ls_config();
 
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let host_position = tower_lsp_server::ls_types::Position {
             line: 3,
             character: 5,
@@ -3577,6 +3581,7 @@ mod tests {
         let config = lua_ls_config();
 
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
 
         // First, send hover requests to establish connection and open virtual docs
         // Use positions that are within the code block (position.line >= region_start_line)
