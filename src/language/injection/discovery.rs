@@ -660,11 +660,70 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_token_without_loaded_parser() {
+    fn canonicalizes_token_independently_of_parser_availability() {
         let coordinator = LanguageCoordinator::new();
 
         assert_eq!(
             InjectionResolver::resolve_language(&coordinator, "py", "print('hello')"),
+            "python"
+        );
+
+        coordinator
+            .language_registry_for_parallel()
+            .register("py".to_string(), tree_sitter_python::LANGUAGE.into());
+        assert_eq!(
+            InjectionResolver::resolve_language(&coordinator, "py", "print('hello')"),
+            "python"
+        );
+    }
+
+    #[test]
+    fn explicit_token_beats_loaded_first_line_language() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry_for_parallel()
+            .register("lua".to_string(), tree_sitter_lua::LANGUAGE.into());
+
+        assert_eq!(
+            InjectionResolver::resolve_language(
+                &coordinator,
+                "py",
+                "#!/usr/bin/env lua\nprint('hello')",
+            ),
+            "python"
+        );
+    }
+
+    #[test]
+    fn configured_base_beats_generic_token_alias_without_parser() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&crate::config::WorkspaceSettings {
+            languages: std::collections::HashMap::from([(
+                "py".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("custom-python".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            InjectionResolver::resolve_language(&coordinator, "py", ""),
+            "custom-python"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_first_line_without_loaded_parser() {
+        let coordinator = LanguageCoordinator::new();
+
+        assert_eq!(
+            InjectionResolver::resolve_language(
+                &coordinator,
+                "unknown",
+                "#!/usr/bin/env python\nprint('hello')",
+            ),
             "python"
         );
     }

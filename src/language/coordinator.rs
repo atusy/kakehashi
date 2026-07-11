@@ -1212,9 +1212,7 @@ impl LanguageCoordinator {
     /// (1) LSP `languageId` (if not `"plaintext"`); (2) heuristics — explicit
     /// token (`"py"`, `"js"`), path token via `extract_token_from_path`, then
     /// first-line content (shebang, mode line, Emacs markers).
-    /// Host call: `detect_language(path, content, None, language_id)`;
-    /// injection call: `detect_language_hot(token, content, Some(token),
-    /// Some(token))` — the per-region hot path logs at TRACE.
+    /// Host call: `detect_language(path, content, None, language_id)`.
     pub(crate) fn detect_language(
         &self,
         path: &str,
@@ -1225,39 +1223,23 @@ impl LanguageCoordinator {
         self.detect_language_logged(path, content, token, language_id, log::Level::Debug)
     }
 
-    /// Hot-path variant of [`Self::detect_language`] that logs at TRACE.
-    ///
-    /// Per-injection-region resolution runs this once per region per walk —
-    /// thousands of calls per second during a typing storm — and per-call
-    /// DEBUG formatting/writes flood stderr (measured ~16k lines/sec, dwarfing
-    /// the detection chain itself). The chain is identical; only the log level
-    /// differs, matching `resolve_injection_language`'s TRACE convention.
-    pub(crate) fn detect_language_hot(
-        &self,
-        path: &str,
-        content: &str,
-        token: Option<&str>,
-        language_id: Option<&str>,
-    ) -> Option<String> {
-        self.detect_language_logged(path, content, token, language_id, log::Level::Trace)
-    }
-
     /// Canonical injection language for bridge selection and virtual URIs.
     ///
-    /// Prefer the established parser-aware detection result. When no parser is
-    /// available yet, retain a normalized token, configured base, or first-line
-    /// candidate so eager bridge selection does not fall back to a raw alias.
+    /// Candidate selection deliberately does not inspect parser state: eager
+    /// bridge selection and virtual URIs must stay stable before and after a
+    /// parser loads. A configured base for the explicit identifier takes
+    /// precedence over generic token aliases, followed by first-line fallback.
+    /// Consequently, registering a parser under an alias such as `py` or `js`
+    /// does not change bridge keys/URIs: bridge configuration uses the canonical
+    /// `python`/`javascript` name unless that alias has an explicit base.
     pub(crate) fn canonical_injection_language(&self, identifier: &str, content: &str) -> String {
-        if let Some(language) =
-            self.detect_language_hot(identifier, content, Some(identifier), Some(identifier))
+        if identifier != "plaintext"
+            && let Some(base) = self.resolve_base(identifier)
         {
-            return language;
+            return base;
         }
         if let Some(candidate) = super::heuristic::detect_from_token(identifier) {
             return self.resolve_base(&candidate).unwrap_or(candidate);
-        }
-        if let Some(base) = self.resolve_base(identifier) {
-            return base;
         }
         if let Some(candidate) = super::heuristic::detect_from_first_line(content) {
             return self.resolve_base(&candidate).unwrap_or(candidate);
