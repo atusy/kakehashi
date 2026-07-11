@@ -486,6 +486,7 @@ mod tests {
         let registry = server.language.language_registry_for_parallel();
         registry.register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
         registry.register("python".to_string(), tree_sitter_python::LANGUAGE.into());
+        registry.register("lua".to_string(), tree_sitter_lua::LANGUAGE.into());
         let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
         let injection_query = Query::new(
             &markdown_language,
