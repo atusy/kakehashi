@@ -290,10 +290,10 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     let edit_guard = edit_lock.lock().await;
     let current_incarnation = documents.get(&uri).map(|doc| doc.incarnation());
     if current_incarnation != Some(incarnation) {
-        drop(edit_guard);
         if current_incarnation.is_none() {
             documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
         }
+        drop(edit_guard);
         return;
     }
 
@@ -347,15 +347,21 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         let diagnostics =
             collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
 
-        // Collection can outlive the timer body's entry gate. Reject a closed
-        // document or a new lifetime at the last boundary before mutating the
-        // diagnostic cache/editor; didClose also aborts this registered task and
-        // clears the host, but the incarnation check makes stale publication
-        // independently impossible.
-        if publish_documents
+        // Collection can outlive the timer body's entry gate. Serialize the
+        // final liveness check + publication with didClose's
+        // `clear_document_state_on_close` edit-lock section: publish-first is
+        // cleared by the following close, while close-first observes no matching
+        // lifetime and returns. didClose also aborts this registered task.
+        let publish_edit_lock = publish_documents.edit_lock(&uri_clone);
+        let publish_edit_guard = publish_edit_lock.lock().await;
+        let current_incarnation = publish_documents
             .get(&uri_clone)
-            .is_none_or(|doc| doc.incarnation() != incarnation)
-        {
+            .map(|doc| doc.incarnation());
+        if current_incarnation != Some(incarnation) {
+            if current_incarnation.is_none() {
+                publish_documents.remove_edit_lock_if_unshared(&uri_clone, &publish_edit_lock);
+            }
+            drop(publish_edit_guard);
             return;
         }
 
@@ -380,6 +386,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
                 publisher.publish_pull_layer(&uri_clone, diagnostics).await;
             }
         }
+        drop(publish_edit_guard);
     });
 
     // Register with SyntheticDiagnosticsManager for superseding
