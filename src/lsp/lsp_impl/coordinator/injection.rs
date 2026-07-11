@@ -441,9 +441,7 @@ mod tests {
 
         let edit_lock = server.documents.edit_lock(&uri);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), edit_lock.lock())
-                .await
-                .is_err(),
+            edit_lock.try_lock().is_err(),
             "the old injection pass must still own the lifecycle guard"
         );
         release.notify_one();
