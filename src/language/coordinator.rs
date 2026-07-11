@@ -575,6 +575,7 @@ impl LanguageCoordinator {
         search_paths: &[PathBuf],
         language: &tree_sitter::Language,
     ) -> LanguageLoadResult {
+        self.query_store.remove_queries(derived_name);
         self.register_configured_language(derived_name, language.clone());
         self.derived_languages
             .write()
@@ -3412,6 +3413,36 @@ mod tests {
         assert!(
             summary.loaded.contains(&"rmd".to_string()),
             "leaf derived 'rmd' should load"
+        );
+    }
+
+    #[test]
+    fn derived_registration_replaces_standalone_queries() {
+        let coordinator = LanguageCoordinator::new();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        coordinator.query_store.insert_highlight_query(
+            "derived".to_string(),
+            std::sync::Arc::new(
+                tree_sitter::Query::new(&language, "(identifier) @variable").unwrap(),
+            ),
+        );
+
+        let result = coordinator.register_derived_from_base(
+            "derived",
+            "base",
+            &crate::config::settings::LanguageSettings {
+                base: Some("base".to_string()),
+                ..Default::default()
+            },
+            None,
+            &[],
+            &language,
+        );
+
+        assert!(result.success);
+        assert!(
+            coordinator.highlight_query("derived").is_none(),
+            "query kinds absent from the new base must not survive standalone-to-derived reload"
         );
     }
 
