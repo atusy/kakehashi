@@ -1391,10 +1391,20 @@ impl LanguageCoordinator {
             content.len()
         );
 
-        // 1. Try direct identifier first (skip "plaintext")
-        if identifier != "plaintext"
-            && let Some(found) = self.try_load_with_base(identifier)
-        {
+        // 1. Try the identifier first. Explicit plaintext remains featureless
+        // unless it has an eligible configured base mapping; loading plaintext
+        // itself or applying content heuristics would violate that explicit key.
+        if identifier == "plaintext" {
+            let base = self.resolve_base(identifier)?;
+            let found = self.try_load_with_base(&base)?;
+            log::trace!(
+                target: "kakehashi::language_detection",
+                "Resolved injection '{}' -> '{}' via configured plaintext base",
+                identifier, found.0
+            );
+            return Some(found);
+        }
+        if let Some(found) = self.try_load_with_base(identifier) {
             log::trace!(
                 target: "kakehashi::language_detection",
                 "Resolved injection '{}' -> '{}' via identifier (direct or base)",
@@ -1939,6 +1949,42 @@ mod tests {
         let (resolved, load_result) = result.unwrap();
         assert_eq!(resolved, "markdown");
         assert!(load_result.success);
+    }
+
+    #[test]
+    fn test_injection_plaintext_uses_eligible_config_base() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+        coordinator.build_base_map(&HashMap::from([(
+            "plaintext".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("python".to_string()),
+                ..Default::default()
+            },
+        )]));
+
+        let (resolved, load_result) = coordinator
+            .resolve_injection_language("plaintext", "#!/usr/bin/env ruby")
+            .expect("eligible plaintext base must drive parser resolution");
+
+        assert_eq!(resolved, "python");
+        assert!(load_result.success);
+    }
+
+    #[test]
+    fn test_injection_plaintext_without_base_stays_featureless() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+
+        assert!(
+            coordinator
+                .resolve_injection_language("plaintext", "#!/usr/bin/env python")
+                .is_none()
+        );
     }
 
     #[test]
