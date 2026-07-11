@@ -82,7 +82,9 @@ base = "markdown"
 This ensures:
 - **Consistent behavior**: All detection paths apply the same base logic
 - **User control**: Users can define mappings that work at any detection level
-- **Alignment with injection**: Document-level and injection-level detection behave the same way
+- **Shared base semantics**: Document parser resolution and injection bridge
+  canonicalization both honor eligible bases, while their surrounding fallback
+  chains intentionally differ as described below (including explicit `plaintext`).
 
 Example scenarios:
 - Editor sends `languageId: "rmd"` → base resolves to `markdown` → parser found
