@@ -291,41 +291,39 @@ pub(crate) fn collect_all_injections<'a>(
         if !check_match_predicates(query, match_, text) {
             continue;
         }
+        let Some(language) = extract_injection_language(query, match_, text) else {
+            continue;
+        };
         for capture in iter_injection_content_captures(match_, query) {
             if capture.node.start_byte() >= capture.node.end_byte() {
                 continue;
             }
-            if let Some(language) = extract_injection_language(query, match_, text) {
-                let key = (
-                    capture.node.start_byte(),
-                    capture.node.end_byte(),
-                    language.clone(),
-                    match_.pattern_index,
-                );
-                // `or_insert_with` so the per-pattern predicate scans
-                // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
-                // are skipped when this content-node range was already inserted by
-                // an earlier matching pattern for the same language. Same
-                // resulting language layers, fewer scans.
-                injections_map.entry(key).or_insert_with(|| {
-                    let offset = effective_offset_for_pattern(query, match_.pattern_index);
-                    InjectionRegionInfo {
-                        language,
-                        content_node: capture.node,
-                        pattern_index: match_.pattern_index,
-                        include_children: has_include_children_for_pattern(
-                            query,
-                            match_.pattern_index,
-                        ),
-                        // Match the semantic path: effective offsets and
-                        // multi-region grouping do not compose safely.
-                        combined: has_combined_for_pattern(query, match_.pattern_index)
-                            && offset.is_none(),
-                        identity_slot: 0,
-                        offset,
-                    }
-                });
-            }
+            let key = (
+                capture.node.start_byte(),
+                capture.node.end_byte(),
+                language.clone(),
+                match_.pattern_index,
+            );
+            // `or_insert_with` so the per-pattern predicate scans
+            // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
+            // are skipped when this content-node range was already inserted by
+            // an earlier matching pattern for the same language. Same
+            // resulting language layers, fewer scans.
+            injections_map.entry(key).or_insert_with(|| {
+                let offset = effective_offset_for_pattern(query, match_.pattern_index);
+                InjectionRegionInfo {
+                    language: language.clone(),
+                    content_node: capture.node,
+                    pattern_index: match_.pattern_index,
+                    include_children: has_include_children_for_pattern(query, match_.pattern_index),
+                    // Match the semantic path: effective offsets and
+                    // multi-region grouping do not compose safely.
+                    combined: has_combined_for_pattern(query, match_.pattern_index)
+                        && offset.is_none(),
+                    identity_slot: 0,
+                    offset,
+                }
+            });
         }
     }
 
