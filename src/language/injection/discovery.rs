@@ -558,14 +558,7 @@ impl InjectionResolver {
                 text,
             )
         } else {
-            Some(Self::build_resolved_injection(
-                coordinator,
-                tracker,
-                uri,
-                region,
-                text,
-                incarnation,
-            ))
+            Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
         }
     }
 
@@ -687,13 +680,13 @@ impl InjectionResolver {
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
             let mut region = first_cacheable.clone();
             region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
-            return ResolvedInjection {
+            return Some(ResolvedInjection {
                 region,
                 injection_language,
                 virtual_content,
                 line_column_offsets,
                 contiguous: true,
-            };
+            });
         }
         let group_start = first_cacheable.byte_range.start;
         let group_end = cacheable
@@ -1341,7 +1334,7 @@ mod tests {
         let uri = test_uri("combined");
 
         let resolved =
-            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query);
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query, 0);
 
         assert_eq!(resolved.len(), 1, "combined captures form one document");
         assert!(resolved[0].virtual_content.contains("<div>"));
@@ -1374,6 +1367,7 @@ mod tests {
             &tree,
             text,
             &query,
+            0,
         );
 
         assert_eq!(resolved.len(), 1);
@@ -1415,6 +1409,7 @@ mod tests {
             &tree,
             text,
             &query,
+            0,
         );
 
         assert_eq!(resolved.len(), 1);
@@ -1477,6 +1472,7 @@ mod tests {
             &tree,
             text,
             &query,
+            0,
         );
 
         assert_eq!(resolved.len(), 1);
@@ -1510,6 +1506,7 @@ mod tests {
             &tree,
             text,
             &query,
+            0,
         );
 
         assert_eq!(resolved.len(), 2);
@@ -1595,6 +1592,7 @@ mod tests {
             text,
             &query,
             15,
+            0,
         )
         .expect("comment position resolves");
 
