@@ -245,10 +245,6 @@ impl Kakehashi {
         if !load.success {
             return Some(None);
         }
-        let Some(query) = self.language.bindings_query(&layer_language) else {
-            return Some(None);
-        };
-
         let included_ranges =
             compute_included_ranges(&region.content_node, region.include_children);
         // The pooled spawn_blocking + timeout protocol every parse site
@@ -277,7 +273,15 @@ impl Kakehashi {
             .await;
 
         match parsed {
-            Some(layer_tree) => Some(Some((query, content_text, layer_tree, content_range.start))),
+            Some(layer_tree) => {
+                // Resolve after parse_with_pool: a reload can invalidate the
+                // first parser generation and make it retry with the new
+                // grammar, whose bindings query must accompany that tree.
+                let Some(query) = self.language.bindings_query(&layer_language) else {
+                    return Some(None);
+                };
+                Some(Some((query, content_text, layer_tree, content_range.start)))
+            }
             None => Some(None),
         }
     }
