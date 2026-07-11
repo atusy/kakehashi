@@ -406,7 +406,6 @@ impl InjectionCoordinator {
 mod tests {
     use super::InjectionResolver;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Notify;
     use tower_lsp_server::LspService;
     use tree_sitter::Query;
@@ -440,37 +439,22 @@ mod tests {
         });
         entered.notified().await;
 
-        let reopen_waiting = Arc::new(Notify::new());
-        let reopened = Arc::new(AtomicBool::new(false));
-        let documents = Arc::clone(&server.documents);
-        let reopen_uri = uri.clone();
-        let reopen_waiting_task = Arc::clone(&reopen_waiting);
-        let reopened_task = Arc::clone(&reopened);
-        let reopen = tokio::spawn(async move {
-            let edit_lock = documents.edit_lock(&reopen_uri);
-            reopen_waiting_task.notify_one();
-            let _guard = edit_lock.lock().await;
-            documents.remove_preserving_edit_lock(&reopen_uri);
-            let incarnation = documents.insert(
-                reopen_uri,
-                "# new".to_string(),
-                Some("markdown".to_string()),
-                None,
-            );
-            reopened_task.store(true, Ordering::Release);
-            incarnation
-        });
-        reopen_waiting.notified().await;
-
+        let edit_lock = server.documents.edit_lock(&uri);
         assert!(
-            !reopened.load(Ordering::Acquire),
-            "reopen must remain behind the old injection pass's lifecycle guard"
+            tokio::time::timeout(std::time::Duration::from_millis(50), edit_lock.lock())
+                .await
+                .is_err(),
+            "the old injection pass must still own the lifecycle guard"
         );
         release.notify_one();
         process.await.unwrap();
-        let new_incarnation = reopen.await.unwrap();
+        let _guard = edit_lock.lock().await;
+        server.documents.remove_preserving_edit_lock(&uri);
+        let new_incarnation =
+            server
+                .documents
+                .insert(uri, "# new".to_string(), Some("markdown".to_string()), None);
 
-        assert!(reopened.load(Ordering::Acquire));
         assert_ne!(new_incarnation, old_incarnation);
     }
 
