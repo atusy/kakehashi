@@ -13,14 +13,14 @@ use super::super::protocol::VirtualDocumentUri;
 struct LifecycleCleanup<'a> {
     pool: &'a LanguageServerPool,
     host_uri: &'a url::Url,
-    lifecycle: Arc<tokio::sync::Mutex<()>>,
+    lifecycle: &'a Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Drop for LifecycleCleanup<'_> {
     fn drop(&mut self) {
         if self.pool.current_host_incarnation(self.host_uri).is_none() {
             self.pool
-                .remove_host_lifecycle_lock_if_unshared(self.host_uri, &self.lifecycle);
+                .remove_host_lifecycle_lock_if_unshared(self.host_uri, self.lifecycle);
         }
     }
 }
@@ -72,7 +72,7 @@ impl LanguageServerPool {
         let _lifecycle_cleanup = LifecycleCleanup {
             pool: self,
             host_uri,
-            lifecycle: Arc::clone(&lifecycle),
+            lifecycle: &lifecycle,
         };
         for injection in injections {
             // Hold the host cache guard through didOpen. didClose/reopen replaces
