@@ -159,7 +159,7 @@ impl Kakehashi {
             // Multi-line code-fence injections (`start_column == 0`) are
             // unchanged because their line and byte bounds are equivalent.
             let mapper = PositionMapper::new(snapshot.text());
-            let request_bytes = clamp_request_to_document(&mapper, snapshot.text(), host_range);
+            let request_bytes = clamp_request_to_document(&mapper, host_range);
 
             let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
 
@@ -434,13 +434,9 @@ impl Kakehashi {
 /// pair to `[min, max]` rather than collapsing it to an empty range — the two
 /// positions still describe the span the user selected, so formatting it is
 /// more useful than silently doing nothing.
-fn clamp_request_to_document(
-    mapper: &PositionMapper,
-    text: &str,
-    range: Range,
-) -> std::ops::Range<usize> {
-    let start = mapper.position_to_byte_clamped(text, range.start);
-    let end = mapper.position_to_byte_clamped(text, range.end);
+fn clamp_request_to_document(mapper: &PositionMapper, range: Range) -> std::ops::Range<usize> {
+    let start = mapper.position_to_byte_clamped(range.start);
+    let end = mapper.position_to_byte_clamped(range.end);
     start.min(end)..start.max(end)
 }
 
@@ -588,7 +584,7 @@ mod tests {
         let mapper = PositionMapper::new(text);
         let range = pos_range(0, 0, 999, 0);
 
-        let bytes = clamp_request_to_document(&mapper, text, range);
+        let bytes = clamp_request_to_document(&mapper, range);
         assert_eq!(bytes, 0..text.len());
     }
 
@@ -600,7 +596,7 @@ mod tests {
         let mapper = PositionMapper::new(text);
         let range = pos_range(999, 0, 999, 5);
 
-        let bytes = clamp_request_to_document(&mapper, text, range);
+        let bytes = clamp_request_to_document(&mapper, range);
         assert_eq!(bytes, text.len()..text.len());
     }
 
@@ -615,7 +611,7 @@ mod tests {
         let mapper = PositionMapper::new(text);
         let range = pos_range(0, 0, 0, 999);
 
-        let bytes = clamp_request_to_document(&mapper, text, range);
+        let bytes = clamp_request_to_document(&mapper, range);
         assert_eq!(bytes, 0..10);
     }
 
@@ -629,7 +625,7 @@ mod tests {
         let mapper = PositionMapper::new(text);
         let range = pos_range(1, 5, 0, 2);
 
-        let bytes = clamp_request_to_document(&mapper, text, range);
+        let bytes = clamp_request_to_document(&mapper, range);
         assert_eq!(bytes, 2..16);
     }
 

@@ -30,7 +30,7 @@ use crate::text::PositionMapper;
 pub(crate) struct NativeBindingsContext<'a> {
     pub(crate) model: &'a BindingsModel,
     pub(crate) byte: usize,
-    pub(crate) mapper: &'a PositionMapper,
+    pub(crate) mapper: &'a PositionMapper<'a>,
     pub(crate) layer_offset: usize,
 }
 

@@ -2,19 +2,20 @@ use line_index::{LineIndex, WideEncoding, WideLineCol};
 use tower_lsp_server::ls_types::Position;
 
 /// Position mapper for converting between LSP positions and byte offsets
-pub struct PositionMapper {
+pub struct PositionMapper<'text> {
     line_index: LineIndex,
+    text: &'text str,
 }
 
-impl PositionMapper {
+impl<'text> PositionMapper<'text> {
     /// Create a new PositionMapper with pre-computed line starts
-    pub fn new(text: &str) -> Self {
+    pub fn new(text: &'text str) -> Self {
         let line_index = LineIndex::new(text);
-        Self { line_index }
+        Self { line_index, text }
     }
 }
 
-impl PositionMapper {
+impl PositionMapper<'_> {
     /// Convert LSP Position to byte offset in the document
     pub fn position_to_byte(&self, position: Position) -> Option<usize> {
         // LSP positions are UTF-16 based
@@ -47,22 +48,27 @@ impl PositionMapper {
     /// An in-bounds position maps exactly (identical to `position_to_byte`):
     /// the largest in-bounds offset on a line is its end-of-content, which is
     /// `<= line(l).end()`, so the `min` never alters it.
-    pub fn position_to_byte_clamped(&self, text: &str, position: Position) -> usize {
+    pub fn position_to_byte_clamped(&self, position: Position) -> usize {
         match self.line_index.line(position.line) {
             // Line exists: take the mapped offset but clamp it to the line's
             // end so an over-long character can't spill past this line.
             Some(line_range) => {
                 let line_start: usize = line_range.start().into();
                 let line_range_end: usize = line_range.end().into();
-                let line = &text[line_start..line_range_end];
+                let line = &self.text[line_start..line_range_end];
                 let content = line
                     .strip_suffix('\n')
                     .map(|line| line.strip_suffix('\r').unwrap_or(line))
                     .unwrap_or(line);
                 let line_end = line_start + content.len();
-                self.position_to_byte(position)
+                let mut byte = self
+                    .position_to_byte(position)
                     .unwrap_or(line_end)
-                    .min(line_end)
+                    .min(line_end);
+                while !self.text.is_char_boundary(byte) {
+                    byte -= 1;
+                }
+                byte
             }
             // The line itself is past EOF: clamp to the document end.
             None => self.line_index.len().into(),
@@ -396,7 +402,7 @@ mod tests {
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
         assert_eq!(
-            mapper.position_to_byte_clamped(text, Position::new(1, 2)),
+            mapper.position_to_byte_clamped(Position::new(1, 2)),
             mapper.position_to_byte(Position::new(1, 2)).unwrap()
         );
     }
@@ -408,10 +414,15 @@ mod tests {
         // clamps there, not to the start of line 1 or the document end.
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
-        assert_eq!(
-            mapper.position_to_byte_clamped(text, Position::new(0, 999)),
-            5
-        );
+        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 5);
+    }
+
+    #[test]
+    fn clamped_floors_utf16_position_inside_surrogate_pair() {
+        let text = "👋x\n";
+        let mapper = PositionMapper::new(text);
+
+        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 1)), 0);
     }
 
     #[test]
@@ -446,7 +457,7 @@ mod tests {
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
         assert_eq!(
-            mapper.position_to_byte_clamped(text, Position::new(99, 0)),
+            mapper.position_to_byte_clamped(Position::new(99, 0)),
             text.len()
         );
     }

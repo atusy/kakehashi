@@ -1396,8 +1396,8 @@ fn execute_captures_walk(
     // same forgiveness range_formatting applies, rather than collapsing
     // to null (which the protocol reserves for unresolvable states).
     let byte_range = lsp_range.map(|r| {
-        let a = mapper.position_to_byte_clamped(text, r.start);
-        let b = mapper.position_to_byte_clamped(text, r.end);
+        let a = mapper.position_to_byte_clamped(r.start);
+        let b = mapper.position_to_byte_clamped(r.end);
         a.min(b)..a.max(b)
     });
 
@@ -3049,12 +3049,12 @@ mod tests {
                     .lookup_node(&rig.uri, &id)
                     .expect("a current serve mints resolvable ids");
                 assert_eq!(
-                    mapper.position_to_byte_clamped(&text, to_pos(&c["range"]["start"])),
+                    mapper.position_to_byte_clamped(to_pos(&c["range"]["start"])),
                     s,
                     "capture start must be the id's own tracked start"
                 );
                 assert_eq!(
-                    mapper.position_to_byte_clamped(&text, to_pos(&c["range"]["end"])),
+                    mapper.position_to_byte_clamped(to_pos(&c["range"]["end"])),
                     e,
                     "capture end must be the id's own tracked end"
                 );

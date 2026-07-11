@@ -57,10 +57,8 @@ pub(crate) fn apply_content_changes_with_edits(
             // inverts. Clamping to line content also keeps an overlong column
             // from consuming that line's terminator (#707).
             let mapper = PositionMapper::new(&text);
-            let start_offset = mapper.position_to_byte_clamped(&text, range.start);
-            let end_offset = mapper
-                .position_to_byte_clamped(&text, range.end)
-                .max(start_offset);
+            let start_offset = mapper.position_to_byte_clamped(range.start);
+            let end_offset = mapper.position_to_byte_clamped(range.end).max(start_offset);
 
             // Once a full replacement has landed in this batch the edits will be
             // discarded at the end (the batch is a full sync), so skip building the
