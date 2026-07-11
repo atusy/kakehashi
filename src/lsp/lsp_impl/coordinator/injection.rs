@@ -186,6 +186,10 @@ impl InjectionCoordinator {
             return;
         }
 
+        // Stop the previous pass before closing a replaced language-bearing URI;
+        // otherwise an old eager task can enqueue didOpen after the close and
+        // resurrect the stale URI. The new batch is created below after cleanup.
+        self.bridge.cancel_eager_open(uri);
         let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
         for region_id in replaced_regions {
             self.diagnostics
