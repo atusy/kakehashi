@@ -51,6 +51,18 @@ impl LanguageServerPool {
 
         // For each injection, check if it's actually opened and send didChange
         for injection in injections {
+            // Publish the latest content even when no downstream document is
+            // open yet. A first interactive request may still be awaiting the
+            // server handshake with an older snapshot; its didOpen consumes
+            // this value after taking the per-document transition. Keep the
+            // value after didOpen so a respawned server also reopens from the
+            // latest host content; unchanged edits avoid replacing it.
+            self.record_latest_virtual_content(
+                host_uri,
+                &injection.language,
+                &injection.region_id,
+                &injection.content,
+            );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
 

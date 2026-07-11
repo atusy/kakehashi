@@ -196,6 +196,7 @@ struct OpenClaimGuard {
 }
 
 type OpenTransitionLocks = DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>;
+type LatestVirtualContents = DashMap<Url, DashMap<(String, String), Arc<str>>>;
 
 impl OpenClaimGuard {
     fn disarm(&mut self) {
@@ -261,6 +262,10 @@ pub struct LanguageServerPool {
     /// Serializes didOpen enqueue/promotion, rollback, and didClose per exact
     /// downstream document so wire order matches tracker state transitions.
     open_transition_locks: Arc<OpenTransitionLocks>,
+    /// Latest extracted content observed from host didChange for each injection.
+    /// Interactive requests may carry an older snapshot while awaiting server
+    /// startup; the didOpen path reads this after claiming the transition.
+    latest_virtual_contents: LatestVirtualContents,
     /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
@@ -372,6 +377,7 @@ impl LanguageServerPool {
             shutting_down: AtomicBool::new(false),
             document_tracker: Arc::new(DocumentTracker::new()),
             open_transition_locks: Arc::new(DashMap::new()),
+            latest_virtual_contents: DashMap::new(),
             host_documents: Mutex::new(HashMap::new()),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
@@ -1077,6 +1083,21 @@ impl LanguageServerPool {
         self.document_tracker
             .register_pending_document(host_uri, virtual_uri, connection_key)
             .await;
+        // Read as close to enqueue as possible, after pending registration's
+        // awaits. If an edit publishes after this read, it observes the open
+        // claim and serializes a didChange behind this didOpen transition.
+        let current_content = self
+            .latest_virtual_contents
+            .get(host_uri)
+            .and_then(|contents| {
+                contents
+                    .get(&(
+                        virtual_uri.language().to_string(),
+                        virtual_uri.region_id().to_string(),
+                    ))
+                    .map(|entry| Arc::clone(entry.value()))
+            });
+        let virtual_content = current_content.as_deref().unwrap_or(virtual_content);
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
@@ -1111,6 +1132,45 @@ impl LanguageServerPool {
             .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content)
             .await;
         Ok(())
+    }
+
+    pub(crate) fn record_latest_virtual_content(
+        &self,
+        host_uri: &Url,
+        language: &str,
+        region_id: &str,
+        content: &str,
+    ) {
+        let contents = self
+            .latest_virtual_contents
+            .entry(host_uri.clone())
+            .or_default();
+        let key = (language.to_string(), region_id.to_string());
+        if contents
+            .get(&key)
+            .is_some_and(|cached| cached.as_ref() == content)
+        {
+            return;
+        }
+        contents.insert(key, Arc::<str>::from(content));
+    }
+
+    pub(crate) fn clear_latest_virtual_contents(&self, host_uri: &Url) {
+        self.latest_virtual_contents.remove(host_uri);
+    }
+
+    pub(crate) fn clear_invalidated_virtual_contents(
+        &self,
+        host_uri: &Url,
+        invalidated_ulids: &[ulid::Ulid],
+    ) {
+        let invalidated: std::collections::HashSet<String> =
+            invalidated_ulids.iter().map(ToString::to_string).collect();
+        if let Some(contents) = self.latest_virtual_contents.get(host_uri) {
+            contents.retain(|(_, region_id), _| !invalidated.contains(region_id));
+        }
+        self.latest_virtual_contents
+            .remove_if(host_uri, |_, contents| contents.is_empty());
     }
 
     /// Increment the version of a virtual document and return the new version,
@@ -3472,6 +3532,111 @@ mod tests {
             }
             _ => panic!("Expected Notification, got Request"),
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_document_opened_uses_edit_that_arrived_while_server_was_starting() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/stale-open.md").unwrap();
+        let host_uri_lsp = url_to_uri(&host_uri);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+
+        pool.forward_didchange_to_opened_docs(
+            &host_uri,
+            &[super::super::coordinator::BridgeInjection {
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_0.to_string(),
+                content: "print('current')".to_string(),
+            }],
+        )
+        .await;
+
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "print('stale')",
+            &connection_key,
+        )
+        .await
+        .unwrap();
+
+        let OutboundMessage::Untracked(message) = rx.try_recv().unwrap() else {
+            panic!("didOpen must be an untracked notification");
+        };
+        assert_eq!(
+            message["params"]["textDocument"]["text"],
+            "print('current')"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_close_reclaims_unopened_latest_virtual_content() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/cache-close.md").unwrap();
+        pool.forward_didchange_to_opened_docs(
+            &host_uri,
+            &[super::super::coordinator::BridgeInjection {
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_0.to_string(),
+                content: "print('cached')".to_string(),
+            }],
+        )
+        .await;
+        assert_eq!(pool.latest_virtual_contents.len(), 1);
+
+        assert!(pool.close_host_document(&host_uri).await.is_empty());
+
+        assert!(pool.latest_virtual_contents.is_empty());
+    }
+
+    #[test]
+    fn unchanged_latest_virtual_content_reuses_allocation() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/cache-dedup.md").unwrap();
+        pool.record_latest_virtual_content(&host_uri, "lua", TEST_ULID_LUA_0, "print('same')");
+        let before = Arc::clone(
+            pool.latest_virtual_contents
+                .get(&host_uri)
+                .unwrap()
+                .get(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
+                .unwrap()
+                .value(),
+        );
+
+        pool.record_latest_virtual_content(&host_uri, "lua", TEST_ULID_LUA_0, "print('same')");
+
+        let after = Arc::clone(
+            pool.latest_virtual_contents
+                .get(&host_uri)
+                .unwrap()
+                .get(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
+                .unwrap()
+                .value(),
+        );
+        assert!(Arc::ptr_eq(&before, &after));
+    }
+
+    #[tokio::test]
+    async fn invalidation_reclaims_only_matching_latest_virtual_content() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/cache-invalidation.md").unwrap();
+        pool.record_latest_virtual_content(&host_uri, "lua", TEST_ULID_LUA_0, "first");
+        pool.record_latest_virtual_content(&host_uri, "lua", TEST_ULID_LUA_1, "second");
+
+        pool.close_invalidated_docs(&host_uri, &[TEST_ULID_LUA_0.parse::<ulid::Ulid>().unwrap()])
+            .await;
+
+        let contents = pool.latest_virtual_contents.get(&host_uri).unwrap();
+        assert!(!contents.contains_key(&("lua".to_string(), TEST_ULID_LUA_0.to_string())));
+        assert!(contents.contains_key(&("lua".to_string(), TEST_ULID_LUA_1.to_string())));
+        drop(contents);
+
+        pool.close_invalidated_docs(&host_uri, &[TEST_ULID_LUA_1.parse::<ulid::Ulid>().unwrap()])
+            .await;
+        assert!(!pool.latest_virtual_contents.contains_key(&host_uri));
     }
 
     /// Test that ensure_document_opened skips didOpen when document is already opened.
