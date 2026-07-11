@@ -73,7 +73,8 @@ struct UriEntries {
     /// Collision-free discriminators for bridge injection alternatives. Kept
     /// with the URI lifecycle so document-controlled dynamic language names
     /// are reclaimed on close instead of accumulating process-wide.
-    named_layers: HashMap<(usize, String), usize>,
+    named_layers: HashMap<usize, HashMap<String, usize>>,
+    next_named_layer: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -100,19 +101,20 @@ impl UriEntries {
         }
         if incarnation > self.latest_incarnation {
             self.named_layers.clear();
+            self.next_named_layer = 0;
         }
         self.latest_incarnation = incarnation;
-        let next = self.named_layers.len();
-        match self
-            .named_layers
-            .entry((pattern_index, language.to_owned()))
-        {
-            Entry::Occupied(entry) => Some(*entry.get()),
-            Entry::Vacant(entry) => (next < usize::MAX / 2 + 1).then(|| {
-                entry.insert(next);
-                next
-            }),
+        let languages = self.named_layers.entry(pattern_index).or_default();
+        if let Some(slot) = languages.get(language) {
+            return Some(*slot);
         }
+        let slot = self.next_named_layer;
+        if slot > usize::MAX / 2 {
+            return None;
+        }
+        languages.insert(language.to_owned(), slot);
+        self.next_named_layer += 1;
+        Some(slot)
     }
 
     /// Get or insert a ULID for a position key, keeping both maps in sync.
@@ -179,6 +181,7 @@ impl UriEntries {
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
         if self.latest_incarnation <= closing_incarnation {
             self.named_layers.clear();
+            self.next_named_layer = 0;
         }
     }
 }
@@ -807,6 +810,7 @@ impl NodeTracker {
             latest_incarnation: entries.latest_incarnation,
             shift_gen: entries.shift_gen + 1,
             named_layers: std::mem::take(&mut entries.named_layers),
+            next_named_layer: entries.next_named_layer,
         };
 
         for (key, tracked) in entries.drain() {
