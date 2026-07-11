@@ -69,14 +69,17 @@ impl LanguageServerPool {
                 Some(lifecycle) => Some(lifecycle.lock().await),
                 None => None,
             };
+            let current_incarnation = self
+                .latest_virtual_contents
+                .get(host_uri)
+                .map(|host| host.incarnation);
             if let Some(expected) = expected_incarnation
-                && self
-                    .latest_virtual_contents
-                    .get(host_uri)
-                    .is_none_or(|host| host.incarnation != expected)
+                && current_incarnation != Some(expected)
             {
                 drop(lifecycle_guard);
-                if let Some(lifecycle) = &lifecycle {
+                if current_incarnation.is_none()
+                    && let Some(lifecycle) = &lifecycle
+                {
                     self.remove_host_lifecycle_lock_if_unshared(host_uri, lifecycle);
                 }
                 return;

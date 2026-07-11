@@ -3814,6 +3814,7 @@ mod tests {
         )
         .await;
         assert!(!pool.is_document_opened(&virtual_uri));
+        assert!(pool.host_lifecycle_locks.contains_key(&host_uri));
 
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         pool.ensure_document_opened(
