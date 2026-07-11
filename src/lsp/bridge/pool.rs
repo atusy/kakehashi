@@ -1075,6 +1075,17 @@ impl LanguageServerPool {
             connection_key: connection_key.clone(),
             armed: true,
         };
+        // Register host_to_virtual BEFORE send so that close_host_document
+        // can find this document even if the task is aborted after send.
+        // The single-writer loop (ls-bridge-message-ordering) guarantees FIFO ordering, so
+        // any subsequent didClose queued by close_host_document will arrive
+        // after didOpen on the wire.
+        self.document_tracker
+            .register_pending_document(host_uri, virtual_uri, connection_key)
+            .await;
+        // Read as close to enqueue as possible, after pending registration's
+        // awaits. If an edit publishes after this read, it observes the open
+        // claim and serializes a didChange behind this didOpen transition.
         let current_content = self
             .latest_virtual_contents
             .get(host_uri)
@@ -1087,14 +1098,6 @@ impl LanguageServerPool {
                     .map(|entry| Arc::clone(entry.value()))
             });
         let virtual_content = current_content.as_deref().unwrap_or(virtual_content);
-        // Register host_to_virtual BEFORE send so that close_host_document
-        // can find this document even if the task is aborted after send.
-        // The single-writer loop (ls-bridge-message-ordering) guarantees FIFO ordering, so
-        // any subsequent didClose queued by close_host_document will arrive
-        // after didOpen on the wire.
-        self.document_tracker
-            .register_pending_document(host_uri, virtual_uri, connection_key)
-            .await;
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
