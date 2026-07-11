@@ -32,7 +32,7 @@ pub struct DocumentParserPool {
     /// Factory for creating new parsers
     factory: ParserFactory,
     generation: u64,
-    reload_in_progress: bool,
+    reload_depth: usize,
 }
 
 impl DocumentParserPool {
@@ -42,24 +42,24 @@ impl DocumentParserPool {
             available: HashMap::new(),
             factory,
             generation: 0,
-            reload_in_progress: false,
+            reload_depth: 0,
         }
     }
 
     pub(crate) fn begin_reload(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.available.clear();
-        self.reload_in_progress = true;
+        self.reload_depth = self.reload_depth.saturating_add(1);
     }
 
     pub(crate) fn finish_reload(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.available.clear();
-        self.reload_in_progress = false;
+        self.reload_depth = self.reload_depth.saturating_sub(1);
     }
 
     pub(crate) fn acquire_versioned(&mut self, language_id: &str) -> Option<(Parser, u64)> {
-        if self.reload_in_progress {
+        if self.reload_depth != 0 {
             return None;
         }
         let generation = self.generation;

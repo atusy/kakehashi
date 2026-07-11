@@ -959,9 +959,15 @@ mod tests {
         pool.release("test".to_string(), tree_sitter::Parser::new());
 
         pool.begin_reload();
+        pool.begin_reload();
         assert!(
             pool.acquire_versioned("test").is_none(),
             "no parser checkout may start inside the reload window"
+        );
+        pool.finish_reload();
+        assert!(
+            pool.acquire_versioned("test").is_none(),
+            "one reload finishing must not close an overlapping reload window"
         );
         pool.finish_reload();
         pool.release("test".to_string(), tree_sitter::Parser::new());
