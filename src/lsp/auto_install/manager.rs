@@ -269,8 +269,9 @@ impl AutoInstallManager {
         }
 
         // Claim before the network-backed support lookup so concurrent calls
-        // for the same language do not all fetch metadata. The RAII guard
-        // releases the claim on every lookup/error early return.
+        // for the same language do not all fetch metadata. Ordinary early
+        // returns release the RAII claim; a timeout transfers it to a detached
+        // keeper until the still-running blocking lookup exits.
         if !self.installing_languages.try_start_install(language) {
             events.push(InstallEvent::Log {
                 level: MessageType::INFO,
