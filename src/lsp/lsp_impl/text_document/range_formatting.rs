@@ -235,23 +235,8 @@ impl Kakehashi {
                     &resolved.injection_language,
                     "textDocument/formatting",
                 );
-                let region_ctx = DocumentRequestContext {
-                    uri: uri.clone(),
-                    resolved: resolved.clone(),
-                    configs,
-                    upstream_request_id: upstream_request_id.clone(),
-                    priorities: agg.priorities,
-                    strategy: agg.strategy,
-                    max_fan_out: agg.max_fan_out,
-                    client_progress_token: None,
-                };
                 if matches!(
-                    plan_region_format(
-                        region_ctx.strategy,
-                        &region_ctx.priorities,
-                        &region_ctx.configs,
-                        region_ctx.max_fan_out,
-                    ),
+                    plan_region_format(agg.strategy, &agg.priorities, &configs, agg.max_fan_out,),
                     RegionFormatPlan::Skip | RegionFormatPlan::Disabled
                 ) {
                     continue;
@@ -262,7 +247,16 @@ impl Kakehashi {
                 )) {
                     continue;
                 }
-
+                let region_ctx = DocumentRequestContext {
+                    uri: uri.clone(),
+                    resolved: resolved.clone(),
+                    configs,
+                    upstream_request_id: upstream_request_id.clone(),
+                    priorities: agg.priorities,
+                    strategy: agg.strategy,
+                    max_fan_out: agg.max_fan_out,
+                    client_progress_token: None,
+                };
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning
                 // downstream).

@@ -321,6 +321,39 @@ impl Kakehashi {
                 &resolved.injection_language,
                 "textDocument/formatting",
             );
+            let pipeline =
+                plan_region_format(agg.strategy, &agg.priorities, &configs, agg.max_fan_out);
+            match &pipeline {
+                RegionFormatPlan::Skip => {
+                    log::warn!(
+                        target: "kakehashi::formatting",
+                        "concatenated formatting for {}->{} lists only unconfigured \
+                         server(s) {:?}; none are configured for this region, so it \
+                         is left unformatted (priorities is an allowlist — \
+                         non-listed servers are not run)",
+                        language_name,
+                        resolved.injection_language,
+                        agg.priorities,
+                    );
+                    continue;
+                }
+                RegionFormatPlan::Disabled => {
+                    log::debug!(
+                        target: "kakehashi::formatting",
+                        "formatting disabled for {}->{} (priorities = [])",
+                        language_name,
+                        resolved.injection_language,
+                    );
+                    continue;
+                }
+                RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
+            }
+            if !seen_edit_ranges.insert((
+                resolved.region.byte_range.start,
+                resolved.region.byte_range.end,
+            )) {
+                continue;
+            }
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved: resolved.clone(),
@@ -358,12 +391,7 @@ impl Kakehashi {
                     PRIORITIES_WILDCARD,
                 );
             }
-            let pipeline = match plan_region_format(
-                region_ctx.strategy,
-                &region_ctx.priorities,
-                &region_ctx.configs,
-                region_ctx.max_fan_out,
-            ) {
+            let pipeline = match pipeline {
                 RegionFormatPlan::Concatenated(servers) => {
                     // Capture the region's per-line host prefixes now, while
                     // the host snapshot is at hand: the pipeline's whole-region
@@ -383,45 +411,8 @@ impl Kakehashi {
                     Some((servers, host_line_prefixes))
                 }
                 RegionFormatPlan::Preferred => None,
-                RegionFormatPlan::Skip => {
-                    // `concatenated` with a non-empty `priorities` that names only
-                    // unconfigured servers: the allowlist resolved to nothing, so
-                    // running the region's other servers would violate it. Leave
-                    // the region unformatted and warn so the typo'd/missing name
-                    // surfaces instead of silently formatting with the wrong
-                    // server.
-                    log::warn!(
-                        target: "kakehashi::formatting",
-                        "concatenated formatting for {}->{} lists only unconfigured \
-                         server(s) {:?}; none are configured for this region, so it \
-                         is left unformatted (priorities is an allowlist — \
-                         non-listed servers are not run)",
-                        language_name,
-                        region_ctx.resolved.injection_language,
-                        region_ctx.priorities,
-                    );
-                    continue;
-                }
-                RegionFormatPlan::Disabled => {
-                    // priorities = []: the per-method fan-out kill switch
-                    // (aggregation-priorities-wildcard). Deliberate config, so
-                    // no warning — just skip the region.
-                    log::debug!(
-                        target: "kakehashi::formatting",
-                        "formatting disabled for {}->{} (priorities = [])",
-                        language_name,
-                        region_ctx.resolved.injection_language,
-                    );
-                    continue;
-                }
+                RegionFormatPlan::Skip | RegionFormatPlan::Disabled => unreachable!(),
             };
-            if !seen_edit_ranges.insert((
-                resolved.region.byte_range.start,
-                resolved.region.byte_range.end,
-            )) {
-                continue;
-            }
-
             // Mint this region's tracked-source token into the shared
             // aggregator ONLY for the preferred branch. Concatenated regions
             // (`pipeline.is_some()`) get no token — concatenated client progress
