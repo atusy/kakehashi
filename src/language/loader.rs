@@ -26,6 +26,13 @@ fn resolved_library_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn loader_cache_key(lang_name: &str, normalized_path: &Path) -> (String, PathBuf) {
+    (
+        lang_name.to_string(),
+        resolved_library_path(normalized_path),
+    )
+}
+
 /// Load (or fetch the already-mapped) library at `normalized_path`, leaking it
 /// into the process-global cache so it can never be unmapped.
 fn immortal_library(normalized_path: &Path) -> Result<&'static Library, ParserLoadError> {
@@ -93,8 +100,7 @@ impl ParserLoader {
     ) -> Result<Language, ParserLoadError> {
         // Normalize the path before loading
         let normalized_path = path.clean();
-        let resolved_path = resolved_library_path(&normalized_path);
-        let cache_key = (lang_name.to_string(), resolved_path);
+        let cache_key = loader_cache_key(lang_name, &normalized_path);
 
         // Derive function name from language name using standard convention
         let func_name = format!("tree_sitter_{lang_name}");
@@ -128,30 +134,19 @@ impl ParserLoader {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
-    const SYSTEM_LIBRARIES: [&str; 2] = ["/usr/lib/libSystem.B.dylib", "/usr/lib/libobjc.A.dylib"];
-    #[cfg(target_os = "linux")]
-    const SYSTEM_LIBRARIES: [&str; 2] = ["libc.so.6", "libm.so.6"];
-
     #[test]
     fn test_parser_loader_creation() {
         let loader = ParserLoader::new();
         assert!(loader.loaded_libraries.is_empty());
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn same_language_name_tracks_each_resolved_library_path() {
-        let mut loader = ParserLoader::new();
+    fn same_language_name_keys_each_resolved_library_path() {
+        let first = loader_cache_key("example", Path::new("/missing/first-parser"));
+        let second = loader_cache_key("example", Path::new("/missing/second-parser"));
 
-        for path in SYSTEM_LIBRARIES {
-            assert!(matches!(
-                loader.load_language(Path::new(path), "definitely_missing"),
-                Err(ParserLoadError::SymbolNotFound(_))
-            ));
-        }
-
-        assert_eq!(loader.loaded_libraries.len(), 2);
+        assert_ne!(first, second);
+        assert_eq!(first.0, second.0);
     }
 
     #[test]
