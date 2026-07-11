@@ -42,10 +42,7 @@ const PARSE_TIMEOUT: std::time::Duration = crate::language::injection::NATIVE_PA
 /// pool thread itself is protected by the in-parse abort, not by this.
 const PARSE_AWAIT_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
 
-#[cfg(not(test))]
 const RELOAD_WAIT_BACKSTOP: std::time::Duration = PARSE_TIMEOUT;
-#[cfg(test)]
-const RELOAD_WAIT_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Host-parse with a wall-clock abort — the shared
 /// [`parse_with_deadline`](crate::language::injection::parse_with_deadline)
@@ -207,7 +204,9 @@ impl ParseCoordinator {
                                 if std::time::Instant::now() >= reload_wait_deadline {
                                     return None;
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                // Leave enough scheduling room for the reload owner
+                                // to reacquire the mutex and close the window.
+                                std::thread::sleep(std::time::Duration::from_millis(5));
                             }
                             crate::language::parser_pool::ParserCheckout::Unavailable => {
                                 return None;

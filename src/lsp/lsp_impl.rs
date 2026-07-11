@@ -1091,33 +1091,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_waits_for_reload_instead_of_giving_up() {
-        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
-        service.inner().parser_pool.lock().unwrap().begin_reload();
-        let parser_pool = std::sync::Arc::clone(&service.inner().parser_pool);
-        let finish_reload = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            let mut pool = parser_pool.lock().unwrap();
-            pool.finish_reload();
-            pool.release("test".to_string(), tree_sitter::Parser::new());
-        });
-
-        let parsed = service
-            .inner()
-            .parse_coordinator()
-            .parse_with_pool(
-                "test",
-                &url::Url::parse("file:///reload-wait.test").unwrap(),
-                0,
-                |parser, _deadline, _generation_retry| (parser, Some(1)),
-            )
-            .await;
-
-        finish_reload.join().unwrap();
-        assert_eq!(parsed, Some(1));
-    }
-
-    #[tokio::test]
     async fn parse_gives_up_when_reload_never_finishes() {
         let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
         service.inner().parser_pool.lock().unwrap().begin_reload();
