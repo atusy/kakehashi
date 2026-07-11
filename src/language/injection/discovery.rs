@@ -696,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_base_beats_generic_token_alias_without_parser() {
+    fn configured_base_beats_syntect_token_normalization_without_parser() {
         let coordinator = LanguageCoordinator::new();
         coordinator.load_settings(&crate::config::WorkspaceSettings {
             languages: std::collections::HashMap::from([(

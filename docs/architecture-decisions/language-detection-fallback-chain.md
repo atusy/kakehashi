@@ -105,7 +105,7 @@ detect_language(path, content, token, language_id):
     effective_token = token OR extract_token_from_path(path)
     if effective_token exists:
         // Try syntect normalization (py → python, Makefile → make)
-        if syntect recognizes effective_token:
+        if normalized = syntect_detect(effective_token):
             if try_with_base_fallback(normalized) succeeds:
                 return result
         // Try raw token with base fallback (handles jsx, tsx)
