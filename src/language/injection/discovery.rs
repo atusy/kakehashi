@@ -532,8 +532,6 @@ fn find_injection_at_position<'a>(
 pub(crate) struct ResolvedInjection {
     /// Cacheable injection region with line range information
     pub region: CacheableInjectionRegion,
-    /// Raw language identifier captured or assigned by the injection query.
-    pub raw_injection_language: String,
     /// Language of the injection content
     pub injection_language: String,
     /// Extracted virtual document content. Excluded line prefixes are stripped;
@@ -678,7 +676,6 @@ impl InjectionResolver {
             Self::resolve_language(coordinator, &region.language, &virtual_content);
         Some(ResolvedInjection {
             region: cacheable_region,
-            raw_injection_language: region.language.clone(),
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
@@ -788,7 +785,6 @@ impl InjectionResolver {
             Self::resolve_language(coordinator, &first.language, &virtual_content);
         Some(ResolvedInjection {
             region: combined_region,
-            raw_injection_language: first.language.clone(),
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
@@ -850,7 +846,7 @@ impl InjectionResolver {
                     == Some(identity_layer)
         })?;
 
-        let resolved = if region.combined {
+        if region.combined {
             let group: Vec<_> = regions
                 .iter()
                 .filter(|candidate| {
@@ -859,17 +855,28 @@ impl InjectionResolver {
                         && candidate.language == region.language
                 })
                 .collect();
+            // Every capture in a combined group has a tracker ID, while the
+            // virtual document uses the first capture's ID as its canonical
+            // identity. Resolving any member ID must still reach that shared
+            // document rather than rejecting non-first captures below.
             Self::build_combined_injection(
                 coordinator,
                 Some((tracker, uri, incarnation)),
                 &group,
                 None,
                 text,
-            )?
+            )
         } else {
-            Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)?
-        };
-        (resolved.region.region_id == region_id).then_some(resolved)
+            let resolved = Self::build_resolved_injection(
+                coordinator,
+                tracker,
+                uri,
+                region,
+                text,
+                incarnation,
+            )?;
+            (resolved.region.region_id == region_id).then_some(resolved)
+        }
     }
 
     /// [`resolve_all`](Self::resolve_all) minus the injection-query run, for a
@@ -972,7 +979,6 @@ impl InjectionResolver {
                     Self::resolve_language(coordinator, &region.language, &virtual_content);
                 resolved.push(ResolvedInjection {
                     region: cacheable[index].clone(),
-                    raw_injection_language: region.language.clone(),
                     injection_language: resolved_language,
                     virtual_content,
                     line_column_offsets,
@@ -1450,6 +1456,24 @@ mod tests {
         assert!(resolved[0].virtual_content.contains("</div>"));
         assert!(!resolved[0].virtual_content.contains("let close"));
         assert!(!resolved[0].contiguous);
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+        let second_id = InjectionResolver::calculate_region_id(&tracker, &uri, &regions[1], 0)
+            .unwrap()
+            .to_string();
+        let via_second = InjectionResolver::resolve_by_region_id(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            &second_id,
+            0,
+        )
+        .expect("a non-first combined capture resolves the shared document");
+        assert_eq!(via_second.region.region_id, resolved[0].region.region_id);
+        assert_eq!(via_second.virtual_content, resolved[0].virtual_content);
     }
 
     #[test]

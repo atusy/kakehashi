@@ -413,7 +413,7 @@ fn parser_enabled_injection_language(language: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{InjectionResolver, parser_enabled_injection_language};
+    use super::parser_enabled_injection_language;
 
     #[test]
     fn explicit_plaintext_does_not_request_a_parser() {
@@ -423,7 +423,6 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tower_lsp_server::LspService;
-    use tree_sitter::Query;
     use url::Url;
 
     #[tokio::test]

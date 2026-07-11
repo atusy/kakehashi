@@ -344,7 +344,6 @@ mod tests {
                     region_id: "r0".to_string(),
                     content_hash: 0,
                 },
-                raw_injection_language: "rust".to_string(),
                 injection_language: "rust".to_string(),
                 virtual_content: String::new(),
                 line_column_offsets: vec![],
