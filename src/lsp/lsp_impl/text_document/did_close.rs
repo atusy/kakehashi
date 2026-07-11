@@ -48,6 +48,11 @@ impl Kakehashi {
         if let Some(closing_incarnation) = closing_incarnation {
             self.bridge.cleanup(uri, closing_incarnation);
         }
+        // `None` means another teardown already removed the document. Do not
+        // invent a maximal incarnation and wipe the tracker: a reopen can land
+        // between that absent observation and here, and its newer published IDs
+        // must survive. The first teardown already installed the close marker,
+        // which rejects any later stale mint, so skipping is leak-safe.
         self.synthetic_diagnostics.remove_document(uri);
         self.debounced_diagnostics.cancel(uri);
         self.bridge.cancel_eager_open(uri);

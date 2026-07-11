@@ -1270,9 +1270,12 @@ mod tests {
 
         // Phase 2: calculate_region_id uses position-based keys (not ordinals)
         // Different positions → different ULIDs regardless of language
-        let ulid_0 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0], 0);
-        let ulid_1 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[1], 0);
-        let ulid_2 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[2], 0);
+        let ulid_0 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0], 0)
+            .expect("unmanaged test tracker admits the mint");
+        let ulid_1 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[1], 0)
+            .expect("unmanaged test tracker admits the mint");
+        let ulid_2 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[2], 0)
+            .expect("unmanaged test tracker admits the mint");
 
         // All different because they have different byte positions
         assert_ne!(
@@ -1290,7 +1293,8 @@ mod tests {
 
         // Same position returns same ULID (stability)
         let ulid_0_again =
-            InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0], 0);
+            InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0], 0)
+                .expect("same-lifetime remint is admitted");
         assert_eq!(
             ulid_0, ulid_0_again,
             "Same position key should return same ULID"
