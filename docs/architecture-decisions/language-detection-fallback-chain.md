@@ -30,7 +30,7 @@ For bridge routing and virtual-document identity, first derive a
 parser-independent canonical injection candidate. Parser loading remains a
 later, separate decision.
 
-```
+```text
 1. LSP languageId  →  Try direct  →  Try base   →  If available: use it
                                                 →  If no: continue
 2. Token detection →  syntect     →  Try base   →  If available: use it
@@ -96,7 +96,7 @@ Example scenarios:
 
 Each detection method tries a direct match first, then base resolution:
 
-```
+```text
 detect_language(path, content, token, language_id):
     // 1. Try languageId (skip "plaintext")
     if language_id exists and != "plaintext":
@@ -139,7 +139,7 @@ This means:
 
 The fallback chain also applies to **injected languages** (e.g., code blocks in Markdown, JavaScript inside HTML). Injection queries extract a language identifier, but this identifier needs resolution:
 
-```
+```text
 Document (markdown) ──parse──▶ AST ──injection query──▶ "py" ──detect──▶ python
                                                       ▶ "sh" ──detect──▶ bash
 ```
