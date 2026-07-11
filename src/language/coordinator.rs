@@ -1516,8 +1516,7 @@ impl LanguageCoordinator {
                 let generation = self
                     .load_generation
                     .load(std::sync::atomic::Ordering::Acquire);
-                self.configured_load_failures
-                    .insert(lang_name.to_string(), generation);
+                self.record_configured_load_failure(lang_name, generation);
                 self.record_failed_load(lang_name, generation);
                 return result;
             }
@@ -1546,6 +1545,18 @@ impl LanguageCoordinator {
             .load(std::sync::atomic::Ordering::Acquire);
         self.dynamically_loaded
             .insert(language_id.to_string(), generation);
+    }
+
+    fn record_configured_load_failure(&self, language_id: &str, generation: u64) {
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::record_configured_load_failure");
+        self.configured_load_failures
+            .insert(language_id.to_string(), generation);
+        self.language_registry.unregister(language_id);
+        self.dynamically_loaded.remove(language_id);
+        self.query_store.remove_queries(language_id);
     }
 
     fn load_queries_for_language(
@@ -3364,6 +3375,27 @@ mod tests {
             !coordinator.ensure_language_loaded("markdown").success,
             "an explicit configured parser failure must not fall back to dynamic discovery"
         );
+    }
+
+    #[test]
+    fn configured_failure_removes_racing_dynamic_publication() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&WorkspaceSettings::default());
+        let generation = coordinator
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(coordinator.publish_dynamic_language(
+            "racing",
+            tree_sitter_rust::LANGUAGE.into(),
+            generation,
+            || {},
+        ));
+
+        coordinator.record_configured_load_failure("racing", generation);
+
+        assert!(!coordinator.language_registry.contains("racing"));
+        assert!(coordinator.dynamically_loaded.get("racing").is_none());
+        assert!(coordinator.configured_load_failed("racing", generation));
     }
 
     #[test]
