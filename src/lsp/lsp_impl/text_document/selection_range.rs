@@ -96,6 +96,7 @@ impl Kakehashi {
         }
         let expected_version = snapshot.parsed_version;
         let expected_incarnation = snapshot.incarnation;
+        let expected_settings_generation = self.cache.semantic_token_generation();
 
         // Run the synchronous injection-aware walk as one work-unit on the
         // compute pool against the snapshot's consistent (text, tree). The
@@ -130,7 +131,8 @@ impl Kakehashi {
                         && snapshot.incarnation == expected_incarnation
                 })
         });
-        if !still_current {
+        if !still_current || self.cache.semantic_token_generation() != expected_settings_generation
+        {
             return Err(crate::error::content_modified_error());
         }
 
