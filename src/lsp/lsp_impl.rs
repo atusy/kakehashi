@@ -926,8 +926,9 @@ mod tests {
                 "test",
                 &url::Url::parse("file:///reload-race.test").unwrap(),
                 0,
-                move |parser, _deadline| {
+                move |parser, _deadline, generation_retry| {
                     let call = calls_for_parse.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(generation_retry, call != 0);
                     if call == 0 {
                         let mut pool = parser_pool.lock().unwrap();
                         pool.invalidate();

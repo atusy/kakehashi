@@ -136,9 +136,10 @@ impl ParseCoordinator {
     /// work-unit on the bounded compute pool, with timeout.
     ///
     /// The caller provides the actual parse logic via `parse_fn`, which receives a
-    /// `tree_sitter::Parser` plus the work-unit's wall-clock deadline (feed it to
-    /// [`parse_text_with_deadline`]) and must return the parser along with an
-    /// optional result.
+    /// `tree_sitter::Parser`, the work-unit's wall-clock deadline (feed it to
+    /// [`parse_text_with_deadline`]), and whether this attempt follows a parser
+    /// generation change. Incremental callers must drop old-tree seeds on that
+    /// retry because the replacement parser may use a different grammar.
     /// The `parser_pool` sync mutex is acquired **only on the pool thread** (the
     /// parse-snapshot ADR's Stage-1 obligation: a tokio worker must never block on
     /// a mutex a compute thread holds), briefly around acquire and release; the
@@ -167,7 +168,7 @@ impl ParseCoordinator {
         parse_fn: F,
     ) -> Option<T>
     where
-        F: FnMut(tree_sitter::Parser, std::time::Instant) -> (tree_sitter::Parser, Option<T>)
+        F: FnMut(tree_sitter::Parser, std::time::Instant, bool) -> (tree_sitter::Parser, Option<T>)
             + Send
             + 'static,
         T: Send + 'static,
@@ -181,7 +182,7 @@ impl ParseCoordinator {
             self.compute_pool.run(None, move || {
                 let mut parse_fn = parse_fn;
                 let mut language_name_owned = language_name_owned;
-                for _attempt in 0..2 {
+                for attempt in 0..2 {
                     let (parser, parser_generation) = parser_pool
                         .lock()
                         .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
@@ -194,7 +195,7 @@ impl ParseCoordinator {
                     // tree-less until the next edit). The awaiter above covers
                     // queue + parse with slack, so the result is not dropped.
                     let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
-                    let (parser, value) = parse_fn(parser, deadline);
+                    let (parser, value) = parse_fn(parser, deadline, attempt != 0);
                     match parser_pool
                         .lock()
                         .recover_poison("ParseCoordinator::parse_with_pool(release)")
@@ -538,7 +539,7 @@ impl ParseCoordinator {
                     &language_name,
                     &uri,
                     text.len(),
-                    move |mut parser, deadline| {
+                    move |mut parser, deadline, _generation_retry| {
                         let _ = auto_install.begin_parsing(&language_name_clone);
                         let parse_result =
                             parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
@@ -807,7 +808,7 @@ impl ParseCoordinator {
                     &language_name,
                     &uri,
                     text_len,
-                    move |mut parser, deadline| {
+                    move |mut parser, deadline, _generation_retry| {
                         let _ = auto_install.begin_parsing(&language_name_clone);
                         let result =
                             parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
@@ -1000,12 +1001,16 @@ impl ParseCoordinator {
                 &language_name,
                 uri,
                 text_len,
-                move |mut parser, deadline| {
+                move |mut parser, deadline, generation_retry| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
                     let result = parse_text_with_deadline(
                         &mut parser,
                         &text_for_parse,
-                        seed.as_ref(),
+                        if generation_retry {
+                            None
+                        } else {
+                            seed.as_ref()
+                        },
                         deadline,
                     );
                     let _ = auto_install.end_parsing(&language_name_clone);

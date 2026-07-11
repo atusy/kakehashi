@@ -263,7 +263,7 @@ impl Kakehashi {
                 content_text.len(),
                 // The work-unit deadline is for main-document parses;
                 // parse_with_ranges self-bounds at NATIVE_PARSE_BUDGET.
-                move |mut parser, _deadline| {
+                move |mut parser, _deadline, _generation_retry| {
                     let tree = parse_with_ranges(
                         &mut parser,
                         &content_text_for_parse,
