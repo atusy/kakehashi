@@ -120,9 +120,17 @@ pub(super) async fn apply_shared_settings(
     // whole awaited propagate below. (The final bump after apply_settings
     // covers the settings-side inputs the apply swaps.)
     cache.bump_semantic_token_generation();
+    // Publish the settings snapshot before invalidating downstream connections:
+    // once propagation exposes a pool miss, a concurrent request must resolve
+    // the NEW launch config rather than respawn from the old snapshot (#587).
+    match raw_settings {
+        Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
+        None => settings_manager.apply_settings(settings),
+    }
+    let settings = settings_manager.load_settings();
     // Path c: push the new per-server settings to live downstream connections
     // at this single reload choke point (initialize, didChangeConfiguration,
-    // auto-install reload), before `settings` is consumed by the apply below.
+    // auto-install reload).
     // At initialize time there are no connections yet, so it is a clean no-op
     // (downstream-settings-propagation).
     let pushed = bridge.propagate_settings(&settings).await;
@@ -131,10 +139,6 @@ pub(super) async fn apply_shared_settings(
             target: "kakehashi::bridge",
             "Propagated settings change to {} downstream connection(s)", pushed
         );
-    }
-    match raw_settings {
-        Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
-        None => settings_manager.apply_settings(settings),
     }
     // A settings/query reload can change tokenization for unchanged text, so
     // bump the semantic-token cache generation once more: the ladder is one
