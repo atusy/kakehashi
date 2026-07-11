@@ -340,6 +340,14 @@ impl NodeTracker {
             .is_none_or(|current| *current == Some(incarnation))
     }
 
+    /// Reclaim an entry this call materialized only to lose the lifecycle
+    /// admission race. A concurrent reopen may already have edited or minted;
+    /// retain either signal (`shift_gen > 0` or non-empty ids).
+    fn remove_pristine_entry(&self, uri: &Url) {
+        self.entries
+            .remove_if(uri, |_, entry| entry.shift_gen == 0 && entry.len() == 0);
+    }
+
     /// Get or create a stable ULID for a **host-layer** tree-sitter node.
     ///
     /// Convenience for the common case (host tree, region content nodes): it
@@ -413,12 +421,16 @@ impl NodeTracker {
         // pattern to avoid DashMap lifetime ambiguity.)
         if let Some(mut entry) = self.entries.get_mut(uri) {
             if !self.admits_incarnation(uri, incarnation) {
+                drop(entry);
+                self.remove_pristine_entry(uri);
                 return Ulid::new();
             }
             return entry.get_or_insert(key, incarnation);
         }
         let mut entry = self.entries.entry(uri.clone()).or_default();
         if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
             return Ulid::new();
         }
         entry.get_or_insert(key, incarnation)
@@ -829,6 +841,8 @@ impl NodeTracker {
         }
         let entry = self.entries.entry(uri.clone()).or_default();
         if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
             return None;
         }
         let epoch = self
@@ -896,12 +910,16 @@ impl NodeTracker {
         // concurrent FIRST edit on a never-minted URI.
         if let Some(mut entry) = self.entries.get_mut(uri) {
             if !self.admits_incarnation(uri, incarnation) {
+                drop(entry);
+                self.remove_pristine_entry(uri);
                 return None;
             }
             return self.mint_batch_in_entry(&mut entry, expected, incarnation, keys);
         }
         let mut entry = self.entries.entry(uri.clone()).or_default();
         if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
             return None;
         }
         self.mint_batch_in_entry(&mut entry, expected, incarnation, keys)
