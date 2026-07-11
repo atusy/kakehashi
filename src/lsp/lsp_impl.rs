@@ -163,6 +163,7 @@ pub(super) async fn apply_shared_settings(
     // pre-reload checkouts, while this one rejects parsers acquired while the
     // registry and query stores were being replaced.
     drop(parser_reload);
+    crate::analysis::semantic::invalidate_thread_local_parser_caches();
     // Second bump IMMEDIATELY after the query swap, before any await: a
     // request that started after the transitional bump above but before the
     // swap computed against the OLD queries yet stamped the new generation —
