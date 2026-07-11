@@ -13,6 +13,7 @@ pub(crate) mod text_document;
 mod whole_document;
 mod workspace;
 
+use crate::error::LockResultExt;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::request::{
     GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
@@ -107,6 +108,29 @@ pub(super) struct ReloadLanguageState<'a> {
 /// publication after the synchronous language/query swap.
 static SETTINGS_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+struct ParserReloadGuard<'a> {
+    parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
+}
+
+impl<'a> ParserReloadGuard<'a> {
+    fn begin(parser_pool: &'a std::sync::Mutex<DocumentParserPool>) -> Self {
+        parser_pool
+            .lock()
+            .recover_poison("ParserReloadGuard::begin")
+            .begin_reload();
+        Self { parser_pool }
+    }
+}
+
+impl Drop for ParserReloadGuard<'_> {
+    fn drop(&mut self) {
+        self.parser_pool
+            .lock()
+            .recover_poison("ParserReloadGuard::drop")
+            .finish_reload();
+    }
+}
+
 pub(super) async fn apply_shared_settings(
     client: &Client,
     language_state: ReloadLanguageState<'_>,
@@ -128,11 +152,7 @@ pub(super) async fn apply_shared_settings(
     // built MID-swap against a half-updated query set.
     cache.bump_semantic_token_generation();
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
-    language_state
-        .parser_pool
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .begin_reload();
+    let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
     let mut summary = language_state.language.load_settings(&settings);
     let reparse_uris = if language_state.invalidate_documents {
         language_state.documents.invalidate_all_parses()
@@ -142,11 +162,7 @@ pub(super) async fn apply_shared_settings(
     // Invalidate again after the synchronous swap: the first bump rejects
     // pre-reload checkouts, while this one rejects parsers acquired while the
     // registry and query stores were being replaced.
-    language_state
-        .parser_pool
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .finish_reload();
+    drop(parser_reload);
     // Second bump IMMEDIATELY after the query swap, before any await: a
     // request that started after the transitional bump above but before the
     // swap computed against the OLD queries yet stamped the new generation —
@@ -1054,6 +1070,22 @@ mod tests {
         assert!(matches!(
             pool.acquire_versioned("test"),
             crate::language::parser_pool::ParserCheckout::Acquired(_, _)
+        ));
+    }
+
+    #[test]
+    fn parser_reload_guard_finishes_reload_during_unwind() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let parser_pool = &service.inner().parser_pool;
+        let unwind = std::panic::catch_unwind(|| {
+            let _reload = ParserReloadGuard::begin(parser_pool);
+            panic!("simulate reload failure");
+        });
+
+        assert!(unwind.is_err());
+        assert!(!matches!(
+            parser_pool.lock().unwrap().acquire_versioned("test"),
+            crate::language::parser_pool::ParserCheckout::Reloading
         ));
     }
 
