@@ -8,10 +8,10 @@
 //! calls `try_install()`, dispatches the events, and then handles
 //! post-install coordination (settings update, language reload).
 
-use std::path::PathBuf;
+use std::{future::Future, path::PathBuf};
 use tower_lsp_server::ls_types::MessageType;
 
-use crate::install::support_check::should_skip_unsupported_language;
+use crate::install::support_check::{SkipReason, should_skip_unsupported_language};
 use crate::language::FailedParserRegistry;
 
 use super::{InstallingLanguages, InstallingLanguagesExt};
@@ -226,6 +226,28 @@ impl AutoInstallManager {
     /// `SettingsManager` (Kakehashi checks settings first), or reload the
     /// language (Kakehashi handles post-install).
     pub async fn try_install(&self, language: &str) -> InstallResult {
+        self.try_install_with_support_check(language, |language, default_data_dir| async move {
+            let fetch_options =
+                default_data_dir
+                    .as_ref()
+                    .map(|dir| crate::install::metadata::FetchOptions {
+                        data_dir: Some(dir.as_path()),
+                        use_cache: true,
+                    });
+            should_skip_unsupported_language(&language, fetch_options.as_ref()).await
+        })
+        .await
+    }
+
+    async fn try_install_with_support_check<F, Fut>(
+        &self,
+        language: &str,
+        support_check: F,
+    ) -> InstallResult
+    where
+        F: FnOnce(String, Option<PathBuf>) -> Fut,
+        Fut: Future<Output = (bool, Option<SkipReason>)>,
+    {
         let mut events = Vec::new();
 
         // Check if parser previously failed (crash protection)
@@ -246,16 +268,8 @@ impl AutoInstallManager {
 
         // Check if language is supported by nvim-treesitter
         let default_data_dir = crate::install::default_data_dir();
-        let fetch_options =
-            default_data_dir
-                .as_ref()
-                .map(|dir| crate::install::metadata::FetchOptions {
-                    data_dir: Some(dir.as_path()),
-                    use_cache: true,
-                });
-
         let (should_skip, reason) =
-            should_skip_unsupported_language(language, fetch_options.as_ref()).await;
+            support_check(language.to_string(), default_data_dir.clone()).await;
 
         if let Some(reason) = &reason {
             events.push(InstallEvent::Log {
