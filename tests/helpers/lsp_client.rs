@@ -723,17 +723,18 @@ impl LspClient {
             let Value::Object(mut map) = message else {
                 continue;
             };
-            let method = map
-                .get("method")
-                .and_then(|m| m.as_str())
-                .map(str::to_string);
-            match (method, map.remove("id")) {
-                (Some(method), Some(id)) if method == expected_method => {
+            let method = map.get("method").and_then(|m| m.as_str());
+            match method {
+                Some(method) if method == expected_method && map.contains_key("id") => {
+                    let id = map.remove("id").expect("present: checked above");
                     let params = map.remove("params").unwrap_or(Value::Null);
                     return Some((id, params, watched));
                 }
-                (Some(method), None) if watch.contains(&method.as_str()) => {
-                    watched.push((method, map.remove("params").unwrap_or(Value::Null)));
+                Some(method) if !map.contains_key("id") && watch.contains(&method) => {
+                    watched.push((
+                        method.to_string(),
+                        map.remove("params").unwrap_or(Value::Null),
+                    ));
                 }
                 _ => {} // other request/response/notification — skip
             }
