@@ -553,10 +553,13 @@ pub fn remove_query_install_and_backups(
             let ownership = backup_ownership_sidecar(&path);
             // Same NotFound tolerance as the canonical dir above: a backup
             // deleted externally after enumeration is already the end state.
-            if remove_dir_all_tolerating_vanished(&path)? {
+            let removed_dir = remove_dir_all_tolerating_vanished(&path)?;
+            // The sidecar is a kakehashi-owned artifact too: deleting it
+            // counts as removal even when the dir itself vanished first.
+            let removed_sidecar = fs::remove_file(ownership).is_ok();
+            if removed_dir || removed_sidecar {
                 removal.removed_backups = true;
             }
-            let _ = fs::remove_file(ownership);
         }
     }
     Ok(removal)
