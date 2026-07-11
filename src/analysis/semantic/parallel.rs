@@ -149,7 +149,6 @@ impl LruParserCache {
     }
 
     /// Clear the cache.
-    #[cfg(test)]
     fn clear(&mut self) {
         self.parsers.clear();
         self.order.clear();
@@ -167,8 +166,15 @@ impl LruParserCache {
 // Each Rayon worker thread maintains its own bounded LRU cache of parsers.
 // This avoids cross-thread synchronization during parallel injection processing
 // while preventing unbounded memory growth in long-running LSP servers.
+static PARSER_CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
-    static PARSER_CACHE: RefCell<LruParserCache> = RefCell::new(LruParserCache::new());
+    static PARSER_CACHE: RefCell<(u64, LruParserCache)> =
+        RefCell::new((0, LruParserCache::new()));
+}
+
+pub(crate) fn invalidate_thread_local_parser_caches() {
+    PARSER_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 /// Factory for creating parsers with thread-local caching.
@@ -198,7 +204,13 @@ impl ThreadLocalParserFactory {
         included_ranges: Option<&[tree_sitter::Range]>,
     ) -> Option<Tree> {
         PARSER_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
+            let mut state = cache.borrow_mut();
+            let generation = PARSER_CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+            if state.0 != generation {
+                state.1.clear();
+                state.0 = generation;
+            }
+            let cache = &mut state.1;
 
             // Get or create parser for this language
             if !cache.contains(language_id) {
@@ -233,7 +245,7 @@ impl ThreadLocalParserFactory {
     #[cfg(test)]
     pub fn clear_cache() {
         PARSER_CACHE.with(|cache| {
-            cache.borrow_mut().clear();
+            cache.borrow_mut().1.clear();
         });
     }
 }
@@ -1580,6 +1592,18 @@ mod tests {
             !tree.root_node().has_error(),
             "Parse tree should not have errors"
         );
+    }
+
+    #[test]
+    fn reload_generation_clears_thread_local_parsers() {
+        ThreadLocalParserFactory::clear_cache();
+        let factory = ThreadLocalParserFactory::new(create_test_registry());
+        assert!(factory.parse("rust", "fn main() {}", None).is_some());
+        PARSER_CACHE.with(|cache| assert_eq!(cache.borrow().1.len(), 1));
+
+        invalidate_thread_local_parser_caches();
+        assert!(factory.parse("unknown", "", None).is_none());
+        PARSER_CACHE.with(|cache| assert_eq!(cache.borrow().1.len(), 0));
     }
 
     #[test]

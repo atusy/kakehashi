@@ -127,6 +127,7 @@ pub(super) async fn apply_shared_settings(
     // The second bump below then also invalidates anything a racing request
     // built MID-swap against a half-updated query set.
     cache.bump_semantic_token_generation();
+    crate::analysis::semantic::invalidate_thread_local_parser_caches();
     language_state
         .parser_pool
         .lock()
