@@ -48,7 +48,10 @@ fn capability_prefilter_applies(method: &str) -> bool {
     )
 }
 
-/// Whether a bridge response can directly mutate the editor document.
+/// Whether a bridge response can carry edits, apply edits, or initiate an
+/// editor mutation. These methods require one contiguous host span even when
+/// the response itself (for example linked-editing ranges) is only a precursor
+/// to the client's edit.
 ///
 /// Non-contiguous `injection.combined` documents mask host-only gaps inside
 /// their outer range. Until edit translation carries those allowed spans,
