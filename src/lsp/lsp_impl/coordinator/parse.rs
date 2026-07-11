@@ -497,16 +497,14 @@ impl ParseCoordinator {
                 // entry (via `parse_sender`'s vacant insert) for the gone URI. The
                 // text + incarnation guard is what makes this resurrection-safe once
                 // the open parse runs off the ingress ticket (#6).
-                if self
-                    .documents
-                    .set_parse_result_if_text_and_incarnation_unchanged(
-                        &uri,
-                        &text,
-                        incarnation,
-                        Some(&language_name),
-                        None,
-                    )
-                {
+                if self.documents.set_parse_result_if_inputs_unchanged(
+                    &uri,
+                    &text,
+                    incarnation,
+                    content_version,
+                    Some(&language_name),
+                    None,
+                ) {
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, false);
                 }
@@ -587,15 +585,14 @@ impl ParseCoordinator {
                 // `didClose` racing this off-ingress parse can't leave stale
                 // injection entries for a gone document. (`Tree` clone is a
                 // cheap refcount bump.)
-                let stored = self
-                    .documents
-                    .set_parse_result_if_text_and_incarnation_unchanged(
-                        &uri,
-                        &text,
-                        incarnation,
-                        Some(&language_name),
-                        Some(tree.clone()),
-                    );
+                let stored = self.documents.set_parse_result_if_inputs_unchanged(
+                    &uri,
+                    &text,
+                    incarnation,
+                    content_version,
+                    Some(&language_name),
+                    Some(tree.clone()),
+                );
                 // Populate BEFORE the publish so the derived discovery rides the
                 // snapshot (ADR §3 don't-discover-twice); readers keep serving
                 // the previous snapshot meanwhile. A rejected CAS (raced) skips
@@ -651,16 +648,14 @@ impl ParseCoordinator {
             // through to the no-language path below which would null it out. Host
             // bridging needs only text + language (never a tree), so preserving the
             // language keeps a host-bridged document working after a parse failure.
-            if self
-                .documents
-                .set_parse_result_if_text_and_incarnation_unchanged(
-                    &uri,
-                    &text,
-                    incarnation,
-                    Some(&language_name),
-                    None,
-                )
-            {
+            if self.documents.set_parse_result_if_inputs_unchanged(
+                &uri,
+                &text,
+                incarnation,
+                content_version,
+                Some(&language_name),
+                None,
+            ) {
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, false);
             }
@@ -684,16 +679,14 @@ impl ParseCoordinator {
         }
 
         // No language detected at all → store no language, no tree.
-        if self
-            .documents
-            .set_parse_result_if_text_and_incarnation_unchanged(
-                &uri,
-                &text,
-                incarnation,
-                None,
-                None,
-            )
-        {
+        if self.documents.set_parse_result_if_inputs_unchanged(
+            &uri,
+            &text,
+            incarnation,
+            content_version,
+            None,
+            None,
+        ) {
             self.documents
                 .mark_parse_finished(&uri, parse_generation, false);
         }
@@ -856,11 +849,12 @@ impl ParseCoordinator {
             // when the tree actually landed, so a `didClose` racing this
             // reparse can't leave stale injection entries for a gone
             // document. (`Tree` clone is a cheap refcount bump.)
-            let stored = self.documents.attach_tree_if_absent(
+            let stored = self.documents.attach_tree_if_parse_inputs_unchanged(
                 &uri,
                 &text,
                 expected_language_id.as_deref(),
                 expected_incarnation,
+                content_version,
                 tree.clone(),
             );
             // Populate BEFORE the publish so the discovery rides the snapshot
@@ -1064,11 +1058,12 @@ impl ParseCoordinator {
             // identical-text reopen — the tree belongs to the prior lifetime
             // and must not attach to the reopened document (nor let the
             // watermark advance below run on the old lifetime's ticket).
-            let stored = self.documents.update_tree_if_text_and_language_unchanged(
+            let stored = self.documents.update_tree_if_parse_inputs_unchanged(
                 uri,
                 &text,
                 language_id.as_deref(),
                 incarnation,
+                content_version,
                 tree.clone(),
             );
             // Populate BEFORE the publish so the derived discovery rides the
