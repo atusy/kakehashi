@@ -930,6 +930,13 @@ fn build_combined_virtual_content(
     span: Range<usize>,
     included: &[Range<usize>],
 ) -> (String, Vec<u32>) {
+    // Tree-sitter byte ranges are only valid for the exact parsed text. A
+    // stale tree must not turn a combined-document rebuild into an invalid
+    // UTF-8 slice or an oversized allocation.
+    let span = ceil_char_boundary(text, span.start)..floor_char_boundary(text, span.end);
+    if span.start >= span.end {
+        return (String::new(), Vec::new());
+    }
     let mut output = String::with_capacity(span.len());
     let mut offsets = Vec::new();
     let mut line_start = span.start;
@@ -1432,6 +1439,17 @@ mod tests {
             0..text.len(),
             std::slice::from_ref(&(1..usize::MAX)),
         );
+
+        assert_eq!(content, "x\n");
+        assert_eq!(offsets, vec![1, 0]);
+    }
+
+    #[test]
+    fn combined_content_snaps_stale_span_start_before_slicing() {
+        let text = "éx\n";
+
+        let (content, offsets) =
+            build_combined_virtual_content(text, 1..text.len(), &[1..text.len()]);
 
         assert_eq!(content, "x\n");
         assert_eq!(offsets, vec![1, 0]);
