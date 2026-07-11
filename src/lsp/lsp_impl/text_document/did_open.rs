@@ -7,6 +7,15 @@ use crate::language::LanguageEvent;
 
 impl Kakehashi {
     pub(crate) async fn did_open_impl(&self, params: DidOpenTextDocumentParams) {
+        self.did_open_impl_with_lock_probe(params, std::future::ready(()))
+            .await;
+    }
+
+    pub(in crate::lsp::lsp_impl) async fn did_open_impl_with_lock_probe(
+        &self,
+        params: DidOpenTextDocumentParams,
+        before_lifecycle_lock: impl std::future::Future<Output = ()>,
+    ) {
         let text_document = params.text_document;
         let language_id = text_document.language_id;
         let lsp_uri = text_document.uri;
@@ -25,11 +34,20 @@ impl Kakehashi {
             Some(language_id.clone())
         };
 
+        // Serialize reopen insertion behind the prior lifetime's complete
+        // didClose cleanup. didClose deliberately retains this map entry while
+        // the document itself is absent, so reopening cannot mint a fresh mutex
+        // and expose new state to URI-scoped old-lifetime teardown.
+        let edit_lock = self.documents.edit_lock(&uri);
+        before_lifecycle_lock.await;
+        let edit_guard = edit_lock.lock().await;
+
         // Insert document immediately (without tree) so concurrent requests can find it.
         // This handles race conditions where semanticTokens/full arrives before
         // parse_document completes. The tree will be updated by parse_document.
         self.documents
             .insert(uri.clone(), text.clone(), language_name.clone(), None);
+        drop(edit_guard);
 
         // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
         // host document to any `_self` host-bridge server *before* the parser load,

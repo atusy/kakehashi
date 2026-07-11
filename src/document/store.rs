@@ -538,11 +538,12 @@ impl DocumentStore {
     /// lock entry behind forever. Such handlers call this on their miss path to
     /// keep the map bounded. Safe to call while holding the lock's `Arc` guard —
     /// the guard keeps the mutex alive; only the map entry is removed.
+    #[cfg(test)]
     pub(crate) fn remove_edit_lock(&self, uri: &Url) {
         self.edit_locks.remove(uri);
     }
 
-    /// [`remove_edit_lock`](Self::remove_edit_lock), but only while the map
+    /// Remove the edit-lock entry, but only while the map
     /// still holds the exact `Arc` the caller acquired AND nobody else
     /// holds a clone — for miss paths that probe liveness some time after
     /// their `edit_lock()` call. A close+reopen in that gap can hand the
@@ -564,7 +565,7 @@ impl DocumentStore {
     /// Ensure a watermark channel exists for `uri` carrying the current lifetime's
     /// `incarnation`, created at ticket 0. Called when a document is registered or
     /// edited so the watermark's lifetime tracks the document's — it exists exactly
-    /// while the document is open and is dropped by [`remove`](Self::remove) on close.
+    /// while the document is open and is dropped when the document closes.
     ///
     /// Idempotent **within a lifetime**: an existing channel whose incarnation
     /// already matches is left untouched, so an edit never resets the ticket. But a
@@ -687,9 +688,19 @@ impl DocumentStore {
     }
 
     // Lock safety: Single remove() call - no read lock held before or during write
+    #[cfg(test)]
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
-        self.parse_states.remove(uri);
         self.edit_locks.remove(uri);
+        self.remove_preserving_edit_lock(uri)
+    }
+
+    /// Remove a document while retaining its per-URI edit lock entry.
+    ///
+    /// Lifecycle teardown holds that lock across cleanup after the document is
+    /// gone. Keeping the map entry makes a fast reopen wait on the same mutex
+    /// instead of creating a fresh lock and racing the old lifetime's cleanup.
+    pub(crate) fn remove_preserving_edit_lock(&self, uri: &Url) -> Option<Document> {
+        self.parse_states.remove(uri);
         // Dropping the watermark sender wakes any reader still blocked on
         // the watermark for this document, so a reader racing the close
         // proceeds into the empty fallback instead of stalling to the timeout.
