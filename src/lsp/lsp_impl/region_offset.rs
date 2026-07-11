@@ -19,9 +19,9 @@ use tower_lsp_server::ls_types::Position;
 use url::Url;
 
 use crate::document::DocumentStore;
+use crate::language::injection::ResolvedInjection;
 use crate::language::{InjectionResolver, LanguageCoordinator};
-use crate::lsp::bridge::{BridgeCoordinator, RegionOffset};
-use crate::text::PositionMapper;
+use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, region_host_end};
 
 /// Rebuild the region's current host offset from the live parse, keyed by its
 /// `region_id` (a ULID in production). Returns `None` when the offset can't be
@@ -68,18 +68,43 @@ pub(super) fn resolve_region_offset(
     if resolved.region.region_id != region_id {
         return None;
     }
-    // The region's exclusive host-document end, content-precise (the injection
-    // region's own byte range mapped through the live host text). Callers that
-    // translate an inbound edit use it to reject a range that runs past the
-    // region into unrelated host text.
-    let region_end =
-        PositionMapper::new(snapshot.text()).byte_to_position(resolved.region.byte_range.end)?;
-    // `start` is `Copy`; move `line_column_offsets` out (no clone — `resolved`
-    // is dropped after this).
+    Some(resolved_region_geometry(resolved))
+}
+
+/// Consume a resolved region into the geometry shared by freshness and edit
+/// validation. The end is derived from the exact virtual content rather than
+/// the raw content-node range, whose trailing named children may be excluded.
+fn resolved_region_geometry(resolved: ResolvedInjection) -> (RegionOffset, Position, bool) {
     let start_line = resolved.region.line_range.start;
-    Some((
-        RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets),
-        region_end,
-        resolved.contiguous,
-    ))
+    let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets);
+    let region_end = region_host_end(&resolved.virtual_content, &offset);
+    (offset, region_end, resolved.contiguous)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::injection::{CacheableInjectionRegion, ResolvedInjection};
+
+    #[test]
+    fn geometry_uses_virtual_content_end_not_raw_node_end() {
+        let resolved = ResolvedInjection {
+            region: CacheableInjectionRegion {
+                language: "rust".to_string(),
+                byte_range: 10..99,
+                line_range: 2..3,
+                start_column: 3,
+                region_id: "region".to_string(),
+                content_hash: 0,
+            },
+            injection_language: "rust".to_string(),
+            virtual_content: "x".to_string(),
+            line_column_offsets: vec![3],
+            contiguous: true,
+        };
+
+        let (_, region_end, _) = resolved_region_geometry(resolved);
+
+        assert_eq!(region_end, Position::new(2, 4));
+    }
 }
