@@ -286,7 +286,12 @@ impl CacheCoordinator {
                         info.content_node.start_byte(),
                         info.content_node.end_byte(),
                         info.content_node.kind(),
-                        crate::language::injection::InjectionResolver::region_identity_layer(info)?,
+                        crate::language::injection::InjectionResolver::region_identity_layer(
+                            tracker,
+                            uri,
+                            info,
+                            incarnation,
+                        )?,
                     ))
                 })
                 .collect::<Option<Vec<_>>>()?;

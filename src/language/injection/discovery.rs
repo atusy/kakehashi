@@ -24,24 +24,6 @@ use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_
 // alternate language layers at identical host coordinates distinct ULIDs.
 const REGION_IDENTITY_LAYER_BASE: usize = usize::MAX / 2 + 1;
 
-fn region_identity_slot(pattern_index: usize, language: &str) -> Option<usize> {
-    type IdentitySlots = std::collections::HashMap<(usize, String), usize>;
-    static SLOTS: std::sync::OnceLock<std::sync::Mutex<IdentitySlots>> = std::sync::OnceLock::new();
-
-    let slots = SLOTS.get_or_init(Default::default);
-    let mut slots = slots.lock().ok()?;
-    let next = slots.len();
-    match slots.entry((pattern_index, language.to_owned())) {
-        std::collections::hash_map::Entry::Occupied(entry) => Some(*entry.get()),
-        std::collections::hash_map::Entry::Vacant(entry) => (next < REGION_IDENTITY_LAYER_BASE)
-            .then(|| {
-                let slot = next;
-                entry.insert(slot);
-                slot
-            }),
-    }
-}
-
 /// Iterates over the `@injection.content` captures in a query match.
 fn iter_injection_content_captures<'a, 'b>(
     match_: &'b QueryMatch<'_, 'a>,
@@ -80,9 +62,7 @@ pub(crate) struct InjectionRegionInfo<'a> {
     pub offset: Option<InjectionOffset>,
     /// Whether this pattern's captures form one virtual document.
     pub combined: bool,
-    /// Stable, collision-free identity slot interned from query pattern and
-    /// language. Unlike a current-match ordinal, it does not shift when
-    /// another pattern stops matching.
+    /// Stable query pattern index used as part of tracker identity.
     pub identity_slot: usize,
 }
 
@@ -371,7 +351,7 @@ pub(crate) fn collect_all_injections<'a>(
         // from one pattern at the same range, so the pattern index alone aliases
         // their virtual documents. A current-match ordinal is also unsuitable:
         // removing one match would shift every later identity.
-        region.identity_slot = region_identity_slot(region.pattern_index, &region.language)?;
+        region.identity_slot = region.pattern_index;
     }
     Some(injections)
 }
@@ -631,7 +611,7 @@ impl InjectionResolver {
         injection: &InjectionRegionInfo,
         incarnation: u64,
     ) -> Option<Ulid> {
-        let identity_layer = Self::region_identity_layer(injection)?;
+        let identity_layer = Self::region_identity_layer(tracker, uri, injection, incarnation)?;
         tracker.get_or_create_in_layer_for_incarnation(
             uri,
             injection.content_node.start_byte(),
@@ -643,8 +623,19 @@ impl InjectionResolver {
     }
 
     /// Tracker-layer key used by both inline and batch region-ID minting.
-    pub(crate) fn region_identity_layer(injection: &InjectionRegionInfo) -> Option<usize> {
-        REGION_IDENTITY_LAYER_BASE.checked_add(injection.identity_slot)
+    pub(crate) fn region_identity_layer(
+        tracker: &NodeTracker,
+        uri: &Url,
+        injection: &InjectionRegionInfo,
+        incarnation: u64,
+    ) -> Option<usize> {
+        let slot = tracker.named_layer_for_incarnation(
+            uri,
+            injection.pattern_index,
+            &injection.language,
+            incarnation,
+        )?;
+        REGION_IDENTITY_LAYER_BASE.checked_add(slot)
     }
 
     /// Derive a parser-independent canonical injection language for bridge
@@ -854,7 +845,8 @@ impl InjectionResolver {
             candidate.content_node.start_byte() == start
                 && candidate.content_node.end_byte() == end
                 && candidate.content_node.kind() == kind
-                && Self::region_identity_layer(candidate) == Some(identity_layer)
+                && Self::region_identity_layer(tracker, uri, candidate, incarnation)
+                    == Some(identity_layer)
         })?;
 
         let resolved = if region.combined {
@@ -1715,9 +1707,15 @@ mod tests {
 
     #[test]
     fn dynamic_languages_from_one_pattern_get_distinct_identity_slots() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("dynamic_identity");
         assert_ne!(
-            region_identity_slot(7, "javascript").unwrap(),
-            region_identity_slot(7, "typescript").unwrap(),
+            tracker
+                .named_layer_for_incarnation(&uri, 7, "javascript", 0)
+                .unwrap(),
+            tracker
+                .named_layer_for_incarnation(&uri, 7, "typescript", 0)
+                .unwrap(),
             "one dynamic-language pattern must not alias distinct virtual documents"
         );
     }

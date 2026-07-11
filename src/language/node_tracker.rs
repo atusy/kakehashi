@@ -70,6 +70,10 @@ struct UriEntries {
     /// comparison alone cannot: with two mid-pass edits, an entry minted
     /// between them is shifted by the second yet still missed the first).
     shift_gen: u64,
+    /// Collision-free discriminators for bridge injection alternatives. Kept
+    /// with the URI lifecycle so document-controlled dynamic language names
+    /// are reclaimed on close instead of accumulating process-wide.
+    named_layers: HashMap<(usize, String), usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +89,32 @@ struct TrackedPosition {
 }
 
 impl UriEntries {
+    fn named_layer(
+        &mut self,
+        pattern_index: usize,
+        language: &str,
+        incarnation: u64,
+    ) -> Option<usize> {
+        if incarnation < self.latest_incarnation {
+            return None;
+        }
+        if incarnation > self.latest_incarnation {
+            self.named_layers.clear();
+        }
+        self.latest_incarnation = incarnation;
+        let next = self.named_layers.len();
+        match self
+            .named_layers
+            .entry((pattern_index, language.to_owned()))
+        {
+            Entry::Occupied(entry) => Some(*entry.get()),
+            Entry::Vacant(entry) => (next < usize::MAX / 2 + 1).then(|| {
+                entry.insert(next);
+                next
+            }),
+        }
+    }
+
     /// Get or insert a ULID for a position key, keeping both maps in sync.
     fn get_or_insert(&mut self, key: PositionKey, incarnation: u64) -> Option<Ulid> {
         if incarnation < self.latest_incarnation {
@@ -333,6 +363,33 @@ impl NodeTracker {
         self.incarnations
             .get(uri)
             .is_none_or(|current| *current == Some(incarnation))
+    }
+
+    /// Allocate a collision-free, URI-lifecycle-owned layer discriminator for
+    /// an injection query pattern and its (possibly dynamic) language.
+    pub(crate) fn named_layer_for_incarnation(
+        &self,
+        uri: &Url,
+        pattern_index: usize,
+        language: &str,
+        incarnation: u64,
+    ) -> Option<usize> {
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            if !self.admits_incarnation(uri, incarnation) {
+                return None;
+            }
+            return entry.named_layer(pattern_index, language, incarnation);
+        }
+        let mut entry = self.entries.entry(uri.clone()).or_default();
+        if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
+            return None;
+        }
+        entry.named_layer(pattern_index, language, incarnation)
     }
 
     /// Reclaim an entry this call materialized only to lose the lifecycle
@@ -745,6 +802,7 @@ impl NodeTracker {
             reverse: HashMap::with_capacity(entries.len()),
             latest_incarnation: entries.latest_incarnation,
             shift_gen: entries.shift_gen + 1,
+            named_layers: std::mem::take(&mut entries.named_layers),
         };
 
         for (key, tracked) in entries.drain() {
