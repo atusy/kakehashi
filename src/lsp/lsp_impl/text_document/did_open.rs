@@ -7,6 +7,15 @@ use crate::language::LanguageEvent;
 
 impl Kakehashi {
     pub(crate) async fn did_open_impl(&self, params: DidOpenTextDocumentParams) {
+        self.did_open_impl_with_lock_probe(params, std::future::ready(()))
+            .await;
+    }
+
+    async fn did_open_impl_with_lock_probe(
+        &self,
+        params: DidOpenTextDocumentParams,
+        before_lifecycle_lock: impl std::future::Future<Output = ()>,
+    ) {
         let text_document = params.text_document;
         let language_id = text_document.language_id;
         let lsp_uri = text_document.uri;
@@ -30,6 +39,7 @@ impl Kakehashi {
         // the document itself is absent, so reopening cannot mint a fresh mutex
         // and expose new state to URI-scoped old-lifetime teardown.
         let edit_lock = self.documents.edit_lock(&uri);
+        before_lifecycle_lock.await;
         let edit_guard = edit_lock.lock().await;
 
         // Insert document immediately (without tree) so concurrent requests can find it.

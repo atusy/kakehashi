@@ -137,24 +137,29 @@ mod tests {
         cleanup_paused.notified().await;
         assert!(server.documents.get(&uri).is_none());
 
+        let reopen_started = Arc::new(Notify::new());
         let reopen = {
             let service = Arc::clone(&service);
             let uri = uri.clone();
+            let reopen_started = Arc::clone(&reopen_started);
             tokio::spawn(async move {
                 service
                     .inner()
-                    .did_open_impl(DidOpenTextDocumentParams {
-                        text_document: TextDocumentItem {
-                            uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
-                            language_id: "plaintext".to_string(),
-                            version: 1,
-                            text: "new".to_string(),
+                    .did_open_impl_with_lock_probe(
+                        DidOpenTextDocumentParams {
+                            text_document: TextDocumentItem {
+                                uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                                language_id: "plaintext".to_string(),
+                                version: 1,
+                                text: "new".to_string(),
+                            },
                         },
-                    })
+                        async move { reopen_started.notify_one() },
+                    )
                     .await;
             })
         };
-        tokio::task::yield_now().await;
+        reopen_started.notified().await;
         assert!(
             server.documents.get(&uri).is_none(),
             "reopen must not expose new state during old-lifetime cleanup"
