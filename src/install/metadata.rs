@@ -327,6 +327,13 @@ mod tests {
 
         assert!(fetched.load(Ordering::Relaxed));
         assert!(parsers.contains_key("lua"));
+        assert!(
+            cache
+                .read()
+                .and_then(|content| parse_parsers_lua(&content).ok())
+                .is_some_and(|cached| cached.contains_key("lua")),
+            "successful recovery must replace the corrupt cache"
+        );
     }
 
     #[test]
@@ -615,5 +622,6 @@ return {
             matches!(result, Err(MetadataError::EmptyMetadata)),
             "invalid fetched metadata must not be cached as a successful result"
         );
+        assert_eq!(cache.read().as_deref(), Some("truncated cache"));
     }
 }
