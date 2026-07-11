@@ -1192,7 +1192,11 @@ impl LanguageCoordinator {
     /// Visibility: pub(crate) - called by LSP layer (lsp_impl) to check parser
     /// availability before attempting language operations.
     pub(crate) fn has_parser_available(&self, language_name: &str) -> bool {
-        self.language_registry.contains(language_name)
+        let generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        !self.configured_load_failed(language_name, generation)
+            && self.has_current_parser_registration(language_name, generation)
     }
 
     /// language-detection-fallback-chain unified detection chain for host docs and injections; returns
@@ -3246,6 +3250,10 @@ mod tests {
         assert!(
             coordinator.language_registry.contains("dynamic"),
             "the regression requires a stale registry entry to remain present"
+        );
+        assert!(
+            !coordinator.has_parser_available("dynamic"),
+            "detection must not accept a stale registration"
         );
         assert!(
             !coordinator.ensure_language_loaded("dynamic").success,
