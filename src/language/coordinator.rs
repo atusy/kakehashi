@@ -11,7 +11,7 @@ use crate::error::LockResultExt;
 use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tree_sitter::Language;
 
 /// Maximum length (in characters) for pattern previews in log messages.
@@ -77,6 +77,10 @@ pub(crate) struct LanguageCoordinator {
     /// generation that resolved their library path. A registered parser is not
     /// a cache hit after reload unless this tag matches the current generation.
     dynamically_loaded: dashmap::DashMap<String, u64>,
+    /// Serializes settings-generation changes with registry publication so a
+    /// load resolved under an old configuration cannot overwrite or retag a
+    /// parser registered by a newer reload.
+    registration_lock: Mutex<()>,
     /// Bumped by every `load_settings` (the only event that can make a
     /// failed load succeed) before the hygiene clear. Read-validated against
     /// `failed_loads` entries; see there.
@@ -112,6 +116,7 @@ impl LanguageCoordinator {
             derived_languages: RwLock::new(HashSet::new()),
             failed_loads: dashmap::DashMap::new(),
             dynamically_loaded: dashmap::DashMap::new(),
+            registration_lock: Mutex::new(()),
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
@@ -123,17 +128,26 @@ impl LanguageCoordinator {
     /// Visibility: pub(crate) - called by LSP layer (semantic_tokens, selection_range)
     /// and analysis modules to ensure parsers are available before use.
     pub(crate) fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
-        let current_generation = self
-            .load_generation
-            .load(std::sync::atomic::Ordering::Acquire);
-        if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
+        loop {
+            let current_generation = self
+                .load_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
+                return result;
+            }
+            let result = self.try_load_language_by_id(language_id, current_generation);
+            if self
+                .load_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != current_generation
+            {
+                continue;
+            }
+            if !result.success {
+                self.record_failed_load(language_id, current_generation);
+            }
             return result;
         }
-        let result = self.try_load_language_by_id(language_id, current_generation);
-        if !result.success {
-            self.record_failed_load(language_id, current_generation);
-        }
-        result
     }
 
     /// Already-decided verdict for a load, or `None` when a real attempt is
@@ -293,6 +307,13 @@ impl LanguageCoordinator {
                             ))
                         });
 
+                        if self
+                            .load_generation
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            != current_generation
+                        {
+                            continue;
+                        }
                         return result;
                     }
                 }
@@ -349,8 +370,14 @@ impl LanguageCoordinator {
         // hygiene only: a stale store racing it lands with an old tag and is
         // inert, so no ordering between bump, clear, and in-flight scans can
         // produce a wrong suppression.
-        self.load_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        {
+            let _registration = self
+                .registration_lock
+                .lock()
+                .recover_poison("LanguageCoordinator::load_settings(generation)");
+            self.load_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         self.failed_loads.clear();
 
         // Build base map from language configs
@@ -517,8 +544,7 @@ impl LanguageCoordinator {
         search_paths: &[PathBuf],
         language: &tree_sitter::Language,
     ) -> LanguageLoadResult {
-        self.language_registry
-            .register(derived_name.to_string(), language.clone());
+        self.register_configured_language(derived_name, language.clone());
         self.derived_languages
             .write()
             .recover_poison("LanguageCoordinator::register_derived_from_base(derived_languages)")
@@ -774,17 +800,14 @@ impl LanguageCoordinator {
         }
 
         // Warning: parser may not exist yet (dynamic discovery)
-        let language = match self.load_and_register_parser(
-            language_id,
-            None,
-            &search_paths,
-            LanguageLogLevel::Warning,
-        ) {
-            Ok(lang) => lang,
-            Err(result) => return result,
-        };
-        self.dynamically_loaded
-            .insert(language_id.to_string(), current_generation);
+        let language =
+            match self.load_parser(language_id, None, &search_paths, LanguageLogLevel::Warning) {
+                Ok(lang) => lang,
+                Err(result) => return result,
+            };
+        if !self.register_dynamic_language(language_id, language.clone(), current_generation) {
+            return LanguageLoadResult::default();
+        }
 
         let mut events = Vec::new();
 
@@ -812,16 +835,41 @@ impl LanguageCoordinator {
         LanguageLoadResult::success_with(events)
     }
 
-    /// Resolve, load, and register a parser for the given language.
+    fn register_dynamic_language(
+        &self,
+        language_id: &str,
+        language: Language,
+        expected_generation: u64,
+    ) -> bool {
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::register_dynamic_language");
+        if self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != expected_generation
+        {
+            return false;
+        }
+        self.language_registry
+            .register(language_id.to_string(), language);
+        self.dynamically_loaded
+            .insert(language_id.to_string(), expected_generation);
+        true
+    }
+
+    /// Resolve and load a parser for the given language.
     ///
-    /// Returns `Ok(Language)` on success, or `Err(LanguageLoadResult)` with
-    /// an appropriate failure event on error.
+    /// Publication is deliberately separate so the caller can serialize it
+    /// with settings-generation changes. Returns `Ok(Language)` on success,
+    /// or `Err(LanguageLoadResult)` with an appropriate failure event.
     ///
     /// `missing_parser_level` controls how a missing parser is reported:
     /// - `Warning` for dynamic loading — the parser may not exist yet (normal)
     /// - `Error` for config-driven loading — the parser was explicitly configured
     ///   but cannot be found (configuration problem)
-    fn load_and_register_parser(
+    fn load_parser(
         &self,
         lang_name: &str,
         parser_config: Option<&str>,
@@ -844,7 +892,7 @@ impl LanguageCoordinator {
             let result = self
                 .parser_loader
                 .write()
-                .recover_poison("LanguageCoordinator::load_and_register_parser")
+                .recover_poison("LanguageCoordinator::load_parser")
                 .load_language(&lib_path, lang_name);
             match result {
                 Ok(lang) => lang,
@@ -859,9 +907,6 @@ impl LanguageCoordinator {
                 }
             }
         };
-
-        self.language_registry
-            .register(lang_name.to_string(), language.clone());
 
         Ok(language)
     }
@@ -1415,7 +1460,7 @@ impl LanguageCoordinator {
         search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
         // Error: parser was explicitly configured but can't be found
-        let language = match self.load_and_register_parser(
+        let language = match self.load_parser(
             lang_name,
             config.parser.as_deref(),
             search_paths,
@@ -1424,11 +1469,7 @@ impl LanguageCoordinator {
             Ok(lang) => lang,
             Err(result) => return result,
         };
-        // Config-driven registration supersedes any older on-demand entry.
-        // Remove the generation tag only after the new parser is registered,
-        // so a concurrent cache read cannot mistake the old parser for an
-        // untagged, configuration-owned registration.
-        self.dynamically_loaded.remove(lang_name);
+        self.register_configured_language(lang_name, language.clone());
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
 
@@ -1437,6 +1478,16 @@ impl LanguageCoordinator {
             format!("Language {lang_name} loaded."),
         ));
         LanguageLoadResult::success_with(events)
+    }
+
+    fn register_configured_language(&self, language_id: &str, language: Language) {
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::register_configured_language");
+        self.language_registry
+            .register(language_id.to_string(), language);
+        self.dynamically_loaded.remove(language_id);
     }
 
     fn load_queries_for_language(
@@ -3150,6 +3201,24 @@ mod tests {
         assert!(
             !coordinator.ensure_language_loaded("dynamic").success,
             "a prior-generation dynamic entry must not bypass current search-path resolution"
+        );
+    }
+
+    #[test]
+    fn stale_dynamic_load_cannot_retag_configured_registration() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&WorkspaceSettings::default());
+        coordinator.register_configured_language("dynamic", tree_sitter_rust::LANGUAGE.into());
+
+        assert!(
+            !coordinator
+                .register_dynamic_language("dynamic", tree_sitter_rust::LANGUAGE.into(), 0,),
+            "a load resolved before the reload must lose publication"
+        );
+        assert!(coordinator.language_registry.contains("dynamic"));
+        assert!(
+            coordinator.dynamically_loaded.get("dynamic").is_none(),
+            "the current configured parser must remain untagged"
         );
     }
 
