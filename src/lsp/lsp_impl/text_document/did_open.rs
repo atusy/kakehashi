@@ -45,8 +45,10 @@ impl Kakehashi {
         // Insert document immediately (without tree) so concurrent requests can find it.
         // This handles race conditions where semanticTokens/full arrives before
         // parse_document completes. The tree will be updated by parse_document.
-        self.documents
-            .insert(uri.clone(), text.clone(), language_name.clone(), None);
+        let incarnation =
+            self.documents
+                .insert(uri.clone(), text.clone(), language_name.clone(), None);
+        self.bridge.open_tracker_incarnation(&uri, incarnation);
         drop(edit_guard);
 
         // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real

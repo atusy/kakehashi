@@ -29,6 +29,11 @@ use url::Url;
 /// one (per lazy-node-identity-tracking "no tombstone" rule).
 pub(crate) struct NodeTracker {
     entries: DashMap<Url, UriEntries>,
+    /// Current document lifetime for URIs managed by the LSP lifecycle.
+    /// `None` is a close tombstone: it prevents a direct mint that passed its
+    /// last reader-side liveness check before didClose from recreating an old
+    /// entry after cleanup. An absent key keeps standalone/test trackers usable.
+    incarnations: DashMap<Url, Option<u64>>,
     /// Bumped by every [`cleanup`](Self::cleanup) (didClose). Folded into the
     /// mint latch ([`mint_epoch`](Self::mint_epoch)) so a close/reopen —
     /// which removes the per-URI index and would reset its `shift_gen` to 0
@@ -316,8 +321,20 @@ impl NodeTracker {
     pub(crate) fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            incarnations: DashMap::new(),
             cleanup_epoch: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Register the current open lifetime before any request can mint for it.
+    pub(crate) fn open_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.incarnations.insert(uri.clone(), Some(incarnation));
+    }
+
+    fn admits_incarnation(&self, uri: &Url, incarnation: u64) -> bool {
+        self.incarnations
+            .get(uri)
+            .is_none_or(|current| *current == Some(incarnation))
     }
 
     /// Get or create a stable ULID for a **host-layer** tree-sitter node.
@@ -352,8 +369,8 @@ impl NodeTracker {
     /// Get or create a stable ULID for a tree-sitter node at injection `layer`.
     ///
     /// Uses lazy-node-identity-tracking composite key `(start_byte, end_byte,
-    /// kind, layer)`: the same key always returns the same ULID, while
-    /// different nodes — including a host vs injected node that share an
+    /// kind, layer)`: the same key returns the same ULID within one document
+    /// incarnation, while a reopen remints it. Different nodes — including a host vs injected node that share an
     /// identical span and kind (`layer` differs) — receive distinct ULIDs.
     ///
     /// Updates both the forward and reverse index so the returned ULID can be
@@ -385,9 +402,15 @@ impl NodeTracker {
         // `Url` clone `entry()` needs for its owned key. (Explicit two-step
         // pattern to avoid DashMap lifetime ambiguity.)
         if let Some(mut entry) = self.entries.get_mut(uri) {
+            if !self.admits_incarnation(uri, incarnation) {
+                return Ulid::new();
+            }
             return entry.get_or_insert(key, incarnation);
         }
         let mut entry = self.entries.entry(uri.clone()).or_default();
+        if !self.admits_incarnation(uri, incarnation) {
+            return Ulid::new();
+        }
         entry.get_or_insert(key, incarnation)
     }
 
@@ -727,6 +750,10 @@ impl NodeTracker {
     /// incarnation is newer than `closing_incarnation`. This simultaneously
     /// invalidates every pre-close id and preserves every published reopened id.
     /// When no newer entries remain, the whole URI index is removed.
+    /// The lifecycle map keeps a lightweight close tombstone so a direct mint
+    /// that passed its reader-side check before didClose cannot recreate the
+    /// just-removed lifetime afterward; didOpen replaces it with the new
+    /// incarnation before that lifetime starts minting.
     ///
     /// The global epoch bump runs BEFORE retention, and the order is
     /// load-bearing: a
@@ -750,6 +777,14 @@ impl NodeTracker {
     pub(crate) fn cleanup(&self, uri: &Url, closing_incarnation: u64) {
         self.cleanup_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.incarnations
+            .entry(uri.clone())
+            .and_modify(|current| {
+                if *current == Some(closing_incarnation) {
+                    *current = None;
+                }
+            })
+            .or_insert(None);
         self.entries.remove_if_mut(uri, |_, entries| {
             entries.retain_newer_than(closing_incarnation);
             entries.len() == 0
@@ -838,9 +873,15 @@ impl NodeTracker {
         // fallback stays load-bearing: it serializes the latch check with a
         // concurrent FIRST edit on a never-minted URI.
         if let Some(mut entry) = self.entries.get_mut(uri) {
+            if !self.admits_incarnation(uri, incarnation) {
+                return None;
+            }
             return self.mint_batch_in_entry(&mut entry, expected, incarnation, keys);
         }
         let mut entry = self.entries.entry(uri.clone()).or_default();
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
         self.mint_batch_in_entry(&mut entry, expected, incarnation, keys)
     }
 
@@ -1003,6 +1044,24 @@ mod tests {
         let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
 
         assert_eq!(tracker.lookup_node(&uri, &stale_id), None);
+        assert_eq!(
+            tracker.lookup_node(&uri, &reopened_id),
+            Some((0, 4, "word", 0))
+        );
+    }
+
+    #[test]
+    fn direct_mint_cannot_resurrect_closed_incarnation_after_cleanup() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("stale_after_cleanup");
+        tracker.open_incarnation(&uri, 1);
+        tracker.cleanup(&uri, 1);
+
+        let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
+        assert_eq!(tracker.lookup_node(&uri, &stale_id), None);
+
+        tracker.open_incarnation(&uri, 2);
+        let reopened_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2);
         assert_eq!(
             tracker.lookup_node(&uri, &reopened_id),
             Some((0, 4, "word", 0))

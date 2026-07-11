@@ -722,6 +722,10 @@ impl BridgeCoordinator {
         self.node_tracker.cleanup(uri, closing_incarnation)
     }
 
+    pub(crate) fn open_tracker_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.node_tracker.open_incarnation(uri, incarnation);
+    }
+
     // ========================================
     // Lifecycle (delegate to pool)
     // ========================================
