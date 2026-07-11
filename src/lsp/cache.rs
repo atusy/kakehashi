@@ -282,23 +282,20 @@ impl CacheCoordinator {
             let region_keys = regions
                 .iter()
                 .map(|info| {
-                    Some((
+                    (
                         info.content_node.start_byte(),
                         info.content_node.end_byte(),
                         info.content_node.kind(),
-                        crate::language::injection::InjectionResolver::region_identity_layer(
-                            tracker,
-                            uri,
-                            info,
-                            incarnation,
-                        )?,
-                    ))
+                        info.pattern_index,
+                        info.language.as_str(),
+                    )
                 })
-                .collect::<Option<Vec<_>>>()?;
-            let region_ids = tracker.mint_batch_if_unshifted_for_incarnation(
+                .collect::<Vec<_>>();
+            let region_ids = tracker.mint_named_batch_if_unshifted_for_incarnation(
                 uri,
                 entry_mint_epoch,
                 incarnation,
+                crate::language::injection::REGION_IDENTITY_LAYER_BASE,
                 region_keys,
             )?;
 

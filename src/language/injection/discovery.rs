@@ -22,7 +22,7 @@ use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_
 // Keep bridge-region identities in a namespace disjoint from real parse-tree
 // injection depths (0..=MAX_INJECTION_DEPTH). The per-range slot then gives
 // alternate language layers at identical host coordinates distinct ULIDs.
-const REGION_IDENTITY_LAYER_BASE: usize = usize::MAX / 2 + 1;
+pub(crate) const REGION_IDENTITY_LAYER_BASE: usize = usize::MAX / 2 + 1;
 
 /// Iterates over the `@injection.content` captures in a query match.
 fn iter_injection_content_captures<'a, 'b>(

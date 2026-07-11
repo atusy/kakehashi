@@ -1014,6 +1014,66 @@ impl NodeTracker {
         self.mint_batch_in_entry(&mut entry, expected, incarnation, keys)
     }
 
+    /// Atomically allocate named layer discriminators and mint their position
+    /// keys under the same parse-snapshot latch. A rejected stale batch leaves
+    /// neither ULIDs nor dynamic-language reservations behind.
+    pub(crate) fn mint_named_batch_if_unshifted_for_incarnation<'a>(
+        &self,
+        uri: &Url,
+        expected: (u64, u64),
+        incarnation: u64,
+        layer_base: usize,
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize, &'a str)>,
+    ) -> Option<Vec<Ulid>> {
+        if !self.admits_incarnation(uri, incarnation) {
+            return None;
+        }
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            if !self.admits_incarnation(uri, incarnation) {
+                drop(entry);
+                self.remove_pristine_entry(uri);
+                return None;
+            }
+            return self.mint_named_batch_in_entry(
+                &mut entry,
+                expected,
+                incarnation,
+                layer_base,
+                keys,
+            );
+        }
+        let mut entry = self.entries.entry(uri.clone()).or_default();
+        if !self.admits_incarnation(uri, incarnation) {
+            drop(entry);
+            self.remove_pristine_entry(uri);
+            return None;
+        }
+        self.mint_named_batch_in_entry(&mut entry, expected, incarnation, layer_base, keys)
+    }
+
+    fn mint_named_batch_in_entry<'a>(
+        &self,
+        entry: &mut UriEntries,
+        expected: (u64, u64),
+        incarnation: u64,
+        layer_base: usize,
+        keys: impl IntoIterator<Item = (usize, usize, &'static str, usize, &'a str)>,
+    ) -> Option<Vec<Ulid>> {
+        let epoch = self
+            .cleanup_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if (entry.shift_gen, epoch) != expected {
+            return None;
+        }
+        keys.into_iter()
+            .map(|(start, end, kind, pattern_index, language)| {
+                let slot = entry.named_layer(pattern_index, language, incarnation)?;
+                let layer = layer_base.checked_add(slot)?;
+                entry.get_or_insert(PositionKey::new(start, end, kind, layer), incarnation)
+            })
+            .collect()
+    }
+
     /// The latch check + mint body of
     /// [`mint_batch_if_unshifted`](Self::mint_batch_if_unshifted), run while
     /// the caller holds `entry`'s exclusive lock.
@@ -1092,6 +1152,32 @@ mod tests {
         assert_ne!(
             tracker.named_layer_for_incarnation(&uri, 0, "typescript", 2),
             Some(javascript)
+        );
+    }
+
+    #[test]
+    fn rejected_named_batch_reserves_no_language_slots() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("stale_named_batch");
+        tracker.open_incarnation(&uri, 1);
+        let stale_epoch = (1, tracker.mint_epoch(&uri).1);
+
+        assert!(
+            tracker
+                .mint_named_batch_if_unshifted_for_incarnation(
+                    &uri,
+                    stale_epoch,
+                    1,
+                    usize::MAX / 2 + 1,
+                    [(0, 4, "word", 0, "javascript")],
+                )
+                .is_none()
+        );
+        assert!(
+            tracker
+                .entries
+                .get(&uri)
+                .is_none_or(|entry| entry.named_layers.is_empty())
         );
     }
 
