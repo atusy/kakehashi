@@ -50,6 +50,24 @@ fn same_launch_config(
     old == new
 }
 
+fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
+    handle.begin_shutdown();
+    tokio::spawn(async move {
+        const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+        if tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, handle.graceful_shutdown())
+            .await
+            .is_err()
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Timed out shutting down invalidated {} connection",
+                key
+            );
+            handle.complete_shutdown();
+        }
+    });
+}
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -609,7 +627,6 @@ impl LanguageServerPool {
             self.document_tracker.purge_connection(&key).await;
             self.purge_open_transition_locks(&key).await;
             if let Some(handle) = connections.remove(&key) {
-                handle.begin_shutdown();
                 stale_handles.push((key, handle));
             }
         }
@@ -653,20 +670,7 @@ impl LanguageServerPool {
         }
         drop(connections);
         for (key, handle) in stale_handles {
-            tokio::spawn(async move {
-                const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-                if tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, handle.graceful_shutdown())
-                    .await
-                    .is_err()
-                {
-                    log::warn!(
-                        target: "kakehashi::bridge",
-                        "Timed out shutting down invalidated {} connection",
-                        key
-                    );
-                    handle.complete_shutdown();
-                }
-            });
+            shutdown_invalidated_connection(key, handle);
         }
         pushed
     }
@@ -1786,7 +1790,18 @@ impl LanguageServerPool {
         // reused by the ReturnExisting arm below.
         // Use pure decision function for testability (ls-bridge-message-ordering Operation Gating)
         let existing = connections.get(&connection_key);
-        let existing_state = existing.map(|h| h.state());
+        let launch_config_changed = existing.is_some_and(|handle| {
+            handle
+                .launch_config()
+                .is_some_and(|old| !same_launch_config(old, server_config))
+        });
+        let existing_state = if launch_config_changed {
+            // Reuse the stale/closed cleanup path below. `Failed` maps to
+            // SpawnNew, while the explicit flag also schedules process shutdown.
+            Some(ConnectionState::Failed)
+        } else {
+            existing.map(|h| h.state())
+        };
         match decide_connection_action(existing_state, panic_count) {
             ConnectionAction::ReturnExisting => {
                 // `decide_connection_action` only returns ReturnExisting when a
@@ -1820,6 +1835,8 @@ impl LanguageServerPool {
             ConnectionAction::SpawnNew => {
                 // Remove stale connection if present (Failed or Closed state)
                 if existing_state.is_some() {
+                    let invalidated_handle =
+                        launch_config_changed.then(|| existing.cloned()).flatten();
                     // Drop the dead connection's document state with it: the
                     // replacement process has nothing open, so the lazy host
                     // sync must re-send didOpen and the virt tracker must let
@@ -1842,6 +1859,9 @@ impl LanguageServerPool {
                     // entry remains and the next acquire retries the idempotent
                     // purge instead of spawning over partial document state.
                     connections.remove(&connection_key);
+                    if let Some(handle) = invalidated_handle {
+                        shutdown_invalidated_connection(connection_key.clone(), handle);
+                    }
                 }
             }
         }
