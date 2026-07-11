@@ -307,7 +307,13 @@ impl AutoInstallManager {
                 // marker/completion pair back to it.
                 tokio::spawn(async move {
                     let _marker = install_marker;
-                    let _ = completion.await;
+                    if let Err(join_error) = completion.await {
+                        log::error!(
+                            target: "kakehashi::auto_install",
+                            "Metadata support-check completion task failed: {}",
+                            join_error
+                        );
+                    }
                 });
                 (result, None)
             } else {

@@ -170,7 +170,20 @@ where
             // completion waiter to callers that must retain an in-flight claim.
             check.abort();
             let completion = tokio::spawn(async move {
-                let _ = check.await;
+                if let Err(join_error) = check.await {
+                    if join_error.is_panic() {
+                        log::error!(
+                            target: "kakehashi::auto_install",
+                            "Timed-out metadata support check panicked: {}",
+                            join_error
+                        );
+                    } else {
+                        log::debug!(
+                            target: "kakehashi::auto_install",
+                            "Timed-out metadata support check was cancelled before starting"
+                        );
+                    }
+                }
             });
             TrackedSupportCheck {
                 should_skip: true,
