@@ -74,7 +74,6 @@ fn same_launch_config(
 }
 
 fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
-    handle.begin_shutdown();
     tokio::spawn(async move {
         const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
         let shutdown_handle = Arc::clone(&handle);
