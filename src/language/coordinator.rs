@@ -73,9 +73,10 @@ pub(crate) struct LanguageCoordinator {
     /// re-poisoning — no clear-vs-store ordering to get right. The clear on
     /// `load_settings` is memory hygiene, not the correctness mechanism.
     failed_loads: dashmap::DashMap<String, u64>,
-    /// Registry entries discovered from search paths, tagged with the settings
-    /// generation that resolved their library path. A registered parser is not
-    /// a cache hit after reload unless this tag matches the current generation.
+    /// Reload-scoped registry entries, tagged with the settings generation that
+    /// resolved their library path. Manually pre-registered/built-in entries are
+    /// untagged; configured and dynamically discovered parsers must match the
+    /// current generation before they are cache hits.
     dynamically_loaded: dashmap::DashMap<String, u64>,
     /// Serializes settings-generation changes with registry publication so a
     /// load resolved under an old configuration cannot overwrite or retag a
@@ -814,22 +815,21 @@ impl LanguageCoordinator {
                 Ok(lang) => lang,
                 Err(result) => return result,
             };
-        if !self.register_dynamic_language(language_id, language.clone(), current_generation) {
+        let mut events = Vec::new();
+        if !self.publish_dynamic_language(language_id, language.clone(), current_generation, || {
+            // Publish queries under the same generation gate as the parser.
+            // A reload cannot advance the generation and then be overwritten
+            // by queries resolved from the previous search paths.
+            self.load_all_queries(
+                &language,
+                &search_paths,
+                language_id,
+                "Dynamically loaded",
+                &mut events,
+            );
+        }) {
             return LanguageLoadResult::default();
         }
-
-        let mut events = Vec::new();
-
-        // Use fault-tolerant loading for all query types
-        // This handles languages like TypeScript that inherit from ecma,
-        // and gracefully skips invalid patterns while preserving valid ones
-        self.load_all_queries(
-            &language,
-            &search_paths,
-            language_id,
-            "Dynamically loaded",
-            &mut events,
-        );
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
@@ -844,12 +844,16 @@ impl LanguageCoordinator {
         LanguageLoadResult::success_with(events)
     }
 
-    fn register_dynamic_language(
+    fn publish_dynamic_language<F>(
         &self,
         language_id: &str,
         language: Language,
         expected_generation: u64,
-    ) -> bool {
+        publish_queries: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
         let _registration = self
             .registration_lock
             .lock()
@@ -865,6 +869,7 @@ impl LanguageCoordinator {
             .register(language_id.to_string(), language);
         self.dynamically_loaded
             .insert(language_id.to_string(), expected_generation);
+        publish_queries();
         true
     }
 
@@ -1496,7 +1501,11 @@ impl LanguageCoordinator {
             .recover_poison("LanguageCoordinator::register_configured_language");
         self.language_registry
             .register(language_id.to_string(), language);
-        self.dynamically_loaded.remove(language_id);
+        let generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        self.dynamically_loaded
+            .insert(language_id.to_string(), generation);
     }
 
     fn load_queries_for_language(
@@ -3220,14 +3229,35 @@ mod tests {
         coordinator.register_configured_language("dynamic", tree_sitter_rust::LANGUAGE.into());
 
         assert!(
-            !coordinator
-                .register_dynamic_language("dynamic", tree_sitter_rust::LANGUAGE.into(), 0,),
+            !coordinator.publish_dynamic_language(
+                "dynamic",
+                tree_sitter_rust::LANGUAGE.into(),
+                0,
+                || {},
+            ),
             "a load resolved before the reload must lose publication"
         );
         assert!(coordinator.language_registry.contains("dynamic"));
         assert!(
-            coordinator.dynamically_loaded.get("dynamic").is_none(),
-            "the current configured parser must remain untagged"
+            coordinator
+                .dynamically_loaded
+                .get("dynamic")
+                .is_some_and(|generation| *generation == 1),
+            "the current configured parser must keep its newer generation"
+        );
+    }
+
+    #[test]
+    fn failed_config_reload_does_not_revalidate_old_parser() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.register_configured_language("configured", tree_sitter_rust::LANGUAGE.into());
+        assert!(coordinator.ensure_language_loaded("configured").success);
+
+        coordinator.load_settings(&WorkspaceSettings::default());
+
+        assert!(
+            !coordinator.ensure_language_loaded("configured").success,
+            "an old configured registration must not survive a generation where it was not loaded"
         );
     }
 
