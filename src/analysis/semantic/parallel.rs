@@ -872,13 +872,22 @@ fn rebuild_context<'a>(
         // corrupt reuse-path entry must degrade (here: to the untrimmed
         // container classification), not panic.
         let ends_with_newline = |end: usize| text.get(..end).is_some_and(|s| s.ends_with('\n'));
+        // checked_add everywhere: reuse-path bytes are untrusted, and a
+        // corrupt offset must degrade (skip / untrimmed) — release-mode wrap
+        // would misclassify, debug-mode overflow would panic.
         let prose = ranges.last().is_some_and(|r| {
-            text.get(..inj_start_byte + r.end_byte)
+            inj_start_byte
+                .checked_add(r.end_byte)
+                .and_then(|end| text.get(..end))
                 .is_some_and(|s| !s.ends_with('\n'))
         });
         for r in ranges {
-            let start = inj_start_byte + r.start_byte;
-            let mut end = inj_start_byte + r.end_byte;
+            let (Some(start), Some(mut end)) = (
+                inj_start_byte.checked_add(r.start_byte),
+                inj_start_byte.checked_add(r.end_byte),
+            ) else {
+                continue;
+            };
             if prose && ends_with_newline(end) {
                 end -= 1;
                 if text.get(..end).is_some_and(|s| s.ends_with('\r')) {
