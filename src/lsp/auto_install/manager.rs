@@ -275,7 +275,10 @@ impl AutoInstallManager {
         if !self.installing_languages.try_start_install(language) {
             events.push(InstallEvent::Log {
                 level: MessageType::INFO,
-                message: format!("Language '{}' is already being installed", language),
+                message: format!(
+                    "Language '{}' support is already being checked or installed",
+                    language
+                ),
             });
             return InstallResult {
                 outcome: InstallOutcome::AlreadyInstalling,
@@ -595,7 +598,8 @@ mod tests {
         assert_eq!(lookup_count.load(Ordering::SeqCst), 1);
         assert!(result.events.iter().any(|e| matches!(
             e,
-            InstallEvent::Log { level: MessageType::INFO, message } if message.contains("already being installed")
+            InstallEvent::Log { level: MessageType::INFO, message }
+                if message.contains("already being checked or installed")
         )));
 
         let _ = release_tx.send(());
