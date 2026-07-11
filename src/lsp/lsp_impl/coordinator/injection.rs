@@ -172,6 +172,36 @@ impl InjectionCoordinator {
     /// Resolves injection data once and reuses it across all three steps. Must be
     /// called AFTER parse_document so the AST is available.
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
+        self.process_injections_after_lifecycle_lock(
+            uri,
+            forward_did_change,
+            std::future::ready(()),
+        )
+        .await;
+    }
+
+    async fn process_injections_after_lifecycle_lock<F>(
+        &self,
+        uri: &Url,
+        forward_did_change: bool,
+        after_lifecycle_lock: F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        // Serialize the complete tree-derived downstream pass with didClose and
+        // didOpen. A parse task belongs to the document incarnation that exists
+        // when it acquires this guard; holding the same lifecycle lock through
+        // cancellation, close/update, and eager-open prevents an old task from
+        // mutating a fast-reopened lifetime between check and side effect.
+        let edit_lock = self.documents.edit_lock(uri);
+        let _lifecycle_guard = edit_lock.lock().await;
+        after_lifecycle_lock.await;
+        if self.documents.get(uri).is_none() {
+            self.bridge.cancel_eager_open(uri);
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            return;
+        }
+
         let Some(host_language) = self.get_language_for_document(uri) else {
             self.bridge.cancel_eager_open(uri);
             return;
@@ -375,9 +405,74 @@ impl InjectionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::InjectionResolver;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
     use tower_lsp_server::LspService;
     use tree_sitter::Query;
     use url::Url;
+
+    #[tokio::test]
+    async fn process_injections_finishes_before_fast_reopen() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///injection-lifecycle.md").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "# old".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let injection = server.injection_coordinator();
+        let process_uri = uri.clone();
+        let process_entered = Arc::clone(&entered);
+        let process_release = Arc::clone(&release);
+        let process = tokio::spawn(async move {
+            injection
+                .process_injections_after_lifecycle_lock(&process_uri, false, async move {
+                    process_entered.notify_one();
+                    process_release.notified().await;
+                })
+                .await;
+        });
+        entered.notified().await;
+
+        let reopen_waiting = Arc::new(Notify::new());
+        let reopened = Arc::new(AtomicBool::new(false));
+        let documents = Arc::clone(&server.documents);
+        let reopen_uri = uri.clone();
+        let reopen_waiting_task = Arc::clone(&reopen_waiting);
+        let reopened_task = Arc::clone(&reopened);
+        let reopen = tokio::spawn(async move {
+            let edit_lock = documents.edit_lock(&reopen_uri);
+            reopen_waiting_task.notify_one();
+            let _guard = edit_lock.lock().await;
+            documents.remove_preserving_edit_lock(&reopen_uri);
+            let incarnation = documents.insert(
+                reopen_uri,
+                "# new".to_string(),
+                Some("markdown".to_string()),
+                None,
+            );
+            reopened_task.store(true, Ordering::Release);
+            incarnation
+        });
+        reopen_waiting.notified().await;
+
+        assert!(
+            !reopened.load(Ordering::Acquire),
+            "reopen must remain behind the old injection pass's lifecycle guard"
+        );
+        release.notify_one();
+        process.await.unwrap();
+        let new_incarnation = reopen.await.unwrap();
+
+        assert!(reopened.load(Ordering::Acquire));
+        assert_ne!(new_incarnation, old_incarnation);
+    }
 
     /// The snapshot fast path of `resolve_injection_data` must produce
     /// exactly what the inline (live-tree) resolution produces — the fast
