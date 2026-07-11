@@ -81,9 +81,9 @@ impl Kakehashi {
         // document's edit lock first (the same lock `did_change` holds across its
         // reparse). Without it, `remove` could drop the lock entry while an edit
         // still holds the old `Arc`, so a later edit would create a *fresh* lock
-        // and stop serializing with the in-flight one. The guard is held
-        // Keep the retained edit lock through every URI-scoped teardown below;
-        // didOpen takes the same lock before inserting the next lifetime.
+        // and stop serializing with the in-flight one. The retained lock stays
+        // held through every URI-scoped teardown below; didOpen takes the same
+        // lock before inserting the next lifetime.
         self.close_document_lifecycle(&uri, std::future::ready(()))
             .await;
 
