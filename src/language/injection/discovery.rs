@@ -508,13 +508,14 @@ impl InjectionResolver {
         )
     }
 
-    /// Resolve injection language using the unified detection chain (language-detection-fallback-chain).
+    /// Derive a parser-independent canonical injection language for bridge
+    /// selection and stable virtual-document identity.
     ///
     /// This normalizes raw fence identifiers (e.g., "py") to canonical language names
     /// (e.g., "python") that match bridge server configurations.
     ///
-    /// Falls back to the raw identifier if no resolution is found, allowing the
-    /// bridge lookup to fail gracefully with a clear error message.
+    /// Falls back to the raw identifier when no configured or heuristic
+    /// canonical candidate exists; bridge matching then uses that explicit key.
     fn resolve_language(
         coordinator: &LanguageCoordinator,
         raw_identifier: &str,

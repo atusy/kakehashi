@@ -1206,8 +1206,8 @@ impl LanguageCoordinator {
             && self.has_current_parser_registration(language_name, generation)
     }
 
-    /// language-detection-fallback-chain unified detection chain for host docs and injections; returns
-    /// the first language with an available parser. Each stage is
+    /// Parser-aware language-detection fallback chain for host documents;
+    /// returns the first language with an available parser. Each stage is
     /// detect → base resolution → availability:
     /// (1) LSP `languageId` (if not `"plaintext"`); (2) heuristics — explicit
     /// token (`"py"`, `"js"`), path token via `extract_token_from_path`, then
