@@ -491,6 +491,7 @@ impl NodeTracker {
     /// of positions the intervening edits did not shift (keeping the delta
     /// lineage minimal) without ever writing its stale coordinates into this
     /// live-coordinate index.
+    #[cfg(test)]
     pub(crate) fn lookup_in_layer(
         &self,
         uri: &Url,
@@ -505,6 +506,24 @@ impl NodeTracker {
             .forward
             .get(&key)
             .map(|entry| entry.ulid)
+    }
+
+    /// Incarnation-filtered read-only lookup for stale-serving paths. A pass
+    /// from an older lifetime must never reuse a reopened lifetime's ID even
+    /// when its position key is byte-identical.
+    pub(crate) fn lookup_in_layer_for_incarnation(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        layer: usize,
+        incarnation: u64,
+    ) -> Option<Ulid> {
+        let key = PositionKey::new(start, end, kind, layer);
+        let entries = self.entries.get(uri)?;
+        let tracked = entries.forward.get(&key)?;
+        (tracked.incarnation == incarnation).then_some(tracked.ulid)
     }
 
     /// Get the ULID for a host-layer position if it exists, without creating it.
@@ -1096,6 +1115,11 @@ mod tests {
         let stale_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1);
 
         assert_eq!(stale_id, None);
+        assert_eq!(
+            tracker.lookup_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 1),
+            None,
+            "an older lifetime cannot reuse the reopened lifetime's position ID"
+        );
         assert_eq!(
             tracker.lookup_node(&uri, &reopened_id),
             Some((0, 4, "word", 0, 2))

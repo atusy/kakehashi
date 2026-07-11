@@ -450,10 +450,13 @@ impl Kakehashi {
         else {
             return Value::Null;
         };
-        let infos: Vec<Value> = items
+        let infos: Option<Vec<Value>> = items
             .into_iter()
-            .map(|triple| self.mint_node_info(&uri, layer, incarnation, triple))
+            .map(|triple| {
+                let info = self.mint_node_info(&uri, layer, incarnation, triple);
+                (!info.is_null()).then_some(info)
+            })
             .collect();
-        Value::Array(infos)
+        infos.map_or(Value::Null, Value::Array)
     }
 }

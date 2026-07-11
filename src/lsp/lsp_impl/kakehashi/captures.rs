@@ -1554,7 +1554,14 @@ fn execute_captures_walk(
             // unregistered ids must still be unique per capture.
             capture_keys()
                 .map(|(start, end, kind, layer)| {
-                    match tracker.lookup_in_layer(uri, start, end, kind, layer) {
+                    match tracker.lookup_in_layer_for_incarnation(
+                        uri,
+                        start,
+                        end,
+                        kind,
+                        layer,
+                        incarnation,
+                    ) {
                         Some(live) => live,
                         None => ulid::Ulid::new(),
                     }

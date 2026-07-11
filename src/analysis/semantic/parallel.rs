@@ -772,12 +772,13 @@ fn discover_single_region(
                         incarnation,
                     )?
                 } else {
-                    tracker.lookup_in_layer(
+                    tracker.lookup_in_layer_for_incarnation(
                         uri,
                         injection.content_node.start_byte(),
                         injection.content_node.end_byte(),
                         injection.content_node.kind(),
                         0,
+                        incarnation,
                     )?
                 }
                 .to_string();
