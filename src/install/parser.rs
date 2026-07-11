@@ -1968,6 +1968,17 @@ mod tests {
             !target.exists(),
             "partial extraction target should be removed"
         );
+        let leaked_temps = fs::read_dir(temp.path())
+            .expect("read extraction directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".kakehashi-extract-")
+            })
+            .count();
+        assert_eq!(leaked_temps, 0, "partial extraction temp should be removed");
     }
 
     #[test]
