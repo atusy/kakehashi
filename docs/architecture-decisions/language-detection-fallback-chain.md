@@ -113,7 +113,7 @@ detect_language(path, content, token, language_id):
             return result
 
     // 3. First-line detection (shebang, mode line)
-    if syntect detects from first line:
+    if detected = syntect_detect_first_line(content):
         if try_with_base_fallback(detected) succeeds:
             return result
 
