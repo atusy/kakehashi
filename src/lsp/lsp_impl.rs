@@ -122,7 +122,7 @@ pub(super) async fn apply_shared_settings(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .begin_reload();
-    let summary = language_state.language.load_settings(&settings);
+    let mut summary = language_state.language.load_settings(&settings);
     // Invalidate again after the synchronous swap: the first bump rejects
     // pre-reload checkouts, while this one rejects parsers acquired while the
     // registry and query stores were being replaced.
@@ -174,6 +174,14 @@ pub(super) async fn apply_shared_settings(
     // `didChange` deliberately does NOT invalidate (delta needs the previous
     // tokens); only a query/config reload does.
     cache.bump_semantic_token_generation();
+    // Query removal/replacement affects unchanged documents too. Request one
+    // workspace refresh for every reload; ClientNotifier capability-gates and
+    // coalesces it with any language-specific refresh events in this batch.
+    summary
+        .events
+        .push(crate::language::LanguageEvent::semantic_tokens_refresh(
+            "workspace settings reload",
+        ));
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
