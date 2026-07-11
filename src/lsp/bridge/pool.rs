@@ -916,10 +916,10 @@ impl LanguageServerPool {
     pub(crate) async fn remove_replaced_virtual_docs(
         &self,
         host_uri: &Url,
-        expected_uris: &std::collections::HashMap<String, String>,
+        expected_languages: &std::collections::HashMap<&str, &str>,
     ) -> Vec<OpenedVirtualDoc> {
         self.document_tracker
-            .remove_replaced_virtual_docs(host_uri, expected_uris)
+            .remove_replaced_virtual_docs(host_uri, expected_languages)
             .await
     }
 
@@ -1373,11 +1373,15 @@ impl LanguageServerPool {
             for doc in replaced {
                 let language = doc.virtual_uri.language();
                 let region_id = doc.virtual_uri.region_id();
-                if let Some(regions) = host.contents.get(language) {
+                let empty = if let Some(regions) = host.contents.get(language) {
                     regions.remove(region_id);
+                    regions.is_empty()
+                } else {
+                    false
+                };
+                if empty {
+                    host.contents.remove(language);
                 }
-                host.contents
-                    .remove_if(language, |_, regions| regions.is_empty());
             }
         }
     }

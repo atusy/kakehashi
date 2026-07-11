@@ -746,7 +746,7 @@ impl DocumentTracker {
     pub(crate) async fn remove_replaced_virtual_docs(
         &self,
         host_uri: &Url,
-        expected_uris: &std::collections::HashMap<String, String>,
+        expected_languages: &std::collections::HashMap<&str, &str>,
     ) -> Vec<OpenedVirtualDoc> {
         let mut host_map = self.host_to_virtual.lock().await;
         let Some(docs) = host_map.get_mut(host_uri) else {
@@ -755,10 +755,10 @@ impl DocumentTracker {
 
         let mut to_close = Vec::new();
         docs.retain(|doc| {
-            let Some(expected) = expected_uris.get(doc.virtual_uri.region_id()) else {
+            let Some(expected) = expected_languages.get(doc.virtual_uri.region_id()) else {
                 return true;
             };
-            let replaced = doc.virtual_uri.to_uri_string() != *expected;
+            let replaced = doc.virtual_uri.language() != *expected;
             if replaced {
                 to_close.push(doc.clone());
             }
@@ -1520,8 +1520,6 @@ mod tests {
         let tracker = DocumentTracker::new();
         let host_uri = test_host_uri("canonical_language_change");
         let old_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
-        let expected_uri =
-            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_LUA_0);
         let sibling_uri =
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_PYTHON_0);
         let connection = ConnectionKey::for_server("server");
@@ -1532,10 +1530,7 @@ mod tests {
             .register_opened_document(&host_uri, &sibling_uri, &connection)
             .await;
 
-        let expected = std::collections::HashMap::from([(
-            TEST_ULID_LUA_0.to_string(),
-            expected_uri.to_uri_string(),
-        )]);
+        let expected = std::collections::HashMap::from([(TEST_ULID_LUA_0, "python")]);
         let removed = tracker
             .remove_replaced_virtual_docs(&host_uri, &expected)
             .await;

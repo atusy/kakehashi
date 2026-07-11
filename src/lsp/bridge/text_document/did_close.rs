@@ -234,32 +234,12 @@ impl LanguageServerPool {
         host_uri: &Url,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
     ) -> std::collections::HashSet<String> {
-        let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
-            Ok(uri) => uri,
-            Err(error) => {
-                log::error!(
-                    target: "kakehashi::bridge",
-                    "Failed to convert host URI; replaced virtual documents remain open: {error}"
-                );
-                return std::collections::HashSet::new();
-            }
-        };
-        let expected_uris = injections
+        let expected_languages = injections
             .iter()
-            .map(|injection| {
-                (
-                    injection.region_id.clone(),
-                    VirtualDocumentUri::new(
-                        &host_uri_lsp,
-                        &injection.language,
-                        &injection.region_id,
-                    )
-                    .to_uri_string(),
-                )
-            })
+            .map(|injection| (injection.region_id.as_str(), injection.language.as_str()))
             .collect();
         let to_close = self
-            .remove_replaced_virtual_docs(host_uri, &expected_uris)
+            .remove_replaced_virtual_docs(host_uri, &expected_languages)
             .await;
         self.clear_replaced_virtual_contents(host_uri, &to_close);
         let replaced_regions = to_close
