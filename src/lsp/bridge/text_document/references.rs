@@ -87,62 +87,94 @@ impl LanguageServerPool {
                 )
             },
         )
-        .await
+        .await?
     }
 }
 
-/// Normalize a `references` response (`Location[] | null`) into `Vec<Location>`,
-/// applying the same URI filter as goto: keep real-file URIs, translate matches
-/// on the request's virtual URI, drop other virtual URIs (cross-region offsets
-/// are unsafe). An empty filtered vec is preserved (not `None`) so callers can
-/// tell "no results" from "search failed".
+/// Normalize a `references` response (`Location[] | null`) into
+/// `io::Result<Option<Vec<Location>>>`, applying the same URI filter as goto:
+/// keep real-file URIs, translate matches on the request's virtual URI, drop
+/// other virtual URIs (cross-region offsets are unsafe). `Ok(Some(vec))` may
+/// be empty — an empty array from the server is preserved as-is, while
+/// `Ok(None)` covers the answers the protocol allows that carry no array: a
+/// JSON-RPC error response or a `null` result. Protocol violations — a
+/// response with neither `result` nor `error`, or a result that is not
+/// `Location[] | null` — return `Err`, letting callers surface a warning.
 fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
-) -> Option<Vec<Location>> {
+) -> io::Result<Option<Vec<Location>>> {
     if response_has_jsonrpc_error(&response, "textDocument/references") {
-        return None;
+        return Ok(None);
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "textDocument/references response carries neither result nor error (protocol violation)"
+        );
+        return Err(io::Error::other(
+            "textDocument/references response carries neither result nor error (protocol violation)",
+        ));
+    };
     if result.is_null() {
-        return None;
+        return Ok(None);
     }
 
     // The LSP spec defines ReferenceResponse as: Location[] | null
     // References only returns arrays of Location (simpler than goto endpoints)
 
     if result.is_array() {
-        let arr = result.as_array()?;
+        let arr = result
+            .as_array()
+            .expect("result.is_array() was checked above");
         if arr.is_empty() {
             // Preserve empty arrays (semantic: "searched, found nothing")
-            return Some(vec![]);
+            return Ok(Some(vec![]));
         }
 
         // Location[] → transform each location
-        if let Ok(locations) = serde_json::from_value::<Vec<Location>>(result) {
-            let transformed: Vec<Location> = locations
-                .into_iter()
-                .filter_map(|location| {
-                    transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
-                })
-                .collect();
+        match serde_json::from_value::<Vec<Location>>(result) {
+            Ok(locations) => {
+                let transformed: Vec<Location> = locations
+                    .into_iter()
+                    .filter_map(|location| {
+                        transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
+                    })
+                    .collect();
 
-            // Preserve empty array after filtering
-            return Some(transformed);
+                // Preserve empty array after filtering
+                return Ok(Some(transformed));
+            }
+            Err(err) => {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "references response did not match Location[]: {err}"
+                );
+                return Err(io::Error::other(format!(
+                    "malformed textDocument/references result from downstream server: {err}"
+                )));
+            }
         }
     }
 
-    // Failed to deserialize as Location[]
-    None
+    log::warn!(
+        target: "kakehashi::bridge",
+        "references response did not match Location[]"
+    );
+    Err(io::Error::other(
+        "malformed textDocument/references result from downstream server",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::super::test_helpers::test_host_uri;
     use super::RegionOffset;
     use super::transform_references_response_to_host;
+    use crate::lsp::bridge::test_logging::captured_warnings_for;
 
     // ==========================================================================
     // References response transformation tests
@@ -163,7 +195,116 @@ mod tests {
             &RegionOffset::new(5, 0),
         );
 
-        assert!(transformed.is_none());
+        assert!(transformed.unwrap().is_none());
+    }
+
+    #[test]
+    fn references_response_with_jsonrpc_error_returns_ok_none() {
+        // A downstream error response is a protocol-legal "no answer": it must
+        // stay Ok(None), not become Err (which is reserved for violations).
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": { "code": -32603, "message": "internal error" }
+        });
+
+        let transformed = transform_references_response_to_host(
+            response,
+            "file:///virtual.lua",
+            &test_host_uri(),
+            &RegionOffset::new(5, 0),
+        );
+
+        assert!(transformed.unwrap().is_none());
+    }
+
+    #[test]
+    fn references_response_warns_on_missing_result_success() {
+        let warnings = captured_warnings_for(|| {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42
+            });
+
+            let transformed = transform_references_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &test_host_uri(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_err());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains(
+                        "textDocument/references response carries neither result nor error (protocol violation)",
+                    )
+            }),
+            "expected missing-result references warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn references_response_warns_on_malformed_success_result() {
+        let warnings = captured_warnings_for(|| {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": "not references"
+            });
+
+            let transformed = transform_references_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &test_host_uri(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_err());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains("references response did not match Location[]")
+            }),
+            "expected malformed references warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn references_response_warns_on_malformed_location_array() {
+        let warnings = captured_warnings_for(|| {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": [
+                    {
+                        "uri": "file:///project/referenced.lua"
+                    }
+                ]
+            });
+
+            let transformed = transform_references_response_to_host(
+                response,
+                "file:///project/kakehashi-virtual-uri-region-0.lua",
+                &test_host_uri(),
+                &RegionOffset::new(5, 0),
+            );
+
+            assert!(transformed.is_err());
+        });
+
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("kakehashi::bridge")
+                    && message.contains("references response did not match Location[]")
+            }),
+            "expected malformed references array warning, got {warnings:?}"
+        );
     }
 
     #[test]
@@ -182,8 +323,7 @@ mod tests {
             &RegionOffset::new(5, 0),
         );
 
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert!(
             locations.is_empty(),
             "Should preserve empty array from server"
@@ -216,8 +356,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].uri, host_uri);
         assert_eq!(locations[0].range.start.line, 12); // 2 + 10
@@ -253,8 +392,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].uri.as_str(), real_file_uri);
         assert_eq!(locations[0].range.start.line, 10); // Unchanged
@@ -288,8 +426,7 @@ mod tests {
         );
 
         // Should filter out cross-region virtual URI, resulting in empty array
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert!(
             locations.is_empty(),
             "Should have empty array after filtering"
@@ -338,8 +475,7 @@ mod tests {
             &RegionOffset::new(region_start_line, 0),
         );
 
-        assert!(transformed.is_some());
-        let locations = transformed.unwrap();
+        let locations = transformed.unwrap().unwrap();
         assert_eq!(locations.len(), 2); // Cross-region filtered out
         assert_eq!(locations[0].uri, host_uri);
         assert_eq!(locations[0].range.start.line, 3); // Transformed: 0 + 3

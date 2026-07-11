@@ -191,66 +191,11 @@ fn transform_location_link_for_goto(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, Once};
-
-    use log::{Level, LevelFilter, Log, Metadata, Record};
     use serde_json::json;
 
+    use crate::lsp::bridge::test_logging::captured_warnings_for;
+
     use super::*;
-
-    static LOGGER: CapturingLogger = CapturingLogger {
-        messages: Mutex::new(Vec::new()),
-    };
-    static INIT_LOGGER: Once = Once::new();
-    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
-    static CAPTURING: AtomicBool = AtomicBool::new(false);
-
-    struct CapturingLogger {
-        messages: Mutex<Vec<String>>,
-    }
-
-    struct CaptureGuard;
-
-    impl Drop for CaptureGuard {
-        fn drop(&mut self) {
-            CAPTURING.store(false, Ordering::Relaxed);
-        }
-    }
-
-    impl Log for CapturingLogger {
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            CAPTURING.load(Ordering::Relaxed)
-                && metadata.level() <= Level::Warn
-                && metadata.target() == "kakehashi::bridge"
-        }
-
-        fn log(&self, record: &Record<'_>) {
-            if !self.enabled(record.metadata()) {
-                return;
-            }
-            let message = format!("{}:{}:{}", record.level(), record.target(), record.args());
-            self.messages.lock().unwrap().push(message);
-        }
-
-        fn flush(&self) {}
-    }
-
-    fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
-        INIT_LOGGER.call_once(|| {
-            log::set_logger(&LOGGER).expect("test logger should install once");
-            log::set_max_level(LevelFilter::Warn);
-        });
-        let _capture = CAPTURE_LOCK.lock().unwrap();
-        LOGGER.messages.lock().unwrap().clear();
-        CAPTURING.store(true, Ordering::Relaxed);
-        let guard = CaptureGuard;
-        f();
-        drop(guard);
-        let captured = LOGGER.messages.lock().unwrap().clone();
-        LOGGER.messages.lock().unwrap().clear();
-        captured
-    }
 
     #[test]
     fn goto_response_warns_on_malformed_success_result() {
