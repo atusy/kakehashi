@@ -635,6 +635,9 @@ impl LanguageServerPool {
 
         let mut stale_handles = Vec::new();
         for key in invalidated {
+            if let Some(handle) = connections.get(&key) {
+                handle.begin_shutdown();
+            }
             self.host_documents
                 .lock()
                 .await
@@ -1852,6 +1855,9 @@ impl LanguageServerPool {
                 if existing_state.is_some() {
                     let invalidated_handle =
                         launch_config_changed.then(|| existing.cloned()).flatten();
+                    if let Some(handle) = &invalidated_handle {
+                        handle.begin_shutdown();
+                    }
                     // Drop the dead connection's document state with it: the
                     // replacement process has nothing open, so the lazy host
                     // sync must re-send didOpen and the virt tracker must let
