@@ -585,8 +585,10 @@ fn extract_archive<R: Read>(
             create_archive_dir(dest, &safe_relative)?;
         } else {
             unpack_archive_file_entry(&mut entry, dest, &safe_relative)?;
+            // Only FILES count as material: an archive of bare directories
+            // under the prefix still produced nothing buildable.
+            extracted_any = true;
         }
-        extracted_any = true;
     }
 
     // An archive whose every entry missed `expected_prefix` produced nothing:
