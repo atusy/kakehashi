@@ -11,7 +11,7 @@ impl Kakehashi {
             .await;
     }
 
-    async fn did_open_impl_with_lock_probe(
+    pub(in crate::lsp::lsp_impl) async fn did_open_impl_with_lock_probe(
         &self,
         params: DidOpenTextDocumentParams,
         before_lifecycle_lock: impl std::future::Future<Output = ()>,
