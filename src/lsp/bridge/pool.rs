@@ -196,6 +196,7 @@ struct OpenClaimGuard {
 }
 
 type OpenTransitionLocks = DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>;
+type LatestVirtualContents = DashMap<Url, DashMap<(String, String), Arc<str>>>;
 
 impl OpenClaimGuard {
     fn disarm(&mut self) {
@@ -264,7 +265,7 @@ pub struct LanguageServerPool {
     /// Latest extracted content observed from host didChange for each injection.
     /// Interactive requests may carry an older snapshot while awaiting server
     /// startup; the didOpen path reads this after claiming the transition.
-    latest_virtual_contents: DashMap<(Url, String, String), Arc<str>>,
+    latest_virtual_contents: LatestVirtualContents,
     /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
@@ -1076,12 +1077,15 @@ impl LanguageServerPool {
         };
         let current_content = self
             .latest_virtual_contents
-            .get(&(
-                host_uri.clone(),
-                virtual_uri.language().to_string(),
-                virtual_uri.region_id().to_string(),
-            ))
-            .map(|entry| Arc::clone(entry.value()));
+            .get(host_uri)
+            .and_then(|contents| {
+                contents
+                    .get(&(
+                        virtual_uri.language().to_string(),
+                        virtual_uri.region_id().to_string(),
+                    ))
+                    .map(|entry| Arc::clone(entry.value()))
+            });
         let virtual_content = current_content.as_deref().unwrap_or(virtual_content);
         // Register host_to_virtual BEFORE send so that close_host_document
         // can find this document even if the task is aborted after send.
@@ -1134,19 +1138,22 @@ impl LanguageServerPool {
         region_id: &str,
         content: &str,
     ) {
-        self.latest_virtual_contents.insert(
-            (
-                host_uri.clone(),
-                language.to_string(),
-                region_id.to_string(),
-            ),
-            Arc::<str>::from(content),
-        );
+        let contents = self
+            .latest_virtual_contents
+            .entry(host_uri.clone())
+            .or_default();
+        let key = (language.to_string(), region_id.to_string());
+        if contents
+            .get(&key)
+            .is_some_and(|cached| cached.as_ref() == content)
+        {
+            return;
+        }
+        contents.insert(key, Arc::<str>::from(content));
     }
 
     pub(crate) fn clear_latest_virtual_contents(&self, host_uri: &Url) {
-        self.latest_virtual_contents
-            .retain(|(uri, _, _), _| uri != host_uri);
+        self.latest_virtual_contents.remove(host_uri);
     }
 
     pub(crate) fn clear_invalidated_virtual_contents(
@@ -1156,8 +1163,9 @@ impl LanguageServerPool {
     ) {
         let invalidated: std::collections::HashSet<String> =
             invalidated_ulids.iter().map(ToString::to_string).collect();
-        self.latest_virtual_contents
-            .retain(|(uri, _, region_id), _| uri != host_uri || !invalidated.contains(region_id));
+        if let Some(contents) = self.latest_virtual_contents.get(host_uri) {
+            contents.retain(|(_, region_id), _| !invalidated.contains(region_id));
+        }
     }
 
     /// Increment the version of a virtual document and return the new version,
@@ -3577,6 +3585,33 @@ mod tests {
         assert!(pool.close_host_document(&host_uri).await.is_empty());
 
         assert!(pool.latest_virtual_contents.is_empty());
+    }
+
+    #[test]
+    fn unchanged_latest_virtual_content_reuses_allocation() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/cache-dedup.md").unwrap();
+        pool.record_latest_virtual_content(&host_uri, "lua", TEST_ULID_LUA_0, "print('same')");
+        let before = Arc::clone(
+            pool.latest_virtual_contents
+                .get(&host_uri)
+                .unwrap()
+                .get(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
+                .unwrap()
+                .value(),
+        );
+
+        pool.record_latest_virtual_content(&host_uri, "lua", TEST_ULID_LUA_0, "print('same')");
+
+        let after = Arc::clone(
+            pool.latest_virtual_contents
+                .get(&host_uri)
+                .unwrap()
+                .get(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
+                .unwrap()
+                .value(),
+        );
+        assert!(Arc::ptr_eq(&before, &after));
     }
 
     /// Test that ensure_document_opened skips didOpen when document is already opened.

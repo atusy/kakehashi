@@ -54,7 +54,9 @@ impl LanguageServerPool {
             // Publish the latest content even when no downstream document is
             // open yet. A first interactive request may still be awaiting the
             // server handshake with an older snapshot; its didOpen consumes
-            // this value after taking the per-document transition.
+            // this value after taking the per-document transition. Keep the
+            // value after didOpen so a respawned server also reopens from the
+            // latest host content; unchanged edits avoid replacing it.
             self.record_latest_virtual_content(
                 host_uri,
                 &injection.language,
