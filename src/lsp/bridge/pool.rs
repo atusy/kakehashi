@@ -43,13 +43,34 @@ fn same_launch_config(
     old: &crate::config::settings::BridgeServerConfig,
     new: &crate::config::settings::BridgeServerConfig,
 ) -> bool {
-    old.cmd == new.cmd
-        && old.languages == new.languages
-        && old.initialization_options == new.initialization_options
-        && old.workspace_markers == new.workspace_markers
-        && old.on_type_formatting_triggers == new.on_type_formatting_triggers
-        && old.prefer_shared_instance == new.prefer_shared_instance
-        && old.enabled == new.enabled
+    use crate::config::settings::BridgeServerConfig;
+    let BridgeServerConfig {
+        cmd: old_cmd,
+        languages: old_languages,
+        initialization_options: old_initialization_options,
+        settings: _,
+        workspace_markers: old_workspace_markers,
+        on_type_formatting_triggers: old_on_type_formatting_triggers,
+        prefer_shared_instance: _,
+        enabled: _,
+    } = old;
+    let BridgeServerConfig {
+        cmd: new_cmd,
+        languages: new_languages,
+        initialization_options: new_initialization_options,
+        settings: _,
+        workspace_markers: new_workspace_markers,
+        on_type_formatting_triggers: new_on_type_formatting_triggers,
+        prefer_shared_instance: _,
+        enabled: _,
+    } = new;
+    old_cmd == new_cmd
+        && old_languages == new_languages
+        && old_initialization_options == new_initialization_options
+        && old_workspace_markers == new_workspace_markers
+        && old_on_type_formatting_triggers == new_on_type_formatting_triggers
+        && old.prefers_shared_instance() == new.prefers_shared_instance()
+        && old.is_enabled() == new.is_enabled()
 }
 
 fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
@@ -6396,6 +6417,17 @@ mod tests {
             })
             .await;
         assert_eq!(pushed, 0, "no live connections → nothing pushed");
+    }
+
+    #[test]
+    fn launch_config_compares_boolean_defaults_by_effective_value() {
+        let inherited = crate::config::settings::BridgeServerConfig::default();
+        let explicit = crate::config::settings::BridgeServerConfig {
+            prefer_shared_instance: Some(false),
+            enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(same_launch_config(&inherited, &explicit));
     }
 
     #[tokio::test]

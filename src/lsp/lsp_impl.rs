@@ -128,9 +128,9 @@ pub(super) async fn apply_shared_settings(
         None => settings_manager.apply_settings(settings),
     }
     let settings = settings_manager.load_settings();
-    // Path c: push the new per-server settings to live downstream connections
-    // at this single reload choke point (initialize, didChangeConfiguration,
-    // auto-install reload).
+    // Path c: apply downstream config at this single reload choke point
+    // (initialize, didChangeConfiguration, auto-install reload): push runtime
+    // settings in place and recycle connections whose launch config changed.
     // At initialize time there are no connections yet, so it is a clean no-op
     // (downstream-settings-propagation).
     let pushed = bridge.propagate_settings(&settings).await;

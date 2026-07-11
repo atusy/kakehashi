@@ -282,11 +282,11 @@ impl BridgeCoordinator {
         Arc::clone(&self.pool)
     }
 
-    /// Propagate a merged-settings change to every live downstream connection
-    /// (downstream-settings-propagation, path c). Each server's settings are
-    /// re-resolved through the same wildcard merge used at spawn, so an
-    /// unchanged config yields identical values and pushes nothing. Returns the
-    /// number of connections pushed.
+    /// Apply merged server-config changes to live downstream connections.
+    /// Runtime `settings` changes are pushed in place; removed servers and
+    /// spawn-time config changes evict and shut down their connections so the
+    /// next use spawns from the new config. Returns the number of settings
+    /// notifications pushed (evictions are not counted).
     pub(crate) async fn propagate_settings(&self, settings: &WorkspaceSettings) -> usize {
         self.pool
             .propagate_settings(|server_name| resolve_reload_server_config(settings, server_name))
