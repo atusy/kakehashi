@@ -1370,12 +1370,14 @@ impl LanguageCoordinator {
         (None, "none", last_candidate)
     }
 
-    /// language-detection-fallback-chain injection-language detection. Same chain as `detect_language`
+    /// language-detection-fallback-chain injection-language detection. Normally uses the same chain as `detect_language`
     /// (1: direct id, 2: syntect normalisation `py→python`, `js→javascript`,
     /// 3: first-line shebang/mode-line) but *loads* the parser instead of
     /// only checking availability — injection discovery runs before we know
     /// which parsers are needed. Each step runs through `try_load_with_base`
-    /// for config-based base resolution (e.g. `rmd→markdown`).
+    /// for config-based base resolution (e.g. `rmd→markdown`). Explicit
+    /// `plaintext` is the exception: only an eligible configured base is loaded,
+    /// otherwise it remains featureless and returns `None` without heuristics.
     pub(crate) fn resolve_injection_language(
         &self,
         identifier: &str,
