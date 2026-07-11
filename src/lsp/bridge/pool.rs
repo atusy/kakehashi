@@ -1261,19 +1261,17 @@ impl LanguageServerPool {
         if host.incarnation != incarnation {
             return;
         }
-        if let Some(regions) = host.contents.get(language) {
-            if regions
+        if let Some(regions) = host.contents.get(language)
+            && regions
                 .get(region_id)
                 .is_some_and(|cached| cached.as_ref() == content)
-            {
-                return;
-            }
-            regions.insert(region_id.to_string(), Arc::<str>::from(content));
+        {
             return;
         }
-        let regions = DashMap::new();
-        regions.insert(region_id.to_string(), Arc::<str>::from(content));
-        host.contents.insert(language.to_string(), regions);
+        host.contents
+            .entry(language.to_string())
+            .or_default()
+            .insert(region_id.to_string(), Arc::<str>::from(content));
     }
 
     pub(crate) fn host_lifecycle_lock(&self, host_uri: &Url) -> Arc<tokio::sync::Mutex<()>> {
