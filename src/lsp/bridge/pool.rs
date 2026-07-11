@@ -1169,6 +1169,8 @@ impl LanguageServerPool {
         if let Some(contents) = self.latest_virtual_contents.get(host_uri) {
             contents.retain(|(_, region_id), _| !invalidated.contains(region_id));
         }
+        self.latest_virtual_contents
+            .remove_if(host_uri, |_, contents| contents.is_empty());
     }
 
     /// Increment the version of a virtual document and return the new version,
@@ -3630,6 +3632,11 @@ mod tests {
         let contents = pool.latest_virtual_contents.get(&host_uri).unwrap();
         assert!(!contents.contains_key(&("lua".to_string(), TEST_ULID_LUA_0.to_string())));
         assert!(contents.contains_key(&("lua".to_string(), TEST_ULID_LUA_1.to_string())));
+        drop(contents);
+
+        pool.close_invalidated_docs(&host_uri, &[TEST_ULID_LUA_1.parse::<ulid::Ulid>().unwrap()])
+            .await;
+        assert!(!pool.latest_virtual_contents.contains_key(&host_uri));
     }
 
     /// Test that ensure_document_opened skips didOpen when document is already opened.
