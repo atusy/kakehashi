@@ -342,9 +342,22 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     // Spawn the actual diagnostic task (similar to DiagnosticScheduler::spawn_synthetic_diagnostic_task)
     // This task is registered with SyntheticDiagnosticsManager for superseding
     let uri_clone = uri.clone();
+    let publish_documents = Arc::clone(&documents);
     let task = tokio::spawn(async move {
         let diagnostics =
             collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
+
+        // Collection can outlive the timer body's entry gate. Reject a closed
+        // document or a new lifetime at the last boundary before mutating the
+        // diagnostic cache/editor; didClose also aborts this registered task and
+        // clears the host, but the incarnation check makes stale publication
+        // independently impossible.
+        if publish_documents
+            .get(&uri_clone)
+            .is_none_or(|doc| doc.incarnation() != incarnation)
+        {
+            return;
+        }
 
         // Feed the host-event pull outcome into the cache and republish the merged
         // set (push-propagation-diagnostic-forwarding) — push slots survive.
