@@ -305,9 +305,22 @@ impl CacheCoordinator {
                 })
                 .collect();
 
+            // Resolve once for every consumer that needs resolved language /
+            // virtual content. In production the bridge and whole-document
+            // gates rise together, so resolving independently would duplicate
+            // the language-detection chain on the parse critical path.
+            let resolved = (build_bridge_regions || build_resolved_regions).then(|| {
+                crate::language::injection::InjectionResolver::resolve_from_prebuilt(
+                    language,
+                    &regions,
+                    &cacheable_regions,
+                    text,
+                )
+            });
+
             // Bridge-downstream regions from the SAME collected `regions`
             // (parse-snapshot ADR §3, never discover twice): the exact
-            // (raw language, region_id, clean content) triple
+            // (resolved language, region_id, clean content) triple
             // `resolve_injection_data` used to re-derive by re-running the
             // injection query per downstream pass. Gated on a bridge server
             // actually being configured: populate runs on the pre-publish
@@ -316,25 +329,14 @@ impl CacheCoordinator {
             // any late-configured bridge fall back to inline resolution.
             let bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>> =
                 build_bridge_regions.then(|| {
-                    regions
+                    resolved
+                        .as_ref()
+                        .expect("bridge regions requested resolution")
                         .iter()
-                        .zip(cacheable_regions.iter())
-                        .map(|(info, cacheable)| {
-                            let included_ranges =
-                                crate::language::injection::compute_included_ranges(
-                                    &info.content_node,
-                                    info.include_children,
-                                );
-                            let content = crate::language::injection::extract_clean_content(
-                                text,
-                                info.content_node.byte_range(),
-                                included_ranges.as_deref(),
-                            );
-                            crate::document::DiscoveredBridgeRegion {
-                                raw_language: info.language.clone(),
-                                region_id: cacheable.region_id.clone(),
-                                content,
-                            }
+                        .map(|region| crate::document::DiscoveredBridgeRegion {
+                            language: region.injection_language.clone(),
+                            region_id: region.region.region_id.clone(),
+                            content: region.virtual_content.clone(),
                         })
                         .collect()
                 });
@@ -343,14 +345,8 @@ impl CacheCoordinator {
             // same single query run — and from the SAME per-region ids and
             // content hashes already in `cacheable_regions` (no duplicate
             // mint/hash on this critical path).
-            let resolved_regions = build_resolved_regions.then(|| {
-                crate::language::injection::InjectionResolver::resolve_from_prebuilt(
-                    language,
-                    &regions,
-                    &cacheable_regions,
-                    text,
-                )
-            });
+            let resolved_regions = build_resolved_regions
+                .then(|| resolved.expect("whole-document regions requested resolution"));
 
             // Producer half of the discovery lever: build the owned discovery
             // from the SAME `regions` just collected — the injection query (`Q`)

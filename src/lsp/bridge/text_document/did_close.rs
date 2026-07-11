@@ -222,9 +222,34 @@ impl LanguageServerPool {
         }
 
         // Send didClose and clean up tracking for each closed doc
-        for doc in &to_close {
-            self.close_single_virtual_doc(doc).await;
+        for doc in to_close {
+            self.close_single_virtual_doc(&doc).await;
         }
+    }
+
+    /// Close the old language-bearing URI when a live region keeps its ULID but
+    /// resolves to a different language after an edit.
+    pub(crate) async fn close_replaced_docs(
+        &self,
+        host_uri: &Url,
+        injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
+    ) -> std::collections::HashSet<String> {
+        let expected_languages = injections
+            .iter()
+            .map(|injection| (injection.region_id.as_str(), injection.language.as_str()))
+            .collect();
+        let to_close = self
+            .remove_replaced_virtual_docs(host_uri, &expected_languages)
+            .await;
+        self.clear_replaced_virtual_contents(host_uri, &to_close);
+        let replaced_regions = to_close
+            .iter()
+            .map(|doc| doc.virtual_uri.region_id().to_string())
+            .collect();
+        for doc in to_close {
+            self.close_single_virtual_doc(&doc).await;
+        }
+        replaced_regions
     }
 }
 

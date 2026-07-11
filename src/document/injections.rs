@@ -105,10 +105,11 @@ pub(crate) struct DiscoveredInjections {
 /// the downstream path), and carried on the `ParseSnapshot`.
 #[derive(Clone)]
 pub(crate) struct DiscoveredBridgeRegion {
-    /// The RAW injection language identifier (e.g. `"py"`), exactly as the
-    /// query captured it — bridge config lookup and auto-install resolve it
-    /// themselves, so no canonicalization here (identical to the inline path).
-    pub raw_language: String,
+    /// Resolved injection language, shared by eager lifecycle messages and
+    /// interactive request dispatch. Aliases are canonicalized when detection
+    /// succeeds (e.g. `"py"` to `"python"`); otherwise this retains the raw
+    /// identifier so both paths use the same fallback URI.
+    pub language: String,
     /// Position-stable tracker ULID, byte-identical to the one minted for the
     /// `InjectionMap` (same `get_or_create` on the same node).
     pub region_id: String,

@@ -118,7 +118,7 @@ impl InjectionCoordinator {
             return bridge_regions
                 .iter()
                 .map(|region| BridgeInjection {
-                    language: region.raw_language.clone(),
+                    language: region.language.clone(),
                     region_id: region.region_id.clone(),
                     content: region.content.clone(),
                 })
@@ -149,31 +149,21 @@ impl InjectionCoordinator {
             return Vec::new();
         }
 
-        regions
-            .iter()
-            .filter_map(|region| {
-                let region_id = InjectionResolver::calculate_region_id(
-                    self.bridge.node_tracker(),
-                    uri,
-                    region,
-                    incarnation,
-                )?;
-                let included_ranges = crate::language::injection::compute_included_ranges(
-                    &region.content_node,
-                    region.include_children,
-                );
-                let content = crate::language::injection::extract_clean_content(
-                    &text,
-                    region.content_node.byte_range(),
-                    included_ranges.as_deref(),
-                );
-                Some(BridgeInjection {
-                    language: region.language.clone(),
-                    region_id: region_id.to_string(),
-                    content,
-                })
-            })
-            .collect()
+        InjectionResolver::resolve_from_regions(
+            &self.language,
+            self.bridge.node_tracker(),
+            uri,
+            &regions,
+            &text,
+            incarnation,
+        )
+        .into_iter()
+        .map(|region| BridgeInjection {
+            language: region.injection_language,
+            region_id: region.region.region_id,
+            content: region.virtual_content,
+        })
+        .collect()
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
@@ -182,6 +172,36 @@ impl InjectionCoordinator {
     /// Resolves injection data once and reuses it across all three steps. Must be
     /// called AFTER parse_document so the AST is available.
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
+        self.process_injections_after_lifecycle_lock(
+            uri,
+            forward_did_change,
+            std::future::ready(()),
+        )
+        .await;
+    }
+
+    async fn process_injections_after_lifecycle_lock<F>(
+        &self,
+        uri: &Url,
+        forward_did_change: bool,
+        after_lifecycle_lock: F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        // Serialize the complete tree-derived downstream pass with didClose and
+        // didOpen. The pass uses the document state observed after it acquires
+        // this guard; holding the same lifecycle lock through
+        // cancellation, close/update, and eager-open prevents an old task from
+        // mutating a fast-reopened lifetime between check and side effect.
+        let edit_lock = self.documents.edit_lock(uri);
+        let _lifecycle_guard = edit_lock.lock().await;
+        after_lifecycle_lock.await;
+        if self.documents.get(uri).is_none() {
+            self.bridge.cancel_eager_open(uri);
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            return;
+        }
+
         let Some(host_language) = self.get_language_for_document(uri) else {
             self.bridge.cancel_eager_open(uri);
             return;
@@ -194,6 +214,16 @@ impl InjectionCoordinator {
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
             return;
+        }
+
+        // Stop the previous pass before closing a replaced language-bearing URI;
+        // otherwise an old eager task can enqueue didOpen after the close and
+        // resurrect the stale URI. The new batch is created below after cleanup.
+        self.bridge.cancel_eager_open(uri);
+        let replaced_regions = self.bridge.close_replaced_docs(uri, &injections).await;
+        for region_id in replaced_regions {
+            self.diagnostics
+                .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
 
         if forward_did_change {
@@ -374,8 +404,57 @@ impl InjectionCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use super::InjectionResolver;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
     use tower_lsp_server::LspService;
+    use tree_sitter::Query;
     use url::Url;
+
+    #[tokio::test]
+    async fn process_injections_finishes_before_fast_reopen() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///injection-lifecycle.md").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "# old".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let injection = server.injection_coordinator();
+        let process_uri = uri.clone();
+        let process_entered = Arc::clone(&entered);
+        let process_release = Arc::clone(&release);
+        let process = tokio::spawn(async move {
+            injection
+                .process_injections_after_lifecycle_lock(&process_uri, false, async move {
+                    process_entered.notify_one();
+                    process_release.notified().await;
+                })
+                .await;
+        });
+        entered.notified().await;
+
+        let edit_lock = server.documents.edit_lock(&uri);
+        assert!(
+            edit_lock.try_lock().is_err(),
+            "the old injection pass must still own the lifecycle guard"
+        );
+        release.notify_one();
+        process.await.unwrap();
+        let _guard = edit_lock.lock().await;
+        server.documents.remove_preserving_edit_lock(&uri);
+        let new_incarnation =
+            server
+                .documents
+                .insert(uri, "# new".to_string(), Some("markdown".to_string()), None);
+
+        assert_ne!(new_incarnation, old_incarnation);
+    }
 
     /// The snapshot fast path of `resolve_injection_data` must produce
     /// exactly what the inline (live-tree) resolution produces — the fast
@@ -386,26 +465,30 @@ mod tests {
         let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
         let server = service.inner();
 
-        let settings = crate::config::WorkspaceSettings {
-            search_paths: vec![
-                std::env::var("TREE_SITTER_GRAMMARS")
-                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
-            ],
-            ..Default::default()
-        };
-        let _ = server.language.load_settings(&settings);
-        for lang in ["markdown", "markdown_inline", "lua"] {
-            if !server.language.ensure_language_loaded(lang).success {
-                eprintln!("Skipping: {lang} parser not available");
-                return;
-            }
-        }
+        let registry = server.language.language_registry_for_parallel();
+        registry.register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        registry.register("python".to_string(), tree_sitter_python::LANGUAGE.into());
+        registry.register("lua".to_string(), tree_sitter_lua::LANGUAGE.into());
+        let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let injection_query = Query::new(
+            &markdown_language,
+            r#"
+            (fenced_code_block
+              (info_string (language) @_lang)
+              (code_fence_content) @injection.content
+              (#set-lang-from-info-string! @_lang)
+              (#offset! @injection.content 1 0 0 0))
+            "#,
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
 
-        let text = "# T\n\n```lua\nlocal x = 1\n```\n\n```lua\nlocal y = 2\n```\n";
+        let text = "# T\n\n```py\nignored\nx = 1\n```\n\n```unknown\n#!/usr/bin/env lua\n#!/usr/bin/env python\ny = 2\n```\n";
         let mut pool = server.language.create_document_parser_pool();
-        let Some(mut parser) = pool.acquire("markdown") else {
-            return;
-        };
+        let mut parser = pool.acquire("markdown").expect("registered parser");
         let tree = parser.parse(text, None).expect("parse markdown");
         pool.release("markdown".to_string(), parser);
 
@@ -453,6 +536,28 @@ mod tests {
         publish(None, content_version);
         let inline = injection.resolve_injection_data(&uri, "markdown");
         assert!(!inline.is_empty(), "the two fences must resolve");
+        assert!(
+            inline.iter().all(|region| region.language == "python"),
+            "inline eager discovery must use the request resolver's canonical language"
+        );
+        let interactive = InjectionResolver::resolve_all(
+            &server.language,
+            server.bridge.node_tracker(),
+            &uri,
+            &tree,
+            text,
+            &server
+                .language
+                .injection_query("markdown")
+                .expect("registered injection query"),
+            incarnation,
+        );
+        assert!(
+            interactive
+                .iter()
+                .all(|region| region.injection_language == "python"),
+            "interactive request discovery must use the canonical language"
+        );
 
         // FAST PATH: populate derives the bridge regions from the same tree
         // (same tracker → same region ids); a newer current snapshot carries
@@ -480,6 +585,10 @@ mod tests {
             content_version,
         );
         let fast = injection.resolve_injection_data(&uri, "markdown");
+        assert!(
+            fast.iter().all(|region| region.language == "python"),
+            "cached eager discovery must use the request resolver's canonical language"
+        );
 
         assert_eq!(
             inline.len(),
@@ -487,7 +596,7 @@ mod tests {
             "fast path must resolve the same regions"
         );
         for (a, b) in inline.iter().zip(fast.iter()) {
-            assert_eq!(a.language, b.language, "raw language must match");
+            assert_eq!(a.language, b.language, "canonical language must match");
             assert_eq!(a.region_id, b.region_id, "region id must match");
             assert_eq!(a.content, b.content, "clean content must match");
         }
