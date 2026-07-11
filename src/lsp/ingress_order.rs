@@ -295,10 +295,10 @@ enum Role {
 /// wire — but their params carry no `textDocument`, so the URI comes from the
 /// routing envelope in `params.data.kakehashi.host_uri` (unenveloped items
 /// pass through ungated; their handlers return them unchanged anyway). The
-/// `kakehashi/node/*` protocol stays unclassified on purpose: node ids
-/// carry their own staleness handling (`null` → client re-acquires), so
-/// gating those point lookups would add latency without changing
-/// observable behavior.
+/// full `kakehashi/node` family is gated too (#698). Its tracker and
+/// incarnation checks catch staleness only after a lifecycle writer has run;
+/// without this barrier a following node request can overtake a wire-order
+/// `didChange`/`didClose` and observe the pre-writer document.
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
@@ -330,6 +330,10 @@ fn classify(req: &Request) -> Option<Role> {
             Some(Role::Reader {
                 uri: normalize_uri(raw),
             })
+        }
+        _ if method == "kakehashi/node" || method.starts_with("kakehashi/node/") => {
+            let uri = text_document_uri(req)?;
+            Some(Role::Reader { uri })
         }
         _ => None,
     }
@@ -651,6 +655,10 @@ mod tests {
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
             "kakehashi/captures/range",
+            "kakehashi/node",
+            "kakehashi/node/text",
+            "kakehashi/node/children",
+            "kakehashi/node/descendantForPointRange",
         ] {
             let reader = classify(&notification(method, URI));
             assert!(
@@ -812,6 +820,68 @@ mod tests {
         assert!(reader.is_woken(), "writer completion must wake the reader");
         assert!(reader.poll().is_ready());
 
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_node_text_only_after_preceding_close() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didClose",
+            release: Some(release_rx),
+        });
+
+        let close_fut = gate.call(notification("textDocument/didClose", URI));
+        let node_fut = gate.call(notification("kakehashi/node/text", URI));
+        let mut close = tokio_test::task::spawn(close_fut);
+        let mut node = tokio_test::task::spawn(node_fut);
+
+        assert!(node.poll().is_pending(), "node/text must wait for didClose");
+        assert!(close.poll().is_pending(), "didClose stalls on the oneshot");
+        assert!(node.poll().is_pending(), "node/text remains gated");
+        release_tx.send(()).expect("didClose is waiting");
+        assert!(close.poll().is_ready());
+        assert!(node.is_woken());
+        assert!(node.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["close", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_node_navigation_only_after_preceding_change() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let change_fut = gate.call(notification("textDocument/didChange", URI));
+        let node_fut = gate.call(notification("kakehashi/node/children", URI));
+        let mut change = tokio_test::task::spawn(change_fut);
+        let mut node = tokio_test::task::spawn(node_fut);
+
+        assert!(
+            node.poll().is_pending(),
+            "node navigation must wait for didChange"
+        );
+        assert!(
+            change.poll().is_pending(),
+            "didChange stalls on the oneshot"
+        );
+        assert!(node.poll().is_pending(), "node navigation remains gated");
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(change.poll().is_ready());
+        assert!(node.is_woken());
+        assert!(node.poll().is_ready());
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]
