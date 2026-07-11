@@ -1294,11 +1294,18 @@ impl LanguageServerPool {
 
     pub(crate) async fn close_host_incarnation(&self, host_uri: &Url, incarnation: u64) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
-        let _guard = lifecycle.lock().await;
+        let guard = lifecycle.lock().await;
         // A delayed close from an older lifetime must not clear a fast reopen's
         // cache container.
         self.latest_virtual_contents
             .remove_if(host_uri, |_, host| host.incarnation == incarnation);
+        let host_closed = !self.latest_virtual_contents.contains_key(host_uri);
+        drop(guard);
+        if host_closed {
+            self.host_lifecycle_locks.remove_if(host_uri, |_, current| {
+                Arc::ptr_eq(current, &lifecycle) && Arc::strong_count(current) == 2
+            });
+        }
     }
 
     pub(crate) fn clear_invalidated_virtual_contents(
@@ -3834,6 +3841,7 @@ mod tests {
         assert!(pool.close_host_document(&host_uri).await.is_empty());
 
         assert!(pool.latest_virtual_contents.is_empty());
+        assert!(pool.host_lifecycle_locks.is_empty());
     }
 
     #[tokio::test]
