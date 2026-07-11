@@ -98,7 +98,7 @@ Each detection method tries a direct match first, then base resolution:
 detect_language(path, content, token, language_id):
     // 1. Try languageId (skip "plaintext")
     if language_id exists and != "plaintext":
-        if try_with_base_fallback(language_id) succeeds:
+        if result = try_with_base_fallback(language_id):
             return result
 
     // 2. Token-based detection
@@ -106,15 +106,15 @@ detect_language(path, content, token, language_id):
     if effective_token exists:
         // Try syntect normalization (py → python, Makefile → make)
         if normalized = syntect_detect(effective_token):
-            if try_with_base_fallback(normalized) succeeds:
+            if result = try_with_base_fallback(normalized):
                 return result
         // Try raw token with base fallback (handles jsx, tsx)
-        if try_with_base_fallback(effective_token) succeeds:
+        if result = try_with_base_fallback(effective_token):
             return result
 
     // 3. First-line detection (shebang, mode line)
     if detected = syntect_detect_first_line(content):
-        if try_with_base_fallback(detected) succeeds:
+        if result = try_with_base_fallback(detected):
             return result
 
     return None
@@ -122,7 +122,7 @@ detect_language(path, content, token, language_id):
 try_with_base_fallback(candidate):
     if parser_available(candidate):
         return candidate
-    if base_configured(candidate) AND parser_available(base):
+    if base = configured_base(candidate) AND parser_available(base):
         return base
     return None
 ```
