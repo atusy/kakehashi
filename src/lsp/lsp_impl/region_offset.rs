@@ -36,15 +36,9 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool)> {
-    let ulid = ulid::Ulid::from_string(region_id).ok()?;
-    let (_start_byte, _end, _kind, _layer, tracked_incarnation) =
-        bridge.node_tracker().lookup_node(host_url, &ulid)?;
     // Snapshot is owned, so the document handle (a store lock) is released
     // before `detect_document_language` reaches back into the store.
     let snapshot = documents.get(host_url)?.snapshot()?;
-    if snapshot.incarnation() != tracked_incarnation {
-        return None;
-    }
     let language_name = super::detect_document_language(language, documents, host_url)?;
     let injection_query = language.injection_query(&language_name)?;
     let resolved = InjectionResolver::resolve_by_region_id(
@@ -57,10 +51,9 @@ pub(super) fn resolve_region_offset(
         region_id,
         snapshot.incarnation(),
     )?;
-    // Exact-ID resolution also rejects an edit race: if the separately-fetched
-    // snapshot no longer contains the tracked layer, no resolved region has
-    // this ID and callers fall back safely instead of translating another
-    // same-range language layer.
+    // Exact-ID resolution also validates the tracker incarnation and rejects
+    // an edit race: if this snapshot no longer contains the tracked layer, no
+    // candidate has the ID and callers fall back safely.
     Some(resolved_region_geometry(resolved))
 }
 

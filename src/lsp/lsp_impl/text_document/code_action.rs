@@ -257,7 +257,8 @@ impl Kakehashi {
     /// the edit to wrong host columns — corruption. On any divergence fail soft
     /// (the client re-requests fresh actions), mirroring the stale-region case.
     /// The same live resolution yields the content-precise region end used to
-    /// bound the edit (`resolved.region.byte_range.end`, matching applyEdit).
+    /// bound the edit (the exact virtual-content end mapped through the live
+    /// per-line offset, matching applyEdit).
     ///
     /// Known limitation (shared with `code_lens_region_is_fresh`): for
     /// injections whose queries apply `#offset!` (today only YAML/TOML
@@ -282,7 +283,7 @@ impl Kakehashi {
             );
             return Err(RegionEndUnavailable::MalformedEnvelope);
         };
-        let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
+        let Ok(_ulid) = envelope.region_id.parse::<Ulid>() else {
             log::warn!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: envelope region_id {:?} is not a valid ULID",
@@ -290,7 +291,7 @@ impl Kakehashi {
             );
             return Err(RegionEndUnavailable::MalformedEnvelope);
         };
-        self.code_action_region_end_live(envelope, &host_url, ulid)
+        self.code_action_region_end_live(envelope, &host_url)
             .ok_or(RegionEndUnavailable::Stale)
     }
 
@@ -301,17 +302,11 @@ impl Kakehashi {
         &self,
         envelope: &CodeActionEnvelope,
         host_url: &Url,
-        ulid: Ulid,
     ) -> Option<Position> {
         // Re-resolve the region from the LIVE parse (same construction as the
         // goto/showDocument offset path), yielding the current per-line offset
         // AND the content-precise host byte range.
-        let (_start_byte, _end, _kind, _layer, tracked_incarnation) =
-            self.bridge.node_tracker().lookup_node(host_url, &ulid)?;
         let snapshot = self.documents.get(host_url)?.snapshot()?;
-        if snapshot.incarnation() != tracked_incarnation {
-            return None;
-        }
         let language_name = detect_document_language(&self.language, &self.documents, host_url)?;
         let injection_query = self.language.injection_query(&language_name)?;
         let resolved = InjectionResolver::resolve_by_region_id(

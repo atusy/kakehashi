@@ -813,17 +813,41 @@ impl InjectionResolver {
         region_id: &str,
         incarnation: u64,
     ) -> Option<ResolvedInjection> {
-        Self::resolve_all(
-            coordinator,
-            tracker,
-            uri,
-            tree,
-            text,
-            injection_query,
-            incarnation,
-        )
-        .into_iter()
-        .find(|resolved| resolved.region.region_id == region_id)
+        let ulid = Ulid::from_string(region_id).ok()?;
+        let (start, end, kind, identity_layer, tracked_incarnation) =
+            tracker.lookup_node(uri, &ulid)?;
+        if tracked_incarnation != incarnation {
+            return None;
+        }
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
+        let region = regions.iter().find(|candidate| {
+            candidate.content_node.start_byte() == start
+                && candidate.content_node.end_byte() == end
+                && candidate.content_node.kind() == kind
+                && Self::region_identity_layer(candidate) == Some(identity_layer)
+        })?;
+
+        let resolved = if region.combined {
+            let group: Vec<_> = regions
+                .iter()
+                .filter(|candidate| {
+                    candidate.combined
+                        && candidate.pattern_index == region.pattern_index
+                        && candidate.language == region.language
+                })
+                .collect();
+            Self::build_combined_injection(
+                coordinator,
+                Some((tracker, uri, incarnation)),
+                &group,
+                None,
+                text,
+            )?
+        } else {
+            Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)?
+        };
+        (resolved.region.region_id == region_id).then_some(resolved)
     }
 
     /// [`resolve_all`](Self::resolve_all) minus the injection-query run, for a
