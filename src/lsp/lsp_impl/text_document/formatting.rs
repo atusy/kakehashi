@@ -39,6 +39,7 @@ use crate::config::settings::AggregationStrategy;
 use crate::config::settings::{LayerSource, PRIORITIES_WILDCARD};
 use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
+use crate::language::injection::ResolvedInjection;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
@@ -301,7 +302,7 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-        for resolved in all_regions.iter() {
+        for resolved in unique_edit_regions(&all_regions) {
             // Combined injections mask host-only gaps with whitespace. A formatter
             // returns a contiguous whole-document replacement, which would replace
             // those real host gaps as well and corrupt the document.
@@ -566,6 +567,23 @@ impl Kakehashi {
             FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
     }
+}
+
+/// Select one deterministic edit-producing layer for each host byte range.
+///
+/// Discovery orders same-range alternate languages by query-pattern priority.
+/// Formatting must preserve that first winner because dispatching every layer
+/// would concatenate overlapping edits for the identical host span.
+pub(super) fn unique_edit_regions(
+    regions: &[ResolvedInjection],
+) -> impl Iterator<Item = &ResolvedInjection> {
+    let mut seen = std::collections::HashSet::new();
+    regions.iter().filter(move |resolved| {
+        seen.insert((
+            resolved.region.byte_range.start,
+            resolved.region.byte_range.end,
+        ))
+    })
 }
 
 /// Collapse a formatted text into a single whole-document replacement edit
@@ -1842,6 +1860,41 @@ pub(super) async fn finalize_formatting_edits(
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range};
+
+    fn resolved_region(
+        language: &str,
+        byte_range: std::ops::Range<usize>,
+    ) -> crate::language::injection::ResolvedInjection {
+        crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: language.to_string(),
+                byte_range,
+                line_range: 0..1,
+                start_column: 0,
+                region_id: language.to_string(),
+                content_hash: 0,
+            },
+            injection_language: language.to_string(),
+            virtual_content: String::new(),
+            line_column_offsets: vec![0],
+            contiguous: true,
+        }
+    }
+
+    #[test]
+    fn edit_regions_keep_first_language_for_identical_host_range() {
+        let regions = vec![
+            resolved_region("first", 10..20),
+            resolved_region("second", 10..20),
+            resolved_region("third", 30..40),
+        ];
+
+        let selected: Vec<_> = unique_edit_regions(&regions)
+            .map(|region| region.injection_language.as_str())
+            .collect();
+
+        assert_eq!(selected, ["first", "third"]);
+    }
 
     fn edit(start_line: u32, start_char: u32, new_text: &str) -> TextEdit {
         TextEdit {
