@@ -56,16 +56,29 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
     handle.begin_shutdown();
     tokio::spawn(async move {
         const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-        if tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, handle.graceful_shutdown())
-            .await
-            .is_err()
-        {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "Timed out shutting down invalidated {} connection",
-                key
-            );
-            handle.complete_shutdown();
+        let shutdown_handle = Arc::clone(&handle);
+        let shutdown_task = tokio::spawn(async move { shutdown_handle.graceful_shutdown().await });
+        let abort = shutdown_task.abort_handle();
+        match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, shutdown_task).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                log::error!(
+                    target: "kakehashi::bridge",
+                    "Shutdown task for invalidated {} connection failed: {}",
+                    key,
+                    error
+                );
+                handle.complete_shutdown();
+            }
+            Err(_) => {
+                abort.abort();
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "Timed out shutting down invalidated {} connection",
+                    key
+                );
+                handle.complete_shutdown();
+            }
         }
     });
 }
@@ -1966,7 +1979,7 @@ impl LanguageServerPool {
             workspace_folders,
             settings_cell,
         ));
-        handle.record_launch_config(server_config.clone());
+        handle.record_launch_config(server_config);
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
@@ -6262,11 +6275,11 @@ mod tests {
         let lua_value = Arc::new(json!({ "Lua": { "telemetry": { "enable": false } } }));
         let lua =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
-        ra.record_launch_config(crate::config::settings::BridgeServerConfig {
+        ra.record_launch_config(&crate::config::settings::BridgeServerConfig {
             settings: Some(json!({ "not-retained": true })),
             ..Default::default()
         });
-        lua.record_launch_config(crate::config::settings::BridgeServerConfig::default());
+        lua.record_launch_config(&crate::config::settings::BridgeServerConfig::default());
         assert!(ra.launch_config().unwrap().settings.is_none());
         lua.store_settings(Some(Arc::clone(&lua_value)));
         {
@@ -6404,9 +6417,9 @@ mod tests {
             cmd: vec!["stable-server".into()],
             ..Default::default()
         };
-        changed.record_launch_config(old_changed);
-        removed.record_launch_config(old_removed);
-        unchanged.record_launch_config(stable.clone());
+        changed.record_launch_config(&old_changed);
+        removed.record_launch_config(&old_removed);
+        unchanged.record_launch_config(&stable);
         {
             let mut connections = pool.connections().await;
             connections.insert(changed_key.clone(), Arc::clone(&changed));

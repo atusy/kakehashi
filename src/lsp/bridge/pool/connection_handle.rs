@@ -217,10 +217,19 @@ impl ConnectionHandle {
 
     pub(super) fn record_launch_config(
         &self,
-        mut config: crate::config::settings::BridgeServerConfig,
+        config: &crate::config::settings::BridgeServerConfig,
     ) {
-        config.settings = None;
-        let _ = self.launch_config.set(config);
+        let snapshot = crate::config::settings::BridgeServerConfig {
+            cmd: config.cmd.clone(),
+            languages: config.languages.clone(),
+            initialization_options: config.initialization_options.clone(),
+            settings: None,
+            workspace_markers: config.workspace_markers.clone(),
+            on_type_formatting_triggers: config.on_type_formatting_triggers.clone(),
+            prefer_shared_instance: config.prefer_shared_instance,
+            enabled: config.enabled,
+        };
+        let _ = self.launch_config.set(snapshot);
     }
 
     pub(super) fn launch_config(&self) -> Option<&crate::config::settings::BridgeServerConfig> {
