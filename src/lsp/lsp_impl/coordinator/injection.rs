@@ -186,6 +186,10 @@ impl InjectionCoordinator {
             self.bridge.cancel_eager_open(uri);
             return;
         };
+        let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
+            self.bridge.cancel_eager_open(uri);
+            return;
+        };
         let injections = self.resolve_injection_data(uri, &host_language);
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
@@ -194,7 +198,7 @@ impl InjectionCoordinator {
 
         if forward_did_change {
             self.bridge
-                .forward_didchange_to_opened_docs(uri, &injections)
+                .forward_didchange_to_opened_docs(uri, incarnation, &injections)
                 .await;
         }
 

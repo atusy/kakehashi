@@ -792,11 +792,20 @@ impl BridgeCoordinator {
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         uri: &Url,
+        incarnation: u64,
         injections: &[BridgeInjection],
     ) {
         self.pool
-            .forward_didchange_to_opened_docs(uri, injections)
+            .forward_didchange_to_opened_docs(uri, incarnation, injections)
             .await;
+    }
+
+    pub(crate) fn open_host_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.pool.open_host_incarnation(uri, incarnation);
+    }
+
+    pub(crate) fn close_host_incarnation(&self, uri: &Url, incarnation: u64) {
+        self.pool.close_host_incarnation(uri, incarnation);
     }
 
     // ========================================

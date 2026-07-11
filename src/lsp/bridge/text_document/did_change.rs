@@ -34,6 +34,7 @@ impl LanguageServerPool {
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         host_uri: &Url,
+        incarnation: u64,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
     ) {
         // Convert host_uri to lsp_types::Uri for bridge protocol functions
@@ -59,6 +60,7 @@ impl LanguageServerPool {
             // latest host content; unchanged edits avoid replacing it.
             self.record_latest_virtual_content(
                 host_uri,
+                incarnation,
                 &injection.language,
                 &injection.region_id,
                 &injection.content,

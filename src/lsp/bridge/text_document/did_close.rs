@@ -189,7 +189,6 @@ impl LanguageServerPool {
     /// The connection to downstream language servers remains open — only the
     /// virtual documents are closed.
     pub(crate) async fn close_host_document(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
-        self.clear_latest_virtual_contents(host_uri);
         // 1. Remove and get all virtual docs for this host
         let virtual_docs = self.remove_host_virtual_docs(host_uri).await;
 
