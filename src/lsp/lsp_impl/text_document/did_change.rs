@@ -51,7 +51,8 @@ impl Kakehashi {
                     // We created an edit-lock entry above for a document that
                     // doesn't exist (a stray/reordered notification). Drop it so
                     // the map can't grow unboundedly from such notifications.
-                    self.documents.remove_edit_lock(&uri);
+                    self.documents
+                        .remove_edit_lock_if_unshared(&uri, &edit_lock);
                     return;
                 }
             }

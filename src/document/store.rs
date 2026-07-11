@@ -538,6 +538,7 @@ impl DocumentStore {
     /// lock entry behind forever. Such handlers call this on their miss path to
     /// keep the map bounded. Safe to call while holding the lock's `Arc` guard —
     /// the guard keeps the mutex alive; only the map entry is removed.
+    #[cfg(test)]
     pub(crate) fn remove_edit_lock(&self, uri: &Url) {
         self.edit_locks.remove(uri);
     }
