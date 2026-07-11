@@ -511,8 +511,8 @@ impl InjectionResolver {
     /// Derive a parser-independent canonical injection language for bridge
     /// selection and stable virtual-document identity.
     ///
-    /// This normalizes raw fence identifiers (e.g., "py") to canonical language names
-    /// (e.g., "python") that match bridge server configurations.
+    /// This derives the stable bridge key from an explicit configured base or
+    /// heuristic normalization (for example, `py` to `python`).
     ///
     /// Falls back to the raw identifier when no configured or heuristic
     /// canonical candidate exists; bridge matching then uses that explicit key.
