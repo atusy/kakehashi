@@ -106,7 +106,7 @@ impl Kakehashi {
         let pool = self.bridge.pool_arc();
 
         // Outer JoinSet: one task per injection region, all in parallel
-        let mut outer_join_set: JoinSet<Vec<ColorInformation>> = JoinSet::new();
+        let mut outer_join_set: JoinSet<(usize, Option<Vec<ColorInformation>>)> = JoinSet::new();
 
         // Drop servers already known (a live, `Ready` connection) NOT to support
         // this method before the per-region fan-out spawns their tasks
@@ -119,7 +119,7 @@ impl Kakehashi {
             )
             .await;
 
-        for resolved in all_regions.iter() {
+        for (region_index, resolved) in all_regions.iter().enumerate() {
             // Get ALL bridge server configs for this injection language
             let mut configs = self.bridge_configs_for_injection_language(
                 &language_name,
@@ -171,10 +171,11 @@ impl Kakehashi {
                     None,
                 )
                 .await;
-                match result {
-                    FanInResult::Done(colors) => colors,
-                    FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
-                }
+                let colors = match result {
+                    FanInResult::Done(colors) => Some(colors),
+                    FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
+                };
+                (region_index, colors)
             });
         }
 
@@ -188,11 +189,17 @@ impl Kakehashi {
             upstream_request_id.clone(),
         );
         // Collect results, aborting early if $/cancelRequest arrives.
-        crate::lsp::aggregation::region::collect_region_results_with_cancel(
-            outer_join_set,
-            cancel_rx,
-            |acc, items: Vec<ColorInformation>| acc.extend(items),
+        let completion_order_items =
+            crate::lsp::aggregation::region::collect_region_results_with_cancel(
+                outer_join_set,
+                cancel_rx,
+                |acc, region_items: (usize, Option<Vec<ColorInformation>>)| acc.push(region_items),
+            )
+            .await?;
+        Ok(
+            crate::lsp::lsp_impl::whole_document::flatten_ordered_region_items(
+                completion_order_items,
+            ),
         )
-        .await
     }
 }
