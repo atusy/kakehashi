@@ -43,11 +43,13 @@ fn same_launch_config(
     old: &crate::config::settings::BridgeServerConfig,
     new: &crate::config::settings::BridgeServerConfig,
 ) -> bool {
-    let mut old = old.clone();
-    let mut new = new.clone();
-    old.settings = None;
-    new.settings = None;
-    old == new
+    old.cmd == new.cmd
+        && old.languages == new.languages
+        && old.initialization_options == new.initialization_options
+        && old.workspace_markers == new.workspace_markers
+        && old.on_type_formatting_triggers == new.on_type_formatting_triggers
+        && old.prefer_shared_instance == new.prefer_shared_instance
+        && old.enabled == new.enabled
 }
 
 fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
@@ -2091,6 +2093,18 @@ impl LanguageServerPool {
                     Ok(())
                 }
                 Ok(Err(e)) => {
+                    if matches!(
+                        handle_for_handshake.state(),
+                        ConnectionState::Closing | ConnectionState::Closed
+                    ) {
+                        log::debug!(
+                            target: "kakehashi::bridge::init",
+                            "[{}] LSP handshake interrupted by connection invalidation: {}",
+                            server_name_for_log,
+                            e
+                        );
+                        return Err(e);
+                    }
                     // Init failed with io::Error - transition to Failed
                     // Preserve the original ErrorKind for proper error categorization
                     log::error!(
@@ -6248,8 +6262,12 @@ mod tests {
         let lua_value = Arc::new(json!({ "Lua": { "telemetry": { "enable": false } } }));
         let lua =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
-        ra.record_launch_config(crate::config::settings::BridgeServerConfig::default());
+        ra.record_launch_config(crate::config::settings::BridgeServerConfig {
+            settings: Some(json!({ "not-retained": true })),
+            ..Default::default()
+        });
         lua.record_launch_config(crate::config::settings::BridgeServerConfig::default());
+        assert!(ra.launch_config().unwrap().settings.is_none());
         lua.store_settings(Some(Arc::clone(&lua_value)));
         {
             let mut conns = pool.connections().await;

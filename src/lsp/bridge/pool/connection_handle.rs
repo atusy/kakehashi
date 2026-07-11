@@ -215,7 +215,11 @@ impl ConnectionHandle {
         }
     }
 
-    pub(super) fn record_launch_config(&self, config: crate::config::settings::BridgeServerConfig) {
+    pub(super) fn record_launch_config(
+        &self,
+        mut config: crate::config::settings::BridgeServerConfig,
+    ) {
+        config.settings = None;
         let _ = self.launch_config.set(config);
     }
 
