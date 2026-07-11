@@ -27,8 +27,8 @@ fn diagnostic_cheap_cmp(left: &Diagnostic, right: &Diagnostic) -> std::cmp::Orde
         .cmp(&diagnostic_position_key(right))
         .then_with(|| left.message.cmp(&right.message))
         .then_with(|| left.source.cmp(&right.source))
-        .then_with(|| diagnostic_code_cmp(left.code.as_ref(), right.code.as_ref()))
         .then_with(|| left.severity.cmp(&right.severity))
+        .then_with(|| diagnostic_code_cmp(left.code.as_ref(), right.code.as_ref()))
 }
 
 fn diagnostic_code_cmp(
@@ -90,7 +90,7 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::{Position, Range};
+    use tower_lsp_server::ls_types::{DiagnosticSeverity, Position, Range};
 
     fn diag(message: &str) -> Diagnostic {
         Diagnostic {
@@ -139,6 +139,31 @@ mod tests {
             vec![
                 NumberOrString::String("A".to_string()),
                 NumberOrString::String("B".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_severity_precedence_before_code() {
+        let mut later_severity = diag("same");
+        later_severity.severity = Some(DiagnosticSeverity::WARNING);
+        later_severity.code = Some(NumberOrString::String("A".to_string()));
+
+        let mut earlier_severity = diag("same");
+        earlier_severity.severity = Some(DiagnosticSeverity::ERROR);
+        earlier_severity.code = Some(NumberOrString::String("B".to_string()));
+
+        let mut diagnostics = vec![later_severity, earlier_severity];
+        sort_diagnostics_deterministically(&mut diagnostics);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.severity)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(DiagnosticSeverity::ERROR),
+                Some(DiagnosticSeverity::WARNING),
             ]
         );
     }
