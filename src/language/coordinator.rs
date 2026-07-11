@@ -73,6 +73,10 @@ pub(crate) struct LanguageCoordinator {
     /// re-poisoning — no clear-vs-store ordering to get right. The clear on
     /// `load_settings` is memory hygiene, not the correctness mechanism.
     failed_loads: dashmap::DashMap<String, u64>,
+    /// Registry entries discovered from search paths, tagged with the settings
+    /// generation that resolved their library path. A registered parser is not
+    /// a cache hit after reload unless this tag matches the current generation.
+    dynamically_loaded: dashmap::DashMap<String, u64>,
     /// Bumped by every `load_settings` (the only event that can make a
     /// failed load succeed) before the hygiene clear. Read-validated against
     /// `failed_loads` entries; see there.
@@ -107,6 +111,7 @@ impl LanguageCoordinator {
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
             failed_loads: dashmap::DashMap::new(),
+            dynamically_loaded: dashmap::DashMap::new(),
             load_generation: std::sync::atomic::AtomicU64::new(0),
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
@@ -124,7 +129,7 @@ impl LanguageCoordinator {
         if let Some(result) = self.cached_load_verdict(language_id, current_generation) {
             return result;
         }
-        let result = self.try_load_language_by_id(language_id);
+        let result = self.try_load_language_by_id(language_id, current_generation);
         if !result.success {
             self.record_failed_load(language_id, current_generation);
         }
@@ -146,7 +151,7 @@ impl LanguageCoordinator {
         language_id: &str,
         current_generation: u64,
     ) -> Option<LanguageLoadResult> {
-        if self.language_registry.contains(language_id) {
+        if self.has_current_parser_registration(language_id, current_generation) {
             return Some(LanguageLoadResult::success_with(Vec::new()));
         }
         if self
@@ -157,6 +162,14 @@ impl LanguageCoordinator {
             return Some(LanguageLoadResult::default());
         }
         None
+    }
+
+    fn has_current_parser_registration(&self, language_id: &str, current_generation: u64) -> bool {
+        self.language_registry.contains(language_id)
+            && self
+                .dynamically_loaded
+                .get(language_id)
+                .is_none_or(|generation| *generation == current_generation)
     }
 
     /// Record a failed load, tagged with the generation captured BEFORE the
@@ -250,7 +263,8 @@ impl LanguageCoordinator {
                         let coordinator = Arc::clone(self);
                         let owned_id = language_id.to_string();
                         let result = tokio::task::spawn_blocking(move || {
-                            let result = coordinator.try_load_language_by_id(&owned_id);
+                            let result = coordinator
+                                .try_load_language_by_id(&owned_id, current_generation);
                             // Record the failure INSIDE the blocking task so a
                             // winner cancelled mid-`.await` (its future dropped)
                             // still populates the negative cache: the detached
@@ -556,7 +570,10 @@ impl LanguageCoordinator {
         search_paths: &[PathBuf],
         visiting: &mut HashSet<String>,
     ) -> Result<(), LanguageLoadResult> {
-        if self.language_registry.contains(base_name) {
+        let current_generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if self.has_current_parser_registration(base_name, current_generation) {
             return Ok(());
         }
 
@@ -582,7 +599,7 @@ impl LanguageCoordinator {
                      base language '{base_name}' is part of a circular chain"
                 ),
             )),
-            None => self.try_load_language_by_id(base_name),
+            None => self.try_load_language_by_id(base_name, current_generation),
         };
 
         if base_result.success {
@@ -743,11 +760,11 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Internal only - called by ensure_language_loaded.
     /// Not exposed as public API to keep interface minimal (YAGNI).
-    fn try_load_language_by_id(&self, language_id: &str) -> LanguageLoadResult {
-        if self.language_registry.contains(language_id) {
-            return LanguageLoadResult::success_with(Vec::new());
-        }
-
+    fn try_load_language_by_id(
+        &self,
+        language_id: &str,
+        current_generation: u64,
+    ) -> LanguageLoadResult {
         let search_paths = self.config_store.search_paths();
         if search_paths.is_empty() {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
@@ -766,6 +783,8 @@ impl LanguageCoordinator {
             Ok(lang) => lang,
             Err(result) => return result,
         };
+        self.dynamically_loaded
+            .insert(language_id.to_string(), current_generation);
 
         let mut events = Vec::new();
 
@@ -1405,6 +1424,11 @@ impl LanguageCoordinator {
             Ok(lang) => lang,
             Err(result) => return result,
         };
+        // Config-driven registration supersedes any older on-demand entry.
+        // Remove the generation tag only after the new parser is registered,
+        // so a concurrent cache read cannot mistake the old parser for an
+        // untagged, configuration-owned registration.
+        self.dynamically_loaded.remove(lang_name);
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
 
@@ -3100,6 +3124,32 @@ mod tests {
         assert!(
             !coordinator.has_queries("markdown"),
             "removed standalone-loaded derived language should have queries cleared on reload"
+        );
+    }
+
+    #[test]
+    fn settings_reload_invalidates_dynamic_registry_hits() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator
+            .language_registry
+            .register("dynamic".to_string(), tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .dynamically_loaded
+            .insert("dynamic".to_string(), 0);
+        assert!(
+            coordinator.ensure_language_loaded("dynamic").success,
+            "the dynamic parser is current before reload"
+        );
+
+        coordinator.load_settings(&WorkspaceSettings::default());
+
+        assert!(
+            coordinator.language_registry.contains("dynamic"),
+            "the regression requires a stale registry entry to remain present"
+        );
+        assert!(
+            !coordinator.ensure_language_loaded("dynamic").success,
+            "a prior-generation dynamic entry must not bypass current search-path resolution"
         );
     }
 
