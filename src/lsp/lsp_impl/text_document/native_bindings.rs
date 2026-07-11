@@ -230,7 +230,10 @@ impl Kakehashi {
             return Some(None);
         }
         let content_range = region.content_node.byte_range();
-        let Some(content_text) = text.get(content_range.clone()).map(str::to_string) else {
+        let Some(content_text) = text
+            .get(content_range.clone())
+            .map(std::sync::Arc::<str>::from)
+        else {
             return Some(None);
         };
         let Some((layer_language, load)) = self
@@ -251,6 +254,7 @@ impl Kakehashi {
         // The pooled spawn_blocking + timeout protocol every parse site
         // uses: a pathological region cannot pin an async worker.
         let lang_for_parse = layer_language.clone();
+        let content_text_for_parse = std::sync::Arc::clone(&content_text);
         let parsed = self
             .parse_coordinator()
             .parse_with_pool(
@@ -262,23 +266,18 @@ impl Kakehashi {
                 move |mut parser, _deadline| {
                     let tree = parse_with_ranges(
                         &mut parser,
-                        &content_text,
+                        &content_text_for_parse,
                         included_ranges.as_deref(),
                         "kakehashi::bindings",
                         &lang_for_parse,
                     );
-                    (parser, tree.map(|tree| (tree, content_text)))
+                    (parser, tree)
                 },
             )
             .await;
 
         match parsed {
-            Some((layer_tree, content_text)) => Some(Some((
-                query,
-                std::sync::Arc::from(content_text),
-                layer_tree,
-                content_range.start,
-            ))),
+            Some(layer_tree) => Some(Some((query, content_text, layer_tree, content_range.start))),
             None => Some(None),
         }
     }

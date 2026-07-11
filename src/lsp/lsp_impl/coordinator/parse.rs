@@ -156,8 +156,8 @@ impl ParseCoordinator {
     ///   a pinned thread would stall every document's tree-CPU)
     /// - The `PARSE_AWAIT_BACKSTOP` awaiter timeout fired (extreme queue
     ///   pressure; the work-unit still self-bounds)
-    /// - Settings changed while the parser was checked out, so the result was
-    ///   produced by the previous parser generation
+    /// - Settings changed during both the initial parse and its one retry, so
+    ///   neither result belongs to the current parser generation
     /// - The closure returned `None`
     pub(crate) async fn parse_with_pool<T, F>(
         &self,
@@ -167,7 +167,7 @@ impl ParseCoordinator {
         parse_fn: F,
     ) -> Option<T>
     where
-        F: FnOnce(tree_sitter::Parser, std::time::Instant) -> (tree_sitter::Parser, Option<T>)
+        F: FnMut(tree_sitter::Parser, std::time::Instant) -> (tree_sitter::Parser, Option<T>)
             + Send
             + 'static,
         T: Send + 'static,
@@ -179,24 +179,34 @@ impl ParseCoordinator {
         let result = tokio::time::timeout(
             PARSE_AWAIT_BACKSTOP,
             self.compute_pool.run(None, move || {
-                let (parser, parser_generation) = parser_pool
-                    .lock()
-                    .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
-                    .acquire_versioned(&language_name_owned)?;
-                // The in-parse abort deadline is anchored at DEQUEUE, not
-                // submission: a parse that sat in the pool queue behind other
-                // documents' work still gets its full budget of actual parse
-                // CPU (a submission-anchored deadline let a burst of opens
-                // expire healthy parses in the queue, leaving those documents
-                // tree-less until the next edit). The awaiter above covers
-                // queue + parse with slack, so the result is not dropped.
-                let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
-                let (parser, value) = parse_fn(parser, deadline);
-                let parser_is_current = parser_pool
-                    .lock()
-                    .recover_poison("ParseCoordinator::parse_with_pool(release)")
-                    .release_versioned(language_name_owned, parser, parser_generation);
-                parser_is_current.then_some(value).flatten()
+                let mut parse_fn = parse_fn;
+                let mut language_name_owned = language_name_owned;
+                for _attempt in 0..2 {
+                    let (parser, parser_generation) = parser_pool
+                        .lock()
+                        .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
+                        .acquire_versioned(&language_name_owned)?;
+                    // The in-parse abort deadline is anchored at DEQUEUE, not
+                    // submission: a parse that sat in the pool queue behind other
+                    // documents' work still gets its full budget of actual parse
+                    // CPU (a submission-anchored deadline let a burst of opens
+                    // expire healthy parses in the queue, leaving those documents
+                    // tree-less until the next edit). The awaiter above covers
+                    // queue + parse with slack, so the result is not dropped.
+                    let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
+                    let (parser, value) = parse_fn(parser, deadline);
+                    match parser_pool
+                        .lock()
+                        .recover_poison("ParseCoordinator::parse_with_pool(release)")
+                        .release_versioned(language_name_owned, parser, parser_generation)
+                    {
+                        Ok(()) => return value,
+                        Err(stale_language_name) => {
+                            language_name_owned = stale_language_name;
+                        }
+                    }
+                }
+                None
             }),
         )
         .await;

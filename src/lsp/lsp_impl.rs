@@ -884,7 +884,8 @@ mod tests {
             .parser_pool
             .lock()
             .unwrap()
-            .release_versioned("stale".to_string(), parser, generation);
+            .release_versioned("stale".to_string(), parser, generation)
+            .is_ok();
 
         assert!(
             !parser_is_current,
@@ -901,6 +902,44 @@ mod tests {
                 .is_none(),
             "a parser checked out before reload must not re-enter the new pool generation"
         );
+    }
+
+    #[tokio::test]
+    async fn parse_retries_after_parser_generation_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        service
+            .inner()
+            .parser_pool
+            .lock()
+            .unwrap()
+            .release("test".to_string(), tree_sitter::Parser::new());
+        let parser_pool = std::sync::Arc::clone(&service.inner().parser_pool);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_for_parse = std::sync::Arc::clone(&calls);
+
+        let parsed = service
+            .inner()
+            .parse_coordinator()
+            .parse_with_pool(
+                "test",
+                &url::Url::parse("file:///reload-race.test").unwrap(),
+                0,
+                move |parser, _deadline| {
+                    let call = calls_for_parse.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        let mut pool = parser_pool.lock().unwrap();
+                        pool.invalidate();
+                        pool.release("test".to_string(), tree_sitter::Parser::new());
+                    }
+                    (parser, Some(call + 1))
+                },
+            )
+            .await;
+
+        assert_eq!(parsed, Some(2), "only the current-generation parse lands");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

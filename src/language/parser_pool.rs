@@ -59,15 +59,15 @@ impl DocumentParserPool {
         language_id: String,
         parser: Parser,
         generation: u64,
-    ) -> bool {
+    ) -> Result<(), String> {
         if generation == self.generation {
             self.available
                 .entry(language_id)
                 .or_default()
                 .push((generation, parser));
-            true
+            Ok(())
         } else {
-            false
+            Err(language_id)
         }
     }
 
