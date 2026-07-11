@@ -1304,7 +1304,9 @@ impl LanguageServerPool {
         lifecycle: &Arc<tokio::sync::Mutex<()>>,
     ) {
         self.host_lifecycle_locks.remove_if(host_uri, |_, current| {
-            Arc::ptr_eq(current, lifecycle) && Arc::strong_count(current) == 2
+            Arc::ptr_eq(current, lifecycle)
+                && Arc::strong_count(current) == 2
+                && !self.latest_virtual_contents.contains_key(host_uri)
         });
     }
 

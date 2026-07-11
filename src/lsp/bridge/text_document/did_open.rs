@@ -83,9 +83,6 @@ impl LanguageServerPool {
             let current_incarnation = self.current_host_incarnation(host_uri);
             if current_incarnation != Some(expected_incarnation) {
                 drop(lifecycle_guard);
-                if current_incarnation.is_none() {
-                    self.remove_host_lifecycle_lock_if_unshared(host_uri, &lifecycle);
-                }
                 return;
             }
             let virtual_uri =
