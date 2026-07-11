@@ -458,8 +458,10 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
                     "Archive download failed, falling back to git clone: {}",
                     e
                 );
-                // Clean up partial extraction before fallback
-                let _ = fs::remove_dir_all(dest);
+                // Never let git consume a partially extracted archive tree.
+                // Cleanup failure is a local I/O error, not a recoverable
+                // archive-content failure.
+                remove_partial_archive_destination(dest)?;
             }
         }
     }
@@ -472,6 +474,14 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         revision
     );
     clone_repo(url, revision, dest)
+}
+
+fn remove_partial_archive_destination(dest: &Path) -> Result<(), ParserInstallError> {
+    match fs::remove_dir_all(dest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ParserInstallError::IoError(error)),
+    }
 }
 
 fn archive_error_allows_git_fallback(error: &ParserInstallError) -> bool {
