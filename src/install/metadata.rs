@@ -113,16 +113,18 @@ fn load_parsers_lua(
 ) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
     if let Some(cache) = cache
         && let Some(cached_content) = cache.read()
+        && let Ok(parsers) = parse_parsers_lua(&cached_content)
     {
-        return parse_parsers_lua(&cached_content);
+        return Ok(parsers);
     }
 
     let content = fetch()?;
+    let parsers = parse_parsers_lua(&content)?;
     if let Some(cache) = cache {
         // Ignore cache write errors - caching is best-effort
         let _ = cache.write(&content);
     }
-    parse_parsers_lua(&content)
+    Ok(parsers)
 }
 
 fn fetch_parsers_lua() -> Result<String, MetadataError> {
@@ -307,7 +309,25 @@ pub fn is_language_supported(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
+
+    #[test]
+    fn corrupt_fresh_cache_falls_back_to_fetch() {
+        let temp = tempdir().expect("temp dir");
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("truncated").expect("write corrupt cache");
+        let fetched = AtomicBool::new(false);
+
+        let parsers = load_parsers_lua(Some(&cache), || {
+            fetched.store(true, Ordering::Relaxed);
+            Ok("lua = { url = 'https://example.com/lua', revision = 'abc' }".to_string())
+        })
+        .expect("corrupt cache should be repaired from the source");
+
+        assert!(fetched.load(Ordering::Relaxed));
+        assert!(parsers.contains_key("lua"));
+    }
 
     #[test]
     fn test_fetch_parser_metadata_with_caching() {
@@ -583,22 +603,17 @@ return {
     }
 
     #[test]
-    fn test_is_language_supported_returns_error_for_invalid_metadata() {
+    fn invalid_source_still_returns_metadata_error_after_cache_miss() {
         use crate::install::test_helpers::setup_mock_metadata_cache;
 
         let temp = tempdir().expect("Failed to create temp dir");
-        let options = FetchOptions {
-            data_dir: Some(temp.path()),
-            use_cache: true,
-        };
+        setup_mock_metadata_cache(temp.path(), "truncated cache");
+        let cache = MetadataCache::with_default_ttl(temp.path());
 
-        let mock_parsers_lua = "return {}";
-        setup_mock_metadata_cache(temp.path(), mock_parsers_lua);
-
-        let result = is_language_supported("lua", Some(&options));
+        let result = load_parsers_lua(Some(&cache), || Ok("return {}".to_string()));
         assert!(
             matches!(result, Err(MetadataError::EmptyMetadata)),
-            "Expected empty metadata error for invalid metadata"
+            "invalid fetched metadata must not be cached as a successful result"
         );
     }
 }
