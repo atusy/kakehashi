@@ -749,6 +749,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_plaintext_ignores_first_line_heuristics() {
+        let coordinator = LanguageCoordinator::new();
+
+        assert_eq!(
+            InjectionResolver::resolve_language(
+                &coordinator,
+                "plaintext",
+                "#!/usr/bin/env python\nprint('hello')",
+            ),
+            "plaintext"
+        );
+    }
+
     /// Helper: parse `text` with tree-sitter Rust, match `string_content` nodes
     /// via injection query, and return the `CacheableInjectionRegion` for the first match.
     fn cacheable_from_first_injection(text: &str) -> CacheableInjectionRegion {

@@ -1236,6 +1236,9 @@ impl LanguageCoordinator {
         if let Some(base) = self.resolve_base(identifier) {
             return base;
         }
+        if identifier == "plaintext" {
+            return identifier.to_string();
+        }
         if let Some(candidate) = super::heuristic::detect_from_token(identifier) {
             return self.resolve_base(&candidate).unwrap_or(candidate);
         }
