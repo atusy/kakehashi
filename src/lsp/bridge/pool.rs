@@ -266,7 +266,7 @@ pub(crate) struct HostVirtualContents {
     // container, so a stale publisher holding the old DashMap guard can only
     // mutate detached state that current didOpen readers cannot observe.
     pub(crate) incarnation: u64,
-    contents: DashMap<(String, String), Arc<str>>,
+    contents: DashMap<String, DashMap<String, Arc<str>>>,
 }
 
 type LatestVirtualContents = DashMap<Url, HostVirtualContents>;
@@ -1203,11 +1203,12 @@ impl LanguageServerPool {
         // claim and serializes a didChange behind this didOpen transition.
         let current_content = self.latest_virtual_contents.get(host_uri).and_then(|host| {
             host.contents
-                .get(&(
-                    virtual_uri.language().to_string(),
-                    virtual_uri.region_id().to_string(),
-                ))
-                .map(|entry| Arc::clone(entry.value()))
+                .get(virtual_uri.language())
+                .and_then(|regions| {
+                    regions
+                        .get(virtual_uri.region_id())
+                        .map(|entry| Arc::clone(entry.value()))
+                })
         });
         let virtual_content = current_content.as_deref().unwrap_or(virtual_content);
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
@@ -1260,15 +1261,19 @@ impl LanguageServerPool {
         if host.incarnation != incarnation {
             return;
         }
-        let contents = &host.contents;
-        let key = (language.to_string(), region_id.to_string());
-        if contents
-            .get(&key)
-            .is_some_and(|cached| cached.as_ref() == content)
-        {
+        if let Some(regions) = host.contents.get(language) {
+            if regions
+                .get(region_id)
+                .is_some_and(|cached| cached.as_ref() == content)
+            {
+                return;
+            }
+            regions.insert(region_id.to_string(), Arc::<str>::from(content));
             return;
         }
-        contents.insert(key, Arc::<str>::from(content));
+        let regions = DashMap::new();
+        regions.insert(region_id.to_string(), Arc::<str>::from(content));
+        host.contents.insert(language.to_string(), regions);
     }
 
     pub(crate) fn host_lifecycle_lock(&self, host_uri: &Url) -> Arc<tokio::sync::Mutex<()>> {
@@ -1333,8 +1338,10 @@ impl LanguageServerPool {
         let invalidated: std::collections::HashSet<String> =
             invalidated_ulids.iter().map(ToString::to_string).collect();
         if let Some(host) = self.latest_virtual_contents.get(host_uri) {
-            host.contents
-                .retain(|(_, region_id), _| !invalidated.contains(region_id));
+            host.contents.retain(|_, regions| {
+                regions.retain(|region_id, _| !invalidated.contains(region_id));
+                !regions.is_empty()
+            });
         }
     }
 
@@ -3882,27 +3889,19 @@ mod tests {
         let host_uri = Url::parse("file:///test/cache-dedup.md").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "print('same')");
-        let before = Arc::clone(
-            pool.latest_virtual_contents
-                .get(&host_uri)
-                .unwrap()
-                .contents
-                .get(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
-                .unwrap()
-                .value(),
-        );
+        let before = {
+            let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
+            let regions = host.contents.get("lua").unwrap();
+            Arc::clone(regions.get(TEST_ULID_LUA_0).unwrap().value())
+        };
 
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "print('same')");
 
-        let after = Arc::clone(
-            pool.latest_virtual_contents
-                .get(&host_uri)
-                .unwrap()
-                .contents
-                .get(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
-                .unwrap()
-                .value(),
-        );
+        let after = {
+            let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
+            let regions = host.contents.get("lua").unwrap();
+            Arc::clone(regions.get(TEST_ULID_LUA_0).unwrap().value())
+        };
         assert!(Arc::ptr_eq(&before, &after));
     }
 
@@ -3921,12 +3920,14 @@ mod tests {
         assert!(
             !contents
                 .contents
-                .contains_key(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
+                .get("lua")
+                .is_some_and(|regions| regions.contains_key(TEST_ULID_LUA_0))
         );
         assert!(
             contents
                 .contents
-                .contains_key(&("lua".to_string(), TEST_ULID_LUA_1.to_string()))
+                .get("lua")
+                .is_some_and(|regions| regions.contains_key(TEST_ULID_LUA_1))
         );
         drop(contents);
 
@@ -3943,7 +3944,8 @@ mod tests {
                 .get(&host_uri)
                 .unwrap()
                 .contents
-                .contains_key(&("lua".to_string(), TEST_ULID_LUA_0.to_string()))
+                .get("lua")
+                .is_some_and(|regions| regions.contains_key(TEST_ULID_LUA_0))
         );
     }
 
