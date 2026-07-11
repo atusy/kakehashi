@@ -11,7 +11,9 @@
 use std::{future::Future, path::PathBuf};
 use tower_lsp_server::ls_types::MessageType;
 
-use crate::install::support_check::{SkipReason, should_skip_unsupported_language};
+use crate::install::support_check::{
+    TrackedSupportCheck, should_skip_unsupported_language_tracked,
+};
 use crate::language::FailedParserRegistry;
 
 use super::{InstallingLanguages, InstallingLanguagesExt};
@@ -234,7 +236,7 @@ impl AutoInstallManager {
                         data_dir: Some(dir.as_path()),
                         use_cache: true,
                     });
-            should_skip_unsupported_language(&language, fetch_options.as_ref()).await
+            should_skip_unsupported_language_tracked(&language, fetch_options.as_ref()).await
         })
         .await
     }
@@ -246,7 +248,7 @@ impl AutoInstallManager {
     ) -> InstallResult
     where
         F: FnOnce(String, Option<PathBuf>) -> Fut + Send + 'static,
-        Fut: Future<Output = (bool, Option<SkipReason>)> + Send + 'static,
+        Fut: Future<Output = TrackedSupportCheck> + Send + 'static,
     {
         let mut events = Vec::new();
 
@@ -296,7 +298,7 @@ impl AutoInstallManager {
             let result = support_check(lookup_language, lookup_data_dir).await;
             (result, install_marker)
         });
-        let ((should_skip, reason), install_marker) = match support_task.await {
+        let (support_result, install_marker) = match support_task.await {
             Ok(result) => result,
             Err(join_error) => {
                 events.push(InstallEvent::Log {
@@ -312,6 +314,11 @@ impl AutoInstallManager {
                 };
             }
         };
+        let TrackedSupportCheck {
+            should_skip,
+            reason,
+            completion,
+        } = support_result;
 
         if let Some(reason) = &reason {
             events.push(InstallEvent::Log {
@@ -321,6 +328,12 @@ impl AutoInstallManager {
         }
 
         if should_skip {
+            if let Some(completion) = completion {
+                tokio::spawn(async move {
+                    let _marker = install_marker;
+                    let _ = completion.await;
+                });
+            }
             return InstallResult {
                 outcome: InstallOutcome::Unsupported,
                 events,
@@ -544,7 +557,7 @@ mod tests {
                     first_lookup_count.fetch_add(1, Ordering::SeqCst);
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
-                    (true, None)
+                    TrackedSupportCheck::completed(true, None)
                 })
                 .await
         });
@@ -554,7 +567,7 @@ mod tests {
         let result = manager
             .try_install_with_support_check("lua", move |_, _| {
                 duplicate_lookup_count.fetch_add(1, Ordering::SeqCst);
-                async { (false, None) }
+                async { TrackedSupportCheck::completed(false, None) }
             })
             .await;
 
@@ -577,7 +590,9 @@ mod tests {
         let (manager, _temp) = create_test_manager();
 
         let result = manager
-            .try_install_with_support_check("unsupported", |_, _| async { (true, None) })
+            .try_install_with_support_check("unsupported", |_, _| async {
+                TrackedSupportCheck::completed(true, None)
+            })
             .await;
 
         assert_eq!(result.outcome, InstallOutcome::Unsupported);
@@ -587,6 +602,41 @@ mod tests {
                 .try_start_install("unsupported"),
             "unsupported and metadata-error exits share this skip path and must release the claim"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_support_work_keeps_claim_until_completion() {
+        let (manager, _temp) = create_test_manager();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let result = manager
+            .try_install_with_support_check("lua", |_, _| async move {
+                TrackedSupportCheck {
+                    should_skip: true,
+                    reason: None,
+                    completion: Some(tokio::spawn(async move {
+                        let _ = release_rx.await;
+                    })),
+                }
+            })
+            .await;
+        assert_eq!(result.outcome, InstallOutcome::Unsupported);
+
+        let duplicate = manager
+            .try_install_with_support_check("lua", |_, _| async {
+                TrackedSupportCheck::completed(false, None)
+            })
+            .await;
+        assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.installing_languages.try_start_install("lua") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("claim keeper must release after timed-out work finishes");
     }
 
     #[tokio::test]
@@ -606,7 +656,7 @@ mod tests {
                 .try_install_with_support_check("lua", |_, _| async move {
                     let _ = started_tx.send(());
                     let _ = release_rx.await;
-                    (true, None)
+                    TrackedSupportCheck::completed(true, None)
                 })
                 .await
         });
@@ -619,7 +669,7 @@ mod tests {
         let duplicate = manager
             .try_install_with_support_check("lua", move |_, _| {
                 duplicate_count.fetch_add(1, Ordering::SeqCst);
-                async { (false, None) }
+                async { TrackedSupportCheck::completed(false, None) }
             })
             .await;
         assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
