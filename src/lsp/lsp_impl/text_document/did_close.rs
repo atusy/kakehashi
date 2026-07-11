@@ -38,8 +38,10 @@ impl Kakehashi {
         // document's edit lock first (the same lock `did_change` holds across its
         // reparse). Without it, `remove` could drop the lock entry while an edit
         // still holds the old `Arc`, so a later edit would create a *fresh* lock
-        // and stop serializing with the in-flight one. The guard is dropped right
-        // after the removal — the remaining cleanups touch other subsystems.
+        // and stop serializing with the in-flight one. The guard is held
+        // across the whole in-helper teardown (captures/walk cache clears,
+        // walk cancellation, document + cache removal); only the cleanups
+        // BELOW this call run outside the edit-lock section.
         self.clear_document_state_on_close(&uri).await;
 
         // Clean up region ID mappings for this document
