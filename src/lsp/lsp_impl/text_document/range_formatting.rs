@@ -36,7 +36,7 @@ use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, parse_host_ve
 use crate::text::PositionMapper;
 
 use super::super::{Kakehashi, uri_to_url};
-use super::formatting::{finalize_formatting_edits, unique_edit_regions};
+use super::formatting::{RegionFormatPlan, finalize_formatting_edits, plan_region_format};
 
 impl Kakehashi {
     pub(crate) async fn range_formatting_impl(
@@ -177,7 +177,8 @@ impl Kakehashi {
             });
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-            for resolved in unique_edit_regions(&all_regions) {
+            let mut seen_edit_ranges = std::collections::HashSet::new();
+            for resolved in all_regions.iter() {
                 // Non-contiguous combined injections contain masked host-only
                 // gaps. Even a covering range may fall back to full formatting,
                 // whose single replacement would overwrite those real gaps.
@@ -220,7 +221,6 @@ impl Kakehashi {
                 if configs.is_empty() {
                     continue;
                 }
-
                 // Resolve aggregation under "textDocument/formatting", not
                 // "textDocument/rangeFormatting". Range formatting is the
                 // partial-document counterpart of full formatting and shares its
@@ -245,6 +245,23 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
+                if matches!(
+                    plan_region_format(
+                        region_ctx.strategy,
+                        &region_ctx.priorities,
+                        &region_ctx.configs,
+                        region_ctx.max_fan_out,
+                    ),
+                    RegionFormatPlan::Skip | RegionFormatPlan::Disabled
+                ) {
+                    continue;
+                }
+                if !seen_edit_ranges.insert((
+                    resolved.region.byte_range.start,
+                    resolved.region.byte_range.end,
+                )) {
+                    continue;
+                }
 
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning

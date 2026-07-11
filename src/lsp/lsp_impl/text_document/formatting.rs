@@ -39,6 +39,7 @@ use crate::config::settings::AggregationStrategy;
 use crate::config::settings::{LayerSource, PRIORITIES_WILDCARD};
 use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
+#[cfg(test)]
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
@@ -302,7 +303,8 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-        for resolved in unique_edit_regions(&all_regions) {
+        let mut seen_edit_ranges = std::collections::HashSet::new();
+        for resolved in all_regions.iter() {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
             // would replace those real host gaps as well and corrupt the document.
@@ -314,7 +316,6 @@ impl Kakehashi {
             if configs.is_empty() {
                 continue;
             }
-
             let agg = self.resolve_aggregation_config(
                 language_name,
                 &resolved.injection_language,
@@ -414,6 +415,12 @@ impl Kakehashi {
                     continue;
                 }
             };
+            if !seen_edit_ranges.insert((
+                resolved.region.byte_range.start,
+                resolved.region.byte_range.end,
+            )) {
+                continue;
+            }
 
             // Mint this region's tracked-source token into the shared
             // aggregator ONLY for the preferred branch. Concatenated regions
@@ -574,6 +581,7 @@ impl Kakehashi {
 /// Discovery orders same-range alternate languages by query-pattern priority.
 /// Formatting must preserve that first winner because dispatching every layer
 /// would concatenate overlapping edits for the identical host span.
+#[cfg(test)]
 pub(super) fn unique_edit_regions(
     regions: &[ResolvedInjection],
 ) -> impl Iterator<Item = &ResolvedInjection> {
@@ -620,7 +628,7 @@ fn whole_document_replacement(original: &str, formatted: &str) -> Option<Vec<Tex
 /// How a single injection region should be formatted, derived from its resolved
 /// aggregation config. Extracted so the gating rule lives in one testable place.
 #[derive(Debug, PartialEq, Eq)]
-enum RegionFormatPlan {
+pub(super) enum RegionFormatPlan {
     /// Run the sequential concatenated pipeline over these effective servers
     /// (explicit `priorities` names filtered to configured servers, deduped,
     /// order preserved — the `"*"` wildcard is excluded, see
@@ -663,7 +671,7 @@ enum RegionFormatPlan {
 ///   allowlist forbids running the non-listed servers `preferred` would pick.
 ///   A `"*"` mixed into the list is ignored (no deterministic expansion order
 ///   for a sequential pipeline); the caller warns.
-fn plan_region_format(
+pub(super) fn plan_region_format(
     strategy: AggregationStrategy,
     priorities: &[String],
     configs: &[ResolvedServerConfig],
