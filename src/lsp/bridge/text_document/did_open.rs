@@ -65,7 +65,7 @@ impl LanguageServerPool {
                 }
                 None => None,
             };
-            let _lifecycle_guard = match &lifecycle {
+            let lifecycle_guard = match &lifecycle {
                 Some(lifecycle) => Some(lifecycle.lock().await),
                 None => None,
             };
@@ -75,6 +75,10 @@ impl LanguageServerPool {
                     .get(host_uri)
                     .is_none_or(|host| host.incarnation != expected)
             {
+                drop(lifecycle_guard);
+                if let Some(lifecycle) = &lifecycle {
+                    self.remove_host_lifecycle_lock_if_unshared(host_uri, lifecycle);
+                }
                 return;
             }
             let virtual_uri =

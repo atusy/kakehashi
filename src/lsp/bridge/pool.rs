@@ -1289,6 +1289,16 @@ impl LanguageServerPool {
             .map(|entry| Arc::clone(entry.value()))
     }
 
+    pub(crate) fn remove_host_lifecycle_lock_if_unshared(
+        &self,
+        host_uri: &Url,
+        lifecycle: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.host_lifecycle_locks.remove_if(host_uri, |_, current| {
+            Arc::ptr_eq(current, lifecycle) && Arc::strong_count(current) == 2
+        });
+    }
+
     pub(crate) async fn open_host_incarnation(&self, host_uri: &Url, incarnation: u64) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
         let _guard = lifecycle.lock().await;
@@ -1311,9 +1321,7 @@ impl LanguageServerPool {
         let host_closed = !self.latest_virtual_contents.contains_key(host_uri);
         drop(guard);
         if host_closed {
-            self.host_lifecycle_locks.remove_if(host_uri, |_, current| {
-                Arc::ptr_eq(current, &lifecycle) && Arc::strong_count(current) == 2
-            });
+            self.remove_host_lifecycle_lock_if_unshared(host_uri, &lifecycle);
         }
     }
 
