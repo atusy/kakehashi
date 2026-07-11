@@ -5,6 +5,23 @@ use tower_lsp_server::ls_types::DidCloseTextDocumentParams;
 use super::super::{Kakehashi, uri_to_url};
 
 impl Kakehashi {
+    pub(in crate::lsp::lsp_impl) async fn clear_document_state_on_close(&self, uri: &url::Url) {
+        let edit_lock = self.documents.edit_lock(uri);
+        let _edit_guard = edit_lock.lock().await;
+        // Captures lineage and walk memos are installed under this same lock,
+        // so a store that won first is cleared while one arriving later sees
+        // the document gone and refuses to install obsolete state.
+        self.captures_cache.retain(|key, _| key.0 != *uri);
+        self.captures_walk_cache.retain(|key, _| key.0 != *uri);
+        self.cancel_captures_walks_for_document(uri);
+        self.documents.remove(uri);
+        self.cache.remove_document(uri);
+        // The match cache uses insert-then-verify. Clearing after document
+        // removal ensures a straggler either inserted before this clear or
+        // observes the closed document and self-removes.
+        self.captures_match_cache.clear_document(uri);
+    }
+
     pub(crate) async fn did_close_impl(&self, params: DidCloseTextDocumentParams) {
         let lsp_uri = params.text_document.uri;
 
@@ -21,37 +38,11 @@ impl Kakehashi {
         // document's edit lock first (the same lock `did_change` holds across its
         // reparse). Without it, `remove` could drop the lock entry while an edit
         // still holds the old `Arc`, so a later edit would create a *fresh* lock
-        // and stop serializing with the in-flight one. The guard is dropped right
-        // after the removal — the remaining cleanups touch other subsystems.
-        {
-            let edit_lock = self.documents.edit_lock(&uri);
-            let _edit_guard = edit_lock.lock().await;
-            // Drop stored captures lineage BEFORE the removal and INSIDE the
-            // edit-lock section (captures-protocol): `store_lineage` inserts
-            // under this same lock, so clearing here cannot wipe a lineage a
-            // fast reopen's `full` stored after this close completed — that
-            // insert can only start once this section is over, against the
-            // reopened document's fresh open generation. (A didOpen landing
-            // *inside* this section is a wider lifecycle race; for captures it
-            // degrades to the self-healing "delta answers null → client calls
-            // full again", never to stale data.)
-            self.captures_cache.retain(|key, _| key.0 != uri);
-            self.captures_walk_cache.retain(|key, _| key.0 != uri);
-            self.cancel_captures_walks_for_document(&uri);
-            self.documents.remove(&uri);
-            // Semantic token handlers serialize their final currency check and
-            // cache insert with this lock. A store that won first is cleared;
-            // one that arrives later observes the document gone and refuses.
-            self.cache.remove_document(&uri);
-            // AFTER the document removal, deliberately: the match cache's
-            // store paths use an insert-then-verify handshake against this
-            // ordering — a straggler walk whose post-insert liveness probe
-            // saw the document open is guaranteed to have inserted before
-            // this clear runs, so the clear reclaims it; one that probes
-            // after the removal self-removes. Clearing BEFORE the removal
-            // would reopen the resurrection leak (codex review).
-            self.captures_match_cache.clear_document(&uri);
-        }
+        // and stop serializing with the in-flight one. The guard is held
+        // across the whole in-helper teardown (captures/walk cache clears,
+        // walk cancellation, document + cache removal); only the cleanups
+        // BELOW this call run outside the edit-lock section.
+        self.clear_document_state_on_close(&uri).await;
 
         // Clean up region ID mappings for this document
         // (lazy-node-identity-tracking). This runs AFTER the removal above
