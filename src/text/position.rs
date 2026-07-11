@@ -1,6 +1,8 @@
 use line_index::{LineIndex, WideEncoding, WideLineCol};
 use tower_lsp_server::ls_types::Position;
 
+use super::char_boundary::floor_char_boundary;
+
 /// Position mapper for converting between LSP positions and byte offsets
 pub struct PositionMapper<'text> {
     line_index: LineIndex,
@@ -61,14 +63,11 @@ impl PositionMapper<'_> {
                     .map(|line| line.strip_suffix('\r').unwrap_or(line))
                     .unwrap_or(line);
                 let line_end = line_start + content.len();
-                let mut byte = self
+                let byte = self
                     .position_to_byte(position)
                     .unwrap_or(line_end)
                     .min(line_end);
-                while !self.text.is_char_boundary(byte) {
-                    byte -= 1;
-                }
-                byte
+                floor_char_boundary(self.text, byte)
             }
             // The line itself is past EOF: clamp to the document end.
             None => self.line_index.len().into(),
