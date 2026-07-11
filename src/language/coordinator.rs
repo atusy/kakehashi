@@ -1481,7 +1481,13 @@ impl LanguageCoordinator {
             LanguageLogLevel::Error,
         ) {
             Ok(lang) => lang,
-            Err(result) => return result,
+            Err(result) => {
+                let generation = self
+                    .load_generation
+                    .load(std::sync::atomic::Ordering::Acquire);
+                self.record_failed_load(lang_name, generation);
+                return result;
+            }
         };
         self.register_configured_language(lang_name, language.clone());
 
@@ -3258,6 +3264,43 @@ mod tests {
         assert!(
             !coordinator.ensure_language_loaded("configured").success,
             "an old configured registration must not survive a generation where it was not loaded"
+        );
+    }
+
+    #[test]
+    fn configured_parser_failure_blocks_dynamic_fallback() {
+        let coordinator = LanguageCoordinator::new();
+        let cwd = std::env::current_dir().expect("cwd");
+        let grammar_dir = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        let dynamic_parser = std::path::PathBuf::from(&grammar_dir)
+            .join("parser")
+            .join(format!("markdown.{}", std::env::consts::DLL_EXTENSION));
+        if !dynamic_parser.exists() {
+            eprintln!(
+                "skipping configured_parser_failure_blocks_dynamic_fallback: '{}' does not exist",
+                dynamic_parser.display()
+            );
+            return;
+        }
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings {
+                parser: Some("/definitely/missing/parser.so".to_string()),
+                ..Default::default()
+            },
+        );
+
+        coordinator.load_settings(&WorkspaceSettings {
+            languages,
+            search_paths: vec![grammar_dir],
+            ..Default::default()
+        });
+
+        assert!(
+            !coordinator.ensure_language_loaded("markdown").success,
+            "an explicit configured parser failure must not fall back to dynamic discovery"
         );
     }
 
