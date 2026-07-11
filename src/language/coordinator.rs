@@ -883,6 +883,7 @@ impl LanguageCoordinator {
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire)
             != expected_generation
+            || self.configured_load_failed(language_id, expected_generation)
         {
             return false;
         }
@@ -3325,14 +3326,15 @@ mod tests {
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
         assert!(
-            coordinator.publish_dynamic_language(
+            !coordinator.publish_dynamic_language(
                 "markdown",
                 tree_sitter_rust::LANGUAGE.into(),
                 generation,
                 || {},
             ),
-            "simulate dynamic fallback winning the publication race"
+            "configured failure must reject same-generation dynamic publication"
         );
+        assert!(!coordinator.language_registry.contains("markdown"));
 
         assert!(
             !coordinator.ensure_language_loaded("markdown").success,
