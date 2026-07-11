@@ -62,7 +62,8 @@ impl Kakehashi {
         // has no entries. `layer` pins resolution to the language tree that
         // minted the node so navigation stays in-layer (node-reference-protocol
         // Scope rule).
-        let Some((start, end, kind, layer)) = self.bridge.node_tracker().lookup_node(&uri, &ulid)
+        let Some((start, end, kind, layer, tracked_incarnation)) =
+            self.bridge.node_tracker().lookup_node(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -80,6 +81,9 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
         let incarnation = snapshot.incarnation;
+        if incarnation != tracked_incarnation {
+            return Ok(Value::Null);
+        }
         let host_text: &str = &snapshot.text;
         let Some(host_tree) = snapshot.tree.as_ref() else {
             return Ok(Value::Null);

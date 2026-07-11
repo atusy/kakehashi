@@ -307,9 +307,12 @@ impl Kakehashi {
         // Re-resolve the region from the LIVE parse (same construction as the
         // goto/showDocument offset path), yielding the current per-line offset
         // AND the content-precise host byte range.
-        let (start_byte, _end, _kind, _layer) =
+        let (start_byte, _end, _kind, _layer, tracked_incarnation) =
             self.bridge.node_tracker().lookup_node(host_url, &ulid)?;
         let snapshot = self.documents.get(host_url)?.snapshot()?;
+        if snapshot.incarnation() != tracked_incarnation {
+            return None;
+        }
         let language_name = detect_document_language(&self.language, &self.documents, host_url)?;
         let injection_query = self.language.injection_query(&language_name)?;
         let resolved = InjectionResolver::resolve_at_byte_offset(

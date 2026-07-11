@@ -3037,7 +3037,7 @@ mod tests {
         for m in &matches {
             for c in m["captures"].as_array().unwrap() {
                 let id: ulid::Ulid = c["node"]["id"].as_str().unwrap().parse().unwrap();
-                let (s, e, kind, _layer) = rig
+                let (s, e, kind, _layer, _incarnation) = rig
                     .tracker
                     .lookup_node(&rig.uri, &id)
                     .expect("a current serve mints resolvable ids");
@@ -3145,7 +3145,7 @@ mod tests {
         let id: ulid::Ulid = captures[0]["node"]["id"].as_str().unwrap().parse().unwrap();
         assert_eq!(
             rig.tracker.lookup_node(&rig.uri, &id),
-            Some((3, 4, "identifier", 0)),
+            Some((3, 4, "identifier", 0, 0)),
             "the survivor must keep ITS OWN id, not inherit the dropped capture's"
         );
     }

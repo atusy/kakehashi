@@ -104,11 +104,6 @@ impl UriEntries {
         ulid
     }
 
-    /// Lookup a position key by ULID.
-    fn lookup(&self, ulid: &Ulid) -> Option<&PositionKey> {
-        self.reverse.get(ulid).map(|tracked| &tracked.key)
-    }
-
     /// Returns the number of (key, ulid) pairs currently tracked.
     fn len(&self) -> usize {
         debug_assert_eq!(
@@ -459,9 +454,9 @@ impl NodeTracker {
         &self,
         uri: &Url,
         ulid: &Ulid,
-    ) -> Option<(usize, usize, &'static str)> {
-        let (start, end, kind, _layer) = self.lookup_node(uri, ulid)?;
-        Some((start, end, kind))
+    ) -> Option<(usize, usize, &'static str, u64)> {
+        let (start, end, kind, _layer, incarnation) = self.lookup_node(uri, ulid)?;
+        Some((start, end, kind, incarnation))
     }
 
     /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind, layer)`.
@@ -474,10 +469,17 @@ impl NodeTracker {
         &self,
         uri: &Url,
         ulid: &Ulid,
-    ) -> Option<(usize, usize, &'static str, usize)> {
+    ) -> Option<(usize, usize, &'static str, usize, u64)> {
         let entries = self.entries.get(uri)?;
-        let key = entries.lookup(ulid)?;
-        Some((key.start_byte, key.end_byte, key.kind, key.layer))
+        let tracked = entries.reverse.get(ulid)?;
+        let key = tracked.key;
+        Some((
+            key.start_byte,
+            key.end_byte,
+            key.kind,
+            key.layer,
+            tracked.incarnation,
+        ))
     }
 
     /// Get the ULID for a position in a layer if it exists, without creating
@@ -1050,7 +1052,7 @@ mod tests {
         );
         assert_eq!(
             tracker.lookup_node(&uri, &reopened_id),
-            Some((10, 14, "word", 0)),
+            Some((10, 14, "word", 0, 2)),
             "the reopened lifetime's id survives the raced close"
         );
         assert_eq!(
@@ -1071,7 +1073,7 @@ mod tests {
         assert_eq!(tracker.lookup_node(&uri, &old_id), None);
         assert_eq!(
             tracker.lookup_node(&uri, &reopened_id),
-            Some((0, 4, "word", 0))
+            Some((0, 4, "word", 0, 2))
         );
     }
 
@@ -1086,7 +1088,7 @@ mod tests {
         assert_eq!(tracker.lookup_node(&uri, &stale_id), None);
         assert_eq!(
             tracker.lookup_node(&uri, &reopened_id),
-            Some((0, 4, "word", 0))
+            Some((0, 4, "word", 0, 2))
         );
     }
 
@@ -1113,7 +1115,7 @@ mod tests {
         let reopened_id = tracker.get_or_create_in_layer_for_incarnation(&uri, 0, 4, "word", 0, 2);
         assert_eq!(
             tracker.lookup_node(&uri, &reopened_id),
-            Some((0, 4, "word", 0))
+            Some((0, 4, "word", 0, 2))
         );
     }
 
@@ -1290,13 +1292,13 @@ mod tests {
 
         assert_eq!(
             tracker.lookup_node(&uri, &ulid),
-            Some((5, 15, "block", 3)),
+            Some((5, 15, "block", 3, 0)),
             "lookup_node should round-trip the layer discriminator"
         );
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
-            Some((5, 15, "block")),
-            "lookup_position should drop the layer"
+            Some((5, 15, "block", 0)),
+            "lookup_position should drop the layer but retain incarnation"
         );
     }
 
@@ -1363,7 +1365,7 @@ mod tests {
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
-            Some((30, 50, "block")),
+            Some((30, 50, "block", 0)),
             "Newly issued ULID must be resolvable via reverse index"
         );
     }
@@ -1418,7 +1420,7 @@ mod tests {
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
-            Some((55, 75, "block")),
+            Some((55, 75, "block", 0)),
             "lookup_position should follow adjusted node range"
         );
     }

@@ -196,7 +196,8 @@ impl Kakehashi {
 
         // Tracked `(start, end, kind, layer)`. `layer` pins resolution to the
         // language tree that minted the node so navigation stays in-layer.
-        let (start, end, kind, layer) = self.bridge.node_tracker().lookup_node(&uri, &ulid)?;
+        let (start, end, kind, layer, tracked_incarnation) =
+            self.bridge.node_tracker().lookup_node(&uri, &ulid)?;
 
         // Resolve a CURRENT snapshot (parse-snapshot ADR §3): the tracked
         // `(start, end)` lives at the current `content_version` (the tracker
@@ -204,6 +205,9 @@ impl Kakehashi {
         // tree would be wrong, not merely late — reject immediately with the
         // universal null; only the bounded first-parse wait applies.
         let snapshot = self.current_snapshot(&uri).await?;
+        if snapshot.incarnation != tracked_incarnation {
+            return None;
+        }
         let host_text = std::sync::Arc::clone(&snapshot.text);
         let host_tree = snapshot.tree.clone()?;
 
@@ -356,17 +360,18 @@ impl Kakehashi {
         };
 
         let tracker = self.bridge.node_tracker();
-        let Some((start, end, kind, layer)) = tracker.lookup_node(&uri, &ulid) else {
+        let Some((start, end, kind, layer, tracked_incarnation)) = tracker.lookup_node(&uri, &ulid)
+        else {
             return Value::Null;
         };
-        let Some((desc_start, desc_end, desc_kind, desc_layer)) =
+        let Some((desc_start, desc_end, desc_kind, desc_layer, desc_incarnation)) =
             tracker.lookup_node(&uri, &descendant_ulid)
         else {
             return Value::Null;
         };
         // Two-id same-layer contract: ids minted in different layers never
         // share a tree, so the relation is undefined — null, not an error.
-        if layer != desc_layer {
+        if layer != desc_layer || tracked_incarnation != desc_incarnation {
             return Value::Null;
         }
 
@@ -374,6 +379,9 @@ impl Kakehashi {
         let Some(snapshot) = self.current_snapshot(&uri).await else {
             return Value::Null;
         };
+        if snapshot.incarnation != tracked_incarnation {
+            return Value::Null;
+        }
         let host_text: &str = &snapshot.text;
         let Some(host_tree) = snapshot.tree.as_ref() else {
             return Value::Null;

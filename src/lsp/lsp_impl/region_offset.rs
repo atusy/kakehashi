@@ -35,10 +35,14 @@ pub(super) fn resolve_region_offset(
     region_id: &str,
 ) -> Option<(RegionOffset, Position)> {
     let ulid = ulid::Ulid::from_string(region_id).ok()?;
-    let (start_byte, _end, _kind, _layer) = bridge.node_tracker().lookup_node(host_url, &ulid)?;
+    let (start_byte, _end, _kind, _layer, tracked_incarnation) =
+        bridge.node_tracker().lookup_node(host_url, &ulid)?;
     // Snapshot is owned, so the document handle (a store lock) is released
     // before `detect_document_language` reaches back into the store.
     let snapshot = documents.get(host_url)?.snapshot()?;
+    if snapshot.incarnation() != tracked_incarnation {
+        return None;
+    }
     let language_name = super::detect_document_language(language, documents, host_url)?;
     let injection_query = language.injection_query(&language_name)?;
     let resolved = InjectionResolver::resolve_at_byte_offset(
