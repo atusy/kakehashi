@@ -114,6 +114,18 @@ impl DocumentStore {
         Self::default()
     }
 
+    pub(crate) fn invalidate_all_parses(&self) -> Vec<Url> {
+        let mut uris = Vec::with_capacity(self.documents.len());
+        for mut entry in self.documents.iter_mut() {
+            uris.push(entry.key().clone());
+            entry.value_mut().invalidate_parse();
+        }
+        for uri in &uris {
+            self.update_tree_availability(uri, false);
+        }
+        uris
+    }
+
     /// Update tree availability without affecting parse-in-progress tracking.
     /// The `in_progress` state is owned exclusively by mark_parse_started/mark_parse_finished.
     fn update_tree_availability(&self, uri: &Url, has_tree: bool) {
@@ -393,6 +405,7 @@ impl DocumentStore {
     ///   is the [`(incarnation, ticket)`](Document::incarnation) epoch's
     ///   incarnation half; the text and language checks remain because they guard
     ///   the orthogonal within-lifetime races above.
+    #[cfg(test)]
     pub(crate) fn update_tree_if_text_and_language_unchanged(
         &self,
         uri: &Url,
@@ -420,6 +433,33 @@ impl DocumentStore {
         stored
     }
 
+    pub(crate) fn update_tree_if_parse_inputs_unchanged(
+        &self,
+        uri: &Url,
+        expected_text: &str,
+        expected_language_id: Option<&str>,
+        expected_incarnation: u64,
+        expected_content_version: u64,
+        new_tree: Tree,
+    ) -> bool {
+        let stored = self.documents.get_mut(uri).is_some_and(|mut doc| {
+            if doc.incarnation() == expected_incarnation
+                && doc.content_version() == expected_content_version
+                && doc.text() == expected_text
+                && doc.language_id() == expected_language_id
+            {
+                doc.set_tree(new_tree);
+                true
+            } else {
+                false
+            }
+        });
+        if stored {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        stored
+    }
+
     /// Like [`update_tree_if_text_and_language_unchanged`], but additionally stores
     /// the tree only if the document currently has **no** tree. For the off-ingress
     /// install reparse (`reparse_installed_document`), whose "don't clobber a
@@ -433,6 +473,7 @@ impl DocumentStore {
     /// install reparse is off-ingress, so a `didClose` + reopen (possibly relabelling
     /// the language) can race it. Without these checks the freshly-installed grammar's
     /// tree could attach to a reopened — even relabelled — document.
+    #[cfg(test)]
     pub(crate) fn attach_tree_if_absent(
         &self,
         uri: &Url,
@@ -455,6 +496,34 @@ impl DocumentStore {
         } else {
             false
         };
+        if stored {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        stored
+    }
+
+    pub(crate) fn attach_tree_if_parse_inputs_unchanged(
+        &self,
+        uri: &Url,
+        expected_text: &str,
+        expected_language_id: Option<&str>,
+        expected_incarnation: u64,
+        expected_content_version: u64,
+        new_tree: Tree,
+    ) -> bool {
+        let stored = self.documents.get_mut(uri).is_some_and(|mut doc| {
+            if doc.tree().is_none()
+                && doc.incarnation() == expected_incarnation
+                && doc.content_version() == expected_content_version
+                && doc.text() == expected_text
+                && doc.language_id() == expected_language_id
+            {
+                doc.set_tree(new_tree);
+                true
+            } else {
+                false
+            }
+        });
         if stored {
             self.mark_tree_available_if_tracked(uri);
         }
@@ -489,6 +558,7 @@ impl DocumentStore {
     /// left gone, not resurrected — the resurrection-safety the open parse needs once
     /// it runs off the ingress ticket. Availability is marked only when a tree
     /// landed (the no-tree paths rely on the caller's `mark_parse_finished(false)`).
+    #[cfg(test)]
     pub(crate) fn set_parse_result_if_text_and_incarnation_unchanged(
         &self,
         uri: &Url,
@@ -513,6 +583,33 @@ impl DocumentStore {
         } else {
             false
         };
+        if stored && has_tree {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        stored
+    }
+
+    pub(crate) fn set_parse_result_if_inputs_unchanged(
+        &self,
+        uri: &Url,
+        expected_text: &Arc<str>,
+        expected_incarnation: u64,
+        expected_content_version: u64,
+        language: Option<&str>,
+        tree: Option<Tree>,
+    ) -> bool {
+        let has_tree = tree.is_some();
+        let stored = self.documents.get_mut(uri).is_some_and(|mut doc| {
+            if doc.incarnation() == expected_incarnation
+                && doc.content_version() == expected_content_version
+                && Arc::ptr_eq(&doc.text_arc(), expected_text)
+            {
+                doc.set_parse_result(language.map(String::from), tree);
+                true
+            } else {
+                false
+            }
+        });
         if stored && has_tree {
             self.mark_tree_available_if_tracked(uri);
         }
@@ -840,6 +937,50 @@ pub(crate) struct SnapshotView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_invalidation_clears_open_document_trees() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///reload.rs").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        store.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+        let document = store.get(&uri).unwrap();
+        assert!(document.tree().is_some());
+        let pre_reload_text = document.text_arc();
+        let incarnation = document.incarnation();
+        drop(document);
+
+        assert_eq!(store.invalidate_all_parses(), vec![uri.clone()]);
+
+        let stale_tree = parser.parse("fn main() {}", None).unwrap();
+        assert!(
+            !store.set_parse_result_if_inputs_unchanged(
+                &uri,
+                &pre_reload_text,
+                incarnation,
+                0,
+                Some("rust"),
+                Some(stale_tree),
+            ),
+            "a pre-reload parse must not restore the legacy tree"
+        );
+
+        let document = store.get(&uri).unwrap();
+        assert!(document.tree().is_none());
+        assert_eq!(document.content_version(), 1);
+        let snapshot = document.latest_snapshot_slot().snapshot.unwrap();
+        assert_eq!(snapshot.parsed_version, 1);
+        assert!(snapshot.tree.is_none());
+    }
 
     mod snapshot_cell {
         use super::super::*;

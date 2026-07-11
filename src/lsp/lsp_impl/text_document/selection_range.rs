@@ -94,6 +94,9 @@ impl Kakehashi {
         if snapshot.tree.is_none() {
             return Ok(None);
         }
+        let expected_version = snapshot.parsed_version;
+        let expected_incarnation = snapshot.incarnation;
+        let expected_settings_generation = self.cache.semantic_token_generation();
 
         // Run the synchronous injection-aware walk as one work-unit on the
         // compute pool against the snapshot's consistent (text, tree). The
@@ -119,6 +122,19 @@ impl Kakehashi {
                 )
             })
             .await;
+
+        let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
+            view.content_version == expected_version
+                && view.slot.current_incarnation == expected_incarnation
+                && view.slot.snapshot.is_some_and(|snapshot| {
+                    snapshot.parsed_version == expected_version
+                        && snapshot.incarnation == expected_incarnation
+                })
+        });
+        if !still_current || self.cache.semantic_token_generation() != expected_settings_generation
+        {
+            return Err(crate::error::content_modified_error());
+        }
 
         // None = the work-unit panicked (logged by the pool); serve the
         // no-result fallback rather than an error.

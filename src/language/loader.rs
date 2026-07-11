@@ -22,6 +22,17 @@ use crate::error::LockResultExt;
 /// for the process lifetime, so immortality changes nothing there.
 static LOADED_LIBRARIES: OnceLock<Mutex<HashMap<PathBuf, &'static Library>>> = OnceLock::new();
 
+fn resolved_library_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn loader_cache_key(lang_name: &str, normalized_path: &Path) -> (String, PathBuf) {
+    (
+        lang_name.to_string(),
+        resolved_library_path(normalized_path),
+    )
+}
+
 /// Load (or fetch the already-mapped) library at `normalized_path`, leaking it
 /// into the process-global cache so it can never be unmapped.
 fn immortal_library(normalized_path: &Path) -> Result<&'static Library, ParserLoadError> {
@@ -29,9 +40,7 @@ fn immortal_library(normalized_path: &Path) -> Result<&'static Library, ParserLo
     // share one leaked entry (PathClean alone is lexical); fall back to the
     // cleaned path when the file cannot be resolved — `Library::new` will
     // then report the real error.
-    let key = normalized_path
-        .canonicalize()
-        .unwrap_or_else(|_| normalized_path.to_path_buf());
+    let key = resolved_library_path(normalized_path);
     let cache = LOADED_LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = cache.lock().recover_poison("loader::immortal_library");
     if let Some(library) = map.get(&key) {
@@ -45,8 +54,8 @@ fn immortal_library(normalized_path: &Path) -> Result<&'static Library, ParserLo
 /// A wrapper around dynamic library loading for Tree-sitter language parsers
 #[derive(Default)]
 pub(crate) struct ParserLoader {
-    /// Per-loader name→library index into the process-global cache.
-    loaded_libraries: HashMap<String, &'static Library>,
+    /// Per-loader (name, resolved path) index into the process-global cache.
+    loaded_libraries: HashMap<(String, PathBuf), &'static Library>,
 }
 
 #[derive(Debug)]
@@ -91,18 +100,19 @@ impl ParserLoader {
     ) -> Result<Language, ParserLoadError> {
         // Normalize the path before loading
         let normalized_path = path.clean();
+        let cache_key = loader_cache_key(lang_name, &normalized_path);
 
         // Derive function name from language name using standard convention
         let func_name = format!("tree_sitter_{lang_name}");
 
         // Load the library if not already loaded
-        if !self.loaded_libraries.contains_key(lang_name) {
+        if !self.loaded_libraries.contains_key(&cache_key) {
             let library = immortal_library(&normalized_path)?;
-            self.loaded_libraries.insert(lang_name.to_string(), library);
+            self.loaded_libraries.insert(cache_key.clone(), library);
         }
 
         // Get the library from cache
-        let library = *self.loaded_libraries.get(lang_name).ok_or_else(|| {
+        let library = *self.loaded_libraries.get(&cache_key).ok_or_else(|| {
             ParserLoadError::CacheError(format!("Failed to get library for {lang_name}"))
         })?;
 
@@ -128,6 +138,15 @@ mod tests {
     fn test_parser_loader_creation() {
         let loader = ParserLoader::new();
         assert!(loader.loaded_libraries.is_empty());
+    }
+
+    #[test]
+    fn same_language_name_keys_each_resolved_library_path() {
+        let first = loader_cache_key("example", Path::new("/missing/first-parser"));
+        let second = loader_cache_key("example", Path::new("/missing/second-parser"));
+
+        assert_ne!(first, second);
+        assert_eq!(first.0, second.0);
     }
 
     #[test]

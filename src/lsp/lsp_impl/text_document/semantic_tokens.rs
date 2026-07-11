@@ -1107,6 +1107,8 @@ impl Kakehashi {
         };
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -1114,12 +1116,39 @@ impl Kakehashi {
         };
         let text = std::sync::Arc::clone(&snapshot.text);
 
+        let language_loaded = self
+            .language
+            .ensure_language_loaded_async(&language_name)
+            .await
+            .success;
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+        if !self.semantic_snapshot_is_current(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            generation,
+            &edit_lock,
+        ) {
+            return Err(crate::error::content_modified_error());
+        }
+        if !language_loaded {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        }
         let Some(query) = self.language.highlight_query(&language_name) else {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
             })));
         };
+        drop(_edit_guard);
 
         // Short-circuit an identical-viewport re-request of an unchanged document
         // (#535). `cache_key` folds the document text with the settings generation,

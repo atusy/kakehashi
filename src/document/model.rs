@@ -252,6 +252,29 @@ impl Document {
         self.pending_seed = None;
     }
 
+    pub(crate) fn invalidate_parse(&mut self) {
+        self.tree = None;
+        self.pending_seed = None;
+        // Grammar/query settings are parse inputs even when text is unchanged.
+        // Advancing the internal version makes every pre-reload parse result
+        // stale and lets the scheduled current-generation snapshot supersede it.
+        self.content_version = self.content_version.wrapping_add(1);
+        self.snapshot_tx.send_replace(SnapshotSlot {
+            current_incarnation: self.incarnation,
+            snapshot: Some(Arc::new(ParseSnapshot {
+                text: Arc::clone(&self.text),
+                tree: None,
+                language: self.language_id.clone(),
+                parsed_version: self.content_version,
+                incarnation: self.incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            })),
+        });
+    }
+
     /// Store the open-time parse result — the detected `language` and the parsed
     /// `tree` (`None` for a parsed-to-nothing / no-language / crashed-parser open) —
     /// **preserving the existing text**.

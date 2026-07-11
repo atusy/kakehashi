@@ -537,7 +537,7 @@ pub type CaptureMappings = HashMap<String, QueryTypeMappings>;
 ///
 /// Used in the unified `queries` field to specify what kind of query a file contains.
 /// When not specified, the kind is inferred from the filename pattern.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum QueryKind {
     /// Syntax highlighting queries

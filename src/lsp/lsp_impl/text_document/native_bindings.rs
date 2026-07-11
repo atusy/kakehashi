@@ -97,11 +97,17 @@ impl Kakehashi {
         // doubles as the staleness witness for the publish-time check below
         // (every edit and reopen installs a fresh allocation).
         self.ensure_document_parsed(&uri).await;
-        let Some((text, tree)) = ({
+        let settings_generation = self.cache.semantic_token_generation();
+        let Some((text, tree, content_version, incarnation)) = ({
             let doc = self.documents.get(&uri);
             doc.and_then(|doc| {
                 let tree = doc.tree()?.clone();
-                Some((doc.text_arc(), tree))
+                Some((
+                    doc.text_arc(),
+                    tree,
+                    doc.content_version(),
+                    doc.incarnation(),
+                ))
             })
         }) else {
             return Ok(None);
@@ -184,11 +190,12 @@ impl Kakehashi {
         // A didChange between the snapshot and here makes every computed
         // range stale — worst case a rename WorkspaceEdit applied to newer
         // text. Publish only while the snapshot's text is still current.
-        let unchanged = self
-            .documents
-            .get(&uri)
-            .is_some_and(|doc| std::sync::Arc::ptr_eq(&doc.text_arc(), &text));
-        if !unchanged {
+        let unchanged = self.documents.get(&uri).is_some_and(|doc| {
+            doc.content_version() == content_version
+                && doc.incarnation() == incarnation
+                && std::sync::Arc::ptr_eq(&doc.text_arc(), &text)
+        });
+        if !unchanged || self.cache.semantic_token_generation() != settings_generation {
             return Ok(None);
         }
         Ok(answer)
@@ -230,7 +237,10 @@ impl Kakehashi {
             return Some(None);
         }
         let content_range = region.content_node.byte_range();
-        let Some(content_text) = text.get(content_range.clone()).map(str::to_string) else {
+        let Some(content_text) = text
+            .get(content_range.clone())
+            .map(std::sync::Arc::<str>::from)
+        else {
             return Some(None);
         };
         let Some((layer_language, load)) = self
@@ -242,15 +252,12 @@ impl Kakehashi {
         if !load.success {
             return Some(None);
         }
-        let Some(query) = self.language.bindings_query(&layer_language) else {
-            return Some(None);
-        };
-
         let included_ranges =
             compute_included_ranges(&region.content_node, region.include_children);
         // The pooled spawn_blocking + timeout protocol every parse site
         // uses: a pathological region cannot pin an async worker.
         let lang_for_parse = layer_language.clone();
+        let content_text_for_parse = std::sync::Arc::clone(&content_text);
         let parsed = self
             .parse_coordinator()
             .parse_with_pool(
@@ -259,26 +266,29 @@ impl Kakehashi {
                 content_text.len(),
                 // The work-unit deadline is for main-document parses;
                 // parse_with_ranges self-bounds at NATIVE_PARSE_BUDGET.
-                move |mut parser, _deadline| {
+                move |mut parser, _deadline, _generation_retry| {
                     let tree = parse_with_ranges(
                         &mut parser,
-                        &content_text,
+                        &content_text_for_parse,
                         included_ranges.as_deref(),
                         "kakehashi::bindings",
                         &lang_for_parse,
                     );
-                    (parser, tree.map(|tree| (tree, content_text)))
+                    (parser, tree)
                 },
             )
             .await;
 
         match parsed {
-            Some((layer_tree, content_text)) => Some(Some((
-                query,
-                std::sync::Arc::from(content_text),
-                layer_tree,
-                content_range.start,
-            ))),
+            Some(layer_tree) => {
+                // Resolve after parse_with_pool: a reload can invalidate the
+                // first parser generation and make it retry with the new
+                // grammar, whose bindings query must accompany that tree.
+                let Some(query) = self.language.bindings_query(&layer_language) else {
+                    return Some(None);
+                };
+                Some(Some((query, content_text, layer_tree, content_range.start)))
+            }
             None => Some(None),
         }
     }

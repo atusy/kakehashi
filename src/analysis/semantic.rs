@@ -3,6 +3,7 @@ mod finalize;
 mod injection;
 mod legend;
 mod parallel;
+pub(crate) use parallel::invalidate_thread_local_parser_caches;
 mod range;
 mod token_collector;
 

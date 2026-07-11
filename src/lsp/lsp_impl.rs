@@ -13,6 +13,7 @@ pub(crate) mod text_document;
 mod whole_document;
 mod workspace;
 
+use crate::error::LockResultExt;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::request::{
     GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
@@ -93,15 +94,53 @@ pub(super) fn bridge_configs_for_injection_language(
     bridge.cached_configs_for_injection_language(&settings, host_language, injection_language)
 }
 
+pub(super) struct ReloadLanguageState<'a> {
+    language: &'a LanguageCoordinator,
+    parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
+    documents: &'a DocumentStore,
+    invalidate_documents: bool,
+    request_semantic_refresh: bool,
+}
+
+/// One server process owns one effective workspace settings snapshot. Keep the
+/// complete async reload transaction ordered across didChangeConfiguration and
+/// post-install reloads, including downstream propagation and SettingsManager
+/// publication after the synchronous language/query swap.
+static SETTINGS_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ParserReloadGuard<'a> {
+    parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
+}
+
+impl<'a> ParserReloadGuard<'a> {
+    fn begin(parser_pool: &'a std::sync::Mutex<DocumentParserPool>) -> Self {
+        parser_pool
+            .lock()
+            .recover_poison("ParserReloadGuard::begin")
+            .begin_reload();
+        Self { parser_pool }
+    }
+}
+
+impl Drop for ParserReloadGuard<'_> {
+    fn drop(&mut self) {
+        self.parser_pool
+            .lock()
+            .recover_poison("ParserReloadGuard::drop")
+            .finish_reload();
+    }
+}
+
 pub(super) async fn apply_shared_settings(
     client: &Client,
-    language: &LanguageCoordinator,
+    language_state: ReloadLanguageState<'_>,
     settings_manager: &SettingsManager,
     cache: &CacheCoordinator,
     bridge: &BridgeCoordinator,
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
-) {
+) -> Vec<Url> {
+    let _reload = SETTINGS_RELOAD_LOCK.lock().await;
     // TRANSITIONAL generation bump BEFORE any query/config mutation: from
     // this instant, every generation-stamped product built from the OLD
     // queries (snapshot-riding discovery/bridge/resolved regions, layer
@@ -112,7 +151,19 @@ pub(super) async fn apply_shared_settings(
     // The second bump below then also invalidates anything a racing request
     // built MID-swap against a half-updated query set.
     cache.bump_semantic_token_generation();
-    let summary = language.load_settings(&settings);
+    crate::analysis::semantic::invalidate_thread_local_parser_caches();
+    let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
+    let mut summary = language_state.language.load_settings(&settings);
+    let reparse_uris = if language_state.invalidate_documents {
+        language_state.documents.invalidate_all_parses()
+    } else {
+        Vec::new()
+    };
+    // Invalidate again after the synchronous swap: the first bump rejects
+    // pre-reload checkouts, while this one rejects parsers acquired while the
+    // registry and query stores were being replaced.
+    drop(parser_reload);
+    crate::analysis::semantic::invalidate_thread_local_parser_caches();
     // Second bump IMMEDIATELY after the query swap, before any await: a
     // request that started after the transitional bump above but before the
     // swap computed against the OLD queries yet stamped the new generation —
@@ -156,9 +207,31 @@ pub(super) async fn apply_shared_settings(
     // `didChange` deliberately does NOT invalidate (delta needs the previous
     // tokens); only a query/config reload does.
     cache.bump_semantic_token_generation();
+    // Query removal/replacement affects unchanged documents too. Request one
+    // workspace refresh for every reload; ClientNotifier capability-gates and
+    // coalesces it with any language-specific refresh events in this batch.
+    if language_state.request_semantic_refresh {
+        summary
+            .events
+            .push(crate::language::LanguageEvent::semantic_tokens_refresh(
+                "workspace settings reload",
+            ));
+    } else {
+        // Initialization may produce language-specific refresh events (for
+        // example while registering a derived language). No refresh request is
+        // valid before InitializeResult/initialized, and no document has yet
+        // consumed tokens, so keep the logs while stripping every refresh.
+        summary.events.retain(|event| {
+            !matches!(
+                event,
+                crate::language::LanguageEvent::SemanticTokensRefresh { .. }
+            )
+        });
+    }
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
+    reparse_uris
 }
 
 /// Convert url::Url to ls_types::Uri, the reverse conversion for bridge protocol
@@ -406,14 +479,48 @@ impl Kakehashi {
     ) {
         apply_shared_settings(
             &self.client,
-            &self.language,
+            ReloadLanguageState {
+                language: &self.language,
+                parser_pool: &self.parser_pool,
+                documents: &self.documents,
+                invalidate_documents: true,
+                request_semantic_refresh: true,
+            },
             &self.settings_manager,
             &self.cache,
             &self.bridge,
             Some(raw_settings),
             settings,
         )
-        .await;
+        .await
+        .into_iter()
+        .for_each(|uri| self.schedule_reparse(uri, None));
+        self.warn_on_misconfigured_settings().await;
+    }
+
+    async fn apply_initial_settings(
+        &self,
+        raw_settings: RawWorkspaceSettings,
+        settings: WorkspaceSettings,
+    ) {
+        apply_shared_settings(
+            &self.client,
+            ReloadLanguageState {
+                language: &self.language,
+                parser_pool: &self.parser_pool,
+                documents: &self.documents,
+                invalidate_documents: false,
+                request_semantic_refresh: false,
+            },
+            &self.settings_manager,
+            &self.cache,
+            &self.bridge,
+            Some(raw_settings),
+            settings,
+        )
+        .await
+        .into_iter()
+        .for_each(|uri| self.schedule_reparse(uri, None));
         self.warn_on_misconfigured_settings().await;
     }
 
@@ -819,6 +926,189 @@ mod tests {
 
     // Note: Wildcard config resolution tests are in src/config.rs
     // Note: apply_content_changes_with_edits tests are in src/lsp/text_sync.rs
+
+    #[tokio::test]
+    async fn settings_reload_discards_available_document_parsers() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        service
+            .inner()
+            .parser_pool
+            .lock()
+            .unwrap()
+            .release("stale".to_string(), tree_sitter::Parser::new());
+
+        service
+            .inner()
+            .apply_raw_settings(
+                RawWorkspaceSettings::default(),
+                WorkspaceSettings::default(),
+            )
+            .await;
+
+        assert!(
+            service
+                .inner()
+                .parser_pool
+                .lock()
+                .unwrap()
+                .acquire("stale")
+                .is_none(),
+            "settings reload must not reuse a parser configured before the reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn parser_released_after_settings_reload_is_discarded() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let (parser, generation) = {
+            let mut pool = service.inner().parser_pool.lock().unwrap();
+            pool.release("stale".to_string(), tree_sitter::Parser::new());
+            match pool.acquire_versioned("stale") {
+                crate::language::parser_pool::ParserCheckout::Acquired(parser, generation) => {
+                    (parser, generation)
+                }
+                _ => panic!("precondition: stale parser is available"),
+            }
+        };
+
+        service
+            .inner()
+            .apply_raw_settings(
+                RawWorkspaceSettings::default(),
+                WorkspaceSettings::default(),
+            )
+            .await;
+        let parser_is_current = service
+            .inner()
+            .parser_pool
+            .lock()
+            .unwrap()
+            .release_versioned("stale".to_string(), parser, generation)
+            .is_ok();
+
+        assert!(
+            !parser_is_current,
+            "a parse from the previous pool generation must not publish its result"
+        );
+
+        assert!(
+            service
+                .inner()
+                .parser_pool
+                .lock()
+                .unwrap()
+                .acquire("stale")
+                .is_none(),
+            "a parser checked out before reload must not re-enter the new pool generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_retries_after_parser_generation_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        service
+            .inner()
+            .parser_pool
+            .lock()
+            .unwrap()
+            .release("test".to_string(), tree_sitter::Parser::new());
+        let parser_pool = std::sync::Arc::clone(&service.inner().parser_pool);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_for_parse = std::sync::Arc::clone(&calls);
+
+        let parsed = service
+            .inner()
+            .parse_coordinator()
+            .parse_with_pool(
+                "test",
+                &url::Url::parse("file:///reload-race.test").unwrap(),
+                0,
+                move |parser, _deadline, generation_retry| {
+                    let call = calls_for_parse.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(generation_retry, call != 0);
+                    if call == 0 {
+                        let mut pool = parser_pool.lock().unwrap();
+                        pool.begin_reload();
+                        pool.finish_reload();
+                        pool.release("test".to_string(), tree_sitter::Parser::new());
+                    }
+                    (parser, Some(call + 1))
+                },
+            )
+            .await;
+
+        assert_eq!(parsed, Some(2), "only the current-generation parse lands");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn parser_checkout_is_rejected_throughout_reload() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let mut pool = service.inner().parser_pool.lock().unwrap();
+        pool.release("test".to_string(), tree_sitter::Parser::new());
+
+        pool.begin_reload();
+        pool.begin_reload();
+        assert!(
+            matches!(
+                pool.acquire_versioned("test"),
+                crate::language::parser_pool::ParserCheckout::Reloading
+            ),
+            "no parser checkout may start inside the reload window"
+        );
+        pool.finish_reload();
+        assert!(
+            matches!(
+                pool.acquire_versioned("test"),
+                crate::language::parser_pool::ParserCheckout::Reloading
+            ),
+            "one reload finishing must not close an overlapping reload window"
+        );
+        pool.finish_reload();
+        pool.release("test".to_string(), tree_sitter::Parser::new());
+        assert!(matches!(
+            pool.acquire_versioned("test"),
+            crate::language::parser_pool::ParserCheckout::Acquired(_, _)
+        ));
+    }
+
+    #[test]
+    fn parser_reload_guard_finishes_reload_during_unwind() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let parser_pool = &service.inner().parser_pool;
+        let unwind = std::panic::catch_unwind(|| {
+            let _reload = ParserReloadGuard::begin(parser_pool);
+            panic!("simulate reload failure");
+        });
+
+        assert!(unwind.is_err());
+        assert!(!matches!(
+            parser_pool.lock().unwrap().acquire_versioned("test"),
+            crate::language::parser_pool::ParserCheckout::Reloading
+        ));
+    }
+
+    #[tokio::test]
+    async fn parse_gives_up_when_reload_never_finishes() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        service.inner().parser_pool.lock().unwrap().begin_reload();
+
+        let parsed = service
+            .inner()
+            .parse_coordinator()
+            .parse_with_pool(
+                "test",
+                &url::Url::parse("file:///stuck-reload.test").unwrap(),
+                0,
+                |parser, _deadline, _generation_retry| (parser, Some(1)),
+            )
+            .await;
+
+        service.inner().parser_pool.lock().unwrap().finish_reload();
+        assert_eq!(parsed, None);
+    }
 
     #[test]
     fn test_check_injected_languages_identifies_missing_parsers() {
