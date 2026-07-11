@@ -61,7 +61,7 @@ Each detection method follows the **detect → base resolution → availability 
 
    If syntect doesn't recognize the token, it's tried directly as a base candidate.
    This handles extensions like `jsx`, `tsx` that syntect doesn't know but may be
-   configured with a base (e.g., `jsx.base = "javascript"`).
+   configured with a base (e.g., `[languages.jsx] base = "javascript"`).
 
 3. **First-line detection (lowest priority)**
    - Shebang detection: `#!/usr/bin/env python` → python
