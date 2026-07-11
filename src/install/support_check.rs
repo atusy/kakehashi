@@ -309,26 +309,30 @@ return {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timed_out_blocking_check_exposes_its_completion() {
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
 
-        let mut result = should_skip_unsupported_language_with_checker_tracked(
-            "lua",
-            None,
-            Duration::from_millis(20),
-            move |_lang, _options| {
-                let _ = started_tx.send(());
-                let _ = release_rx.recv();
-                Ok(true)
-            },
-        )
-        .await;
+        let check = tokio::spawn(async move {
+            should_skip_unsupported_language_with_checker_tracked(
+                "lua",
+                None,
+                Duration::from_millis(20),
+                move |_lang, _options| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(true)
+                },
+            )
+            .await
+        });
 
         started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .await
             .expect("blocking checker must start before timing out");
+        tokio::time::advance(Duration::from_millis(20)).await;
+        let mut result = check.await.expect("support check task must finish");
         let completion = result
             .completion
             .take()
