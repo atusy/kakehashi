@@ -1230,11 +1230,12 @@ impl LanguageCoordinator {
     /// Candidate selection deliberately does not inspect parser state: eager
     /// bridge selection and virtual URIs must stay stable before and after a
     /// parser loads. An eligible configured base mapping for the explicit
-    /// identifier takes precedence over syntect token normalization, followed by
-    /// first-line fallback. Consequently, registering a parser under a
-    /// non-canonical key such as `py` or `js` does not change bridge keys/URIs:
-    /// bridge configuration uses `python`/`javascript` unless that key has a
-    /// registered base mapping.
+    /// identifier takes precedence. An otherwise unconfigured explicit
+    /// `plaintext` remains `plaintext`; other identifiers proceed through syntect
+    /// token normalization and then first-line fallback. Consequently,
+    /// registering a parser under a non-canonical key such as `py` or `js` does
+    /// not change bridge keys/URIs: bridge configuration uses
+    /// `python`/`javascript` unless that key has a registered base mapping.
     pub(crate) fn canonical_injection_language(&self, identifier: &str, content: &str) -> String {
         if let Some(base) = self.resolve_base(identifier) {
             return base;
