@@ -82,6 +82,9 @@ pub(crate) struct LanguageCoordinator {
     /// untagged; configured and dynamically discovered parsers must match the
     /// current generation before they are cache hits.
     dynamically_loaded: dashmap::DashMap<String, u64>,
+    /// Languages whose current query set came from an explicit configured
+    /// override while their parser remained an untagged built-in registration.
+    configured_query_overrides: dashmap::DashSet<String>,
     /// Serializes settings-generation changes with registry publication so a
     /// load resolved under an old configuration cannot overwrite or retag a
     /// parser registered by a newer reload.
@@ -126,6 +129,7 @@ impl LanguageCoordinator {
             failed_loads: dashmap::DashMap::new(),
             configured_load_failures: dashmap::DashMap::new(),
             dynamically_loaded: dashmap::DashMap::new(),
+            configured_query_overrides: dashmap::DashSet::new(),
             registration_lock: Mutex::new(()),
             settings_reload_lock: Mutex::new(()),
             load_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1508,7 +1512,9 @@ impl LanguageCoordinator {
             config.parser.is_none() && self.has_current_parser_registration(lang_name, generation);
         let pre_registered_is_builtin =
             pre_registered && self.dynamically_loaded.get(lang_name).is_none();
-        let preserve_builtin_queries = pre_registered_is_builtin && config.queries.is_none();
+        let had_configured_query_override = self.configured_query_overrides.contains(lang_name);
+        let preserve_builtin_queries =
+            pre_registered_is_builtin && config.queries.is_none() && !had_configured_query_override;
         if !preserve_builtin_queries {
             // Query kinds absent from the new configuration must disappear; the
             // insertion helpers only replace kinds that successfully load.
@@ -1538,6 +1544,12 @@ impl LanguageCoordinator {
         }
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
+        if pre_registered_is_builtin && config.queries.is_some() {
+            self.configured_query_overrides
+                .insert(lang_name.to_string());
+        } else {
+            self.configured_query_overrides.remove(lang_name);
+        }
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
@@ -3414,6 +3426,35 @@ mod tests {
         assert!(!coordinator.language_registry.contains("racing"));
         assert!(coordinator.dynamically_loaded.get("racing").is_none());
         assert!(coordinator.configured_load_failed("racing", generation));
+    }
+
+    #[test]
+    fn removing_builtin_query_override_clears_configured_queries() {
+        let coordinator = LanguageCoordinator::new();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        coordinator
+            .language_registry
+            .register("builtin".to_string(), language.clone());
+        coordinator.query_store.insert_highlight_query(
+            "builtin".to_string(),
+            std::sync::Arc::new(
+                tree_sitter::Query::new(&language, "(identifier) @variable").unwrap(),
+            ),
+        );
+        coordinator
+            .configured_query_overrides
+            .insert("builtin".to_string());
+        let mut languages = HashMap::new();
+        languages.insert("builtin".to_string(), LanguageSettings::default());
+
+        coordinator.load_settings(&WorkspaceSettings {
+            languages,
+            ..Default::default()
+        });
+
+        assert!(coordinator.highlight_query("builtin").is_none());
+        assert!(!coordinator.configured_query_overrides.contains("builtin"));
+        assert!(coordinator.has_parser_available("builtin"));
     }
 
     #[test]
