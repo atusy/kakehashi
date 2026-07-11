@@ -1981,7 +1981,7 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
         coordinator
             .language_registry_for_parallel()
-            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
 
         assert!(
             coordinator
@@ -2017,7 +2017,7 @@ mod tests {
         // Register "python" parser
         coordinator
             .language_registry_for_parallel()
-            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
 
         // Injection with unknown identifier but Python shebang in content
         let content = "#!/usr/bin/env python\nprint('hello')";
