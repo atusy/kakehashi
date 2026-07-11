@@ -22,6 +22,7 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         host_uri: &url::Url,
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
+        expected_incarnation: Option<u64>,
         injections: Vec<crate::lsp::bridge::coordinator::BridgeInjection>,
     ) {
         // Wait for the server to be ready (handshake complete)
@@ -51,6 +52,18 @@ impl LanguageServerPool {
         let mut sender = ConnectionHandleSender(&handle);
 
         for injection in &injections {
+            // Hold the host cache guard through didOpen. didClose/reopen replaces
+            // this entry, so it either linearizes after this open (and closes the
+            // tracked virtual document) or wins first and makes this stale batch
+            // stop without opening old content.
+            let host_incarnation_guard = expected_incarnation.and_then(|incarnation| {
+                self.latest_virtual_contents
+                    .get(host_uri)
+                    .filter(|host| host.incarnation == incarnation)
+            });
+            if expected_incarnation.is_some() && host_incarnation_guard.is_none() {
+                return;
+            }
             let virtual_uri =
                 VirtualDocumentUri::new(host_uri_lsp, &injection.language, &injection.region_id);
 
@@ -226,6 +239,7 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
+            None,
             injections,
         )
         .await;
@@ -278,6 +292,7 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
+            None,
             injections.clone(),
         )
         .await;
@@ -294,6 +309,7 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
+            None,
             injections,
         )
         .await;

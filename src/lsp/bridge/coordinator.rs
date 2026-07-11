@@ -393,7 +393,14 @@ impl BridgeCoordinator {
             return;
         };
         self.pool
-            .eager_open_virtual_documents(server_name, &config, host_uri, &host_uri_lsp, for_server)
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                host_uri,
+                &host_uri_lsp,
+                None,
+                for_server,
+            )
             .await;
     }
 
@@ -821,6 +828,7 @@ impl BridgeCoordinator {
         settings: &WorkspaceSettings,
         host_language: &str,
         host_uri: &Url,
+        incarnation: u64,
         injections: Vec<BridgeInjection>,
     ) {
         // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
@@ -926,6 +934,7 @@ impl BridgeCoordinator {
                         &config,
                         &host_uri_owned,
                         &host_uri_lsp,
+                        Some(incarnation),
                         group_injections,
                     ) => {}
                 }

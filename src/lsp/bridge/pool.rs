@@ -260,11 +260,11 @@ struct OpenClaimGuard {
 }
 
 type OpenTransitionLocks = DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>;
-struct HostVirtualContents {
+pub(crate) struct HostVirtualContents {
     // The open lifetime that owns this container. Reopen replaces the whole
     // container, so a stale publisher holding the old DashMap guard can only
     // mutate detached state that current didOpen readers cannot observe.
-    incarnation: u64,
+    pub(crate) incarnation: u64,
     contents: DashMap<(String, String), Arc<str>>,
 }
 
@@ -337,7 +337,7 @@ pub struct LanguageServerPool {
     /// Latest extracted content observed from host didChange for each injection.
     /// Interactive requests may carry an older snapshot while awaiting server
     /// startup; the didOpen path reads this after claiming the transition.
-    latest_virtual_contents: LatestVirtualContents,
+    pub(crate) latest_virtual_contents: LatestVirtualContents,
     /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
@@ -3758,6 +3758,23 @@ mod tests {
             TEST_ULID_LUA_0,
             "print('old lifetime')",
         );
+
+        let handle = create_handle_with_key(ConnectionState::Ready, connection_key.clone()).await;
+        pool.insert_connection(handle).await;
+        pool.eager_open_virtual_documents(
+            "lua",
+            &devnull_config(),
+            &host_uri,
+            &host_uri_lsp,
+            Some(1),
+            vec![super::super::coordinator::BridgeInjection {
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_0.to_string(),
+                content: "print('old lifetime')".to_string(),
+            }],
+        )
+        .await;
+        assert!(!pool.is_document_opened(&virtual_uri));
 
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         pool.ensure_document_opened(

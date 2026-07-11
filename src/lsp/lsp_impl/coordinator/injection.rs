@@ -234,7 +234,7 @@ impl InjectionCoordinator {
         };
         tokio::spawn(install_task);
 
-        self.eager_spawn_bridge_servers(uri, &host_language, injections)
+        self.eager_spawn_bridge_servers(uri, incarnation, &host_language, injections)
             .await;
     }
 
@@ -333,12 +333,13 @@ impl InjectionCoordinator {
     pub(crate) async fn eager_spawn_bridge_servers(
         &self,
         uri: &Url,
+        incarnation: u64,
         host_language: &str,
         injections: Vec<BridgeInjection>,
     ) {
         let settings = self.settings_manager.load_settings();
         self.bridge
-            .eager_spawn_and_open_documents(&settings, host_language, uri, injections)
+            .eager_spawn_and_open_documents(&settings, host_language, uri, incarnation, injections)
             .await;
     }
 
