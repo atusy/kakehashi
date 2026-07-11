@@ -105,11 +105,11 @@ detect_language(path, content, token, language_id):
     effective_token = token OR extract_token_from_path(path)
     if effective_token exists:
         // Try syntect normalization (py → python, Makefile → make)
-        if syntect recognizes token:
+        if syntect recognizes effective_token:
             if try_with_base_fallback(normalized) succeeds:
                 return result
         // Try raw token with base fallback (handles jsx, tsx)
-        if try_with_base_fallback(raw_token) succeeds:
+        if try_with_base_fallback(effective_token) succeeds:
             return result
 
     // 3. First-line detection (shebang, mode line)
