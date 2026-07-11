@@ -54,12 +54,22 @@ fn lsp_legend_modifiers() -> Vec<SemanticTokenModifier> {
         .collect()
 }
 
-fn host_position_encoding(capabilities: &ClientCapabilities) -> Option<PositionEncodingKind> {
-    capabilities
+fn host_position_encoding(
+    capabilities: &ClientCapabilities,
+) -> Result<Option<PositionEncodingKind>> {
+    let advertised = capabilities
         .general
         .as_ref()
-        .and_then(|general| general.position_encodings.as_ref())
-        .map(|_| PositionEncodingKind::UTF16)
+        .and_then(|general| general.position_encodings.as_ref());
+    match advertised {
+        None => Ok(None),
+        Some(encodings) if encodings.contains(&PositionEncodingKind::UTF16) => {
+            Ok(Some(PositionEncodingKind::UTF16))
+        }
+        Some(_) => Err(tower_lsp_server::jsonrpc::Error::invalid_params(
+            "kakehashi requires UTF-16 position encoding",
+        )),
+    }
 }
 
 impl Kakehashi {
@@ -67,7 +77,7 @@ impl Kakehashi {
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult> {
-        let position_encoding = host_position_encoding(&params.capabilities);
+        let position_encoding = host_position_encoding(&params.capabilities)?;
         // Store client capabilities for LSP compliance checks (e.g., refresh support).
         // Uses SettingsManager which wraps OnceLock for "set once, read many" semantics.
         self.settings_manager
@@ -1608,28 +1618,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_announces_utf16_when_position_encodings_are_advertised() {
+    fn host_negotiates_only_advertised_utf16() {
         use tower_lsp_server::ls_types::{
             ClientCapabilities, GeneralClientCapabilities, PositionEncodingKind,
         };
 
         let capabilities = ClientCapabilities {
             general: Some(GeneralClientCapabilities {
-                position_encodings: Some(vec![PositionEncodingKind::UTF8]),
+                position_encodings: Some(vec![
+                    PositionEncodingKind::UTF8,
+                    PositionEncodingKind::UTF16,
+                ]),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
         assert_eq!(
-            host_position_encoding(&capabilities),
+            host_position_encoding(&capabilities).unwrap(),
             Some(PositionEncodingKind::UTF16),
         );
         assert_eq!(
-            host_position_encoding(&ClientCapabilities::default()),
+            host_position_encoding(&ClientCapabilities::default()).unwrap(),
             None,
             "omitted capability uses the protocol's UTF-16 default",
         );
+
+        let utf8_only = ClientCapabilities {
+            general: Some(GeneralClientCapabilities {
+                position_encodings: Some(vec![PositionEncodingKind::UTF8]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(host_position_encoding(&utf8_only).is_err());
     }
 
     /// A throwaway cancel context for tests that don't exercise cancellation.
