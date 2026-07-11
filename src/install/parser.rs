@@ -696,7 +696,7 @@ fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ArchiveFe
         ArchiveFetchError::Io(io::Error::new(
             e.kind(),
             format!(
-                "failed to create archive dir {}: {e}",
+                "Failed to create archive dir {}: {e}",
                 escaped_path(safe_relative)
             ),
         ))
@@ -734,7 +734,7 @@ fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, A
                     ArchiveFetchError::Io(io::Error::new(
                         e.kind(),
                         format!(
-                            "failed to create ancestor of archive path {}: {e}",
+                            "Failed to create ancestor of archive path {}: {e}",
                             escaped_path(safe_relative)
                         ),
                     ))
