@@ -305,7 +305,7 @@ impl Kakehashi {
     ) -> Option<Position> {
         // Re-resolve the region from the LIVE parse (same construction as the
         // goto/showDocument offset path), yielding the current per-line offset
-        // AND the content-precise host byte range.
+        // and virtual content used to derive the exact mapped host end.
         let snapshot = self.documents.get(host_url)?.snapshot()?;
         let language_name = detect_document_language(&self.language, &self.documents, host_url)?;
         let injection_query = self.language.injection_query(&language_name)?;
