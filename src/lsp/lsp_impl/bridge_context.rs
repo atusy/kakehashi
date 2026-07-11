@@ -53,8 +53,9 @@ fn capability_prefilter_applies(method: &str) -> bool {
 /// the response itself (for example linked-editing ranges) is only a precursor
 /// to the client's edit.
 ///
-/// Non-contiguous `injection.combined` documents mask host-only gaps inside
-/// their outer range. Until edit translation carries those allowed spans,
+/// Non-contiguous `injection.combined` documents mask bytes inside their outer
+/// range, including inter-capture gaps, stripped line prefixes, and excluded
+/// child ranges. Until edit translation carries the exact allowed spans,
 /// forwarding these methods could apply virtual whitespace over real host text.
 fn method_requires_contiguous_injection(method: &str) -> bool {
     matches!(
