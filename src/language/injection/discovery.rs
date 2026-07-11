@@ -392,6 +392,21 @@ pub(crate) fn detect_injection<'a>(
             .then(a.language.as_str().cmp(b.language.as_str()))
     });
 
+    // Equal spans are alternative interpretations, not nested syntax. Keep
+    // the first query-pattern candidate for single-hierarchy consumers (the
+    // same priority used by bridge position resolution) while preserving real
+    // geometric nesting across different spans.
+    let mut previous_range = None;
+    sorted_injections.retain(|region| {
+        let range = (region.start_byte, region.end_byte);
+        if previous_range == Some(range) {
+            false
+        } else {
+            previous_range = Some(range);
+            true
+        }
+    });
+
     // Build the language hierarchy from outermost to innermost
     let mut hierarchy = vec![base_language.to_string()];
     for region in &sorted_injections {
@@ -1654,8 +1669,8 @@ mod tests {
         let (hierarchy, _, _) = result.unwrap();
         assert_eq!(
             hierarchy,
-            vec!["rust", "doc", "comment"],
-            "distinct language layers on the same node must survive discovery"
+            vec!["rust", "doc"],
+            "same-range alternatives use the first query pattern instead of fabricating nesting"
         );
     }
 
