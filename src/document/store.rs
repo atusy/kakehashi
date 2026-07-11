@@ -874,6 +874,7 @@ mod tests {
 
         let document = store.get(&uri).unwrap();
         assert!(document.tree().is_none());
+        assert_eq!(document.content_version(), 1);
         assert!(document.latest_snapshot_slot().snapshot.is_none());
     }
 
