@@ -146,10 +146,13 @@ For example, a Markdown code fence with ` ```py ` provides the identifier
 `"py"`. Two related operations intentionally have different acceptance rules:
 
 - **Bridge canonicalization** produces a stable language key even when no
-  parser exists yet. It checks an explicit configured base, then syntect token
-  normalization (and that candidate's base), then first-line detection (and
-  that candidate's base), and finally the raw identifier. Without an explicit
-  `py` base override, `py` remains `python` before and after parser installation.
+  parser exists yet. It checks an eligible configured base mapping first. An
+  explicit unconfigured `plaintext` identifier then remains `plaintext` rather
+  than acquiring language features from its content. Other identifiers proceed
+  through syntect token normalization (and that candidate's base), then
+  first-line detection (and that candidate's base), and finally the raw
+  identifier. Without an eligible `py` base override, `py` remains `python`
+  before and after parser installation.
 - **Parser resolution** may then load or select the canonical language/base and
   can still fail when no grammar is available.
 
