@@ -97,6 +97,7 @@ impl Kakehashi {
         // doubles as the staleness witness for the publish-time check below
         // (every edit and reopen installs a fresh allocation).
         self.ensure_document_parsed(&uri).await;
+        let settings_generation = self.cache.semantic_token_generation();
         let Some((text, tree, content_version, incarnation)) = ({
             let doc = self.documents.get(&uri);
             doc.and_then(|doc| {
@@ -194,7 +195,7 @@ impl Kakehashi {
                 && doc.incarnation() == incarnation
                 && std::sync::Arc::ptr_eq(&doc.text_arc(), &text)
         });
-        if !unchanged {
+        if !unchanged || self.cache.semantic_token_generation() != settings_generation {
             return Ok(None);
         }
         Ok(answer)
