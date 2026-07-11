@@ -236,6 +236,26 @@ mod tests {
     }
 
     #[test]
+    fn test_overlong_column_does_not_consume_crlf_terminator() {
+        let old_text = "hello\r\nworld\r\n";
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position::new(0, 5),
+                end: Position::new(0, 999),
+            }),
+            range_length: None,
+            text: String::new(),
+        }];
+
+        let (new_text, edits) = apply_content_changes_with_edits(old_text, changes);
+
+        assert_eq!(new_text, old_text);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].start_byte, 5);
+        assert_eq!(edits[0].old_end_byte, 5);
+    }
+
+    #[test]
     fn test_out_of_range_edit_keeps_inputedit_byte_and_point_consistent() {
         // When the range is clamped, the InputEdit's tree-sitter points must be
         // derived from the clamped byte offsets, not the original out-of-bounds
