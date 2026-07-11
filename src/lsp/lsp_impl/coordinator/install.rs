@@ -9,7 +9,7 @@ use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::lsp_impl::{
-    Kakehashi, apply_shared_settings, build_notifier, detect_document_language,
+    Kakehashi, ReloadLanguageState, apply_shared_settings, build_notifier, detect_document_language,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
@@ -229,7 +229,10 @@ impl InstallCoordinator {
     ) {
         apply_shared_settings(
             &self.client,
-            &self.language,
+            ReloadLanguageState {
+                language: &self.language,
+                parser_pool: &self.parser_pool,
+            },
             &self.settings_manager,
             &self.cache,
             &self.bridge,

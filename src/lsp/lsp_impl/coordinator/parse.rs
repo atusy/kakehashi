@@ -177,10 +177,10 @@ impl ParseCoordinator {
         let result = tokio::time::timeout(
             PARSE_AWAIT_BACKSTOP,
             self.compute_pool.run(None, move || {
-                let parser = parser_pool
+                let (parser, parser_generation) = parser_pool
                     .lock()
                     .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
-                    .acquire(&language_name_owned)?;
+                    .acquire_versioned(&language_name_owned)?;
                 // The in-parse abort deadline is anchored at DEQUEUE, not
                 // submission: a parse that sat in the pool queue behind other
                 // documents' work still gets its full budget of actual parse
@@ -193,7 +193,7 @@ impl ParseCoordinator {
                 parser_pool
                     .lock()
                     .recover_poison("ParseCoordinator::parse_with_pool(release)")
-                    .release(language_name_owned, parser);
+                    .release_versioned(language_name_owned, parser, parser_generation);
                 value
             }),
         )

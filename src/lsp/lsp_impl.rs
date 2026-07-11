@@ -93,9 +93,14 @@ pub(super) fn bridge_configs_for_injection_language(
     bridge.cached_configs_for_injection_language(&settings, host_language, injection_language)
 }
 
+pub(super) struct ReloadLanguageState<'a> {
+    language: &'a LanguageCoordinator,
+    parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
+}
+
 pub(super) async fn apply_shared_settings(
     client: &Client,
-    language: &LanguageCoordinator,
+    language_state: ReloadLanguageState<'_>,
     settings_manager: &SettingsManager,
     cache: &CacheCoordinator,
     bridge: &BridgeCoordinator,
@@ -112,7 +117,12 @@ pub(super) async fn apply_shared_settings(
     // The second bump below then also invalidates anything a racing request
     // built MID-swap against a half-updated query set.
     cache.bump_semantic_token_generation();
-    let summary = language.load_settings(&settings);
+    let summary = language_state.language.load_settings(&settings);
+    language_state
+        .parser_pool
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .invalidate();
     // Second bump IMMEDIATELY after the query swap, before any await: a
     // request that started after the transitional bump above but before the
     // swap computed against the OLD queries yet stamped the new generation —
@@ -406,7 +416,10 @@ impl Kakehashi {
     ) {
         apply_shared_settings(
             &self.client,
-            &self.language,
+            ReloadLanguageState {
+                language: &self.language,
+                parser_pool: &self.parser_pool,
+            },
             &self.settings_manager,
             &self.cache,
             &self.bridge,
@@ -819,6 +832,71 @@ mod tests {
 
     // Note: Wildcard config resolution tests are in src/config.rs
     // Note: apply_content_changes_with_edits tests are in src/lsp/text_sync.rs
+
+    #[tokio::test]
+    async fn settings_reload_discards_available_document_parsers() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        service
+            .inner()
+            .parser_pool
+            .lock()
+            .unwrap()
+            .release("stale".to_string(), tree_sitter::Parser::new());
+
+        service
+            .inner()
+            .apply_raw_settings(
+                RawWorkspaceSettings::default(),
+                WorkspaceSettings::default(),
+            )
+            .await;
+
+        assert!(
+            service
+                .inner()
+                .parser_pool
+                .lock()
+                .unwrap()
+                .acquire("stale")
+                .is_none(),
+            "settings reload must not reuse a parser configured before the reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn parser_released_after_settings_reload_is_discarded() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let (parser, generation) = {
+            let mut pool = service.inner().parser_pool.lock().unwrap();
+            pool.release("stale".to_string(), tree_sitter::Parser::new());
+            pool.acquire_versioned("stale").unwrap()
+        };
+
+        service
+            .inner()
+            .apply_raw_settings(
+                RawWorkspaceSettings::default(),
+                WorkspaceSettings::default(),
+            )
+            .await;
+        service
+            .inner()
+            .parser_pool
+            .lock()
+            .unwrap()
+            .release_versioned("stale".to_string(), parser, generation);
+
+        assert!(
+            service
+                .inner()
+                .parser_pool
+                .lock()
+                .unwrap()
+                .acquire("stale")
+                .is_none(),
+            "a parser checked out before reload must not re-enter the new pool generation"
+        );
+    }
 
     #[test]
     fn test_check_injected_languages_identifies_missing_parsers() {

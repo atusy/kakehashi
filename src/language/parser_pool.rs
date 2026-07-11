@@ -28,9 +28,10 @@ impl ParserFactory {
 /// Per-document parser pool for efficient parser reuse
 pub struct DocumentParserPool {
     /// Available parsers by language ID
-    available: HashMap<String, Vec<Parser>>,
+    available: HashMap<String, Vec<(u64, Parser)>>,
     /// Factory for creating new parsers
     factory: ParserFactory,
+    generation: u64,
 }
 
 impl DocumentParserPool {
@@ -39,6 +40,31 @@ impl DocumentParserPool {
         Self {
             available: HashMap::new(),
             factory,
+            generation: 0,
+        }
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.available.clear();
+    }
+
+    pub(crate) fn acquire_versioned(&mut self, language_id: &str) -> Option<(Parser, u64)> {
+        let generation = self.generation;
+        self.acquire(language_id).map(|parser| (parser, generation))
+    }
+
+    pub(crate) fn release_versioned(
+        &mut self,
+        language_id: String,
+        parser: Parser,
+        generation: u64,
+    ) {
+        if generation == self.generation {
+            self.available
+                .entry(language_id)
+                .or_default()
+                .push((generation, parser));
         }
     }
 
@@ -47,7 +73,7 @@ impl DocumentParserPool {
     pub fn acquire(&mut self, language_id: &str) -> Option<Parser> {
         // Try to get from pool first
         if let Some(parsers) = self.available.get_mut(language_id)
-            && let Some(parser) = parsers.pop()
+            && let Some((_, parser)) = parsers.pop()
         {
             return Some(parser);
         }
@@ -58,7 +84,10 @@ impl DocumentParserPool {
 
     /// Release a parser back to the pool for reuse
     pub fn release(&mut self, language_id: String, parser: Parser) {
-        self.available.entry(language_id).or_default().push(parser);
+        self.available
+            .entry(language_id)
+            .or_default()
+            .push((self.generation, parser));
     }
 }
 
