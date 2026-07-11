@@ -69,13 +69,14 @@ fn should_emit_settle_refresh(
     cache: &CacheCoordinator,
     uri: &Url,
     content_version: u64,
+    tree_less_upgrade: bool,
 ) -> bool {
     let settled = documents
         .get(uri)
         .is_some_and(|doc| doc.content_version() == content_version);
-    let client_is_stale = cache
-        .served_semantic_version(uri)
-        .is_some_and(|served| served < content_version);
+    let client_is_stale = cache.served_semantic_version(uri).is_some_and(|served| {
+        served < content_version || (tree_less_upgrade && served == content_version)
+    });
     settled && client_is_stale
 }
 
@@ -1085,6 +1086,11 @@ impl ParseCoordinator {
             } else {
                 PopulatedSnapshotRegions::default()
             };
+            let tree_less_upgrade = self.documents.latest_snapshot(uri).is_some_and(|view| {
+                view.slot.snapshot.is_some_and(|snapshot| {
+                    snapshot.parsed_version == content_version && snapshot.tree.is_none()
+                })
+            });
             let published = self.publish_parse_snapshot(
                 uri,
                 crate::document::snapshot::ParseSnapshot {
@@ -1111,14 +1117,21 @@ impl ParseCoordinator {
             //   already reparsing newer text, whose own publish re-evaluates);
             // - some client actually consumes this document's semantic tokens
             //   (a served-version mark exists) AND its last served tokens
-            //   predate this snapshot (otherwise its own didChange-driven
-            //   request already caught up).
+            //   predate this snapshot, OR it served the reload's current
+            //   tree-less placeholder that this publish upgrades at the same
+            //   version (otherwise its own didChange-driven request caught up).
             // Net: at most one refresh per settle, none mid-burst, none for
             // documents nobody highlights. Emitted from the parse loop, never
             // didChange (synchronous clients can't answer a server request
             // mid-notification).
             if published
-                && should_emit_settle_refresh(&self.documents, &self.cache, uri, content_version)
+                && should_emit_settle_refresh(
+                    &self.documents,
+                    &self.cache,
+                    uri,
+                    content_version,
+                    tree_less_upgrade,
+                )
             {
                 events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
                     language_name.clone(),
@@ -1153,28 +1166,42 @@ mod tests {
         // content_version == 0 now.
 
         // No served mark: nobody highlights this document -> no refresh.
-        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 0));
+        assert!(!should_emit_settle_refresh(
+            &documents, &cache, &uri, 0, false
+        ));
 
         // Client already served THIS version -> its didChange-driven request
         // caught up -> no refresh.
         cache.record_served_semantic_version(&uri, 0);
-        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 0));
+        assert!(!should_emit_settle_refresh(
+            &documents, &cache, &uri, 0, false
+        ));
 
         // An edit bumps the live version; the publish for v1 finds the client
         // stale (served 0 < 1) and the document settled (live == 1) -> emit.
         documents.update_document(uri.clone(), "ab".into(), None);
-        assert!(should_emit_settle_refresh(&documents, &cache, &uri, 1));
+        assert!(should_emit_settle_refresh(
+            &documents, &cache, &uri, 1, false
+        ));
 
         // Mid-burst: another edit already moved the live version past this
         // publish (live 2, publish v1) -> not settled -> no refresh (the v2
         // publish re-evaluates).
         documents.update_document(uri.clone(), "abc".into(), None);
-        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 1));
+        assert!(!should_emit_settle_refresh(
+            &documents, &cache, &uri, 1, false
+        ));
 
         // The mark is monotonic: a stale serve cannot regress it.
         cache.record_served_semantic_version(&uri, 2);
         cache.record_served_semantic_version(&uri, 1);
-        assert!(!should_emit_settle_refresh(&documents, &cache, &uri, 2));
+        assert!(!should_emit_settle_refresh(
+            &documents, &cache, &uri, 2, false
+        ));
+        assert!(
+            should_emit_settle_refresh(&documents, &cache, &uri, 2, true),
+            "a same-version tree-less to tree upgrade must heal an empty serve"
+        );
     }
 
     /// The deadline must actually abort the native parse (an expired one
