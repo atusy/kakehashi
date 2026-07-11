@@ -81,6 +81,7 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::node::children", "no current parse snapshot for {}", uri);
             return Ok(Value::Null);
         };
+        let incarnation = snapshot.incarnation;
         let host_text: &str = &snapshot.text;
         let Some(host_tree) = snapshot.tree.as_ref() else {
             return Ok(Value::Null);
@@ -131,8 +132,14 @@ impl Kakehashi {
             .map(|(c_start, c_end, c_kind)| {
                 // Children live in the same tree as their parent, so they are
                 // minted in the same `layer`.
-                let child_ulid =
-                    tracker.get_or_create_in_layer(&uri, c_start, c_end, c_kind, layer);
+                let child_ulid = tracker.get_or_create_in_layer_for_incarnation(
+                    &uri,
+                    c_start,
+                    c_end,
+                    c_kind,
+                    layer,
+                    incarnation,
+                );
                 json!({
                     "id": child_ulid.to_string(),
                     "kind": c_kind,

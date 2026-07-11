@@ -119,6 +119,7 @@ impl Kakehashi {
                     snapshot_tree,
                     &snapshot.text,
                     injection_query.as_ref(),
+                    snapshot.incarnation,
                 )),
             };
 

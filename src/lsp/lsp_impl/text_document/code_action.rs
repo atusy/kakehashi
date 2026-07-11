@@ -320,6 +320,7 @@ impl Kakehashi {
             snapshot.text(),
             injection_query.as_ref(),
             start_byte,
+            snapshot.incarnation(),
         )?;
         // The tracker byte and the freshly-resolved region can disagree after an
         // edit (the byte now falls in a different live region); a mismatched

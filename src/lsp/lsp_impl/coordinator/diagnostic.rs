@@ -202,6 +202,7 @@ impl DiagnosticScheduler {
                                 snapshot.tree(),
                                 snapshot.text(),
                                 injection_query.as_ref(),
+                                snapshot.incarnation(),
                             )),
                         };
 

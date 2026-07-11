@@ -79,6 +79,7 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::node::parent", "no current parse snapshot for {}", uri);
             return Ok(Value::Null);
         };
+        let incarnation = snapshot.incarnation;
         let host_text: &str = &snapshot.text;
         let Some(host_tree) = snapshot.tree.as_ref() else {
             return Ok(Value::Null);
@@ -125,7 +126,14 @@ impl Kakehashi {
         let parent_ulid = self
             .bridge
             .node_tracker()
-            .get_or_create_in_layer(&uri, p_start, p_end, p_kind, layer);
+            .get_or_create_in_layer_for_incarnation(
+                &uri,
+                p_start,
+                p_end,
+                p_kind,
+                layer,
+                incarnation,
+            );
 
         Ok(json!({
             "id": parent_ulid.to_string(),

@@ -466,6 +466,7 @@ impl InjectionResolver {
     ///
     /// Does not hold any Document lock: inputs (`tree`, `text`) must be pre-cloned,
     /// typically via `DocumentSnapshot`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_at_byte_offset(
         coordinator: &LanguageCoordinator,
         tracker: &NodeTracker,
@@ -474,6 +475,7 @@ impl InjectionResolver {
         text: &str,
         injection_query: &Query,
         byte_offset: usize,
+        incarnation: u64,
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
         let (_region_index, region) = find_injection_at_position(&injections, byte_offset)?;
@@ -483,6 +485,7 @@ impl InjectionResolver {
             uri,
             region,
             text,
+            incarnation,
         ))
     }
 
@@ -503,12 +506,14 @@ impl InjectionResolver {
         tracker: &NodeTracker,
         uri: &Url,
         injection: &InjectionRegionInfo,
+        incarnation: u64,
     ) -> Ulid {
-        tracker.get_or_create(
+        tracker.get_or_create_for_incarnation(
             uri,
             injection.content_node.start_byte(),
             injection.content_node.end_byte(),
             injection.content_node.kind(),
+            incarnation,
         )
     }
 
@@ -545,8 +550,9 @@ impl InjectionResolver {
         uri: &Url,
         region: &InjectionRegionInfo,
         text: &str,
+        incarnation: u64,
     ) -> ResolvedInjection {
-        let region_id = Self::calculate_region_id(tracker, uri, region);
+        let region_id = Self::calculate_region_id(tracker, uri, region, incarnation);
         let region_id_str = region_id.to_string();
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
@@ -573,6 +579,7 @@ impl InjectionResolver {
         tree: &Tree,
         text: &str,
         injection_query: &Query,
+        incarnation: u64,
     ) -> Vec<ResolvedInjection> {
         let Some(injections) =
             collect_all_injections(&tree.root_node(), text, Some(injection_query))
@@ -580,7 +587,7 @@ impl InjectionResolver {
             return Vec::new();
         };
 
-        Self::resolve_from_regions(coordinator, tracker, uri, &injections, text)
+        Self::resolve_from_regions(coordinator, tracker, uri, &injections, text, incarnation)
     }
 
     /// [`resolve_all`](Self::resolve_all) minus the injection-query run, for a
@@ -592,10 +599,13 @@ impl InjectionResolver {
         uri: &Url,
         regions: &[InjectionRegionInfo<'_>],
         text: &str,
+        incarnation: u64,
     ) -> Vec<ResolvedInjection> {
         regions
             .iter()
-            .map(|region| Self::build_resolved_injection(coordinator, tracker, uri, region, text))
+            .map(|region| {
+                Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+            })
             .collect()
     }
 
@@ -1020,7 +1030,7 @@ mod tests {
         let uri = test_uri("offset_frontmatter");
 
         let resolved =
-            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query);
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query, 0);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].virtual_content, "title: x\n");
         assert_eq!(resolved[0].region.line_range.start, 1);
@@ -1053,7 +1063,7 @@ mod tests {
         let uri = test_uri("offset_blockquote");
 
         let resolved =
-            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query);
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query, 0);
         assert_eq!(resolved.len(), 1);
         // The row offset trims the first content line; child exclusion strips
         // the remaining `> ` prefixes.
@@ -1087,6 +1097,7 @@ mod tests {
             text,
             &query,
             22,
+            0,
         );
         assert!(resolved.is_some(), "Should resolve injection");
         let region_id = resolved.unwrap().region.region_id;
@@ -1135,6 +1146,7 @@ mod tests {
             text,
             &query,
             byte_offsets[0],
+            0,
         );
         let r2 = InjectionResolver::resolve_at_byte_offset(
             &coordinator,
@@ -1144,6 +1156,7 @@ mod tests {
             text,
             &query,
             byte_offsets[1],
+            0,
         );
         let r3 = InjectionResolver::resolve_at_byte_offset(
             &coordinator,
@@ -1153,6 +1166,7 @@ mod tests {
             text,
             &query,
             byte_offsets[2],
+            0,
         );
 
         // Each should have different ULIDs (different ordinals)
@@ -1192,6 +1206,7 @@ mod tests {
             text,
             &query,
             byte_offset,
+            0,
         );
         let r2 = InjectionResolver::resolve_at_byte_offset(
             &coordinator,
@@ -1201,6 +1216,7 @@ mod tests {
             text,
             &query,
             byte_offset,
+            0,
         );
 
         assert_eq!(
@@ -1261,9 +1277,9 @@ mod tests {
 
         // Phase 2: calculate_region_id uses position-based keys (not ordinals)
         // Different positions → different ULIDs regardless of language
-        let ulid_0 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0]);
-        let ulid_1 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[1]);
-        let ulid_2 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[2]);
+        let ulid_0 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0], 0);
+        let ulid_1 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[1], 0);
+        let ulid_2 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[2], 0);
 
         // All different because they have different byte positions
         assert_ne!(
@@ -1280,7 +1296,8 @@ mod tests {
         );
 
         // Same position returns same ULID (stability)
-        let ulid_0_again = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0]);
+        let ulid_0_again =
+            InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0], 0);
         assert_eq!(
             ulid_0, ulid_0_again,
             "Same position key should return same ULID"

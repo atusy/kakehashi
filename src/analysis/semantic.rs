@@ -136,6 +136,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             tracker: p.tracker.as_ref(),
             cache: p.cache.as_ref(),
             generation: p.generation,
+            incarnation: p.incarnation,
             // Currency latch for region-id minting, taken here inside the
             // work-unit so the race window is the compute itself, not the
             // pool-queue wait. A stale serve goes read-only on the tracker

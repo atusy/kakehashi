@@ -172,6 +172,7 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::node", "no current parse snapshot for {}", uri);
             return Ok(Value::Null);
         };
+        let incarnation = snapshot.incarnation;
 
         let text: &str = &snapshot.text;
         let Some(tree) = snapshot.tree.as_ref() else {
@@ -199,7 +200,7 @@ impl Kakehashi {
         // keeps the no-injection request shape (the dominant case for plain
         // documents) at PR-1 cost.
         if matches!(selector, InjectionSelector::Host) {
-            return Ok(self.resolve_host_layer_node(&uri, tree, byte, doc_len));
+            return Ok(self.resolve_host_layer_node(&uri, tree, byte, doc_len, incarnation));
         }
 
         // We need the host language to seed `injection_stack_at` with the
@@ -235,6 +236,7 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::node", "no current parse snapshot for {} after load", uri);
             return Ok(Value::Null);
         };
+        let incarnation = snapshot.incarnation;
         let text = std::sync::Arc::clone(&snapshot.text);
         let Some(tree) = snapshot.tree.clone() else {
             return Ok(Value::Null);
@@ -291,12 +293,13 @@ impl Kakehashi {
                 // sharing (start, end, kind) get distinct ULIDs and stay navigable
                 // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
                 // Key", issue #313).
-                let ulid = tracker.get_or_create_in_layer(
+                let ulid = tracker.get_or_create_in_layer_for_incarnation(
                     &uri,
                     node.start_byte(),
                     node.end_byte(),
                     node.kind(),
                     layer_index,
+                    incarnation,
                 );
 
                 json!({
@@ -318,16 +321,18 @@ impl Kakehashi {
         tree: &tree_sitter::Tree,
         byte: usize,
         doc_len: usize,
+        incarnation: u64,
     ) -> Value {
         let Some(node) = smallest_containing_node(tree, byte, doc_len) else {
             return Value::Null;
         };
 
-        let ulid = self.bridge.node_tracker().get_or_create(
+        let ulid = self.bridge.node_tracker().get_or_create_for_incarnation(
             uri,
             node.start_byte(),
             node.end_byte(),
             node.kind(),
+            incarnation,
         );
 
         json!({

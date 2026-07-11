@@ -144,7 +144,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         id: &str,
         mut f: impl FnMut(tree_sitter::Node<'_>) -> R + Send + 'static,
-    ) -> Option<(Url, usize, R)> {
+    ) -> Option<(Url, usize, u64, R)> {
         // Most accessors don't need the document text; ignore it.
         self.with_node_text(lsp_uri, id, move |node, _text| f(node))
             .await
@@ -165,7 +165,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         id: &str,
         mut f: impl FnMut(tree_sitter::Node<'_>, &str) -> R + Send + 'static,
-    ) -> Option<(Url, usize, R)> {
+    ) -> Option<(Url, usize, u64, R)> {
         // Most accessors don't need the minting layer's included ranges.
         self.with_node_text_ranges(lsp_uri, id, move |node, text, _ranges| f(node, text))
             .await
@@ -182,7 +182,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         id: &str,
         mut f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> R + Send + 'static,
-    ) -> Option<(Url, usize, R)> {
+    ) -> Option<(Url, usize, u64, R)> {
         // An unparseable URI signals a misbehaving client; warn for parity with
         // `node` / `node/text` / `node/parent` / `node/children` while still
         // collapsing to `null`.
@@ -253,7 +253,7 @@ impl Kakehashi {
             );
             return None;
         };
-        Some((uri, layer, result))
+        Some((uri, layer, snapshot.incarnation, result))
     }
 
     /// Mint (or reuse) a stable ULID for a related node in `layer` and shape it
@@ -263,13 +263,14 @@ impl Kakehashi {
         &self,
         uri: &Url,
         layer: usize,
+        incarnation: u64,
         triple: NodeTriple,
     ) -> Value {
         let (start, end, kind) = triple;
         let ulid = self
             .bridge
             .node_tracker()
-            .get_or_create_in_layer(uri, start, end, kind, layer);
+            .get_or_create_in_layer_for_incarnation(uri, start, end, kind, layer, incarnation);
         json!({ "id": ulid.to_string(), "kind": kind })
     }
 
@@ -288,11 +289,12 @@ impl Kakehashi {
         id: &str,
         f: impl FnMut(tree_sitter::Node<'_>) -> Option<NodeTriple> + Send + 'static,
     ) -> Value {
-        let Some((uri, layer, picked)) = self.with_node_by_id(lsp_uri, id, f).await else {
+        let Some((uri, layer, incarnation, picked)) = self.with_node_by_id(lsp_uri, id, f).await
+        else {
             return Value::Null;
         };
         match picked {
-            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            Some(triple) => self.mint_node_info(&uri, layer, incarnation, triple),
             None => Value::Null,
         }
     }
@@ -309,11 +311,13 @@ impl Kakehashi {
         + Send
         + 'static,
     ) -> Value {
-        let Some((uri, layer, picked)) = self.with_node_text_ranges(lsp_uri, id, f).await else {
+        let Some((uri, layer, incarnation, picked)) =
+            self.with_node_text_ranges(lsp_uri, id, f).await
+        else {
             return Value::Null;
         };
         match picked {
-            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            Some(triple) => self.mint_node_info(&uri, layer, incarnation, triple),
             None => Value::Null,
         }
     }
@@ -414,7 +418,7 @@ impl Kakehashi {
             return Value::Null;
         };
         match picked {
-            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            Some(triple) => self.mint_node_info(&uri, layer, snapshot.incarnation, triple),
             None => Value::Null,
         }
     }
@@ -431,12 +435,13 @@ impl Kakehashi {
         id: &str,
         f: impl FnMut(tree_sitter::Node<'_>) -> Vec<NodeTriple> + Send + 'static,
     ) -> Value {
-        let Some((uri, layer, items)) = self.with_node_by_id(lsp_uri, id, f).await else {
+        let Some((uri, layer, incarnation, items)) = self.with_node_by_id(lsp_uri, id, f).await
+        else {
             return Value::Null;
         };
         let infos: Vec<Value> = items
             .into_iter()
-            .map(|triple| self.mint_node_info(&uri, layer, triple))
+            .map(|triple| self.mint_node_info(&uri, layer, incarnation, triple))
             .collect();
         Value::Array(infos)
     }

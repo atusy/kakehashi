@@ -6,27 +6,33 @@ use super::super::{Kakehashi, uri_to_url};
 
 impl Kakehashi {
     #[cfg(test)]
-    pub(in crate::lsp::lsp_impl) async fn clear_document_state_on_close(&self, uri: &url::Url) {
+    pub(in crate::lsp::lsp_impl) async fn clear_document_state_on_close(
+        &self,
+        uri: &url::Url,
+    ) -> Option<u64> {
         let edit_lock = self.documents.edit_lock(uri);
         let edit_guard = edit_lock.lock().await;
-        self.clear_document_state_on_close_locked(uri);
+        let closing_incarnation = self.clear_document_state_on_close_locked(uri);
         drop(edit_guard);
         self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+        closing_incarnation
     }
 
-    fn clear_document_state_on_close_locked(&self, uri: &url::Url) {
+    fn clear_document_state_on_close_locked(&self, uri: &url::Url) -> Option<u64> {
         // Captures lineage and walk memos are installed under this same lock,
         // so a store that won first is cleared while one arriving later sees
         // the document gone and refuses to install obsolete state.
         self.captures_cache.retain(|key, _| key.0 != *uri);
         self.captures_walk_cache.retain(|key, _| key.0 != *uri);
         self.cancel_captures_walks_for_document(uri);
+        let closing_incarnation = self.documents.get(uri).map(|doc| doc.incarnation());
         self.documents.remove_preserving_edit_lock(uri);
         self.cache.remove_document(uri);
         // The match cache uses insert-then-verify. Clearing after document
         // removal ensures a straggler either inserted before this clear or
         // observes the closed document and self-removes.
         self.captures_match_cache.clear_document(uri);
+        closing_incarnation
     }
 
     async fn close_document_lifecycle(
@@ -36,11 +42,12 @@ impl Kakehashi {
     ) {
         let edit_lock = self.documents.edit_lock(uri);
         let edit_guard = edit_lock.lock().await;
-        self.clear_document_state_on_close_locked(uri);
+        let closing_incarnation = self.clear_document_state_on_close_locked(uri);
         after_remove.await;
 
-        self.bridge
-            .cleanup(uri, || self.documents.latest_snapshot(uri).is_some());
+        if let Some(closing_incarnation) = closing_incarnation {
+            self.bridge.cleanup(uri, closing_incarnation);
+        }
         self.synthetic_diagnostics.remove_document(uri);
         self.debounced_diagnostics.cancel(uri);
         self.bridge.cancel_eager_open(uri);

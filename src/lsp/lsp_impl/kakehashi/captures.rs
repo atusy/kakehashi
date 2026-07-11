@@ -1240,6 +1240,7 @@ impl Kakehashi {
                     &tracker,
                     &documents,
                     entry_mint_epoch,
+                    incarnation,
                     mint_into_tracker,
                     generation,
                     &match_cache,
@@ -1359,6 +1360,7 @@ fn execute_captures_walk(
     tracker: &crate::language::NodeTracker,
     documents: &crate::document::DocumentStore,
     entry_mint_epoch: (u64, u64),
+    incarnation: u64,
     mint_into_tracker: bool,
     generation: u64,
     match_cache: &super::captures_match_cache::CapturesMatchCache,
@@ -1535,7 +1537,12 @@ fn execute_captures_walk(
             })
         };
         let layer_ulids: Vec<ulid::Ulid> = if mint_into_tracker {
-            tracker.mint_batch_if_unshifted(uri, entry_mint_epoch, capture_keys())
+            tracker.mint_batch_if_unshifted_for_incarnation(
+                uri,
+                entry_mint_epoch,
+                incarnation,
+                capture_keys(),
+            )
         } else {
             None
         }
@@ -2775,6 +2782,7 @@ mod tests {
             &tracker,
             &store,
             tracker.mint_epoch(&uri),
+            0,
             true,
             0,
             &match_cache,
@@ -2805,6 +2813,7 @@ mod tests {
             &tracker,
             &store,
             tracker.mint_epoch(&uri),
+            0,
             false,
             0,
             &match_cache,
@@ -2837,6 +2846,7 @@ mod tests {
             &stale_tracker,
             &store,
             stale_tracker.mint_epoch(&uri),
+            0,
             false,
             0,
             &match_cache,
@@ -2991,6 +3001,7 @@ mod tests {
                 &self.tracker,
                 &self.store,
                 entry_mint_epoch,
+                incarnation,
                 mint_into_tracker,
                 generation,
                 &self.match_cache,

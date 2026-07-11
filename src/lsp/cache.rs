@@ -207,6 +207,7 @@ impl CacheCoordinator {
         language: &LanguageCoordinator,
         tracker: &NodeTracker,
         entry_mint_epoch: (u64, u64),
+        incarnation: u64,
         build_bridge_regions: bool,
         build_resolved_regions: bool,
     ) -> Option<PopulatedInjections> {
@@ -278,9 +279,10 @@ impl CacheCoordinator {
             // pre-lever path) and defer identity to the next current pass —
             // the tracker is meanwhile kept live by the ordinary didChange
             // edit-shift.
-            let region_ids = tracker.mint_batch_if_unshifted(
+            let region_ids = tracker.mint_batch_if_unshifted_for_incarnation(
                 uri,
                 entry_mint_epoch,
+                incarnation,
                 regions.iter().map(|info| {
                     (
                         info.content_node.start_byte(),
@@ -365,6 +367,7 @@ impl CacheCoordinator {
                 uri,
                 tracker,
                 generation,
+                incarnation,
             );
 
             // Live-hash set for the content-addressed injection-token cache's
@@ -906,6 +909,7 @@ print("hello")
             &coordinator,
             &tracker,
             tracker.mint_epoch(&uri),
+            0,
             true,
             true,
         );
@@ -968,6 +972,7 @@ print("hello")
             &coordinator,
             &tracker,
             tracker.mint_epoch(&uri),
+            0,
             true,
             true,
         );
@@ -1044,6 +1049,7 @@ print("hello")
             &coordinator,
             &tracker,
             tracker.mint_epoch(&uri),
+            0,
             true,
             true,
         );
@@ -1090,6 +1096,7 @@ print("goodbye")
             &coordinator,
             &tracker,
             tracker.mint_epoch(&uri),
+            0,
             true,
             true,
         );

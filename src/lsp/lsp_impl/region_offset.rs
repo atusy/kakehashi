@@ -49,6 +49,7 @@ pub(super) fn resolve_region_offset(
         snapshot.text(),
         injection_query.as_ref(),
         start_byte,
+        snapshot.incarnation(),
     )?;
     // `region_id`/`start_byte` came from the tracker + node map, but
     // `resolved` came from a separately-fetched snapshot. If an edit landed
