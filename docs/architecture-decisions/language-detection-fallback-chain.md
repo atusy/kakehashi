@@ -153,9 +153,12 @@ For example, a Markdown code fence with ` ```py ` provides the identifier
 
 Parser resolution follows this fallback pattern:
 
-1. **Try the identifier directly**: Check if a parser named `"py"` is available
-2. **Normalize via syntect**: Use `detect_from_token("py")` which returns `"python"`
-3. **Try config-based alias**: If syntect doesn't recognize it, check user-configured aliases
+1. **Try identifier then configured base**: Load `"py"` directly, then its
+   configured base before considering generic normalization
+2. **Normalize via syntect, then try its base**: Use `detect_from_token("py")`
+   which returns `"python"`, and load that candidate or its configured base
+3. **Try first-line candidate then its base**: Use shebang/mode-line detection
+   only after the explicit identifier paths fail
 4. **Skip parser-backed analysis if unavailable**: Bridge routing can still use
    the canonical candidate, but semantic/parser work skips the region when no
    parser matches
