@@ -622,7 +622,9 @@ impl InjectionResolver {
         )
     }
 
-    /// Tracker-layer key used by both inline and batch region-ID minting.
+    /// Tracker-layer key used by both inline and batch region-ID minting. The
+    /// slot is collision-free and stable within one URI incarnation; its
+    /// numeric value depends on first-observation order.
     pub(crate) fn region_identity_layer(
         tracker: &NodeTracker,
         uri: &Url,

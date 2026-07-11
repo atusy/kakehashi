@@ -177,6 +177,9 @@ impl UriEntries {
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
         self.reverse
             .retain(|_, tracked| tracked.incarnation > closing_incarnation);
+        if self.latest_incarnation <= closing_incarnation {
+            self.named_layers.clear();
+        }
     }
 }
 
@@ -396,8 +399,9 @@ impl NodeTracker {
     /// admission race. A concurrent reopen may already have edited or minted;
     /// retain either signal (`shift_gen > 0` or non-empty ids).
     fn remove_pristine_entry(&self, uri: &Url) {
-        self.entries
-            .remove_if(uri, |_, entry| entry.shift_gen == 0 && entry.len() == 0);
+        self.entries.remove_if(uri, |_, entry| {
+            entry.shift_gen == 0 && entry.len() == 0 && entry.named_layers.is_empty()
+        });
     }
 
     /// Get or create a stable ULID for a **host-layer** tree-sitter node.
@@ -890,7 +894,7 @@ impl NodeTracker {
             .or_insert(None);
         self.entries.remove_if_mut(uri, |_, entries| {
             entries.retain_newer_than(closing_incarnation);
-            entries.len() == 0
+            entries.len() == 0 && entries.named_layers.is_empty()
         });
     }
 
@@ -1064,6 +1068,27 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
+    }
+
+    #[test]
+    fn stale_cleanup_preserves_newer_named_layers() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("named_layer_cleanup");
+        tracker.open_incarnation(&uri, 2);
+        let javascript = tracker
+            .named_layer_for_incarnation(&uri, 0, "javascript", 2)
+            .unwrap();
+
+        tracker.cleanup(&uri, 1);
+
+        assert_eq!(
+            tracker.named_layer_for_incarnation(&uri, 0, "javascript", 2),
+            Some(javascript)
+        );
+        assert_ne!(
+            tracker.named_layer_for_incarnation(&uri, 0, "typescript", 2),
+            Some(javascript)
+        );
     }
 
     /// The batch reconciliation mint reuses an existing id by position and
