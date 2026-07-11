@@ -543,7 +543,7 @@ impl DocumentStore {
         self.edit_locks.remove(uri);
     }
 
-    /// [`remove_edit_lock`](Self::remove_edit_lock), but only while the map
+    /// Remove the edit-lock entry, but only while the map
     /// still holds the exact `Arc` the caller acquired AND nobody else
     /// holds a clone — for miss paths that probe liveness some time after
     /// their `edit_lock()` call. A close+reopen in that gap can hand the
@@ -565,7 +565,7 @@ impl DocumentStore {
     /// Ensure a watermark channel exists for `uri` carrying the current lifetime's
     /// `incarnation`, created at ticket 0. Called when a document is registered or
     /// edited so the watermark's lifetime tracks the document's — it exists exactly
-    /// while the document is open and is dropped by [`remove`](Self::remove) on close.
+    /// while the document is open and is dropped when the document closes.
     ///
     /// Idempotent **within a lifetime**: an existing channel whose incarnation
     /// already matches is left untouched, so an edit never resets the ticket. But a

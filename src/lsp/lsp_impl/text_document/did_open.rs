@@ -342,6 +342,9 @@ mod tests {
         })
         .await;
         reopen.abort();
+        if let Err(error) = reopen.await {
+            assert!(error.is_cancelled(), "didOpen task panicked: {error}");
+        }
         assert_eq!(server.documents.get(&uri).unwrap().text(), "new");
     }
 

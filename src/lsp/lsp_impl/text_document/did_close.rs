@@ -178,5 +178,10 @@ mod tests {
 
         close.abort();
         reopen.abort();
+        for (name, task) in [("didClose", close), ("didOpen", reopen)] {
+            if let Err(error) = task.await {
+                assert!(error.is_cancelled(), "{name} task panicked: {error}");
+            }
+        }
     }
 }
