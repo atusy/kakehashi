@@ -245,8 +245,8 @@ impl AutoInstallManager {
         support_check: F,
     ) -> InstallResult
     where
-        F: FnOnce(String, Option<PathBuf>) -> Fut,
-        Fut: Future<Output = (bool, Option<SkipReason>)>,
+        F: FnOnce(String, Option<PathBuf>) -> Fut + Send + 'static,
+        Fut: Future<Output = (bool, Option<SkipReason>)> + Send + 'static,
     {
         let mut events = Vec::new();
 
@@ -286,8 +286,32 @@ impl AutoInstallManager {
 
         // Check if language is supported by nvim-treesitter
         let default_data_dir = crate::install::default_data_dir();
-        let (should_skip, reason) =
-            support_check(language.to_string(), default_data_dir.clone()).await;
+        // The task owns the claim so cancellation of this caller cannot release
+        // it while the lookup (which contains spawn_blocking work) continues.
+        // On normal completion the claim returns here and is either dropped by
+        // an early return or transferred to the parser-install task below.
+        let lookup_language = language.to_string();
+        let lookup_data_dir = default_data_dir.clone();
+        let support_task = tokio::spawn(async move {
+            let result = support_check(lookup_language, lookup_data_dir).await;
+            (result, install_marker)
+        });
+        let ((should_skip, reason), install_marker) = match support_task.await {
+            Ok(result) => result,
+            Err(join_error) => {
+                events.push(InstallEvent::Log {
+                    level: MessageType::ERROR,
+                    message: format!(
+                        "Support check task for '{}' failed: {}",
+                        language, join_error
+                    ),
+                });
+                return InstallResult {
+                    outcome: InstallOutcome::Failed,
+                    events,
+                };
+            }
+        };
 
         if let Some(reason) = &reason {
             events.push(InstallEvent::Log {
@@ -566,16 +590,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_support_lookup_releases_install_claim() {
+    async fn cancelled_caller_keeps_claim_until_support_lookup_finishes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
         let (manager, _temp) = create_test_manager();
         let task_manager = manager.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
         let task = tokio::spawn(async move {
             task_manager
                 .try_install_with_support_check("lua", |_, _| async move {
                     let _ = started_tx.send(());
-                    std::future::pending::<(bool, Option<SkipReason>)>().await
+                    let _ = release_rx.await;
+                    (true, None)
                 })
                 .await
         });
@@ -583,10 +614,25 @@ mod tests {
         task.abort();
         let _ = task.await;
 
-        assert!(
-            manager.installing_languages.try_start_install("lua"),
-            "cancelling during metadata lookup must release the claim"
-        );
+        let duplicate_lookups = Arc::new(AtomicUsize::new(0));
+        let duplicate_count = Arc::clone(&duplicate_lookups);
+        let duplicate = manager
+            .try_install_with_support_check("lua", move |_, _| {
+                duplicate_count.fetch_add(1, Ordering::SeqCst);
+                async { (false, None) }
+            })
+            .await;
+        assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
+        assert_eq!(duplicate_lookups.load(Ordering::SeqCst), 0);
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.installing_languages.try_start_install("lua") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached lookup task must release the claim after its support check finishes");
     }
 
     #[tokio::test]
