@@ -1499,12 +1499,9 @@ mod tests {
 
         // The window elapses; the parked trailing task re-runs republish.
         tokio::time::advance(super::WIRE_PUBLISH_QUIET_WINDOW).await;
-        // Bounded yields to drain the woken trailing task under the paused
-        // clock (its republish takes the async per-host lock, so one poll is
-        // not enough; 20 is comfortably past what the task needs).
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        // Advance virtual time once more so Tokio drains the woken trailing
+        // task through its nested awaits without relying on a poll count.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         assert!(
             !server.diagnostics.wire_gate_is_dirty(&uri),
             "the trailing republish flushed the withheld set"
