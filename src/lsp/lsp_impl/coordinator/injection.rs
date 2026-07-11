@@ -472,6 +472,7 @@ mod tests {
                 .language
                 .injection_query("markdown")
                 .expect("registered injection query"),
+            incarnation,
         );
         assert!(
             interactive
