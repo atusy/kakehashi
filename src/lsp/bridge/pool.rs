@@ -1261,11 +1261,14 @@ impl LanguageServerPool {
         if host.incarnation != incarnation {
             return;
         }
-        if let Some(regions) = host.contents.get(language)
-            && regions
+        if let Some(regions) = host.contents.get(language) {
+            if regions
                 .get(region_id)
                 .is_some_and(|cached| cached.as_ref() == content)
-        {
+            {
+                return;
+            }
+            regions.insert(region_id.to_string(), Arc::<str>::from(content));
             return;
         }
         host.contents
