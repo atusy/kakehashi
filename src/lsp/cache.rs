@@ -307,7 +307,7 @@ impl CacheCoordinator {
 
             // Bridge-downstream regions from the SAME collected `regions`
             // (parse-snapshot ADR §3, never discover twice): the exact
-            // (raw language, region_id, clean content) triple
+            // (canonical language, region_id, clean content) triple
             // `resolve_injection_data` used to re-derive by re-running the
             // injection query per downstream pass. Gated on a bridge server
             // actually being configured: populate runs on the pre-publish
@@ -331,7 +331,7 @@ impl CacheCoordinator {
                                 included_ranges.as_deref(),
                             );
                             crate::document::DiscoveredBridgeRegion {
-                                raw_language:
+                                language:
                                     crate::language::injection::InjectionResolver::resolve_language(
                                         language,
                                         &info.language,

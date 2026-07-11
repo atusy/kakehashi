@@ -118,7 +118,7 @@ impl InjectionCoordinator {
             return bridge_regions
                 .iter()
                 .map(|region| BridgeInjection {
-                    language: region.raw_language.clone(),
+                    language: region.language.clone(),
                     region_id: region.region_id.clone(),
                     content: region.content.clone(),
                 })
