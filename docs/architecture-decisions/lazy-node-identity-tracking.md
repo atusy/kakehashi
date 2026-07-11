@@ -175,6 +175,10 @@ cleanup: pre-close ids still become indistinguishable from never-issued ids,
 while ids already published by the reopened snapshot remain resolvable.
 Incarnation is metadata, not part of the position uniqueness key, so a node at
 the same position in a new lifetime receives a fresh ULID.
+The tracker also records the URI's current open incarnation (or a lightweight
+closed marker). This closes the post-cleanup window where a direct reader that
+passed liveness before `didClose` could otherwise recreate an old-lifetime
+entry; the closed marker contains no node IDs and is replaced on `didOpen`.
 
 **Invalidate semantics**: When a node's START falls inside the edit range, both entries are removed. After removal, the ULID is **indistinguishable from "never issued"** — by design, no tombstone is kept, so memory stays bounded to live nodes only.
 
