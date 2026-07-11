@@ -1004,7 +1004,7 @@ impl DiagnosticAggregator {
         // `published_set_changed` recorded the merge before the send, so
         // without the debt a later identical merge would skip past the
         // unchanged check while the editor never received the set.
-        if !gates.contains_key(host) {
+        let Some(gate) = gates.get_mut(host) else {
             gates.insert(
                 host.clone(),
                 WireGate {
@@ -1014,8 +1014,7 @@ impl DiagnosticAggregator {
                 },
             );
             return WireAdmit::SendNow;
-        }
-        let gate = gates.get_mut(host).expect("present: checked above");
+        };
         let elapsed = gate.last_sent_at.map(|at| now.duration_since(at));
         match elapsed {
             Some(elapsed) if elapsed < window => {
