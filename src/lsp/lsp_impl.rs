@@ -117,7 +117,15 @@ pub(super) async fn apply_shared_settings(
     // The second bump below then also invalidates anything a racing request
     // built MID-swap against a half-updated query set.
     cache.bump_semantic_token_generation();
+    language_state
+        .parser_pool
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .invalidate();
     let summary = language_state.language.load_settings(&settings);
+    // Invalidate again after the synchronous swap: the first bump rejects
+    // pre-reload checkouts, while this one rejects parsers acquired while the
+    // registry and query stores were being replaced.
     language_state
         .parser_pool
         .lock()
