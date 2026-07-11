@@ -277,7 +277,7 @@ impl DiagnosticPublisher {
     fn open_document_language(&self, uri: &Url) -> Option<String> {
         let doc = self.documents.get(uri)?;
         self.language
-            .detect_language_hot(uri.path(), doc.text(), None, doc.language_id())
+            .detect_language_trace(uri.path(), doc.text(), None, doc.language_id())
     }
 
     /// Remove `Host` push slots from `snapshot` whose server is no longer a
@@ -980,7 +980,7 @@ impl DiagnosticPublisher {
         // region slots are present (every keystroke settle during a typing
         // burst) — the debug variant would re-grow the per-event
         // `language_detection` log volume PR #677 moved off hot paths.
-        let Some(language_name) = self.language.detect_language_hot(
+        let Some(language_name) = self.language.detect_language_trace(
             host.path(),
             snapshot.text(),
             None,
