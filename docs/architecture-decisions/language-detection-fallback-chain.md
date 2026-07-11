@@ -146,8 +146,9 @@ For example, a Markdown code fence with ` ```py ` provides the identifier
 
 - **Bridge canonicalization** produces a stable language key even when no
   parser exists yet. It checks an explicit configured base, then syntect token
-  normalization, then first-line detection, and finally the raw identifier.
-  Thus `py` remains `python` before and after parser installation.
+  normalization (and that candidate's base), then first-line detection (and
+  that candidate's base), and finally the raw identifier. Thus `py` remains
+  `python` before and after parser installation.
 - **Parser resolution** may then load or select the canonical language/base and
   can still fail when no grammar is available.
 
