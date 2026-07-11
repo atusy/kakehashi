@@ -87,6 +87,13 @@ impl ArchiveFetchError {
     fn into_recovery(self) -> ArchiveRecovery {
         match self {
             error @ (Self::Content(_) | Self::Unsafe(_)) => ArchiveRecovery::CloneFallback(error),
+            // InvalidInput is content-driven too: it is what unpacking an
+            // archive path that is invalid on the local filesystem produces,
+            // not a local disk/permission failure — the clone fallback can
+            // still succeed there.
+            Self::Io(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                ArchiveRecovery::CloneFallback(Self::Io(error))
+            }
             Self::Io(error) => ArchiveRecovery::Fail(error),
         }
     }
@@ -532,6 +539,7 @@ fn extract_archive<R: Read>(
 ) -> Result<(), ArchiveFetchError> {
     fs::create_dir_all(dest)?;
 
+    let mut extracted_any = false;
     for entry_result in archive
         .entries()
         .map_err(|e| ArchiveFetchError::Content(format!("Failed to read archive entries: {}", e)))?
@@ -578,8 +586,17 @@ fn extract_archive<R: Read>(
         } else {
             unpack_archive_file_entry(&mut entry, dest, &safe_relative)?;
         }
+        extracted_any = true;
     }
 
+    // An archive whose every entry missed `expected_prefix` produced nothing:
+    // surface it as a content mismatch (clone fallback) instead of letting a
+    // later build step fail confusingly on an empty directory.
+    if !extracted_any {
+        return Err(ArchiveFetchError::Content(format!(
+            "Archive contained no entries under the expected prefix {expected_prefix:?}"
+        )));
+    }
     Ok(())
 }
 
