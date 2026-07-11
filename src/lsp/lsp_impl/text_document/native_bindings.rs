@@ -97,11 +97,16 @@ impl Kakehashi {
         // doubles as the staleness witness for the publish-time check below
         // (every edit and reopen installs a fresh allocation).
         self.ensure_document_parsed(&uri).await;
-        let Some((text, tree)) = ({
+        let Some((text, tree, content_version, incarnation)) = ({
             let doc = self.documents.get(&uri);
             doc.and_then(|doc| {
                 let tree = doc.tree()?.clone();
-                Some((doc.text_arc(), tree))
+                Some((
+                    doc.text_arc(),
+                    tree,
+                    doc.content_version(),
+                    doc.incarnation(),
+                ))
             })
         }) else {
             return Ok(None);
@@ -184,10 +189,11 @@ impl Kakehashi {
         // A didChange between the snapshot and here makes every computed
         // range stale — worst case a rename WorkspaceEdit applied to newer
         // text. Publish only while the snapshot's text is still current.
-        let unchanged = self
-            .documents
-            .get(&uri)
-            .is_some_and(|doc| std::sync::Arc::ptr_eq(&doc.text_arc(), &text));
+        let unchanged = self.documents.get(&uri).is_some_and(|doc| {
+            doc.content_version() == content_version
+                && doc.incarnation() == incarnation
+                && std::sync::Arc::ptr_eq(&doc.text_arc(), &text)
+        });
         if !unchanged {
             return Ok(None);
         }
