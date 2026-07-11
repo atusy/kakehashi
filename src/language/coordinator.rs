@@ -1501,24 +1501,36 @@ impl LanguageCoordinator {
         config: &LanguageSettings,
         search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
-        // Query kinds absent from the new configuration must disappear; the
-        // insertion helpers only replace kinds that successfully load.
-        self.query_store.remove_queries(lang_name);
-        // Error: parser was explicitly configured but can't be found
-        let language = match self.load_parser(
-            lang_name,
-            config.parser.as_deref(),
-            search_paths,
-            LanguageLogLevel::Error,
-        ) {
-            Ok(lang) => lang,
-            Err(result) => {
-                let generation = self
-                    .load_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
-                self.record_configured_load_failure(lang_name, generation);
-                self.record_failed_load(lang_name, generation);
-                return result;
+        let generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let pre_registered =
+            config.parser.is_none() && self.has_current_parser_registration(lang_name, generation);
+        let preserve_builtin_queries = pre_registered
+            && self.dynamically_loaded.get(lang_name).is_none()
+            && config.queries.is_none();
+        if !preserve_builtin_queries {
+            // Query kinds absent from the new configuration must disappear; the
+            // insertion helpers only replace kinds that successfully load.
+            self.query_store.remove_queries(lang_name);
+        }
+        let language = if pre_registered {
+            self.language_registry
+                .get(lang_name)
+                .expect("current parser registration disappeared")
+        } else {
+            match self.load_parser(
+                lang_name,
+                config.parser.as_deref(),
+                search_paths,
+                LanguageLogLevel::Error,
+            ) {
+                Ok(lang) => lang,
+                Err(result) => {
+                    self.record_configured_load_failure(lang_name, generation);
+                    self.record_failed_load(lang_name, generation);
+                    return result;
+                }
             }
         };
         self.register_configured_language(lang_name, language.clone());
