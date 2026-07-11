@@ -346,8 +346,19 @@ impl AutoInstallManager {
                 events,
             };
         }
-        let install_marker =
-            install_marker.expect("a completed supported lookup must return its install marker");
+        let Some(install_marker) = install_marker else {
+            events.push(InstallEvent::Log {
+                level: MessageType::ERROR,
+                message: format!(
+                    "Support check for '{}' completed without its install claim",
+                    language
+                ),
+            });
+            return InstallResult {
+                outcome: InstallOutcome::Failed,
+                events,
+            };
+        };
 
         // Progress begin
         events.push(InstallEvent::ProgressBegin);
@@ -646,6 +657,28 @@ mod tests {
         })
         .await
         .expect("claim keeper must release after timed-out work finishes");
+    }
+
+    #[tokio::test]
+    async fn supported_result_without_returned_claim_fails_closed() {
+        let (manager, _temp) = create_test_manager();
+
+        let result = manager
+            .try_install_with_support_check("lua", |_, _| async {
+                TrackedSupportCheck {
+                    should_skip: false,
+                    reason: None,
+                    completion: Some(tokio::spawn(async {})),
+                }
+            })
+            .await;
+
+        assert_eq!(result.outcome, InstallOutcome::Failed);
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            InstallEvent::Log { level: MessageType::ERROR, message }
+                if message.contains("completed without its install claim")
+        )));
     }
 
     #[tokio::test]
