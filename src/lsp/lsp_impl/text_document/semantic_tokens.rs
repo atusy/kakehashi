@@ -1114,6 +1114,17 @@ impl Kakehashi {
         };
         let text = std::sync::Arc::clone(&snapshot.text);
 
+        if !self
+            .language
+            .ensure_language_loaded_async(&language_name)
+            .await
+            .success
+        {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        }
         let Some(query) = self.language.highlight_query(&language_name) else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
