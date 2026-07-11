@@ -279,18 +279,22 @@ impl CacheCoordinator {
             // pre-lever path) and defer identity to the next current pass —
             // the tracker is meanwhile kept live by the ordinary didChange
             // edit-shift.
+            let region_keys = regions
+                .iter()
+                .map(|info| {
+                    Some((
+                        info.content_node.start_byte(),
+                        info.content_node.end_byte(),
+                        info.content_node.kind(),
+                        crate::language::injection::InjectionResolver::region_identity_layer(info)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
             let region_ids = tracker.mint_batch_if_unshifted_for_incarnation(
                 uri,
                 entry_mint_epoch,
                 incarnation,
-                regions.iter().map(|info| {
-                    (
-                        info.content_node.start_byte(),
-                        info.content_node.end_byte(),
-                        info.content_node.kind(),
-                        0,
-                    )
-                }),
+                region_keys,
             )?;
 
             // Convert to CacheableInjectionRegion pairing each region with

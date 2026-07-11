@@ -602,7 +602,7 @@ impl InjectionResolver {
         injection: &InjectionRegionInfo,
         incarnation: u64,
     ) -> Option<Ulid> {
-        let identity_layer = REGION_IDENTITY_LAYER_BASE.checked_add(injection.identity_slot)?;
+        let identity_layer = Self::region_identity_layer(injection)?;
         tracker.get_or_create_in_layer_for_incarnation(
             uri,
             injection.content_node.start_byte(),
@@ -611,6 +611,11 @@ impl InjectionResolver {
             identity_layer,
             incarnation,
         )
+    }
+
+    /// Tracker-layer key used by both inline and batch region-ID minting.
+    pub(crate) fn region_identity_layer(injection: &InjectionRegionInfo) -> Option<usize> {
+        REGION_IDENTITY_LAYER_BASE.checked_add(injection.identity_slot)
     }
 
     /// Derive a parser-independent canonical injection language for bridge
