@@ -121,7 +121,7 @@ pub(super) async fn apply_shared_settings(
         .parser_pool
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .invalidate();
+        .begin_reload();
     let summary = language_state.language.load_settings(&settings);
     // Invalidate again after the synchronous swap: the first bump rejects
     // pre-reload checkouts, while this one rejects parsers acquired while the
@@ -130,7 +130,7 @@ pub(super) async fn apply_shared_settings(
         .parser_pool
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .invalidate();
+        .finish_reload();
     // Second bump IMMEDIATELY after the query swap, before any await: a
     // request that started after the transitional bump above but before the
     // swap computed against the OLD queries yet stamped the new generation —
@@ -939,7 +939,8 @@ mod tests {
                     assert_eq!(generation_retry, call != 0);
                     if call == 0 {
                         let mut pool = parser_pool.lock().unwrap();
-                        pool.invalidate();
+                        pool.begin_reload();
+                        pool.finish_reload();
                         pool.release("test".to_string(), tree_sitter::Parser::new());
                     }
                     (parser, Some(call + 1))
@@ -949,6 +950,22 @@ mod tests {
 
         assert_eq!(parsed, Some(2), "only the current-generation parse lands");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn parser_checkout_is_rejected_throughout_reload() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let mut pool = service.inner().parser_pool.lock().unwrap();
+        pool.release("test".to_string(), tree_sitter::Parser::new());
+
+        pool.begin_reload();
+        assert!(
+            pool.acquire_versioned("test").is_none(),
+            "no parser checkout may start inside the reload window"
+        );
+        pool.finish_reload();
+        pool.release("test".to_string(), tree_sitter::Parser::new());
+        assert!(pool.acquire_versioned("test").is_some());
     }
 
     #[test]
