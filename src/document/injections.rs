@@ -110,8 +110,9 @@ pub(crate) struct DiscoveredBridgeRegion {
     /// succeeds (e.g. `"py"` to `"python"`); otherwise this retains the raw
     /// identifier so both paths use the same fallback URI.
     pub language: String,
-    /// Position-stable tracker ULID, byte-identical to the one minted for the
-    /// `InjectionMap` (same `get_or_create` on the same node).
+    /// Tracker ULID shared with the `InjectionMap`, keyed by host geometry plus
+    /// the query-pattern/language discriminator so same-range alternatives
+    /// remain distinct within the document incarnation.
     pub region_id: String,
     /// The exact virtual-document text the bridge opens downstream: excluded
     /// prefixes are removed, while an `injection.combined` group preserves host
