@@ -124,9 +124,9 @@ impl std::fmt::Debug for AutoInstallManager {
 /// entry on drop. Manual `finish_install` calls would leak the marker if the
 /// calling future were dropped at an await, leaving the language stuck
 /// `AlreadyInstalling` (and, via `should_skip_parse`, never parsed) for the
-/// server's lifetime. For the install itself the guard moves into the
-/// spawned install task, so it tracks the blocking work's true lifetime
-/// rather than the caller's.
+/// server's lifetime. The guard first moves into the support-check task, then
+/// into the install task on success, so it tracks detached work's true
+/// lifetime rather than the caller's.
 struct InstallMarkerGuard {
     installing: InstallingLanguages,
     language: String,
@@ -295,8 +295,20 @@ impl AutoInstallManager {
         let lookup_language = language.to_string();
         let lookup_data_dir = default_data_dir.clone();
         let support_task = tokio::spawn(async move {
-            let result = support_check(lookup_language, lookup_data_dir).await;
-            (result, install_marker)
+            let mut result = support_check(lookup_language, lookup_data_dir).await;
+            if let Some(completion) = result.completion.take() {
+                // Start the keeper inside this detached task. If the caller
+                // dropped our JoinHandle while the check was running, task
+                // output would be discarded and could not safely carry the
+                // marker/completion pair back to it.
+                tokio::spawn(async move {
+                    let _marker = install_marker;
+                    let _ = completion.await;
+                });
+                (result, None)
+            } else {
+                (result, Some(install_marker))
+            }
         });
         let (support_result, install_marker) = match support_task.await {
             Ok(result) => result,
@@ -317,7 +329,7 @@ impl AutoInstallManager {
         let TrackedSupportCheck {
             should_skip,
             reason,
-            completion,
+            completion: _,
         } = support_result;
 
         if let Some(reason) = &reason {
@@ -328,17 +340,13 @@ impl AutoInstallManager {
         }
 
         if should_skip {
-            if let Some(completion) = completion {
-                tokio::spawn(async move {
-                    let _marker = install_marker;
-                    let _ = completion.await;
-                });
-            }
             return InstallResult {
                 outcome: InstallOutcome::Unsupported,
                 events,
             };
         }
+        let install_marker =
+            install_marker.expect("a completed supported lookup must return its install marker");
 
         // Progress begin
         events.push(InstallEvent::ProgressBegin);
@@ -683,6 +691,56 @@ mod tests {
         })
         .await
         .expect("the detached lookup task must release the claim after its support check finishes");
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_keeps_claim_after_lookup_timeout() {
+        let (manager, _temp) = create_test_manager();
+        let task_manager = manager.clone();
+        let (lookup_started_tx, lookup_started_rx) = tokio::sync::oneshot::channel();
+        let (timeout_tx, timeout_rx) = tokio::sync::oneshot::channel();
+        let (timed_out_tx, timed_out_rx) = tokio::sync::oneshot::channel();
+        let (work_release_tx, work_release_rx) = tokio::sync::oneshot::channel();
+
+        let caller = tokio::spawn(async move {
+            task_manager
+                .try_install_with_support_check("lua", |_, _| async move {
+                    let _ = lookup_started_tx.send(());
+                    let _ = timeout_rx.await;
+                    let completion = tokio::spawn(async move {
+                        let _ = work_release_rx.await;
+                    });
+                    let _ = timed_out_tx.send(());
+                    TrackedSupportCheck {
+                        should_skip: true,
+                        reason: None,
+                        completion: Some(completion),
+                    }
+                })
+                .await
+        });
+        lookup_started_rx.await.expect("support lookup must start");
+        caller.abort();
+        let _ = caller.await;
+
+        let _ = timeout_tx.send(());
+        timed_out_rx
+            .await
+            .expect("detached support lookup must report timeout");
+        tokio::task::yield_now().await;
+        assert!(
+            !manager.installing_languages.try_start_install("lua"),
+            "timeout completion must retain the claim after caller cancellation"
+        );
+
+        let _ = work_release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !manager.installing_languages.try_start_install("lua") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("claim keeper must release after timed-out blocking work finishes");
     }
 
     #[tokio::test]

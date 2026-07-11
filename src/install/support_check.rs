@@ -52,10 +52,9 @@ const METADATA_CHECK_TIMEOUT: Duration = Duration::from_secs(65);
 
 /// Support-check result plus work that outlived the timeout.
 ///
-/// `completion` is present only when an already-started blocking metadata
-/// lookup could not be cancelled. Auto-install keeps its per-language claim
-/// until this handle finishes, preventing a timed-out lookup from overlapping
-/// a retry.
+/// `completion` is present when the check times out. It finishes after the
+/// blocking task is cancelled before starting or, if already running, after
+/// the lookup exits. Auto-install retains its per-language claim until then.
 pub(crate) struct TrackedSupportCheck {
     pub(crate) should_skip: bool,
     pub(crate) reason: Option<SkipReason>,
