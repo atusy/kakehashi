@@ -778,8 +778,10 @@ impl LanguageCoordinator {
 
     /// Resolve a derived languageId to its base language name.
     ///
-    /// Returns the base name if the input has a base declaration, otherwise None.
-    /// Example: "rmd" → Some("markdown") if rmd has `base = "markdown"`
+    /// Returns the registered base mapping, otherwise `None`. A declaration is
+    /// intentionally not registered when the derived language owns a distinct
+    /// parser; see [`Self::build_base_map`].
+    /// Example: "rmd" → Some("markdown") when its base mapping is eligible.
     fn resolve_base(&self, language_id: &str) -> Option<String> {
         let base_map = self
             .base_map
@@ -1227,11 +1229,12 @@ impl LanguageCoordinator {
     ///
     /// Candidate selection deliberately does not inspect parser state: eager
     /// bridge selection and virtual URIs must stay stable before and after a
-    /// parser loads. A configured base for the explicit identifier takes
-    /// precedence over syntect token normalization, followed by first-line
-    /// fallback. Consequently, registering a parser under a non-canonical key
-    /// such as `py` or `js` does not change bridge keys/URIs: bridge configuration
-    /// uses `python`/`javascript` unless that key has an explicit base.
+    /// parser loads. An eligible configured base mapping for the explicit
+    /// identifier takes precedence over syntect token normalization, followed by
+    /// first-line fallback. Consequently, registering a parser under a
+    /// non-canonical key such as `py` or `js` does not change bridge keys/URIs:
+    /// bridge configuration uses `python`/`javascript` unless that key has a
+    /// registered base mapping.
     pub(crate) fn canonical_injection_language(&self, identifier: &str, content: &str) -> String {
         if let Some(base) = self.resolve_base(identifier) {
             return base;
