@@ -129,7 +129,7 @@ impl Kakehashi {
         let pool = self.bridge.pool_arc();
 
         // Outer JoinSet: one task per injection region, all in parallel
-        let mut outer_join_set: JoinSet<Vec<DocumentSymbol>> = JoinSet::new();
+        let mut outer_join_set: JoinSet<(usize, Option<Vec<DocumentSymbol>>)> = JoinSet::new();
 
         // Shared client progress: a whole-document request fans out over several
         // injection regions (one `dispatch_preferred` each), so they share ONE
@@ -155,7 +155,7 @@ impl Kakehashi {
             )
             .await;
 
-        for resolved in all_regions.iter() {
+        for (region_index, resolved) in all_regions.iter().enumerate() {
             // Get ALL bridge server configs for this injection language
             let mut configs = self.bridge_configs_for_injection_language(
                 &language_name,
@@ -229,10 +229,11 @@ impl Kakehashi {
                         dispatch_preferred(&region_ctx, pool.clone(), send, is_nonempty, None).await
                     }
                 };
-                match result {
-                    FanInResult::Done(symbols) => symbols.unwrap_or_default(),
-                    FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
-                }
+                let symbols = match result {
+                    FanInResult::Done(symbols) => symbols,
+                    FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
+                };
+                (region_index, symbols)
             });
         }
 
@@ -247,11 +248,12 @@ impl Kakehashi {
         let result = crate::lsp::aggregation::region::collect_region_results_with_cancel(
             outer_join_set,
             cancel_rx,
-            |acc, items: Vec<DocumentSymbol>| acc.extend(items),
+            |acc, region_items: (usize, Option<Vec<DocumentSymbol>>)| acc.push(region_items),
         )
         .await;
 
-        let all_symbols = result?;
+        let all_symbols =
+            crate::lsp::lsp_impl::whole_document::flatten_ordered_region_items(result?);
 
         Ok(format_document_symbol_response(
             all_symbols,
