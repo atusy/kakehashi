@@ -476,7 +476,7 @@ fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
             needs_rewrite |= ch != ' ' || index == 0 || previous_whitespace;
             previous_whitespace = true;
         } else {
-            needs_rewrite |= ch.is_control();
+            needs_rewrite |= ch.is_control() || is_bidi_control(ch);
             previous_whitespace = false;
         }
     }
@@ -496,13 +496,22 @@ fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
             out.push(' ');
             pending_space = false;
         }
-        if ch.is_control() {
+        if is_bidi_control(ch) {
+            out.extend(ch.escape_unicode());
+        } else if ch.is_control() {
             out.extend(ch.escape_default());
         } else {
             out.push(ch);
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// The lower-case severity word. Both an absent severity and an out-of-spec
@@ -695,8 +704,13 @@ mod tests {
 
     #[test]
     fn jsonl_format_preserves_control_characters() {
-        let mut d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "boom\u{1b}[31m");
-        d.source = Some("tool\u{009b}".to_string());
+        let mut d = diag(
+            0,
+            0,
+            Some(DiagnosticSeverity::ERROR),
+            "boom\u{1b}[31m\u{202e}",
+        );
+        d.source = Some("tool\u{009b}\u{2066}".to_string());
 
         let value: serde_json::Value = serde_json::from_str(&format_diagnostic(
             OutputFormat::Jsonl,
@@ -706,8 +720,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(value["file"], "dir/\u{1b}[2Jfile");
-        assert_eq!(value["message"], "boom\u{1b}[31m");
-        assert_eq!(value["source"], "tool\u{009b}");
+        assert_eq!(value["message"], "boom\u{1b}[31m\u{202e}");
+        assert_eq!(value["source"], "tool\u{009b}\u{2066}");
     }
 
     #[test]
@@ -745,8 +759,8 @@ mod tests {
     #[test]
     fn default_fields_escape_non_whitespace_controls() {
         assert_eq!(
-            one_line("before\u{1b}[31mred\u{7f}\u{009b}after"),
-            "before\\u{1b}[31mred\\u{7f}\\u{9b}after"
+            one_line("before\u{1b}[31mred\u{7f}\u{009b}\u{202e}\u{2066}after"),
+            "before\\u{1b}[31mred\\u{7f}\\u{9b}\\u{202e}\\u{2066}after"
         );
     }
 
