@@ -229,28 +229,36 @@ fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetada
 /// Find the content within matching braces starting from the first `{`.
 fn find_matching_brace(s: &str) -> Option<&str> {
     let start = s.find('{')?;
-    let mut depth = 0;
-    let mut end = start;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
 
-    for (i, c) in s[start..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
+    for (i, byte) in s.as_bytes()[start..].iter().copied().enumerate() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
                 if depth == 0 {
-                    end = start + i + 1;
-                    break;
+                    return Some(&s[start..start + i + 1]);
                 }
             }
             _ => {}
         }
     }
 
-    if depth == 0 {
-        Some(&s[start..end])
-    } else {
-        None
-    }
+    None
 }
 
 /// Fetch parser metadata for a language from nvim-treesitter.
@@ -398,6 +406,25 @@ return {
         let s2 = "prefix { inner } suffix";
         let result2 = find_matching_brace(s2);
         assert_eq!(result2, Some("{ inner }"));
+    }
+
+    #[test]
+    fn parser_metadata_ignores_braces_inside_quoted_strings() {
+        let content = r#"
+lua = {
+  readme_note = "write } literally",
+  install_info = {
+    url = 'https://github.com/tree-sitter-grammars/tree-sitter-lua',
+    revision = 'main',
+  },
+}
+"#;
+
+        let parsers = parse_parsers_lua(content).expect("valid metadata must parse");
+        let lua = parsers
+            .get("lua")
+            .expect("lua metadata must not be truncated");
+        assert_eq!(lua.revision, "main");
     }
 
     #[test]
