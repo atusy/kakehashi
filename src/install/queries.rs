@@ -843,7 +843,7 @@ fn backup_is_owned(path: &Path) -> bool {
 }
 
 fn backup_is_complete_and_owned(path: &Path) -> Result<bool, QueryInstallError> {
-    let regular_file_or_absent = |path: &Path| match fs::metadata(path) {
+    let regular_file_or_absent = |path: &Path| match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(QueryInstallError::IoError(e)),

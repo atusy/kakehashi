@@ -487,19 +487,38 @@ fn installed_query_language_name_if_dir(path: &Path, is_dir: bool) -> Option<Str
 fn preflight_query_install_tree(root: &Path) -> Result<(), String> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("cannot read query directory '{}': {e}", dir.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| {
-                format!(
-                    "cannot read an entry in query directory '{}': {e}",
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "cannot read query directory '{}': {e}",
                     dir.display()
-                )
-            })?;
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot read an entry in query directory '{}': {e}",
+                        dir.display()
+                    ));
+                }
+            };
             let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot inspect query entry '{}': {e}",
+                        path.display()
+                    ));
+                }
+            };
             // remove_dir_all does not follow symlinks, so only real child
             // directories need traversal preflight.
             if file_type.is_dir() {
