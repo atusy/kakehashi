@@ -242,10 +242,9 @@ pub(super) fn injection_stack_at(
             // it before parsing so a timeout cannot erase sibling ambiguity.
             viable_candidates += 1;
             if selected.is_some() {
-                if parent_ambiguous || viable_candidates > 1 {
-                    break;
-                }
-                continue;
+                // A selection implies one prior viable candidate; reaching
+                // this branch proves a second, so ambiguity is conclusive.
+                break;
             }
             let Some(injected_tree) =
                 parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
