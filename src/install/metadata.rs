@@ -6,7 +6,6 @@
 //! The main branch of nvim-treesitter uses a consolidated format where each language
 //! entry contains url, revision, and location all in one place.
 
-use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
@@ -172,7 +171,7 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     for (lang, block) in lang_names {
         // Query-only entries (for example upstream `ecma`) intentionally have
         // no install_info and are not installable parsers.
-        if block.contains("install_info") {
+        if has_install_info(block) {
             let info = extract_parser_metadata_from_block(block).ok_or_else(|| {
                 MetadataError::ParseError(format!("incomplete parser metadata for {lang}"))
             })?;
@@ -188,9 +187,19 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
 }
 
 fn top_level_table_keys(s: &str) -> Vec<(String, &str)> {
-    let Some(mut offset) = returned_table_start(s) else {
+    let Some(offset) = returned_table_start(s) else {
         return Vec::new();
     };
+    table_entries(s, offset)
+        .into_iter()
+        .filter_map(|(name, value)| match value {
+            LuaValue::Table(block) if !is_reserved_key(&name) => Some((name, block)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn table_entries(s: &str, mut offset: usize) -> Vec<(String, LuaValue<'_>)> {
     let mut keys = Vec::new();
     let mut depth = 0;
     let mut quote = None;
@@ -274,14 +283,16 @@ fn top_level_table_keys(s: &str) -> Vec<(String, &str)> {
                     .take_while(|next| next.is_whitespace())
                     .map(char::len_utf8)
                     .sum::<usize>();
-                if s[after_equals + whitespace..].starts_with('{') {
-                    let name = &s[offset..name_end];
-                    let block_start = after_equals + whitespace;
-                    if !is_reserved_key(name)
-                        && let Some(block) = find_matching_brace(&s[block_start..])
-                    {
-                        keys.push((name.to_string(), block));
+                let value_start = after_equals + whitespace;
+                let name = s[offset..name_end].to_string();
+                if s[value_start..].starts_with('{') {
+                    if let Some(block) = find_matching_brace(&s[value_start..]) {
+                        keys.push((name, LuaValue::Table(block)));
                     }
+                } else if matches!(s[value_start..].chars().next(), Some('\'' | '"'))
+                    && let Some(value) = quoted_string(&s[value_start..])
+                {
+                    keys.push((name, LuaValue::String(value)));
                 }
             }
         }
@@ -302,6 +313,26 @@ fn top_level_table_keys(s: &str) -> Vec<(String, &str)> {
     keys
 }
 
+fn quoted_string(s: &str) -> Option<&str> {
+    let delimiter = s.chars().next()?;
+    let mut escaped = false;
+    for (offset, c) in s[delimiter.len_utf8()..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == delimiter {
+            return Some(&s[delimiter.len_utf8()..delimiter.len_utf8() + offset]);
+        }
+    }
+    None
+}
+
+enum LuaValue<'a> {
+    Table(&'a str),
+    String(&'a str),
+}
+
 /// Check if a key is a reserved/internal key (not a language name)
 fn is_reserved_key(name: &str) -> bool {
     matches!(
@@ -318,32 +349,35 @@ fn is_reserved_key(name: &str) -> bool {
 }
 
 fn extract_parser_metadata_from_block(block_content: &str) -> Option<ParserMetadata> {
-    // Extract URL (required)
-    let url_re = Regex::new(r#"url\s*=\s*'([^']+)'"#).ok()?;
-    let url = url_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string())?;
-
-    // Extract revision (required) - in main branch, revision is inside install_info
-    let revision_re = Regex::new(r#"revision\s*=\s*'([^']+)'"#).ok()?;
-    let revision = revision_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string())?;
-
-    // Extract location (optional)
-    let location_re = Regex::new(r#"location\s*=\s*'([^']+)'"#).ok()?;
-    let location = location_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string());
+    let install_info =
+        table_entries(block_content, 0)
+            .into_iter()
+            .find_map(|(name, value)| match (name.as_str(), value) {
+                ("install_info", LuaValue::Table(table)) => Some(table),
+                _ => None,
+            })?;
+    let fields = table_entries(install_info, 0);
+    let string_field = |key: &str| {
+        fields.iter().find_map(|(name, value)| match value {
+            LuaValue::String(value) if name == key => Some((*value).to_string()),
+            _ => None,
+        })
+    };
+    let url = string_field("url")?;
+    let revision = string_field("revision")?;
+    let location = string_field("location");
 
     Some(ParserMetadata {
         url,
         revision,
         location,
     })
+}
+
+fn has_install_info(block: &str) -> bool {
+    table_entries(block, 0)
+        .into_iter()
+        .any(|(name, value)| name == "install_info" && matches!(value, LuaValue::Table(_)))
 }
 
 /// Find the content within matching braces starting from the first `{`.
@@ -680,6 +714,16 @@ mod tests {
 
         assert_eq!(parsers["lua"].url, "https://example/lua");
         assert_eq!(parsers["lua"].revision, "right");
+    }
+
+    #[test]
+    fn commented_metadata_fields_do_not_validate_an_entry() {
+        let content = "return {\nlua = { install_info = {\n-- url = 'https://example/wrong'\n-- revision = 'wrong'\n} },\n}";
+
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
     }
 
     #[test]
