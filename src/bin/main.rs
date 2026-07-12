@@ -398,17 +398,26 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     // Status recovery can restore backups or remove interrupted staging
     // directories. Coordinate that mutation and the following snapshot with
     // bulk uninstall's exclusive operation guard.
-    let _operation_lock = kakehashi::install::operation_lock::LanguageOperationGuard::shared(
-        &data_dir,
-    )
-    .map_err(|e| {
-        eprintln!("Failed to coordinate language status: {e}");
-        ExitCode::FAILURE
-    })?;
+    let operation_lock = if data_dir.exists() {
+        match kakehashi::install::operation_lock::LanguageOperationGuard::shared(&data_dir) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                // Status remains a read-only inspection when its storage is
+                // not writable. Without coordination, skip recovery below so
+                // this process does not mutate outside the operation protocol.
+                eprintln!("Warning: cannot coordinate language status; skipping recovery: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
-    if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+    if operation_lock.is_some()
+        && let Err(e) = queries::recover_interrupted_query_installs(&queries_dir)
+    {
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }
 

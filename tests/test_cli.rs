@@ -687,6 +687,25 @@ fn test_language_status_help() {
     );
 }
 
+#[test]
+fn test_language_status_does_not_create_missing_data_dir() {
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("missing");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!data_dir.exists(), "status must remain read-only");
+}
+
 /// Test that language status shows installed languages
 #[test]
 fn test_language_status_shows_installed() {
