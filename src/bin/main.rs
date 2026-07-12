@@ -420,6 +420,9 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
             .extension()
             .map(|ext| ext == std::env::consts::DLL_EXTENSION)
             .unwrap_or(false);
+        if !is_parser {
+            return Ok(());
+        }
         let is_file = match std::fs::metadata(&path) {
             Ok(metadata) => metadata.is_file(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -434,10 +437,7 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
             }
             Err(error) => return Err(error),
         };
-        if is_parser
-            && is_file
-            && let Some(stem) = path.file_stem()
-        {
+        if is_file && let Some(stem) = path.file_stem() {
             languages.insert(stem.to_string_lossy().to_string());
         }
         Ok(())
