@@ -540,6 +540,12 @@ fn installed_query_language_name_for_uninstall(
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(queries::is_recovery_directory_name);
+    if is_recovery_dir && file_type.is_symlink() {
+        return Err(format!(
+            "query recovery entry '{}' must not be a symlink",
+            path.display()
+        ));
+    }
     if file_type.is_dir() && (language.is_some() || is_recovery_dir) {
         preflight_query_install_tree(&path)?;
     }
@@ -655,13 +661,20 @@ fn preflight_targeted_query_state(queries_dir: &Path, language: &str) -> Result<
             .file_type()
             .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
         let is_target = name == language;
+        let is_recovery = queries::is_recovery_directory_name(name);
         if is_target && !(file_type.is_dir() || file_type.is_symlink()) {
             return Err(format!(
                 "query entry '{}' is not a directory or symlink",
                 path.display()
             ));
         }
-        if file_type.is_dir() && (is_target || queries::is_recovery_directory_name(name)) {
+        if is_recovery && file_type.is_symlink() {
+            return Err(format!(
+                "query recovery entry '{}' must not be a symlink",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() && (is_target || is_recovery) {
             preflight_query_install_tree(&path)?;
         }
     }

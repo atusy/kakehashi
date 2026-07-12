@@ -1893,6 +1893,54 @@ fn test_language_uninstall_all_preflights_recovery_backups_before_restore() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_uninstall_all_rejects_symlinked_recovery_entries() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    let outside = test_dir.path().join("outside-backup");
+    fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+    fs::create_dir_all(&outside).expect("Failed to create outside backup");
+    let outside_query = outside.join("highlights.scm");
+    fs::write(&outside_query, "(comment) @comment").expect("Failed to write outside query");
+    let backup_name = ".lua.4294967295.0.backup";
+    symlink(&outside, queries_dir.join(backup_name)).expect("Failed to link recovery backup");
+    fs::write(
+        queries_dir.join(format!("{backup_name}.kakehashi-backup")),
+        "ok\n",
+    )
+    .expect("Failed to mark backup ownership");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "recovery symlink must fail before recovery; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        outside_query.exists(),
+        "outside recovery target must remain untouched"
+    );
+    assert!(
+        fs::symlink_metadata(queries_dir.join(backup_name)).is_ok(),
+        "recovery symlink must remain for explicit repair"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_uninstall_all_ignores_unrelated_hidden_query_dirs() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
