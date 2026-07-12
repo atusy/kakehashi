@@ -22,7 +22,10 @@ impl Kakehashi {
     /// Run the LSP initialize/initialized lifecycle for CLI mode, loading
     /// configuration from `root` (typically the current directory) exactly
     /// like an editor session rooted there would.
-    pub(crate) async fn cli_initialize(&self, root: &Path) {
+    pub(crate) async fn cli_initialize(
+        &self,
+        root: &Path,
+    ) -> tower_lsp_server::jsonrpc::Result<()> {
         // One-shot CLI: no editor consumes proactive publishDiagnostics, so
         // did_open_impl skips the synthetic diagnostic task (#489).
         self.mark_cli_mode();
@@ -42,10 +45,9 @@ impl Kakehashi {
             workspace_folders,
             ..Default::default()
         };
-        if let Err(e) = self.initialize_impl(params).await {
-            log::warn!(target: "kakehashi::cli", "initialize failed: {e}");
-        }
+        self.initialize_impl(params).await?;
         self.initialized_impl(InitializedParams {}).await;
+        Ok(())
     }
 
     /// Whether the path alone identifies a known language (loading the
