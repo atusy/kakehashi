@@ -378,7 +378,7 @@ impl Kakehashi {
         }
 
         // Parse the incoming settings.
-        let parsed = match serde_json::from_value::<RawWorkspaceSettings>(settings_value) {
+        let mut parsed = match serde_json::from_value::<RawWorkspaceSettings>(settings_value) {
             Ok(settings) => settings,
             Err(err) => {
                 self.notifier()
@@ -387,6 +387,20 @@ impl Kakehashi {
                 return;
             }
         };
+
+        let root_path = self.settings_manager.root_path();
+        if let Err(errs) = crate::config::expand::expand_settings_paths(
+            &mut parsed,
+            root_path.as_deref(),
+            self.home_dir.as_deref(),
+            crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
+        ) {
+            let event = crate::lsp::SettingsEvent::error(format!(
+                "Path expansion failed: {errs}. This configuration has been discarded; previous settings remain in effect. Please correct the affected paths and environment variables or remove them from your config.",
+            ));
+            self.notifier().log_settings_events(&[event]).await;
+            return;
+        }
 
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
@@ -402,24 +416,9 @@ impl Kakehashi {
             return;
         };
 
-        match WorkspaceSettings::try_from_settings(
-            &merged_ts,
-            self.home_dir.as_deref(),
-            crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
-        ) {
-            Ok(settings) => {
-                self.apply_raw_settings(merged_ts, settings).await;
-                self.notifier().log_info("Configuration updated!").await;
-            }
-            Err(errs) => {
-                let event = crate::lsp::SettingsEvent::error(format!(
-                    "Path expansion failed: {errs}. \
-                     This configuration has been discarded; previous settings remain in effect. \
-                     Please correct the affected paths and environment variables or remove them from your config.",
-                ));
-                self.notifier().log_settings_events(&[event]).await;
-            }
-        }
+        let settings = WorkspaceSettings::from_expanded_settings(&merged_ts);
+        self.apply_raw_settings(merged_ts, settings).await;
+        self.notifier().log_info("Configuration updated!").await;
     }
 }
 
@@ -431,6 +430,48 @@ mod tests {
         LayerAggregationConfig, LayersConfig, QueryItem, QueryTypeMappings,
     };
     use std::collections::BTreeSet;
+    use std::path::Path;
+
+    #[test]
+    fn runtime_paths_are_relative_to_workspace_root() {
+        let mut settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["./runtime".into()]),
+            languages: [(
+                "lua".into(),
+                LanguageSettings {
+                    parser: Some("./parser/lua.so".into()),
+                    queries: Some(vec![QueryItem {
+                        path: "./queries/highlights.scm".into(),
+                        kind: None,
+                    }]),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+
+        crate::config::expand::expand_settings_paths(
+            &mut settings,
+            Some(Path::new("/workspace")),
+            None,
+            |_| None,
+        )
+        .expect("relative runtime paths should resolve");
+
+        assert_eq!(
+            settings.search_paths,
+            Some(vec!["/workspace/runtime".into()])
+        );
+        assert_eq!(
+            settings.languages["lua"].parser.as_deref(),
+            Some("/workspace/parser/lua.so")
+        );
+        assert_eq!(
+            settings.languages["lua"].queries.as_ref().unwrap()[0].path,
+            "/workspace/queries/highlights.scm"
+        );
+    }
 
     fn assert_known_keys_match_schema<T: schemars::JsonSchema>(
         known_keys: &[&str],

@@ -167,6 +167,14 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `languages[*].parser`
 - `languages[*].queries[*].path`
 
+Relative values are resolved after environment and tilde expansion. Values in
+a TOML file are relative to that file's directory; values supplied through
+`initializationOptions` or `workspace/didChangeConfiguration` are relative to
+the initialized workspace root. Each `--config-file` layer uses its own parent
+directory, so paths retain the correct base when multiple files are merged.
+Absolute values, including absolute paths produced by `~` or `$VAR`, are not
+rebased.
+
 **Behavior on undefined variables:** If a referenced environment variable is not defined, configuration loading fails with an error notification and falls back to previous settings (or defaults). The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
 
 ### Option Reference

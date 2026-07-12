@@ -1,3 +1,4 @@
+use path_clean::PathClean;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -122,6 +123,63 @@ pub(super) fn expand_path(
     match result {
         Ok(expanded) => Ok(expanded.into_owned()),
         Err(e) => Err(e.cause),
+    }
+}
+
+/// Expand and anchor path-valued fields while their configuration source is
+/// still known. Relative values are resolved against `base`; absolute values
+/// produced by `~` or environment expansion remain absolute.
+pub(crate) fn expand_settings_paths(
+    settings: &mut crate::config::RawWorkspaceSettings,
+    base: Option<&Path>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Result<(), ExpandErrors> {
+    let mut errors = Vec::new();
+    let mut expand = |path: &mut String| match expand_path(path, home, &env_fn) {
+        Ok(expanded_string) => {
+            let expanded_path = Path::new(&expanded_string);
+            *path = if expanded_path.is_relative() {
+                if let Some(base) = base {
+                    base.join(expanded_path)
+                        .clean()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    expanded_string
+                }
+            } else {
+                expanded_string
+            };
+        }
+        Err(error) => errors.push(error),
+    };
+
+    if let Some(search_paths) = settings.search_paths.as_mut() {
+        for path in search_paths {
+            expand(path);
+        }
+    }
+    let mut language_names = settings.languages.keys().cloned().collect::<Vec<_>>();
+    language_names.sort();
+    for name in language_names {
+        let Some(language) = settings.languages.get_mut(&name) else {
+            continue;
+        };
+        if let Some(parser) = language.parser.as_mut() {
+            expand(parser);
+        }
+        if let Some(queries) = language.queries.as_mut() {
+            for query in queries {
+                expand(&mut query.path);
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ExpandErrors(errors))
     }
 }
 
@@ -273,6 +331,43 @@ mod tests {
     fn dollar_dollar_escape() {
         let env = make_env(&[]);
         assert_eq!(expand_path("$$literal", None, &env).unwrap(), "$literal");
+    }
+
+    #[test]
+    fn settings_paths_are_anchored_after_expansion() {
+        let mut settings = crate::config::RawWorkspaceSettings {
+            search_paths: Some(vec!["$REL/runtime".into(), "$ABS/runtime".into()]),
+            languages: [(
+                "lua".into(),
+                crate::config::LanguageSettings {
+                    parser: Some("~/parser/lua.so".into()),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let env = make_env(&[("REL", "vendor"), ("ABS", "/opt/kakehashi")]);
+
+        expand_settings_paths(
+            &mut settings,
+            Some(Path::new("/workspace")),
+            Some("/home/user"),
+            env,
+        )
+        .expect("settings paths should expand");
+
+        assert_eq!(
+            settings.search_paths,
+            Some(vec![
+                "/workspace/vendor/runtime".into(),
+                "/opt/kakehashi/runtime".into()
+            ])
+        );
+        assert_eq!(
+            settings.languages["lua"].parser.as_deref(),
+            Some("/home/user/parser/lua.so")
+        );
     }
 
     #[test]
