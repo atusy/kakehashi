@@ -255,7 +255,7 @@ fn find_matching_brace(s: &str) -> Option<&str> {
     while i < bytes.len() {
         let byte = bytes[i];
         if line_comment {
-            line_comment = byte != b'\n';
+            line_comment = !matches!(byte, b'\n' | b'\r');
             i += 1;
             continue;
         }
@@ -493,6 +493,14 @@ lua = {
 "#;
 
         let parsers = parse_parsers_lua(content).expect("valid commented metadata must parse");
+        assert!(parsers.contains_key("lua"));
+    }
+
+    #[test]
+    fn parser_metadata_ends_line_comments_at_carriage_returns() {
+        let content = "lua = {\r-- don't consume the following fields\rinstall_info = {\rurl = 'https://example.com/lua',\rrevision = 'main',\r},\r}\r";
+
+        let parsers = parse_parsers_lua(content).expect("CR-only metadata must parse");
         assert!(parsers.contains_key("lua"));
     }
 
