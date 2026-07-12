@@ -541,6 +541,14 @@ fn windows_process_probe_is_running(probe: WindowsProcessProbe) -> bool {
 }
 
 #[cfg(windows)]
+fn windows_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
 fn process_is_running_windows(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
@@ -589,6 +597,10 @@ fn claim_and_unlink_stale_parser_file(
         Err(error) => return Err(ParserInstallError::IoError(error)),
     };
     if !initial.file_type().is_file() {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    if windows_metadata_is_reparse_point(&initial) {
         return Ok(None);
     }
     let file = match fs::OpenOptions::new()
@@ -830,11 +842,23 @@ fn remove_stale_cleanup_claim_windows(path: &Path) {
     if !metadata.file_type().is_dir() {
         return;
     }
+    #[cfg(windows)]
+    {
+        // `is_dir` can be true for junctions and other directory reparse
+        // points. Never resolve `owner` or `artifact` through one.
+        if windows_metadata_is_reparse_point(&metadata) {
+            return;
+        }
+    }
     let marker = path.join("owner");
     let Ok(marker_metadata) = fs::symlink_metadata(&marker) else {
         return;
     };
     if !marker_metadata.file_type().is_file() {
+        return;
+    }
+    #[cfg(windows)]
+    if windows_metadata_is_reparse_point(&marker_metadata) {
         return;
     }
     let mut options = fs::OpenOptions::new();
