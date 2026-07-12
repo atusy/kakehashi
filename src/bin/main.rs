@@ -529,20 +529,31 @@ fn installed_query_language_name_for_uninstall(
 }
 
 fn read_optional_install_dir(path: &Path, kind: &str) -> Result<Option<std::fs::ReadDir>, String> {
-    match std::fs::read_dir(path) {
-        Ok(entries) => Ok(Some(entries)),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                && std::fs::symlink_metadata(path)
-                    .is_err_and(|metadata_error| metadata_error.kind() == e.kind()) =>
-        {
-            Ok(None)
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "cannot inspect {kind} directory '{}': {e}",
+                path.display()
+            ));
         }
-        Err(e) => Err(format!(
-            "cannot read {kind} directory '{}': {e}",
-            path.display()
-        )),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "{kind} directory '{}' must not be a symlink",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!(
+                "{kind} path '{}' is not a directory",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
     }
+    std::fs::read_dir(path)
+        .map(Some)
+        .map_err(|e| format!("cannot read {kind} directory '{}': {e}", path.display()))
 }
 
 fn collect_installed_languages_for_uninstall(
