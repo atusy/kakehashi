@@ -63,11 +63,44 @@ impl MetadataCache {
 
     /// Write content to cache.
     pub fn write(&self, content: &str) -> io::Result<()> {
+        self.write_with(content, |file, content| {
+            use std::io::Write as _;
+            file.write_all(content.as_bytes())
+        })
+    }
+
+    fn write_with(
+        &self,
+        content: &str,
+        write: impl FnOnce(&mut fs::File, &str) -> io::Result<()>,
+    ) -> io::Result<()> {
         // Ensure cache directory exists
         fs::create_dir_all(&self.cache_dir)?;
 
-        // Write content
-        fs::write(self.cache_path(), content)?;
+        let cache_path = self.cache_path();
+        let existing_permissions = fs::symlink_metadata(&cache_path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_file())
+            .map(|metadata| metadata.permissions());
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(fs::Permissions::from_mode(0o666));
+        }
+        let mut temporary = builder.tempfile_in(&self.cache_dir)?;
+        write(temporary.as_file_mut(), content)?;
+        if let Some(permissions) = existing_permissions {
+            temporary.as_file().set_permissions(permissions)?;
+        }
+        temporary.as_file().sync_all()?;
+        temporary.persist(cache_path).map_err(|error| error.error)?;
+
+        // The file data is durable above. Best-effort directory sync also
+        // persists the replaced directory entry on filesystems that support it.
+        if let Ok(directory) = fs::File::open(&self.cache_dir) {
+            let _ = directory.sync_all();
+        }
 
         Ok(())
     }
@@ -91,6 +124,82 @@ mod tests {
         // Read from cache
         let cached = cache.read().expect("Cache should be readable");
         assert_eq!(cached, content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_replaces_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let cache_path = cache_dir.join("parsers.lua");
+        let target = temp.path().join("unrelated.lua");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(&target, "unrelated").unwrap();
+        symlink(&target, &cache_path).unwrap();
+
+        MetadataCache::with_default_ttl(temp.path())
+            .write("metadata")
+            .unwrap();
+
+        assert!(
+            !cache_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(cache_path).unwrap(), "metadata");
+        assert_eq!(fs::read_to_string(target).unwrap(), "unrelated");
+    }
+
+    #[test]
+    fn failed_cache_write_preserves_previous_content() {
+        use std::io::Write as _;
+
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("previous").unwrap();
+
+        let result = cache.write_with("replacement", |file, content| {
+            file.write_all(&content.as_bytes()[..3])?;
+            Err(io::Error::other("injected write failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(cache.cache_path()).unwrap(), "previous");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_preserves_creation_and_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        let ordinary = temp.path().join("ordinary");
+        fs::write(&ordinary, "ordinary").unwrap();
+
+        cache.write("first").unwrap();
+        assert_eq!(
+            fs::metadata(cache.cache_path())
+                .unwrap()
+                .permissions()
+                .mode(),
+            fs::metadata(ordinary).unwrap().permissions().mode()
+        );
+
+        fs::set_permissions(cache.cache_path(), fs::Permissions::from_mode(0o640)).unwrap();
+        cache.write("second").unwrap();
+        assert_eq!(
+            fs::metadata(cache.cache_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
     }
 
     #[test]
