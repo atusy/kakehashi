@@ -973,6 +973,7 @@ impl DiagnosticPublisher {
         }
         let client = self.client.clone();
         let aggregator = Arc::clone(&self.aggregator);
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             loop {
                 // `workspace_diagnostic_refresh()` resolves when the editor answers
@@ -1000,6 +1001,13 @@ impl DiagnosticPublisher {
                 // future change adds a *pre-shutdown* panic source to this task,
                 // revisit — it would wedge the guard (and a drop-guard "fix" would
                 // reopen the `finish_refresh` lost-wakeup, so clear it atomically).
+                // Admission can race shutdown before this detached task first runs.
+                // Do not start a request once cancellation is observable, and clear
+                // the single-flight claim that admission already took.
+                if shutdown.is_cancelled() {
+                    aggregator.cancel_refresh_flight();
+                    break;
+                }
                 // Count each wire send, including trailing fires (#533).
                 aggregator.record_refresh_sent();
                 if let Err(e) = client.workspace_diagnostic_refresh().await {
@@ -1010,6 +1018,10 @@ impl DiagnosticPublisher {
                 }
                 // Fire exactly one more iff a refresh was requested while this one
                 // was in flight; otherwise the guard is now clear and we stop.
+                if shutdown.is_cancelled() {
+                    aggregator.cancel_refresh_flight();
+                    break;
+                }
                 if !aggregator.finish_refresh() {
                     break;
                 }
@@ -1172,6 +1184,32 @@ mod tests {
         let metrics = server.diagnostics.metrics_snapshot();
         assert_eq!(metrics.refreshes_requested, 1);
         assert_eq!(metrics.refreshes_sent, 0, "shutdown must suppress the send");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_an_admitted_refresh_before_send() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+
+        publisher.request_pull_diagnostic_refresh(true);
+        server.shutdown_token.cancel();
+        tokio::task::yield_now().await;
+
+        let metrics = server.diagnostics.metrics_snapshot();
+        assert_eq!(metrics.refreshes_requested, 1);
+        assert_eq!(metrics.refreshes_sent, 0, "admitted task must not send");
     }
 
     fn rust_server_config() -> (String, BridgeServerConfig) {

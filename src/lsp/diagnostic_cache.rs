@@ -902,6 +902,14 @@ impl DiagnosticAggregator {
         }
     }
 
+    /// Clear refresh work that was admitted before shutdown became observable.
+    pub(crate) fn cancel_refresh_flight(&self) {
+        *self
+            .refresh_flight
+            .lock()
+            .recover_poison("DiagnosticAggregator::refresh_flight") = RefreshFlight::default();
+    }
+
     /// Bump a host's `current` coverage version (#497) — a **push-origin** change the
     /// editor doesn't know about just landed, so its last-pulled view is now stale.
     /// Called only from the push/eviction paths (`publish_recorded_hosts`,
