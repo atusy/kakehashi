@@ -6,6 +6,8 @@
 pub(crate) mod cache;
 pub(crate) mod http;
 pub mod metadata;
+#[doc(hidden)]
+pub mod operation_lock;
 pub mod parser;
 pub mod queries;
 pub(crate) mod support_check;
