@@ -463,7 +463,7 @@ return {
     fn parser_metadata_ignores_braces_inside_quoted_strings() {
         let content = r#"
 lua = {
-  readme_note = "write } literally",
+  readme_note = "write \" } after C:\\tmp",
   install_info = {
     url = 'https://github.com/tree-sitter-grammars/tree-sitter-lua',
     revision = 'main',
