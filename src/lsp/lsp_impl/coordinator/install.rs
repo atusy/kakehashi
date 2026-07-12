@@ -197,7 +197,7 @@ impl InstallCoordinator {
         // Keep the post-install search-path derivation in the same transaction
         // domain as runtime configuration pushes, or either update can overwrite
         // the other after deriving from a shared stale snapshot.
-        let _settings_transaction = self.settings_manager.begin_settings_transaction().await;
+        let settings_transaction = self.settings_manager.begin_settings_transaction().await;
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let (updated_raw_settings, updated_settings) = updated_settings_after_install(
             &settings_snapshot.raw_settings,
@@ -205,12 +205,8 @@ impl InstallCoordinator {
             data_dir,
         );
 
-        self.apply_raw_settings(
-            updated_raw_settings,
-            updated_settings,
-            _settings_transaction,
-        )
-        .await;
+        self.apply_raw_settings(updated_raw_settings, updated_settings, settings_transaction)
+            .await;
 
         let load_result = self.language.ensure_language_loaded_async(language).await;
         self.notifier()

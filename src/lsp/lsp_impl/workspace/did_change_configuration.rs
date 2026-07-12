@@ -391,7 +391,7 @@ impl Kakehashi {
         // Serialize the snapshot read and publication as one transaction. The
         // reload lock inside apply_shared_settings starts too late to prevent
         // two callers deriving replacements from the same old snapshot.
-        let _settings_transaction = self.settings_manager.begin_settings_transaction().await;
+        let settings_transaction = self.settings_manager.begin_settings_transaction().await;
 
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
@@ -414,13 +414,13 @@ impl Kakehashi {
         ) {
             Ok(settings) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
-                self.apply_raw_settings(merged_ts, settings, _settings_transaction)
+                self.apply_raw_settings(merged_ts, settings, settings_transaction)
                     .await;
                 self.warn_on_misconfigured_settings(&warnings).await;
                 self.notifier().log_info("Configuration updated!").await;
             }
             Err(errs) => {
-                drop(_settings_transaction);
+                drop(settings_transaction);
                 let event = crate::lsp::SettingsEvent::error(format!(
                     "Path expansion failed: {errs}. \
                      This configuration has been discarded; previous settings remain in effect. \
