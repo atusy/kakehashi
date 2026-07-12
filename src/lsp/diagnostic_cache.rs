@@ -925,6 +925,8 @@ impl DiagnosticAggregator {
     }
 
     /// Capture both the current version and the coverage-entry lifetime.
+    /// Returns `None` when the host has no active coverage entry, including
+    /// after `didClose`; passing that through to [`Self::mark_served`] is a no-op.
     pub(crate) fn coverage_stamp(&self, host: &Url) -> Option<DiagnosticCoverageStamp> {
         self.coverage
             .lock()
