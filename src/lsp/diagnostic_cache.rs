@@ -2469,11 +2469,13 @@ mod tests {
         let h = host();
         agg.bump_current(&h);
         agg.bump_current(&h);
-        let stale = agg.coverage_stamp(&h);
+        let stale = agg
+            .coverage_stamp(&h)
+            .expect("coverage exists before close");
 
         agg.forget_coverage(&h);
         agg.bump_current(&h);
-        agg.mark_served(&h, stale);
+        agg.mark_served(&h, Some(stale));
 
         assert!(
             agg.is_dirty(),
