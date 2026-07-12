@@ -587,6 +587,20 @@ fn windows_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
+fn open_windows_claim_directory_guard(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(windows)]
 fn process_is_running_windows(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
@@ -891,13 +905,23 @@ fn remove_stale_cleanup_claim_windows(path: &Path) {
         return;
     }
     #[cfg(windows)]
-    {
+    let claim_guard = {
         // `is_dir` can be true for junctions and other directory reparse
         // points. Never resolve `owner` or `artifact` through one.
         if windows_metadata_is_reparse_point(&metadata) {
             return;
         }
-    }
+        let Ok(guard) = open_windows_claim_directory_guard(path) else {
+            return;
+        };
+        let Ok(opened) = guard.metadata() else {
+            return;
+        };
+        if !opened.file_type().is_dir() || windows_metadata_is_reparse_point(&opened) {
+            return;
+        }
+        guard
+    };
     let marker = path.join("owner");
     let Ok(marker_metadata) = fs::symlink_metadata(&marker) else {
         return;
@@ -937,6 +961,8 @@ fn remove_stale_cleanup_claim_windows(path: &Path) {
     }
     let _ = fs::remove_file(path.join("artifact"));
     let _ = fs::remove_file(marker);
+    #[cfg(windows)]
+    drop(claim_guard);
     let _ = fs::remove_dir(path);
 }
 
