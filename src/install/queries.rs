@@ -47,6 +47,8 @@ pub enum QueryInstallError {
     IoError(std::io::Error),
     /// Queries already exist and --force not specified.
     AlreadyExists(PathBuf),
+    /// Publication was superseded by a language uninstall operation.
+    SupersededByUninstall(String),
 }
 
 impl std::fmt::Display for QueryInstallError {
@@ -75,6 +77,12 @@ impl std::fmt::Display for QueryInstallError {
                     f,
                     "Queries already exist at {}. Use --force to overwrite.",
                     path.display()
+                )
+            }
+            Self::SupersededByUninstall(language) => {
+                write!(
+                    f,
+                    "Query install for {language} was superseded by uninstall"
                 )
             }
         }
@@ -425,10 +433,7 @@ fn install_queries_recursive(
 }
 
 fn query_install_superseded_by_uninstall(language: &str) -> QueryInstallError {
-    QueryInstallError::IoError(std::io::Error::new(
-        std::io::ErrorKind::Interrupted,
-        format!("Query install for {language} was superseded by uninstall"),
-    ))
+    QueryInstallError::SupersededByUninstall(language.to_string())
 }
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
@@ -1507,6 +1512,26 @@ mod tests {
         assert!(
             !queries_parent.join("raced_lang").exists(),
             "uninstall tombstone must prevent restoring canonical queries"
+        );
+    }
+
+    #[test]
+    fn tombstoned_query_install_returns_structured_supersession() {
+        let temp_dir = TempDir::new().unwrap();
+        let queries_parent = temp_dir.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        write_uninstall_tombstone(&queries_parent, "disabled_lang").unwrap();
+
+        let result = install_queries_with_dependencies_from_allowing_http_for_tests(
+            "http://127.0.0.1:1",
+            "disabled_lang",
+            temp_dir.path(),
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(QueryInstallError::SupersededByUninstall(language)) if language == "disabled_lang"),
+            "operation ordering should not be reported as an unrelated I/O failure"
         );
     }
 
