@@ -302,7 +302,6 @@ impl InstallCoordinator {
 
         self.apply_raw_settings_locked(&reload, updated_raw_settings, updated_settings)
             .await;
-        drop(_settings_transaction);
 
         let load_result = self.language.ensure_language_loaded_async(language).await;
         let global_loaded = self.language.has_parser_available(language);
@@ -349,6 +348,7 @@ impl InstallCoordinator {
                 documents: &self.documents,
                 invalidate_documents: false,
                 request_semantic_refresh: true,
+                settings_transaction: None,
             },
             &self.settings_manager,
             &self.cache,

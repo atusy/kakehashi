@@ -442,8 +442,8 @@ impl Kakehashi {
         ) {
             Ok(settings) => {
                 let warning_settings = settings.clone();
-                self.apply_raw_settings(merged_ts, settings).await;
-                drop(_settings_transaction);
+                self.apply_raw_settings(merged_ts, settings, _settings_transaction)
+                    .await;
                 self.warn_on_misconfigured_settings(&warning_settings).await;
                 self.notifier().log_info("Configuration updated!").await;
             }
