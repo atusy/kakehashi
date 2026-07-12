@@ -4,7 +4,7 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -203,6 +203,21 @@ fn remove_parser_backup_marker(backup: &Path) -> std::io::Result<()> {
     }
 }
 
+fn parser_backup_marker_is_owned(marker: &Path) -> std::io::Result<bool> {
+    let file = match fs::File::open(marker) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() != PARSER_BACKUP_MARKER_CONTENT.len() as u64 {
+        return Ok(false);
+    }
+    let mut content = Vec::with_capacity(PARSER_BACKUP_MARKER_CONTENT.len() + 1);
+    file.take((PARSER_BACKUP_MARKER_CONTENT.len() + 1) as u64)
+        .read_to_end(&mut content)?;
+    Ok(content == PARSER_BACKUP_MARKER_CONTENT)
+}
+
 fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(parser_dir) {
         Ok(entries) => entries,
@@ -221,12 +236,7 @@ fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec
         {
             continue;
         }
-        let marker_content = match fs::read(parser_backup_ownership_sidecar(&entry.path())) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if marker_content == PARSER_BACKUP_MARKER_CONTENT {
+        if parser_backup_marker_is_owned(&parser_backup_ownership_sidecar(&entry.path()))? {
             backups.push(entry.path());
         }
     }
@@ -251,13 +261,8 @@ pub fn owned_parser_backup_languages(parser_dir: &Path) -> std::io::Result<Vec<S
             continue;
         };
         let marker = parser_backup_ownership_sidecar(&entry.path());
-        match fs::read(marker) {
-            Ok(content) if content == PARSER_BACKUP_MARKER_CONTENT => {
-                languages.insert(language.to_owned());
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        if parser_backup_marker_is_owned(&marker)? {
+            languages.insert(language.to_owned());
         }
     }
     Ok(languages.into_iter().collect())
@@ -285,12 +290,7 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
             continue;
         }
         let backup = parser_dir.join(backup_name);
-        let marker_content = match fs::read(&marker) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if !backup.try_exists()? && marker_content == PARSER_BACKUP_MARKER_CONTENT {
+        if !backup.try_exists()? && parser_backup_marker_is_owned(&marker)? {
             remove_parser_backup_marker(&backup)?;
         }
     }
