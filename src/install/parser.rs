@@ -459,11 +459,9 @@ fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec
         {
             continue;
         }
-        if parser_backup_marker_is_owned(
-            &parser_backup_ownership_sidecar(&entry.path()),
-            &entry.path(),
-        )? {
-            backups.push(entry.path());
+        let path = entry.path();
+        if parser_backup_marker_is_owned(&parser_backup_ownership_sidecar(&path), &path)? {
+            backups.push(path);
         }
     }
     Ok(backups)
@@ -480,14 +478,12 @@ fn parser_backup_intent_files(parser_dir: &Path, language: &str) -> std::io::Res
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
+        let path = entry.path();
         if entry.file_type()?.is_file()
             && generated_parser_backup_matches_language(name, language)
-            && parser_backup_marker_is_intent(
-                &parser_backup_intent_sidecar(&entry.path()),
-                &entry.path(),
-            )?
+            && parser_backup_marker_is_intent(&parser_backup_intent_sidecar(&path), &path)?
         {
-            backups.push(entry.path());
+            backups.push(path);
         }
     }
     Ok(backups)
@@ -510,15 +506,13 @@ pub fn owned_parser_backup_languages(parser_dir: &Path) -> std::io::Result<Vec<S
         let Some(language) = name.to_str().and_then(parser_backup_language) else {
             continue;
         };
-        let marker = parser_backup_ownership_sidecar(&entry.path());
+        let path = entry.path();
+        let marker = parser_backup_ownership_sidecar(&path);
         let canonical =
             parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
-        if parser_backup_marker_is_owned(&marker, &entry.path())?
+        if parser_backup_marker_is_owned(&marker, &path)?
             || (!path_entry_exists(&canonical)?
-                && parser_backup_marker_is_intent(
-                    &parser_backup_intent_sidecar(&entry.path()),
-                    &entry.path(),
-                )?)
+                && parser_backup_marker_is_intent(&parser_backup_intent_sidecar(&path), &path)?)
         {
             languages.insert(language.to_owned());
         }
