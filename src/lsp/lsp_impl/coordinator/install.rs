@@ -12,6 +12,7 @@ use crate::lsp::lsp_impl::{
     Kakehashi, ReloadLanguageState, apply_shared_settings, build_notifier, detect_document_language,
 };
 use crate::lsp::settings_manager::SettingsManager;
+use path_clean::PathClean;
 use tower_lsp_server::Client;
 
 use super::ParseCoordinator;
@@ -24,7 +25,7 @@ fn updated_settings_after_install(
 ) -> (crate::config::RawWorkspaceSettings, WorkspaceSettings) {
     let mut updated_settings = settings.clone();
     let mut updated_raw_settings = raw_settings.clone();
-    let data_dir_str = data_dir.to_string_lossy().to_string();
+    let data_dir_str = data_dir.clean().to_string_lossy().into_owned();
     if !updated_settings.search_paths.contains(&data_dir_str) {
         updated_settings.search_paths.push(data_dir_str.clone());
 
@@ -357,6 +358,27 @@ mod tests {
             updated_settings.search_paths,
             vec!["/installed".to_string()]
         );
+    }
+
+    #[test]
+    fn reload_after_install_deduplicates_lexical_data_dir_variants() {
+        let raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["/tmp/installed".to_string()]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            search_paths: vec!["/tmp/installed".to_string()],
+            ..Default::default()
+        };
+
+        let (updated_raw, updated_settings) = updated_settings_after_install(
+            &raw_settings,
+            &settings,
+            Path::new("/tmp/parent/../installed"),
+        );
+
+        assert_eq!(updated_raw.search_paths, raw_settings.search_paths);
+        assert_eq!(updated_settings.search_paths, settings.search_paths);
     }
 
     #[test]
