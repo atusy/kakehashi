@@ -543,7 +543,6 @@ impl Kakehashi {
         .await
         .into_iter()
         .for_each(|uri| self.schedule_reparse(uri, None));
-        self.warn_on_misconfigured_settings().await;
     }
 
     async fn apply_initial_settings(

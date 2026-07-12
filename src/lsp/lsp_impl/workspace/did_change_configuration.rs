@@ -443,6 +443,7 @@ impl Kakehashi {
             Ok(settings) => {
                 self.apply_raw_settings(merged_ts, settings).await;
                 drop(_settings_transaction);
+                self.warn_on_misconfigured_settings().await;
                 self.notifier().log_info("Configuration updated!").await;
             }
             Err(errs) => {
