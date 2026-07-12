@@ -617,6 +617,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_request_clears_retained_cancellation() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock, forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+        let request = Request::build("textDocument/hover")
+            .params(serde_json::json!({}))
+            .id(123i64)
+            .finish();
+        let request_future = service.call(request);
+
+        assert!(forwarder.notify_cancel(&upstream_id));
+        drop(request_future);
+
+        let mut reused_id_cancel = forwarder.subscribe(upstream_id).unwrap();
+        assert!(
+            matches!(
+                reused_id_cancel.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "dropping the accepted request must not poison later reuse of its ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_for_unknown_id_is_not_retained() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let upstream_id = UpstreamId::String("not-active".to_string());
+
+        assert!(!forwarder.notify_cancel(&upstream_id));
+        let mut later_subscription = forwarder.subscribe(upstream_id).unwrap();
+        assert!(matches!(
+            later_subscription.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn work_done_progress_cancel_is_intercepted() {
         let mock = MockService::new();
         let pool = Arc::new(LanguageServerPool::new());
