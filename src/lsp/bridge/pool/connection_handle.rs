@@ -792,6 +792,7 @@ impl ConnectionHandle {
     /// No internal timeout (ls-bridge-timeout-hierarchy): the caller (`shutdown_all_with_timeout`) enforces the
     /// global budget so a slow server can use leftover time without N×timeout multiplication.
     pub(crate) async fn graceful_shutdown(&self) -> io::Result<()> {
+        let mut shutdown_state = self.state_watch.subscribe();
         // 1. Transition to Closing state
         self.begin_shutdown();
 
@@ -808,7 +809,15 @@ impl ConnectionHandle {
         let mut maybe_writer = if let Some(mut handle) = writer_handle {
             handle.stop_and_reclaim().await
         } else {
-            None
+            // Another caller already owns the sole writer and therefore the
+            // process shutdown. Do not publish Closed early: wait until that
+            // owner completes so global shutdown cannot return with a live child.
+            while *shutdown_state.borrow_and_update() != ConnectionState::Closed {
+                if shutdown_state.changed().await.is_err() {
+                    break;
+                }
+            }
+            return Ok(());
         };
 
         // 3-4. Perform LSP handshake if we have the writer

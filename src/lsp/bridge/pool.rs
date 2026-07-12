@@ -113,28 +113,26 @@ fn spawn_invalidated_connection_cleanup(
     open_transition_locks: Arc<OpenTransitionLocks>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut stale_handles = Vec::new();
         for key in &invalidated {
             if let Some(handle) = connections.get(key) {
                 handle.begin_shutdown();
+                stale_handles.push((key.clone(), Arc::clone(handle)));
             }
         }
+        // Closing entries remain mapped, so same-key respawn is still gated;
+        // release the global map before any purge await so shutdown_all can
+        // snapshot and coordinate these handles under its own deadline.
+        drop(connections);
 
-        let mut stale_handles = Vec::new();
-        for key in invalidated {
+        for key in &invalidated {
             host_documents
                 .lock()
                 .await
-                .retain(|(_, connection_key), _| connection_key != &key);
-            document_tracker.purge_connection(&key).await;
-            purge_transition_locks(&open_transition_locks, &key).await;
-            if let Some(handle) = connections.get(&key) {
-                stale_handles.push((key, Arc::clone(handle)));
-            }
+                .retain(|(_, connection_key), _| connection_key != key);
+            document_tracker.purge_connection(key).await;
+            purge_transition_locks(&open_transition_locks, key).await;
         }
-        // Keep Closing handles mapped while releasing the map lock. This blocks
-        // same-key respawn, while allowing global shutdown to snapshot and join
-        // these handles under its own deadline instead of waiting outside it.
-        drop(connections);
         let mut shutdowns = tokio::task::JoinSet::new();
         for (key, handle) in &stale_handles {
             shutdowns.spawn(shutdown_invalidated_connection(
