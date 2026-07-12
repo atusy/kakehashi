@@ -169,14 +169,11 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     let lang_names = top_level_table_keys(content);
 
     // For each language, find its block and extract metadata
-    for lang in lang_names {
-        let block = parser_metadata_block(content, &lang).ok_or_else(|| {
-            MetadataError::ParseError(format!("incomplete parser block for {lang}"))
-        })?;
+    for (lang, block) in lang_names {
         // Query-only entries (for example upstream `ecma`) intentionally have
         // no install_info and are not installable parsers.
         if block.contains("install_info") {
-            let info = extract_parser_metadata(content, &lang).ok_or_else(|| {
+            let info = extract_parser_metadata_from_block(block).ok_or_else(|| {
                 MetadataError::ParseError(format!("incomplete parser metadata for {lang}"))
             })?;
             parsers.insert(lang, info);
@@ -190,7 +187,7 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     Ok(parsers)
 }
 
-fn top_level_table_keys(s: &str) -> Vec<String> {
+fn top_level_table_keys(s: &str) -> Vec<(String, &str)> {
     let Some(mut offset) = returned_table_start(s) else {
         return Vec::new();
     };
@@ -279,8 +276,11 @@ fn top_level_table_keys(s: &str) -> Vec<String> {
                     .sum::<usize>();
                 if s[after_equals + whitespace..].starts_with('{') {
                     let name = &s[offset..name_end];
-                    if !is_reserved_key(name) {
-                        keys.push(name.to_string());
+                    let block_start = after_equals + whitespace;
+                    if !is_reserved_key(name)
+                        && let Some(block) = find_matching_brace(&s[block_start..])
+                    {
+                        keys.push((name.to_string(), block));
                     }
                 }
             }
@@ -317,10 +317,7 @@ fn is_reserved_key(name: &str) -> bool {
     )
 }
 
-/// Extract parser metadata for a specific language from parsers.lua content.
-fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetadata> {
-    let block_content = parser_metadata_block(content, language)?;
-
+fn extract_parser_metadata_from_block(block_content: &str) -> Option<ParserMetadata> {
     // Extract URL (required)
     let url_re = Regex::new(r#"url\s*=\s*'([^']+)'"#).ok()?;
     let url = url_re
@@ -347,19 +344,6 @@ fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetada
         revision,
         location,
     })
-}
-
-fn parser_metadata_block<'a>(content: &'a str, language: &str) -> Option<&'a str> {
-    // Find the start of this language's block
-    // Use word boundary to avoid matching substrings (e.g., "c" matching "cpp")
-    let block_start_pattern = format!(r#"(?m)^\s*{}\s*=\s*\{{"#, regex::escape(language));
-    let block_start_re = Regex::new(&block_start_pattern).ok()?;
-
-    let block_start = block_start_re.find(content)?;
-    let start_pos = block_start.start();
-
-    // Find the end of this block by counting braces
-    find_matching_brace(&content[start_pos..])
 }
 
 /// Find the content within matching braces starting from the first `{`.
@@ -690,6 +674,15 @@ mod tests {
     }
 
     #[test]
+    fn preamble_examples_do_not_shadow_returned_entries() {
+        let content = "--[=[\nlua = { install_info = { url = 'https://example/wrong', revision = 'wrong' } }\n]=]\nreturn {\nlua = { install_info = { url = 'https://example/lua', revision = 'right' } },\n}";
+        let parsers = parse_complete_parsers_lua(content).expect("complete metadata");
+
+        assert_eq!(parsers["lua"].url, "https://example/lua");
+        assert_eq!(parsers["lua"].revision, "right");
+    }
+
+    #[test]
     fn test_fetch_parser_metadata_with_caching() {
         // This test verifies that FetchOptions can be used to enable caching
         let temp = tempdir().expect("Failed to create temp dir");
@@ -787,7 +780,7 @@ return {
 
     #[test]
     fn test_extract_parser_metadata() {
-        let content = r#"
+        let content = r#"return {
   rust = {
     install_info = {
       revision = 'abc123',
@@ -795,9 +788,11 @@ return {
     },
     tier = 1,
   },
+}
 "#;
 
-        let info = extract_parser_metadata(content, "rust").expect("should extract");
+        let parsers = parse_parsers_lua(content).expect("should parse");
+        let info = parsers.get("rust").expect("should extract");
         assert_eq!(info.url, "https://github.com/tree-sitter/tree-sitter-rust");
         assert_eq!(info.revision, "abc123");
         assert!(info.location.is_none());
@@ -805,7 +800,7 @@ return {
 
     #[test]
     fn test_extract_parser_metadata_with_location() {
-        let content = r#"
+        let content = r#"return {
   markdown = {
     install_info = {
       location = 'tree-sitter-markdown',
@@ -814,9 +809,11 @@ return {
     },
     tier = 2,
   },
+}
 "#;
 
-        let info = extract_parser_metadata(content, "markdown").expect("should extract");
+        let parsers = parse_parsers_lua(content).expect("should parse");
+        let info = parsers.get("markdown").expect("should extract");
         assert_eq!(
             info.url,
             "https://github.com/tree-sitter-grammars/tree-sitter-markdown"
