@@ -827,7 +827,21 @@ fn remove_stale_cleanup_claim_windows(path: &Path) {
         return;
     }
     let marker = path.join("owner");
-    let Ok(file) = fs::OpenOptions::new().read(true).open(&marker) else {
+    let Ok(marker_metadata) = fs::symlink_metadata(&marker) else {
+        return;
+    };
+    if !marker_metadata.file_type().is_file() {
+        return;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let Ok(file) = options.open(&marker) else {
         return;
     };
     if !file
@@ -1533,6 +1547,31 @@ mod tests {
             .expect("cleanup succeeds");
 
         assert!(!staged.exists(), "confirmed-dead staging file is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_claim_recovery_rejects_symlink_marker() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let claim = parser_dir.join(".parser-cleanup.123.0");
+        fs::create_dir(&claim).expect("create claim dir");
+        fs::write(claim.join("artifact"), b"user data").expect("write artifact");
+        let target = temp.path().join("marker-target");
+        fs::write(&target, PARSER_CLEANUP_MARKER).expect("write marker target");
+        symlink(&target, claim.join("owner")).expect("create marker symlink");
+
+        cleanup_interrupted_parser_installs_windows_with(&parser_dir, |_| false)
+            .expect("cleanup succeeds");
+
+        assert!(claim.exists(), "unproven claim is preserved");
+        assert_eq!(
+            fs::read(claim.join("artifact")).expect("read artifact"),
+            b"user data"
+        );
     }
 
     #[cfg(windows)]
