@@ -488,7 +488,18 @@ fn visit_install_directory(
 ) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                // No directory entry is the normal pre-install state.
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                // A dangling symlink (or another entry read_dir could not
+                // follow) exists, so preserve the original scan failure.
+                Ok(_) => return Err(e),
+                Err(metadata_error) => return Err(metadata_error),
+            }
+        }
         Err(e) => return Err(e),
     };
     for entry in entries {
