@@ -228,7 +228,7 @@ impl CancelForwarder {
             let mut subscribers = self
                 .subscribers
                 .lock()
-                .recover_poison("CancelForwarder::notify_cancel");
+                .recover_poison("CancelForwarder::notify_cancel_for_generation");
             if subscribers.active_requests.get(upstream_id).copied() != generation {
                 return false;
             }

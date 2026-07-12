@@ -2690,7 +2690,7 @@ impl LanguageServerPool {
             let registry = self
                 .upstream_request_registry
                 .lock()
-                .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id");
+                .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id_if_current");
             if !is_current() {
                 return Ok(());
             }
