@@ -1151,15 +1151,15 @@ mod tests {
     #[derive(Default)]
     struct FakeParserFileOps {
         files: HashMap<PathBuf, &'static str>,
-        fail_rename: Option<(PathBuf, PathBuf)>,
+        failed_renames: Vec<(PathBuf, PathBuf)>,
     }
 
     impl ParserFileOps for FakeParserFileOps {
         fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
             if self
-                .fail_rename
-                .as_ref()
-                .is_some_and(|(fail_from, fail_to)| fail_from == from && fail_to == to)
+                .failed_renames
+                .iter()
+                .any(|(fail_from, fail_to)| fail_from == from && fail_to == to)
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -1189,7 +1189,7 @@ mod tests {
         let mut ops = FakeParserFileOps::default();
         ops.files.insert(tmp.clone(), "new");
         ops.files.insert(parser.clone(), "old");
-        ops.fail_rename = Some((tmp.clone(), parser.clone()));
+        ops.failed_renames.push((tmp.clone(), parser.clone()));
 
         let error = publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
             .expect_err("injected publish failure must be reported");
@@ -1197,6 +1197,43 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(ops.files.get(&parser), Some(&"old"));
         assert!(!ops.files.contains_key(&backup));
+    }
+
+    #[test]
+    fn transactional_publish_removes_backup_after_success() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+
+        publish_parser_transactionally(&mut ops, &tmp, &parser, &backup).expect("publish succeeds");
+
+        assert_eq!(ops.files.get(&parser), Some(&"new"));
+        assert!(!ops.files.contains_key(&tmp));
+        assert!(!ops.files.contains_key(&backup));
+    }
+
+    #[test]
+    fn transactional_publish_keeps_backup_when_rollback_fails() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.failed_renames.push((tmp.clone(), parser.clone()));
+        ops.failed_renames.push((backup.clone(), parser.clone()));
+
+        let error = publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("publish and rollback failures must be reported");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("failed to restore backup"));
+        assert_eq!(ops.files.get(&backup), Some(&"old"));
+        assert_eq!(ops.files.get(&tmp), Some(&"new"));
+        assert!(!ops.files.contains_key(&parser));
     }
 
     #[test]
