@@ -323,7 +323,7 @@ fn publish_compiled_parser(
         let _ = fs::remove_file(tmp_file);
         return Err(ParserInstallError::IoError(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
-            format!("Parser install for {language} was superseded by uninstall"),
+            format!("Parser install for {language} was superseded by a newer parser operation"),
         )));
     }
     // On unix `rename` atomically replaces an existing parser. Windows
