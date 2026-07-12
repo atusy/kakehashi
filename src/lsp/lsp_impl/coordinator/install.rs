@@ -205,9 +205,12 @@ impl InstallCoordinator {
             data_dir,
         );
 
-        self.apply_raw_settings(updated_raw_settings, updated_settings)
-            .await;
-        drop(_settings_transaction);
+        self.apply_raw_settings(
+            updated_raw_settings,
+            updated_settings,
+            _settings_transaction,
+        )
+        .await;
 
         let load_result = self.language.ensure_language_loaded_async(language).await;
         self.notifier()
@@ -231,6 +234,7 @@ impl InstallCoordinator {
         &self,
         raw_settings: crate::config::RawWorkspaceSettings,
         settings: WorkspaceSettings,
+        settings_transaction: tokio::sync::MutexGuard<'_, ()>,
     ) {
         let _reparse_uris = apply_shared_settings(
             &self.client,
@@ -240,6 +244,7 @@ impl InstallCoordinator {
                 documents: &self.documents,
                 invalidate_documents: false,
                 request_semantic_refresh: true,
+                settings_transaction: Some(settings_transaction),
             },
             &self.settings_manager,
             &self.cache,

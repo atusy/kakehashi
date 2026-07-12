@@ -100,6 +100,7 @@ pub(super) struct ReloadLanguageState<'a> {
     documents: &'a DocumentStore,
     invalidate_documents: bool,
     request_semantic_refresh: bool,
+    settings_transaction: Option<tokio::sync::MutexGuard<'a, ()>>,
 }
 
 /// One server process owns one effective workspace settings snapshot. Keep the
@@ -133,7 +134,7 @@ impl Drop for ParserReloadGuard<'_> {
 
 pub(super) async fn apply_shared_settings(
     client: &Client,
-    language_state: ReloadLanguageState<'_>,
+    mut language_state: ReloadLanguageState<'_>,
     settings_manager: &SettingsManager,
     cache: &CacheCoordinator,
     bridge: &BridgeCoordinator,
@@ -178,6 +179,10 @@ pub(super) async fn apply_shared_settings(
         Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
         None => settings_manager.apply_settings(settings),
     }
+    // Snapshot derivation and publication are now atomic. Release the outer
+    // read-modify-write guard before downstream/client I/O; SETTINGS_RELOAD_LOCK
+    // continues to serialize the remaining propagation work.
+    drop(language_state.settings_transaction.take());
     let settings = settings_manager.load_settings();
     // Path c: apply downstream config at this single reload choke point
     // (initialize, didChangeConfiguration, auto-install reload): push runtime
@@ -476,6 +481,7 @@ impl Kakehashi {
         &self,
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
+        settings_transaction: tokio::sync::MutexGuard<'_, ()>,
     ) {
         apply_shared_settings(
             &self.client,
@@ -485,6 +491,7 @@ impl Kakehashi {
                 documents: &self.documents,
                 invalidate_documents: true,
                 request_semantic_refresh: true,
+                settings_transaction: Some(settings_transaction),
             },
             &self.settings_manager,
             &self.cache,
@@ -511,6 +518,7 @@ impl Kakehashi {
                 documents: &self.documents,
                 invalidate_documents: false,
                 request_semantic_refresh: false,
+                settings_transaction: None,
             },
             &self.settings_manager,
             &self.cache,
@@ -955,11 +963,17 @@ mod tests {
             .unwrap()
             .release("stale".to_string(), tree_sitter::Parser::new());
 
+        let transaction = service
+            .inner()
+            .settings_manager
+            .begin_settings_transaction()
+            .await;
         service
             .inner()
             .apply_raw_settings(
                 RawWorkspaceSettings::default(),
                 WorkspaceSettings::default(),
+                transaction,
             )
             .await;
 
@@ -989,11 +1003,17 @@ mod tests {
             }
         };
 
+        let transaction = service
+            .inner()
+            .settings_manager
+            .begin_settings_transaction()
+            .await;
         service
             .inner()
             .apply_raw_settings(
                 RawWorkspaceSettings::default(),
                 WorkspaceSettings::default(),
+                transaction,
             )
             .await;
         let parser_is_current = service
