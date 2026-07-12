@@ -28,7 +28,38 @@ pub mod test_helpers {
 
 pub(crate) use parser::parser_file_exists;
 
+use fs4::fs_std::FileExt;
+use std::fs;
 use std::path::PathBuf;
+
+/// Cross-process lock that makes parser and query changes one language operation.
+pub struct LanguageOperationLockGuard {
+    _file: fs::File,
+}
+
+impl LanguageOperationLockGuard {
+    /// Serialize install and uninstall for one language across processes.
+    pub fn acquire(
+        data_dir: &std::path::Path,
+        language: &str,
+    ) -> std::io::Result<LanguageOperationLockGuard> {
+        if !queries::is_safe_language_name(language) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe language name '{}'", language.escape_default()),
+            ));
+        }
+        let lock_dir = data_dir.join(".operation-locks");
+        fs::create_dir_all(&lock_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_dir.join(format!("{language}.lock")))?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
+}
 
 /// Get the default data directory for kakehashi.
 ///
@@ -279,6 +310,16 @@ fn install_language_blocking_with_query_installer(
         return result;
     }
 
+    let _operation_lock = match LanguageOperationLockGuard::acquire(data_dir, language) {
+        Ok(lock) => lock,
+        Err(error) => {
+            let reason = format!("Failed to lock language operation: {error}");
+            result.parser_error = Some(reason.clone());
+            result.queries_error = Some(reason);
+            return result;
+        }
+    };
+
     if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
         let reason = e.to_string();
         result.queries_error = Some(reason);
@@ -380,6 +421,33 @@ fn install_language_blocking_allowing_http_queries_for_tests(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_operation_lock_serializes_the_same_language() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = LanguageOperationLockGuard::acquire(temp.path(), "lua").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let data_dir = temp.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _second = LanguageOperationLockGuard::acquire(&data_dir, "lua").unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a same-language operation must wait for the current one"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the waiter acquires after release");
+        waiter.join().unwrap();
+    }
 
     #[test]
     fn test_default_data_dir_returns_some() {

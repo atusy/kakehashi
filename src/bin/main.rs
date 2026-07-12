@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use kakehashi::install::{default_data_dir, metadata, parser, queries};
+use kakehashi::install::{LanguageOperationLockGuard, default_data_dir, metadata, parser, queries};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -570,6 +570,18 @@ fn run_language_uninstall(
             continue;
         }
 
+        // Parser and query locks protect their own artifacts, but only this
+        // outer lock prevents their phases from interleaving with a complete
+        // install in another process.
+        let _operation_lock = match LanguageOperationLockGuard::acquire(&data_dir, lang) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!("✗ Failed to lock uninstall for '{}': {}", lang, error);
+                any_failed = true;
+                continue;
+            }
+        };
+
         let mut removed_something = false;
 
         // Remove queries directory and any kakehashi-created backups under the
@@ -713,6 +725,12 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
         ExitCode::FAILURE
     })?;
+
+    let _operation_lock =
+        LanguageOperationLockGuard::acquire(&data_dir, language).map_err(|e| {
+            eprintln!("✗ Failed to lock installation for '{}': {}", language, e);
+            ExitCode::FAILURE
+        })?;
 
     // Track success/failure for exit code
     let mut parser_success = true;
