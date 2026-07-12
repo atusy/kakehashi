@@ -90,8 +90,8 @@ fn publish_parser_transactionally(
                 return Err(std::io::Error::new(
                     error.kind(),
                     format!(
-                        "failed to claim parser backup: {error}; failed to remove new ownership marker '{}': {marker_error}",
-                        parser_backup_ownership_sidecar(backup_file).display()
+                        "failed to claim parser backup: {error}; failed to remove new intent marker '{}': {marker_error}",
+                        parser_backup_intent_sidecar(backup_file).display()
                     ),
                 ));
             }
@@ -2082,7 +2082,16 @@ mod tests {
         let error = publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
             .expect_err("claim cleanup failure must identify marker");
 
-        assert!(error.to_string().contains("parser.backup.owner"));
+        assert!(
+            error
+                .to_string()
+                .contains(&parser_backup_intent_sidecar(&backup).display().to_string()),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("new intent marker"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
