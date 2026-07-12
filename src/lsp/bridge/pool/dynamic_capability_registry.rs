@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use tower_lsp_server::ls_types::{Registration, Unregistration};
@@ -16,16 +16,22 @@ use crate::error::LockResultExt;
 /// registrations to coexist (e.g., two `textDocument/diagnostic` registrations
 /// with different document selectors).
 pub(crate) struct DynamicCapabilityRegistry {
-    registrations: RwLock<HashMap<String, Registration>>,
+    registrations: RwLock<CapabilityRegistrationState>,
     /// Serializes capability acknowledgement/publication with outbound actions
     /// whose validity depends on the published registry state.
     workspace_folder_ordering: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+#[derive(Default)]
+struct CapabilityRegistrationState {
+    active: HashMap<String, Registration>,
+    revoked_ids: HashSet<String>,
+}
+
 impl DynamicCapabilityRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            registrations: RwLock::new(HashMap::new()),
+            registrations: RwLock::new(CapabilityRegistrationState::default()),
             workspace_folder_ordering: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -40,7 +46,8 @@ impl DynamicCapabilityRegistry {
             .write()
             .recover_poison("DynamicCapabilityRegistry::register");
         for reg in registrations {
-            guard.insert(reg.id.clone(), reg);
+            guard.revoked_ids.remove(&reg.id);
+            guard.active.insert(reg.id.clone(), reg);
         }
     }
 
@@ -50,7 +57,8 @@ impl DynamicCapabilityRegistry {
             .write()
             .recover_poison("DynamicCapabilityRegistry::unregister");
         for unreg in unregistrations {
-            guard.remove(&unreg.id);
+            guard.active.remove(&unreg.id);
+            guard.revoked_ids.insert(unreg.id);
         }
     }
 
@@ -58,8 +66,20 @@ impl DynamicCapabilityRegistry {
         self.registrations
             .read()
             .recover_poison("DynamicCapabilityRegistry::has_registration")
+            .active
             .values()
             .any(|r| r.method == method)
+    }
+
+    /// Whether a registration ID was explicitly revoked and has not since
+    /// been registered again. This also covers IDs advertised in initialize
+    /// capabilities rather than through `client/registerCapability`.
+    pub(crate) fn is_registration_revoked(&self, id: &str) -> bool {
+        self.registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::is_registration_revoked")
+            .revoked_ids
+            .contains(id)
     }
 }
 
@@ -107,6 +127,20 @@ mod tests {
         registry.unregister(vec![unreg]);
 
         assert!(!registry.has_registration("textDocument/completion"));
+        assert!(registry.is_registration_revoked("1"));
+    }
+
+    #[test]
+    fn registering_an_id_clears_its_revocation() {
+        let registry = DynamicCapabilityRegistry::new();
+        let unreg = make_unregistration("1", "textDocument/completion");
+        registry.unregister(vec![unreg]);
+        assert!(registry.is_registration_revoked("1"));
+
+        registry.register(vec![make_registration("1", "textDocument/completion")]);
+
+        assert!(!registry.is_registration_revoked("1"));
+        assert!(registry.has_registration("textDocument/completion"));
     }
 
     #[test]
@@ -128,8 +162,8 @@ mod tests {
         assert!(registry.has_registration("textDocument/completion"));
         // Verify both registrations are stored (keyed by ID)
         let guard = registry.registrations.read().unwrap();
-        assert_eq!(guard.get("1").unwrap().id, "1");
-        assert_eq!(guard.get("2").unwrap().id, "2");
+        assert_eq!(guard.active.get("1").unwrap().id, "1");
+        assert_eq!(guard.active.get("2").unwrap().id, "2");
     }
 
     #[test]

@@ -548,9 +548,18 @@ impl ConnectionHandle {
     pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
         self.dynamic_capabilities()
             .has_registration("workspace/didChangeWorkspaceFolders")
-            || self
-                .server_capabilities()
-                .is_some_and(supports_workspace_folder_changes)
+            || self.server_capabilities().is_some_and(|caps| {
+                supports_workspace_folder_changes(caps)
+                    && !caps
+                        .workspace
+                        .as_ref()
+                        .and_then(|workspace| workspace.workspace_folders.as_ref())
+                        .and_then(|folders| match &folders.change_notifications {
+                            Some(OneOf::Right(id)) => Some(id.as_str()),
+                            _ => None,
+                        })
+                        .is_some_and(|id| self.dynamic_capabilities().is_registration_revoked(id))
+            })
     }
 
     /// Log, at most once per connection, that a `preferSharedInstance` server
@@ -2057,6 +2066,25 @@ mod tests {
             }]);
 
         assert!(handle.supports_workspace_folder_changes());
+    }
+
+    #[tokio::test]
+    async fn handle_honors_initialize_workspace_folder_unregistration() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(caps_with_workspace_folders(Some(folders_cap(
+            Some(true),
+            Some(OneOf::Right("wf-id".to_string())),
+        ))));
+        assert!(handle.supports_workspace_folder_changes());
+
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "wf-id".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+
+        assert!(!handle.supports_workspace_folder_changes());
     }
 
     #[tokio::test]
