@@ -719,9 +719,9 @@ fn test_did_change_configuration_skips_unrelated_flat_settings() {
     );
 }
 
-/// didChangeConfiguration does not report success for empty kakehashi sections.
+/// An empty wrapped section clears the complete runtime layer.
 #[test]
-fn test_did_change_configuration_skips_empty_kakehashi_section() {
+fn test_did_change_configuration_empty_kakehashi_section_restores_base() {
     let dir = TempDir::new().unwrap();
     let config = dir.path().join("base.toml");
     std::fs::write(&config, "autoInstall = false\n").unwrap();
@@ -737,6 +737,16 @@ fn test_did_change_configuration_skips_empty_kakehashi_section() {
 
     client.send_notification(
         "workspace/didChangeConfiguration",
+        json!({ "settings": { "kakehashi": { "autoInstall": true } } }),
+    );
+    poll_effective_settings(
+        &mut client,
+        |s| s["autoInstall"] == json!(true),
+        "runtime layer should override the config-file layer",
+    );
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
         json!({
             "settings": {
                 "kakehashi": {},
@@ -747,21 +757,21 @@ fn test_did_change_configuration_skips_empty_kakehashi_section() {
         }),
     );
 
-    let unexpected_success = client.wait_for_notification_where(
+    let success = client.wait_for_notification_where(
         &["window/logMessage"],
-        Duration::from_millis(250),
+        Duration::from_secs(5),
         is_config_updated,
     );
     assert!(
-        unexpected_success.is_none(),
-        "empty kakehashi section must not log success; got: {unexpected_success:?}"
+        success.is_some(),
+        "empty kakehashi section should apply the cleared runtime layer"
     );
 
     let settings = query_effective_settings(&mut client);
     assert_eq!(
         settings["autoInstall"],
         json!(false),
-        "empty kakehashi section should leave settings unchanged"
+        "empty kakehashi section should restore config-file settings"
     );
 }
 
@@ -943,7 +953,7 @@ fn test_did_change_configuration_preserves_config_file_settings() {
 
     client.send_notification(
         "workspace/didChangeConfiguration",
-        json!({ "settings": { "autoInstall": false } }),
+        json!({ "settings": { "kakehashi": { "autoInstall": false } } }),
     );
 
     let settings = poll_effective_settings(
@@ -955,6 +965,48 @@ fn test_did_change_configuration_preserves_config_file_settings() {
         settings["searchPaths"],
         json!(["/from-file"]),
         "searchPaths from config file should be preserved"
+    );
+}
+
+/// Each didChangeConfiguration payload replaces the previous runtime layer.
+#[test]
+fn test_did_change_configuration_removed_key_reverts_to_config_file() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = true\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(true), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "autoInstall": false } }),
+    );
+    poll_effective_settings(
+        &mut client,
+        |s| s["autoInstall"] == json!(false),
+        "first runtime layer should override the config file",
+    );
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "kakehashi": { "searchPaths": ["/replacement"] } } }),
+    );
+    let settings = poll_effective_settings(
+        &mut client,
+        |s| s["searchPaths"] == json!(["/replacement"]),
+        "second runtime layer should be applied",
+    );
+    assert_eq!(
+        settings["autoInstall"],
+        json!(true),
+        "omitted runtime key should fall back to the config-file layer"
     );
 }
 

@@ -12,6 +12,7 @@ use crate::lsp::lsp_impl::{
     Kakehashi, ReloadLanguageState, apply_shared_settings, build_notifier, detect_document_language,
 };
 use crate::lsp::settings_manager::SettingsManager;
+use path_clean::PathClean;
 use tower_lsp_server::Client;
 
 use super::ParseCoordinator;
@@ -24,8 +25,13 @@ fn updated_settings_after_install(
 ) -> (crate::config::RawWorkspaceSettings, WorkspaceSettings) {
     let mut updated_settings = settings.clone();
     let mut updated_raw_settings = raw_settings.clone();
-    let data_dir_str = data_dir.to_string_lossy().to_string();
-    if !updated_settings.search_paths.contains(&data_dir_str) {
+    let cleaned_data_dir = data_dir.clean();
+    let data_dir_str = cleaned_data_dir.to_string_lossy().into_owned();
+    if !updated_settings
+        .search_paths
+        .iter()
+        .any(|existing| std::path::Path::new(existing).clean() == cleaned_data_dir)
+    {
         updated_settings.search_paths.push(data_dir_str.clone());
 
         let raw_search_paths = updated_raw_settings
@@ -198,6 +204,7 @@ impl InstallCoordinator {
         // domain as runtime configuration pushes, or either update can overwrite
         // the other after deriving from a shared stale snapshot.
         let settings_transaction = self.settings_manager.begin_settings_transaction().await;
+        self.settings_manager.record_installed_search_path(data_dir);
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let (updated_raw_settings, updated_settings) = updated_settings_after_install(
             &settings_snapshot.raw_settings,
@@ -356,6 +363,45 @@ mod tests {
             updated_settings.search_paths,
             vec!["/installed".to_string()]
         );
+    }
+
+    #[test]
+    fn reload_after_install_deduplicates_lexical_data_dir_variants() {
+        let raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["/tmp/installed".to_string()]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            search_paths: vec!["/tmp/installed".to_string()],
+            ..Default::default()
+        };
+
+        let (updated_raw, updated_settings) = updated_settings_after_install(
+            &raw_settings,
+            &settings,
+            Path::new("/tmp/parent/../installed"),
+        );
+
+        assert_eq!(updated_raw.search_paths, raw_settings.search_paths);
+        assert_eq!(updated_settings.search_paths, settings.search_paths);
+    }
+
+    #[test]
+    fn reload_after_install_deduplicates_lexical_existing_path_variants() {
+        let raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["/tmp/parent/../installed".to_string()]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            search_paths: vec!["/tmp/parent/../installed".to_string()],
+            ..Default::default()
+        };
+
+        let (updated_raw, updated_settings) =
+            updated_settings_after_install(&raw_settings, &settings, Path::new("/tmp/installed"));
+
+        assert_eq!(updated_raw.search_paths, raw_settings.search_paths);
+        assert_eq!(updated_settings.search_paths, settings.search_paths);
     }
 
     #[test]

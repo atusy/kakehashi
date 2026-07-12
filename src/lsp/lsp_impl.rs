@@ -510,6 +510,8 @@ impl Kakehashi {
         settings: WorkspaceSettings,
     ) {
         let warnings = Self::misconfigured_settings_warnings(&settings);
+        self.settings_manager
+            .set_base_raw_settings(raw_settings.clone());
         apply_shared_settings(
             &self.client,
             ReloadLanguageState {

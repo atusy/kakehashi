@@ -7,7 +7,8 @@ kakehashi needs to support multiple configuration sources to accommodate differe
 1. **Programmed defaults**: Built-in defaults for zero-config usage
 2. **User-wide defaults**: Settings that apply across all projects for a user
 3. **Project-specific settings**: Configuration local to a specific project/directory
-4. **Session-specific overrides**: Settings passed directly from the LSP client at initialization
+4. **Initialization overrides**: Settings passed directly from the LSP client at initialization
+5. **Runtime overrides**: The client's current configuration section, replaced on each notification
 
 The limitations of the current system are:
 
@@ -19,7 +20,7 @@ The standard pattern in many language servers and CLI tools is layered configura
 
 ## Decision
 
-**Implement a four-layer configuration system with "later sources override earlier ones" semantics.**
+**Implement a five-layer configuration system with "later sources override earlier ones" semantics.**
 
 ### Query Configuration Schema
 
@@ -73,12 +74,20 @@ queries = [
    - `--config-file` CLI option to specify alternative path(s)
    - Purpose: Project-specific settings, version-controlled with the project
 
-4. **Session-specific overrides** (highest precedence)
-   - Sources:
-     - `initializationOptions` in the LSP `initialize` request (at startup)
-     - `workspace/didChangeConfiguration` notification (at runtime)
-   - Purpose: Per-session overrides from the editor/client configuration
-   - Note: Runtime changes via `didChangeConfiguration` re-trigger the merge process
+4. **Initialization overrides**
+   - Source: `initializationOptions` in the LSP `initialize` request
+   - Purpose: Startup-only per-session overrides from the editor/client
+
+5. **Runtime overrides** (highest precedence)
+   - Source: the current kakehashi section in each
+     `workspace/didChangeConfiguration` notification
+   - Purpose: Live editor/client configuration
+   - Replacement semantics: each accepted notification replaces the previous
+     runtime layer; it is not merged onto the previous effective snapshot
+   - Omitting a previously supplied key restores its value from the startup
+     layers (defaults, files, and `initializationOptions`)
+   - An explicit wrapped `{ "kakehashi": {} }` section clears the runtime layer
+     completely, while unrelated flat editor settings are ignored
 
 ### Merge Algorithm
 
@@ -93,7 +102,15 @@ Configs are applied in order (earlier = lower precedence, later = higher precede
 ```
 final_config = [defaults, user_config, project_config, InitializationOptions]
     .into_iter().reduce(merge_workspace_settings).flatten()
+
+effective_config = merge_workspace_settings(final_config, current_runtime_section)
 ```
+
+`final_config` is retained as the stable startup base. On every accepted
+`didChangeConfiguration`, kakehashi merges only the notification's current
+runtime section onto that base. Parser data directories discovered by successful
+installs are then re-applied as a process-local operational layer so a later
+runtime replacement cannot make a newly installed parser unreachable.
 
 **Scalar values and Option types** (`searchPaths`, `autoInstall`):
 - Later sources completely replace earlier values (via `overlay.or(base)`)

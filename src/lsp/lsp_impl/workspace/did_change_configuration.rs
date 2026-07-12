@@ -332,6 +332,10 @@ fn append_unknown_layers_keys(
 impl Kakehashi {
     /// Handle workspace/didChangeConfiguration notification.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
+        let has_kakehashi_wrapper = params
+            .settings
+            .as_object()
+            .is_some_and(|settings| settings.contains_key("kakehashi"));
         let uses_deprecated_unwrapped_shape =
             uses_deprecated_unwrapped_didchange_shape(&params.settings);
         let (settings_value, unknown_keys) = settings_payload(params.settings);
@@ -370,9 +374,10 @@ impl Kakehashi {
             return;
         }
 
-        if settings_value
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty)
+        if !has_kakehashi_wrapper
+            && settings_value
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
         {
             return;
         }
@@ -393,13 +398,13 @@ impl Kakehashi {
         // two callers deriving replacements from the same old snapshot.
         let settings_transaction = self.settings_manager.begin_settings_transaction().await;
 
-        // Merge onto current effective settings (not from scratch).
-        // The current settings already reflect defaults < user < project < initializationOptions,
-        // so merging preserves languages and other fields set during initialize.
-        let current_ts = self.settings_manager.load_raw_settings();
+        // Each accepted notification replaces the previous runtime layer. Merge
+        // it onto the stable startup layers rather than the prior effective
+        // snapshot, so omitted keys revert to files/initialization options.
+        let base_ts = self.settings_manager.load_base_raw_settings();
         // SAFETY: merge_workspace_settings(Some, Some) always returns Some, so unwrap_or_return is
         // defensive only — the None branch is unreachable under the current implementation.
-        let Some(merged_ts) = merge_workspace_settings(Some((*current_ts).clone()), Some(parsed))
+        let Some(mut merged_ts) = merge_workspace_settings(Some((*base_ts).clone()), Some(parsed))
         else {
             log::warn!(
                 "merge_workspace_settings returned None despite two Some inputs; skipping configuration update"
@@ -412,7 +417,9 @@ impl Kakehashi {
             self.home_dir.as_deref(),
             crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
         ) {
-            Ok(settings) => {
+            Ok(mut settings) => {
+                self.settings_manager
+                    .apply_installed_search_paths(&mut merged_ts, &mut settings);
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.apply_raw_settings(merged_ts, settings, settings_transaction)
                     .await;

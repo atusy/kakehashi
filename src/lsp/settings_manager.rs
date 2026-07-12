@@ -2,6 +2,7 @@
 //! `apply_settings`) plus initialize-only state — `client_capabilities` and
 //! `root_path` (both `OnceLock`, set once during `initialize()`).
 
+use crate::error::LockResultExt;
 use arc_swap::ArcSwap;
 use path_clean::PathClean;
 use std::path::PathBuf;
@@ -25,6 +26,12 @@ pub(crate) struct SettingsSnapshot {
 
 pub(crate) struct SettingsManager {
     root_path: ArcSwap<Option<PathBuf>>,
+    /// Startup layers (defaults, config files, and initialization options),
+    /// before any replaceable didChangeConfiguration layer is applied.
+    base_raw_settings: ArcSwap<RawWorkspaceSettings>,
+    /// Parser data directories discovered by successful installs. These form
+    /// a durable layer above replaceable client settings for this process.
+    installed_search_paths: std::sync::Mutex<Vec<String>>,
     settings_snapshot: ArcSwap<SettingsSnapshot>,
     /// Serializes read-modify-write settings transactions from runtime config
     /// pushes and post-install search-path updates.
@@ -78,6 +85,8 @@ impl SettingsManager {
 
         Self {
             root_path: ArcSwap::new(Arc::new(None)),
+            base_raw_settings: ArcSwap::new(Arc::new(raw_settings.clone())),
+            installed_search_paths: std::sync::Mutex::new(Vec::new()),
             settings_snapshot: ArcSwap::new(Arc::new(SettingsSnapshot {
                 raw_settings: Arc::new(raw_settings),
                 settings: Arc::new(settings),
@@ -164,6 +173,57 @@ impl SettingsManager {
     /// Load the current raw workspace settings.
     pub(crate) fn load_raw_settings(&self) -> Arc<RawWorkspaceSettings> {
         Arc::clone(&self.settings_snapshot.load().raw_settings)
+    }
+
+    /// Load the immutable startup layers used beneath runtime client settings.
+    pub(crate) fn load_base_raw_settings(&self) -> Arc<RawWorkspaceSettings> {
+        self.base_raw_settings.load_full()
+    }
+
+    /// Replace the startup layers during the initialize handshake.
+    pub(crate) fn set_base_raw_settings(&self, raw_settings: RawWorkspaceSettings) {
+        self.base_raw_settings.store(Arc::new(raw_settings));
+    }
+
+    /// Remember a parser data directory for subsequent runtime-layer rebuilds.
+    pub(crate) fn record_installed_search_path(&self, data_dir: &std::path::Path) {
+        let data_dir = data_dir.clean().to_string_lossy().into_owned();
+        let mut paths = self
+            .installed_search_paths
+            .lock()
+            .recover_poison("SettingsManager::record_installed_search_path");
+        if !paths.contains(&data_dir) {
+            paths.push(data_dir);
+        }
+    }
+
+    /// Reapply parser data directories added after the startup layers loaded.
+    pub(crate) fn apply_installed_search_paths(
+        &self,
+        raw_settings: &mut RawWorkspaceSettings,
+        settings: &mut WorkspaceSettings,
+    ) {
+        let paths = self
+            .installed_search_paths
+            .lock()
+            .recover_poison("SettingsManager::apply_installed_search_paths");
+        for path in paths.iter() {
+            let cleaned_path = std::path::Path::new(path).clean();
+            if !settings
+                .search_paths
+                .iter()
+                .any(|existing| std::path::Path::new(existing).clean() == cleaned_path)
+            {
+                settings.search_paths.push(path.clone());
+                let raw_paths = raw_settings.search_paths.get_or_insert_with(Vec::new);
+                if !raw_paths
+                    .iter()
+                    .any(|existing| std::path::Path::new(existing).clean() == cleaned_path)
+                {
+                    raw_paths.push(path.clone());
+                }
+            }
+        }
     }
 
     /// Load the current raw and effective workspace settings from one snapshot.
@@ -556,6 +616,81 @@ mod tests {
             raw_settings.auto_install
         );
         assert_eq!(&*snapshot.settings, &effective_settings);
+    }
+
+    #[test]
+    fn test_installed_search_paths_survive_rebuilt_runtime_settings() {
+        let manager = SettingsManager::new();
+        manager.record_installed_search_path(std::path::Path::new("/installed"));
+
+        let mut raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["/runtime".to_string()]),
+            ..Default::default()
+        };
+        let mut effective_settings =
+            WorkspaceSettings::try_from_settings(&raw_settings, None, |_| None).unwrap();
+
+        manager.apply_installed_search_paths(&mut raw_settings, &mut effective_settings);
+
+        assert_eq!(
+            raw_settings.search_paths,
+            Some(vec!["/runtime".to_string(), "/installed".to_string()])
+        );
+        assert_eq!(
+            effective_settings.search_paths,
+            vec!["/runtime".to_string(), "/installed".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_installed_search_path_does_not_duplicate_expanded_raw_path() {
+        let manager = SettingsManager::new();
+        manager.record_installed_search_path(std::path::Path::new("/installed"));
+
+        let mut raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["${DATA_DIR}".to_string()]),
+            ..Default::default()
+        };
+        let mut effective_settings =
+            WorkspaceSettings::try_from_settings(&raw_settings, None, |var| {
+                (var == "DATA_DIR").then(|| "/installed".to_string())
+            })
+            .unwrap();
+
+        manager.apply_installed_search_paths(&mut raw_settings, &mut effective_settings);
+
+        assert_eq!(
+            raw_settings.search_paths,
+            Some(vec!["${DATA_DIR}".to_string()])
+        );
+        assert_eq!(
+            effective_settings.search_paths,
+            vec!["/installed".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_installed_search_path_deduplicates_lexical_variants() {
+        let manager = SettingsManager::new();
+        manager.record_installed_search_path(std::path::Path::new("/tmp/parent/../installed"));
+
+        let mut raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["/tmp/installed".to_string()]),
+            ..Default::default()
+        };
+        let mut effective_settings =
+            WorkspaceSettings::try_from_settings(&raw_settings, None, |_| None).unwrap();
+
+        manager.apply_installed_search_paths(&mut raw_settings, &mut effective_settings);
+
+        assert_eq!(
+            raw_settings.search_paths,
+            Some(vec!["/tmp/installed".to_string()])
+        );
+        assert_eq!(
+            effective_settings.search_paths,
+            vec!["/tmp/installed".to_string()]
+        );
     }
 
     /// Tests for supports_semantic_tokens_refresh capability checking.
