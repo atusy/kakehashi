@@ -575,9 +575,14 @@ fn read_optional_install_dir(path: &Path, kind: &str) -> Result<Option<std::fs::
         }
         Ok(_) => {}
     }
-    std::fs::read_dir(path)
-        .map(Some)
-        .map_err(|e| format!("cannot read {kind} directory '{}': {e}", path.display()))
+    match std::fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "cannot read {kind} directory '{}': {e}",
+            path.display()
+        )),
+    }
 }
 
 fn collect_installed_languages_for_uninstall(
