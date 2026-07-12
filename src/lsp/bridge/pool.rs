@@ -554,8 +554,8 @@ impl LanguageServerPool {
         self.workspace_folders.snapshot()
     }
 
-    /// Update the upstream client workspace snapshot used by future
-    /// client-fallback downstream connections.
+    /// Update the upstream client workspace snapshot, notifying compatible
+    /// live shared/fallback connections and recycling incompatible ones.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
@@ -607,21 +607,9 @@ impl LanguageServerPool {
             }
         }
 
-        let mut stale_handles = Vec::new();
-        for key in invalidated {
-            if let Some(handle) = connections.get(&key) {
-                handle.begin_shutdown();
-            }
-            self.host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
-            self.document_tracker.purge_connection(&key).await;
-            self.purge_open_transition_locks(&key).await;
-            if let Some(handle) = connections.remove(&key) {
-                stale_handles.push((key, handle));
-            }
-        }
+        let stale_handles = self
+            .remove_and_purge_invalidated_connections(&mut connections, invalidated)
+            .await;
         drop(connections);
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
@@ -741,21 +729,9 @@ impl LanguageServerPool {
             }
         }
 
-        let mut stale_handles = Vec::new();
-        for key in invalidated {
-            if let Some(handle) = connections.get(&key) {
-                handle.begin_shutdown();
-            }
-            self.host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
-            self.document_tracker.purge_connection(&key).await;
-            self.purge_open_transition_locks(&key).await;
-            if let Some(handle) = connections.remove(&key) {
-                stale_handles.push((key, handle));
-            }
-        }
+        let stale_handles = self
+            .remove_and_purge_invalidated_connections(&mut connections, invalidated)
+            .await;
 
         let mut pushed = 0;
         for (key, handle) in connections.iter() {
@@ -1162,6 +1138,34 @@ impl LanguageServerPool {
                 Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
             });
         }
+    }
+
+    /// Stop, purge, and remove invalidated connections while the caller holds
+    /// the connection-map lock. Keeping the map locked through key-based purge
+    /// prevents a replacement with the same key from being spawned and then
+    /// having its fresh tracking state removed as though it belonged to the
+    /// stale handle.
+    async fn remove_and_purge_invalidated_connections(
+        &self,
+        connections: &mut HashMap<ConnectionKey, Arc<ConnectionHandle>>,
+        invalidated: Vec<ConnectionKey>,
+    ) -> Vec<(ConnectionKey, Arc<ConnectionHandle>)> {
+        let mut stale_handles = Vec::new();
+        for key in invalidated {
+            if let Some(handle) = connections.get(&key) {
+                handle.begin_shutdown();
+            }
+            self.host_documents
+                .lock()
+                .await
+                .retain(|(_, connection_key), _| connection_key != &key);
+            self.document_tracker.purge_connection(&key).await;
+            self.purge_open_transition_locks(&key).await;
+            if let Some(handle) = connections.remove(&key) {
+                stale_handles.push((key, handle));
+            }
+        }
+        stale_handles
     }
 
     /// Resolve the exact `(server, root)` connection a document currently
