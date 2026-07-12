@@ -130,8 +130,17 @@ fn spawn_invalidated_connection_cleanup(
                 stale_handles.push((key, handle));
             }
         }
+        let mut shutdowns = tokio::task::JoinSet::new();
         for (key, handle) in stale_handles {
-            shutdown_invalidated_connection(key, handle).await;
+            shutdowns.spawn(shutdown_invalidated_connection(key, handle));
+        }
+        while let Some(result) = shutdowns.join_next().await {
+            if let Err(error) = result {
+                log::error!(
+                    target: "kakehashi::bridge",
+                    "invalidated connection shutdown task failed: {error}"
+                );
+            }
         }
         drop(connections);
     })
