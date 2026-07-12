@@ -117,9 +117,9 @@ fn whole_document_range(host_text: &str) -> tree_sitter::Range {
 /// Regex chain consults the markdown, then python, then regex injection
 /// queries in turn — matching the semantic-tokens parallel collector.
 ///
-/// The returned `Vec` always contains at least the host layer (layer 0); the
+/// The returned stack always contains at least the host layer (layer 0); the
 /// function never fails — a parse/registry miss at any depth simply stops the
-/// walk and returns the layers gathered so far.
+/// walk and returns the layers gathered so far, plus any terminal ambiguity.
 pub(super) fn injection_stack_at(
     coordinator: &LanguageCoordinator,
     host_language: &str,
