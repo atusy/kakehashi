@@ -29,7 +29,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::TextDocumentIdentifier;
 use ulid::Ulid;
 
-use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{NodeResolution, with_resolved_node};
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 /// Request parameters for `kakehashi/node/parent`.
@@ -113,15 +113,17 @@ impl Kakehashi {
                     .map(|p| (p.start_byte(), p.end_byte(), p.kind()))
             },
         );
-        let Some(Some((p_start, p_end, p_kind))) = parent_info else {
-            if parent_info.is_none() {
+        let (p_start, p_end, p_kind) = match parent_info {
+            NodeResolution::Found(Some(parent)) => parent,
+            NodeResolution::Found(None) | NodeResolution::Ambiguous => return Ok(Value::Null),
+            NodeResolution::NotFound => {
                 log::warn!(
                     target: "kakehashi::node::parent",
                     "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
                     layer, ulid, uri, start, end, kind
                 );
+                return Ok(Value::Null);
             }
-            return Ok(Value::Null);
         };
 
         // Issue / reuse a stable ULID for the parent (lazy-node-identity-tracking

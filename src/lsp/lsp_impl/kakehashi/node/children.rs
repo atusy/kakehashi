@@ -29,7 +29,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::TextDocumentIdentifier;
 use ulid::Ulid;
 
-use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{NodeResolution, with_resolved_node};
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 /// Request parameters for `kakehashi/node/children`.
@@ -105,7 +105,7 @@ impl Kakehashi {
         // tree-sitter's `Node::children(&mut cursor)` iterates BOTH named and
         // anonymous children in document order. A leaf node yields an empty
         // iterator, which we serialize as `[]` (NOT `null`).
-        let child_infos: Option<Vec<(usize, usize, &'static str)>> = with_resolved_node(
+        let child_infos: NodeResolution<Vec<(usize, usize, &'static str)>> = with_resolved_node(
             &self.language,
             &host_language,
             host_text,
@@ -121,13 +121,17 @@ impl Kakehashi {
                     .collect()
             },
         );
-        let Some(child_infos) = child_infos else {
-            log::warn!(
-                target: "kakehashi::node::children",
-                "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
-                layer, ulid, uri, start, end, kind
-            );
-            return Ok(Value::Null);
+        let child_infos = match child_infos {
+            NodeResolution::Found(children) => children,
+            NodeResolution::Ambiguous => return Ok(Value::Null),
+            NodeResolution::NotFound => {
+                log::warn!(
+                    target: "kakehashi::node::children",
+                    "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
+                    layer, ulid, uri, start, end, kind
+                );
+                return Ok(Value::Null);
+            }
         };
 
         let tracker = self.bridge.node_tracker();

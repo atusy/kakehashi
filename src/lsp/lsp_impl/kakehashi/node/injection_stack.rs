@@ -45,6 +45,15 @@ pub(super) struct InjectionLayer {
     ambiguous: bool,
 }
 
+/// Outcome of resolving a depth-keyed node reference.
+pub(super) enum NodeResolution<R> {
+    Found(R),
+    NotFound,
+    /// Multiple same-depth siblings contain the anchor, so choosing one would
+    /// risk returning a node from a tree that did not mint the id (#350).
+    Ambiguous,
+}
+
 /// Whether `pattern_index` carries an `#offset!` directive. Used to decide if
 /// the raw-content-node fast bounds check is safe: an offset can extend the
 /// effective range past the raw node, so the shortcut only holds without one.
@@ -261,7 +270,7 @@ pub(super) fn with_resolved_node<R>(
     kind: &'static str,
     layer: usize,
     mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
-) -> Option<R> {
+) -> NodeResolution<R> {
     with_resolved_node_ranges(
         coordinator,
         host_language,
@@ -297,18 +306,20 @@ pub(super) fn with_resolved_node_ranges<R>(
     kind: &'static str,
     layer: usize,
     mut f: impl FnMut(tree_sitter::Node<'_>, &[tree_sitter::Range]) -> R,
-) -> Option<R> {
+) -> NodeResolution<R> {
     // Reject obviously-invalid ranges up front — same guard `find_node_at`
     // applies internally, but checking here also avoids the expensive
     // `injection_stack_at` walk (which clones and re-parses layers) for a
     // stale tracker entry whose range no longer fits the document.
     if start > end || end > host_text.len() {
-        return None;
+        return NodeResolution::NotFound;
     }
 
     // Host layer: resolve against the host tree without the stack walk.
     if layer == 0 {
-        let node = find_node_at(host_tree, start, end, kind)?;
+        let Some(node) = find_node_at(host_tree, start, end, kind) else {
+            return NodeResolution::NotFound;
+        };
         // This is the shared prelude for EVERY id-based accessor, so the
         // whole-document range must be O(1): reuse the root's end position
         // instead of whole_document_range, whose byte_to_point would rescan
@@ -321,18 +332,22 @@ pub(super) fn with_resolved_node_ranges<R>(
             start_point: tree_sitter::Point { row: 0, column: 0 },
             end_point: host_tree.root_node().end_position(),
         }];
-        return Some(f(node, &ranges));
+        return NodeResolution::Found(f(node, &ranges));
     }
 
     // Deeper layer: rebuild the stack at `start` and search the minting layer
     // only. `stack.get(layer)` is None when the nesting is now shallower.
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
-    let layer_entry = stack.get(layer)?;
+    let Some(layer_entry) = stack.get(layer) else {
+        return NodeResolution::NotFound;
+    };
     if layer_entry.ambiguous {
-        return None;
+        return NodeResolution::Ambiguous;
     }
-    let node = find_node_at(&layer_entry.tree, start, end, kind)?;
-    Some(f(node, &layer_entry.ranges))
+    let Some(node) = find_node_at(&layer_entry.tree, start, end, kind) else {
+        return NodeResolution::NotFound;
+    };
+    NodeResolution::Found(f(node, &layer_entry.ranges))
 }
 
 /// Resolve **two** tracked nodes in the **same** minting layer and run `f` on
@@ -357,7 +372,7 @@ pub(super) fn with_resolved_node_pair<R>(
     descendant: (usize, usize, &'static str),
     layer: usize,
     mut f: impl FnMut(tree_sitter::Node<'_>, tree_sitter::Node<'_>) -> R,
-) -> Option<R> {
+) -> NodeResolution<R> {
     let (node_start, node_end, node_kind) = node;
     let (desc_start, desc_end, desc_kind) = descendant;
     // Same defensive range guards as the single-node path: a stale tracker
@@ -367,24 +382,36 @@ pub(super) fn with_resolved_node_pair<R>(
         || desc_start > desc_end
         || desc_end > host_text.len()
     {
-        return None;
+        return NodeResolution::NotFound;
     }
 
     // Host layer: both resolve against the host tree, no stack walk.
     if layer == 0 {
-        let resolved_node = find_node_at(host_tree, node_start, node_end, node_kind)?;
-        let resolved_desc = find_node_at(host_tree, desc_start, desc_end, desc_kind)?;
-        return Some(f(resolved_node, resolved_desc));
+        let Some(resolved_node) = find_node_at(host_tree, node_start, node_end, node_kind) else {
+            return NodeResolution::NotFound;
+        };
+        let Some(resolved_desc) = find_node_at(host_tree, desc_start, desc_end, desc_kind) else {
+            return NodeResolution::NotFound;
+        };
+        return NodeResolution::Found(f(resolved_node, resolved_desc));
     }
 
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, desc_start);
-    let layer_entry = stack.get(layer)?;
+    let Some(layer_entry) = stack.get(layer) else {
+        return NodeResolution::NotFound;
+    };
     if layer_entry.ambiguous {
-        return None;
+        return NodeResolution::Ambiguous;
     }
-    let resolved_node = find_node_at(&layer_entry.tree, node_start, node_end, node_kind)?;
-    let resolved_desc = find_node_at(&layer_entry.tree, desc_start, desc_end, desc_kind)?;
-    Some(f(resolved_node, resolved_desc))
+    let Some(resolved_node) = find_node_at(&layer_entry.tree, node_start, node_end, node_kind)
+    else {
+        return NodeResolution::NotFound;
+    };
+    let Some(resolved_desc) = find_node_at(&layer_entry.tree, desc_start, desc_end, desc_kind)
+    else {
+        return NodeResolution::NotFound;
+    };
+    NodeResolution::Found(f(resolved_node, resolved_desc))
 }
 
 /// Collect the injection languages along the cursor's injection path at
@@ -1105,8 +1132,8 @@ mod tests {
             |node| (node.start_byte(), node.end_byte(), node.kind()),
         );
 
-        assert_eq!(
-            resolved, None,
+        assert!(
+            matches!(resolved, NodeResolution::Ambiguous),
             "a depth-only id cannot prove which overlapping sibling minted it"
         );
     }
