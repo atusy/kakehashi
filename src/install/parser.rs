@@ -44,26 +44,18 @@ fn publish_parser_transactionally(
     match ops.rename(tmp_file, parser_file) {
         Ok(()) => {
             if had_old_parser {
-                if let Err(cleanup_error) = ops.remove_file(backup_file) {
-                    if let Err(unpublish_error) = ops.rename(parser_file, tmp_file) {
+                match ops.remove_file(backup_file) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
                         return Err(std::io::Error::new(
-                            cleanup_error.kind(),
+                            error.kind(),
                             format!(
-                                "failed to remove parser backup '{}': {cleanup_error}; failed to unpublish replacement: {unpublish_error}",
+                                "published parser but failed to remove backup '{}': {error}",
                                 backup_file.display()
                             ),
                         ));
                     }
-                    if let Err(rollback_error) = ops.rename(backup_file, parser_file) {
-                        return Err(std::io::Error::new(
-                            cleanup_error.kind(),
-                            format!(
-                                "failed to remove parser backup '{}': {cleanup_error}; failed to restore backup: {rollback_error}",
-                                backup_file.display()
-                            ),
-                        ));
-                    }
-                    return Err(cleanup_error);
                 }
             }
             Ok(())
@@ -1174,6 +1166,7 @@ mod tests {
         failed_renames: Vec<(PathBuf, PathBuf)>,
         rollback_error_kind: Option<std::io::ErrorKind>,
         failed_removals: Vec<PathBuf>,
+        vanished_removals: Vec<PathBuf>,
     }
 
     impl ParserFileOps for FakeParserFileOps {
@@ -1198,6 +1191,17 @@ mod tests {
         }
 
         fn remove_file(&mut self, path: &Path) -> std::io::Result<()> {
+            if self
+                .vanished_removals
+                .iter()
+                .any(|vanished| vanished == path)
+            {
+                self.files.remove(path);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "injected external removal",
+                ));
+            }
             if self.failed_removals.iter().any(|failed| failed == path) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -1285,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn transactional_publish_restores_old_parser_when_backup_cleanup_fails() {
+    fn transactional_publish_preserves_both_copies_when_backup_cleanup_fails() {
         let tmp = PathBuf::from("parser.tmp");
         let parser = PathBuf::from("parser.dll");
         let backup = PathBuf::from("parser.backup");
@@ -1298,8 +1302,25 @@ mod tests {
             .expect_err("backup cleanup failure must fail the transaction");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(ops.files.get(&parser), Some(&"old"));
-        assert_eq!(ops.files.get(&tmp), Some(&"new"));
+        assert_eq!(ops.files.get(&parser), Some(&"new"));
+        assert!(!ops.files.contains_key(&tmp));
+        assert_eq!(ops.files.get(&backup), Some(&"old"));
+    }
+
+    #[test]
+    fn transactional_publish_accepts_backup_that_vanished_during_cleanup() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.vanished_removals.push(backup.clone());
+
+        publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect("a vanished backup is already cleaned up");
+
+        assert_eq!(ops.files.get(&parser), Some(&"new"));
         assert!(!ops.files.contains_key(&backup));
     }
 
