@@ -484,6 +484,24 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn find_query_file_treats_dangling_symlink_as_present_asset() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let query_dir = dir.path().join("queries/rust");
+        fs::create_dir_all(&query_dir).unwrap();
+        let query_file = query_dir.join("highlights.scm");
+        symlink("missing-target.scm", &query_file).unwrap();
+
+        assert_eq!(
+            QueryLoader::find_query_file(&[dir.path()], "rust", "highlights.scm"),
+            Some(query_file),
+            "a broken configured asset must not be classified as ordinary absence"
+        );
+    }
+
     #[test]
     fn test_resolve_library_path() {
         // Test explicit library path
