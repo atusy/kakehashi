@@ -787,6 +787,42 @@ fn test_language_status_fails_for_dangling_install_directory_symlink() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_status_fails_for_dangling_query_entry_symlink() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir(test_dir.path().join("queries")).expect("Failed to create queries directory");
+    symlink(
+        "missing-query-directory",
+        test_dir.path().join("queries/rust"),
+    )
+    .expect("Failed to create dangling query symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect query directory"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No languages installed"),
+        "stderr: {stderr}"
+    );
+}
+
 /// Test that language status shows missing queries
 #[test]
 fn test_language_status_missing_queries() {

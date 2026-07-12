@@ -415,6 +415,7 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
         if is_parser && let Some(stem) = path.file_stem() {
             languages.insert(stem.to_string_lossy().to_string());
         }
+        Ok(())
     })
     .map_err(|e| {
         eprintln!(
@@ -426,9 +427,10 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 
     // Also check queries directory for languages that might only have queries
     visit_install_directory(&queries_dir, |entry| {
-        if let Some(name) = installed_query_language_name(&entry.path()) {
+        if let Some(name) = installed_query_language_name_checked(&entry.path())? {
             languages.insert(name);
         }
+        Ok(())
     })
     .map_err(|e| {
         eprintln!(
@@ -484,7 +486,7 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 /// not observe the complete installation and must not report an empty result.
 fn visit_install_directory(
     path: &Path,
-    mut visit: impl FnMut(std::fs::DirEntry),
+    mut visit: impl FnMut(std::fs::DirEntry) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
@@ -503,23 +505,30 @@ fn visit_install_directory(
         Err(e) => return Err(e),
     };
     for entry in entries {
-        visit(entry?);
+        visit(entry?)?;
     }
     Ok(())
 }
 
 fn installed_query_language_name(path: &Path) -> Option<String> {
-    if !path.is_dir() {
-        return None;
+    installed_query_language_name_checked(path).ok().flatten()
+}
+
+fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<String>> {
+    if !std::fs::metadata(path)?.is_dir() {
+        return Ok(None);
     }
-    let name = path.file_name()?.to_string_lossy();
+    let Some(file_name) = path.file_name() else {
+        return Ok(None);
+    };
+    let name = file_name.to_string_lossy();
     if name.starts_with('.') {
-        return None;
+        return Ok(None);
     }
     if !queries::is_safe_language_name(&name) {
-        return None;
+        return Ok(None);
     }
-    Some(name.to_string())
+    Ok(Some(name.to_string()))
 }
 
 /// Run the language uninstall command
