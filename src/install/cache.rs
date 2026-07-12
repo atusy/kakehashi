@@ -43,13 +43,11 @@ impl MetadataCache {
     /// Returns `None` if cache doesn't exist or is stale.
     pub fn read(&self) -> Option<String> {
         let cache_path = self.cache_path();
-
-        if !cache_path.exists() {
+        let mut file = open_cache_file(&cache_path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !cache_metadata_is_regular(&metadata) {
             return None;
         }
-
-        // Check if cache is fresh based on file modification time
-        let metadata = fs::metadata(&cache_path).ok()?;
         let modified = metadata.modified().ok()?;
         let age = SystemTime::now().duration_since(modified).ok()?;
 
@@ -58,7 +56,9 @@ impl MetadataCache {
             return None;
         }
 
-        fs::read_to_string(&cache_path).ok()
+        let mut content = String::new();
+        io::Read::read_to_string(&mut file, &mut content).ok()?;
+        Some(content)
     }
 
     /// Write content to cache.
@@ -104,6 +104,45 @@ impl MetadataCache {
 
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn open_cache_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn cache_metadata_is_regular(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_type().is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(not(windows))]
+fn cache_metadata_is_regular(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+}
+
+#[cfg(windows)]
+fn open_cache_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_cache_file(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
 }
 
 #[cfg(test)]
@@ -152,6 +191,49 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(cache_path).unwrap(), "metadata");
         assert_eq!(fs::read_to_string(target).unwrap(), "unrelated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_read_ignores_symlink_without_reading_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let cache_path = cache_dir.join("parsers.lua");
+        let target = temp.path().join("outside.lua");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(&target, "outside metadata").unwrap();
+        symlink(&target, cache_path).unwrap();
+
+        let cache = MetadataCache::with_default_ttl(temp.path());
+
+        assert_eq!(cache.read(), None);
+        assert_eq!(fs::read_to_string(target).unwrap(), "outside metadata");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cache_read_ignores_windows_symlink_without_reading_target() {
+        use std::os::windows::fs::symlink_file;
+
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let cache_path = cache_dir.join("parsers.lua");
+        let target = temp.path().join("outside.lua");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(&target, "outside metadata").unwrap();
+        if let Err(error) = symlink_file(&target, &cache_path) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("create cache symlink: {error}");
+        }
+
+        let cache = MetadataCache::with_default_ttl(temp.path());
+
+        assert_eq!(cache.read(), None);
+        assert_eq!(fs::read_to_string(target).unwrap(), "outside metadata");
     }
 
     #[test]
