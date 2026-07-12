@@ -256,7 +256,7 @@ fn recover_parser_backups(
     language: &str,
 ) -> std::io::Result<()> {
     cleanup_orphan_parser_backup_markers(parser_dir, language)?;
-    let mut backups = parser_backup_files(parser_dir, language)?;
+    let backups = parser_backup_files(parser_dir, language)?;
     if backups.is_empty() {
         return Ok(());
     }
