@@ -147,19 +147,7 @@ pub fn load_settings(
         .flatten();
     let raw_settings = merged.clone();
     let settings =
-        merged.and_then(
-            |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
-                Ok(ws) => Some(ws),
-                Err(errs) => {
-                    events.push(SettingsEvent::error(format!(
-                        "Path expansion failed: {errs}. \
-                     This configuration has been discarded. \
-                     Please correct the affected paths and environment variables or remove them from your config.",
-                    )));
-                    None
-                }
-            },
-        );
+        expand_merged_settings(merged, home, &env_fn, &mut events, fatal_error.is_some());
 
     SettingsLoadOutcome {
         settings,
@@ -168,6 +156,32 @@ pub fn load_settings(
         used_deprecated_root_markers,
         fatal_error,
     }
+}
+
+fn expand_merged_settings(
+    merged: Option<RawWorkspaceSettings>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+    skip_due_to_fatal_error: bool,
+) -> Option<WorkspaceSettings> {
+    if skip_due_to_fatal_error {
+        return None;
+    }
+
+    merged.and_then(
+        |settings| match WorkspaceSettings::try_from_settings(&settings, home, env_fn) {
+            Ok(settings) => Some(settings),
+            Err(errs) => {
+                events.push(SettingsEvent::error(format!(
+                    "Path expansion failed: {errs}. \
+                     This configuration has been discarded. \
+                     Please correct the affected paths and environment variables or remove them from your config.",
+                )));
+                None
+            }
+        },
+    )
 }
 
 /// Load user config and add appropriate events to the events vector.
@@ -598,6 +612,28 @@ mod tests {
                 .all(|event| !event.message.contains("previous settings")),
             "initialization-time errors must not claim that previous settings exist"
         );
+    }
+
+    #[test]
+    fn fatal_explicit_error_skips_duplicate_merged_expansion_event() {
+        let merged = RawWorkspaceSettings {
+            search_paths: Some(vec!["$UNDEFINED_VAR/parsers".to_string()]),
+            ..Default::default()
+        };
+        let mut events = vec![SettingsEvent::error(
+            "Path expansion failed in explicit.toml",
+        )];
+
+        let settings = expand_merged_settings(
+            Some(merged),
+            None,
+            crate::config::make_env(&[]),
+            &mut events,
+            true,
+        );
+
+        assert!(settings.is_none());
+        assert_eq!(events.len(), 1, "fatal error must be reported only once");
     }
 
     /// A config layer using the deprecated `rootMarkers` key sets the outcome
