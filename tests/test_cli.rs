@@ -1209,29 +1209,36 @@ fn test_language_uninstall_all() {
     assert!(queries.is_empty(), "All queries should be removed");
 }
 
-/// `--all` must not claim success when it cannot enumerate installed parsers.
 #[cfg(unix)]
-#[test]
-fn test_language_uninstall_all_fails_for_unreadable_parser_dir() {
+fn assert_uninstall_all_fails_for_unreadable_dir(dir_name: &str) {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let parser_dir = test_dir.path().join("parser");
-    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
-    fs::write(
-        parser_dir.join(format!("testlang.{}", std::env::consts::DLL_EXTENSION)),
-        "fake",
-    )
-    .expect("Failed to write parser");
-    fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o000))
-        .expect("Failed to make parser dir unreadable");
+    let install_dir = test_dir.path().join(dir_name);
+    if dir_name == "parser" {
+        fs::create_dir_all(&install_dir).expect("Failed to create parser dir");
+        fs::write(
+            install_dir.join(format!("testlang.{}", std::env::consts::DLL_EXTENSION)),
+            "fake",
+        )
+        .expect("Failed to write parser");
+    } else {
+        fs::create_dir_all(install_dir.join("testlang")).expect("Failed to create queries dir");
+        fs::write(
+            install_dir.join("testlang/highlights.scm"),
+            "(comment) @comment",
+        )
+        .expect("Failed to write query");
+    }
+    fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make install dir unreadable");
 
     // Elevated test environments may retain permission to read mode-000 paths.
     // Skip there rather than asserting a failure the OS cannot produce.
-    if fs::read_dir(&parser_dir).is_ok() {
-        fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
-            .expect("Failed to restore parser dir permissions");
+    if fs::read_dir(&install_dir).is_ok() {
+        fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore install dir permissions");
         return;
     }
 
@@ -1247,8 +1254,8 @@ fn test_language_uninstall_all_fails_for_unreadable_parser_dir() {
         .output()
         .expect("Failed to execute command");
 
-    fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
-        .expect("Failed to restore parser dir permissions");
+    fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore install dir permissions");
 
     assert!(
         !output.status.success(),
@@ -1260,6 +1267,14 @@ fn test_language_uninstall_all_fails_for_unreadable_parser_dir() {
         "stderr should identify the failed install scan: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// `--all` must not claim success when either asset root cannot be enumerated.
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_fails_for_unreadable_install_dirs() {
+    assert_uninstall_all_fails_for_unreadable_dir("parser");
+    assert_uninstall_all_fails_for_unreadable_dir("queries");
 }
 
 /// Test that language uninstall --all ignores internal query staging directories
