@@ -346,11 +346,9 @@ fn recover_parser_backups(
     Ok(true)
 }
 
-/// Remove the canonical parser and every kakehashi-generated replacement backup.
-pub fn remove_parser_install_and_backups(
-    parser_dir: &Path,
-    language: &str,
-) -> std::io::Result<bool> {
+/// Remove parser artifacts without operation coordination for focused unit tests.
+#[cfg(test)]
+fn remove_parser_install_and_backups(parser_dir: &Path, language: &str) -> std::io::Result<bool> {
     if !super::queries::is_safe_language_name(language) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -393,6 +391,8 @@ pub enum ParserInstallError {
     IoError(std::io::Error),
     /// Parser already exists.
     AlreadyExists(PathBuf),
+    /// An interrupted replacement was recovered instead of rebuilding.
+    Recovered(PathBuf),
 }
 
 impl std::fmt::Display for ParserInstallError {
@@ -410,6 +410,7 @@ impl std::fmt::Display for ParserInstallError {
                     path.display()
                 )
             }
+            Self::Recovered(path) => write!(f, "Recovered parser at {}", path.display()),
         }
     }
 }
@@ -435,8 +436,7 @@ pub struct ParserInstallResult {
     pub language: String,
     /// Path where parser was installed.
     pub install_path: PathBuf,
-    /// Git revision that was used. Empty when an interrupted replacement was
-    /// recovered without rebuilding from source.
+    /// Git revision that was used.
     pub revision: String,
 }
 
@@ -817,11 +817,7 @@ pub fn install_parser_after_operation_started(
 
     #[cfg(windows)]
     if recovered && !options.force {
-        return Ok(ParserInstallResult {
-            language: language.to_string(),
-            install_path: parser_file,
-            revision: String::new(),
-        });
+        return Err(ParserInstallError::Recovered(parser_file));
     }
 
     let install_token = begin_parser_install(&parser_dir, &parser_file, language, options.force)?;
