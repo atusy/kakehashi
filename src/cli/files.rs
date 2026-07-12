@@ -61,7 +61,7 @@ pub(crate) fn collect_files(
 
     let mut files = Vec::new();
     let mut walk_errors = 0usize;
-    let mut has_explicit_symlink = false;
+    let mut has_explicit_alias = false;
     for path in paths {
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
@@ -79,22 +79,24 @@ pub(crate) fn collect_files(
             if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;
             }
-            has_explicit_symlink |= is_symlink;
+            has_explicit_alias |= paths.len() > 1
+                && std::fs::canonicalize(&path).is_ok_and(|resolved| resolved != path);
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
         } else {
             if is_excluded(&exclude_matcher, base, &path, false) {
                 continue;
             }
-            has_explicit_symlink |= is_symlink;
+            has_explicit_alias |= paths.len() > 1
+                && std::fs::canonicalize(&path).is_ok_and(|resolved| resolved != path);
             files.push(path);
         }
     }
     files.sort();
-    if has_explicit_symlink {
+    if has_explicit_alias {
         let mut seen = std::collections::HashSet::new();
         files.retain(|path| {
             // Preserve the stable sorted spelling for output, but compare the
-            // resolved path so explicit symlink aliases do not process one file
+            // resolved path so explicit filesystem aliases do not process one file
             // twice. If an entry vanished after collection, retain its lexical
             // path and let the caller report the existing read error.
             let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
@@ -510,6 +512,28 @@ mod tests {
             std::fs::canonicalize(&files[0]).unwrap(),
             std::fs::canonicalize(document).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ancestor_aliases_are_deduplicated() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        let document = real.join("doc.md");
+        write(&document, "x");
+        symlink(&real, &alias).unwrap();
+
+        let files = collect_paths(
+            tmp.path(),
+            &[document.clone(), alias.join("doc.md")],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
     }
 
     #[test]
