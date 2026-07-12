@@ -154,6 +154,7 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
     let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
     install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
@@ -170,6 +171,7 @@ pub fn install_queries_with_dependencies_after_install_started(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
     let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
     install_queries_with_dependencies_after_install_started_under_operation_lock(
         language, data_dir, force,
@@ -200,6 +202,7 @@ pub(crate) fn install_queries_with_dependencies_from(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
     let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
     install_queries_with_dependencies_from_under_operation_lock(base_url, language, data_dir, force)
 }
@@ -228,6 +231,7 @@ pub(crate) fn install_queries_with_dependencies_from_allowing_http_for_tests(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
     let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
     install_queries_with_dependencies_from_allowing_http_for_tests_under_operation_lock(
         base_url, language, data_dir, force,
