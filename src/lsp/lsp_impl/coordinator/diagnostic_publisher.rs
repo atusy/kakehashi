@@ -125,6 +125,7 @@ pub(crate) struct DiagnosticPublisher {
     settings_manager: Arc<SettingsManager>,
     cache: Arc<crate::lsp::cache::CacheCoordinator>,
     aggregator: Arc<DiagnosticAggregator>,
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl DiagnosticPublisher {
@@ -137,6 +138,7 @@ impl DiagnosticPublisher {
             settings_manager: Arc::clone(&server.settings_manager),
             cache: Arc::clone(&server.cache),
             aggregator: Arc::clone(&server.diagnostics),
+            shutdown: server.shutdown_token.clone(),
         }
     }
 
@@ -154,8 +156,13 @@ impl DiagnosticPublisher {
         };
         let publisher = self.clone();
         tokio::spawn(async move {
-            wait_for_forwarded_refresh_settle(&publisher.aggregator, generation).await;
-            publisher.request_pull_diagnostic_refresh_inner(true, false);
+            tokio::select! {
+                biased;
+                _ = publisher.shutdown.cancelled() => {}
+                _ = wait_for_forwarded_refresh_settle(&publisher.aggregator, generation) => {
+                    publisher.request_pull_diagnostic_refresh_inner(true, false);
+                }
+            }
         });
     }
 
@@ -1134,6 +1141,33 @@ mod tests {
         publisher.request_forwarded_diagnostic_refresh();
 
         assert_eq!(server.diagnostics.metrics_snapshot().refreshes_requested, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_pending_forwarded_refresh() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.request_forwarded_diagnostic_refresh();
+        server.shutdown_token.cancel();
+
+        tokio::time::advance(FORWARDED_REFRESH_MAX_WAIT).await;
+        tokio::task::yield_now().await;
+
+        let metrics = server.diagnostics.metrics_snapshot();
+        assert_eq!(metrics.refreshes_requested, 1);
+        assert_eq!(metrics.refreshes_sent, 0, "shutdown must suppress the send");
     }
 
     fn rust_server_config() -> (String, BridgeServerConfig) {
