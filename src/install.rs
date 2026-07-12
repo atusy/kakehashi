@@ -54,6 +54,9 @@ pub enum LanguageOperationPermit<'a> {
 
 impl LanguageOperationPermit<'_> {
     pub(crate) fn covers(&self, data_dir: &std::path::Path, language: &str) -> bool {
+        let Ok(data_dir) = fs::canonicalize(data_dir) else {
+            return false;
+        };
         match self {
             Self::Language(guard) => guard.data_dir == data_dir && guard.language == language,
             Self::All(guard) => guard.data_dir == data_dir,
@@ -78,7 +81,7 @@ impl AllLanguageOperationsLockGuard {
         file.lock_exclusive()?;
         Ok(Self {
             _file: file,
-            data_dir: data_dir.to_path_buf(),
+            data_dir: fs::canonicalize(data_dir)?,
         })
     }
 }
@@ -107,7 +110,7 @@ impl LanguageOperationLockGuard {
         Ok(Self {
             _all_file: all_file,
             _file: file,
-            data_dir: data_dir.to_path_buf(),
+            data_dir: fs::canonicalize(data_dir)?,
             language: language.to_string(),
         })
     }
@@ -527,6 +530,22 @@ mod tests {
         assert!(permit.covers(temp.path(), "lua"));
         assert!(permit.covers(temp.path(), "python"));
         assert!(!permit.covers(other.path(), "lua"));
+    }
+
+    #[test]
+    fn operation_permit_uses_canonical_directory_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let equivalent = data_dir.join("nested/..");
+        fs::create_dir_all(data_dir.join("nested")).unwrap();
+
+        let language = LanguageOperationLockGuard::acquire(&equivalent, "lua").unwrap();
+        let permit = LanguageOperationPermit::Language(&language);
+        assert!(
+            permit.covers(&data_dir, "lua"),
+            "equivalent path spellings must identify the same locked directory"
+        );
     }
 
     #[test]
