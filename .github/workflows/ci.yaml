@@ -26,6 +26,13 @@ jobs:
       - run: make deps/tree-sitter
       - run: cargo test
 
+  windows-parser-test:
+    name: Windows parser test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --lib install::parser::tests
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
