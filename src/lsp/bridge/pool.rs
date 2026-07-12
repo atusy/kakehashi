@@ -372,7 +372,7 @@ pub struct LanguageServerPool {
     ///
     /// Set once via `set_workspace_folders()` after receiving the upstream initialize request.
     /// Passed to downstream servers during LSP handshake.
-    workspace_folders: OnceLock<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+    workspace_folders: super::WorkspaceFolderSet,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set once via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -459,7 +459,7 @@ impl LanguageServerPool {
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
             root_uri: OnceLock::new(),
-            workspace_folders: OnceLock::new(),
+            workspace_folders: super::WorkspaceFolderSet::new(None),
             client_capabilities: OnceLock::new(),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
@@ -544,12 +544,24 @@ impl LanguageServerPool {
         &self,
         folders: Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>,
     ) {
-        let _ = self.workspace_folders.set(folders);
+        if let Some(folders) = folders {
+            self.workspace_folders.apply_change(folders, &[]);
+        }
     }
 
     /// Get the workspace folders.
     fn workspace_folders(&self) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
-        self.workspace_folders.get().and_then(|v| v.clone())
+        self.workspace_folders.snapshot()
+    }
+
+    /// Update the upstream client workspace snapshot used by future
+    /// client-fallback downstream connections.
+    pub(crate) fn apply_workspace_folder_change(
+        &self,
+        added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
+        removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
+    ) {
+        self.workspace_folders.apply_change(added, removed);
     }
 
     /// Set the upstream client capabilities.
