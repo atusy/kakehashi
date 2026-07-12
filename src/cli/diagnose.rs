@@ -467,7 +467,23 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
 /// Make an untrusted diagnostic field safe for the line-oriented `default`
 /// format: collapse whitespace runs and visibly escape terminal controls.
 /// Single-pass, with no intermediate collection.
-fn one_line(message: &str) -> String {
+fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
+    let mut previous_whitespace = false;
+    let mut needs_rewrite = false;
+    for (index, ch) in message.chars().enumerate() {
+        if ch.is_whitespace() {
+            needs_rewrite |= ch != ' ' || index == 0 || previous_whitespace;
+            previous_whitespace = true;
+        } else {
+            needs_rewrite |= ch.is_control();
+            previous_whitespace = false;
+        }
+    }
+    needs_rewrite |= previous_whitespace;
+    if !needs_rewrite {
+        return std::borrow::Cow::Borrowed(message);
+    }
+
     let mut out = String::with_capacity(message.len());
     let mut pending_space = false;
     for ch in message.chars() {
@@ -485,7 +501,7 @@ fn one_line(message: &str) -> String {
             out.push(ch);
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// The lower-case severity word. Both an absent severity and an out-of-spec
