@@ -334,8 +334,8 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     // over — after writing, so a read-only target mode can't block the write.
     tmp.as_file()
         .set_permissions(std::fs::metadata(&target)?.permissions())?;
-    // A link can be added while the replacement is prepared. Check again at
-    // the last point before persist would split that new alias from `target`.
+    // A link can be added while the replacement is prepared. Narrow that race
+    // by checking again immediately before persist would split the new alias.
     reject_multiple_hard_links(&target)?;
     tmp.persist(&target).map_err(|e| e.error)?;
     // Best-effort directory fsync: on some filesystems the rename's
@@ -368,6 +368,8 @@ fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn reject_multiple_hard_links(_target: &Path) -> std::io::Result<()> {
+    // Stable std currently exposes link counts only on Unix. In particular,
+    // Windows MetadataExt::number_of_links is still a nightly-only API.
     Ok(())
 }
 
