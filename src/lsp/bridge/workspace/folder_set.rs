@@ -70,14 +70,20 @@ impl WorkspaceFolderSet {
 
     /// Apply an upstream workspace-folder change atomically. Removals match by
     /// URI (folder names are display metadata), then additions append in event
-    /// order while preserving URI uniqueness.
-    pub(crate) fn apply_change(&self, added: Vec<WorkspaceFolder>, removed: &[WorkspaceFolder]) {
+    /// order while preserving URI uniqueness. Returns the resulting snapshot
+    /// from the same lock acquisition so primary-root selection cannot observe
+    /// an interleaved folder event.
+    pub(crate) fn apply_change(
+        &self,
+        added: Vec<WorkspaceFolder>,
+        removed: &[WorkspaceFolder],
+    ) -> Option<Vec<WorkspaceFolder>> {
         let mut guard = self
             .inner
             .lock()
             .recover_poison("WorkspaceFolderSet::apply_change");
         if guard.is_none() && added.is_empty() {
-            return;
+            return None;
         }
         let folders = guard.get_or_insert_with(Vec::new);
         folders.retain(|existing| !removed.iter().any(|removed| removed.uri == existing.uri));
@@ -86,6 +92,7 @@ impl WorkspaceFolderSet {
                 folders.push(folder);
             }
         }
+        guard.clone()
     }
 
     /// Atomically add `folder` and announce it, returning whether the set now

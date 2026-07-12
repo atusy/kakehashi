@@ -1,6 +1,7 @@
 //! `SettingsManager`: workspace settings (`ArcSwap`, hot-swappable via
-//! `apply_settings`) plus initialize-only state — `client_capabilities` and
-//! `root_path` (both `OnceLock`, set once during `initialize()`).
+//! `apply_settings`) plus client capabilities and primary-root state. The root
+//! shares the same `ArcSwap` snapshot as raw/effective settings so a workspace
+//! folder transition publishes all three atomically (#746).
 
 use arc_swap::ArcSwap;
 use path_clean::PathClean;
@@ -13,19 +14,27 @@ use tower_lsp_server::ls_types::{
 
 use crate::config::expand::with_kakehashi_defaults;
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
+use crate::error::LockResultExt;
 #[cfg(test)]
 use crate::lsp::client::check_semantic_tokens_refresh_support;
 
 /// Centralized manager for workspace settings, capabilities, and configuration.
 #[derive(Debug)]
 pub(crate) struct SettingsSnapshot {
+    pub(crate) root_path: Arc<Option<PathBuf>>,
     pub(crate) raw_settings: Arc<RawWorkspaceSettings>,
     pub(crate) settings: Arc<WorkspaceSettings>,
 }
 
 pub(crate) struct SettingsManager {
-    root_path: ArcSwap<Option<PathBuf>>,
     settings_snapshot: ArcSwap<SettingsSnapshot>,
+    /// Session-owned configuration layers (initialization options followed by
+    /// runtime updates), retained separately so a workspace-root change can
+    /// replace only the project-file layer.
+    session_settings: std::sync::Mutex<Option<RawWorkspaceSettings>>,
+    /// Deprecated `rootUri`, or process CWD when absent. Initialize fixes this
+    /// fallback for the session; it is used only when no workspace folder remains.
+    fallback_root_path: OnceLock<Option<PathBuf>>,
     /// Client capabilities from initialize() - immutable after initialization.
     /// Uses OnceLock to enforce "set once, read many" semantics per LSP protocol.
     client_capabilities: OnceLock<ClientCapabilities>,
@@ -42,7 +51,6 @@ pub(crate) struct SettingsManager {
 impl std::fmt::Debug for SettingsManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SettingsManager")
-            .field("root_path", &"ArcSwap<Option<PathBuf>>")
             .field("settings_snapshot", &"ArcSwap<SettingsSnapshot>")
             .field("client_capabilities", &"OnceLock<ClientCapabilities>")
             .finish()
@@ -74,11 +82,13 @@ impl SettingsManager {
         });
 
         Self {
-            root_path: ArcSwap::new(Arc::new(None)),
             settings_snapshot: ArcSwap::new(Arc::new(SettingsSnapshot {
+                root_path: Arc::new(None),
                 raw_settings: Arc::new(raw_settings),
                 settings: Arc::new(settings),
             })),
+            session_settings: std::sync::Mutex::new(None),
+            fallback_root_path: OnceLock::new(),
             client_capabilities: OnceLock::new(),
             root_markers_deprecation_warned: AtomicBool::new(false),
             unwrapped_didchange_deprecation_warned: AtomicBool::new(false),
@@ -136,12 +146,25 @@ impl SettingsManager {
     /// `workspace_folders`, `root_uri` (deprecated but supported for backward
     /// compatibility), or the current working directory.
     pub(crate) fn set_root_path(&self, path: Option<PathBuf>) {
-        self.root_path.store(Arc::new(path));
+        let snapshot = self.settings_snapshot.load_full();
+        self.settings_snapshot.store(Arc::new(SettingsSnapshot {
+            root_path: Arc::new(path),
+            raw_settings: Arc::clone(&snapshot.raw_settings),
+            settings: Arc::clone(&snapshot.settings),
+        }));
     }
 
     /// Get the current workspace root path.
     pub(crate) fn root_path(&self) -> Arc<Option<PathBuf>> {
-        self.root_path.load_full()
+        Arc::clone(&self.settings_snapshot.load().root_path)
+    }
+
+    pub(crate) fn set_fallback_root_path(&self, path: Option<PathBuf>) {
+        let _ = self.fallback_root_path.set(path);
+    }
+
+    pub(crate) fn fallback_root_path(&self) -> Option<PathBuf> {
+        self.fallback_root_path.get().cloned().flatten()
     }
 
     /// Load the current workspace settings.
@@ -159,6 +182,20 @@ impl SettingsManager {
         self.settings_snapshot.load_full()
     }
 
+    pub(crate) fn set_session_settings(&self, settings: Option<RawWorkspaceSettings>) {
+        *self
+            .session_settings
+            .lock()
+            .recover_poison("SettingsManager::session_settings") = settings;
+    }
+
+    pub(crate) fn load_session_settings(&self) -> Option<RawWorkspaceSettings> {
+        self.session_settings
+            .lock()
+            .recover_poison("SettingsManager::session_settings")
+            .clone()
+    }
+
     /// Apply new workspace settings for later retrieval via `load_settings()`.
     pub(crate) fn apply_settings(&self, settings: WorkspaceSettings) {
         let raw_settings = RawWorkspaceSettings::from(&settings);
@@ -171,7 +208,19 @@ impl SettingsManager {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
+        let root_path = self.root_path();
+        self.apply_settings_with_raw_at_root(root_path.as_ref().clone(), raw_settings, settings);
+    }
+
+    /// Atomically publish a new primary root with the settings derived from it.
+    pub(crate) fn apply_settings_with_raw_at_root(
+        &self,
+        root_path: Option<PathBuf>,
+        raw_settings: RawWorkspaceSettings,
+        settings: WorkspaceSettings,
+    ) {
         self.settings_snapshot.store(Arc::new(SettingsSnapshot {
+            root_path: Arc::new(root_path),
             raw_settings: Arc::new(raw_settings),
             settings: Arc::new(settings),
         }));
@@ -383,6 +432,47 @@ mod tests {
         let loaded = manager.load_settings();
 
         assert!(!loaded.auto_install);
+    }
+
+    #[test]
+    fn session_settings_preserve_initialization_and_runtime_layers() {
+        let manager = SettingsManager::new();
+        let initialization = RawWorkspaceSettings {
+            auto_install: Some(false),
+            ..Default::default()
+        };
+
+        manager.set_session_settings(Some(initialization.clone()));
+
+        assert_eq!(
+            manager
+                .load_session_settings()
+                .and_then(|settings| settings.auto_install),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn root_and_settings_publish_in_one_snapshot() {
+        let manager = SettingsManager::new();
+        let raw = RawWorkspaceSettings {
+            auto_install: Some(false),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        };
+
+        manager.apply_settings_with_raw_at_root(Some(PathBuf::from("/new-root")), raw, settings);
+        let snapshot = manager.load_settings_pair();
+
+        assert_eq!(
+            snapshot.root_path.as_ref(),
+            &Some(PathBuf::from("/new-root"))
+        );
+        assert_eq!(snapshot.raw_settings.auto_install, Some(false));
+        assert!(!snapshot.settings.auto_install);
     }
 
     #[test]

@@ -102,6 +102,12 @@ pub(super) struct ReloadLanguageState<'a> {
     request_semantic_refresh: bool,
 }
 
+pub(super) struct SettingsUpdate {
+    root_path: Option<Option<std::path::PathBuf>>,
+    raw_settings: Option<RawWorkspaceSettings>,
+    settings: WorkspaceSettings,
+}
+
 /// One server process owns one effective workspace settings snapshot. Keep the
 /// complete async reload transaction ordered across didChangeConfiguration and
 /// post-install reloads, including downstream propagation and SettingsManager
@@ -137,9 +143,13 @@ pub(super) async fn apply_shared_settings(
     settings_manager: &SettingsManager,
     cache: &CacheCoordinator,
     bridge: &BridgeCoordinator,
-    raw_settings: Option<RawWorkspaceSettings>,
-    settings: WorkspaceSettings,
+    update: SettingsUpdate,
 ) -> Vec<Url> {
+    let SettingsUpdate {
+        root_path,
+        raw_settings,
+        settings,
+    } = update;
     let _reload = SETTINGS_RELOAD_LOCK.lock().await;
     // TRANSITIONAL generation bump BEFORE any query/config mutation: from
     // this instant, every generation-stamped product built from the OLD
@@ -174,9 +184,14 @@ pub(super) async fn apply_shared_settings(
     // Publish the settings snapshot before invalidating downstream connections:
     // once propagation exposes a pool miss, a concurrent request must resolve
     // the NEW launch config rather than respawn from the old snapshot (#587).
-    match raw_settings {
-        Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
-        None => settings_manager.apply_settings(settings),
+    match (root_path, raw_settings) {
+        (Some(root_path), Some(raw_settings)) => {
+            settings_manager.apply_settings_with_raw_at_root(root_path, raw_settings, settings)
+        }
+        (None, Some(raw_settings)) => {
+            settings_manager.apply_settings_with_raw(raw_settings, settings)
+        }
+        (_, None) => settings_manager.apply_settings(settings),
     }
     let settings = settings_manager.load_settings();
     // Path c: apply downstream config at this single reload choke point
@@ -489,8 +504,11 @@ impl Kakehashi {
             &self.settings_manager,
             &self.cache,
             &self.bridge,
-            Some(raw_settings),
-            settings,
+            SettingsUpdate {
+                root_path: None,
+                raw_settings: Some(raw_settings),
+                settings,
+            },
         )
         .await
         .into_iter()
@@ -515,8 +533,41 @@ impl Kakehashi {
             &self.settings_manager,
             &self.cache,
             &self.bridge,
-            Some(raw_settings),
-            settings,
+            SettingsUpdate {
+                root_path: None,
+                raw_settings: Some(raw_settings),
+                settings,
+            },
+        )
+        .await
+        .into_iter()
+        .for_each(|uri| self.schedule_reparse(uri, None));
+        self.warn_on_misconfigured_settings().await;
+    }
+
+    async fn apply_raw_settings_at_root(
+        &self,
+        root_path: Option<std::path::PathBuf>,
+        raw_settings: RawWorkspaceSettings,
+        settings: WorkspaceSettings,
+    ) {
+        apply_shared_settings(
+            &self.client,
+            ReloadLanguageState {
+                language: &self.language,
+                parser_pool: &self.parser_pool,
+                documents: &self.documents,
+                invalidate_documents: true,
+                request_semantic_refresh: true,
+            },
+            &self.settings_manager,
+            &self.cache,
+            &self.bridge,
+            SettingsUpdate {
+                root_path: Some(root_path),
+                raw_settings: Some(raw_settings),
+                settings,
+            },
         )
         .await
         .into_iter()
