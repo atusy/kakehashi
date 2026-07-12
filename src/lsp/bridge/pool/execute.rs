@@ -357,6 +357,80 @@ mod tests {
     use crate::lsp::bridge::pool::test_helpers::*;
     use std::sync::Arc;
 
+    async fn capture_downstream_id(
+        pool: Arc<LanguageServerPool>,
+        handle: Arc<ConnectionHandle>,
+        host_uri: Url,
+        upstream_id: UpstreamId,
+    ) -> RequestId {
+        let probe = Arc::new(std::sync::OnceLock::new());
+        let request_probe = Arc::clone(&probe);
+        let request = tokio::spawn(async move {
+            pool.execute_bridge_request_observed(
+                handle,
+                &host_uri,
+                "lua",
+                TEST_ULID_LUA_0,
+                &RegionOffset::new(0, 0),
+                "print('hello')",
+                Some(upstream_id),
+                |_, request_id| {
+                    JsonRpcRequest::new(
+                        request_id.as_i64(),
+                        "test/request",
+                        serde_json::Value::Null,
+                    )
+                },
+                |_, _| (),
+                Some(&request_probe),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while probe.get().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request should publish its downstream id");
+        let downstream_id = *probe.get().expect("probe should be populated");
+        request.abort();
+        let _ = request.await;
+        downstream_id
+    }
+
+    #[tokio::test]
+    async fn downstream_ids_are_unique_and_independent_of_upstream_id() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = test_host_uri("downstream-id");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("test-server"),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let upstream_id = UpstreamId::Number(42);
+
+        let first = capture_downstream_id(
+            Arc::clone(&pool),
+            Arc::clone(&handle),
+            host_uri.clone(),
+            upstream_id.clone(),
+        )
+        .await;
+        let second = capture_downstream_id(pool, handle, host_uri, upstream_id).await;
+
+        assert_ne!(first, second, "each downstream request needs a fresh id");
+        assert_ne!(first.as_i64(), 42, "downstream id must not mirror upstream");
+        assert_ne!(
+            second.as_i64(),
+            42,
+            "downstream id must not mirror upstream"
+        );
+    }
+
     #[tokio::test]
     async fn host_close_waits_for_request_enqueue_guard() {
         let pool = Arc::new(LanguageServerPool::new());
