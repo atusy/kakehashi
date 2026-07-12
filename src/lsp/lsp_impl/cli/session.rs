@@ -61,10 +61,10 @@ impl Kakehashi {
     }
 
     /// Whether a file discovered during a directory walk identifies a known
-    /// language by path or by a memory-bounded streaming scan of its first
-    /// line. Only path misses read content. The scan keeps overlapping windows
-    /// so shebangs and mode markers beyond the first buffer remain detectable
-    /// without retaining an arbitrarily long line. Files whose
+    /// language by path or by a bounded prefix of its first line. Only path
+    /// misses read content. The hard cap keeps ordinary directory traversal
+    /// from scanning arbitrarily large extensionless files; explicitly named
+    /// files remain authoritative for mode markers beyond the cap. Files whose
     /// first-line I/O fails are retained so the command's normal read path can
     /// report the operational error; invalid UTF-8 is filtered as non-text.
     pub(crate) fn cli_can_handle_discovered_file(&self, path: &Path) -> bool {
@@ -79,51 +79,29 @@ impl Kakehashi {
             // unsupported language.
             return true;
         };
-        const READ_CHUNK_BYTES: usize = 4 * 1024;
-        const WINDOW_BYTES: usize = 8 * 1024;
+        const MAX_FIRST_LINE_BYTES: usize = 8 * 1024;
         let path = path.to_string_lossy();
-        let mut reader = std::io::BufReader::new(file);
-        let mut chunk = [0; READ_CHUNK_BYTES];
-        let mut window = Vec::with_capacity(WINDOW_BYTES + READ_CHUNK_BYTES);
-        loop {
-            let read = match reader.read(&mut chunk) {
-                Ok(0) => return false,
-                Ok(read) => read,
-                Err(_) => return true,
-            };
-            let line_end = chunk[..read]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(read, |index| index + 1);
-            window.extend_from_slice(&chunk[..line_end]);
-
-            let valid = match std::str::from_utf8(&window) {
-                Ok(valid) => valid,
-                Err(error) if error.error_len().is_none() => {
-                    std::str::from_utf8(&window[..error.valid_up_to()])
-                        .expect("valid_up_to always identifies valid UTF-8")
-                }
-                Err(_) => return false,
-            };
-            if self
-                .language
-                .loadable_language_for_document(&path, valid)
-                .is_some()
-            {
-                return true;
-            }
-            if line_end < read || chunk[..line_end].ends_with(b"\n") {
-                return false;
-            }
-
-            if window.len() > WINDOW_BYTES {
-                let mut keep_from = window.len() - WINDOW_BYTES;
-                while keep_from < window.len() && (window[keep_from] & 0b1100_0000) == 0b1000_0000 {
-                    keep_from += 1;
-                }
-                window.drain(..keep_from);
-            }
+        let mut probe = Vec::with_capacity(MAX_FIRST_LINE_BYTES + 1);
+        if std::io::BufReader::new(file)
+            .take((MAX_FIRST_LINE_BYTES + 1) as u64)
+            .read_to_end(&mut probe)
+            .is_err()
+        {
+            return true;
         }
+        let truncated = probe.len() > MAX_FIRST_LINE_BYTES;
+        probe.truncate(MAX_FIRST_LINE_BYTES);
+        let valid = match std::str::from_utf8(&probe) {
+            Ok(valid) => valid,
+            Err(error) if truncated && error.error_len().is_none() => {
+                std::str::from_utf8(&probe[..error.valid_up_to()])
+                    .expect("valid_up_to always identifies valid UTF-8")
+            }
+            Err(_) => return false,
+        };
+        self.language
+            .loadable_language_for_document(&path, valid)
+            .is_some()
     }
 
     /// Gracefully shut down downstream language servers (LSP shutdown/exit

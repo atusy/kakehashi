@@ -313,9 +313,9 @@ fn e2e_directory_walk_respects_gitignore_but_explicit_path_wins() {
 fn e2e_directory_walk_formats_extensionless_shebang_file() {
     let prefix = "#!/usr/bin/env python ";
     let padding = " ".repeat(8191 - prefix.len());
-    // BufReader's 8 KiB internal read boundary cuts through this multibyte
-    // character. Discovery must continue assembling the complete valid UTF-8
-    // first line and still detect its shebang language.
+    // The hard 8 KiB probe boundary cuts through this multibyte character.
+    // Discovery must validate the complete prefix and still detect the
+    // shebang language without treating the split code point as binary.
     let source = format!("{prefix}{padding}é\nvalue = 1\n");
     let late_mode_line = format!("{}-*- C++ -*-\nvalue = 2\n", " ".repeat(12 * 1024));
     let ws = workspace_with(&[("tool", &source), ("modeline", &late_mode_line)]);
@@ -361,11 +361,19 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
     );
     assert_eq!(read(ws.path(), "modeline"), late_mode_line);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("1 unchanged"),
-        "the late mode-line file should be collected even though no formatter applies; stderr: {}",
+        String::from_utf8_lossy(&output.stderr).contains("0 unchanged"),
+        "directory discovery should skip markers beyond its bounded prefix; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(read(ws.path(), "unknown"), unknown);
+
+    let explicit = run_format(ws.path(), &["modeline"]);
+    assert!(explicit.status.success());
+    assert!(
+        String::from_utf8_lossy(&explicit.stderr).contains("1 unchanged"),
+        "an explicit path must still use full first-line detection; stderr: {}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
 }
 
 #[test]
