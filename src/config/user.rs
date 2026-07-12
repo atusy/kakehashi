@@ -103,12 +103,38 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
                     // The path may have appeared after the first read. Retry
                     // once so a concurrent atomic install does not surface a
                     // stale NotFound; a dangling symlink still fails here.
-                    std::fs::read_to_string(&path).map_err(|retry_source| {
-                        UserConfigError::IoError {
-                            path: path.clone(),
-                            source: retry_source,
+                    match std::fs::read_to_string(&path) {
+                        Ok(contents) => contents,
+                        Err(retry_source)
+                            if retry_source.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            match std::fs::symlink_metadata(&path) {
+                                Err(final_error)
+                                    if final_error.kind() == std::io::ErrorKind::NotFound =>
+                                {
+                                    return Ok(None);
+                                }
+                                Err(final_error) => {
+                                    return Err(UserConfigError::IoError {
+                                        path,
+                                        source: final_error,
+                                    });
+                                }
+                                Ok(_) => {
+                                    return Err(UserConfigError::IoError {
+                                        path,
+                                        source: retry_source,
+                                    });
+                                }
+                            }
                         }
-                    })?
+                        Err(retry_source) => {
+                            return Err(UserConfigError::IoError {
+                                path,
+                                source: retry_source,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -185,6 +211,7 @@ mod tests {
     use serial_test::serial;
     use std::env;
 
+    #[must_use]
     struct EnvVarGuard {
         key: &'static str,
         original: Option<std::ffi::OsString>,
