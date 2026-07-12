@@ -92,6 +92,106 @@ impl ParserFileOps for StdParserFileOps {
     }
 }
 
+fn generated_parser_backup_matches_language(name: &str, language: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".backup"))
+    else {
+        return false;
+    };
+    let Some(stem) = stem.strip_suffix(&format!(".{}", std::env::consts::DLL_EXTENSION)) else {
+        return false;
+    };
+    let Some((prefix, counter)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    let Some((backup_language, pid)) = prefix.rsplit_once('.') else {
+        return false;
+    };
+    backup_language == language
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !counter.is_empty()
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut backups = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if entry.file_type()?.is_file() && generated_parser_backup_matches_language(name, language)
+        {
+            backups.push(entry.path());
+        }
+    }
+    Ok(backups)
+}
+
+#[cfg(any(windows, test))]
+fn recover_parser_backups(
+    parser_dir: &Path,
+    parser_file: &Path,
+    language: &str,
+) -> std::io::Result<()> {
+    let mut backups = parser_backup_files(parser_dir, language)?;
+    if backups.is_empty() {
+        return Ok(());
+    }
+    if parser_file.is_file() {
+        for backup in backups {
+            fs::remove_file(backup)?;
+        }
+        return Ok(());
+    }
+    backups.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    let restore = backups.pop().expect("non-empty parser backup list");
+    fs::rename(&restore, parser_file)?;
+    for obsolete in backups {
+        fs::remove_file(obsolete)?;
+    }
+    Ok(())
+}
+
+/// Remove the canonical parser and every kakehashi-generated replacement backup.
+pub fn remove_parser_install_and_backups(
+    parser_dir: &Path,
+    language: &str,
+) -> std::io::Result<bool> {
+    if !super::queries::is_safe_language_name(language) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe parser language name",
+        ));
+    }
+    let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
+    let mut removed = match fs::remove_file(parser_file) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    for backup in parser_backup_files(parser_dir, language)? {
+        match fs::remove_file(backup) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
 /// Error types for parser installation.
 #[derive(Debug)]
 pub enum ParserInstallError {
@@ -513,6 +613,10 @@ pub fn install_parser_after_operation_started(
 
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
+
+    fs::create_dir_all(&parser_dir)?;
+    #[cfg(windows)]
+    recover_parser_backups(&parser_dir, &parser_file, language)?;
     let install_token = begin_parser_install(&parser_dir, &parser_file, language, options.force)?;
 
     // Fetch metadata (with caching support)
@@ -561,7 +665,6 @@ pub fn install_parser_after_operation_started(
     // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
     // by this process still fails at the rename — a loaded DLL can't be removed — a
     // pre-existing platform limitation this scheme doesn't change.)
-    fs::create_dir_all(&parser_dir)?;
     static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let tmp_file = parser_dir.join(format!(
         ".{}.{}.{}.{}.tmp",
@@ -1322,6 +1425,85 @@ mod tests {
 
         assert_eq!(ops.files.get(&parser), Some(&"new"));
         assert!(!ops.files.contains_key(&backup));
+    }
+
+    fn generated_backup_name(language: &str, pid: u32, counter: usize) -> String {
+        format!(
+            ".{language}.{pid}.{counter}.{}.backup",
+            std::env::consts::DLL_EXTENSION
+        )
+    }
+
+    #[test]
+    fn parser_backup_matching_rejects_other_or_user_files() {
+        let owned = generated_backup_name("lua", 123, 4);
+        assert!(generated_parser_backup_matches_language(&owned, "lua"));
+        assert!(!generated_parser_backup_matches_language(&owned, "rust"));
+        assert!(!generated_parser_backup_matches_language(
+            ".lua.manual.dylib.backup",
+            "lua"
+        ));
+        assert!(!generated_parser_backup_matches_language(
+            "lua.123.4.dylib.backup",
+            "lua"
+        ));
+    }
+
+    #[test]
+    fn parser_uninstall_removes_owned_backups_only() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let canonical = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let owned = parser_dir.join(generated_backup_name("lua", 123, 4));
+        let other_language = parser_dir.join(generated_backup_name("rust", 123, 4));
+        let user_file = parser_dir.join(".lua.manual.backup");
+        for path in [&canonical, &owned, &other_language, &user_file] {
+            fs::write(path, b"parser").expect("write parser fixture");
+        }
+
+        assert!(
+            remove_parser_install_and_backups(&parser_dir, "lua").expect("remove parser files")
+        );
+
+        assert!(!canonical.exists());
+        assert!(!owned.exists());
+        assert!(other_language.exists());
+        assert!(user_file.exists());
+    }
+
+    #[test]
+    fn parser_recovery_restores_backup_when_canonical_is_missing() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let canonical = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 4));
+        fs::write(&backup, b"working parser").expect("write backup");
+
+        recover_parser_backups(&parser_dir, &canonical, "lua").expect("recover parser backup");
+
+        assert_eq!(
+            fs::read(&canonical).expect("read restored parser"),
+            b"working parser"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn parser_recovery_removes_obsolete_backup_when_canonical_exists() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let canonical = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 4));
+        fs::write(&canonical, b"new parser").expect("write canonical");
+        fs::write(&backup, b"old parser").expect("write backup");
+
+        recover_parser_backups(&parser_dir, &canonical, "lua").expect("clean parser backup");
+
+        assert_eq!(fs::read(&canonical).expect("read canonical"), b"new parser");
+        assert!(!backup.exists());
     }
 
     #[test]
