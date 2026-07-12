@@ -1221,22 +1221,19 @@ fn test_language_uninstall_all() {
     assert!(queries.is_empty(), "All queries should be removed");
 }
 
-/// A bulk uninstall must rebuild its snapshot after waiting for an install
-/// operation that began while its preliminary discovery was in progress.
+/// A bulk uninstall must include an install that starts after confirmation is
+/// requested but completes before its exclusive snapshot.
 #[test]
 fn test_language_uninstall_all_includes_install_completed_before_exclusive_lock() {
     use kakehashi::install::operation_lock::LanguageOperationGuard;
     use std::fs;
-    use std::time::Duration;
+    use std::io::{Read, Write};
+    use std::process::Stdio;
 
     let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
     fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
     fs::create_dir_all(test_dir.path().join("queries")).expect("Failed to create queries dir");
 
-    // Model an install phase already in flight. Shared holders do not block
-    // preliminary discovery, but they do block the authoritative exclusive
-    // snapshot used by `--all`.
-    let install = LanguageOperationGuard::shared(test_dir.path()).unwrap();
     let mut uninstall = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args([
             "language",
@@ -1244,15 +1241,28 @@ fn test_language_uninstall_all_includes_install_completed_before_exclusive_lock(
             "--all",
             "--data-dir",
             test_dir.path().to_str().unwrap(),
-            "--force",
         ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("Failed to start uninstall command");
 
-    std::thread::sleep(Duration::from_millis(100));
+    let mut prompt = Vec::new();
+    let stderr = uninstall.stderr.as_mut().unwrap();
+    while !prompt.ends_with(b"[y/N] ") {
+        let mut byte = [0];
+        assert_eq!(stderr.read(&mut byte).unwrap(), 1, "prompt ended early");
+        prompt.push(byte[0]);
+    }
+
+    // This install starts after the prompt and holds the shared side while it
+    // publishes. After consent, uninstall must wait and include it in the
+    // authoritative exclusive snapshot.
+    let install = LanguageOperationGuard::shared(test_dir.path()).unwrap();
     let ext = std::env::consts::DLL_EXTENSION;
     let parser = test_dir.path().join(format!("parser/concurrent.{ext}"));
     fs::write(&parser, "fake").expect("Failed to publish concurrent parser");
+    uninstall.stdin.as_mut().unwrap().write_all(b"y\n").unwrap();
     drop(install);
 
     let status = uninstall
