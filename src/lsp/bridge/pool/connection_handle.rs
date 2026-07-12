@@ -90,6 +90,11 @@ pub(crate) struct ConnectionHandle {
     /// using `wait_for_ready()`. The Sender is stored here; receivers are created
     /// via `state_watch.subscribe()`.
     state_watch: tokio::sync::watch::Sender<ConnectionState>,
+    /// Exactly one caller owns writer reclamation and child termination. Other
+    /// shutdown callers wait on `shutdown_complete` instead of competing for the
+    /// sole writer or publishing completion early.
+    shutdown_owner: AtomicBool,
+    shutdown_complete: tokio::sync::Notify,
     /// Channel sender for outbound messages (ls-bridge-message-ordering single-writer pattern).
     ///
     /// All notifications and requests are queued here and written to stdin
@@ -198,6 +203,8 @@ impl ConnectionHandle {
         Self {
             state: std::sync::RwLock::new(initial_state),
             state_watch,
+            shutdown_owner: AtomicBool::new(false),
+            shutdown_complete: tokio::sync::Notify::new(),
             tx,
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
             router,
@@ -765,11 +772,19 @@ impl ConnectionHandle {
     /// running to receive the shutdown response. Valid from Ready or Initializing
     /// (ls-bridge-message-ordering/ls-bridge-graceful-shutdown).
     pub(crate) fn begin_shutdown(&self) {
+        let mut state = self
+            .state
+            .write()
+            .recover_poison("ConnectionHandle::begin_shutdown");
+        if *state == ConnectionState::Closed {
+            return;
+        }
         // Stop the liveness timer (but not the reader task) per ls-bridge-timeout-hierarchy
         // Global shutdown (Tier 3) overrides liveness timeout (Tier 2)
         // Reader continues running to receive shutdown response
         self.reader_handle.stop_liveness_timer();
-        self.set_state(ConnectionState::Closing);
+        *state = ConnectionState::Closing;
+        self.state_watch.send_replace(ConnectionState::Closing);
     }
 
     /// Complete the shutdown sequence.
@@ -780,6 +795,25 @@ impl ConnectionHandle {
     /// Valid from Closing or Failed states per ls-bridge-message-ordering/ls-bridge-graceful-shutdown.
     pub(crate) fn complete_shutdown(&self) {
         self.set_state(ConnectionState::Closed);
+        self.shutdown_complete.notify_waiters();
+    }
+
+    pub(crate) fn claim_shutdown_ownership(&self) -> bool {
+        self.state() != ConnectionState::Closed
+            && self
+                .shutdown_owner
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    pub(crate) async fn wait_for_shutdown_completion(&self) {
+        loop {
+            let notified = self.shutdown_complete.notified();
+            if self.state() == ConnectionState::Closed {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// LSP graceful shutdown: Closing → stop writer → shutdown/exit → force-kill → Closed (ls-bridge-graceful-shutdown).
@@ -792,7 +826,18 @@ impl ConnectionHandle {
     /// No internal timeout (ls-bridge-timeout-hierarchy): the caller (`shutdown_all_with_timeout`) enforces the
     /// global budget so a slow server can use leftover time without N×timeout multiplication.
     pub(crate) async fn graceful_shutdown(&self) -> io::Result<()> {
-        let mut shutdown_state = self.state_watch.subscribe();
+        let owner = self.claim_shutdown_ownership();
+        self.graceful_shutdown_as(owner).await
+    }
+
+    pub(crate) async fn graceful_shutdown_as(&self, owner: bool) -> io::Result<()> {
+        if self.state() == ConnectionState::Closed {
+            return Ok(());
+        }
+        if !owner {
+            self.wait_for_shutdown_completion().await;
+            return Ok(());
+        }
         // 1. Transition to Closing state
         self.begin_shutdown();
 
@@ -809,15 +854,7 @@ impl ConnectionHandle {
         let mut maybe_writer = if let Some(mut handle) = writer_handle {
             handle.stop_and_reclaim().await
         } else {
-            // Another caller already owns the sole writer and therefore the
-            // process shutdown. Do not publish Closed early: wait until that
-            // owner completes so global shutdown cannot return with a live child.
-            while *shutdown_state.borrow_and_update() != ConnectionState::Closed {
-                if shutdown_state.changed().await.is_err() {
-                    break;
-                }
-            }
-            return Ok(());
+            None
         };
 
         // 3-4. Perform LSP handshake if we have the writer
@@ -1263,6 +1300,29 @@ mod tests {
             ConnectionState::Closing,
             "State should be Closing, not Failed - liveness timer should have been cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_observes_owner_completion_without_regressing_closed() {
+        let handle = Arc::new(spawn_sink_handle().await);
+        assert!(handle.claim_shutdown_ownership());
+        assert!(!handle.claim_shutdown_ownership());
+
+        let mut waiter = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { handle.graceful_shutdown_as(false).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err(),
+            "a non-owner must wait instead of publishing completion"
+        );
+
+        handle.complete_shutdown();
+        waiter.await.unwrap().unwrap();
+        handle.begin_shutdown();
+        assert_eq!(handle.state(), ConnectionState::Closed);
     }
 
     /// Test that liveness timer does not start in Closing state (ls-bridge-timeout-hierarchy Phase 4).
