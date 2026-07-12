@@ -687,6 +687,25 @@ fn test_language_status_help() {
     );
 }
 
+#[test]
+fn test_language_status_does_not_create_missing_data_dir() {
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("missing");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!data_dir.exists(), "status must remain read-only");
+}
+
 /// Test that language status shows installed languages
 #[test]
 fn test_language_status_shows_installed() {
@@ -1219,6 +1238,207 @@ fn test_language_uninstall_all() {
         })
         .unwrap_or_default();
     assert!(queries.is_empty(), "All queries should be removed");
+}
+
+#[test]
+fn test_language_uninstall_does_not_create_missing_data_dir() {
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("testlang");
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["language", "uninstall", "testlang", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--force")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!data_dir.exists(), "targeted uninstall must remain a no-op");
+}
+
+#[test]
+fn test_language_uninstall_rejects_unsafe_name_when_data_dir_is_missing() {
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("missing");
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["language", "uninstall", "../../evil", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--force")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!data_dir.exists());
+}
+
+#[test]
+fn test_language_uninstall_all_coordinates_missing_data_dir() {
+    use kakehashi::install::operation_lock::LanguageOperationGuard;
+    use std::fs;
+
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("missing");
+    let install = LanguageOperationGuard::shared(&data_dir).unwrap();
+    fs::create_dir_all(data_dir.join("parser")).unwrap();
+    let parser = data_dir
+        .join("parser")
+        .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "parser").unwrap();
+
+    let mut uninstall = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["language", "uninstall", "--all", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--force")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(uninstall.try_wait().unwrap().is_none());
+
+    drop(install);
+    assert!(uninstall.wait().unwrap().success());
+    assert!(!parser.exists());
+}
+
+#[test]
+fn test_language_install_rejects_unsafe_name_before_creating_data_dir() {
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("missing");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "install",
+            "../../evil",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        !data_dir.exists(),
+        "invalid input must not create lock state"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_targeted_uninstall_revalidates_roots_after_confirmation() {
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::symlink;
+    use std::process::Stdio;
+
+    let test_dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    fs::create_dir_all(test_dir.path().join("parser")).unwrap();
+    fs::create_dir_all(test_dir.path().join("queries/lua")).unwrap();
+    let parser_name = format!("lua.{}", std::env::consts::DLL_EXTENSION);
+    fs::write(external.path().join(&parser_name), "keep").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stderr = child.stderr.take().unwrap();
+    let mut prompt = Vec::new();
+    while !prompt.ends_with(b"[y/N] ") {
+        let mut byte = [0];
+        stderr.read_exact(&mut byte).unwrap();
+        prompt.push(byte[0]);
+    }
+
+    fs::remove_dir(test_dir.path().join("parser")).unwrap();
+    symlink(external.path(), test_dir.path().join("parser")).unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(external.path().join(parser_name)).unwrap(),
+        "keep"
+    );
+}
+
+/// A bulk uninstall must include an install that starts after confirmation is
+/// requested but completes before its exclusive snapshot.
+#[test]
+fn test_language_uninstall_all_includes_install_completed_before_exclusive_lock() {
+    use kakehashi::install::operation_lock::LanguageOperationGuard;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries")).expect("Failed to create queries dir");
+
+    let mut uninstall = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start uninstall command");
+
+    let mut stderr = uninstall.stderr.take().unwrap();
+    let (prompt_tx, prompt_rx) = mpsc::channel();
+    let prompt_reader = std::thread::spawn(move || {
+        let mut prompt = Vec::new();
+        while !prompt.ends_with(b"[y/N] ") {
+            let mut byte = [0];
+            if stderr.read(&mut byte)? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "prompt ended early",
+                ));
+            }
+            prompt.push(byte[0]);
+        }
+        prompt_tx.send(()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "prompt receiver dropped")
+        })?;
+        Ok::<_, std::io::Error>(stderr)
+    });
+    if prompt_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+        let _ = uninstall.kill();
+        panic!("timed out waiting for uninstall confirmation prompt");
+    }
+
+    // This install starts after the prompt and holds the shared side while it
+    // publishes. After consent, uninstall must wait and include it in the
+    // authoritative exclusive snapshot.
+    let install = LanguageOperationGuard::shared(test_dir.path()).unwrap();
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser = test_dir.path().join(format!("parser/concurrent.{ext}"));
+    fs::write(&parser, "fake").expect("Failed to publish concurrent parser");
+    uninstall.stdin.as_mut().unwrap().write_all(b"y\n").unwrap();
+    drop(install);
+
+    let status = uninstall
+        .wait()
+        .expect("Failed to wait for uninstall command");
+    prompt_reader.join().unwrap().unwrap();
+    assert!(status.success(), "Uninstall --all should succeed");
+    assert!(
+        !parser.exists(),
+        "the authoritative snapshot must include the completed install"
+    );
 }
 
 #[cfg(unix)]

@@ -266,6 +266,22 @@ pub fn install_parser(
     language: &str,
     options: &InstallOptions,
 ) -> Result<ParserInstallResult, ParserInstallError> {
+    if !super::queries::is_safe_language_name(language) {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe language name '{}'", language.escape_default()),
+        )));
+    }
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(&options.data_dir)?;
+    install_parser_under_operation_lock(language, options)
+}
+
+/// Install a parser while the caller holds the data-directory operation lock.
+#[doc(hidden)]
+pub fn install_parser_under_operation_lock(
+    language: &str,
+    options: &InstallOptions,
+) -> Result<ParserInstallResult, ParserInstallError> {
     // `language` becomes path segments (`parser/<language>.<ext>` and the temp
     // file) and a URL/metadata key, so reject traversal-capable names before
     // touching the filesystem. Higher-level callers (auto-install) already gate

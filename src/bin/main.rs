@@ -395,9 +395,29 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
         ExitCode::FAILURE
     })?;
 
+    // Status recovery can restore backups or remove interrupted staging
+    // directories. Coordinate that mutation and the following snapshot with
+    // bulk uninstall's exclusive operation guard.
+    let operation_lock = if data_dir.exists() {
+        match kakehashi::install::operation_lock::LanguageOperationGuard::shared(&data_dir) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                // Status remains a read-only inspection when its storage is
+                // not writable. Without coordination, skip recovery below so
+                // this process does not mutate outside the operation protocol.
+                eprintln!("Warning: cannot coordinate language status; skipping recovery: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
-    if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+    if operation_lock.is_some()
+        && let Err(e) = queries::recover_interrupted_query_installs(&queries_dir)
+    {
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }
 
@@ -719,8 +739,6 @@ fn run_language_uninstall(
         ExitCode::FAILURE
     })?;
 
-    let parser_dir = data_dir.join("parser");
-    let queries_dir = data_dir.join("queries");
     let targeted_language = if all {
         None
     } else {
@@ -733,16 +751,48 @@ fn run_language_uninstall(
         }
         Some(language)
     };
-    // `--all` promises to discover the complete install before removing it.
-    // Validate both roots before recovery, which may delete stale staging
-    // directories or restore backups. Discard this first snapshot and rescan
-    // after recovery so restored languages are included in the uninstall set.
-    if all {
-        collect_installed_languages_for_uninstall(&parser_dir, &queries_dir).map_err(|e| {
-            eprintln!("Failed to scan installed languages: {e}");
-            ExitCode::FAILURE
-        })?;
+
+    match std::fs::symlink_metadata(&data_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !all => {
+            if let Some(language) = language.as_deref() {
+                eprintln!("Language '{}' is not installed.", language);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let parser_dir = data_dir.join("parser");
+    let queries_dir = data_dir.join("queries");
+    // Bulk discovery must be exclusive to avoid observing install renames,
+    // but never make installers wait while the command is awaiting consent.
+    // The authoritative locked snapshot below determines the actual set.
+    if all && !force {
+        eprint!("Uninstall all currently installed languages? [y/N] ");
+        io::stderr().flush().unwrap();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("Cancelled.");
+            return Ok(());
+        }
+    }
+    // Targeted preflight happens before its language-specific prompt. Bulk
+    // consent was already obtained above, so it goes directly to the single
+    // authoritative exclusive phase below.
+    let preliminary_lock = if all {
+        None
     } else {
+        Some(
+            kakehashi::install::operation_lock::LanguageOperationGuard::shared(&data_dir).map_err(
+                |e| {
+                    eprintln!("Failed to coordinate language uninstall: {e}");
+                    ExitCode::FAILURE
+                },
+            )?,
+        )
+    };
+    if !all {
         // Targeted uninstall does not need to enumerate every entry, but it
         // still builds removal paths beneath both roots. Reject a symlinked or
         // non-directory root before recovery/removal can escape data_dir.
@@ -756,20 +806,9 @@ fn run_language_uninstall(
             ExitCode::FAILURE
         })?;
     }
-    if all && let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
-        eprintln!("Failed to recover interrupted query installs: {e}");
-        return Err(ExitCode::FAILURE);
-    }
-
     // Determine which languages to uninstall
-    let languages_to_uninstall: Vec<String> = if all {
-        collect_installed_languages_for_uninstall(&parser_dir, &queries_dir)
-            .map_err(|e| {
-                eprintln!("Failed to scan installed languages: {e}");
-                ExitCode::FAILURE
-            })?
-            .into_iter()
-            .collect()
+    let mut languages_to_uninstall: Vec<String> = if all {
+        Vec::new()
     } else {
         vec![
             targeted_language
@@ -778,21 +817,11 @@ fn run_language_uninstall(
         ]
     };
 
-    if languages_to_uninstall.is_empty() {
-        eprintln!("No languages installed to uninstall.");
-        return Ok(());
-    }
+    drop(preliminary_lock);
 
     // Confirmation prompt unless --force
-    if !force {
-        if all {
-            eprint!(
-                "Uninstall all {} languages? [y/N] ",
-                languages_to_uninstall.len()
-            );
-        } else {
-            eprint!("Uninstall '{}'? [y/N] ", languages_to_uninstall[0]);
-        }
+    if !force && !all {
+        eprint!("Uninstall '{}'? [y/N] ", languages_to_uninstall[0]);
         io::stderr().flush().unwrap();
 
         let mut input = String::new();
@@ -802,15 +831,62 @@ fn run_language_uninstall(
         }
     }
 
-    // Targeted recovery is deliberately after confirmation and scoped to the
-    // requested language: cancellation and invalid input must not mutate any
-    // recovery state, especially not another language's artifacts.
-    if let Some(language) = targeted_language
-        && let Err(e) =
+    // Confirmation is intentionally outside the lock. Once confirmed, take
+    // the operation-wide lock and rebuild the authoritative uninstall set.
+    // An install that held a shared lock is ordered before this snapshot; a
+    // later install cannot publish until the verified-empty point below.
+    let _operation_lock = if all {
+        kakehashi::install::operation_lock::LanguageOperationGuard::exclusive(&data_dir)
+    } else {
+        kakehashi::install::operation_lock::LanguageOperationGuard::shared(&data_dir)
+    }
+    .map_err(|e| {
+        eprintln!("Failed to coordinate language uninstall: {e}");
+        ExitCode::FAILURE
+    })?;
+
+    if all {
+        // Validate the complete tree before recovery mutates stranded staging
+        // state. The post-recovery scan below is the authoritative set.
+        collect_installed_languages_for_uninstall(&parser_dir, &queries_dir).map_err(|e| {
+            eprintln!("Failed to scan installed languages: {e}");
+            ExitCode::FAILURE
+        })?;
+        queries::recover_interrupted_query_installs(&queries_dir).map_err(|e| {
+            eprintln!("Failed to recover interrupted query installs: {e}");
+            ExitCode::FAILURE
+        })?;
+        languages_to_uninstall =
+            collect_installed_languages_for_uninstall(&parser_dir, &queries_dir)
+                .map_err(|e| {
+                    eprintln!("Failed to scan installed languages: {e}");
+                    ExitCode::FAILURE
+                })?
+                .into_iter()
+                .collect();
+
+        if languages_to_uninstall.is_empty() {
+            eprintln!("No languages installed to uninstall.");
+            return Ok(());
+        }
+    } else {
+        // Confirmation happens outside the lock, so validate roots again at
+        // the mutation point to close filesystem TOCTOU windows.
+        read_optional_install_dir(&parser_dir, "parser").map_err(|e| {
+            eprintln!("Failed to validate install roots: {e}");
+            ExitCode::FAILURE
+        })?;
+        let language = targeted_language.expect("targeted uninstall has a language");
+        preflight_targeted_query_state(&queries_dir, language).map_err(|e| {
+            eprintln!("Failed to preflight targeted query state: {e}");
+            ExitCode::FAILURE
+        })?;
+        if let Err(e) =
             queries::recover_interrupted_query_installs_for_language(&queries_dir, language)
-    {
-        eprintln!("Failed to recover interrupted query installs for '{language}': {e}");
-        return Err(ExitCode::FAILURE);
+        {
+            eprintln!("Failed to recover interrupted query installs for '{language}': {e}");
+            return Err(ExitCode::FAILURE);
+        }
     }
 
     // Uninstall each language
@@ -885,6 +961,18 @@ fn run_language_uninstall(
     }
 
     if any_failed {
+        return Err(ExitCode::FAILURE);
+    }
+
+    if all
+        && !collect_installed_languages_for_uninstall(&parser_dir, &queries_dir)
+            .map_err(|e| {
+                eprintln!("Failed to verify language uninstall: {e}");
+                ExitCode::FAILURE
+            })?
+            .is_empty()
+    {
+        eprintln!("Failed to verify that all languages were uninstalled.");
         return Err(ExitCode::FAILURE);
     }
 
@@ -995,6 +1083,21 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         ExitCode::FAILURE
     })?;
 
+    if !queries::is_safe_language_name(language) {
+        eprintln!("✗ Invalid language name {:?}", language);
+        return Err(ExitCode::FAILURE);
+    }
+
+    // Tombstone clearing, parser publication, and query publication form one
+    // install operation relative to bulk uninstall.
+    let _operation_lock = kakehashi::install::operation_lock::LanguageOperationGuard::shared(
+        &data_dir,
+    )
+    .map_err(|e| {
+        eprintln!("✗ Failed to coordinate language installation: {e}");
+        ExitCode::FAILURE
+    })?;
+
     // Track success/failure for exit code
     let mut parser_success = true;
     let mut queries_success = true;
@@ -1017,7 +1120,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         compile: parser::ParserCompile::KillableSubprocess,
     };
 
-    match parser::install_parser(language, &options) {
+    match parser::install_parser_under_operation_lock(language, &options) {
         Ok(result) => {
             eprintln!("✓ Parser installed: {}", result.install_path.display());
             if verbose {
@@ -1033,7 +1136,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     // Install queries (with inherited dependencies)
     eprintln!("Installing queries for '{}' to {:?}...", language, data_dir);
 
-    match queries::install_queries_with_dependencies_after_install_started(
+    match queries::install_queries_with_dependencies_after_install_started_under_operation_lock(
         language, &data_dir, force,
     ) {
         Ok(result) => {

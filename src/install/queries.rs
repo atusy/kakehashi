@@ -154,8 +154,10 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
-    install_queries_with_dependencies_from_with_http_policy(
+    install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         NVIM_TREESITTER_QUERIES_URL,
         language,
         data_dir,
@@ -169,7 +171,22 @@ pub fn install_queries_with_dependencies_after_install_started(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from_with_http_policy(
+    validate_safe_language_name(language)?;
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
+    install_queries_with_dependencies_after_install_started_under_operation_lock(
+        language, data_dir, force,
+    )
+}
+
+/// Continue query installation while the caller holds the operation lock.
+#[doc(hidden)]
+pub fn install_queries_with_dependencies_after_install_started_under_operation_lock(
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
+    install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         NVIM_TREESITTER_QUERIES_URL,
         language,
         data_dir,
@@ -179,13 +196,25 @@ pub fn install_queries_with_dependencies_after_install_started(
 }
 
 /// Like [`install_queries_with_dependencies`] but downloading from `base_url`.
+#[cfg(test)]
 pub(crate) fn install_queries_with_dependencies_from(
     base_url: &str,
     language: &str,
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from_with_http_policy(
+    validate_safe_language_name(language)?;
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
+    install_queries_with_dependencies_from_under_operation_lock(base_url, language, data_dir, force)
+}
+
+pub(crate) fn install_queries_with_dependencies_from_under_operation_lock(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         base_url,
         language,
         data_dir,
@@ -203,7 +232,21 @@ pub(crate) fn install_queries_with_dependencies_from_allowing_http_for_tests(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from_with_http_policy(
+    validate_safe_language_name(language)?;
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
+    install_queries_with_dependencies_from_allowing_http_for_tests_under_operation_lock(
+        base_url, language, data_dir, force,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn install_queries_with_dependencies_from_allowing_http_for_tests_under_operation_lock(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         base_url,
         language,
         data_dir,
@@ -219,7 +262,7 @@ enum QueryHttpPolicy {
     AllowHttpForTests,
 }
 
-fn install_queries_with_dependencies_from_with_http_policy(
+fn install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
     base_url: &str,
     language: &str,
     data_dir: &Path,
@@ -1245,6 +1288,23 @@ mod tests {
             "keep",
             "unsafe tombstone cleanup must not escape queries/"
         );
+    }
+
+    #[test]
+    fn under_operation_lock_install_rejects_unsafe_language_before_path_use() {
+        let temp = TempDir::new().unwrap();
+
+        let result = install_queries_with_dependencies_after_install_started_under_operation_lock(
+            "../../evil",
+            temp.path(),
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(QueryInstallError::InvalidLanguageName(_))
+        ));
+        assert!(!temp.path().join("queries").exists());
     }
 
     #[test]
