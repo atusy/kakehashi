@@ -1978,10 +1978,9 @@ impl LanguageServerPool {
     /// Surfacing it as an error makes the acquire fail and retry, re-attempting
     /// the announce once the queue drains.
     ///
-    /// `Ok(())` no-op for per-root keys, marker-less acquisitions,
-    /// capability-less servers, or a root already in the set — including a
-    /// connection's own initialize-time root, so the first root never
-    /// re-announces.
+    /// `Ok(true)` is also returned for per-root keys, marker-less acquisitions,
+    /// or a root already in the set — including a connection's own
+    /// initialize-time root, so the first root never re-announces.
     async fn announce_shared_root(
         &self,
         handle: &Arc<ConnectionHandle>,
