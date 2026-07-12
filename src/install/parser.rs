@@ -336,7 +336,7 @@ fn compile_parser(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     if let Some(staging_lock) = staging_lock {
-        inherit_staging_lock(&mut cmd, staging_lock);
+        inherit_staging_lock(&mut cmd, staging_lock)?;
     }
     let status = run_killable_subprocess(cmd, PARSER_COMPILE_TIMEOUT, "parser compile")?;
     if !status.success() {
@@ -350,7 +350,10 @@ fn compile_parser(
 }
 
 #[cfg(unix)]
-fn inherit_staging_lock(cmd: &mut Command, staging_lock: &fs::File) {
+fn inherit_staging_lock(
+    cmd: &mut Command,
+    staging_lock: &fs::File,
+) -> Result<(), ParserInstallError> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
@@ -370,10 +373,31 @@ fn inherit_staging_lock(cmd: &mut Command, staging_lock: &fs::File) {
             Ok(())
         });
     }
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn inherit_staging_lock(_cmd: &mut Command, _staging_lock: &fs::File) {}
+#[cfg(windows)]
+fn inherit_staging_lock(
+    cmd: &mut Command,
+    staging_lock: &fs::File,
+) -> Result<(), ParserInstallError> {
+    // Rust's Windows Command implementation explicitly inherits stdio handles.
+    // Carry the parent's delete-denying staging handle as the internal compile
+    // child's unused stdin, closing the parent-exit/child-start cleanup window.
+    let inherited = staging_lock
+        .try_clone()
+        .map_err(ParserInstallError::IoError)?;
+    cmd.stdin(std::process::Stdio::from(inherited));
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inherit_staging_lock(
+    _cmd: &mut Command,
+    _staging_lock: &fs::File,
+) -> Result<(), ParserInstallError> {
+    Ok(())
+}
 
 /// Install a Tree-sitter parser for a language.
 pub fn install_parser(
@@ -509,6 +533,7 @@ fn reserve_parser_staging_file(
         {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+            options.read(true);
             options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         }
         match options.open(&candidate) {
@@ -1739,6 +1764,31 @@ mod tests {
         );
         drop(child_guard);
         fs::rename(&staged, &renamed).expect("rename succeeds after compiler exit");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_guard_is_inherited_at_spawn() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let (staged, parent_guard) =
+            reserve_parser_staging_file(&parser_dir, "lua").expect("reserve staging file");
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "ping -n 3 127.0.0.1 >NUL"]);
+        inherit_staging_lock(&mut command, parent_guard.as_ref().expect("Windows guard"))
+            .expect("configure inherited guard");
+        let mut child = command.spawn().expect("spawn sleeping child");
+        drop(parent_guard);
+        let renamed = parser_dir.join("renamed");
+
+        assert!(
+            fs::rename(&staged, &renamed).is_err(),
+            "child owns the guard before spawn returns"
+        );
+        child.kill().expect("kill child");
+        child.wait().expect("wait child");
+        fs::rename(&staged, &renamed).expect("rename succeeds after child exit");
     }
 
     #[cfg(unix)]
