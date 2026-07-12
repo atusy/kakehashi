@@ -1,3 +1,4 @@
+use path_clean::PathClean;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -122,6 +123,59 @@ pub(super) fn expand_path(
     match result {
         Ok(expanded) => Ok(expanded.into_owned()),
         Err(e) => Err(e.cause),
+    }
+}
+
+/// Expand and anchor path-valued fields while their configuration source is
+/// still known. Relative values are resolved against `base`; absolute values
+/// produced by `~` or environment expansion remain absolute.
+pub(crate) fn expand_settings_paths(
+    settings: &mut crate::config::RawWorkspaceSettings,
+    base: Option<&Path>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Result<(), ExpandErrors> {
+    let mut errors = Vec::new();
+    let mut expand = |path: &mut String| match expand_path(path, home, &env_fn) {
+        Ok(expanded) => {
+            let expanded = Path::new(&expanded);
+            *path = if expanded.is_relative() {
+                base.map_or_else(
+                    || expanded.to_string_lossy().into_owned(),
+                    |base| base.join(expanded).clean().to_string_lossy().into_owned(),
+                )
+            } else {
+                expanded.to_string_lossy().into_owned()
+            };
+        }
+        Err(error) => errors.push(error),
+    };
+
+    if let Some(search_paths) = settings.search_paths.as_mut() {
+        for path in search_paths {
+            expand(path);
+        }
+    }
+    let mut language_names = settings.languages.keys().cloned().collect::<Vec<_>>();
+    language_names.sort();
+    for name in language_names {
+        let Some(language) = settings.languages.get_mut(&name) else {
+            continue;
+        };
+        if let Some(parser) = language.parser.as_mut() {
+            expand(parser);
+        }
+        if let Some(queries) = language.queries.as_mut() {
+            for query in queries {
+                expand(&mut query.path);
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ExpandErrors(errors))
     }
 }
 

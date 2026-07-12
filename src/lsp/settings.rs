@@ -4,7 +4,7 @@ use crate::config::{
 };
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsEventKind {
@@ -82,7 +82,7 @@ pub fn load_settings(
     let mut used_deprecated_root_markers = false;
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
-    let defaults = Some(default_settings());
+    let defaults = normalize_layer(default_settings(), None, home, &env_fn, &mut events);
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
     let config_layers: Vec<Option<RawWorkspaceSettings>> =
@@ -93,14 +93,33 @@ pub fn load_settings(
             )));
             files
                 .iter()
-                .map(|p| load_toml_file(p, &mut events, &mut used_deprecated_root_markers))
+                .map(|p| {
+                    let base = absolute_parent(p);
+                    load_toml_file(p, &mut events, &mut used_deprecated_root_markers).and_then(
+                        |settings| {
+                            normalize_layer(settings, base.as_deref(), home, &env_fn, &mut events)
+                        },
+                    )
+                })
                 .collect()
         } else {
             vec![
                 // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-                load_user_config_with_events(&mut events, &mut used_deprecated_root_markers),
+                load_user_config_with_events(&mut events, &mut used_deprecated_root_markers)
+                    .and_then(|(settings, path)| {
+                        normalize_layer(
+                            settings,
+                            absolute_parent(&path).as_deref(),
+                            home,
+                            &env_fn,
+                            &mut events,
+                        )
+                    }),
                 // Layer 3: Project config from root_path/kakehashi.toml
-                load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers),
+                load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers)
+                    .and_then(|settings| {
+                        normalize_layer(settings, root_path, home, &env_fn, &mut events)
+                    }),
             ]
         };
 
@@ -112,6 +131,7 @@ pub fn load_settings(
             &mut events,
             &mut used_deprecated_root_markers,
         )
+        .and_then(|settings| normalize_layer(settings, root_path, home, &env_fn, &mut events))
     });
 
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
@@ -123,7 +143,13 @@ pub fn load_settings(
         .reduce(merge_workspace_settings)
         .flatten();
     let raw_settings = merged.clone();
-    let settings =
+    let layer_expansion_failed = events.iter().any(|event| {
+        event.kind == SettingsEventKind::Error
+            && event.message.starts_with("Path expansion failed:")
+    });
+    let settings = if layer_expansion_failed {
+        None
+    } else {
         merged.and_then(
             |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
                 Ok(ws) => Some(ws),
@@ -136,7 +162,8 @@ pub fn load_settings(
                     None
                 }
             },
-        );
+        )
+    };
 
     SettingsLoadOutcome {
         settings,
@@ -146,18 +173,45 @@ pub fn load_settings(
     }
 }
 
+fn absolute_parent(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    absolute.parent().map(Path::to_path_buf)
+}
+
+fn normalize_layer(
+    mut settings: RawWorkspaceSettings,
+    base: Option<&Path>,
+    home: Option<&str>,
+    env_fn: &impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+) -> Option<RawWorkspaceSettings> {
+    match crate::config::expand::expand_settings_paths(&mut settings, base, home, env_fn) {
+        Ok(()) => Some(settings),
+        Err(errs) => {
+            events.push(SettingsEvent::error(format!(
+                "Path expansion failed: {errs}. This configuration layer has been discarded."
+            )));
+            None
+        }
+    }
+}
+
 /// Load user config and add appropriate events to the events vector.
 fn load_user_config_with_events(
     events: &mut Vec<SettingsEvent>,
     used_deprecated_root_markers: &mut bool,
-) -> Option<RawWorkspaceSettings> {
+) -> Option<(RawWorkspaceSettings, PathBuf)> {
     match load_user_config() {
         Ok(Some(config)) => {
             events.push(SettingsEvent::info(
                 "Loaded user config from XDG_CONFIG_HOME",
             ));
             *used_deprecated_root_markers |= config.uses_deprecated_root_markers;
-            Some(config.settings)
+            Some((config.settings, config.path))
         }
         Ok(None) => {
             // No user config file exists - this is fine (zero-config experience)
@@ -385,6 +439,35 @@ mod tests {
         assert!(
             settings.auto_install,
             "Project config autoInstall=true should override user config autoInstall=false"
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn project_search_path_is_relative_to_project_config() {
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let empty_user_config = TempDir::new().expect("failed to create user config temp dir");
+        let project_dir = TempDir::new().expect("failed to create project temp dir");
+        std::fs::write(
+            project_dir.path().join("kakehashi.toml"),
+            "searchPaths = [\"./runtime\"]\n",
+        )
+        .expect("failed to write project config");
+
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", empty_user_config.path()) };
+        let outcome = load_settings(Some(project_dir.path()), None, None, |_| None);
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe {
+            match original_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert_eq!(
+            outcome.settings.expect("settings should load").search_paths,
+            [project_dir.path().join("runtime").to_string_lossy()]
         );
     }
 

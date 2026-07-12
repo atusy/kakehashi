@@ -68,6 +68,7 @@ impl std::error::Error for UserConfigError {
 pub(crate) struct UserConfig {
     pub(crate) settings: RawWorkspaceSettings,
     pub(crate) uses_deprecated_root_markers: bool,
+    pub(crate) path: PathBuf,
 }
 
 /// Loads user configuration from the XDG config directory.
@@ -95,12 +96,17 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
 
     let uses_deprecated_root_markers =
         crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
-    let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
-        .map_err(|e| UserConfigError::ParseError { path, source: e })?;
+    let settings = toml::from_str::<RawWorkspaceSettings>(&contents).map_err(|e| {
+        UserConfigError::ParseError {
+            path: path.clone(),
+            source: e,
+        }
+    })?;
 
     Ok(Some(UserConfig {
         settings,
         uses_deprecated_root_markers,
+        path,
     }))
 }
 
