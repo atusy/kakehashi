@@ -146,26 +146,26 @@ impl ParserFileOps for StdParserFileOps {
 }
 
 fn generated_parser_backup_matches_language(name: &str, language: &str) -> bool {
-    let Some(stem) = name
+    parser_backup_language(name).is_some_and(|backup_language| backup_language == language)
+}
+
+fn parser_backup_language(name: &str) -> Option<&str> {
+    let stem = name
         .strip_prefix('.')
-        .and_then(|name| name.strip_suffix(".backup"))
-    else {
-        return false;
-    };
-    let Some(stem) = stem.strip_suffix(&format!(".{}", std::env::consts::DLL_EXTENSION)) else {
-        return false;
-    };
-    let Some((prefix, counter)) = stem.rsplit_once('.') else {
-        return false;
-    };
-    let Some((backup_language, pid)) = prefix.rsplit_once('.') else {
-        return false;
-    };
-    backup_language == language
+        .and_then(|name| name.strip_suffix(".backup"))?;
+    let stem = stem.strip_suffix(&format!(".{}", std::env::consts::DLL_EXTENSION))?;
+    let (prefix, counter) = stem.rsplit_once('.')?;
+    let (backup_language, pid) = prefix.rsplit_once('.')?;
+    if super::queries::is_safe_language_name(backup_language)
         && !pid.is_empty()
         && pid.bytes().all(|byte| byte.is_ascii_digit())
         && !counter.is_empty()
         && counter.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        Some(backup_language)
+    } else {
+        None
+    }
 }
 
 fn parser_backup_ownership_sidecar(backup: &Path) -> PathBuf {
@@ -214,6 +214,36 @@ fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec
         }
     }
     Ok(backups)
+}
+
+/// Return languages with kakehashi-owned transactional backups.
+pub fn owned_parser_backup_languages(parser_dir: &Path) -> std::io::Result<Vec<String>> {
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut languages = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(language) = name.to_str().and_then(parser_backup_language) else {
+            continue;
+        };
+        let marker = parser_backup_ownership_sidecar(&entry.path());
+        match fs::read(marker) {
+            Ok(content) if content == PARSER_BACKUP_MARKER_CONTENT => {
+                languages.insert(language.to_owned());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(languages.into_iter().collect())
 }
 
 fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> std::io::Result<()> {
@@ -1698,6 +1728,31 @@ mod tests {
             "lua.123.4.dylib.backup",
             "lua"
         ));
+    }
+
+    #[test]
+    fn owned_parser_backup_languages_require_exact_marker_and_shape() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let owned = parser_dir.join(generated_backup_name("lua", 123, 4));
+        let unowned = parser_dir.join(generated_backup_name("rust", 123, 5));
+        let unsafe_name = parser_dir.join(generated_backup_name("Lua", 123, 6));
+        for backup in [&owned, &unowned, &unsafe_name] {
+            fs::write(backup, b"parser").expect("write backup");
+        }
+        fs::write(
+            parser_backup_ownership_sidecar(&owned),
+            PARSER_BACKUP_MARKER_CONTENT,
+        )
+        .expect("mark owned backup");
+        fs::write(parser_backup_ownership_sidecar(&unowned), b"user marker")
+            .expect("write unowned marker");
+
+        assert_eq!(
+            owned_parser_backup_languages(&parser_dir).expect("discover backups"),
+            vec!["lua"]
+        );
     }
 
     #[test]

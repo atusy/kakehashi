@@ -506,6 +506,9 @@ fn collect_installed_languages(parser_dir: &Path, queries_dir: &Path) -> Vec<Str
             }
         }
     }
+    if let Ok(backup_languages) = parser::owned_parser_backup_languages(parser_dir) {
+        languages.extend(backup_languages);
+    }
     if let Ok(entries) = fs::read_dir(queries_dir) {
         for entry in entries.flatten() {
             if let Some(name) = installed_query_language_name(&entry.path()) {
