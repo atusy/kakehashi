@@ -339,7 +339,11 @@ pub(super) fn with_resolved_node_ranges<R>(
     // only. `stack.get(layer)` is None when the nesting is now shallower.
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
     let Some(layer_entry) = stack.get(layer) else {
-        return NodeResolution::NotFound;
+        return if stack.last().is_some_and(|entry| entry.ambiguous) {
+            NodeResolution::Ambiguous
+        } else {
+            NodeResolution::NotFound
+        };
     };
     if layer_entry.ambiguous {
         return NodeResolution::Ambiguous;
@@ -398,7 +402,11 @@ pub(super) fn with_resolved_node_pair<R>(
 
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, desc_start);
     let Some(layer_entry) = stack.get(layer) else {
-        return NodeResolution::NotFound;
+        return if stack.last().is_some_and(|entry| entry.ambiguous) {
+            NodeResolution::Ambiguous
+        } else {
+            NodeResolution::NotFound
+        };
     };
     if layer_entry.ambiguous {
         return NodeResolution::Ambiguous;
@@ -1173,6 +1181,22 @@ mod tests {
         assert!(
             matches!(pair, NodeResolution::Ambiguous),
             "pair resolution must reject the same ambiguous layer"
+        );
+
+        let truncated = with_resolved_node(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            paragraph.start_byte(),
+            paragraph.end_byte(),
+            paragraph.kind(),
+            stack.len() + 1,
+            |_| (),
+        );
+        assert!(
+            matches!(truncated, NodeResolution::Ambiguous),
+            "a truncated stack below an ambiguous ancestor is still ambiguous"
         );
     }
 }
