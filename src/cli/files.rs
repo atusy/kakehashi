@@ -23,6 +23,42 @@ pub(crate) struct CollectedFiles {
     pub(crate) walk_errors: usize,
 }
 
+fn explicit_inputs_have_alias(inputs: &mut [(PathBuf, PathBuf, bool)]) -> bool {
+    inputs.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let mut ancestors: Vec<usize> = Vec::new();
+    let mut previous = None;
+
+    for index in 0..inputs.len() {
+        let (lexical, resolved, is_dir) = &inputs[index];
+        if let Some(previous_index) = previous {
+            let previous: &(PathBuf, PathBuf, bool) = &inputs[previous_index];
+            if previous.1 == *resolved && previous.0 != *lexical {
+                return true;
+            }
+        }
+        while ancestors
+            .last()
+            .is_some_and(|&ancestor| !resolved.starts_with(&inputs[ancestor].1))
+        {
+            ancestors.pop();
+        }
+        for &ancestor in &ancestors {
+            let (ancestor_lexical, ancestor_resolved, _) = &inputs[ancestor];
+            let suffix = resolved
+                .strip_prefix(ancestor_resolved)
+                .expect("ancestor stack only contains resolved path prefixes");
+            if ancestor_lexical.join(suffix) != *lexical {
+                return true;
+            }
+        }
+        if *is_dir {
+            ancestors.push(index);
+        }
+        previous = Some(index);
+    }
+    false
+}
+
 /// Build the `--excludes` matcher: gitignore-style patterns rooted at `base`
 /// (the current directory). [`ignore::overrides::Override`] is
 /// whitelist-oriented, so each user pattern is added negated (`!pattern`) to
@@ -81,7 +117,7 @@ pub(crate) fn collect_files(
             }
             if paths.len() > 1 {
                 let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                explicit_identities.push((path.clone(), resolved));
+                explicit_identities.push((path.clone(), resolved, true));
             }
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
         } else {
@@ -90,29 +126,13 @@ pub(crate) fn collect_files(
             }
             if paths.len() > 1 {
                 let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                explicit_identities.push((path.clone(), resolved));
+                explicit_identities.push((path.clone(), resolved, false));
             }
             files.push(path);
         }
     }
     files.sort();
-    let relationship = |left: &Path, right: &Path| {
-        if left == right {
-            Some((0, PathBuf::new()))
-        } else if let Ok(suffix) = right.strip_prefix(left) {
-            Some((1, suffix.to_path_buf()))
-        } else {
-            left.strip_prefix(right)
-                .ok()
-                .map(|suffix| (-1, suffix.to_path_buf()))
-        }
-    };
-    let has_explicit_alias = explicit_identities.iter().enumerate().any(|(index, left)| {
-        explicit_identities[index + 1..].iter().any(|right| {
-            let resolved = relationship(&left.1, &right.1);
-            resolved.is_some() && resolved != relationship(&left.0, &right.0)
-        })
-    });
+    let has_explicit_alias = explicit_inputs_have_alias(&mut explicit_identities);
     if has_explicit_alias {
         let mut seen = std::collections::HashSet::new();
         files.retain(|path| {
@@ -225,6 +245,18 @@ fn walk_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_explicit_file_lists_have_no_alias_relationship() {
+        let mut inputs = (0..4096)
+            .map(|index| {
+                let path = PathBuf::from(format!("/workspace/file-{index}.md"));
+                (path.clone(), path, false)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!explicit_inputs_have_alias(&mut inputs));
+    }
 
     fn write(path: &Path, content: &str) {
         if let Some(parent) = path.parent() {
