@@ -428,8 +428,9 @@ pub(crate) struct DiagnosticAggregator {
     /// [`Self::mark_served`], [`Self::is_dirty`]; forgotten on `didClose`.
     coverage: Mutex<HashMap<Url, HostCoverage>>,
     /// Mints a distinct lifetime for each newly-created coverage entry. A pull
-    /// captures this with `current`; after `didClose` removes the entry, its
-    /// completion must not advance a later reopened lifetime's `served` value.
+    /// captures this epoch and the current version in [`Self::coverage_stamp`];
+    /// after `didClose` removes the entry, its completion must not advance a
+    /// later reopened lifetime's `served` value.
     next_coverage_epoch: AtomicU64,
     /// Hosts whose LAST pull was answered degraded — the bounded parse wait
     /// lapsed while the aggregator held live region pushes, so the response
