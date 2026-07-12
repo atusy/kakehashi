@@ -510,7 +510,7 @@ fn remove_partial_archive_destination(dest: &Path) -> Result<(), ParserInstallEr
         Err(error) => Err(ParserInstallError::IoError(io::Error::new(
             error.kind(),
             format!(
-                "failed to remove partial archive destination {}: {error}",
+                "Failed to remove partial archive destination {}: {error}",
                 dest.display()
             ),
         ))),
@@ -556,7 +556,7 @@ fn extract_archive<R: Read>(
         ArchiveFetchError::Io(io::Error::new(
             error.kind(),
             format!(
-                "failed to create archive destination {}: {error}",
+                "Failed to create archive destination {}: {error}",
                 dest.display()
             ),
         ))
