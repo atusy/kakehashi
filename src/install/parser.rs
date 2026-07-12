@@ -304,6 +304,9 @@ pub fn remove_parser_install_and_backups(
             "unsafe parser language name",
         ));
     }
+    if !parser_dir.try_exists()? {
+        return Ok(false);
+    }
     cleanup_orphan_parser_backup_markers(parser_dir, language)?;
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
     // Remove recovery copies first. If uninstall is interrupted, leaving the
@@ -1703,6 +1706,18 @@ mod tests {
         assert!(unowned_exact_shape.exists());
         assert!(other_language.exists());
         assert!(user_file.exists());
+    }
+
+    #[test]
+    fn parser_uninstall_does_not_create_missing_parser_directory() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+
+        assert!(
+            !remove_parser_install_and_backups(&parser_dir, "lua")
+                .expect("missing parser install is a no-op")
+        );
+        assert!(!parser_dir.exists());
     }
 
     #[test]
