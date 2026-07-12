@@ -124,15 +124,11 @@ impl Kakehashi {
         // refresh redundant, never skips a needed one. Recorded only on the paths
         // that return a report for this open doc (not the cancel path).
         //
-        // Known limitation (deferred epoch class, like `did_close.rs`): if this doc
-        // is closed and re-opened while this pull is in flight, `forget_coverage`
-        // resets the entry to 0 and this captured version becomes stale-HIGH for the
-        // re-opened incarnation. `mark_served` then sets `served` above the re-opened
-        // `current`, leaving the gate briefly stuck-clean → a needed refresh can be
-        // skipped (narrow staleness) until `current` catches back up. Closing this
-        // fully needs a per-incarnation epoch; the editor's own re-open pull
-        // self-heals it.
-        let served_version = self.diagnostics.current_version(&uri);
+        // The stamp includes the coverage-entry lifetime: if this document closes
+        // and reopens while the pull is in flight, the eventual `mark_served` is a
+        // no-op against the new lifetime rather than poisoning it with a stale-high
+        // version (#745).
+        let served_version = self.diagnostics.coverage_stamp(&uri);
 
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
