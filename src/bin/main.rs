@@ -484,6 +484,32 @@ fn installed_query_language_name_if_dir(path: &Path, is_dir: bool) -> Option<Str
     Some(name.to_string())
 }
 
+fn preflight_query_install_tree(root: &Path) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("cannot read query directory '{}': {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "cannot read an entry in query directory '{}': {e}",
+                    dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
+            // remove_dir_all does not follow symlinks, so only real child
+            // directories need traversal preflight.
+            if file_type.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn installed_query_language_name_for_uninstall(
     entry: &std::fs::DirEntry,
 ) -> Result<Option<String>, String> {
@@ -495,7 +521,11 @@ fn installed_query_language_name_for_uninstall(
     // query-root entry. Do not follow it: a dangling target or loop must not
     // make the kakehashi-owned namespace impossible to clean.
     let is_dir = file_type.is_dir() || file_type.is_symlink();
-    Ok(installed_query_language_name_if_dir(&path, is_dir))
+    let language = installed_query_language_name_if_dir(&path, is_dir);
+    if language.is_some() && file_type.is_dir() {
+        preflight_query_install_tree(&path)?;
+    }
+    Ok(language)
 }
 
 fn read_optional_install_dir(path: &Path, kind: &str) -> Result<Option<std::fs::ReadDir>, String> {

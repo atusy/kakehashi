@@ -1464,6 +1464,50 @@ fn test_language_uninstall_all_fails_when_query_recovery_fails() {
     assert!(stranded_tmp.exists(), "failed recovery must stay visible");
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_preflights_query_contents_before_parser_removal() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let query_dir = test_dir.path().join("queries/lua");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&query_dir).expect("Failed to create query dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    fs::write(query_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write query");
+    fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make query dir unreadable");
+    if fs::read_dir(&query_dir).is_ok() {
+        fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore query dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore query dir permissions");
+    assert!(!output.status.success(), "unreadable query tree must fail");
+    assert!(
+        parser.exists(),
+        "query preflight failure must happen before parser removal"
+    );
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {
