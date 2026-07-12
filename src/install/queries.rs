@@ -173,6 +173,7 @@ pub fn install_queries_with_dependencies_after_install_started(
 ) -> Result<QueryInstallResult, QueryInstallError> {
     validate_safe_language_name(language)?;
     let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
+    clear_uninstall_tombstone_for_install(data_dir, language)?;
     install_queries_with_dependencies_after_install_started_with_permit(
         language,
         data_dir,
@@ -1183,6 +1184,33 @@ mod tests {
             fs::read_to_string(data_dir.join("victim.uninstalled")).unwrap(),
             "keep",
             "unsafe tombstone cleanup must not escape queries/"
+        );
+    }
+
+    #[test]
+    fn compatibility_install_restarts_intent_under_operation_lock() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let queries_parent = data_dir.join("queries");
+        let queries_dir = queries_parent.join("lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(
+            queries_dir.join("highlights.scm"),
+            "(identifier) @variable\n",
+        )
+        .unwrap();
+        write_install_marker_for_tests(&queries_dir).unwrap();
+        write_uninstall_tombstone(&queries_parent, "lua").unwrap();
+
+        let result =
+            install_queries_with_dependencies_after_install_started("lua", data_dir, false);
+
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(path)) if path == queries_dir)
+        );
+        assert!(
+            !uninstall_tombstone_path(&queries_parent, "lua").exists(),
+            "the compatibility entry point must establish a new install intent after locking"
         );
     }
 
