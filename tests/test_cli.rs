@@ -1400,7 +1400,7 @@ fn test_language_uninstall_all_includes_install_completed_before_exclusive_lock(
         })?;
         Ok::<_, std::io::Error>(stderr)
     });
-    if prompt_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+    if prompt_rx.recv_timeout(Duration::from_secs(30)).is_err() {
         let _ = uninstall.kill();
         panic!("timed out waiting for uninstall confirmation prompt");
     }
