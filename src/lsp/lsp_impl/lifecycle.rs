@@ -62,7 +62,8 @@ fn host_position_encoding(capabilities: &ClientCapabilities) -> Option<PositionE
         .map(|_| PositionEncodingKind::UTF16)
 }
 
-/// Derive only the root URI the upstream client supplied for downstream
+/// Derive a root URI only from workspace inputs the upstream client supplied
+/// (`workspaceFolders`, `rootUri`, or legacy `rootPath`) for downstream
 /// initialization. Kakehashi may use its process CWD internally for config
 /// discovery, but forwarding that fallback would turn a no-workspace session
 /// into an unrelated workspace for every bridged server.
@@ -1672,17 +1673,21 @@ mod tests {
 
     #[test]
     fn bridge_root_uri_preserves_legacy_root_path() {
+        let root_path = std::env::current_dir().expect("current directory");
         let params: InitializeParams = serde_json::from_value(serde_json::json!({
             "capabilities": {},
             "rootUri": null,
-            "rootPath": "/tmp/legacy-workspace",
+            "rootPath": root_path,
             "workspaceFolders": null
         }))
         .expect("valid initialize params");
 
         assert_eq!(
             bridge_root_uri(&params).as_deref(),
-            Some("file:///tmp/legacy-workspace")
+            Url::from_file_path(&root_path)
+                .ok()
+                .as_ref()
+                .map(Url::as_str)
         );
     }
 
