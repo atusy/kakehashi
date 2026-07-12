@@ -67,6 +67,9 @@ impl WorkspaceFolderSet {
             .inner
             .lock()
             .recover_poison("WorkspaceFolderSet::apply_change");
+        if guard.is_none() && added.is_empty() {
+            return;
+        }
         let folders = guard.get_or_insert_with(Vec::new);
         folders.retain(|existing| !removed.iter().any(|removed| removed.uri == existing.uri));
         for folder in added {
@@ -195,5 +198,14 @@ mod tests {
             set.snapshot(),
             Some(vec![folder("file:///b"), folder("file:///c")])
         );
+    }
+
+    #[test]
+    fn removal_only_change_preserves_a_none_set() {
+        let set = WorkspaceFolderSet::new(None);
+
+        set.apply_change(Vec::new(), &[folder("file:///absent")]);
+
+        assert_eq!(set.snapshot(), None);
     }
 }
