@@ -614,35 +614,56 @@ fn load_toml_settings(
 ) -> Option<RawWorkspaceSettings> {
     let root = root_path?;
     let config_path = root.join("kakehashi.toml");
-    if !config_path.exists() {
-        return None;
-    }
-
-    events.push(SettingsEvent::info(format!(
-        "Found config file: {}",
-        config_path.display()
-    )));
-
-    match fs::read_to_string(&config_path) {
+    let contents = match fs::read_to_string(&config_path) {
         Ok(contents) => {
-            deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-            match toml::from_str::<RawWorkspaceSettings>(&contents) {
-                Ok(settings) => {
-                    events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
-                    Some(settings)
+            events.push(SettingsEvent::info(format!(
+                "Found config file: {}",
+                config_path.display()
+            )));
+            contents
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(&config_path) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    return None;
                 }
-                Err(err) => {
+                Err(metadata_error) => {
                     events.push(SettingsEvent::warning(format!(
-                        "Failed to parse kakehashi.toml: {}",
-                        err
+                        "Failed to read kakehashi.toml: {metadata_error}"
                     )));
-                    None
+                    return None;
                 }
+                // The path may have appeared after the first read. Retry once;
+                // a dangling symlink remains a read error on the retry.
+                Ok(_) => match fs::read_to_string(&config_path) {
+                    Ok(contents) => contents,
+                    Err(retry_error) => {
+                        events.push(SettingsEvent::warning(format!(
+                            "Failed to read kakehashi.toml: {retry_error}"
+                        )));
+                        return None;
+                    }
+                },
             }
         }
         Err(err) => {
             events.push(SettingsEvent::warning(format!(
                 "Failed to read kakehashi.toml: {}",
+                err
+            )));
+            return None;
+        }
+    };
+
+    deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
+    match toml::from_str::<RawWorkspaceSettings>(&contents) {
+        Ok(settings) => {
+            events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
+            Some(settings)
+        }
+        Err(err) => {
+            events.push(SettingsEvent::warning(format!(
+                "Failed to parse kakehashi.toml: {}",
                 err
             )));
             None
@@ -1810,6 +1831,28 @@ mod tests {
         assert!(
             used_deprecated.root_markers,
             "rootMarkers should set the flag"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_toml_settings_reports_dangling_workspace_config() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        symlink("missing.toml", dir.path().join("kakehashi.toml")).unwrap();
+
+        let mut events = Vec::new();
+        let mut deprecated_keys = DeprecatedKeysSeen::default();
+        let result = load_toml_settings(Some(dir.path()), &mut events, &mut deprecated_keys);
+
+        assert!(result.is_none());
+        assert!(
+            events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("Failed to read kakehashi.toml")
+            }),
+            "a configured but broken workspace path must emit a read warning: {events:?}"
         );
     }
 }
