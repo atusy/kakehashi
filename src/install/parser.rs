@@ -89,7 +89,8 @@ fn publish_parser_transactionally(
                         return Err(std::io::Error::new(
                             publish_error.kind(),
                             format!(
-                                "failed to publish parser: {publish_error}; restored parser but failed to remove backup marker: {marker_error}"
+                                "failed to publish parser: {publish_error}; restored parser but failed to remove backup marker '{}': {marker_error}",
+                                parser_backup_ownership_sidecar(backup_file).display()
                             ),
                         ));
                     }
@@ -1406,6 +1407,7 @@ mod tests {
         backup_markers: HashSet<PathBuf>,
         fail_marker_creation: bool,
         fail_marker_write_after_create: bool,
+        fail_marker_removal: bool,
         backup_claim_observed_marker: bool,
     }
 
@@ -1478,6 +1480,12 @@ mod tests {
         }
 
         fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+            if self.fail_marker_removal {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected marker cleanup failure",
+                ));
+            }
             self.backup_markers.remove(backup);
             Ok(())
         }
@@ -1499,6 +1507,26 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(ops.files.get(&parser), Some(&"old"));
         assert!(!ops.files.contains_key(&backup));
+    }
+
+    #[test]
+    fn transactional_publish_identifies_marker_left_after_rollback() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.failed_renames.push((tmp.clone(), parser.clone()));
+        ops.fail_marker_removal = true;
+
+        let error = publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("marker cleanup failure must identify the leftover");
+
+        assert!(
+            error.to_string().contains("parser.backup.owner"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
