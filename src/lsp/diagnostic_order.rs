@@ -39,7 +39,7 @@ fn diagnostic_position_key(diagnostic: &Diagnostic) -> (u32, u32, u32, u32) {
     )
 }
 
-fn canonical_json_string<T: serde::Serialize + std::fmt::Debug>(value: &T) -> String {
+pub(crate) fn canonical_json_string<T: serde::Serialize + std::fmt::Debug>(value: &T) -> String {
     // Fall back to the (deterministic, derive-generated) Debug rendering on a
     // serialization failure instead of a shared sentinel: distinct
     // diagnostics must not collapse to one cached sort key, or the final
