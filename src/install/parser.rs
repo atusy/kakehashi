@@ -507,7 +507,13 @@ fn remove_partial_archive_destination(dest: &Path) -> Result<(), ParserInstallEr
     match fs::remove_dir_all(dest) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ParserInstallError::IoError(error)),
+        Err(error) => Err(ParserInstallError::IoError(io::Error::new(
+            error.kind(),
+            format!(
+                "failed to remove partial archive destination {}: {error}",
+                dest.display()
+            ),
+        ))),
     }
 }
 
@@ -546,7 +552,15 @@ fn extract_archive<R: Read>(
     expected_prefix: &str,
     dest: &Path,
 ) -> Result<(), ArchiveFetchError> {
-    fs::create_dir_all(dest)?;
+    fs::create_dir_all(dest).map_err(|error| {
+        ArchiveFetchError::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "failed to create archive destination {}: {error}",
+                dest.display()
+            ),
+        ))
+    })?;
 
     let mut extracted_any = false;
     for entry_result in archive
