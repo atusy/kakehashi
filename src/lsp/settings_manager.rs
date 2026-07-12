@@ -208,9 +208,12 @@ impl SettingsManager {
             .lock()
             .recover_poison("SettingsManager::apply_installed_search_paths");
         for path in paths.iter() {
-            if !settings.search_paths.iter().any(|existing| {
-                std::path::Path::new(existing).clean() == std::path::Path::new(path)
-            }) {
+            let cleaned_path = std::path::Path::new(path);
+            if !settings
+                .search_paths
+                .iter()
+                .any(|existing| std::path::Path::new(existing).clean() == cleaned_path)
+            {
                 settings.search_paths.push(path.clone());
                 let raw_paths = raw_settings.search_paths.get_or_insert_with(Vec::new);
                 if !raw_paths.contains(path) {

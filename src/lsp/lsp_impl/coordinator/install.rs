@@ -25,8 +25,8 @@ fn updated_settings_after_install(
 ) -> (crate::config::RawWorkspaceSettings, WorkspaceSettings) {
     let mut updated_settings = settings.clone();
     let mut updated_raw_settings = raw_settings.clone();
-    let data_dir_str = data_dir.clean().to_string_lossy().into_owned();
-    let cleaned_data_dir = std::path::Path::new(&data_dir_str);
+    let cleaned_data_dir = data_dir.clean();
+    let data_dir_str = cleaned_data_dir.to_string_lossy().into_owned();
     if !updated_settings
         .search_paths
         .iter()
