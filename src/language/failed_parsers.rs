@@ -21,6 +21,10 @@ use std::sync::{Arc, OnceLock};
 
 const PARSING_MARKER_PREFIX: &str = "parsing_in_progress.";
 
+fn is_lock_contended(error: &io::Error) -> bool {
+    error.raw_os_error() == fs4::lock_contended_error().raw_os_error()
+}
+
 struct SessionMarker {
     file: std::sync::Mutex<fs::File>,
 }
@@ -135,7 +139,7 @@ impl FailedParserRegistry {
                     drop(file);
                     let _ = fs::remove_file(entry.path());
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if is_lock_contended(&error) => {}
                 Err(error) => return Err(error),
             }
         }
