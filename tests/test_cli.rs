@@ -980,6 +980,36 @@ fn test_language_status_ignores_internal_query_dirs() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_status_ignores_dangling_internal_query_symlink() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    fs::create_dir(&queries_dir).expect("Failed to create queries directory");
+    symlink("missing", queries_dir.join(".rust.123.tmp"))
+        .expect("Failed to create internal query symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("No languages installed"),
+        "stderr: {stderr}"
+    );
+}
+
 /// Test that language status recovers a query dir stranded as a hidden backup
 #[test]
 fn test_language_status_recovers_internal_query_backup() {
