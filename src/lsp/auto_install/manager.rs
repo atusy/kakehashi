@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn unit_test_crash_state_is_separate_from_shared_install_assets() {
-        let shared_install_dir = crate::install::test_data_dir();
+        let shared_install_dir = crate::install::test_support::test_data_dir_path();
 
         let state_dir = failed_parser_state_dir();
 
