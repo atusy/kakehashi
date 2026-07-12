@@ -1204,7 +1204,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn shutdown_cancels_an_admitted_refresh_before_send() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
