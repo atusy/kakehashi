@@ -160,10 +160,7 @@ fn write_marker_atomically(marker_path: &Path, content: &[u8]) -> std::io::Resul
         return Err(error);
     }
     drop(marker);
-    // Linking publishes the already-complete inode and atomically fails when
-    // the destination exists; unlike Windows rename, it never replaces a
-    // colliding user or prior-process sidecar.
-    if let Err(error) = fs::hard_link(&marker_tmp, marker_path) {
+    if let Err(error) = publish_marker_no_replace(&marker_tmp, marker_path) {
         let _ = fs::remove_file(marker_tmp);
         return Err(error);
     }
@@ -171,6 +168,29 @@ fn write_marker_atomically(marker_path: &Path, content: &[u8]) -> std::io::Resul
     // which recovery removes by its exact ULID shape.
     let _ = fs::remove_file(marker_tmp);
     Ok(())
+}
+
+#[cfg(windows)]
+fn publish_marker_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Flags 0 is an atomic same-volume move that fails when `to` exists.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+fn publish_marker_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::hard_link(from, to)?;
+    fs::remove_file(from)
 }
 
 #[cfg(any(windows, test))]
