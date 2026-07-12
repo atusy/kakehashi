@@ -66,7 +66,8 @@ fn publish_parser_transactionally(
                 return Err(std::io::Error::new(
                     error.kind(),
                     format!(
-                        "failed to claim parser backup: {error}; failed to remove new ownership marker: {marker_error}"
+                        "failed to claim parser backup: {error}; failed to remove new ownership marker '{}': {marker_error}",
+                        parser_backup_ownership_sidecar(backup_file).display()
                     ),
                 ));
             }
@@ -1589,6 +1590,23 @@ mod tests {
             .expect_err("marker cleanup failure must identify published state");
 
         assert!(error.to_string().contains("published parser"));
+        assert!(error.to_string().contains("parser.backup.owner"));
+    }
+
+    #[test]
+    fn transactional_publish_identifies_marker_left_after_failed_claim() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.failed_renames.push((parser.clone(), backup.clone()));
+        ops.fail_marker_removal = true;
+
+        let error = publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("claim cleanup failure must identify marker");
+
         assert!(error.to_string().contains("parser.backup.owner"));
     }
 
