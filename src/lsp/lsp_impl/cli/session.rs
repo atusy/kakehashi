@@ -80,7 +80,7 @@ impl Kakehashi {
             return true;
         };
         const MAX_FIRST_LINE_BYTES: usize = 8 * 1024;
-        let path = path.to_string_lossy();
+        let path_text = path.to_string_lossy();
         let mut probe = Vec::with_capacity(MAX_FIRST_LINE_BYTES + 1);
         if std::io::BufReader::new(file)
             .take((MAX_FIRST_LINE_BYTES + 1) as u64)
@@ -100,7 +100,7 @@ impl Kakehashi {
             Err(_) => return false,
         };
         self.language
-            .loadable_language_for_document(&path, valid)
+            .loadable_language_for_document(&path_text, valid)
             .is_some()
     }
 
