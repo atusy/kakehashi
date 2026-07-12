@@ -49,7 +49,10 @@ fn normalize_lone_carriage_returns(text: &str) -> Cow<'_, str> {
             normalized[index] = b'\n';
         }
     }
-    Cow::Owned(String::from_utf8(normalized).expect("replacing ASCII bytes preserves valid UTF-8"))
+    // SAFETY: `normalized` came from valid UTF-8 and only ASCII CR bytes were
+    // replaced with ASCII LF bytes, so every UTF-8 code-unit boundary remains
+    // unchanged.
+    Cow::Owned(unsafe { String::from_utf8_unchecked(normalized) })
 }
 
 impl PositionMapper<'_> {
