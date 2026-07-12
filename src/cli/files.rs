@@ -45,8 +45,8 @@ fn build_exclude_matcher(
 ///   it.
 /// - A directory is walked respecting `.gitignore` (even outside a git
 ///   repository), hidden-file filtering, and `--excludes`; only files for
-///   which `is_supported` returns true (language detectable from the path)
-///   are kept.
+///   which `is_supported` returns true are kept. The callback may inspect file
+///   content when support cannot be determined from the path alone.
 /// - A path that does not exist is an error.
 ///
 /// The files are sorted and deduplicated for deterministic processing order.
@@ -136,7 +136,8 @@ fn is_excluded(
 }
 
 /// Walk `dir` respecting `.gitignore` and `--excludes`, appending every
-/// supported file to `out`. Unreadable entries are reported and counted so
+/// supported file to `out`. Support checks may inspect file content. Unreadable
+/// walker entries are reported and counted so
 /// callers can surface an operational-error exit code after processing the
 /// files that were still discoverable.
 fn walk_directory(
