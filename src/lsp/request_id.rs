@@ -6,8 +6,8 @@
 //! `CancelForwarder::subscribe()` via a oneshot so it can abort and return
 //! `RequestCancelled`.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -60,9 +60,16 @@ impl std::error::Error for AlreadySubscribedError {}
 
 /// Registry of cancel notification subscribers.
 ///
-/// Maps upstream request IDs to oneshot senders that notify handlers when
-/// a `$/cancelRequest` arrives.
-type CancelSubscriberRegistry = std::sync::Mutex<HashMap<UpstreamId, oneshot::Sender<()>>>;
+/// Tracks accepted requests, handler subscribers, and cancellations that arrived
+/// in the short interval between those two events.
+#[derive(Default)]
+struct CancelSubscriberState {
+    subscribers: HashMap<UpstreamId, oneshot::Sender<()>>,
+    active_requests: HashSet<UpstreamId>,
+    pending_cancellations: HashSet<UpstreamId>,
+}
+
+type CancelSubscriberRegistry = std::sync::Mutex<CancelSubscriberState>;
 
 /// Forwards cancel requests to downstream language servers.
 ///
@@ -91,7 +98,7 @@ impl CancelForwarder {
     pub fn new(pool: Arc<LanguageServerPool>) -> Self {
         Self {
             pool,
-            subscribers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            subscribers: Arc::new(std::sync::Mutex::new(CancelSubscriberState::default())),
         }
     }
 
@@ -140,7 +147,11 @@ impl CancelForwarder {
                 .subscribers
                 .lock()
                 .recover_poison("CancelForwarder::subscribe");
-            match subscribers.entry(upstream_id) {
+            if subscribers.pending_cancellations.remove(&upstream_id) {
+                let _ = tx.send(());
+                return Ok(rx);
+            }
+            match subscribers.subscribers.entry(upstream_id) {
                 Entry::Occupied(entry) => return Err(AlreadySubscribedError(entry.key().clone())),
                 Entry::Vacant(entry) => {
                     entry.insert(tx);
@@ -159,19 +170,26 @@ impl CancelForwarder {
             .subscribers
             .lock()
             .recover_poison("CancelForwarder::unsubscribe");
-        subscribers.remove(upstream_id);
+        subscribers.subscribers.remove(upstream_id);
     }
 
-    /// Notify a subscriber that their request was cancelled, returning whether one
-    /// existed. Called by `RequestIdCapture` on `$/cancelRequest`; a matched
-    /// subscriber is notified and removed from the registry.
+    /// Notify a subscriber that its request was cancelled, or retain the signal
+    /// while an accepted request has not subscribed yet. Returns whether the ID
+    /// belongs to an active request or subscriber.
     pub(crate) fn notify_cancel(&self, upstream_id: &UpstreamId) -> bool {
         let sender = {
             let mut subscribers = self
                 .subscribers
                 .lock()
                 .recover_poison("CancelForwarder::notify_cancel");
-            subscribers.remove(upstream_id)
+            let sender = subscribers.subscribers.remove(upstream_id);
+            if sender.is_none() && subscribers.active_requests.contains(upstream_id) {
+                subscribers
+                    .pending_cancellations
+                    .insert(upstream_id.clone());
+                return true;
+            }
+            sender
         };
         if let Some(tx) = sender {
             // Send notification (ignore if receiver dropped)
@@ -180,6 +198,45 @@ impl CancelForwarder {
         } else {
             false
         }
+    }
+
+    fn register_request(&self, upstream_id: UpstreamId) {
+        self.subscribers
+            .lock()
+            .recover_poison("CancelForwarder::register_request")
+            .active_requests
+            .insert(upstream_id);
+    }
+
+    fn unregister_request(&self, upstream_id: &UpstreamId) {
+        let mut state = self
+            .subscribers
+            .lock()
+            .recover_poison("CancelForwarder::unregister_request");
+        state.active_requests.remove(upstream_id);
+        state.pending_cancellations.remove(upstream_id);
+        state.subscribers.remove(upstream_id);
+    }
+}
+
+struct ActiveRequestGuard {
+    cancel_forwarder: CancelForwarder,
+    upstream_id: UpstreamId,
+}
+
+impl ActiveRequestGuard {
+    fn new(cancel_forwarder: CancelForwarder, upstream_id: UpstreamId) -> Self {
+        cancel_forwarder.register_request(upstream_id.clone());
+        Self {
+            cancel_forwarder,
+            upstream_id,
+        }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.cancel_forwarder.unregister_request(&self.upstream_id);
     }
 }
 
@@ -262,6 +319,14 @@ where
         // Check if this is a $/cancelRequest notification and forward to downstream
         // Per LSP spec, cancel params.id can be either integer or string
         let cancel_forwarder = self.cancel_forwarder.clone();
+        let active_request = cancel_forwarder.clone().and_then(|forwarder| {
+            let upstream_id = match request_id.as_ref()? {
+                Id::Number(id) => UpstreamId::Number(*id),
+                Id::String(id) => UpstreamId::String(id.clone()),
+                Id::Null => return None,
+            };
+            Some(ActiveRequestGuard::new(forwarder, upstream_id))
+        });
         if req.method() == "$/cancelRequest"
             && let Some(forwarder) = cancel_forwarder.as_ref()
             && let Some(params) = req.params()
@@ -329,6 +394,7 @@ where
         let inner_fut = self.inner.call(req);
 
         Box::pin(async move {
+            let _active_request = active_request;
             // Set the task-local request ID and await the inner future
             CURRENT_REQUEST_ID.scope(request_id, inner_fut).await
         })
@@ -519,6 +585,35 @@ mod tests {
 
         // Note: We can't verify the forward happened without a real pool setup,
         // but we've verified the middleware processes the cancel notification.
+    }
+
+    #[tokio::test]
+    async fn cancel_before_handler_subscription_is_delivered() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock, forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+
+        // `call` means the middleware has accepted this request, but deliberately
+        // leave its future unpolled so the handler cannot have subscribed yet.
+        let request = Request::build("textDocument/hover")
+            .params(serde_json::json!({}))
+            .id(123i64)
+            .finish();
+        let request_future = service.call(request);
+
+        assert!(
+            forwarder.notify_cancel(&upstream_id),
+            "an accepted request must retain cancellation until its handler subscribes"
+        );
+        let cancel = forwarder.subscribe(upstream_id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(50), cancel)
+            .await
+            .expect("retained cancellation should be delivered on subscribe")
+            .expect("cancel sender should signal rather than drop");
+
+        drop(request_future);
     }
 
     #[tokio::test]
