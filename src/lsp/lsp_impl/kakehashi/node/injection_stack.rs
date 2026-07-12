@@ -482,14 +482,12 @@ pub(super) fn with_resolved_node_pair<R>(
 /// injections in the document). That matters for large files with many code
 /// blocks: we only need grammars for the layers that actually wrap the cursor.
 ///
-/// A language is *recorded* as soon as its `@injection.language` is resolved,
-/// even if its parser is not yet loaded. But the walk only *descends* into a
-/// layer whose parser is already in the registry — parsing requires a loaded
-/// grammar. This makes the function a single fixpoint step: callers that
-/// auto-install the returned set and call again will, on the next pass, be
-/// able to parse one level deeper and surface the next language on the path.
-/// Iterating to a fixpoint discovers the full nested chain at the cursor
-/// (Markdown → Python → Regex …) without ever parsing with a missing grammar.
+/// Language resolution loads the parser before returning a canonical language.
+/// The walk descends only while that loaded grammar remains in the registry;
+/// a concurrent unload is treated like any unavailable candidate and scanning
+/// continues with the next containing sibling. Iterating this discovery to a
+/// fixpoint discovers the full nested chain at the cursor (Markdown → Python →
+/// Regex …) without ever parsing with a missing grammar.
 ///
 /// Bounded by [`MAX_INJECTION_DEPTH`] so a misconfigured grammar cycle cannot
 /// loop forever.
@@ -559,14 +557,14 @@ pub(super) fn collect_injection_languages_at(
             };
             languages.insert(resolved_lang.clone());
 
-            // Stop at the first resolvable but unloaded candidate. The caller
-            // installs it and reruns this fixpoint step; only then can we know
-            // whether it parses and remains the smallest viable path.
+            // `resolve_injection_language` only returns after successfully
+            // loading a parser. A miss here therefore means it was unloaded
+            // concurrently; mirror stack rebuilding and try the next sibling.
             let Some(language) = coordinator
                 .language_registry_for_parallel()
                 .get(&resolved_lang)
             else {
-                break;
+                continue;
             };
             let Some(injected_tree) =
                 parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
