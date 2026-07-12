@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_install_clears_the_parser_uninstall_tombstone() {
+    fn a_later_install_replaces_the_uninstall_marker_with_its_token() {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
         let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
@@ -1562,6 +1562,10 @@ mod tests {
             .expect("later install may publish");
 
         assert_eq!(fs::read(parser_file).unwrap(), b"compiled parser");
+        assert_eq!(
+            fs::read_to_string(parser_uninstall_tombstone_path(&parser_dir, "lua")).unwrap(),
+            install_token
+        );
     }
 
     #[test]
