@@ -511,7 +511,7 @@ fn is_bidi_control(ch: char) -> bool {
 }
 
 fn escape_jsonl_terminal_controls(json: String) -> String {
-    let requires_escape = |ch: char| (ch.is_control() && ch >= '\u{80}') || is_bidi_control(ch);
+    let requires_escape = |ch: char| (ch.is_control() && ch >= '\u{7f}') || is_bidi_control(ch);
     if !json.chars().any(requires_escape) {
         return json;
     }
@@ -724,9 +724,10 @@ mod tests {
             Some(DiagnosticSeverity::ERROR),
             "boom\u{1b}[31m\u{202e}",
         );
-        d.source = Some("tool\u{009b}\u{2066}".to_string());
+        d.source = Some("tool\u{7f}\u{009b}\u{2066}".to_string());
 
         let rendered = format_diagnostic(OutputFormat::Jsonl, "dir/\u{1b}[2Jfile", &d);
+        assert!(rendered.contains("\\u007f"), "rendered: {rendered}");
         assert!(rendered.contains("\\u009b"), "rendered: {rendered}");
         assert!(rendered.contains("\\u202e"), "rendered: {rendered}");
         assert!(rendered.contains("\\u2066"), "rendered: {rendered}");
@@ -734,7 +735,7 @@ mod tests {
 
         assert_eq!(value["file"], "dir/\u{1b}[2Jfile");
         assert_eq!(value["message"], "boom\u{1b}[31m\u{202e}");
-        assert_eq!(value["source"], "tool\u{009b}\u{2066}");
+        assert_eq!(value["source"], "tool\u{7f}\u{009b}\u{2066}");
     }
 
     #[test]
