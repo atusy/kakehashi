@@ -26,7 +26,12 @@ fn updated_settings_after_install(
     let mut updated_settings = settings.clone();
     let mut updated_raw_settings = raw_settings.clone();
     let data_dir_str = data_dir.clean().to_string_lossy().into_owned();
-    if !updated_settings.search_paths.contains(&data_dir_str) {
+    let cleaned_data_dir = std::path::Path::new(&data_dir_str);
+    if !updated_settings
+        .search_paths
+        .iter()
+        .any(|existing| std::path::Path::new(existing).clean() == cleaned_data_dir)
+    {
         updated_settings.search_paths.push(data_dir_str.clone());
 
         let raw_search_paths = updated_raw_settings
@@ -376,6 +381,24 @@ mod tests {
             &settings,
             Path::new("/tmp/parent/../installed"),
         );
+
+        assert_eq!(updated_raw.search_paths, raw_settings.search_paths);
+        assert_eq!(updated_settings.search_paths, settings.search_paths);
+    }
+
+    #[test]
+    fn reload_after_install_deduplicates_lexical_existing_path_variants() {
+        let raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["/tmp/parent/../installed".to_string()]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            search_paths: vec!["/tmp/parent/../installed".to_string()],
+            ..Default::default()
+        };
+
+        let (updated_raw, updated_settings) =
+            updated_settings_after_install(&raw_settings, &settings, Path::new("/tmp/installed"));
 
         assert_eq!(updated_raw.search_paths, raw_settings.search_paths);
         assert_eq!(updated_settings.search_paths, settings.search_paths);
