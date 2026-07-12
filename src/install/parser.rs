@@ -10,6 +10,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
+#[cfg(unix)]
+use fs4::fs_std::FileExt;
 use tar::Archive;
 use tree_sitter_loader::Loader;
 
@@ -406,6 +408,7 @@ fn staged_parser_pid(path: &Path) -> Option<u32> {
     let extension = parts.next()?;
     if parts.next().is_some()
         || !super::queries::is_safe_language_name(language)
+        || !is_canonical_decimal(pid)
         || !is_canonical_decimal(counter)
         || extension != std::env::consts::DLL_EXTENSION
     {
@@ -426,17 +429,39 @@ fn cleanup_claim_pid(path: &Path) -> Option<u32> {
     let mut parts = rest.split('.');
     let pid = parts.next()?;
     let counter = parts.next()?;
-    if parts.next().is_some() || !is_canonical_decimal(counter) {
+    if parts.next().is_some() || !is_canonical_decimal(pid) || !is_canonical_decimal(counter) {
         return None;
     }
     pid.parse().ok()
 }
 
 #[cfg(unix)]
-fn claim_stale_parser_file(
+fn claim_and_unlink_stale_parser_file(
     parser_dir: &Path,
     path: &Path,
 ) -> Result<Option<PathBuf>, ParserInstallError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let file = match fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    }
+    let opened = file.metadata()?;
+    let current = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    if opened.dev() != current.dev() || opened.ino() != current.ino() {
+        return Ok(None);
+    }
+
     loop {
         let candidate = parser_dir.join(format!(
             ".parser-cleanup.{}.{}",
@@ -444,7 +469,14 @@ fn claim_stale_parser_file(
             PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         match fs::hard_link(path, &candidate) {
-            Ok(()) => return Ok(Some(candidate)),
+            Ok(()) => {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(ParserInstallError::IoError(error)),
+                }
+                return Ok(Some(candidate));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ParserInstallError::IoError(error)),
@@ -490,14 +522,9 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
             // installer reserves staging paths with create_new, so after this
             // claim it may safely reuse the old PID/counter name without our
             // cleanup deleting its newly-created output.
-            let Some(claimed) = claim_stale_parser_file(parser_dir, &path)? else {
+            let Some(claimed) = claim_and_unlink_stale_parser_file(parser_dir, &path)? else {
                 continue;
             };
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ParserInstallError::IoError(error)),
-            }
             match fs::remove_file(claimed) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1129,13 +1156,50 @@ mod tests {
             ".lua.123.01.{}.tmp",
             std::env::consts::DLL_EXTENSION
         ));
+        let leading_zero_pid = parser_dir.join(format!(
+            ".lua.000123.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        let noncanonical_claim = parser_dir.join(".parser-cleanup.000123.0");
         fs::write(&empty_counter, b"user file").expect("write user file");
         fs::write(&leading_zero, b"user file").expect("write user file");
+        fs::write(&leading_zero_pid, b"user file").expect("write user file");
+        fs::write(&noncanonical_claim, b"user file").expect("write user file");
 
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
 
         assert!(empty_counter.exists(), "empty counter name is preserved");
         assert!(leading_zero.exists(), "leading-zero name is preserved");
+        assert!(leading_zero_pid.exists(), "leading-zero PID is preserved");
+        assert!(
+            noncanonical_claim.exists(),
+            "leading-zero cleanup claim PID is preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_staging_file_claimed_by_another_cleaner() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let mut pid = std::process::id().saturating_add(100_000);
+        while process_is_running(pid) {
+            pid = pid.saturating_add(1);
+        }
+        let staged = parser_dir.join(format!(
+            ".lua.{pid}.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"partial parser").expect("write staged parser");
+        let claimed_elsewhere = fs::File::open(&staged).expect("open staged parser");
+        claimed_elsewhere
+            .lock_exclusive()
+            .expect("simulate another cleaner's claim");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(staged.exists(), "another cleaner owns the staging file");
     }
 
     const TREE_SITTER_JSON_URL: &str =
