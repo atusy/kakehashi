@@ -718,10 +718,25 @@ fn write_forced_output_with(
     let directory = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
+    #[cfg(unix)]
+    let created_permissions = {
+        let directory = directory.unwrap_or(std::path::Path::new("."));
+        let probe = directory.join(format!(".kakehashi-mode-{}", ulid::Ulid::new()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)?;
+        let permissions = file.metadata()?.permissions();
+        drop(file);
+        std::fs::remove_file(probe)?;
+        permissions
+    };
     let mut temporary =
         tempfile::NamedTempFile::new_in(directory.unwrap_or(std::path::Path::new(".")))?;
     write(temporary.as_file_mut(), content)?;
     temporary.as_file().sync_all()?;
+    #[cfg(unix)]
+    temporary.as_file().set_permissions(created_permissions)?;
 
     match temporary.persist_noclobber(path) {
         Ok(_) => Ok(WriteDisposition::Created),
@@ -1233,6 +1248,24 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_force_output_uses_normal_creation_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let ordinary = temp.path().join("ordinary.toml");
+        let output = temp.path().join("config.toml");
+        std::fs::write(&ordinary, "ordinary").unwrap();
+
+        write_forced_output(&output, "generated").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(output).unwrap().permissions().mode(),
+            std::fs::metadata(ordinary).unwrap().permissions().mode()
+        );
     }
 
     #[cfg(unix)]
