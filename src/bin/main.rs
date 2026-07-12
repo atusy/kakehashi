@@ -697,77 +697,50 @@ impl WriteDisposition {
 }
 
 fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result<WriteDisposition> {
+    write_forced_output_with(path, content, |file, content| {
+        use std::io::Write as _;
+        file.write_all(content.as_bytes())
+    })
+}
+
+fn write_forced_output_with(
+    path: &std::path::Path,
+    content: &str,
+    write: impl FnOnce(&mut std::fs::File, &str) -> std::io::Result<()>,
+) -> std::io::Result<WriteDisposition> {
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("refusing to follow output symlink '{}'", path.display()),
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let create = || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .custom_flags(nix::libc::O_NOFOLLOW)
-                .open(path)
-        };
-        let (mut file, disposition) = match create() {
-            Ok(file) => (file, WriteDisposition::Created),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .custom_flags(nix::libc::O_NOFOLLOW)
-                    .open(path)?,
-                WriteDisposition::Overwrote,
-            ),
-            Err(error) => return Err(error),
-        };
-        file.write_all(content.as_bytes())?;
-        Ok(disposition)
-    }
-    #[cfg(not(unix))]
-    {
-        #[cfg(windows)]
-        {
-            use std::io::Write as _;
-            use std::os::windows::fs::OpenOptionsExt as _;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            let create = || {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                    .open(path)
-            };
-            let (mut file, disposition) = match create() {
-                Ok(file) => (file, WriteDisposition::Created),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .truncate(true)
-                        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                        .open(path)?,
-                    WriteDisposition::Overwrote,
-                ),
-                Err(error) => return Err(error),
-            };
-            file.write_all(content.as_bytes())?;
-            Ok(disposition)
+
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(directory.unwrap_or(std::path::Path::new(".")))?;
+    write(temporary.as_file_mut(), content)?;
+    temporary.as_file().sync_all()?;
+
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(WriteDisposition::Created),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let temporary = error.file;
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing to follow output symlink '{}'", path.display()),
+                ));
+            }
+            temporary
+                .as_file()
+                .set_permissions(metadata.permissions())?;
+            temporary.persist(path).map_err(|error| error.error)?;
+            Ok(WriteDisposition::Overwrote)
         }
-        #[cfg(not(windows))]
-        {
-            let disposition = if path.exists() {
-                WriteDisposition::Overwrote
-            } else {
-                WriteDisposition::Created
-            };
-            std::fs::write(path, content)?;
-            Ok(disposition)
-        }
+        Err(error) => Err(error.error),
     }
 }
 
@@ -1243,6 +1216,23 @@ mod tests {
             WriteDisposition::Overwrote
         );
         assert_eq!(std::fs::read_to_string(output).unwrap(), "second");
+    }
+
+    #[test]
+    fn failed_force_output_preserves_existing_file() {
+        use std::io::Write as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "existing").unwrap();
+
+        let result = write_forced_output_with(&output, "generated", |file, content| {
+            file.write_all(&content.as_bytes()[..3])?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
     }
 
     #[cfg(unix)]
