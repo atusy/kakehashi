@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 const PARSING_MARKER_PREFIX: &str = "parsing_in_progress.";
+const NEXT_MARKER_PREFIX: &str = ".parsing_marker_next.";
 
 fn is_lock_contended(error: &io::Error) -> bool {
     error.raw_os_error() == fs4::lock_contended_error().raw_os_error()
@@ -79,6 +80,15 @@ impl FailedParserRegistry {
             .join(format!("{PARSING_MARKER_PREFIX}{}", ulid::Ulid::new()))
     }
 
+    fn crash_recovery_lock(&self) -> io::Result<fs::File> {
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.state_dir.join("crash_recovery.lock"))
+    }
+
     /// Path to the "failed parsers" list file.
     fn failed_parsers_path(&self) -> PathBuf {
         self.state_dir.join("failed_parsers")
@@ -95,12 +105,7 @@ impl FailedParserRegistry {
         // Serialize recovery scanning with marker creation. Otherwise a peer
         // could observe a newly-created marker before its owner locks it and
         // misclassify the live session as crashed.
-        let init_lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.state_dir.join("crash_recovery.lock"))?;
+        let init_lock = self.crash_recovery_lock()?;
         init_lock.lock_exclusive()?;
 
         // Load only after acquiring the cross-process lock. A peer may have
@@ -134,6 +139,21 @@ impl FailedParserRegistry {
         for entry in fs::read_dir(&self.state_dir)? {
             let entry = entry?;
             let name = entry.file_name();
+            if name.to_string_lossy().starts_with(NEXT_MARKER_PREFIX) {
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(entry.path())?;
+                match file.try_lock_exclusive() {
+                    Ok(()) => {
+                        drop(file);
+                        let _ = fs::remove_file(entry.path());
+                    }
+                    Err(error) if is_lock_contended(&error) => {}
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
             if !name.to_string_lossy().starts_with(PARSING_MARKER_PREFIX) {
                 continue;
             }
@@ -282,6 +302,11 @@ impl FailedParserRegistry {
     }
 
     fn persist_current_state(&self) -> io::Result<()> {
+        // Serialize temporary-file publication with startup cleanup. Without
+        // this lock, init could see the file between create and file locking.
+        let recovery_lock = self.crash_recovery_lock()?;
+        recovery_lock.lock_exclusive()?;
+
         let parsing_languages: Vec<String> = self
             .parsing_counts
             .iter()
@@ -304,7 +329,7 @@ impl FailedParserRegistry {
         let next_path = self.session_marker_path();
         let temp_path = self
             .state_dir
-            .join(format!(".parsing_marker_next.{}", ulid::Ulid::new()));
+            .join(format!("{NEXT_MARKER_PREFIX}{}", ulid::Ulid::new()));
         let replacement = (|| -> io::Result<fs::File> {
             let mut file = fs::OpenOptions::new()
                 .create_new(true)
@@ -507,6 +532,18 @@ mod tests {
             "a live peer's active parser must not be quarantined"
         );
         first.end_parsing_language("lua").unwrap();
+    }
+
+    #[test]
+    fn test_init_removes_abandoned_replacement_marker() {
+        let temp = tempdir().unwrap();
+        let abandoned = temp.path().join(".parsing_marker_next.abandoned");
+        fs::write(&abandoned, "partial").unwrap();
+
+        let registry = FailedParserRegistry::new(temp.path());
+        registry.init().unwrap();
+
+        assert!(!abandoned.exists());
     }
 
     #[test]
