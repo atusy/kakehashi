@@ -455,7 +455,7 @@ pub(crate) struct DiagnosticAggregator {
     wire_gate: Mutex<HashMap<Url, WireGate>>,
     /// Always-on counters for the diagnostic path (#533): push-origin republishes
     /// in, `workspace/diagnostic/refresh` requested vs actually sent (the gap is
-    /// what the #497 single-flight + coverage gate saves), and pulls answered with
+    /// what debounce + the #497 single-flight/coverage gates save), and pulls answered with
     /// coarse latency. Read on shutdown / in tests to quantify refresh amplification
     /// on a real session before/after a change. Relaxed atomics — free on the hot
     /// path, and the counts need no cross-counter ordering.
@@ -547,12 +547,12 @@ struct DiagnosticMetrics {
     /// ingress that can drive a refresh). Counted in [`DiagnosticAggregator::bump_current`].
     push_republishes: AtomicU64,
     /// `workspace/diagnostic/refresh` asks that passed the client capability gate
-    /// (entry to `request_pull_diagnostic_refresh`), *before* the single-flight /
-    /// coverage gate decides whether to actually send.
+    /// before forwarded-refresh debounce and the single-flight/coverage gates
+    /// decide whether to actually send.
     refreshes_requested: AtomicU64,
     /// `workspace/diagnostic/refresh` requests actually written to the wire (post
-    /// single-flight + coverage gate, including trailing fires). `requested - sent`
-    /// is what the #497 gate saves.
+    /// forwarded-refresh debounce + single-flight/coverage gates, including
+    /// trailing fires). `requested - sent` is the total coalescing/gate savings.
     refreshes_sent: AtomicU64,
     /// `textDocument/diagnostic` pulls answered (every return of the LSP handler).
     pulls_answered: AtomicU64,
@@ -2520,7 +2520,7 @@ mod tests {
         assert_eq!(
             m.refreshes_requested.saturating_sub(m.refreshes_sent),
             2,
-            "requested - sent is what the gate saved"
+            "requested - sent is what coalescing and the gates saved"
         );
         assert_eq!(m.pulls_answered, 2);
         assert_eq!(m.pull_micros_total, 400);

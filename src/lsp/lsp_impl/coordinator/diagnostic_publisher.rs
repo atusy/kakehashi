@@ -945,8 +945,8 @@ impl DiagnosticPublisher {
         if !self.diagnostic_refresh_supported() {
             return;
         }
-        // Count the ask before the gate so `requested - sent` measures what the
-        // single-flight + coverage gate saves (#533).
+        // Count the ask before the gates so `requested - sent` measures total
+        // debounce/single-flight/coverage savings (#533, #789).
         if record_request {
             self.aggregator.record_refresh_requested();
         }
