@@ -177,9 +177,9 @@ fn validate_utf16_encoding(
         return Ok(());
     };
     if announced.is_null() {
-        return Err(std::io::Error::other(format!(
-            "bridge: downstream initialize {field} is null; UTF-16 is required"
-        )));
+        // Optional JSON-RPC fields are commonly serialized as explicit null;
+        // like absence, that announces no alternative to the UTF-16 default.
+        return Ok(());
     }
     let Some(encoding) = announced.as_str() else {
         return Err(std::io::Error::other(format!(
@@ -440,6 +440,16 @@ mod tests {
             "result": {"capabilities": {}, "offsetEncoding": "utf-16"}
         })
     )]
+    #[case::null_standard_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {"positionEncoding": null}}
+        })
+    )]
+    #[case::null_legacy_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {}, "offsetEncoding": null}
+        })
+    )]
     #[case::complex_result_object(
         serde_json::json!({
             "result": {
@@ -515,20 +525,6 @@ mod tests {
         }),
         "positionEncoding",
         "non-string",
-    )]
-    #[case::null_standard_encoding(
-        serde_json::json!({
-            "result": {"capabilities": {"positionEncoding": null}}
-        }),
-        "positionEncoding",
-        "null",
-    )]
-    #[case::null_legacy_encoding(
-        serde_json::json!({
-            "result": {"capabilities": {}, "offsetEncoding": null}
-        }),
-        "offsetEncoding",
-        "null",
     )]
     #[trace]
     fn validate_rejects_non_utf16_position_encoding(
