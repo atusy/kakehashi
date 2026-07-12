@@ -96,13 +96,22 @@ pub(crate) fn collect_files(
         }
     }
     files.sort();
-    let overlaps = |left: &Path, right: &Path| {
-        left == right || left.starts_with(right) || right.starts_with(left)
+    let relationship = |left: &Path, right: &Path| {
+        if left == right {
+            Some((0, PathBuf::new()))
+        } else if let Ok(suffix) = right.strip_prefix(left) {
+            Some((1, suffix.to_path_buf()))
+        } else {
+            left.strip_prefix(right)
+                .ok()
+                .map(|suffix| (-1, suffix.to_path_buf()))
+        }
     };
     let has_explicit_alias = explicit_identities.iter().enumerate().any(|(index, left)| {
-        explicit_identities[index + 1..]
-            .iter()
-            .any(|right| overlaps(&left.1, &right.1) && !overlaps(&left.0, &right.0))
+        explicit_identities[index + 1..].iter().any(|right| {
+            let resolved = relationship(&left.1, &right.1);
+            resolved.is_some() && resolved != relationship(&left.0, &right.0)
+        })
     });
     if has_explicit_alias {
         let mut seen = std::collections::HashSet::new();
@@ -541,6 +550,27 @@ mod tests {
         let files = collect_paths(
             tmp.path(),
             &[document.clone(), alias.join("doc.md")],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_symlink_directory_aliases_are_deduplicated() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        write(&real.join("doc.md"), "x");
+        symlink(&real, &alias).unwrap();
+
+        let files = collect_paths(
+            tmp.path(),
+            &[tmp.path().to_path_buf(), alias],
             &[],
             &markdown_only,
         );
