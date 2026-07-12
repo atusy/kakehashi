@@ -226,6 +226,10 @@ fn install_queries_with_dependencies_from_with_http_policy(
     force: bool,
     http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    // Acquire the data-directory lock before recursive installation takes any
+    // per-language replacement locks. This order prevents a bulk uninstall
+    // from deadlocking with inherited-query installation.
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
     let mut installed = std::collections::HashSet::new();
     install_queries_recursive(
         base_url,

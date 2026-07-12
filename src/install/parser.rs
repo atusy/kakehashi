@@ -278,6 +278,12 @@ pub fn install_parser(
         )));
     }
 
+    // Operation locks are always acquired before any artifact-specific lock.
+    // Bulk uninstall takes the exclusive side of this lock, so an install
+    // phase either publishes completely before its snapshot or starts after
+    // the uninstall has established an empty state.
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(&options.data_dir)?;
+
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
