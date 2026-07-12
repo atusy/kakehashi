@@ -174,6 +174,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_entry_counts_as_workspace_marker() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        symlink("missing-target", project.join(".project-root")).unwrap();
+        let doc = project.join("src/main.rs");
+
+        assert_eq!(
+            find_marker_root(&doc, &markers(&[".project-root"])),
+            Some(project),
+            "marker presence is defined by its directory entry, not its target"
+        );
+    }
+
     #[test]
     fn earlier_entry_wins_even_when_a_later_entry_is_nearer() {
         // Neovim's flat (string|string[])[] priority: each entry is searched
