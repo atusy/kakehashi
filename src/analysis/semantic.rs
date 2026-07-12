@@ -236,11 +236,11 @@ pub(crate) async fn handle_semantic_tokens_full(
         // is the authoritative wall time; branch durations must not be summed.
         log::debug!(
             target: "kakehashi::semantic",
-            "[SEMANTIC_TOKENS] compute phases: compute={}ms host={}ms injections={}ms finalize={}ms parallel={} regions_reused={}",
-            compute_elapsed.as_millis(),
-            host_elapsed.as_millis(),
-            injections_elapsed.as_millis(),
-            finalize_elapsed.as_millis(),
+            "[SEMANTIC_TOKENS] compute phases: compute={}us host={}us injections={}us finalize={}us parallel={} regions_reused={}",
+            compute_elapsed.as_micros(),
+            host_elapsed.as_micros(),
+            injections_elapsed.as_micros(),
+            finalize_elapsed.as_micros(),
             should_parallelize,
             injection_cache
                 .as_ref()
