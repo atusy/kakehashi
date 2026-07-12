@@ -67,6 +67,7 @@ struct CancelSubscriberState {
     subscribers: HashMap<UpstreamId, (Option<u64>, oneshot::Sender<()>)>,
     active_requests: HashMap<UpstreamId, u64>,
     pending_cancellations: HashMap<UpstreamId, u64>,
+    delivered_cancellations: HashMap<UpstreamId, u64>,
     next_generation: u64,
 }
 
@@ -169,9 +170,21 @@ impl CancelForwarder {
                 .recover_poison("CancelForwarder::subscribe");
             let generation = subscribers.active_requests.get(&upstream_id).copied();
             if generation.is_some()
-                && subscribers.pending_cancellations.get(&upstream_id).copied() == generation
+                && subscribers
+                    .delivered_cancellations
+                    .get(&upstream_id)
+                    .copied()
+                    == generation
+            {
+                return Err(AlreadySubscribedError(upstream_id));
+            }
+            if let Some(generation) = generation
+                && subscribers.pending_cancellations.get(&upstream_id).copied() == Some(generation)
             {
                 subscribers.pending_cancellations.remove(&upstream_id);
+                subscribers
+                    .delivered_cancellations
+                    .insert(upstream_id, generation);
                 let _ = tx.send(());
                 return Ok(rx);
             }
@@ -224,6 +237,13 @@ impl CancelForwarder {
                 .remove(upstream_id)
                 .filter(|(subscriber_generation, _)| *subscriber_generation == generation)
                 .map(|(_, sender)| sender);
+            if sender.is_some()
+                && let Some(generation) = generation
+            {
+                subscribers
+                    .delivered_cancellations
+                    .insert(upstream_id.clone(), generation);
+            }
             if sender.is_none()
                 && let Some(generation) = generation
             {
@@ -262,6 +282,7 @@ impl CancelForwarder {
         if state.active_requests.get(upstream_id) == Some(&generation) {
             state.active_requests.remove(upstream_id);
             state.pending_cancellations.remove(upstream_id);
+            state.delivered_cancellations.remove(upstream_id);
             state.subscribers.remove(upstream_id);
         }
     }
@@ -676,6 +697,32 @@ mod tests {
             .await
             .expect("retained cancellation should be delivered on subscribe")
             .expect("cancel sender should signal rather than drop");
+
+        drop(request_future);
+    }
+
+    #[tokio::test]
+    async fn retained_cancel_rejects_a_second_subscription_in_same_request() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock, forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+        let request = Request::build("textDocument/hover")
+            .params(serde_json::json!({}))
+            .id(123i64)
+            .finish();
+        let request_future = service.call(request);
+
+        assert!(forwarder.notify_cancel(&upstream_id));
+        let cancel = forwarder.subscribe(upstream_id.clone()).unwrap();
+        cancel.await.expect("retained cancel is delivered");
+
+        let duplicate = forwarder.subscribe(upstream_id.clone());
+        assert!(
+            matches!(duplicate, Err(AlreadySubscribedError(id)) if id == upstream_id),
+            "a cancelled active generation must not create a fresh receiver"
+        );
 
         drop(request_future);
     }
