@@ -66,6 +66,7 @@ fn host_position_encoding(capabilities: &ClientCapabilities) -> Option<PositionE
 /// initialization. Kakehashi may use its process CWD internally for config
 /// discovery, but forwarding that fallback would turn a no-workspace session
 /// into an unrelated workspace for every bridged server.
+#[allow(deprecated)]
 fn bridge_root_uri(params: &InitializeParams) -> Option<String> {
     #[allow(deprecated)]
     let primary_uri = params
@@ -74,7 +75,13 @@ fn bridge_root_uri(params: &InitializeParams) -> Option<String> {
         .and_then(|folders| folders.first())
         .map(|folder| &folder.uri)
         .or(params.root_uri.as_ref());
-    primary_uri.map(|uri| uri.as_str().to_string())
+    primary_uri.map(|uri| uri.as_str().to_string()).or_else(|| {
+        params
+            .root_path
+            .as_ref()
+            .and_then(|path| Url::from_file_path(path).ok())
+            .map(|uri| uri.to_string())
+    })
 }
 
 fn bridge_workspace_folders(
@@ -142,9 +149,9 @@ impl Kakehashi {
         let root_uri_for_bridge = bridge_root_uri(&params);
 
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
-        self.bridge.pool().set_root_uri(root_uri_for_bridge.clone());
         let workspace_folders_for_bridge =
             bridge_workspace_folders(&params, root_uri_for_bridge.as_deref());
+        self.bridge.pool().set_root_uri(root_uri_for_bridge);
         self.bridge
             .pool()
             .set_workspace_folders(workspace_folders_for_bridge);
@@ -1661,6 +1668,22 @@ mod tests {
         let root_uri = bridge_root_uri(&params);
         assert_eq!(root_uri, None);
         assert_eq!(bridge_workspace_folders(&params, root_uri.as_deref()), None);
+    }
+
+    #[test]
+    fn bridge_root_uri_preserves_legacy_root_path() {
+        let params: InitializeParams = serde_json::from_value(serde_json::json!({
+            "capabilities": {},
+            "rootUri": null,
+            "rootPath": "/tmp/legacy-workspace",
+            "workspaceFolders": null
+        }))
+        .expect("valid initialize params");
+
+        assert_eq!(
+            bridge_root_uri(&params).as_deref(),
+            Some("file:///tmp/legacy-workspace")
+        );
     }
 
     /// A throwaway cancel context for tests that don't exercise cancellation.
