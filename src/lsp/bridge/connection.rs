@@ -75,6 +75,12 @@ impl BridgeReader {
     async fn read_header_line(&mut self, remaining: &mut usize) -> io::Result<Vec<u8>> {
         let mut line = Vec::new();
         loop {
+            if *remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("downstream message headers exceed limit {MAX_INBOUND_HEADER_SIZE}"),
+                ));
+            }
             let buffered = self.stdout.fill_buf().await?;
             if buffered.is_empty() {
                 return if line.is_empty() {
