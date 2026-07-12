@@ -1300,7 +1300,7 @@ fn test_language_uninstall_all_fails_for_dangling_install_dir() {
 
     assert!(
         !output.status.success(),
-        "a present but unreadable install root must fail; stderr: {}",
+        "a dangling install root must fail; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
