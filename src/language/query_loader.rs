@@ -517,6 +517,15 @@ mod tests {
         assert!(!is_single_path_component("rust/"));
         assert!(!is_single_path_component("rust/."));
         assert!(!is_single_path_component("/rust"));
+        assert!(!is_single_path_component(&format!(
+            "rust{}query",
+            std::path::MAIN_SEPARATOR
+        )));
+        #[cfg(windows)]
+        {
+            assert!(!is_single_path_component(r"C:\rust"));
+            assert!(!is_single_path_component(r"\\server\share\rust"));
+        }
     }
 
     #[test]
