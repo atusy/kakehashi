@@ -1307,6 +1307,41 @@ fn test_language_uninstall_all_fails_for_dangling_install_dir() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_uninstall_all_removes_dangling_parser_entry() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    symlink("missing-parser-library", &parser).expect("Failed to create dangling parser link");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "dangling parser entry should be removable; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&parser).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "dangling parser entry must be removed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_uninstall_all_fails_before_removal_for_query_symlink_loop() {
     use std::fs;
     use std::os::unix::fs::symlink;

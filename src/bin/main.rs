@@ -533,6 +533,9 @@ fn collect_installed_languages_for_uninstall(
                 )
             })?;
             let path = entry.path();
+            entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect parser entry '{}': {e}", path.display()))?;
             let is_parser = path
                 .extension()
                 .map(|ext| ext == std::env::consts::DLL_EXTENSION)
@@ -648,7 +651,15 @@ fn run_language_uninstall(
         let mut removed_something = false;
 
         // Remove parser file
-        if let Some(parser_path) = find_parser_file(&parser_dir, lang) {
+        let parser_path = match find_parser_file_for_uninstall(&parser_dir, lang) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("✗ Failed to inspect parser for '{}': {e}", lang);
+                any_failed = true;
+                continue;
+            }
+        };
+        if let Some(parser_path) = parser_path {
             match fs::remove_file(&parser_path) {
                 Ok(()) => {
                     eprintln!("✓ Removed parser: {}", parser_path.display());
@@ -706,6 +717,18 @@ fn run_language_uninstall(
 fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf> {
     let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
     if path.exists() { Some(path) } else { None }
+}
+
+fn find_parser_file_for_uninstall(
+    parser_dir: &Path,
+    lang: &str,
+) -> Result<Option<PathBuf>, String> {
+    let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot inspect '{}': {e}", path.display())),
+    }
 }
 
 /// Write content to stdout or a file, with --force / --output semantics.
