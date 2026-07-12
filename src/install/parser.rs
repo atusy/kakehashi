@@ -161,10 +161,27 @@ pub fn compile_parser_inprocess(
             ),
         ))
     })?;
+    #[cfg(windows)]
+    let _staging_guard = open_windows_staging_guard(output_path)?;
     let loader = Loader::with_parser_lib_path(parent_dir.to_path_buf());
     loader
         .compile_parser_at_path(grammar_path, output_path.to_path_buf(), &[])
         .map_err(|e| ParserInstallError::CompileError(e.to_string()))
+}
+
+#[cfg(windows)]
+fn open_windows_staging_guard(path: &Path) -> Result<fs::File, ParserInstallError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        // Excluding FILE_SHARE_DELETE makes rename/delete fail while the
+        // re-exec child or its in-process compile is still using this path.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+        .map_err(ParserInstallError::IoError)
 }
 
 /// Arm a self-deadline inside the `__compile-parser` subprocess.
@@ -508,6 +525,39 @@ fn windows_process_probe_is_running(probe: WindowsProcessProbe) -> bool {
     !matches!(probe, WindowsProcessProbe::Exited)
 }
 
+#[cfg(windows)]
+fn process_is_running_windows(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let probe = unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            match GetLastError() {
+                ERROR_INVALID_PARAMETER => WindowsProcessProbe::Exited,
+                ERROR_ACCESS_DENIED => WindowsProcessProbe::AccessDenied,
+                _ => WindowsProcessProbe::UnexpectedFailure,
+            }
+        } else {
+            let mut exit_code = 0;
+            let queried = GetExitCodeProcess(handle, &mut exit_code);
+            let _ = CloseHandle(handle);
+            if queried == 0 {
+                WindowsProcessProbe::UnexpectedFailure
+            } else if exit_code == STILL_ACTIVE as u32 {
+                WindowsProcessProbe::Running
+            } else {
+                WindowsProcessProbe::Exited
+            }
+        }
+    };
+    windows_process_probe_is_running(probe)
+}
+
 #[cfg(unix)]
 fn claim_and_unlink_stale_parser_file(
     parser_dir: &Path,
@@ -698,6 +748,135 @@ fn process_is_running(pid: u32) -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
+fn claim_stale_parser_file_windows(
+    parser_dir: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, ParserInstallError> {
+    use std::io::Write;
+
+    let initial = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    if !initial.file_type().is_file() {
+        return Ok(None);
+    }
+
+    loop {
+        let candidate = parser_dir.join(format!(
+            ".parser-cleanup.{}.{}",
+            std::process::id(),
+            PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ParserInstallError::IoError(error)),
+        }
+        let marker = candidate.join("owner");
+        let marker_result = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .and_then(|mut file| {
+                file.write_all(PARSER_CLEANUP_MARKER)?;
+                file.sync_all()
+            });
+        if let Err(error) = marker_result {
+            let _ = fs::remove_file(&marker);
+            let _ = fs::remove_dir(&candidate);
+            return Err(ParserInstallError::IoError(error));
+        }
+
+        let claimed = candidate.join("artifact");
+        match fs::rename(path, &claimed) {
+            Ok(()) => return Ok(Some(candidate)),
+            Err(_) => {
+                // A live Windows compiler holds a handle that denies delete
+                // sharing, so rename fails here. Unknown failures are equally
+                // conservative: leave the source and discard our empty claim.
+                let _ = fs::remove_file(&marker);
+                let _ = fs::remove_dir(&candidate);
+                return Ok(None);
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn remove_stale_cleanup_claim_windows(path: &Path) {
+    use std::io::Read;
+
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.file_type().is_dir() {
+        return;
+    }
+    let marker = path.join("owner");
+    let Ok(file) = fs::OpenOptions::new().read(true).open(&marker) else {
+        return;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return;
+    }
+    let mut contents = Vec::with_capacity(PARSER_CLEANUP_MARKER.len() + 1);
+    if file
+        .take(PARSER_CLEANUP_MARKER.len() as u64 + 1)
+        .read_to_end(&mut contents)
+        .is_err()
+        || contents != PARSER_CLEANUP_MARKER
+    {
+        return;
+    }
+    let _ = fs::remove_file(path.join("artifact"));
+    let _ = fs::remove_file(marker);
+    let _ = fs::remove_dir(path);
+}
+
+#[cfg(any(windows, test))]
+fn cleanup_interrupted_parser_installs_windows_with(
+    parser_dir: &Path,
+    process_is_running: impl Fn(u32) -> bool,
+) -> Result<(), ParserInstallError> {
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(pid) = cleanup_claim_pid(&path) {
+            if !process_is_running(pid) {
+                remove_stale_cleanup_claim_windows(&path);
+            }
+            continue;
+        }
+        let Some(pid) = staged_parser_pid(&path) else {
+            continue;
+        };
+        if !process_is_running(pid) {
+            let Ok(Some(claimed)) = claim_stale_parser_file_windows(parser_dir, &path) else {
+                continue;
+            };
+            remove_stale_cleanup_claim_windows(&claimed);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserInstallError> {
     let entries = match fs::read_dir(parser_dir) {
@@ -739,10 +918,13 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserInstallError> {
+    cleanup_interrupted_parser_installs_windows_with(parser_dir, process_is_running_windows)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn cleanup_interrupted_parser_installs(_parser_dir: &Path) -> Result<(), ParserInstallError> {
-    // There is no portable process-liveness API. Keep possibly live staging
-    // files instead of risking deletion of another installer process's output.
     Ok(())
 }
 
@@ -1323,6 +1505,23 @@ mod tests {
         assert!(windows_process_probe_is_running(
             WindowsProcessProbe::UnexpectedFailure
         ));
+    }
+
+    #[test]
+    fn windows_cleanup_removes_confirmed_dead_staging_artifact() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let staged = parser_dir.join(format!(
+            ".lua.123.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"stale parser").expect("write staging file");
+
+        cleanup_interrupted_parser_installs_windows_with(&parser_dir, |_| false)
+            .expect("cleanup succeeds");
+
+        assert!(!staged.exists(), "confirmed-dead staging file is removed");
     }
 
     #[cfg(unix)]
