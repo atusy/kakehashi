@@ -298,7 +298,6 @@ fn install_queries_recursive(
             let parents = parse_inherits_directive(&content);
             for parent in parents {
                 // Install parent dependencies (don't force, just ensure they exist)
-                clear_uninstall_tombstone(&queries_parent, &parent)?;
                 match install_queries_recursive(
                     base_url,
                     &parent,
@@ -393,8 +392,11 @@ fn install_queries_recursive(
     // Install parent dependencies
     for parent in parents_to_install {
         eprintln!("Installing inherited queries: {}", parent);
-        // Don't fail if parent already exists
-        clear_uninstall_tombstone(&queries_parent, &parent)?;
+        // An inherited dependency is an implicit install, so it must not
+        // clear an explicit uninstall intent for the parent. Publication
+        // checks that intent while holding only the parent's replace lock;
+        // recursive installs never retain a child's lock while entering the
+        // parent, which also keeps cyclic inheritance deadlock-free.
         match install_queries_recursive(base_url, &parent, data_dir, false, installed, http_policy)
         {
             Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
@@ -1481,6 +1483,43 @@ mod tests {
         assert!(
             !queries_parent.join("raced_lang").exists(),
             "uninstall tombstone must prevent restoring canonical queries"
+        );
+    }
+
+    #[test]
+    fn inherited_install_does_not_override_explicit_parent_uninstall() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let queries_parent = data_dir.join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        write_uninstall_tombstone(&queries_parent, "parent_lang").unwrap();
+        let base_url = spawn_query_file_server(vec![
+            (
+                "/child_lang/highlights.scm",
+                "; inherits: parent_lang\n(identifier) @variable\n",
+            ),
+            ("/parent_lang/highlights.scm", "(comment) @comment\n"),
+        ]);
+
+        install_queries_with_dependencies_from_allowing_http_for_tests(
+            &base_url,
+            "child_lang",
+            &data_dir,
+            false,
+        )
+        .expect("the explicitly requested child should still install");
+
+        assert!(
+            query_install_is_complete(&queries_parent.join("child_lang")),
+            "the child publication is independent of its inherited parent"
+        );
+        assert!(
+            !queries_parent.join("parent_lang").exists(),
+            "implicit inheritance must not resurrect explicitly uninstalled parent queries"
+        );
+        assert!(
+            uninstall_tombstone_path(&queries_parent, "parent_lang").is_file(),
+            "only an explicit parent install may clear the uninstall intent"
         );
     }
 
