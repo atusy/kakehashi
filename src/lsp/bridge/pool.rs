@@ -700,6 +700,11 @@ impl LanguageServerPool {
             }
         }
 
+        // Capability decisions and notification enqueues are now ordered with
+        // dynamic registration acknowledgements. Cleanup can block on process
+        // I/O, so release the per-connection ordering guards before starting it.
+        drop(_ordering_guards);
+
         let cleanup = spawn_invalidated_connection_cleanup(
             connections,
             Arc::clone(&self.connections),
@@ -3307,6 +3312,40 @@ mod tests {
         })
         .await
         .expect("closed stale handle must be removed");
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_change_releases_capability_ordering_before_cleanup() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        // Stall invalidation cleanup after its synchronous capability decision.
+        let host_documents = pool.host_documents.lock().await;
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state() != ConnectionState::Closing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup must begin before probing capability ordering");
+
+        let ordering = handle.dynamic_capabilities().workspace_folder_ordering();
+        tokio::time::timeout(Duration::from_secs(1), ordering.lock_owned())
+            .await
+            .expect("capability acknowledgements must not wait for connection cleanup");
+
+        drop(host_documents);
+        task.await.unwrap();
     }
 
     #[tokio::test]
