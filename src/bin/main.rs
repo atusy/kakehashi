@@ -586,6 +586,16 @@ fn run_language_uninstall(
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
+    // `--all` promises to discover the complete install before removing it.
+    // Validate both roots before recovery, which may delete stale staging
+    // directories or restore backups. Discard this first snapshot and rescan
+    // after recovery so restored languages are included in the uninstall set.
+    if all {
+        collect_installed_languages_for_uninstall(&parser_dir, &queries_dir).map_err(|e| {
+            eprintln!("Failed to scan installed languages: {e}");
+            ExitCode::FAILURE
+        })?;
+    }
     if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }

@@ -1340,6 +1340,46 @@ fn test_language_uninstall_all_fails_before_removal_for_query_symlink_loop() {
     assert!(parser.exists(), "preflight failure must not remove parsers");
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_preflights_before_query_recovery() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let stranded_tmp = test_dir.path().join("queries/.lua.4294967295.0.tmp");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&stranded_tmp).expect("Failed to create stranded query temp dir");
+    fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make parser dir unreadable");
+    if fs::read_dir(&parser_dir).is_ok() {
+        fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore parser dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore parser dir permissions");
+    assert!(!output.status.success(), "unreadable preflight must fail");
+    assert!(
+        stranded_tmp.exists(),
+        "query recovery must not mutate state before all install roots pass preflight"
+    );
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {
