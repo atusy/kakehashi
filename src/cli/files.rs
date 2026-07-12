@@ -16,13 +16,21 @@
 
 use std::path::{Path, PathBuf};
 
-fn has_symlink_ancestor(path: &Path, cache: &mut std::collections::HashMap<PathBuf, bool>) -> bool {
-    path.ancestors().skip(1).any(|ancestor| {
-        *cache.entry(ancestor.to_path_buf()).or_insert_with(|| {
-            std::fs::symlink_metadata(ancestor)
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+fn has_symlink_ancestor(
+    path: &Path,
+    base: &Path,
+    cache: &mut std::collections::HashMap<PathBuf, bool>,
+) -> bool {
+    let is_within_base = path.starts_with(base);
+    path.ancestors()
+        .skip(1)
+        .take_while(|ancestor| !is_within_base || ancestor.starts_with(base))
+        .any(|ancestor| {
+            *cache.entry(ancestor.to_path_buf()).or_insert_with(|| {
+                std::fs::symlink_metadata(ancestor)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            })
         })
-    })
 }
 
 /// Files collected from CLI paths plus any non-fatal directory walk errors
@@ -126,7 +134,8 @@ pub(crate) fn collect_files(
                 continue;
             }
             if paths.len() > 1 {
-                let has_alias = is_symlink || has_symlink_ancestor(&path, &mut ancestor_symlinks);
+                let has_alias =
+                    is_symlink || has_symlink_ancestor(&path, base, &mut ancestor_symlinks);
                 explicit_inputs.push((path.clone(), true, has_alias));
             }
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
@@ -135,7 +144,8 @@ pub(crate) fn collect_files(
                 continue;
             }
             if paths.len() > 1 {
-                let has_alias = is_symlink || has_symlink_ancestor(&path, &mut ancestor_symlinks);
+                let has_alias =
+                    is_symlink || has_symlink_ancestor(&path, base, &mut ancestor_symlinks);
                 explicit_inputs.push((path.clone(), false, has_alias));
             }
             files.push(path);
@@ -155,15 +165,27 @@ pub(crate) fn collect_files(
         false
     };
     if has_explicit_alias {
-        let mut seen = std::collections::HashSet::with_capacity(files.len());
-        files.retain(|path| {
-            // Preserve the stable sorted spelling for output, but compare the
-            // resolved path so explicit filesystem aliases do not process one file
-            // twice. If identity resolution fails after collection, retain the
-            // lexical path so the caller can report any later read error.
-            let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-            seen.insert(identity)
-        });
+        let mut representatives = std::collections::HashMap::with_capacity(files.len());
+        for path in files.drain(..) {
+            let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let is_alias = std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                || has_symlink_ancestor(&path, base, &mut ancestor_symlinks);
+            representatives
+                .entry(identity)
+                .and_modify(|representative: &mut (PathBuf, bool)| {
+                    if representative.1 && !is_alias {
+                        *representative = (path.clone(), false);
+                    }
+                })
+                .or_insert((path, is_alias));
+        }
+        files.extend(
+            representatives
+                .into_values()
+                .map(|(representative, _)| representative),
+        );
+        files.sort();
     } else {
         files.dedup();
     }
@@ -645,6 +667,23 @@ mod tests {
         );
 
         assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedup_prefers_non_symlink_processing_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let document = real.join("doc.md");
+        let alias = tmp.path().join("alias.txt");
+        write(&document, "x");
+        symlink(&document, &alias).unwrap();
+
+        let files = collect_paths(tmp.path(), &[real, alias], &[], &markdown_only);
+
+        assert_eq!(files, vec![document]);
     }
 
     #[cfg(windows)]
