@@ -1068,6 +1068,7 @@ mod tests {
                         std::thread::sleep(ACCEPT_RETRY_DELAY);
                         continue;
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
                 let mut reader = BufReader::new(&mut stream);
