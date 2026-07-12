@@ -1403,6 +1403,56 @@ fn test_language_uninstall_rejects_symlinked_install_roots() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_uninstall_rejects_non_file_parser_entries_before_query_removal() {
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+
+    for all in [false, true] {
+        for entry_kind in ["directory", "socket"] {
+            let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+            let parser_dir = test_dir.path().join("parser");
+            let query_dir = test_dir.path().join("queries/lua");
+            fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+            fs::create_dir_all(&query_dir).expect("Failed to create query dir");
+            fs::write(query_dir.join("highlights.scm"), "(comment) @comment")
+                .expect("Failed to write query");
+            let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+            let _socket = if entry_kind == "directory" {
+                fs::create_dir(&parser).expect("Failed to create parser-shaped directory");
+                None
+            } else {
+                Some(UnixListener::bind(&parser).expect("Failed to create parser-shaped socket"))
+            };
+
+            let mut command = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
+            command.arg("language").arg("uninstall");
+            if all {
+                command.arg("--all");
+            } else {
+                command.arg("lua");
+            }
+            let output = command
+                .arg("--data-dir")
+                .arg(test_dir.path())
+                .arg("--force")
+                .output()
+                .expect("Failed to execute command");
+
+            assert!(
+                !output.status.success(),
+                "{entry_kind} parser entry must fail before mutation; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                query_dir.exists(),
+                "invalid parser entry must be rejected before query removal"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_uninstall_all_removes_dangling_parser_entry() {
     use std::fs;
     use std::os::unix::fs::symlink;

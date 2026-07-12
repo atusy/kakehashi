@@ -575,13 +575,19 @@ fn collect_installed_languages_for_uninstall(
                 )
             })?;
             let path = entry.path();
-            entry
+            let file_type = entry
                 .file_type()
                 .map_err(|e| format!("cannot inspect parser entry '{}': {e}", path.display()))?;
             let is_parser = path
                 .extension()
                 .map(|ext| ext == std::env::consts::DLL_EXTENSION)
                 .unwrap_or(false);
+            if is_parser && !(file_type.is_file() || file_type.is_symlink()) {
+                return Err(format!(
+                    "parser entry '{}' is not a file or symlink",
+                    path.display()
+                ));
+            }
             if is_parser && let Some(stem) = path.file_stem() {
                 languages.insert(stem.to_string_lossy().to_string());
             }
@@ -700,6 +706,17 @@ fn run_language_uninstall(
             continue;
         }
 
+        // Inspect the parser entry before mutating queries. Targeted uninstall
+        // does not run bulk discovery, so this is its per-language preflight;
+        // bulk uninstall repeats the check to close races after discovery.
+        let parser_path = match find_parser_file_for_uninstall(&parser_dir, lang) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("✗ Failed to inspect parser for '{}': {e}", lang);
+                any_failed = true;
+                continue;
+            }
+        };
         let mut removed_something = false;
 
         // Remove queries directory and any kakehashi-created backups under the
@@ -726,14 +743,6 @@ fn run_language_uninstall(
         }
 
         // Remove parser file only after query removal completed.
-        let parser_path = match find_parser_file_for_uninstall(&parser_dir, lang) {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!("✗ Failed to inspect parser for '{}': {e}", lang);
-                any_failed = true;
-                continue;
-            }
-        };
         if let Some(parser_path) = parser_path {
             match fs::remove_file(&parser_path) {
                 Ok(()) => {
@@ -781,7 +790,11 @@ fn find_parser_file_for_uninstall(
 ) -> Result<Option<PathBuf>, String> {
     let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
     match std::fs::symlink_metadata(&path) {
-        Ok(_) => Ok(Some(path)),
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => Ok(Some(path)),
+        Ok(_) => Err(format!(
+            "parser entry '{}' is not a file or symlink",
+            path.display()
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("cannot inspect '{}': {e}", path.display())),
     }
