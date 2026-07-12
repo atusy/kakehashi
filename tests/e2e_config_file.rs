@@ -256,8 +256,9 @@ fn test_config_file_invalid_path_expansion_fails_initialization() {
     assert!(
         error["message"]
             .as_str()
-            .is_some_and(|message| message.contains("Path expansion failed")),
-        "initialize error should identify the expansion failure: {error}"
+            .is_some_and(|message| message.contains("Path expansion failed")
+                && message.contains(config_path.to_str().unwrap())),
+        "initialize error should identify the expansion failure and file: {error}"
     );
 }
 
