@@ -842,6 +842,29 @@ fn backup_is_owned(path: &Path) -> bool {
     backup_ownership_sidecar(path).is_file()
 }
 
+fn backup_is_complete_and_owned(path: &Path) -> Result<bool, QueryInstallError> {
+    let regular_file_or_absent = |path: &Path| match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    };
+
+    let Some(ownership) = regular_file_or_absent(&backup_ownership_sidecar(path))? else {
+        return Ok(false);
+    };
+    if !ownership.is_file() {
+        return Ok(false);
+    }
+    let Some(highlights) = regular_file_or_absent(&path.join("highlights.scm"))? else {
+        return Ok(false);
+    };
+    if !highlights.is_file() {
+        return Ok(false);
+    }
+    let marker = regular_file_or_absent(&path.join(QUERY_INSTALL_COMPLETE_MARKER))?;
+    Ok(marker.is_some_and(|metadata| metadata.is_file()) || highlights.len() > 0)
+}
+
 fn newest_complete_backup_dir(
     queries_parent: &Path,
     language: &str,
@@ -868,13 +891,10 @@ fn newest_complete_backup_dir(
         if !generated_backup_matches_language(name, language) {
             continue;
         }
-        if !backup_is_owned(&path) || !query_install_is_complete(&path) {
+        if !backup_is_complete_and_owned(&path)? {
             continue;
         }
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let modified = entry.metadata()?.modified()?;
         if newest
             .as_ref()
             .is_none_or(|(current, _)| modified > *current)
@@ -1313,6 +1333,33 @@ mod tests {
         assert!(!queries_parent.join("lua").exists());
         assert!(fs::symlink_metadata(&backup).is_ok());
         assert!(outside.join("highlights.scm").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recover_interrupted_query_install_propagates_unreadable_backup_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let backup = queries_parent.join(".lua.4294967295.0.backup");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "(comment) @comment").unwrap();
+        fs::write(backup_ownership_sidecar(&backup), b"owned\n").unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(backup.join("highlights.scm")).is_ok() {
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let result = recover_interrupted_query_install(&queries_parent, "lua");
+
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(result, Err(QueryInstallError::IoError(_))),
+            "backup inspection errors must not be treated as an incomplete backup: {result:?}"
+        );
+        assert!(!queries_parent.join("lua").exists());
     }
 
     #[test]
