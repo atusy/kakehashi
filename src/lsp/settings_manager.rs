@@ -187,7 +187,7 @@ impl SettingsManager {
 
     /// Remember a parser data directory for subsequent runtime-layer rebuilds.
     pub(crate) fn record_installed_search_path(&self, data_dir: &std::path::Path) {
-        let data_dir = data_dir.to_string_lossy().into_owned();
+        let data_dir = data_dir.clean().to_string_lossy().into_owned();
         let mut paths = self
             .installed_search_paths
             .lock()
@@ -208,7 +208,9 @@ impl SettingsManager {
             .lock()
             .recover_poison("SettingsManager::apply_installed_search_paths");
         for path in paths.iter() {
-            if !settings.search_paths.contains(path) {
+            if !settings.search_paths.iter().any(|existing| {
+                std::path::Path::new(existing).clean() == std::path::Path::new(path)
+            }) {
                 settings.search_paths.push(path.clone());
                 let raw_paths = raw_settings.search_paths.get_or_insert_with(Vec::new);
                 if !raw_paths.contains(path) {
@@ -658,6 +660,30 @@ mod tests {
         assert_eq!(
             effective_settings.search_paths,
             vec!["/installed".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_installed_search_path_deduplicates_lexical_variants() {
+        let manager = SettingsManager::new();
+        manager.record_installed_search_path(std::path::Path::new("/tmp/parent/../installed"));
+
+        let mut raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["/tmp/installed".to_string()]),
+            ..Default::default()
+        };
+        let mut effective_settings =
+            WorkspaceSettings::try_from_settings(&raw_settings, None, |_| None).unwrap();
+
+        manager.apply_installed_search_paths(&mut raw_settings, &mut effective_settings);
+
+        assert_eq!(
+            raw_settings.search_paths,
+            Some(vec!["/tmp/installed".to_string()])
+        );
+        assert_eq!(
+            effective_settings.search_paths,
+            vec!["/tmp/installed".to_string()]
         );
     }
 
