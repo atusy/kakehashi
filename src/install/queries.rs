@@ -487,9 +487,13 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
     // rescans the parent), so running it per backup directory would redo the
     // same scan and lock acquisition for each stranded backup.
     let mut recovered_languages = std::collections::HashSet::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        // Recovery artifacts must be real directories. Do not follow a
+        // staging/backup symlink outside the queries root, and propagate
+        // entry-type errors instead of silently treating them as absent.
+        if !entry.file_type()?.is_dir() {
             continue;
         }
         if let Some(language) = backup_language_name(&path) {
@@ -1245,6 +1249,28 @@ mod tests {
             tmp.exists(),
             "generated staging dirs from live installers must not be collected"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recover_interrupted_query_installs_does_not_follow_backup_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&queries_parent).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        let backup = queries_parent.join(".lua.4294967295.0.backup");
+        symlink(&outside, &backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(!queries_parent.join("lua").exists());
+        assert!(fs::symlink_metadata(&backup).is_ok());
+        assert!(outside.join("highlights.scm").exists());
     }
 
     #[test]
