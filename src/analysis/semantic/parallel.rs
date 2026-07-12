@@ -35,7 +35,7 @@ use crate::text::position::byte_to_utf16_col;
 /// so small documents (the overwhelming majority) pay zero overhead and are
 /// byte-identical to the uncached path. The cache only helps once enough regions
 /// exist that reusing the untouched ones outweighs the per-region bookkeeping.
-const INJECTION_CACHE_MIN_REGIONS: usize = 8;
+pub(super) const INJECTION_CACHE_MIN_REGIONS: usize = 8;
 
 /// Test-only counter of how many times the discovery-reuse branch fired (skipped
 /// the injection query by reusing owned discovery). Lets an in-process server

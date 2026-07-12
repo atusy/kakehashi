@@ -20,7 +20,7 @@ pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::filter_semantic_tokens_by_range;
 
 // Re-export for parallel processing
-use parallel::{InjectionCacheCtx, collect_injection_tokens_parallel};
+use parallel::{INJECTION_CACHE_MIN_REGIONS, InjectionCacheCtx, collect_injection_tokens_parallel};
 
 /// Owned handle the LSP layer passes into [`handle_semantic_tokens_full`] to
 /// enable per-region injection-token caching (#529). `None` disables caching
@@ -63,10 +63,6 @@ pub(crate) use token_collector::TokenKind;
 // Test-only imports
 #[cfg(test)]
 use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::SemanticTokens};
-
-/// Below this, scheduling a second Rayon branch costs more than the injection
-/// work it can overlap. Matches the injection-cache engagement threshold.
-const PARALLEL_HOST_INJECTION_MIN_REGIONS: usize = 8;
 
 /// Compute full-document semantic tokens (host + injections) as one work-unit
 /// on the bounded compute pool; the injection fan-out's `par_iter` runs on the
@@ -121,13 +117,13 @@ pub(crate) async fn handle_semantic_tokens_full(
             discovery: p.discovery.as_deref(),
         });
 
-        let should_parallelize = cache_ctx
-            .as_ref()
-            .and_then(|ctx| ctx.discovery)
-            .is_some_and(|discovery| {
-                discovery.complete
-                    && discovery.regions.len() >= PARALLEL_HOST_INJECTION_MIN_REGIONS
-            });
+        let should_parallelize = cache_ctx.as_ref().is_some_and(|ctx| {
+            ctx.discovery.is_some_and(|discovery| {
+                discovery.generation == ctx.generation
+                    && discovery.complete
+                    && discovery.regions.len() >= INJECTION_CACHE_MIN_REGIONS
+            })
+        });
         let mut host_work = || {
                     let started = std::time::Instant::now();
                     let complete = collect_host_tokens(
