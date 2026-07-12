@@ -68,10 +68,13 @@ impl Kakehashi {
     /// first-line I/O fails are retained so the command's normal read path can
     /// report the operational error; invalid UTF-8 is filtered as non-text.
     pub(crate) fn cli_can_handle_discovered_file(&self, path: &Path) -> bool {
-        use std::io::Read as _;
+        use std::io::{BufRead as _, Read as _};
 
         if self.cli_can_handle_path(path) {
             return true;
+        }
+        if path.extension().is_some() {
+            return false;
         }
         let Ok(file) = std::fs::File::open(path) else {
             // Keep the candidate so the command's normal read path reports
@@ -84,7 +87,7 @@ impl Kakehashi {
         let mut probe = Vec::with_capacity(MAX_FIRST_LINE_BYTES + 1);
         if std::io::BufReader::new(file)
             .take((MAX_FIRST_LINE_BYTES + 1) as u64)
-            .read_to_end(&mut probe)
+            .read_until(b'\n', &mut probe)
             .is_err()
         {
             return true;
