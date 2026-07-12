@@ -28,10 +28,13 @@ fn has_symlink_ancestor(
             !is_within_boundary || boundary.is_some_and(|boundary| ancestor.starts_with(boundary))
         })
         .any(|ancestor| {
-            *cache.entry(ancestor.to_path_buf()).or_insert_with(|| {
-                std::fs::symlink_metadata(ancestor)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
-            })
+            if let Some(&is_symlink) = cache.get(ancestor) {
+                return is_symlink;
+            }
+            let is_symlink = std::fs::symlink_metadata(ancestor)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            cache.insert(ancestor.to_path_buf(), is_symlink);
+            is_symlink
         })
 }
 
