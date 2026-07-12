@@ -68,17 +68,19 @@ pub(crate) fn collect_files(
         let path = normalize_path(base, path);
         let metadata = std::fs::metadata(&path)
             .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
-        has_explicit_symlink |= std::fs::symlink_metadata(&path)
+        let is_symlink = std::fs::symlink_metadata(&path)
             .is_ok_and(|metadata| metadata.file_type().is_symlink());
         if metadata.is_dir() {
             if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;
             }
+            has_explicit_symlink |= is_symlink;
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
         } else {
             if is_excluded(&exclude_matcher, base, &path, false) {
                 continue;
             }
+            has_explicit_symlink |= is_symlink;
             files.push(path);
         }
     }
@@ -275,6 +277,28 @@ mod tests {
         );
 
         assert!(files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_symlink_does_not_affect_collected_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = tmp.path().join("docs");
+        let document = docs.join("kept.md");
+        let alias = tmp.path().join("alias.md");
+        write(&document, "x");
+        symlink(&document, &alias).unwrap();
+
+        let files = collect_paths(
+            tmp.path(),
+            &[docs, alias],
+            &["alias.md".to_string()],
+            &markdown_only,
+        );
+
+        assert_eq!(files, vec![document]);
     }
 
     #[test]
