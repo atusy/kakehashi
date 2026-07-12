@@ -153,7 +153,7 @@ pub fn load_settings(
                 Err(errs) => {
                     events.push(SettingsEvent::error(format!(
                         "Path expansion failed: {errs}. \
-                     This configuration has been discarded; previous settings remain in effect. \
+                     This configuration has been discarded. \
                      Please correct the affected paths and environment variables or remove them from your config.",
                     )));
                     None
@@ -590,6 +590,13 @@ mod tests {
                 .iter()
                 .map(|e| format!("{:?}: {}", e.kind, &e.message))
                 .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .all(|event| !event.message.contains("previous settings")),
+            "initialization-time errors must not claim that previous settings exist"
         );
     }
 
