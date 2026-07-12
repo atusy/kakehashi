@@ -441,9 +441,10 @@ impl Kakehashi {
             crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
         ) {
             Ok(settings) => {
+                let warning_settings = settings.clone();
                 self.apply_raw_settings(merged_ts, settings).await;
                 drop(_settings_transaction);
-                self.warn_on_misconfigured_settings().await;
+                self.warn_on_misconfigured_settings(&warning_settings).await;
                 self.notifier().log_info("Configuration updated!").await;
             }
             Err(errs) => {

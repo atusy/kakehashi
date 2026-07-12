@@ -550,6 +550,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
+        let warning_settings = settings.clone();
         apply_shared_settings(
             &self.client,
             ReloadLanguageState {
@@ -568,7 +569,7 @@ impl Kakehashi {
         .await
         .into_iter()
         .for_each(|uri| self.schedule_reparse(uri, None));
-        self.warn_on_misconfigured_settings().await;
+        self.warn_on_misconfigured_settings(&warning_settings).await;
     }
 
     /// Emit a single client-visible warning summarizing all (host, injection)
@@ -583,13 +584,12 @@ impl Kakehashi {
     /// Previously this emitted one notification per pair, which floods the
     /// editor log on `didChangeConfiguration` reloads for workspaces with
     /// many bridge entries.
-    async fn warn_on_misconfigured_settings(&self) {
-        let settings = self.settings_manager.load_settings();
-        let pairs = bridge_context::concatenated_formatting_pairs(&settings);
+    async fn warn_on_misconfigured_settings(&self, settings: &WorkspaceSettings) {
+        let pairs = bridge_context::concatenated_formatting_pairs(settings);
         if let Some(msg) = bridge_context::format_concatenated_formatting_warning(&pairs) {
             self.notifier().log_warning(msg).await;
         }
-        let unspawnable = bridge_context::unspawnable_language_servers(&settings);
+        let unspawnable = bridge_context::unspawnable_language_servers(settings);
         if let Some(msg) = bridge_context::format_unspawnable_servers_warning(&unspawnable) {
             self.notifier().log_warning(msg).await;
         }
