@@ -406,13 +406,50 @@ fn staged_parser_pid(path: &Path) -> Option<u32> {
     let extension = parts.next()?;
     if parts.next().is_some()
         || !super::queries::is_safe_language_name(language)
-        || counter.is_empty()
-        || !counter.bytes().all(|byte| byte.is_ascii_digit())
+        || !is_canonical_decimal(counter)
         || extension != std::env::consts::DLL_EXTENSION
     {
         return None;
     }
     pid.parse().ok()
+}
+
+fn is_canonical_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn cleanup_claim_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix(".parser-cleanup.")?;
+    let mut parts = rest.split('.');
+    let pid = parts.next()?;
+    let counter = parts.next()?;
+    if parts.next().is_some() || !is_canonical_decimal(counter) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+#[cfg(unix)]
+fn claim_stale_parser_file(
+    parser_dir: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, ParserInstallError> {
+    loop {
+        let candidate = parser_dir.join(format!(
+            ".parser-cleanup.{}.{}",
+            std::process::id(),
+            PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match fs::hard_link(path, &candidate) {
+            Ok(()) => return Ok(Some(candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ParserInstallError::IoError(error)),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -435,22 +472,30 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
     for entry in fs::read_dir(parser_dir)? {
         let entry = entry?;
         let path = entry.path();
+        if let Some(pid) = cleanup_claim_pid(&path) {
+            if !process_is_running(pid) {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(ParserInstallError::IoError(error)),
+                }
+            }
+            continue;
+        }
         let Some(pid) = staged_parser_pid(&path) else {
             continue;
         };
         if !process_is_running(pid) {
             // Claim the stale pathname atomically before deleting it. A new
             // installer reserves staging paths with create_new, so after this
-            // rename it may safely reuse the old PID/counter name without our
+            // claim it may safely reuse the old PID/counter name without our
             // cleanup deleting its newly-created output.
-            let claimed = parser_dir.join(format!(
-                ".parser-cleanup.{}.{}",
-                std::process::id(),
-                PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            match fs::rename(&path, &claimed) {
+            let Some(claimed) = claim_stale_parser_file(parser_dir, &path)? else {
+                continue;
+            };
+            match fs::remove_file(&path) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(ParserInstallError::IoError(error)),
             }
             match fs::remove_file(claimed) {
@@ -1078,12 +1123,19 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
-        let staged = parser_dir.join(format!(".lua.123..{}.tmp", std::env::consts::DLL_EXTENSION));
-        fs::write(&staged, b"user file").expect("write user file");
+        let empty_counter =
+            parser_dir.join(format!(".lua.123..{}.tmp", std::env::consts::DLL_EXTENSION));
+        let leading_zero = parser_dir.join(format!(
+            ".lua.123.01.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&empty_counter, b"user file").expect("write user file");
+        fs::write(&leading_zero, b"user file").expect("write user file");
 
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
 
-        assert!(staged.exists(), "noncanonical staging name is preserved");
+        assert!(empty_counter.exists(), "empty counter name is preserved");
+        assert!(leading_zero.exists(), "leading-zero name is preserved");
     }
 
     const TREE_SITTER_JSON_URL: &str =
