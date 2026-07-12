@@ -1654,7 +1654,7 @@ impl LanguageServerPool {
             .await;
 
         // Acquire and wait through initialization for the resolved key.
-        let handle = self
+        let handle = match self
             .acquire_resolved_wait_ready(
                 server_name,
                 server_config,
@@ -1662,7 +1662,29 @@ impl LanguageServerPool {
                 marker.clone(),
                 timeout,
             )
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                let per_root_key = ConnectionKey::new(
+                    server_name,
+                    marker
+                        .as_ref()
+                        .map(|(root, _folder)| root.as_str().to_owned()),
+                );
+                return self
+                    .acquire_resolved_wait_ready(
+                        server_name,
+                        server_config,
+                        per_root_key,
+                        marker,
+                        remaining,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
 
         // Announce the (possibly newly-joined) root before the caller opens any
         // document. Idempotent if `acquire_resolved_wait_ready`'s ReturnExisting
@@ -2110,7 +2132,7 @@ impl LanguageServerPool {
                 drop(connections);
                 if !self.announce_shared_root(&handle, &marker).await? {
                     return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
+                        io::ErrorKind::Unsupported,
                         "bridge: shared connection lost workspace-folder support; retry per root",
                     ));
                 }
