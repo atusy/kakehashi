@@ -10,7 +10,11 @@ use std::path::Path;
 pub enum SettingsEventKind {
     Info,
     Warning,
-    /// Hard error surfaced via `window/showMessage` so the user cannot miss it.
+    /// Hard error normally surfaced via `window/showMessage`.
+    ///
+    /// Fatal explicit-config errors instead reject initialization before
+    /// settings events are sent, so the initialize response is their sole
+    /// client-facing report.
     Error,
 }
 
