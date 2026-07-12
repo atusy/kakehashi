@@ -1075,6 +1075,9 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("make accepted stream blocking");
                 let mut reader = BufReader::new(&mut stream);
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() {
