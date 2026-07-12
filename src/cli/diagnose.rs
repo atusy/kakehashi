@@ -677,6 +677,23 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_format_preserves_control_characters() {
+        let mut d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "boom\u{1b}[31m");
+        d.source = Some("tool\u{009b}".to_string());
+
+        let value: serde_json::Value = serde_json::from_str(&format_diagnostic(
+            OutputFormat::Jsonl,
+            "dir/\u{1b}[2Jfile",
+            &d,
+        ))
+        .unwrap();
+
+        assert_eq!(value["file"], "dir/\u{1b}[2Jfile");
+        assert_eq!(value["message"], "boom\u{1b}[31m");
+        assert_eq!(value["source"], "tool\u{009b}");
+    }
+
+    #[test]
     fn jsonl_numeric_code_stays_numeric() {
         let mut d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
         d.code = Some(NumberOrString::Number(42));
