@@ -34,7 +34,32 @@ use std::path::PathBuf;
 
 /// Cross-process lock that makes parser and query changes one language operation.
 pub struct LanguageOperationLockGuard {
+    _all_file: fs::File,
     _file: fs::File,
+}
+
+/// Cross-process exclusive lock for operations that affect every language.
+pub struct AllLanguageOperationsLockGuard {
+    _file: fs::File,
+}
+
+fn open_all_language_operations_lock(data_dir: &std::path::Path) -> std::io::Result<fs::File> {
+    let lock_dir = data_dir.join(".operation-locks");
+    fs::create_dir_all(&lock_dir)?;
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_dir.join(".all.lock"))
+}
+
+impl AllLanguageOperationsLockGuard {
+    /// Exclude every per-language operation while an all-language operation runs.
+    pub fn acquire(data_dir: &std::path::Path) -> std::io::Result<AllLanguageOperationsLockGuard> {
+        let file = open_all_language_operations_lock(data_dir)?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
 }
 
 impl LanguageOperationLockGuard {
@@ -49,15 +74,19 @@ impl LanguageOperationLockGuard {
                 format!("unsafe language name '{}'", language.escape_default()),
             ));
         }
+        let all_file = open_all_language_operations_lock(data_dir)?;
+        all_file.lock_shared()?;
         let lock_dir = data_dir.join(".operation-locks");
-        fs::create_dir_all(&lock_dir)?;
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
             .open(lock_dir.join(format!("{language}.lock")))?;
         file.lock_exclusive()?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _all_file: all_file,
+            _file: file,
+        })
     }
 }
 
@@ -438,6 +467,21 @@ mod tests {
         second
             .try_lock_exclusive()
             .expect("the same-language lock becomes available after release");
+    }
+
+    #[test]
+    fn all_language_lock_excludes_per_language_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let language = LanguageOperationLockGuard::acquire(temp.path(), "lua").unwrap();
+        let all_file = open_all_language_operations_lock(temp.path()).unwrap();
+        assert!(
+            all_file.try_lock_exclusive().is_err(),
+            "an all-language operation must wait for an active language operation"
+        );
+        drop(language);
+        all_file
+            .try_lock_exclusive()
+            .expect("the all-language lock becomes available after the language operation");
     }
 
     #[test]
