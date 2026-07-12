@@ -505,6 +505,12 @@ mod tests {
             Some(query_file),
             "a broken configured asset must not be classified as ordinary absence"
         );
+
+        let error = QueryLoader::load_query_file(&[dir.path()], "rust", "highlights.scm")
+            .expect_err("the present-but-broken asset must surface its read failure");
+        let message = error.to_string();
+        assert!(message.contains("Failed to read query file"), "{message}");
+        assert!(message.contains("highlights.scm"), "{message}");
     }
 
     #[test]
