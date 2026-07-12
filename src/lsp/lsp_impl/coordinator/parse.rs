@@ -62,6 +62,24 @@ fn parse_text_with_deadline(
 
 /// Run native parser code only after its crash marker is durable. Failing open
 /// would recreate the restart loop the marker exists to prevent.
+struct CrashMarkerGuard<'a> {
+    auto_install: &'a AutoInstallManager,
+    language: &'a str,
+}
+
+impl Drop for CrashMarkerGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.auto_install.end_parsing(self.language) {
+            log::warn!(
+                target: "kakehashi::crash_recovery",
+                "Failed to clear crash marker for parser '{}': {}",
+                self.language,
+                error
+            );
+        }
+    }
+}
+
 fn run_crash_tracked_parse<T>(
     auto_install: &AutoInstallManager,
     language: &str,
@@ -76,15 +94,12 @@ fn run_crash_tracked_parse<T>(
         );
         return None;
     }
+    let guard = CrashMarkerGuard {
+        auto_install,
+        language,
+    };
     let result = parse();
-    if let Err(error) = auto_install.end_parsing(language) {
-        log::warn!(
-            target: "kakehashi::crash_recovery",
-            "Failed to clear crash marker for parser '{}': {}",
-            language,
-            error
-        );
-    }
+    drop(guard);
     Some(result)
 }
 
@@ -1225,6 +1240,35 @@ mod tests {
 
         assert_eq!(result, None);
         assert!(!parser_called.get());
+    }
+
+    #[test]
+    fn panic_unwind_clears_crash_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = crate::language::FailedParserRegistry::new(temp.path());
+        registry.init().unwrap();
+        let manager = AutoInstallManager::new(
+            crate::lsp::auto_install::InstallingLanguages::new(),
+            registry,
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_crash_tracked_parse(&manager, "lua", || panic!("parse panic"));
+        }));
+
+        assert!(panic.is_err());
+        let marker_contents: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("parsing_in_progress.")
+            })
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect();
+        assert_eq!(marker_contents, vec![""]);
     }
 
     /// The four documented invariants of the settle-refresh gate.
