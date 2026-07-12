@@ -263,6 +263,9 @@ fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
         // The thread exclusively owns the successful job handle. Closing it at
         // the same deadline as the Unix watchdog atomically terminates this
         // subprocess and any compiler descendants still assigned to the job.
+        // windows-sys 0.61 models HANDLE as `*mut c_void`, which is not Send.
+        // Transfer its pointer-sized value to the owning watchdog thread and
+        // reconstruct it only for CloseHandle.
         let job = job as usize;
         std::thread::spawn(move || {
             std::thread::sleep(PARSER_COMPILE_TIMEOUT + Duration::from_secs(30));
