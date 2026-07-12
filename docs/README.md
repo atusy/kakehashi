@@ -429,6 +429,7 @@ the `bridge.<lang>.aggregation` nesting:
 |-------|-------------|
 | `priorities` | Ordered allowlist of layers, highest priority first (same allowlist rule as the server-name `priorities` above, but over the closed set `virt`/`host`/`native` — no `"*"`). Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
 | `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit), by the diagnostics methods (default `"concatenated"`: the `virt` regions' diagnostics and the host servers' diagnostics for the real document merge into one report/publish; `"preferred"` returns the first non-empty layer instead), by `textDocument/codeAction` (default `"concatenated"`: the injection region's actions and the host servers' actions appear in one menu, with at most one `isPreferred` action kept), and by list-shaped whole-document methods such as `textDocument/documentLink`, `textDocument/foldingRange`, and `textDocument/codeLens` when explicitly configured. Every other method combines with `"preferred"` regardless of this field. |
+| `minPublishIntervalMs` | For `textDocument/publishDiagnostics`, the minimum interval between editor-facing publishes during rapid changes. Default: `1000`; `0` publishes every changed merge. This does not affect pull diagnostics or refresh requests. |
 
 Details:
 
@@ -454,6 +455,8 @@ Details:
   (`pushFallback`), only push-driven servers' slots fold in (pull-capable
   servers excluded), under the CROSS-LAYER priorities/strategy only —
   server-level `priorities`/`maxFanOut` are not reapplied.
+  `minPublishIntervalMs` applies only to proactive editor-facing
+  `publishDiagnostics` sends for that host language.
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for the bridged
   request methods — including pull/push diagnostics, with the `bridge._self`

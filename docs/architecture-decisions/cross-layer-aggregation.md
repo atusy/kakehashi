@@ -165,6 +165,9 @@ priorities = ["virt", "host", "native"]   # innermost-first; mirrors "deeper win
 [languages.markdown.layers.aggregation."textDocument/hover"]
 priorities = ["host", "virt"]             # allowlist: native does not run
 
+[languages.markdown.layers.aggregation."textDocument/publishDiagnostics"]
+minPublishIntervalMs = 1000                # 0 publishes every changed merge
+
 # ---- Stage 1 stays exactly as before: server names within one target ----
 [languages.markdown.bridge._self.aggregation."textDocument/hover"]
 priorities = ["marksman"]
@@ -191,6 +194,8 @@ pub struct LayerAggregationConfig {
     pub priorities: Option<Vec<LayerSource>>,
     /// Reuses the stage-1 strategy type; omit for the per-method default.
     pub strategy: Option<AggregationStrategy>,
+    /// Push-diagnostic wire cadence in milliseconds; method-specific.
+    pub min_publish_interval_ms: Option<u64>,
 }
 
 pub struct LayersConfig {
