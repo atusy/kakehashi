@@ -855,8 +855,13 @@ fn backup_is_complete_and_owned(path: &Path) -> Result<bool, QueryInstallError> 
     if !ownership.is_file() {
         return Ok(false);
     }
-    let Some(highlights) = regular_file_or_absent(&path.join("highlights.scm"))? else {
-        return Ok(false);
+    // Query files may intentionally be user-managed symlinks; completeness
+    // follows the same semantics as the installed query directory.
+    let highlights_path = path.join("highlights.scm");
+    let highlights = match fs::metadata(&highlights_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(QueryInstallError::IoError(e)),
     };
     if !highlights.is_file() {
         return Ok(false);
