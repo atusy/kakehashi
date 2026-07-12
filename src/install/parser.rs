@@ -204,12 +204,32 @@ fn remove_parser_backup_marker(backup: &Path) -> std::io::Result<()> {
 }
 
 fn parser_backup_marker_is_owned(marker: &Path) -> std::io::Result<bool> {
-    let file = match fs::File::open(marker) {
-        Ok(file) => file,
+    let metadata = match fs::symlink_metadata(marker) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    if file.metadata()?.len() != PARSER_BACKUP_MARKER_CONTENT.len() as u64 {
+    if !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
+    }
+    let file = match options.open(marker) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != PARSER_BACKUP_MARKER_CONTENT.len() as u64
+    {
         return Ok(false);
     }
     let mut content = Vec::with_capacity(PARSER_BACKUP_MARKER_CONTENT.len() + 1);
@@ -1827,7 +1847,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn owned_parser_backup_languages_propagates_marker_read_error() {
+    fn owned_parser_backup_languages_ignores_marker_symlink() {
         use std::os::unix::fs::symlink;
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
@@ -1837,8 +1857,31 @@ mod tests {
         fs::write(&backup, b"parser").expect("write backup");
         symlink(&marker, &marker).expect("create marker symlink loop");
 
-        owned_parser_backup_languages(&parser_dir)
-            .expect_err("uninspectable ownership marker must abort discovery");
+        assert!(
+            owned_parser_backup_languages(&parser_dir)
+                .expect("symlink marker is unowned")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_parser_backup_languages_ignores_marker_fifo() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 4));
+        let marker = parser_backup_ownership_sidecar(&backup);
+        fs::write(&backup, b"parser").expect("write backup");
+        mkfifo(&marker, Mode::S_IRUSR | Mode::S_IWUSR).expect("create marker fifo");
+
+        assert!(
+            owned_parser_backup_languages(&parser_dir)
+                .expect("fifo marker is unowned")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1982,7 +2025,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn parser_recovery_propagates_ownership_marker_read_error() {
+    fn parser_recovery_ignores_ownership_marker_symlink() {
         use std::os::unix::fs::symlink;
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
@@ -1993,8 +2036,10 @@ mod tests {
         fs::write(&backup, b"working parser").expect("write backup");
         symlink(&marker, &marker).expect("create marker symlink loop");
 
-        recover_parser_backups(&parser_dir, &canonical, "lua")
-            .expect_err("marker read error must abort recovery");
+        assert!(
+            !recover_parser_backups(&parser_dir, &canonical, "lua")
+                .expect("symlink marker is unowned")
+        );
 
         assert!(backup.exists());
         assert!(!canonical.exists());
