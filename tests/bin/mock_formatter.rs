@@ -326,6 +326,10 @@ fn main() {
                     // ignores. A fixed id is fine since nothing awaits the ack.
                     if mode == "diagnostics-refresh" {
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
+                    } else if mode == "diagnostics-refresh-burst" {
+                        for id in 1000..1010 {
+                            request(&mut writer, json!(id), "workspace/diagnostic/refresh");
+                        }
                     }
                 }
             }

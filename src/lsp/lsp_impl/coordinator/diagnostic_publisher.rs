@@ -88,6 +88,9 @@ impl RepublishOutcome {
 /// chose existing config surfaces over new ones — revisit if a real setup
 /// needs a different cadence.
 const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// Short enough that a downstream re-analysis still prompts a timely editor
+/// pull, but longer than the 1 ms-scale refresh bursts observed in #789.
+const FORWARDED_REFRESH_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Bundles the state needed to merge the cache and publish for a host, so the
 /// notification feeds (reader push, host-event pull) can trigger a republish
@@ -116,6 +119,30 @@ impl DiagnosticPublisher {
             cache: Arc::clone(&server.cache),
             aggregator: Arc::clone(&server.diagnostics),
         }
+    }
+
+    /// Coalesce a burst of downstream `workspace/diagnostic/refresh` requests
+    /// into one forced upstream refresh after the burst settles (#789).
+    pub(crate) fn request_forwarded_diagnostic_refresh(&self) {
+        let Some(mut generation) = self.aggregator.begin_forwarded_refresh_debounce() else {
+            return;
+        };
+        let publisher = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FORWARDED_REFRESH_SETTLE_WINDOW).await;
+                match publisher
+                    .aggregator
+                    .finish_forwarded_refresh_wait(generation)
+                {
+                    Some(latest) => generation = latest,
+                    None => {
+                        publisher.request_pull_diagnostic_refresh(true);
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Route a downstream `publishDiagnostics` push into the cache, classifying by

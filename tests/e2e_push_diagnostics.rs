@@ -874,6 +874,27 @@ fn e2e_downstream_refresh_forwarded_to_refresh_capable_client() {
 }
 
 #[test]
+fn e2e_downstream_refresh_burst_is_coalesced() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-burst", refresh_capable_caps());
+    open_host(&mut client);
+
+    let (id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("a downstream refresh burst must eventually reach the editor");
+    client.send_response(id, json!(null));
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(500))
+            .is_none(),
+        "one burst must produce at most one editor-visible refresh"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
 fn e2e_downstream_refresh_gated_off_for_refresh_incapable_client() {
     // #521: the same downstream refresh must NOT be forwarded when the client did
     // not advertise `workspace.diagnostics.refreshSupport` — forwarding it would

@@ -418,6 +418,11 @@ pub(crate) struct DiagnosticAggregator {
     /// that window set `pending`, which fires exactly one more refresh on
     /// completion. Drives [`Self::try_begin_refresh`]/[`Self::finish_refresh`].
     refresh_flight: Mutex<RefreshFlight>,
+    /// Trailing-edge debounce for downstream-forwarded diagnostic refreshes
+    /// (#789). Unlike [`Self::refresh_flight`], which only coalesces while the
+    /// editor's acknowledgement is outstanding, this also collapses bursts
+    /// when the editor answers each request immediately.
+    forwarded_refresh_debounce: Mutex<ForwardedRefreshDebounce>,
     /// Per-host coverage versions for the refresh **coverage gate** (#497, commit 2).
     /// `current` bumps on every set-changing republish (the editor's pulled view is
     /// now stale); `served` records the `current` a pull was answered against. A
@@ -469,6 +474,12 @@ struct RefreshFlight {
     /// refresh, #521), so the trailing must fire regardless of the coverage gate —
     /// there is no version representing what the downstream asked to refresh.
     pending_forced: bool,
+}
+
+#[derive(Default)]
+struct ForwardedRefreshDebounce {
+    generation: u64,
+    task_scheduled: bool,
 }
 
 /// Per-host coalescing state for the editor-facing `publishDiagnostics` wire
@@ -602,6 +613,39 @@ impl DiagnosticMetricsSnapshot {
 }
 
 impl DiagnosticAggregator {
+    /// Record downstream refresh activity and claim the single debounce task.
+    /// The returned generation is the activity snapshot that task should wait
+    /// against; `None` means an existing task will observe this activity.
+    pub(crate) fn begin_forwarded_refresh_debounce(&self) -> Option<u64> {
+        let mut debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        debounce.generation = debounce.generation.wrapping_add(1);
+        if debounce.task_scheduled {
+            None
+        } else {
+            debounce.task_scheduled = true;
+            Some(debounce.generation)
+        }
+    }
+
+    /// Check whether activity occurred during the debounce wait. A newer
+    /// generation restarts the settle window; `None` releases the task claim
+    /// and tells the caller to forward exactly one refresh.
+    pub(crate) fn finish_forwarded_refresh_wait(&self, observed: u64) -> Option<u64> {
+        let mut debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        if debounce.generation != observed {
+            Some(debounce.generation)
+        } else {
+            debounce.task_scheduled = false;
+            None
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -2289,6 +2333,31 @@ mod tests {
             "cleared guard → next request sends"
         );
         assert!(!agg.finish_refresh(), "no pending → clears");
+    }
+
+    #[test]
+    fn forwarded_refresh_debounce_waits_for_a_quiet_window() {
+        let agg = DiagnosticAggregator::new();
+
+        let first = agg
+            .begin_forwarded_refresh_debounce()
+            .expect("the first refresh schedules the trailing task");
+        assert!(
+            agg.begin_forwarded_refresh_debounce().is_none(),
+            "burst activity must reuse the scheduled task"
+        );
+        let latest = agg
+            .finish_forwarded_refresh_wait(first)
+            .expect("activity during the wait restarts the settle window");
+        assert_eq!(
+            agg.finish_forwarded_refresh_wait(latest),
+            None,
+            "a quiet window releases exactly one refresh"
+        );
+        assert!(
+            agg.begin_forwarded_refresh_debounce().is_some(),
+            "new activity after the quiet window schedules the next refresh"
+        );
     }
 
     #[test]
