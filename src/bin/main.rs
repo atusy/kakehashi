@@ -647,7 +647,7 @@ fn write_content_to_output(
 
     if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
         let write_result = if force {
-            std::fs::write(path, content)
+            write_forced_output(path, content)
         } else {
             use std::io::Write as _;
 
@@ -657,7 +657,6 @@ fn write_content_to_output(
                 .open(path)
                 .and_then(|mut file| file.write_all(content.as_bytes()))
         };
-
         match write_result {
             Ok(()) => {
                 eprintln!("Created {label} file: {}", path.display());
@@ -679,6 +678,39 @@ fn write_content_to_output(
     }
 
     Ok(())
+}
+
+fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(path)?;
+        file.write_all(content.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        {
+            use std::io::Write as _;
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            file.write_all(content.as_bytes())
+        }
+        #[cfg(not(windows))]
+        std::fs::write(path, content)
+    }
 }
 
 /// Run the config init command
@@ -1137,5 +1169,45 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_output_rejects_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("shared.toml");
+        let output = temp.path().join("config.toml");
+        std::fs::write(&target, "shared").unwrap();
+        symlink(&target, &output).unwrap();
+
+        let result =
+            write_content_to_output("generated", Some(output.clone()), true, "configuration");
+
+        assert!(result.is_err());
+        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "shared");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn force_output_rejects_windows_symlink_without_touching_target() {
+        use std::os::windows::fs::symlink_file;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("shared.toml");
+        let output = temp.path().join("config.toml");
+        std::fs::write(&target, "shared").unwrap();
+        if let Err(error) = symlink_file(&target, &output) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("create test symlink: {error}");
+        }
+
+        let result = write_content_to_output("generated", Some(output), true, "configuration");
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "shared");
     }
 }
