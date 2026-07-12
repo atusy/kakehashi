@@ -586,7 +586,7 @@ impl PartialEq for WireAdmit {
 impl Eq for WireAdmit {}
 
 /// Per-host coverage versions for the refresh gate (#497, commit 2).
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct HostCoverage {
     epoch: u64,
     /// Bumped on each set-changing republish for this host.
@@ -597,7 +597,7 @@ struct HostCoverage {
 }
 
 /// The diagnostic coverage observed when a pull begins.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiagnosticCoverageStamp {
     epoch: u64,
     version: u64,
