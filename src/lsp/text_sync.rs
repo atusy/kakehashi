@@ -179,6 +179,24 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_change_resolves_line_after_lone_cr() {
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(1, 0), Position::new(1, 5))),
+            range_length: Some(5),
+            text: "rust".to_string(),
+        }];
+
+        let (new_text, edits) = apply_content_changes_with_edits("hello\rworld", changes);
+        let edit = edits.first().expect("one edit");
+
+        assert_eq!(new_text, "hello\rrust");
+        assert_eq!((edit.start_byte, edit.old_end_byte), (6, 11));
+        // tree-sitter still sees the lone CR as a column byte, not a row break.
+        assert_eq!(edit.start_position, Point::new(0, 6));
+        assert_eq!(edit.old_end_position, Point::new(0, 11));
+    }
+
+    #[test]
     fn test_apply_content_changes_out_of_range_does_not_panic() {
         // Regression: a change whose range extends past the current text must not
         // panic in `replace_range`. This happens under concurrent `didChange`

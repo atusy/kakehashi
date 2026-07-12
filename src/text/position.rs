@@ -445,6 +445,19 @@ mod tests {
     }
 
     #[test]
+    fn mixed_line_endings_have_one_boundary_each() {
+        let text = "a\rb\r\nc\nd";
+        let mapper = PositionMapper::new(text);
+
+        for (line, byte) in [(0, 0), (1, 2), (2, 5), (3, 7)] {
+            let position = Position::new(line, 0);
+            assert_eq!(mapper.position_to_byte(position), Some(byte));
+            assert_eq!(mapper.byte_to_position(byte), Some(position));
+        }
+        assert_eq!(mapper.position_to_byte(Position::new(4, 0)), None);
+    }
+
+    #[test]
     fn clamped_maps_in_bounds_position_exactly() {
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
