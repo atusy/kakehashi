@@ -165,7 +165,7 @@ fn fetch_parsers_lua() -> Result<String, MetadataError> {
 fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
     let mut parsers = HashMap::new();
 
-    let lang_names = top_level_table_keys(content);
+    let lang_names = top_level_table_keys(content)?;
 
     // For each language, find its block and extract metadata
     for (lang, block) in lang_names {
@@ -194,15 +194,18 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     Ok(parsers)
 }
 
-fn top_level_table_keys(s: &str) -> Vec<(String, &str)> {
+fn top_level_table_keys(s: &str) -> Result<Vec<(String, &str)>, MetadataError> {
     let Some(offset) = returned_table_start(s) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     table_entries(s, offset)
         .into_iter()
-        .filter_map(|(name, value)| match value {
-            LuaValue::Table(block) if !is_reserved_key(&name) => Some((name, block)),
-            _ => None,
+        .filter_map(|(name, value)| match (is_reserved_key(&name), value) {
+            (true, _) => None,
+            (false, LuaValue::Table(block)) => Some(Ok((name, block))),
+            (false, LuaValue::String(_)) => Some(Err(MetadataError::ParseError(format!(
+                "invalid parser entry for {name}"
+            )))),
         })
         .collect()
 }
@@ -741,6 +744,16 @@ mod tests {
     #[test]
     fn non_table_install_info_invalidates_the_document() {
         let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = { install_info = 'damaged' },\n}";
+
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn non_table_parser_entry_invalidates_the_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = 'damaged',\n}";
 
         assert!(matches!(
             parse_complete_parsers_lua(content),
