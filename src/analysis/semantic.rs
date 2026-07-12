@@ -154,42 +154,42 @@ pub(crate) async fn handle_semantic_tokens_full(
             )
         });
         let mut host_work = || {
-                    let started = std::time::Instant::now();
-                    let complete = collect_host_tokens(
-                        &text,
-                        &tree,
-                        &query,
-                        filetype.as_deref(),
-                        capture_mappings.as_deref(),
-                        &text,
-                        &lines,
-                        &line_starts,
-                        0,
-                        0,
-                        supports_multiline,
-                        &[],
-                        &[],
-                        cancel.as_ref(),
-                        &mut host_tokens,
-                    );
-                    (complete, started.elapsed())
-                };
+            let started = std::time::Instant::now();
+            let complete = collect_host_tokens(
+                &text,
+                &tree,
+                &query,
+                filetype.as_deref(),
+                capture_mappings.as_deref(),
+                &text,
+                &lines,
+                &line_starts,
+                0,
+                0,
+                supports_multiline,
+                &[],
+                &[],
+                cancel.as_ref(),
+                &mut host_tokens,
+            );
+            (complete, started.elapsed())
+        };
         let injection_work = || {
-                    let started = std::time::Instant::now();
-                    let result = collect_injection_tokens_parallel(
-                        &text,
-                        &lines,
-                        &line_starts,
-                        &tree,
-                        filetype.as_deref(),
-                        &coordinator,
-                        capture_mappings.as_deref(),
-                        supports_multiline,
-                        cache_ctx.as_ref(),
-                        cancel.as_ref(),
-                    );
-                    (result, started.elapsed())
-                };
+            let started = std::time::Instant::now();
+            let result = collect_injection_tokens_parallel(
+                &text,
+                &lines,
+                &line_starts,
+                &tree,
+                filetype.as_deref(),
+                &coordinator,
+                capture_mappings.as_deref(),
+                supports_multiline,
+                cache_ctx.as_ref(),
+                cancel.as_ref(),
+            );
+            (result, started.elapsed())
+        };
 
         // Host highlighting and a substantial injection pass read the same
         // immutable snapshot and only meet during finalization. Overlap them
