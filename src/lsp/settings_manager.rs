@@ -25,6 +25,9 @@ pub(crate) struct SettingsSnapshot {
 
 pub(crate) struct SettingsManager {
     root_path: ArcSwap<Option<PathBuf>>,
+    /// Startup layers (defaults, config files, and initialization options),
+    /// before any replaceable didChangeConfiguration layer is applied.
+    base_raw_settings: ArcSwap<RawWorkspaceSettings>,
     settings_snapshot: ArcSwap<SettingsSnapshot>,
     /// Serializes read-modify-write settings transactions from runtime config
     /// pushes and post-install search-path updates.
@@ -78,6 +81,7 @@ impl SettingsManager {
 
         Self {
             root_path: ArcSwap::new(Arc::new(None)),
+            base_raw_settings: ArcSwap::new(Arc::new(raw_settings.clone())),
             settings_snapshot: ArcSwap::new(Arc::new(SettingsSnapshot {
                 raw_settings: Arc::new(raw_settings),
                 settings: Arc::new(settings),
@@ -164,6 +168,16 @@ impl SettingsManager {
     /// Load the current raw workspace settings.
     pub(crate) fn load_raw_settings(&self) -> Arc<RawWorkspaceSettings> {
         Arc::clone(&self.settings_snapshot.load().raw_settings)
+    }
+
+    /// Load the immutable startup layers used beneath runtime client settings.
+    pub(crate) fn load_base_raw_settings(&self) -> Arc<RawWorkspaceSettings> {
+        self.base_raw_settings.load_full()
+    }
+
+    /// Replace the startup layers during the initialize handshake.
+    pub(crate) fn set_base_raw_settings(&self, raw_settings: RawWorkspaceSettings) {
+        self.base_raw_settings.store(Arc::new(raw_settings));
     }
 
     /// Load the current raw and effective workspace settings from one snapshot.

@@ -958,6 +958,48 @@ fn test_did_change_configuration_preserves_config_file_settings() {
     );
 }
 
+/// Each didChangeConfiguration payload replaces the previous runtime layer.
+#[test]
+fn test_did_change_configuration_removed_key_reverts_to_config_file() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(&config, "autoInstall = true\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(settings["autoInstall"], json!(true), "precondition");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "autoInstall": false } }),
+    );
+    poll_effective_settings(
+        &mut client,
+        |s| s["autoInstall"] == json!(false),
+        "first runtime layer should override the config file",
+    );
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "searchPaths": ["/replacement"] } }),
+    );
+    let settings = poll_effective_settings(
+        &mut client,
+        |s| s["searchPaths"] == json!(["/replacement"]),
+        "second runtime layer should be applied",
+    );
+    assert_eq!(
+        settings["autoInstall"],
+        json!(true),
+        "omitted runtime key should fall back to the config-file layer"
+    );
+}
+
 /// didChangeConfiguration adds languageServers to a config-file that only had languages.
 #[test]
 fn test_did_change_configuration_adds_language_servers_to_config_file_base() {
