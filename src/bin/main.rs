@@ -739,10 +739,10 @@ fn write_forced_output_with(
                     format!("refusing to follow output symlink '{}'", path.display()),
                 ));
             }
-            reject_multiple_hard_links(path, &metadata)?;
             temporary
                 .as_file()
                 .set_permissions(metadata.permissions())?;
+            reject_multiple_hard_links(path)?;
             temporary.persist(path).map_err(|error| error.error)?;
             Ok(WriteDisposition::Overwrote)
         }
@@ -751,20 +751,14 @@ fn write_forced_output_with(
 }
 
 #[cfg(unix)]
-fn reject_multiple_hard_links(
-    _path: &std::path::Path,
-    metadata: &std::fs::Metadata,
-) -> std::io::Result<()> {
+fn reject_multiple_hard_links(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
-    reject_hard_link_count(metadata.nlink())
+    reject_hard_link_count(std::fs::metadata(path)?.nlink())
 }
 
 #[cfg(windows)]
-fn reject_multiple_hard_links(
-    path: &std::path::Path,
-    _metadata: &std::fs::Metadata,
-) -> std::io::Result<()> {
+fn reject_multiple_hard_links(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -785,10 +779,7 @@ fn reject_multiple_hard_links(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn reject_multiple_hard_links(
-    _path: &std::path::Path,
-    _metadata: &std::fs::Metadata,
-) -> std::io::Result<()> {
+fn reject_multiple_hard_links(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
