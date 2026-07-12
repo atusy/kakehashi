@@ -177,6 +177,14 @@ fn parser_backup_ownership_sidecar(backup: &Path) -> PathBuf {
     ))
 }
 
+fn remove_parser_backup_marker(backup: &Path) -> std::io::Result<()> {
+    match fs::remove_file(parser_backup_ownership_sidecar(backup)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(parser_dir) {
         Ok(entries) => entries,
@@ -242,11 +250,7 @@ fn remove_owned_parser_backup(backup: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    match fs::remove_file(parser_backup_ownership_sidecar(backup)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+    remove_parser_backup_marker(backup)
 }
 
 #[cfg(any(windows, test))]
@@ -282,7 +286,7 @@ fn recover_parser_backups(
     timed_backups.sort_by_key(|(modified, _)| *modified);
     let (_, restore) = timed_backups.pop().expect("non-empty parser backup list");
     fs::rename(&restore, parser_file)?;
-    fs::remove_file(parser_backup_ownership_sidecar(&restore))?;
+    remove_parser_backup_marker(&restore)?;
     for (_, obsolete) in timed_backups {
         remove_owned_parser_backup(&obsolete)?;
     }
@@ -1758,6 +1762,14 @@ mod tests {
 
         assert!(!canonical.exists());
         assert_eq!(fs::read(unowned).expect("read user file"), b"user file");
+    }
+
+    #[test]
+    fn parser_backup_marker_removal_accepts_concurrent_disappearance() {
+        let temp = tempdir().expect("temp dir");
+        let backup = temp.path().join(generated_backup_name("lua", 123, 4));
+
+        remove_parser_backup_marker(&backup).expect("already removed marker is clean");
     }
 
     #[test]
