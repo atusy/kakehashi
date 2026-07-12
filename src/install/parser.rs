@@ -995,7 +995,11 @@ fn remove_stale_cleanup_claim_windows(path: &Path) {
     {
         return;
     }
-    let _ = fs::remove_file(path.join("artifact"));
+    match fs::remove_file(path.join("artifact")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
     let _ = fs::remove_file(marker);
     #[cfg(windows)]
     drop(claim_guard);
@@ -1926,6 +1930,20 @@ mod tests {
 
         assert!(!owned.exists(), "proven abandoned claim is removed");
         assert!(unowned.exists(), "unmarked lookalike is preserved");
+    }
+
+    #[test]
+    fn windows_cleanup_keeps_marker_when_artifact_removal_fails() {
+        let temp = tempdir().expect("temp dir");
+        let claim = temp.path().join(".parser-cleanup.123.0");
+        fs::create_dir(&claim).expect("create claim");
+        fs::write(claim.join("owner"), PARSER_CLEANUP_MARKER).expect("write marker");
+        fs::create_dir(claim.join("artifact")).expect("create non-removable artifact shape");
+
+        remove_stale_cleanup_claim_windows(&claim);
+
+        assert!(claim.join("owner").exists(), "retry marker is preserved");
+        assert!(claim.join("artifact").exists(), "failed artifact remains");
     }
 
     #[cfg(unix)]
