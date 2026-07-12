@@ -79,7 +79,13 @@ fn publish_parser_transactionally(
 
     if had_old_parser && let Err(finalize_error) = ops.finalize_backup_marker(backup_file) {
         let rollback = ops.rename(backup_file, parser_file);
-        let cleanup = ops.remove_backup_marker(backup_file);
+        let cleanup = if rollback.is_ok() {
+            Some(ops.remove_backup_marker(backup_file))
+        } else {
+            // Keep intent/final ownership discoverable when the working parser
+            // remains stranded at the backup path.
+            None
+        };
         return Err(std::io::Error::new(
             finalize_error.kind(),
             format!(
@@ -1693,6 +1699,7 @@ mod tests {
         fail_marker_creation: bool,
         fail_marker_write_after_create: bool,
         fail_marker_removal: bool,
+        fail_marker_finalization: bool,
         backup_claim_observed_marker: bool,
     }
 
@@ -1780,6 +1787,12 @@ mod tests {
         }
 
         fn finalize_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+            if self.fail_marker_finalization {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected marker finalization failure",
+                ));
+            }
             if !self.backup_markers.remove(backup) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -1899,6 +1912,25 @@ mod tests {
         assert!(error.to_string().contains("failed to restore backup"));
         assert_eq!(ops.files.get(&backup), Some(&"old"));
         assert_eq!(ops.files.get(&tmp), Some(&"new"));
+        assert!(!ops.files.contains_key(&parser));
+    }
+
+    #[test]
+    fn transactional_publish_keeps_intent_when_finalization_and_rollback_fail() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.fail_marker_finalization = true;
+        ops.failed_renames.push((backup.clone(), parser.clone()));
+
+        publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("finalization and rollback failure must abort");
+
+        assert_eq!(ops.files.get(&backup), Some(&"old"));
+        assert!(ops.backup_markers.contains(&backup));
         assert!(!ops.files.contains_key(&parser));
     }
 
