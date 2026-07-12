@@ -688,7 +688,30 @@ fn run_language_uninstall(
 
         let mut removed_something = false;
 
-        // Remove parser file
+        // Remove queries directory and any kakehashi-created backups under the
+        // same lock used by install replacement, so uninstall cannot race a
+        // concurrent install into resurrecting queries after reporting success.
+        // Do this before the parser: query removal recursively traverses a tree
+        // and has more ways to fail than deleting one parser entry. If it fails,
+        // preserve the parser rather than leaving the language half-uninstalled.
+        match queries::remove_query_install_and_backups(&queries_dir, lang) {
+            Ok(removal) => {
+                if removal.removed_queries {
+                    eprintln!("✓ Removed queries: {}", queries_dir.join(lang).display());
+                }
+                if removal.removed_backups {
+                    eprintln!("✓ Removed query backups for '{}'", lang);
+                }
+                removed_something |= removal.removed_anything();
+            }
+            Err(e) => {
+                eprintln!("✗ Failed to remove queries for '{}': {}", lang, e);
+                any_failed = true;
+                continue;
+            }
+        }
+
+        // Remove parser file only after query removal completed.
         let parser_path = match find_parser_file_for_uninstall(&parser_dir, lang) {
             Ok(path) => path,
             Err(e) => {
@@ -707,25 +730,6 @@ fn run_language_uninstall(
                     eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
                     any_failed = true;
                 }
-            }
-        }
-
-        // Remove queries directory and any kakehashi-created backups under the
-        // same lock used by install replacement, so uninstall cannot race a
-        // concurrent install into resurrecting queries after reporting success.
-        match queries::remove_query_install_and_backups(&queries_dir, lang) {
-            Ok(removal) => {
-                if removal.removed_queries {
-                    eprintln!("✓ Removed queries: {}", queries_dir.join(lang).display());
-                }
-                if removal.removed_backups {
-                    eprintln!("✓ Removed query backups for '{}'", lang);
-                }
-                removed_something |= removal.removed_anything();
-            }
-            Err(e) => {
-                eprintln!("✗ Failed to remove queries for '{}': {}", lang, e);
-                any_failed = true;
             }
         }
 
