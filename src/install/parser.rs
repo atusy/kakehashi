@@ -20,7 +20,7 @@ use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 
 /// HTTP timeout for archive downloads.
 const ARCHIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-const PARSER_UNINSTALL_TOMBSTONE_SUFFIX: &str = ".uninstalled";
+const PARSER_OPERATION_MARKER_SUFFIX: &str = ".operation";
 
 /// Error types for parser installation.
 #[derive(Debug)]
@@ -284,8 +284,8 @@ impl ParserReplaceLockGuard {
     }
 }
 
-fn parser_uninstall_tombstone_path(parser_dir: &Path, language: &str) -> PathBuf {
-    parser_dir.join(format!(".{language}{PARSER_UNINSTALL_TOMBSTONE_SUFFIX}"))
+fn parser_operation_marker_path(parser_dir: &Path, language: &str) -> PathBuf {
+    parser_dir.join(format!(".{language}{PARSER_OPERATION_MARKER_SUFFIX}"))
 }
 
 fn unsafe_language_name_error(language: &str) -> ParserInstallError {
@@ -306,7 +306,7 @@ fn begin_parser_install(
         return Err(ParserInstallError::AlreadyExists(parser_file.to_path_buf()));
     }
     let token = format!("install:{}", ulid::Ulid::new());
-    let mut marker = fs::File::create(parser_uninstall_tombstone_path(parser_dir, language))?;
+    let mut marker = fs::File::create(parser_operation_marker_path(parser_dir, language))?;
     marker.write_all(token.as_bytes())?;
     Ok(token)
 }
@@ -321,12 +321,12 @@ fn publish_compiled_parser(
         ParserInstallError::IoError(std::io::Error::other("parser path has no parent"))
     })?;
     let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
-    let current_token =
-        match fs::read_to_string(parser_uninstall_tombstone_path(parser_dir, language)) {
-            Ok(token) => Some(token),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(ParserInstallError::IoError(error)),
-        };
+    let current_token = match fs::read_to_string(parser_operation_marker_path(parser_dir, language))
+    {
+        Ok(token) => Some(token),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
     if current_token.as_deref() != Some(install_token) {
         let _ = fs::remove_file(tmp_file);
         return Err(ParserInstallError::IoError(std::io::Error::new(
@@ -354,8 +354,8 @@ pub fn remove_parser_install(
     language: &str,
 ) -> Result<bool, ParserInstallError> {
     let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
-    let mut tombstone = fs::File::create(parser_uninstall_tombstone_path(parser_dir, language))?;
-    writeln!(tombstone, "uninstall:{}", ulid::Ulid::new())?;
+    let mut marker = fs::File::create(parser_operation_marker_path(parser_dir, language))?;
+    writeln!(marker, "uninstall:{}", ulid::Ulid::new())?;
     let parser_file = parser_dir.join(format!("{language}.{}", std::env::consts::DLL_EXTENSION));
     match fs::remove_file(parser_file) {
         Ok(()) => Ok(true),
@@ -1492,21 +1492,21 @@ mod tests {
             matches!(result, Err(ParserInstallError::AlreadyExists(path)) if path == parser_file)
         );
         assert_eq!(
-            fs::read_to_string(parser_uninstall_tombstone_path(&parser_dir, "lua")).unwrap(),
+            fs::read_to_string(parser_operation_marker_path(&parser_dir, "lua")).unwrap(),
             first_token,
             "a no-op install must not cancel the in-flight force install"
         );
     }
 
     #[test]
-    fn uninstall_tombstone_prevents_staged_parser_publication() {
+    fn uninstall_marker_prevents_staged_parser_publication() {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
         let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
         let tmp_file = parser_dir.join(".lua.staged.tmp");
         fs::write(&tmp_file, b"compiled parser").expect("write staged parser");
-        fs::write(parser_uninstall_tombstone_path(&parser_dir, "lua"), b"ok\n")
+        fs::write(parser_operation_marker_path(&parser_dir, "lua"), b"ok\n")
             .expect("record later uninstall");
 
         let result = publish_compiled_parser(&tmp_file, &parser_file, "lua", "install:first");
@@ -1564,7 +1564,7 @@ mod tests {
 
         assert_eq!(fs::read(parser_file).unwrap(), b"compiled parser");
         assert_eq!(
-            fs::read_to_string(parser_uninstall_tombstone_path(&parser_dir, "lua")).unwrap(),
+            fs::read_to_string(parser_operation_marker_path(&parser_dir, "lua")).unwrap(),
             install_token
         );
     }
