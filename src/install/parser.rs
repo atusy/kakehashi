@@ -243,7 +243,11 @@ fn self_exe_for_reexec() -> Result<PathBuf, ParserInstallError> {
 /// subprocess") and bound it with [`PARSER_COMPILE_TIMEOUT`]. Re-exec rather than
 /// `fork`: forking a multithreaded process is unsafe past the child's first
 /// non-async-signal-safe call.
-fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
+fn compile_parser(
+    grammar_path: &Path,
+    output_path: &Path,
+    staging_lock: Option<&fs::File>,
+) -> Result<(), ParserInstallError> {
     let mut cmd = Command::new(self_exe_for_reexec()?);
     cmd.arg("__compile-parser")
         .arg(grammar_path)
@@ -253,6 +257,9 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
         // inherited so `cc` diagnostics land in the logs.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
+    if let Some(staging_lock) = staging_lock {
+        inherit_staging_lock(&mut cmd, staging_lock);
+    }
     let status = run_killable_subprocess(cmd, PARSER_COMPILE_TIMEOUT, "parser compile")?;
     if !status.success() {
         return Err(ParserInstallError::CompileError(format!(
@@ -263,6 +270,32 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
     }
     Ok(())
 }
+
+#[cfg(unix)]
+fn inherit_staging_lock(cmd: &mut Command, staging_lock: &fs::File) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let fd = staging_lock.as_raw_fd();
+    // Only the forked child clears CLOEXEC on its copy. The descriptor then
+    // keeps the advisory lock alive through our re-exec and the compiler it
+    // launches if the installer process exits unexpectedly.
+    unsafe {
+        cmd.pre_exec(move || {
+            let flags = nix::libc::fcntl(fd, nix::libc::F_GETFD);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if nix::libc::fcntl(fd, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn inherit_staging_lock(_cmd: &mut Command, _staging_lock: &fs::File) {}
 
 /// Install a Tree-sitter parser for a language.
 pub fn install_parser(
@@ -338,9 +371,11 @@ pub fn install_parser(
     // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
     // by this process still fails at the rename — a loaded DLL can't be removed — a
     // pre-existing platform limitation this scheme doesn't change.)
-    let (tmp_file, _tmp_lock) = reserve_parser_staging_file(&parser_dir, language)?;
+    let (tmp_file, tmp_lock) = reserve_parser_staging_file(&parser_dir, language)?;
     let compiled = match options.compile {
-        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &tmp_file),
+        ParserCompile::KillableSubprocess => {
+            compile_parser(&source_dir, &tmp_file, tmp_lock.as_ref())
+        }
         ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
     };
     match compiled {
@@ -1177,6 +1212,29 @@ mod tests {
         child.wait().expect("wait for short-lived child");
         assert!(!process_is_running(pid), "reaped child PID is not running");
         pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_lock_is_inherited_through_exec() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("staging");
+        let lock = fs::File::create(&path).expect("create staging file");
+        lock.lock_exclusive().expect("lock staging file");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30");
+        inherit_staging_lock(&mut cmd, &lock);
+        let mut child = cmd.spawn().expect("spawn lock inheritor");
+        drop(lock);
+
+        let contender = fs::File::open(&path).expect("open staging file");
+        assert!(
+            contender.try_lock_exclusive().is_err(),
+            "exec child retains the staging lock after the parent drops it"
+        );
+
+        child.kill().expect("kill lock inheritor");
+        child.wait().expect("reap lock inheritor");
     }
 
     #[cfg(unix)]
