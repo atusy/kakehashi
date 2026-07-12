@@ -16,6 +16,36 @@
 
 use std::path::{Path, PathBuf};
 
+/// Read a collected path as UTF-8 text.
+pub(crate) fn read_regular_file_to_string(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+        let flags = OFlag::from_bits_truncate(fcntl(&file, FcntlArg::F_GETFL)?);
+        fcntl(&file, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK))?;
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
 /// Files collected from CLI paths plus any non-fatal directory walk errors
 /// encountered while discovering them.
 pub(crate) struct CollectedFiles {
@@ -72,11 +102,16 @@ pub(crate) fn collect_files(
                 continue;
             }
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
-        } else {
+        } else if metadata.is_file() {
             if is_excluded(&exclude_matcher, base, &path, false) {
                 continue;
             }
             files.push(path);
+        } else {
+            return Err(format!(
+                "unsupported path '{}': not a regular file or directory",
+                path.display()
+            ));
         }
     }
     files.sort();
@@ -409,6 +444,49 @@ mod tests {
             &[],
             &markdown_only,
         );
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_special_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("input.md");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let result = collect_files(tmp.path(), &[socket], &[], &markdown_only);
+
+        let error = match result {
+            Ok(_) => panic!("special file must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("unsupported path '"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_fifo_replacing_a_collected_file() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("input.md");
+        write(&path, "regular");
+        let collected = collect_paths(tmp.path(), std::slice::from_ref(&path), &[], &markdown_only);
+        std::fs::remove_file(&path).unwrap();
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let collected_path = collected[0].clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            result_tx
+                .send(read_regular_file_to_string(&collected_path))
+                .unwrap();
+        });
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("reading a FIFO without a writer must not block");
+        reader.join().unwrap();
+
         assert!(result.is_err());
     }
 
