@@ -39,9 +39,10 @@ pub(super) struct InjectionLayer {
     /// parent's, so container exclusions (e.g. blockquote `> ` prefixes) are
     /// inherited down the nesting chain.
     pub(super) ranges: Vec<tree_sitter::Range>,
-    /// More than one same-depth injection region contained the cursor when
-    /// this layer was selected. A depth-only id cannot identify the minting
-    /// sibling, so id-based accessors must reject this layer.
+    /// This layer or one of its ancestors had more than one same-depth
+    /// injection region containing the cursor. A depth-only id cannot identify
+    /// the minting sibling, and descendants cannot recover that lost identity,
+    /// so id-based accessors must reject this layer.
     ambiguous: bool,
 }
 
