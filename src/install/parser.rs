@@ -47,7 +47,7 @@ fn publish_parser_transactionally(
                 if let Err(cleanup_error) = ops.remove_file(backup_file) {
                     if let Err(unpublish_error) = ops.rename(parser_file, tmp_file) {
                         return Err(std::io::Error::new(
-                            unpublish_error.kind(),
+                            cleanup_error.kind(),
                             format!(
                                 "failed to remove parser backup '{}': {cleanup_error}; failed to unpublish replacement: {unpublish_error}",
                                 backup_file.display()
@@ -56,7 +56,7 @@ fn publish_parser_transactionally(
                     }
                     if let Err(rollback_error) = ops.rename(backup_file, parser_file) {
                         return Err(std::io::Error::new(
-                            rollback_error.kind(),
+                            cleanup_error.kind(),
                             format!(
                                 "failed to remove parser backup '{}': {cleanup_error}; failed to restore backup: {rollback_error}",
                                 backup_file.display()
@@ -75,7 +75,7 @@ fn publish_parser_transactionally(
             match ops.rename(backup_file, parser_file) {
                 Ok(()) => Err(publish_error),
                 Err(rollback_error) => Err(std::io::Error::new(
-                    rollback_error.kind(),
+                    publish_error.kind(),
                     format!(
                         "failed to publish parser: {publish_error}; failed to restore backup '{}': {rollback_error}",
                         backup_file.display()
@@ -1172,6 +1172,7 @@ mod tests {
     struct FakeParserFileOps {
         files: HashMap<PathBuf, &'static str>,
         failed_renames: Vec<(PathBuf, PathBuf)>,
+        rollback_error_kind: Option<std::io::ErrorKind>,
         failed_removals: Vec<PathBuf>,
     }
 
@@ -1183,7 +1184,9 @@ mod tests {
                 .any(|(fail_from, fail_to)| fail_from == from && fail_to == to)
             {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
+                    self.rollback_error_kind
+                        .filter(|_| from.extension().is_some_and(|ext| ext == "backup"))
+                        .unwrap_or(std::io::ErrorKind::PermissionDenied),
                     "injected publish failure",
                 ));
             }
@@ -1261,6 +1264,24 @@ mod tests {
         assert_eq!(ops.files.get(&backup), Some(&"old"));
         assert_eq!(ops.files.get(&tmp), Some(&"new"));
         assert!(!ops.files.contains_key(&parser));
+    }
+
+    #[test]
+    fn transactional_publish_reports_primary_error_kind_when_rollback_differs() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.failed_renames.push((tmp.clone(), parser.clone()));
+        ops.failed_renames.push((backup.clone(), parser.clone()));
+        ops.rollback_error_kind = Some(std::io::ErrorKind::NotFound);
+
+        let error = publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("publish and rollback failures must be reported");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
