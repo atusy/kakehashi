@@ -94,6 +94,7 @@ pub(crate) async fn handle_semantic_tokens_full(
 ) -> Option<SemanticTokensResult> {
     pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
+        let compute_started = std::time::Instant::now();
         let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
         let line_starts = build_line_start_bytes(&text);
@@ -195,18 +196,21 @@ pub(crate) async fn handle_semantic_tokens_full(
             cancel.as_ref(),
         );
         let finalize_elapsed = finalize_start.elapsed();
+        let compute_elapsed = compute_started.elapsed();
         if is_cancelled() {
             return None;
         }
 
-        // One developer-only event per completed compute keeps the phases
-        // comparable without adding hot-loop logging or operator noise.
+        // Host/injection durations overlap when `parallel=true`, so `compute`
+        // is the authoritative wall time; branch durations must not be summed.
         log::debug!(
             target: "kakehashi::semantic",
-            "[SEMANTIC_TOKENS] compute phases: host={}ms injections={}ms finalize={}ms regions_reused={}",
+            "[SEMANTIC_TOKENS] compute phases: compute={}ms host={}ms injections={}ms finalize={}ms parallel={} regions_reused={}",
+            compute_elapsed.as_millis(),
             host_elapsed.as_millis(),
             injections_elapsed.as_millis(),
             finalize_elapsed.as_millis(),
+            should_parallelize,
             injection_cache
                 .as_ref()
                 // The same generation gate the reuse path applies: a
