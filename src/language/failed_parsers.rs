@@ -84,9 +84,6 @@ impl FailedParserRegistry {
         // Ensure state directory exists
         fs::create_dir_all(&self.state_dir)?;
 
-        // Load previously failed parsers
-        self.load_failed_parsers()?;
-
         // Serialize recovery scanning with marker creation. Otherwise a peer
         // could observe a newly-created marker before its owner locks it and
         // misclassify the live session as crashed.
@@ -97,6 +94,11 @@ impl FailedParserRegistry {
             .write(true)
             .open(self.state_dir.join("crash_recovery.lock"))?;
         init_lock.lock_exclusive()?;
+
+        // Load only after acquiring the cross-process lock. A peer may have
+        // recovered another marker while this process waited; loading earlier
+        // would let our later save overwrite and forget that quarantine.
+        self.load_failed_parsers()?;
 
         // Recover the legacy single marker written by older versions.
         let parsing_state = self.parsing_state_path();
@@ -437,6 +439,26 @@ mod tests {
             "a live peer's active parser must not be quarantined"
         );
         first.end_parsing_language("lua").unwrap();
+    }
+
+    #[test]
+    fn test_recovery_preserves_failures_recorded_by_a_peer() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("failed_parsers"), "lua").unwrap();
+        fs::write(
+            temp.path().join(format!("{PARSING_MARKER_PREFIX}stale")),
+            "rust",
+        )
+        .unwrap();
+
+        let registry = FailedParserRegistry::new(temp.path());
+        registry.init().unwrap();
+
+        assert!(registry.is_failed("lua"));
+        assert!(registry.is_failed("rust"));
+        let persisted = fs::read_to_string(temp.path().join("failed_parsers")).unwrap();
+        assert!(persisted.lines().any(|language| language == "lua"));
+        assert!(persisted.lines().any(|language| language == "rust"));
     }
 
     #[test]
