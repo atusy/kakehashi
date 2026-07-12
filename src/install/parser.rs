@@ -256,8 +256,14 @@ fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
             let _ = CloseHandle(job);
             return Err(ParserInstallError::IoError(error));
         }
-        // Deliberately retain the raw handle until process teardown. Closing it
-        // then atomically terminates any compiler descendants still in the job.
+        // The thread exclusively owns the successful job handle. Closing it at
+        // the same deadline as the Unix watchdog atomically terminates this
+        // subprocess and any compiler descendants still assigned to the job.
+        let job = job as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(PARSER_COMPILE_TIMEOUT + Duration::from_secs(30));
+            let _ = CloseHandle(job as _);
+        });
     }
     Ok(())
 }
