@@ -25,6 +25,19 @@ use tower_lsp_server::LspService;
 use crate::cli::files::collect_files;
 use crate::lsp::Kakehashi;
 
+/// Write one diagnostic line without turning a closed stderr pipe into panic
+/// exit 101. Format mode deliberately ignores SIGPIPE so every stderr write
+/// must tolerate `BrokenPipe`, just like its stdout path does.
+fn write_line_lossy(mut writer: impl std::io::Write, args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{args}");
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        write_line_lossy(std::io::stderr(), format_args!($($arg)*))
+    };
+}
+
 /// Options for the `format` subcommand, mirroring its CLI flags.
 pub struct FormatOptions {
     /// Files or directories to format. With `--stdin-filename`, must be
@@ -347,4 +360,26 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
         let _ = dir_handle.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn diagnostic_write_tolerates_closed_stderr() {
+        write_line_lossy(ClosedPipe, format_args!("initialization failed"));
+    }
 }
