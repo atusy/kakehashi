@@ -729,7 +729,7 @@ impl LanguageServerPool {
         // I/O, so release the per-connection ordering guards before starting it.
         drop(_ordering_guards);
 
-        let cleanup = spawn_invalidated_connection_cleanup(
+        spawn_invalidated_connection_cleanup(
             connections,
             Arc::clone(&self.connections),
             invalidated,
@@ -737,12 +737,6 @@ impl LanguageServerPool {
             Arc::clone(&self.document_tracker),
             Arc::clone(&self.open_transition_locks),
         );
-        if let Err(error) = cleanup.await {
-            log::error!(
-                target: "kakehashi::bridge",
-                "workspace-folder connection cleanup task failed: {error}"
-            );
-        }
     }
 
     /// Set the upstream client capabilities.
@@ -3286,7 +3280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_upstream_folder_change_finishes_owned_connection_cleanup() {
+    async fn upstream_folder_change_detaches_owned_connection_cleanup() {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("lua");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
@@ -3308,8 +3302,10 @@ mod tests {
         })
         .await
         .expect("owned cleanup must mark the stale handle before its first await");
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("workspace-folder handling must not wait for connection cleanup")
+            .unwrap();
         drop(host_documents);
 
         tokio::time::timeout(Duration::from_secs(4), async {
