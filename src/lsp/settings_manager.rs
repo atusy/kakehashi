@@ -210,10 +210,10 @@ impl SettingsManager {
         for path in paths.iter() {
             if !settings.search_paths.contains(path) {
                 settings.search_paths.push(path.clone());
-            }
-            let raw_paths = raw_settings.search_paths.get_or_insert_with(Vec::new);
-            if !raw_paths.contains(path) {
-                raw_paths.push(path.clone());
+                let raw_paths = raw_settings.search_paths.get_or_insert_with(Vec::new);
+                if !raw_paths.contains(path) {
+                    raw_paths.push(path.clone());
+                }
             }
         }
     }
@@ -631,6 +631,33 @@ mod tests {
         assert_eq!(
             effective_settings.search_paths,
             vec!["/runtime".to_string(), "/installed".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_installed_search_path_does_not_duplicate_expanded_raw_path() {
+        let manager = SettingsManager::new();
+        manager.record_installed_search_path(std::path::Path::new("/installed"));
+
+        let mut raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["${DATA_DIR}".to_string()]),
+            ..Default::default()
+        };
+        let mut effective_settings =
+            WorkspaceSettings::try_from_settings(&raw_settings, None, |var| {
+                (var == "DATA_DIR").then(|| "/installed".to_string())
+            })
+            .unwrap();
+
+        manager.apply_installed_search_paths(&mut raw_settings, &mut effective_settings);
+
+        assert_eq!(
+            raw_settings.search_paths,
+            Some(vec!["${DATA_DIR}".to_string()])
+        );
+        assert_eq!(
+            effective_settings.search_paths,
+            vec!["/installed".to_string()]
         );
     }
 
