@@ -160,6 +160,13 @@ pub(crate) fn parse_initialize_response_capabilities(
         ));
     };
 
+    let result = result.as_object().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bridge: invalid initialize result: expected an object",
+        )
+    })?;
+
     validate_utf16_encoding(
         result
             .get("capabilities")
@@ -167,7 +174,6 @@ pub(crate) fn parse_initialize_response_capabilities(
         "capabilities.positionEncoding",
     )?;
     validate_utf16_encoding(result.get("offsetEncoding"), "offsetEncoding")?;
-
     let capabilities = result
         .get("capabilities")
         .filter(|capabilities| !capabilities.is_null());
@@ -496,6 +502,19 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("initialize capabilities"));
+    }
+
+    #[rstest]
+    #[case::scalar(serde_json::json!(42))]
+    #[case::array(serde_json::json!([]))]
+    fn validate_rejects_non_object_result(#[case] result: serde_json::Value) {
+        let response = serde_json::json!({ "result": result });
+
+        let error = parse_initialize_response_capabilities(&response)
+            .expect_err("initialize result must be an object");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("initialize result"));
     }
 
     #[rstest]
