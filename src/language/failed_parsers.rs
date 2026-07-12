@@ -31,6 +31,8 @@ pub(crate) struct FailedParserRegistry {
     /// Per-language parsing counts for concurrent crash detection
     /// Key: language name, Value: number of concurrent parses
     parsing_counts: Arc<DashMap<String, usize>>,
+    /// Serializes count transitions with their durable marker update.
+    persistence_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl FailedParserRegistry {
@@ -40,6 +42,7 @@ impl FailedParserRegistry {
             failed: Arc::new(DashSet::new()),
             state_dir: state_dir.to_path_buf(),
             parsing_counts: Arc::new(DashMap::new()),
+            persistence_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -123,23 +126,31 @@ impl FailedParserRegistry {
 
     /// Record that parsing is starting for a language.
     ///
-    /// This updates in-memory state only. Crash detection happens by checking
-    /// this state on restart (via init()).
+    /// The durable marker is updated before returning, so an uncatchable crash
+    /// in the native parser still leaves recovery evidence for the next run.
     ///
     /// Supports concurrent parsing by tracking a counter per language.
     pub fn begin_parsing(&self, language: &str) -> io::Result<()> {
+        let _guard = self
+            .persistence_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Increment the parsing count for this language
         self.parsing_counts
             .entry(language.to_string())
             .and_modify(|count| *count += 1)
             .or_insert(1);
-        Ok(())
+        self.persist_current_state()
     }
 
     /// Record that parsing completed successfully for a language.
     ///
-    /// This clears in-memory state only (no disk I/O).
+    /// This updates or clears the durable marker after the in-memory count.
     pub fn end_parsing_language(&self, language: &str) -> io::Result<()> {
+        let _guard = self
+            .persistence_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Decrement the parsing count for this language
         if let Some(mut entry) = self.parsing_counts.get_mut(language) {
             *entry -= 1;
@@ -149,7 +160,7 @@ impl FailedParserRegistry {
                 self.parsing_counts.remove(language);
             }
         }
-        Ok(())
+        self.persist_current_state()
     }
 
     /// Persist current parsing state to disk.
@@ -158,6 +169,14 @@ impl FailedParserRegistry {
     /// across process restarts. If parsers are currently being parsed, write
     /// their names to the parsing_in_progress file (one per line).
     pub fn persist_state(&self) -> io::Result<()> {
+        let _guard = self
+            .persistence_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.persist_current_state()
+    }
+
+    fn persist_current_state(&self) -> io::Result<()> {
         let parsing_languages: Vec<String> = self
             .parsing_counts
             .iter()
@@ -167,6 +186,12 @@ impl FailedParserRegistry {
         if !parsing_languages.is_empty() {
             fs::create_dir_all(&self.state_dir)?;
             fs::write(self.parsing_state_path(), parsing_languages.join("\n"))?;
+        } else {
+            match fs::remove_file(self.parsing_state_path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -270,6 +295,27 @@ mod tests {
     }
 
     #[test]
+    fn test_crash_detection_does_not_require_shutdown_persistence() {
+        let temp = tempdir().unwrap();
+
+        {
+            let registry = FailedParserRegistry::new(temp.path());
+            registry.init().unwrap();
+            registry.begin_parsing("lua").unwrap();
+            // Simulate an uncatchable parser crash: neither normal parse cleanup
+            // nor the process lifecycle's graceful-shutdown hook can run.
+        }
+
+        let restarted = FailedParserRegistry::new(temp.path());
+        restarted.init().unwrap();
+
+        assert!(
+            restarted.is_failed("lua"),
+            "an active parser must be recoverable without graceful shutdown"
+        );
+    }
+
+    #[test]
     fn test_successful_parsing_does_not_mark_failed() {
         let temp = tempdir().unwrap();
 
@@ -340,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn test_begin_parsing_does_not_write_to_disk() {
+    fn test_begin_parsing_writes_crash_marker() {
         let temp = tempdir().unwrap();
         let registry = FailedParserRegistry::new(temp.path());
         registry.init().unwrap();
@@ -348,12 +394,11 @@ mod tests {
         // Call begin_parsing
         registry.begin_parsing("lua").unwrap();
 
-        // Verify that parsing_in_progress file does NOT exist
-        // (begin_parsing should only update in-memory state)
+        // Verify that crash evidence is durable before native parsing begins.
         let parsing_state_path = temp.path().join("parsing_in_progress");
         assert!(
-            !parsing_state_path.exists(),
-            "begin_parsing should not write parsing_in_progress file to disk"
+            parsing_state_path.exists(),
+            "begin_parsing should write parsing_in_progress to disk"
         );
 
         // Verify that in-memory state is updated (we'll add accessor for this)
@@ -365,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn test_end_parsing_only_clears_memory() {
+    fn test_end_parsing_clears_crash_marker() {
         let temp = tempdir().unwrap();
         let registry = FailedParserRegistry::new(temp.path());
         registry.init().unwrap();
@@ -387,11 +432,11 @@ mod tests {
             "end_parsing_language should clear in-memory state"
         );
 
-        // Verify no disk I/O happened
+        // Successful completion removes the recovery evidence.
         let parsing_state_path = temp.path().join("parsing_in_progress");
         assert!(
             !parsing_state_path.exists(),
-            "end_parsing_language should not create or modify files"
+            "end_parsing_language should remove the crash marker"
         );
     }
 
