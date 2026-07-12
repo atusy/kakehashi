@@ -82,16 +82,29 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
         None => return Ok(None), // No home directory, silently ignore
     };
 
-    // Check if file exists
-    if !path.exists() {
-        return Ok(None); // Missing file is silently ignored (zero-config)
-    }
-
-    // Read and parse the file
-    let contents = std::fs::read_to_string(&path).map_err(|e| UserConfigError::IoError {
-        path: path.clone(),
-        source: e,
-    })?;
+    // Read first so permission and metadata errors are not collapsed into
+    // "missing" by Path::exists(). A dangling symlink also reports NotFound
+    // when followed, so lstat it before accepting the zero-config case.
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&path) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(metadata_error) => {
+                    return Err(UserConfigError::IoError {
+                        path,
+                        source: metadata_error,
+                    });
+                }
+                Ok(_) => return Err(UserConfigError::IoError { path, source }),
+            }
+        }
+        Err(source) => {
+            return Err(UserConfigError::IoError { path, source });
+        }
+    };
 
     let uses_deprecated_root_markers =
         crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
@@ -274,6 +287,37 @@ mod tests {
         assert!(
             result.unwrap().is_none(),
             "load_user_config should return None when config file is missing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(xdg_env)]
+    fn load_user_config_reports_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let original = env::var("XDG_CONFIG_HOME").ok();
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let config_dir = temp_dir.path().join("kakehashi");
+        std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+        symlink("missing.toml", config_dir.join("kakehashi.toml"))
+            .expect("failed to create dangling config symlink");
+
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME.
+        unsafe { env::set_var("XDG_CONFIG_HOME", temp_dir.path()) };
+        let result = load_user_config();
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME.
+        unsafe {
+            match original {
+                Some(value) => env::set_var("XDG_CONFIG_HOME", value),
+                None => env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            matches!(result, Err(UserConfigError::IoError { .. })),
+            "a configured but broken path must not be treated as absent: {result:?}"
         );
     }
 
