@@ -27,18 +27,20 @@ impl LanguageServerPool {
 
     /// Graceful shutdown of every downstream connection (ls-bridge-graceful-shutdown), parallel,
     /// under the default 10s `GlobalShutdownTimeout` (ls-bridge-timeout-hierarchy). Per-state:
-    /// Ready/Initializing run the LSP shutdown handshake, Failed jumps straight
-    /// to Closed (stdin is gone), Closing/Closed are skipped. Concurrent calls
-    /// are safe (state machine is monotonic) but only the first does real work.
+    /// Ready/Initializing start the LSP shutdown handshake, while Closing joins
+    /// the handshake already owned by another task. Failed jumps straight to
+    /// Closed (stdin is gone), and Closed is skipped. Concurrent calls are safe
+    /// because shutdown ownership is coordinated by the monotonic state machine.
     pub(crate) async fn shutdown_all(&self) {
         self.shutdown_all_with_timeout(GlobalShutdownTimeout::default())
             .await;
     }
 
     /// Parallel graceful shutdown under a single global ceiling (ls-bridge-graceful-shutdown).
-    /// Ready/Initializing connections run the LSP shutdown in parallel; Failed
-    /// ones jump straight to Closed. When `timeout` elapses, survivors are
-    /// force-killed (SIGTERM→SIGKILL on Unix) and all enter Closed.
+    /// Ready/Initializing connections start the LSP shutdown in parallel, while
+    /// Closing connections join an already-owned shutdown; Failed ones jump
+    /// straight to Closed. When `timeout` elapses, survivors are force-killed
+    /// (SIGTERM→SIGKILL on Unix) and all enter Closed.
     pub(crate) async fn shutdown_all_with_timeout(&self, timeout: GlobalShutdownTimeout) {
         // Close the new-spawn window FIRST, before snapshotting connections below:
         // a late eager spawn that acquires the `connections` lock after this point
