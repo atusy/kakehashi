@@ -200,9 +200,19 @@ fn open_windows_staging_guard(path: &Path) -> Result<fs::File, ParserInstallErro
 ///
 /// On a normal/quick compile the process exits first and the watchdog thread or
 /// Windows job is torn down with it; the grace margin keeps the parent's
-/// deadline the usual trigger. The subcommand entry (`src/bin/main.rs`) calls
-/// this before compiling.
-pub fn arm_compile_watchdog() -> Result<(), ParserInstallError> {
+/// deadline the usual trigger.
+///
+/// This infallible entry point preserves the public API used before Windows
+/// support. The internal compile subcommand uses [`try_arm_compile_watchdog`]
+/// so a Windows setup failure is surfaced instead of silently weakening its
+/// process-tree deadline.
+pub fn arm_compile_watchdog() {
+    let _ = try_arm_compile_watchdog();
+}
+
+/// Arm the compile watchdog and surface platform setup failures.
+#[doc(hidden)]
+pub fn try_arm_compile_watchdog() -> Result<(), ParserInstallError> {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, killpg};
