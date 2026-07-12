@@ -744,10 +744,23 @@ fn run_language_uninstall(
         }
         Some(language)
     };
+    // Bulk discovery must be exclusive to avoid observing install renames,
+    // but never make installers wait while the command is awaiting consent.
+    // The authoritative locked snapshot below determines the actual set.
+    if all && !force {
+        eprint!("Uninstall all currently installed languages? [y/N] ");
+        io::stderr().flush().unwrap();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("Cancelled.");
+            return Ok(());
+        }
+    }
     // Discovery and recovery may mutate stranded query state, so even the
     // preliminary snapshot participates in the operation protocol. A short
     // exclusive phase prevents strict recursive scans from observing install
-    // renames mid-flight. Release it before asking for input.
+    // renames mid-flight. Interactive bulk consent was obtained above.
     let preliminary_lock = kakehashi::install::operation_lock::LanguageOperationGuard::exclusive(
         &data_dir,
     )
@@ -808,21 +821,8 @@ fn run_language_uninstall(
     }
 
     // Confirmation prompt unless --force
-    if !force {
-        if all {
-            if languages_to_uninstall.is_empty() {
-                // The exclusive post-confirmation snapshot may still find an
-                // install that begins after this preliminary empty snapshot.
-                eprint!("Uninstall all currently installed languages? [y/N] ");
-            } else {
-                eprint!(
-                    "Uninstall all {} languages? [y/N] ",
-                    languages_to_uninstall.len()
-                );
-            }
-        } else if !all {
-            eprint!("Uninstall '{}'? [y/N] ", languages_to_uninstall[0]);
-        }
+    if !force && !all {
+        eprint!("Uninstall '{}'? [y/N] ", languages_to_uninstall[0]);
         io::stderr().flush().unwrap();
 
         let mut input = String::new();
