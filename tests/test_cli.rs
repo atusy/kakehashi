@@ -957,9 +957,10 @@ fn test_language_status_fails_when_query_recovery_fails() {
         stderr.contains("failed to recover interrupted query installs"),
         "stderr: {stderr}"
     );
+    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr);
     assert!(
-        !stderr.contains("No languages installed"),
-        "status must not report an empty install after recovery failed: {stderr}"
+        !combined.contains("No languages installed"),
+        "status must not report an empty install after recovery failed: {combined}"
     );
 }
 
