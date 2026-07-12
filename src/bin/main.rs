@@ -627,6 +627,37 @@ fn collect_installed_languages_for_uninstall(
     Ok(languages)
 }
 
+fn preflight_targeted_query_state(queries_dir: &Path, language: &str) -> Result<(), String> {
+    let Some(entries) = read_optional_install_dir(queries_dir, "queries")? else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!(
+                "cannot read an entry in queries directory '{}': {e}",
+                queries_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or_default();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
+        let is_target = name == language;
+        if is_target && !(file_type.is_dir() || file_type.is_symlink()) {
+            return Err(format!(
+                "query entry '{}' is not a directory or symlink",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() && (is_target || queries::is_recovery_directory_name(name)) {
+            preflight_query_install_tree(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Run the language uninstall command
 fn run_language_uninstall(
     language: Option<String>,
@@ -656,12 +687,17 @@ fn run_language_uninstall(
         // Targeted uninstall does not need to enumerate every entry, but it
         // still builds removal paths beneath both roots. Reject a symlinked or
         // non-directory root before recovery/removal can escape data_dir.
-        for (path, kind) in [(&parser_dir, "parser"), (&queries_dir, "queries")] {
-            read_optional_install_dir(path, kind).map_err(|e| {
-                eprintln!("Failed to validate install roots: {e}");
-                ExitCode::FAILURE
-            })?;
-        }
+        read_optional_install_dir(&parser_dir, "parser").map_err(|e| {
+            eprintln!("Failed to validate install roots: {e}");
+            ExitCode::FAILURE
+        })?;
+        let language = language
+            .as_deref()
+            .expect("targeted uninstall has a language");
+        preflight_targeted_query_state(&queries_dir, language).map_err(|e| {
+            eprintln!("Failed to preflight targeted query state: {e}");
+            ExitCode::FAILURE
+        })?;
     }
     if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
         if all {

@@ -1695,6 +1695,53 @@ fn test_language_uninstall_all_preflights_query_contents_before_parser_removal()
 
 #[cfg(unix)]
 #[test]
+fn test_language_uninstall_preflights_target_query_contents() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let query_dir = test_dir.path().join("queries/lua");
+    let nested = query_dir.join("nested");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&nested).expect("Failed to create nested query dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    fs::write(nested.join("query.scm"), "(comment) @comment")
+        .expect("Failed to write nested query");
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make nested query unreadable");
+    if fs::read_dir(&nested).is_ok() {
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore nested query permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore nested query permissions");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "unreadable target tree must fail");
+    assert!(
+        stderr.contains("Failed to preflight targeted query state"),
+        "failure must occur during preflight, before removal: {stderr}"
+    );
+    assert!(parser.exists(), "preflight failure must preserve parser");
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_uninstall_all_query_removal_failure_preserves_parser() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
