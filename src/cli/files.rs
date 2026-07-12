@@ -66,10 +66,15 @@ pub(crate) fn collect_files(
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
         let path = normalize_path(base, path);
-        let metadata = std::fs::metadata(&path)
+        let link_metadata = std::fs::symlink_metadata(&path)
             .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
-        let is_symlink = std::fs::symlink_metadata(&path)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        let is_symlink = link_metadata.file_type().is_symlink();
+        let metadata = if is_symlink {
+            std::fs::metadata(&path)
+                .map_err(|e| format!("cannot access '{}': {e}", path.display()))?
+        } else {
+            link_metadata
+        };
         if metadata.is_dir() {
             if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;
