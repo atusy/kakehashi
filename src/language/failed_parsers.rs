@@ -140,10 +140,15 @@ impl FailedParserRegistry {
             let entry = entry?;
             let name = entry.file_name();
             if name.to_string_lossy().starts_with(NEXT_MARKER_PREFIX) {
-                let file = fs::OpenOptions::new()
+                let file = match fs::OpenOptions::new()
                     .read(true)
                     .write(true)
-                    .open(entry.path())?;
+                    .open(entry.path())
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
                 match file.try_lock_exclusive() {
                     Ok(()) => {
                         drop(file);
@@ -157,10 +162,15 @@ impl FailedParserRegistry {
             if !name.to_string_lossy().starts_with(PARSING_MARKER_PREFIX) {
                 continue;
             }
-            let mut file = fs::OpenOptions::new()
+            let mut file = match fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(entry.path())?;
+                .open(entry.path())
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             match file.try_lock_exclusive() {
                 Ok(()) => {
                     let mut content = String::new();
@@ -275,7 +285,14 @@ impl FailedParserRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.decrement_parsing_count(language);
-        self.persist_current_state()
+        if let Err(error) = self.persist_current_state() {
+            self.parsing_counts
+                .entry(language.to_string())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn decrement_parsing_count(&self, language: &str) {
@@ -322,6 +339,16 @@ impl FailedParserRegistry {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Retry bounded cleanup of previously unremovable marker handles on
+        // every state transition instead of allowing the retired set to grow.
+        current.retired.retain_mut(|(path, file)| {
+            if file.set_len(0).is_err() {
+                return true;
+            }
+            let _ = fs::remove_file(path);
+            false
+        });
 
         // Build a replacement inode without touching the currently locked
         // marker. Any create/write failure therefore leaves the prior
