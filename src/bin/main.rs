@@ -483,14 +483,39 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
+fn collect_installed_languages(parser_dir: &Path, queries_dir: &Path) -> Vec<String> {
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    let mut languages = BTreeSet::new();
+    if let Ok(entries) = fs::read_dir(parser_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_parser = path
+                .extension()
+                .map(|ext| ext == std::env::consts::DLL_EXTENSION)
+                .unwrap_or(false);
+            if is_parser && let Some(stem) = path.file_stem() {
+                languages.insert(stem.to_string_lossy().to_string());
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(queries_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = installed_query_language_name(&entry.path()) {
+                languages.insert(name);
+            }
+        }
+    }
+    languages.into_iter().collect()
+}
+
 /// Run the language uninstall command
 fn run_language_uninstall(
     language: Option<String>,
     force: bool,
     all: bool,
 ) -> Result<(), ExitCode> {
-    use std::collections::BTreeSet;
-    use std::fs;
     use std::io::{self, Write};
 
     let data_dir = default_data_dir().ok_or_else(|| {
@@ -501,9 +526,9 @@ fn run_language_uninstall(
     // Acquire before discovery: an install that is still compiling has no
     // parser/query artifact to enumerate. Waiting for every active language
     // operation makes its publication visible before the --all snapshot, and
-    // retaining the lock through confirmation prevents a new language from
-    // appearing outside that snapshot before removal completes.
-    let _all_operations_lock = if all {
+    // retaining the lock through removal prevents a new language from
+    // appearing outside that snapshot before the command completes.
+    let mut all_operations_lock = if all {
         Some(
             AllLanguageOperationsLockGuard::acquire(&data_dir).map_err(|error| {
                 eprintln!("Error: failed to lock uninstall --all: {error}");
@@ -521,32 +546,8 @@ fn run_language_uninstall(
     }
 
     // Determine which languages to uninstall
-    let languages_to_uninstall: Vec<String> = if all {
-        // Collect all installed languages
-        let mut languages = BTreeSet::new();
-
-        if let Ok(entries) = fs::read_dir(&parser_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_parser = path
-                    .extension()
-                    .map(|ext| ext == std::env::consts::DLL_EXTENSION)
-                    .unwrap_or(false);
-                if is_parser && let Some(stem) = path.file_stem() {
-                    languages.insert(stem.to_string_lossy().to_string());
-                }
-            }
-        }
-
-        if let Ok(entries) = fs::read_dir(&queries_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = installed_query_language_name(&entry.path()) {
-                    languages.insert(name);
-                }
-            }
-        }
-
-        languages.into_iter().collect()
+    let mut languages_to_uninstall = if all {
+        collect_installed_languages(&parser_dir, &queries_dir)
     } else {
         vec![language.expect("language required when --all not specified")]
     };
@@ -556,18 +557,48 @@ fn run_language_uninstall(
         return Ok(());
     }
 
-    // Confirmation prompt unless --force
-    if !force {
-        if all {
+    // Confirmation prompt unless --force. Do not hold the global lock while
+    // waiting for input; if the installed set changes, reacquire, rediscover,
+    // and ask again so the displayed count remains the exact removal set.
+    if !force && all {
+        loop {
+            drop(all_operations_lock.take());
             eprint!(
                 "Uninstall all {} languages? [y/N] ",
                 languages_to_uninstall.len()
             );
-        } else {
-            eprint!("Uninstall '{}'? [y/N] ", languages_to_uninstall[0]);
-        }
-        io::stderr().flush().unwrap();
+            io::stderr().flush().unwrap();
 
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y")
+            {
+                eprintln!("Cancelled.");
+                return Ok(());
+            }
+
+            all_operations_lock = Some(
+                AllLanguageOperationsLockGuard::acquire(&data_dir).map_err(|error| {
+                    eprintln!("Error: failed to lock uninstall --all: {error}");
+                    ExitCode::FAILURE
+                })?,
+            );
+            if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+                eprintln!("Warning: failed to recover interrupted query installs: {e}");
+            }
+            let refreshed = collect_installed_languages(&parser_dir, &queries_dir);
+            if refreshed == languages_to_uninstall {
+                break;
+            }
+            languages_to_uninstall = refreshed;
+            if languages_to_uninstall.is_empty() {
+                eprintln!("No languages installed to uninstall.");
+                return Ok(());
+            }
+            eprintln!("Installed languages changed while awaiting confirmation; retrying.");
+        }
+    } else if !force {
+        eprint!("Uninstall '{}'? [y/N] ", languages_to_uninstall[0]);
+        io::stderr().flush().unwrap();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
             eprintln!("Cancelled.");
