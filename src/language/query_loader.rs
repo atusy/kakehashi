@@ -67,6 +67,14 @@ pub(crate) struct ParseResult {
     pub used_inheritance: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QueryLoadError {
+    #[error("query file not found")]
+    NotFound,
+    #[error(transparent)]
+    Other(#[from] LspError),
+}
+
 /// Format search paths for display in error messages.
 pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
     if paths.is_empty() {
@@ -367,9 +375,18 @@ impl QueryLoader {
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
-    ) -> LspResult<ParseResult> {
+    ) -> Result<ParseResult, QueryLoadError> {
         // Load the original file once and pass to resolver to avoid double-loading
-        let original_content = Self::load_query_file(runtime_bases, lang_name, file_name)?;
+        let Some(path) = Self::find_query_file(runtime_bases, lang_name, file_name) else {
+            return Err(QueryLoadError::NotFound);
+        };
+        let original_content = fs::read_to_string(&path).map_err(|e| {
+            LspError::query(format!(
+                "Failed to read query file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
         let used_inheritance = !Self::parse_inherits_directive(&original_content).is_empty();
 
         let mut visited = std::collections::HashSet::new();
