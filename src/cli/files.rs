@@ -109,7 +109,7 @@ pub(crate) fn collect_files(
             files.push(path);
         } else {
             return Err(format!(
-                "cannot access '{}': path is not a regular file or directory",
+                "unsupported path '{}': not a regular file or directory",
                 path.display()
             ));
         }
@@ -456,7 +456,11 @@ mod tests {
 
         let result = collect_files(tmp.path(), &[socket], &[], &markdown_only);
 
-        assert!(result.is_err());
+        let error = match result {
+            Ok(_) => panic!("special file must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("unsupported path '"), "{error}");
     }
 
     #[cfg(unix)]
