@@ -284,13 +284,13 @@ pub fn install_parser(
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
-    fs::create_dir_all(&parser_dir)?;
-    cleanup_interrupted_parser_installs(&parser_dir)?;
-
     // Check if parser already exists
     if parser_file.exists() && !options.force {
         return Err(ParserInstallError::AlreadyExists(parser_file));
     }
+
+    fs::create_dir_all(&parser_dir)?;
+    cleanup_interrupted_parser_installs(&parser_dir)?;
 
     // Fetch metadata (with caching support)
     if options.verbose {
@@ -1328,6 +1328,36 @@ mod tests {
             "staging-shaped symlink is preserved"
         );
         assert_eq!(fs::read(&target).expect("read target"), b"user data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_parser_returns_before_stale_cleanup() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let installed = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        fs::write(&installed, b"installed parser").expect("write installed parser");
+        let stale = parser_dir.join(format!(
+            ".json.{}.0.{}.tmp",
+            terminated_child_pid(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&stale, b"stale parser").expect("write stale parser");
+        let options = InstallOptions {
+            data_dir: temp.path().to_path_buf(),
+            force: false,
+            verbose: false,
+            no_cache: false,
+            compile: ParserCompile::InProcess,
+        };
+
+        let result = install_parser("lua", &options);
+
+        assert!(
+            matches!(result, Err(ParserInstallError::AlreadyExists(path)) if path == installed)
+        );
+        assert!(stale.exists(), "no cleanup runs for a rejected install");
     }
 
     const TREE_SITTER_JSON_URL: &str =
