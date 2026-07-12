@@ -229,6 +229,14 @@ fn parser_backup_marker_is_owned(marker: &Path) -> std::io::Result<bool> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself so a swap after `symlink_metadata`
+        // cannot redirect ownership validation outside the parser directory.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = match options.open(marker) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
