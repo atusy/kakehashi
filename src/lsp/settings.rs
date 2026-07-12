@@ -147,23 +147,13 @@ pub fn load_settings(
         event.kind == SettingsEventKind::Error
             && event.message.starts_with("Path expansion failed:")
     });
-    let settings = if layer_expansion_failed {
-        None
-    } else {
-        merged.and_then(
-            |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
-                Ok(ws) => Some(ws),
-                Err(errs) => {
-                    events.push(SettingsEvent::error(format!(
-                        "Path expansion failed: {errs}. \
-                     This configuration has been discarded; previous settings remain in effect. \
-                     Please correct the affected paths and environment variables or remove them from your config.",
-                    )));
-                    None
-                }
-            },
-        )
-    };
+    let settings = (!layer_expansion_failed)
+        .then(|| {
+            merged
+                .as_ref()
+                .map(WorkspaceSettings::from_expanded_settings)
+        })
+        .flatten();
 
     SettingsLoadOutcome {
         settings,
@@ -530,6 +520,37 @@ mod tests {
                 .path()
                 .join("queries/highlights.scm")
                 .to_string_lossy()
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn path_expansion_is_applied_once_before_anchoring() {
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let empty_user_config = TempDir::new().expect("failed to create user config temp dir");
+        let project_dir = TempDir::new().expect("failed to create project temp dir");
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", empty_user_config.path()) };
+        let outcome = load_settings(
+            Some(project_dir.path()),
+            Some((
+                SettingsSource::InitializationOptions,
+                serde_json::json!({ "searchPaths": ["$$assets"] }),
+            )),
+            None,
+            |_| None,
+        );
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe {
+            match original_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert_eq!(
+            outcome.settings.expect("settings should load").search_paths,
+            [project_dir.path().join("$assets").to_string_lossy()]
         );
     }
 

@@ -237,6 +237,14 @@ fn strip_inherited_aggregation_config(
 }
 
 impl WorkspaceSettings {
+    /// Convert settings whose path fields have already been expanded and
+    /// anchored by their source loader.
+    pub(crate) fn from_expanded_settings(settings: &RawWorkspaceSettings) -> Self {
+        let mut workspace = base_convert(settings);
+        workspace.languages = merge::resolve_base_configs(&workspace.languages);
+        workspace
+    }
+
     /// Convert `RawWorkspaceSettings` to `WorkspaceSettings`, expanding environment
     /// variables (`$VAR`, `${VAR}`) and tilde (`~`) in path fields.
     ///

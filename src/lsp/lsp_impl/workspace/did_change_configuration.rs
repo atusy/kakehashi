@@ -425,24 +425,9 @@ impl Kakehashi {
             return;
         };
 
-        match WorkspaceSettings::try_from_settings(
-            &merged_ts,
-            self.home_dir.as_deref(),
-            crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
-        ) {
-            Ok(settings) => {
-                self.apply_raw_settings(merged_ts, settings).await;
-                self.notifier().log_info("Configuration updated!").await;
-            }
-            Err(errs) => {
-                let event = crate::lsp::SettingsEvent::error(format!(
-                    "Path expansion failed: {errs}. \
-                     This configuration has been discarded; previous settings remain in effect. \
-                     Please correct the affected paths and environment variables or remove them from your config.",
-                ));
-                self.notifier().log_settings_events(&[event]).await;
-            }
-        }
+        let settings = WorkspaceSettings::from_expanded_settings(&merged_ts);
+        self.apply_raw_settings(merged_ts, settings).await;
+        self.notifier().log_info("Configuration updated!").await;
     }
 }
 
