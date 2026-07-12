@@ -2641,11 +2641,11 @@ impl LanguageServerPool {
         }
     }
 
-    /// Fan out `$/cancelRequest` to every server registered for `upstream_id`,
-    /// invoking `notify` after every `(connection, downstream ids)` target has
-    /// been captured and before any cancel is sent. Invoked by
-    /// `RequestIdCapture` (via `CancelForwarder::forward_cancel`) when the
-    /// client cancels.
+    /// Test-only compatibility wrapper that fans out `$/cancelRequest` to
+    /// every server registered for `upstream_id`, invoking `notify` after every
+    /// `(connection, downstream ids)` target has been captured and before any
+    /// cancel is sent. Production `RequestIdCapture` uses the generation-aware
+    /// [`Self::forward_cancel_by_upstream_id_if_current`] path instead.
     ///
     /// LSP cancel is best-effort, so we silently return `Ok(())` (rather than
     /// erroring) when: the ID is unknown, the connection is still initializing,
