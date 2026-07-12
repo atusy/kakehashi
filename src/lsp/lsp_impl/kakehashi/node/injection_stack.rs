@@ -475,9 +475,10 @@ pub(super) fn with_resolved_node_pair<R>(
 /// Collect the injection languages along the cursor's injection path at
 /// `byte`, at all depths that are currently parseable.
 ///
-/// Unlike a whole-document scan, this follows only the single smallest-
-/// containing injection at each level — exactly the path `injection_stack_at`
-/// would take — so its cost is O(depth at the cursor) rather than O(all
+/// Unlike a whole-document scan, this follows only the first viable candidate
+/// among the smallest-first containing injections at each level — exactly the
+/// path `injection_stack_at` would take — so its cost is O(depth at the cursor)
+/// rather than O(all
 /// injections in the document). That matters for large files with many code
 /// blocks: we only need grammars for the layers that actually wrap the cursor.
 ///
@@ -547,34 +548,41 @@ pub(super) fn collect_injection_languages_at(
             candidates.push((region, absolute_ranges));
         }
         candidates.sort_by_key(|(_, ranges)| total_span(ranges));
-        let Some((region, absolute_ranges)) = candidates.into_iter().next() else {
-            break;
-        };
+        let mut selected = None;
+        for (region, absolute_ranges) in candidates {
+            let content =
+                &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+            let Some((resolved_lang, _)) =
+                coordinator.resolve_injection_language(&region.language, content)
+            else {
+                continue;
+            };
+            languages.insert(resolved_lang.clone());
 
-        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
-        let Some((resolved_lang, _)) =
-            coordinator.resolve_injection_language(&region.language, content)
-        else {
+            // Stop at the first resolvable but unloaded candidate. The caller
+            // installs it and reruns this fixpoint step; only then can we know
+            // whether it parses and remains the smallest viable path.
+            let Some(language) = coordinator
+                .language_registry_for_parallel()
+                .get(&resolved_lang)
+            else {
+                break;
+            };
+            let Some(injected_tree) =
+                parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
+            else {
+                // Match `injection_stack_at`: an unavailable or transiently
+                // unparseable smallest candidate must not hide a later viable
+                // sibling at the same depth.
+                continue;
+            };
+            selected = Some((resolved_lang, injected_tree, absolute_ranges));
             break;
-        };
-        languages.insert(resolved_lang.clone());
+        }
 
-        // Descend only if the parser is loaded; otherwise stop and let the
-        // caller install it, then re-run for the next tier (fixpoint).
-        // `get` returns an owned `Language` (clones out, drops its DashMap ref
-        // internally), so no read guard spans the parse; fetched inline.
-        let Some(language) = coordinator
-            .language_registry_for_parallel()
-            .get(&resolved_lang)
-        else {
+        let Some((resolved_lang, injected_tree, absolute_ranges)) = selected else {
             break;
         };
-        let Some(injected_tree) =
-            parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
-        else {
-            break;
-        };
-
         current_tree = injected_tree;
         parent_ranges = absolute_ranges;
         current_lang = resolved_lang;
@@ -1002,6 +1010,57 @@ mod tests {
         };
 
         assert!(stack.missing_layer_is_ambiguous());
+    }
+
+    #[test]
+    fn language_discovery_skips_an_unresolvable_smaller_sibling() {
+        let query_root = tempfile::tempdir().expect("create query root");
+        let query_dir = query_root.path().join("queries/markdown");
+        std::fs::create_dir_all(&query_dir).expect("create markdown query dir");
+        std::fs::write(
+            query_dir.join("injections.scm"),
+            r#"
+            ((paragraph) @injection.content
+              (#set! injection.language "definitely_unknown_language")
+              (#set! injection.include-children))
+            ((section) @injection.content
+              (#set! injection.language "lua")
+              (#set! injection.include-children))
+            "#,
+        )
+        .expect("write fallback injection query");
+
+        let grammar_root = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| "deps/test/kakehashi".to_string());
+        let coordinator = LanguageCoordinator::new();
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                query_root.path().to_string_lossy().into_owned(),
+                grammar_root,
+            ],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("markdown").success);
+        assert!(
+            coordinator
+                .language_registry_for_parallel()
+                .get("lua")
+                .is_none(),
+            "fallback grammar starts unloaded"
+        );
+
+        let text = "# heading\n\nfallback here\n";
+        let mut pool = coordinator.create_document_parser_pool();
+        let mut parser = pool.acquire("markdown").expect("acquire markdown parser");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+        let byte = text.find("fallback").unwrap();
+
+        let languages = collect_injection_languages_at(&coordinator, "markdown", text, &tree, byte);
+
+        assert!(languages.contains("lua"));
+        assert!(!languages.contains("definitely_unknown_language"));
     }
 
     /// The stored layer trees must be exactly what the inline walk would
