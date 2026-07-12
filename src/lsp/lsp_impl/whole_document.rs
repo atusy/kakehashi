@@ -336,6 +336,7 @@ mod tests {
             LayerAggregationConfig {
                 priorities: Some(vec![LayerSource::Virt, LayerSource::Host]),
                 strategy: Some(AggregationStrategy::Concatenated),
+                min_publish_interval_ms: None,
             },
         );
         let mut languages = HashMap::new();

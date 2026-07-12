@@ -2113,6 +2113,7 @@ mod tests {
                         crate::config::settings::LayerAggregationConfig {
                             priorities: Some(vec![LayerSource::Native]),
                             strategy: None,
+                            min_publish_interval_ms: None,
                         },
                     )])),
                 }),
@@ -2147,6 +2148,7 @@ mod tests {
                         crate::config::settings::LayerAggregationConfig {
                             priorities: Some(vec![]),
                             strategy: None,
+                            min_publish_interval_ms: None,
                         },
                     )])),
                 }),

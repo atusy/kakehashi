@@ -771,6 +771,7 @@ print("hello")
             layer_cfg: ResolvedLayerConfig {
                 priorities: vec![LayerSource::Host],
                 strategy: AggregationStrategy::Concatenated,
+                min_publish_interval_ms: None,
             },
         };
         let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);
@@ -880,6 +881,7 @@ print("hello")
             layer_cfg: ResolvedLayerConfig {
                 priorities: vec![LayerSource::Host],
                 strategy: AggregationStrategy::Concatenated,
+                min_publish_interval_ms: None,
             },
         };
         let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);

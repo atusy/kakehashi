@@ -275,6 +275,9 @@ pub(crate) fn merge_layer_aggregation_configs(
             .clone()
             .or_else(|| base.priorities.clone()),
         strategy: overlay.strategy.or(base.strategy),
+        min_publish_interval_ms: overlay
+            .min_publish_interval_ms
+            .or(base.min_publish_interval_ms),
     }
 }
 
@@ -2597,10 +2600,12 @@ mod tests {
         let base = LayerAggregationConfig {
             priorities: Some(vec![LayerSource::Native]),
             strategy: Some(AggregationStrategy::Preferred),
+            min_publish_interval_ms: Some(1000),
         };
         let overlay = LayerAggregationConfig {
             priorities: Some(vec![LayerSource::Virt, LayerSource::Host]),
             strategy: None,
+            min_publish_interval_ms: None,
         };
         let merged = merge_layer_aggregation_configs(&base, &overlay);
         assert_eq!(
@@ -2612,6 +2617,11 @@ mod tests {
             merged.strategy,
             Some(AggregationStrategy::Preferred),
             "unset overlay strategy inherits from base"
+        );
+        assert_eq!(
+            merged.min_publish_interval_ms,
+            Some(1000),
+            "unset overlay interval inherits from base"
         );
     }
 
@@ -2626,6 +2636,7 @@ mod tests {
                         LayerAggregationConfig {
                             priorities: Some(vec![LayerSource::Native]),
                             strategy: Some(AggregationStrategy::Preferred),
+                            min_publish_interval_ms: Some(1000),
                         },
                     ),
                     (
@@ -2633,6 +2644,7 @@ mod tests {
                         LayerAggregationConfig {
                             priorities: Some(vec![LayerSource::Virt]),
                             strategy: None,
+                            min_publish_interval_ms: None,
                         },
                     ),
                 ])),
@@ -2646,6 +2658,7 @@ mod tests {
                     LayerAggregationConfig {
                         priorities: Some(vec![LayerSource::Host]),
                         strategy: None,
+                        min_publish_interval_ms: None,
                     },
                 )])),
             }),
@@ -2684,6 +2697,7 @@ mod tests {
                     LayerAggregationConfig {
                         priorities: Some(vec![LayerSource::Native]),
                         strategy: None,
+                        min_publish_interval_ms: None,
                     },
                 )])),
             }),

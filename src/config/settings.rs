@@ -168,6 +168,11 @@ pub struct LayerAggregationConfig {
     /// method combines with `preferred` regardless.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
+    /// Minimum interval between editor-facing `publishDiagnostics` sends, in
+    /// milliseconds. `None` uses the built-in default; `0` publishes every
+    /// changed merge without coalescing.
+    #[serde(default)]
+    pub min_publish_interval_ms: Option<u64>,
 }
 
 /// The built-in default layer priorities: virt, host, native — innermost first,
@@ -193,6 +198,7 @@ fn dedup_layer_priorities(priorities: Vec<LayerSource>) -> Vec<LayerSource> {
 pub(crate) struct ResolvedLayerConfig {
     pub(crate) priorities: Vec<LayerSource>,
     pub(crate) strategy: AggregationStrategy,
+    pub(crate) min_publish_interval_ms: Option<u64>,
 }
 
 impl ResolvedLayerConfig {
@@ -202,6 +208,7 @@ impl ResolvedLayerConfig {
         Self {
             priorities: default_layer_priorities(),
             strategy: default_layer_strategy_for_method(method),
+            min_publish_interval_ms: None,
         }
     }
 
@@ -701,6 +708,7 @@ impl LanguageSettings {
                 strategy: cfg
                     .strategy
                     .unwrap_or_else(|| default_layer_strategy_for_method(method)),
+                min_publish_interval_ms: cfg.min_publish_interval_ms,
             },
             None => ResolvedLayerConfig::with_defaults(method),
         }
@@ -2378,6 +2386,7 @@ kind = "locals""#;
                     LayerAggregationConfig {
                         priorities: Some(vec![LayerSource::Host, LayerSource::Virt]),
                         strategy: None,
+                        min_publish_interval_ms: None,
                     },
                 )])),
             }),
@@ -2395,6 +2404,31 @@ kind = "locals""#;
     }
 
     #[test]
+    fn layer_publish_interval_parses_camel_case_and_resolves() {
+        let config: LayerAggregationConfig = serde_json::from_value(serde_json::json!({
+            "minPublishIntervalMs": 250
+        }))
+        .unwrap();
+        assert_eq!(config.min_publish_interval_ms, Some(250));
+
+        let settings = LanguageSettings {
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([(
+                    "textDocument/publishDiagnostics".to_string(),
+                    config,
+                )])),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings
+                .resolve_layers("textDocument/publishDiagnostics")
+                .min_publish_interval_ms,
+            Some(250)
+        );
+    }
+
+    #[test]
     fn resolve_layers_method_entry_inherits_unset_fields_from_method_wildcard() {
         // Field-level wildcard merge: the method entry sets strategy only,
         // the "_" entry supplies order.
@@ -2406,6 +2440,7 @@ kind = "locals""#;
                         LayerAggregationConfig {
                             priorities: Some(vec![LayerSource::Native]),
                             strategy: None,
+                            min_publish_interval_ms: Some(750),
                         },
                     ),
                     (
@@ -2413,6 +2448,7 @@ kind = "locals""#;
                         LayerAggregationConfig {
                             priorities: None,
                             strategy: Some(AggregationStrategy::Concatenated),
+                            min_publish_interval_ms: None,
                         },
                     ),
                 ])),
@@ -2434,6 +2470,7 @@ kind = "locals""#;
                         LayerAggregationConfig {
                             priorities: Some(vec![LayerSource::Native, LayerSource::Host]),
                             strategy: None,
+                            min_publish_interval_ms: None,
                         },
                     ),
                     (
@@ -2441,6 +2478,7 @@ kind = "locals""#;
                         LayerAggregationConfig {
                             priorities: Some(vec![LayerSource::Virt]),
                             strategy: None,
+                            min_publish_interval_ms: None,
                         },
                     ),
                 ])),
@@ -2464,6 +2502,7 @@ kind = "locals""#;
                     LayerAggregationConfig {
                         priorities: Some(vec![]),
                         strategy: None,
+                        min_publish_interval_ms: None,
                     },
                 )])),
             }),
@@ -2487,6 +2526,7 @@ kind = "locals""#;
                             LayerSource::Virt,
                         ]),
                         strategy: None,
+                        min_publish_interval_ms: None,
                     },
                 )])),
             }),

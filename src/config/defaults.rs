@@ -82,6 +82,7 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                                 LayerSource::Native,
                             ]),
                             strategy: Some(AggregationStrategy::Preferred),
+                            min_publish_interval_ms: None,
                         },
                     ),
                     (
@@ -89,6 +90,7 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                         LayerAggregationConfig {
                             priorities: None,
                             strategy: Some(AggregationStrategy::Concatenated),
+                            min_publish_interval_ms: None,
                         },
                     ),
                     (
@@ -96,6 +98,7 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                         LayerAggregationConfig {
                             priorities: None,
                             strategy: Some(AggregationStrategy::Concatenated),
+                            min_publish_interval_ms: None,
                         },
                     ),
                     (
@@ -103,6 +106,7 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                         LayerAggregationConfig {
                             priorities: None,
                             strategy: Some(AggregationStrategy::Concatenated),
+                            min_publish_interval_ms: None,
                         },
                     ),
                     (
@@ -113,6 +117,7 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                         LayerAggregationConfig {
                             priorities: None,
                             strategy: Some(AggregationStrategy::Concatenated),
+                            min_publish_interval_ms: None,
                         },
                     ),
                 ])),

@@ -720,10 +720,17 @@ impl DiagnosticPublisher {
         // immediately. Deferral withholds only the wire: the set was already
         // recorded above, so the return value (and with it the push-origin
         // coverage bump + refresh nudge) is unaffected.
-        match self
-            .aggregator
-            .wire_gate_admit(host, WIRE_PUBLISH_QUIET_WINDOW)
-        {
+        let quiet_window = self.publish_quiet_window(host);
+        if quiet_window.is_zero() {
+            // A live config change to zero also clears any withheld debt and
+            // makes its already-scheduled trailing task a no-op.
+            self.aggregator.forget_wire_gate(host);
+            self.client
+                .publish_diagnostics(lsp_uri, diagnostics, None)
+                .await;
+            return changed;
+        }
+        match self.aggregator.wire_gate_admit(host, quiet_window) {
             crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
                 log::debug!(
                     target: LOG_TARGET,
@@ -827,6 +834,20 @@ impl DiagnosticPublisher {
                 .priorities
                 .is_empty()
             })
+    }
+
+    fn publish_quiet_window(&self, host: &Url) -> std::time::Duration {
+        self.open_document_language(host)
+            .and_then(|language_name| {
+                crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                    &self.settings_manager.load_settings(),
+                    &language_name,
+                    "textDocument/publishDiagnostics",
+                )
+                .min_publish_interval_ms
+            })
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(WIRE_PUBLISH_QUIET_WINDOW)
     }
 
     /// Ask pull-mode clients to re-pull diagnostics (`workspace/diagnostic/refresh`)
@@ -1123,6 +1144,26 @@ mod tests {
                 LayerAggregationConfig {
                     priorities: Some(Vec::new()),
                     strategy: None,
+                    min_publish_interval_ms: None,
+                },
+            )])),
+        });
+        settings
+    }
+
+    fn rust_settings_with_publish_interval(interval_ms: u64) -> WorkspaceSettings {
+        let mut settings = rust_settings(true);
+        settings
+            .languages
+            .get_mut("rust")
+            .expect("rust language")
+            .layers = Some(LayersConfig {
+            aggregation: Some(HashMap::from([(
+                "textDocument/publishDiagnostics".to_string(),
+                LayerAggregationConfig {
+                    priorities: None,
+                    strategy: None,
+                    min_publish_interval_ms: Some(interval_ms),
                 },
             )])),
         });
@@ -1406,6 +1447,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn publish_quiet_window_resolves_per_host_language() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        let uri = Url::parse("file:///test/configured.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        assert_eq!(
+            publisher.publish_quiet_window(&uri),
+            WIRE_PUBLISH_QUIET_WINDOW
+        );
+
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_interval(250));
+        assert_eq!(
+            publisher.publish_quiet_window(&uri),
+            std::time::Duration::from_millis(250)
+        );
+
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_interval(0));
+        assert!(publisher.publish_quiet_window(&uri).is_zero());
+    }
+
     #[tokio::test]
     async fn republish_under_seal_keeps_the_change_contract() {
         // With the wire sealed, the merge and the last-published recording must
@@ -1446,6 +1519,39 @@ mod tests {
             RepublishOutcome::Unchanged,
             "the sealed set was recorded as last-published, so a re-merge is unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_publish_interval_never_withholds_changed_merges() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_interval(0));
+        let uri = Url::parse("file:///test/no_coalescing.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        for message in ["first", "second"] {
+            server.diagnostics.record(
+                &uri,
+                DiagnosticSource::Host,
+                "rust_ls".to_string(),
+                Some(ProgressConnectionId::for_test(1)),
+                vec![diag(message)],
+            );
+            assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Changed);
+            assert!(
+                !server.diagnostics.wire_gate_is_dirty(&uri),
+                "zero interval must not withhold {message}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

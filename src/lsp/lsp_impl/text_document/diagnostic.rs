@@ -903,6 +903,7 @@ mod tests {
         ResolvedLayerConfig {
             priorities,
             strategy,
+            min_publish_interval_ms: None,
         }
     }
 
