@@ -725,6 +725,35 @@ fn test_language_status_shows_installed() {
     );
 }
 
+/// Status must not report an install as empty when it could not inspect it.
+#[test]
+fn test_language_status_fails_when_install_directory_is_unreadable() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::write(test_dir.path().join("parser"), "not a directory")
+        .expect("Failed to create invalid parser directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("parser"), "stderr: {stderr}");
+    assert!(stderr.contains("Not a directory"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("No languages installed"),
+        "stderr: {stderr}"
+    );
+}
+
 /// Test that language status shows missing queries
 #[test]
 fn test_language_status_missing_queries() {

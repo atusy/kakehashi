@@ -388,7 +388,6 @@ const DOC_LINK: &str =
 /// Run the language status command
 fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     use std::collections::BTreeSet;
-    use std::fs;
 
     let data_dir = default_data_dir().ok_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
@@ -404,28 +403,40 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     // Collect all installed languages from both parser and queries directories
     let mut languages = BTreeSet::new();
 
-    // Scan parser directory for .so, .dylib, .dll files
-    if let Ok(entries) = fs::read_dir(&parser_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_parser = path
-                .extension()
-                .map(|ext| ext == std::env::consts::DLL_EXTENSION)
-                .unwrap_or(false);
-            if is_parser && let Some(stem) = path.file_stem() {
-                languages.insert(stem.to_string_lossy().to_string());
-            }
+    // Scan parser directory for .so, .dylib, .dll files. A fresh data
+    // directory legitimately has no parser directory yet; every other I/O
+    // failure means status cannot truthfully report the installation as empty.
+    visit_install_directory(&parser_dir, |entry| {
+        let path = entry.path();
+        let is_parser = path
+            .extension()
+            .map(|ext| ext == std::env::consts::DLL_EXTENSION)
+            .unwrap_or(false);
+        if is_parser && let Some(stem) = path.file_stem() {
+            languages.insert(stem.to_string_lossy().to_string());
         }
-    }
+    })
+    .map_err(|e| {
+        eprintln!(
+            "Error: failed to inspect parser directory '{}': {e}",
+            parser_dir.display()
+        );
+        ExitCode::FAILURE
+    })?;
 
     // Also check queries directory for languages that might only have queries
-    if let Ok(entries) = fs::read_dir(&queries_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = installed_query_language_name(&entry.path()) {
-                languages.insert(name);
-            }
+    visit_install_directory(&queries_dir, |entry| {
+        if let Some(name) = installed_query_language_name(&entry.path()) {
+            languages.insert(name);
         }
-    }
+    })
+    .map_err(|e| {
+        eprintln!(
+            "Error: failed to inspect query directory '{}': {e}",
+            queries_dir.display()
+        );
+        ExitCode::FAILURE
+    })?;
 
     if languages.is_empty() {
         eprintln!("No languages installed in {}", data_dir.display());
@@ -463,6 +474,26 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
         }
     }
 
+    Ok(())
+}
+
+/// Visit every entry in an installation directory.
+///
+/// Missing directories are the normal state before the first install. Other
+/// directory-open errors and per-entry iteration errors mean the caller did
+/// not observe the complete installation and must not report an empty result.
+fn visit_install_directory(
+    path: &Path,
+    mut visit: impl FnMut(std::fs::DirEntry),
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        visit(entry?);
+    }
     Ok(())
 }
 
