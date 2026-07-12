@@ -865,7 +865,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         compile: parser::ParserCompile::KillableSubprocess,
     };
 
-    match parser::install_parser_after_operation_started(
+    match parser::install_parser_with_outcome_after_operation_started(
         language,
         &options,
         LanguageOperationPermit::Language(&_operation_lock),

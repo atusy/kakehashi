@@ -834,14 +834,11 @@ pub fn install_parser(
         return Err(unsafe_language_name_error(language));
     }
     let _operation_lock = super::LanguageOperationLockGuard::acquire(&options.data_dir, language)?;
-    match install_parser_after_operation_started(
+    install_parser_after_operation_started(
         language,
         options,
         super::LanguageOperationPermit::Language(&_operation_lock),
-    )? {
-        ParserInstallOutcome::Installed(result) => Ok(result),
-        ParserInstallOutcome::Recovered(path) => Err(ParserInstallError::AlreadyExists(path)),
-    }
+    )
 }
 
 /// Install a parser while the caller holds this language's operation lock.
@@ -850,6 +847,19 @@ pub fn install_parser(
 /// combined parser-and-query operation that must retain one lock across both.
 #[doc(hidden)]
 pub fn install_parser_after_operation_started(
+    language: &str,
+    options: &InstallOptions,
+    permit: super::LanguageOperationPermit<'_>,
+) -> Result<ParserInstallResult, ParserInstallError> {
+    match install_parser_with_outcome_after_operation_started(language, options, permit)? {
+        ParserInstallOutcome::Installed(result) => Ok(result),
+        ParserInstallOutcome::Recovered(path) => Err(ParserInstallError::AlreadyExists(path)),
+    }
+}
+
+/// Install a parser while retaining the recovery-specific outcome.
+#[doc(hidden)]
+pub fn install_parser_with_outcome_after_operation_started(
     language: &str,
     options: &InstallOptions,
     permit: super::LanguageOperationPermit<'_>,
