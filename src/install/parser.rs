@@ -147,7 +147,7 @@ fn publish_parser_transactionally(
 #[cfg(windows)]
 struct StdParserFileOps;
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn write_marker_atomically(marker_path: &Path, content: &[u8]) -> std::io::Result<()> {
     let marker_tmp = marker_staging_path(marker_path, ulid::Ulid::new());
     let mut marker = fs::OpenOptions::new()
@@ -160,10 +160,16 @@ fn write_marker_atomically(marker_path: &Path, content: &[u8]) -> std::io::Resul
         return Err(error);
     }
     drop(marker);
-    if let Err(error) = fs::rename(&marker_tmp, &marker_path) {
+    // Linking publishes the already-complete inode and atomically fails when
+    // the destination exists; unlike Windows rename, it never replaces a
+    // colliding user or prior-process sidecar.
+    if let Err(error) = fs::hard_link(&marker_tmp, marker_path) {
         let _ = fs::remove_file(marker_tmp);
         return Err(error);
     }
+    // A crash or unlink failure leaves only a content-validated staging alias,
+    // which recovery removes by its exact ULID shape.
+    let _ = fs::remove_file(marker_tmp);
     Ok(())
 }
 
@@ -1686,6 +1692,19 @@ mod tests {
 
     const TREE_SITTER_JSON_URL: &str =
         "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
+
+    #[test]
+    fn atomic_marker_publish_preserves_existing_destination() {
+        let temp = tempdir().expect("temp dir");
+        let marker = temp.path().join("backup.owner");
+        fs::write(&marker, b"unrelated").expect("write collision");
+
+        write_marker_atomically(&marker, PARSER_BACKUP_INTENT_CONTENT)
+            .expect_err("atomic publication must reject collision");
+
+        assert_eq!(fs::read(&marker).expect("read collision"), b"unrelated");
+        assert_eq!(fs::read_dir(temp.path()).expect("list temp").count(), 1);
+    }
 
     #[derive(Default)]
     struct FakeParserFileOps {
