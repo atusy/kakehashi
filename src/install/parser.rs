@@ -561,6 +561,9 @@ fn claim_and_unlink_stale_parser_file(
                 file.sync_all()
             });
         if let Err(error) = marker_result {
+            // `write_all` or `sync_all` may fail after creating a partial
+            // marker. Remove it before the now-empty claim directory.
+            let _ = fs::remove_file(&marker);
             let _ = fs::remove_dir(&candidate);
             return Err(ParserInstallError::IoError(error));
         }
