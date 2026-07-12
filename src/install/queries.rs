@@ -509,6 +509,11 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
             "queries directory must have a data-directory parent",
         )));
     };
+    match fs::metadata(queries_parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(QueryInstallError::IoError(error)),
+    }
     let all_lock = super::AllLanguageOperationsLockGuard::acquire(data_dir)?;
     recover_interrupted_query_installs_with_permit(
         queries_parent,
@@ -1342,6 +1347,19 @@ mod tests {
         assert!(
             tmp.exists(),
             "generated staging dirs from live installers must not be collected"
+        );
+    }
+
+    #[test]
+    fn recover_interrupted_query_installs_does_not_create_locks_when_absent() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            !temp.path().join(".operation-locks").exists(),
+            "no-op recovery must not mutate a fresh data directory"
         );
     }
 
