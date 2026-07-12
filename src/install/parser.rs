@@ -483,6 +483,13 @@ pub struct ParserInstallResult {
     pub revision: String,
 }
 
+/// Internal outcome for callers that coordinate parser and query operations.
+#[doc(hidden)]
+pub enum ParserInstallOutcome {
+    Installed(ParserInstallResult),
+    Recovered(PathBuf),
+}
+
 /// How the parser source is compiled.
 ///
 /// The killable path re-execs **this** binary's `__compile-parser` subcommand, so
@@ -819,11 +826,14 @@ pub fn install_parser(
         return Err(unsafe_language_name_error(language));
     }
     let _operation_lock = super::LanguageOperationLockGuard::acquire(&options.data_dir, language)?;
-    install_parser_after_operation_started(
+    match install_parser_after_operation_started(
         language,
         options,
         super::LanguageOperationPermit::Language(&_operation_lock),
-    )
+    )? {
+        ParserInstallOutcome::Installed(result) => Ok(result),
+        ParserInstallOutcome::Recovered(path) => Err(ParserInstallError::AlreadyExists(path)),
+    }
 }
 
 /// Install a parser while the caller holds this language's operation lock.
@@ -835,7 +845,7 @@ pub fn install_parser_after_operation_started(
     language: &str,
     options: &InstallOptions,
     permit: super::LanguageOperationPermit<'_>,
-) -> Result<ParserInstallResult, ParserInstallError> {
+) -> Result<ParserInstallOutcome, ParserInstallError> {
     if !permit.covers(&options.data_dir, language) {
         return Err(ParserInstallError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -860,7 +870,7 @@ pub fn install_parser_after_operation_started(
 
     #[cfg(windows)]
     if recovered && !options.force {
-        return Err(ParserInstallError::AlreadyExists(parser_file));
+        return Ok(ParserInstallOutcome::Recovered(parser_file));
     }
 
     let install_token = begin_parser_install(&parser_dir, &parser_file, language, options.force)?;
@@ -935,11 +945,11 @@ pub fn install_parser_after_operation_started(
         eprintln!("Installed to: {}", parser_file.display());
     }
 
-    Ok(ParserInstallResult {
+    Ok(ParserInstallOutcome::Installed(ParserInstallResult {
         language: language.to_string(),
         install_path: parser_file,
         revision: metadata.revision,
-    })
+    }))
 }
 
 /// Construct a GitHub archive download URL from a repository URL and revision.

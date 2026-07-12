@@ -870,14 +870,14 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         &options,
         LanguageOperationPermit::Language(&_operation_lock),
     ) {
-        Ok(result) => {
+        Ok(parser::ParserInstallOutcome::Installed(result)) => {
             eprintln!("✓ Parser installed: {}", result.install_path.display());
             if verbose {
                 eprintln!("  Revision: {}", result.revision);
             }
         }
-        Err(parser::ParserInstallError::AlreadyExists(path)) => {
-            eprintln!("✓ Parser available: {}", path.display());
+        Ok(parser::ParserInstallOutcome::Recovered(path)) => {
+            eprintln!("✓ Parser recovered: {}", path.display());
         }
         Err(e) => {
             eprintln!("✗ Parser installation failed: {}", e);

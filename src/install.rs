@@ -412,8 +412,11 @@ fn install_language_blocking_with_query_installer(
         &parser_options,
         LanguageOperationPermit::All(&_operation_lock),
     ) {
-        Ok(parser_result) => {
+        Ok(parser::ParserInstallOutcome::Installed(parser_result)) => {
             result.parser_path = Some(parser_result.install_path);
+        }
+        Ok(parser::ParserInstallOutcome::Recovered(path)) => {
+            result.parser_path = Some(path);
         }
         Err(parser::ParserInstallError::AlreadyExists(path)) => {
             result.parser_path = Some(path);
