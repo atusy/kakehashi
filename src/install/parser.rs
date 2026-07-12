@@ -194,10 +194,10 @@ fn open_windows_staging_guard(path: &Path) -> Result<fs::File, ParserInstallErro
 /// can only reach us and our `cc`, never a shell that launched us directly), then
 /// spawn a watchdog that group-kills us shortly after [`PARSER_COMPILE_TIMEOUT`].
 ///
-/// On a normal/quick compile the process exits first and the watchdog thread is
-/// torn down with it; the grace margin keeps the parent's deadline the usual
-/// trigger. Unix-only (process groups); a no-op elsewhere. The subcommand entry
-/// (`src/bin/main.rs`) calls this before compiling.
+/// On a normal/quick compile the process exits first and the watchdog thread or
+/// Windows job is torn down with it; the grace margin keeps the parent's
+/// deadline the usual trigger. The subcommand entry (`src/bin/main.rs`) calls
+/// this before compiling.
 pub fn arm_compile_watchdog() -> Result<(), ParserInstallError> {
     #[cfg(unix)]
     {

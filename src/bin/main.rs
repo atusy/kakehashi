@@ -785,8 +785,7 @@ fn run_compile_parser(
     // hung cc) running as an orphan; the parent's deadline is still the usual
     // trigger.
     if let Err(e) = parser::arm_compile_watchdog() {
-        eprintln!("parser compile setup failed: {e}");
-        return Err(ExitCode::FAILURE);
+        eprintln!("warning: parser compile watchdog unavailable: {e}");
     }
     match parser::compile_parser_inprocess(grammar_dir, output_path) {
         Ok(()) => Ok(()),
