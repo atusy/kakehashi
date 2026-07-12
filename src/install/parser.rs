@@ -281,6 +281,9 @@ pub fn install_parser(
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
+    fs::create_dir_all(&parser_dir)?;
+    cleanup_interrupted_parser_installs(&parser_dir)?;
+
     // Check if parser already exists
     if parser_file.exists() && !options.force {
         return Err(ParserInstallError::AlreadyExists(parser_file));
@@ -332,7 +335,6 @@ pub fn install_parser(
     // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
     // by this process still fails at the rename — a loaded DLL can't be removed — a
     // pre-existing platform limitation this scheme doesn't change.)
-    fs::create_dir_all(&parser_dir)?;
     static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let tmp_file = parser_dir.join(format!(
         ".{}.{}.{}.{}.tmp",
@@ -374,6 +376,65 @@ pub fn install_parser(
         install_path: parser_file,
         revision: metadata.revision,
     })
+}
+
+fn staged_parser_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let mut parts = rest.split('.');
+    let language = parts.next()?;
+    let pid = parts.next()?;
+    let counter = parts.next()?;
+    let extension = parts.next()?;
+    if parts.next().is_some()
+        || !super::queries::is_safe_language_name(language)
+        || !counter.bytes().all(|byte| byte.is_ascii_digit())
+        || extension != std::env::consts::DLL_EXTENSION
+    {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserInstallError> {
+    for entry in fs::read_dir(parser_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(pid) = staged_parser_pid(&path) else {
+            continue;
+        };
+        if !process_is_running(pid) {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ParserInstallError::IoError(error)),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn cleanup_interrupted_parser_installs(_parser_dir: &Path) -> Result<(), ParserInstallError> {
+    // There is no portable process-liveness API. Keep possibly live staging
+    // files instead of risking deletion of another installer process's output.
+    Ok(())
 }
 
 /// Construct a GitHub archive download URL from a repository URL and revision.
@@ -938,6 +999,45 @@ fn invalid_metadata(message: String) -> ParserInstallError {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_removes_staged_parser_from_dead_process() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let mut pid = std::process::id().saturating_add(100_000);
+        while process_is_running(pid) {
+            pid = pid.saturating_add(1);
+        }
+        let staged = parser_dir.join(format!(
+            ".lua.{pid}.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"partial parser").expect("write staged parser");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(!staged.exists(), "dead process staging file is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_staged_parser_from_live_process() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let staged = parser_dir.join(format!(
+            ".lua.{}.0.{}.tmp",
+            std::process::id(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"active parser").expect("write staged parser");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(staged.exists(), "live process staging file is preserved");
+    }
 
     const TREE_SITTER_JSON_URL: &str =
         "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
