@@ -2001,15 +2001,15 @@ impl LanguageServerPool {
         // outcome out here so the error kind can distinguish retryable
         // backpressure (queue full) from a dead/serialization-failed connection.
         let mut send_outcome = NotificationSendResult::Queued;
-        // Hold the `connections` lock across the liveness check AND the
-        // add+announce so a concurrent respawn (get_or_create's SpawnNew branch,
-        // which purges this key's state) cannot interleave between verifying the
-        // handle is still the live pool connection and queuing the
-        // `didChangeWorkspaceFolders` — the same Arc::ptr_eq live-handle guard
-        // the request (execute.rs) and eager-open (did_open.rs) send paths use.
-        // `add_and_announce` is fully synchronous (the send is a non-blocking
-        // try_send), so no `.await` is held under either lock; lock order is
-        // connections → folder set, never the reverse.
+        // Wait for registration acknowledgement ordering without holding the
+        // global map. Once ordered, hold `connections` across the liveness
+        // check and synchronous add+announce so a concurrent respawn cannot
+        // interleave between validation and enqueue.
+        let _ordering = handle
+            .dynamic_capabilities()
+            .workspace_folder_ordering()
+            .lock_owned()
+            .await;
         let connections = self.connections.lock().await;
         if !connections
             .get(handle.key())
@@ -2020,11 +2020,6 @@ impl LanguageServerPool {
                 "bridge: connection was replaced before didChangeWorkspaceFolders",
             ));
         }
-        let _ordering = handle
-            .dynamic_capabilities()
-            .workspace_folder_ordering()
-            .lock_owned()
-            .await;
         if handle.workspace_folders().contains(folder) {
             return Ok(true);
         }
@@ -3422,6 +3417,10 @@ mod tests {
             async move { pool.announce_shared_root(&handle, &marker).await }
         });
         tokio::task::yield_now().await;
+        let connections = tokio::time::timeout(Duration::from_secs(1), pool.connections.lock())
+            .await
+            .expect("capability ordering must not block unrelated connection routing");
+        drop(connections);
         handle.dynamic_capabilities().unregister(vec![
             tower_lsp_server::ls_types::Unregistration {
                 id: "workspace-folders".to_string(),
