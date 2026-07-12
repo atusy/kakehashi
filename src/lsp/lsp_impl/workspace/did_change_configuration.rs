@@ -442,9 +442,11 @@ impl Kakehashi {
         ) {
             Ok(settings) => {
                 self.apply_raw_settings(merged_ts, settings).await;
+                drop(_settings_transaction);
                 self.notifier().log_info("Configuration updated!").await;
             }
             Err(errs) => {
+                drop(_settings_transaction);
                 let event = crate::lsp::SettingsEvent::error(format!(
                     "Invalid configuration: {errs}. \
                      This configuration has been discarded; previous settings remain in effect. \
