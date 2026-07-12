@@ -182,6 +182,7 @@ pub(super) fn injection_stack_at(
         // Smallest effective span wins — that's the most specific injection at
         // the cursor after offset/include adjustments.
         let mut materialized = Vec::new();
+        let mut viable_candidates = 0usize;
         for (region, absolute_ranges) in candidates {
             // Pass the actual injection content to the language resolver so its
             // shebang / first-line heuristics can fire for nested injections.
@@ -192,15 +193,19 @@ pub(super) fn injection_stack_at(
             else {
                 continue;
             };
-            // Only trees which can mint node IDs contribute to ambiguity.
-            // `walk_document_layers` likewise skips unresolved, unloaded, or
-            // unparsable siblings rather than visiting them.
+            // Only resolved candidates with a loaded grammar can mint node
+            // IDs. `walk_document_layers` likewise skips unresolved or
+            // unloaded siblings rather than visiting them.
             let Some(language) = coordinator
                 .language_registry_for_parallel()
                 .get(&resolved_lang)
             else {
                 continue;
             };
+            // A loaded candidate could have minted IDs during the snapshot
+            // walk even if this bounded reparse transiently times out. Count
+            // it before parsing so a timeout cannot erase sibling ambiguity.
+            viable_candidates += 1;
             let Some(injected_tree) =
                 parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
             else {
@@ -212,7 +217,7 @@ pub(super) fn injection_stack_at(
         // Once an ancestor was ambiguous, every descendant is ambiguous too:
         // rebuilding the same child path inside the chosen smallest parent
         // still cannot prove that parent was the sibling which minted the id.
-        let ambiguous = parent_ambiguous || materialized.len() > 1;
+        let ambiguous = parent_ambiguous || viable_candidates > 1;
         let Some((resolved_lang, injected_tree, absolute_ranges)) = materialized.into_iter().next()
         else {
             break;
