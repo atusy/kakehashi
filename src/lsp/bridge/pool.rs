@@ -103,6 +103,60 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
     });
 }
 
+/// Own invalidation cleanup independently of the request future that triggered
+/// it. The owned map guard prevents a same-key respawn until every key-based
+/// purge is complete; dropping the caller's future only detaches this task.
+fn spawn_invalidated_connection_cleanup(
+    mut connections: tokio::sync::OwnedMutexGuard<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    invalidated: Vec<ConnectionKey>,
+    host_documents: Arc<Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>>,
+    document_tracker: Arc<DocumentTracker>,
+    open_transition_locks: Arc<OpenTransitionLocks>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        for key in &invalidated {
+            if let Some(handle) = connections.get(key) {
+                handle.begin_shutdown();
+            }
+        }
+
+        let mut stale_handles = Vec::new();
+        for key in invalidated {
+            host_documents
+                .lock()
+                .await
+                .retain(|(_, connection_key), _| connection_key != &key);
+            document_tracker.purge_connection(&key).await;
+            purge_transition_locks(&open_transition_locks, &key).await;
+            if let Some(handle) = connections.remove(&key) {
+                stale_handles.push((key, handle));
+            }
+        }
+        drop(connections);
+        for (key, handle) in stale_handles {
+            shutdown_invalidated_connection(key, handle);
+        }
+    })
+}
+
+async fn purge_transition_locks(
+    open_transition_locks: &OpenTransitionLocks,
+    connection_key: &ConnectionKey,
+) {
+    let transitions: Vec<_> = open_transition_locks
+        .iter()
+        .filter(|entry| &entry.key().0 == connection_key)
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect();
+    for (key, transition) in transitions {
+        let guard = transition.lock().await;
+        drop(guard);
+        open_transition_locks.remove_if(&key, |_, current| {
+            Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
+        });
+    }
+}
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -312,7 +366,7 @@ pub struct LanguageServerPool {
     /// multi-root monorepo spawns a separate downstream process per resolved
     /// workspace root (issue #382); documents sharing a root (or the
     /// client-root fallback) still share one process.
-    connections: Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    connections: Arc<Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>>,
     /// Gate that rejects **new** connection spawns once shutdown has begun.
     ///
     /// `shutdown_all` snapshots the live connections and tears them down, but a
@@ -345,7 +399,7 @@ pub struct LanguageServerPool {
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
-    host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
+    host_documents: Arc<Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>>,
     /// Upstream request ID → set of downstream connections, for fan-out cancel
     /// forwarding (ls-bridge-message-ordering). Multiple connections can share an ID when a single
     /// upstream request (e.g. diagnostic) targets several injected languages.
@@ -450,13 +504,13 @@ impl LanguageServerPool {
             tokio::sync::mpsc::channel(super::actor::WINDOW_NOTIFICATION_QUEUE_CAPACITY);
         let (upstream_request_tx, upstream_request_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            connections: Mutex::new(HashMap::new()),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: AtomicBool::new(false),
             document_tracker: Arc::new(DocumentTracker::new()),
             open_transition_locks: Arc::new(DashMap::new()),
             host_lifecycle_locks: DashMap::new(),
             latest_virtual_contents: DashMap::new(),
-            host_documents: Mutex::new(HashMap::new()),
+            host_documents: Arc::new(Mutex::new(HashMap::new())),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
@@ -566,7 +620,7 @@ impl LanguageServerPool {
         // upstream snapshot. Once committed below, all live capable handles are
         // notified synchronously and every incompatible handle is marked
         // shutting down before the next await.
-        let mut connections = self.connections.lock().await;
+        let connections = Arc::clone(&self.connections).lock_owned().await;
         if !self.workspace_folders.apply_change(added.clone(), removed) {
             return;
         }
@@ -611,12 +665,18 @@ impl LanguageServerPool {
             }
         }
 
-        let stale_handles = self
-            .remove_and_purge_invalidated_connections(&mut connections, invalidated)
-            .await;
-        drop(connections);
-        for (key, handle) in stale_handles {
-            shutdown_invalidated_connection(key, handle);
+        let cleanup = spawn_invalidated_connection_cleanup(
+            connections,
+            invalidated,
+            Arc::clone(&self.host_documents),
+            Arc::clone(&self.document_tracker),
+            Arc::clone(&self.open_transition_locks),
+        );
+        if let Err(error) = cleanup.await {
+            log::error!(
+                target: "kakehashi::bridge",
+                "workspace-folder connection cleanup task failed: {error}"
+            );
         }
     }
 
@@ -1129,19 +1189,7 @@ impl LanguageServerPool {
     }
 
     async fn purge_open_transition_locks(&self, connection_key: &ConnectionKey) {
-        let transitions: Vec<_> = self
-            .open_transition_locks
-            .iter()
-            .filter(|entry| &entry.key().0 == connection_key)
-            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-            .collect();
-        for (key, transition) in transitions {
-            let guard = transition.lock().await;
-            drop(guard);
-            self.open_transition_locks.remove_if(&key, |_, current| {
-                Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
-            });
-        }
+        purge_transition_locks(&self.open_transition_locks, connection_key).await;
     }
 
     /// Stop, purge, and remove invalidated connections while the caller holds
@@ -3107,6 +3155,45 @@ mod tests {
             pool.workspace_folders(),
             Some(vec![test_workspace_folder("file:///old")])
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_upstream_folder_change_finishes_owned_connection_cleanup() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_documents = pool.host_documents.lock().await;
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state() != ConnectionState::Closing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup must mark the stale handle before its first await");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(host_documents);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !pool.connections.lock().await.contains_key(&key) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup must remove the stale handle after caller cancellation");
     }
 
     /// A Ready shared connection whose server never advertised the
