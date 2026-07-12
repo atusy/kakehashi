@@ -1506,7 +1506,8 @@ mod tests {
         let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
         let tmp_file = parser_dir.join(".lua.staged.tmp");
         fs::write(&tmp_file, b"compiled parser").expect("write staged parser");
-        fs::write(parser_dir.join(".lua.uninstalled"), b"ok\n").expect("record later uninstall");
+        fs::write(parser_uninstall_tombstone_path(&parser_dir, "lua"), b"ok\n")
+            .expect("record later uninstall");
 
         let result = publish_compiled_parser(&tmp_file, &parser_file, "lua", "install:first");
 
