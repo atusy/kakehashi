@@ -1492,6 +1492,49 @@ fn test_language_uninstall_all_rejects_invalid_parser_name_before_removal() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_uninstall_all_rejects_non_directory_query_entries() {
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+
+    for entry_kind in ["file", "socket"] {
+        let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let queries_dir = test_dir.path().join("queries");
+        fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+        let query_entry = queries_dir.join("lua");
+        let _socket = if entry_kind == "file" {
+            fs::write(&query_entry, "not a query directory")
+                .expect("Failed to write query-shaped file");
+            None
+        } else {
+            Some(UnixListener::bind(&query_entry).expect("Failed to create query-shaped socket"))
+        };
+
+        let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+            .args([
+                "language",
+                "uninstall",
+                "--all",
+                "--data-dir",
+                test_dir.path().to_str().unwrap(),
+                "--force",
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        assert!(
+            !output.status.success(),
+            "safe-named query {entry_kind} must fail preflight; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::symlink_metadata(&query_entry).is_ok(),
+            "malformed query entry must remain for repair"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_uninstall_all_removes_dangling_parser_entry() {
     use std::fs;
     use std::os::unix::fs::symlink;

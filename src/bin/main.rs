@@ -521,6 +521,16 @@ fn installed_query_language_name_for_uninstall(
     // query-root entry. Do not follow it: a dangling target or loop must not
     // make the kakehashi-owned namespace impossible to clean.
     let is_dir = file_type.is_dir() || file_type.is_symlink();
+    let safe_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.starts_with('.') && queries::is_safe_language_name(name));
+    if safe_name.is_some() && !is_dir {
+        return Err(format!(
+            "query entry '{}' is not a directory or symlink",
+            path.display()
+        ));
+    }
     let language = installed_query_language_name_if_dir(&path, is_dir);
     // Hidden staging/backup directories are skipped as installed languages,
     // but recovery can mutate recognized ones into canonical installs. Avoid
