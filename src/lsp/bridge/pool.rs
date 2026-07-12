@@ -1691,7 +1691,17 @@ impl LanguageServerPool {
         // path already announced; on the initializing-retry path it is the only
         // announce. Propagates a queue-full failure so the caller retries rather
         // than open a document for an unannounced root.
-        if !self.announce_shared_root(&handle, &marker).await? {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let announced =
+            tokio::time::timeout(remaining, self.announce_shared_root(&handle, &marker))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "workspace-folder announcement timed out",
+                    )
+                })??;
+        if !announced {
             handle.log_incapable_fallback_once(server_name);
             let remaining = timeout.saturating_sub(start.elapsed());
             let per_root_key = ConnectionKey::new(
@@ -2130,7 +2140,16 @@ impl LanguageServerPool {
                 // check, so it must not be held here (the tokio mutex is not
                 // reentrant).
                 drop(connections);
-                if !self.announce_shared_root(&handle, &marker).await? {
+                let announced =
+                    tokio::time::timeout(timeout, self.announce_shared_root(&handle, &marker))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "workspace-folder announcement timed out",
+                            )
+                        })??;
+                if !announced {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "bridge: shared connection lost workspace-folder support; retry per root",
