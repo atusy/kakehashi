@@ -616,12 +616,18 @@ fn remove_stale_cleanup_claim(path: &Path) {
     let Ok(marker_fd) = openat(
         &dir,
         "owner",
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
         Mode::empty(),
     ) else {
         return;
     };
     let file = fs::File::from(marker_fd);
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return;
+    }
     let mut contents = Vec::with_capacity(PARSER_CLEANUP_MARKER.len() + 1);
     if file
         .take(PARSER_CLEANUP_MARKER.len() as u64 + 1)
@@ -1418,6 +1424,11 @@ mod tests {
         fs::write(owned.join("owner"), PARSER_CLEANUP_MARKER).expect("write ownership marker");
         fs::write(owned.join("artifact"), b"stale parser").expect("write stale artifact");
         fs::create_dir(&unowned).expect("create unowned lookalike");
+        nix::unistd::mkfifo(
+            &unowned.join("owner"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create marker-shaped FIFO");
         fs::write(unowned.join("artifact"), b"user data").expect("write user data");
 
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
