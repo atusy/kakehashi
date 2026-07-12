@@ -485,7 +485,8 @@ fn cleanup_claim_pid(path: &Path) -> Option<u32> {
     if parts.next().is_some() || !is_canonical_decimal(pid) || !is_canonical_decimal(counter) {
         return None;
     }
-    pid.parse().ok()
+    let pid = pid.parse().ok()?;
+    (1..=i32::MAX as u32).contains(&pid).then_some(pid)
 }
 
 #[cfg(unix)]
@@ -1378,12 +1379,18 @@ mod tests {
             std::env::consts::DLL_EXTENSION
         ));
         let noncanonical_claim = parser_dir.join(".parser-cleanup.000123.0");
+        let zero_claim = parser_dir.join(".parser-cleanup.0.0");
+        let oversized_claim = parser_dir.join(format!(".parser-cleanup.{}.0", i32::MAX as u32 + 1));
         fs::write(&empty_counter, b"user file").expect("write user file");
         fs::write(&leading_zero, b"user file").expect("write user file");
         fs::write(&leading_zero_pid, b"user file").expect("write user file");
         fs::write(&zero_pid, b"user file").expect("write user file");
         fs::write(&oversized_pid, b"user file").expect("write user file");
         fs::write(&noncanonical_claim, b"user file").expect("write user file");
+        fs::create_dir(&zero_claim).expect("create zero-PID claim lookalike");
+        fs::write(zero_claim.join("owner"), PARSER_CLEANUP_MARKER).expect("write marker");
+        fs::create_dir(&oversized_claim).expect("create oversized-PID claim lookalike");
+        fs::write(oversized_claim.join("owner"), PARSER_CLEANUP_MARKER).expect("write marker");
 
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
 
@@ -1395,6 +1402,11 @@ mod tests {
         assert!(
             noncanonical_claim.exists(),
             "leading-zero cleanup claim PID is preserved"
+        );
+        assert!(zero_claim.exists(), "zero-PID cleanup claim is preserved");
+        assert!(
+            oversized_claim.exists(),
+            "oversized-PID cleanup claim is preserved"
         );
     }
 
