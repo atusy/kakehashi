@@ -396,7 +396,7 @@ mod tests {
     async fn wait_for_downstream_id(probe: &std::sync::OnceLock<RequestId>) -> RequestId {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while probe.get().is_none() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         })
         .await
