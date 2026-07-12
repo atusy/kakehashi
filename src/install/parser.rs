@@ -542,6 +542,21 @@ fn claim_and_unlink_stale_parser_file(
         ));
         match fs::hard_link(path, &candidate) {
             Ok(()) => {
+                // The directory entry is the authority for unlink. Re-check
+                // after creating the claim so a pathname replacement cannot
+                // make us delete an inode other than the one we locked.
+                let current = match fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let _ = fs::remove_file(&candidate);
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(ParserInstallError::IoError(error)),
+                };
+                if opened.dev() != current.dev() || opened.ino() != current.ino() {
+                    let _ = fs::remove_file(&candidate);
+                    return Ok(None);
+                }
                 match fs::remove_file(path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
