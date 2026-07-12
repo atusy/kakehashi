@@ -313,9 +313,9 @@ fn e2e_directory_walk_respects_gitignore_but_explicit_path_wins() {
 fn e2e_directory_walk_formats_extensionless_shebang_file() {
     let prefix = "#!/usr/bin/env python ";
     let padding = " ".repeat(8191 - prefix.len());
-    // Byte 8192 cuts through this multibyte character. Directory discovery
-    // must fall back to normal full-document detection instead of rejecting
-    // or silently skipping the valid UTF-8 file.
+    // BufReader's 8 KiB internal read boundary cuts through this multibyte
+    // character. Discovery must continue assembling the complete valid UTF-8
+    // first line and still detect its shebang language.
     let source = format!("{prefix}{padding}é\nvalue = 1\n");
     let ws = workspace_with(&[("tool", &source)]);
     let unknown = "x".repeat(9 * 1024);
