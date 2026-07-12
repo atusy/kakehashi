@@ -32,6 +32,22 @@ trait ParserFileOps {
 }
 
 #[cfg(any(windows, test))]
+fn remove_published_backup_marker(
+    ops: &mut impl ParserFileOps,
+    backup_file: &Path,
+) -> std::io::Result<()> {
+    ops.remove_backup_marker(backup_file).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "published parser but failed to remove backup marker '{}': {error}",
+                parser_backup_ownership_sidecar(backup_file).display()
+            ),
+        )
+    })
+}
+
+#[cfg(any(windows, test))]
 fn publish_parser_transactionally(
     ops: &mut impl ParserFileOps,
     tmp_file: &Path,
@@ -62,9 +78,9 @@ fn publish_parser_transactionally(
         Ok(()) => {
             if had_old_parser {
                 match ops.remove_file(backup_file) {
-                    Ok(()) => ops.remove_backup_marker(backup_file)?,
+                    Ok(()) => remove_published_backup_marker(ops, backup_file)?,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        ops.remove_backup_marker(backup_file)?;
+                        remove_published_backup_marker(ops, backup_file)?;
                     }
                     Err(error) => {
                         return Err(std::io::Error::new(
@@ -1557,6 +1573,23 @@ mod tests {
             error.to_string().contains("parser.backup.owner"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn transactional_publish_identifies_marker_left_after_success() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.fail_marker_removal = true;
+
+        let error = publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("marker cleanup failure must identify published state");
+
+        assert!(error.to_string().contains("published parser"));
+        assert!(error.to_string().contains("parser.backup.owner"));
     }
 
     #[test]
