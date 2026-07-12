@@ -542,9 +542,7 @@ impl LanguageServerPool {
         &self,
         folders: Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>,
     ) {
-        if let Some(folders) = folders {
-            self.workspace_folders.apply_change(folders, &[]);
-        }
+        self.workspace_folders.replace(folders);
     }
 
     /// Get the workspace folders.
