@@ -80,71 +80,61 @@ pub fn load_settings(
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut used_deprecated_root_markers = false;
-    let mut path_expansion_failed = false;
+    let mut path_base_failed = false;
+    let mut failed_paths = Vec::new();
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
-    let defaults = normalize_layer(
-        default_settings(),
-        None,
-        home,
-        &env_fn,
-        &mut events,
-        &mut path_expansion_failed,
-    );
+    let defaults = normalize_layer(default_settings(), None, home, &env_fn, &mut failed_paths);
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
-    let config_layers: Vec<Option<RawWorkspaceSettings>> =
-        if let Some(files) = crate::config::expand::config_file_override() {
-            events.push(SettingsEvent::info(format!(
-                "Using {} explicit config file(s); default config locations skipped",
-                files.len()
-            )));
-            files
-                .iter()
-                .map(|p| {
-                    let base = absolute_parent(p);
-                    load_toml_file(p, &mut events, &mut used_deprecated_root_markers).and_then(
-                        |settings| {
-                            normalize_layer(
-                                settings,
-                                base.as_deref(),
-                                home,
-                                &env_fn,
-                                &mut events,
-                                &mut path_expansion_failed,
-                            )
-                        },
+    let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(files) =
+        crate::config::expand::config_file_override()
+    {
+        events.push(SettingsEvent::info(format!(
+            "Using {} explicit config file(s); default config locations skipped",
+            files.len()
+        )));
+        files
+            .iter()
+            .map(|p| {
+                let base = match absolute_parent(p) {
+                    Ok(base) => base,
+                    Err(error) => {
+                        path_base_failed = true;
+                        events.push(SettingsEvent::error(format!(
+                            "Failed to resolve explicit config path {}: {error}",
+                            p.display()
+                        )));
+                        None
+                    }
+                };
+                load_toml_file(p, &mut events, &mut used_deprecated_root_markers).and_then(
+                    |settings| {
+                        normalize_layer(settings, base.as_deref(), home, &env_fn, &mut failed_paths)
+                    },
+                )
+            })
+            .collect()
+    } else {
+        vec![
+            // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
+            load_user_config_with_events(&mut events, &mut used_deprecated_root_markers).and_then(
+                |(settings, path)| {
+                    normalize_layer(
+                        settings,
+                        absolute_parent(&path).ok().flatten().as_deref(),
+                        home,
+                        &env_fn,
+                        &mut failed_paths,
                     )
-                })
-                .collect()
-        } else {
-            vec![
-                // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-                load_user_config_with_events(&mut events, &mut used_deprecated_root_markers)
-                    .and_then(|(settings, path)| {
-                        normalize_layer(
-                            settings,
-                            absolute_parent(&path).as_deref(),
-                            home,
-                            &env_fn,
-                            &mut events,
-                            &mut path_expansion_failed,
-                        )
-                    }),
-                // Layer 3: Project config from root_path/kakehashi.toml
-                load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers)
-                    .and_then(|settings| {
-                        normalize_layer(
-                            settings,
-                            root_path,
-                            home,
-                            &env_fn,
-                            &mut events,
-                            &mut path_expansion_failed,
-                        )
-                    }),
-            ]
-        };
+                },
+            ),
+            // Layer 3: Project config from root_path/kakehashi.toml
+            load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers).and_then(
+                |settings| normalize_layer(settings, root_path, home, &env_fn, &mut failed_paths),
+            ),
+        ]
+    };
 
     // Layer 4: Override settings from initialization options or client configuration
     let override_settings = override_settings.and_then(|(source, value)| {
@@ -154,16 +144,7 @@ pub fn load_settings(
             &mut events,
             &mut used_deprecated_root_markers,
         )
-        .and_then(|settings| {
-            normalize_layer(
-                settings,
-                root_path,
-                home,
-                &env_fn,
-                &mut events,
-                &mut path_expansion_failed,
-            )
-        })
+        .and_then(|settings| normalize_layer(settings, root_path, home, &env_fn, &mut failed_paths))
     });
 
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
@@ -174,8 +155,28 @@ pub fn load_settings(
         .into_iter()
         .reduce(merge_workspace_settings)
         .flatten();
+    let surviving_expansion_errors = merged.as_ref().is_some_and(|settings| {
+        failed_paths
+            .iter()
+            .any(|(input, _)| settings_contains_path(settings, input))
+    });
+    if surviving_expansion_errors {
+        let details = failed_paths
+            .iter()
+            .filter(|(input, _)| {
+                merged
+                    .as_ref()
+                    .is_some_and(|settings| settings_contains_path(settings, input))
+            })
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        events.push(SettingsEvent::error(format!(
+            "Path expansion failed: {details}. The complete configuration has been discarded; previous settings remain in effect. Please correct the affected paths and environment variables or remove them from your config."
+        )));
+    }
     let raw_settings = merged.clone();
-    let settings = (!path_expansion_failed)
+    let settings = (!surviving_expansion_errors && !path_base_failed)
         .then(|| {
             merged
                 .as_ref()
@@ -191,13 +192,13 @@ pub fn load_settings(
     }
 }
 
-fn absolute_parent(path: &Path) -> Option<PathBuf> {
+fn absolute_parent(path: &Path) -> std::io::Result<Option<PathBuf>> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().ok()?.join(path)
+        std::env::current_dir()?.join(path)
     };
-    absolute.parent().map(Path::to_path_buf)
+    Ok(absolute.parent().map(Path::to_path_buf))
 }
 
 fn normalize_layer(
@@ -205,19 +206,35 @@ fn normalize_layer(
     base: Option<&Path>,
     home: Option<&str>,
     env_fn: &impl Fn(&str) -> Option<String>,
-    events: &mut Vec<SettingsEvent>,
-    path_expansion_failed: &mut bool,
+    failed_paths: &mut Vec<(String, String)>,
 ) -> Option<RawWorkspaceSettings> {
     match crate::config::expand::expand_settings_paths(&mut settings, base, home, env_fn) {
         Ok(()) => Some(settings),
         Err(errs) => {
-            *path_expansion_failed = true;
-            events.push(SettingsEvent::error(format!(
-                "Path expansion failed: {errs}. The complete configuration has been discarded; previous settings remain in effect. Please correct the affected paths and environment variables or remove them from your config."
-            )));
-            None
+            failed_paths.extend(errs.0.into_iter().map(|error| {
+                let input = match &error {
+                    crate::config::expand::ExpandError::UndefinedVar { input, .. }
+                    | crate::config::expand::ExpandError::NoHomeDir { input } => input.clone(),
+                };
+                (input, error.to_string())
+            }));
+            Some(settings)
         }
     }
+}
+
+fn settings_contains_path(settings: &RawWorkspaceSettings, needle: &str) -> bool {
+    settings
+        .search_paths
+        .as_ref()
+        .is_some_and(|paths| paths.iter().any(|path| path == needle))
+        || settings.languages.values().any(|language| {
+            language.parser.as_deref() == Some(needle)
+                || language
+                    .queries
+                    .as_ref()
+                    .is_some_and(|queries| queries.iter().any(|query| query.path == needle))
+        })
 }
 
 /// Load user config and add appropriate events to the events vector.
@@ -763,6 +780,47 @@ mod tests {
                 .map(|e| format!("{:?}: {}", e.kind, &e.message))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn higher_precedence_path_overrides_lower_expansion_error() {
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let user_config = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let config_dir = user_config.path().join("kakehashi");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("kakehashi.toml"),
+            "searchPaths = ['$UNDEFINED/parsers']\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", user_config.path()) };
+
+        let outcome = load_settings(
+            Some(project.path()),
+            Some((
+                SettingsSource::InitializationOptions,
+                serde_json::json!({"searchPaths": ["valid"]}),
+            )),
+            None,
+            |_| None,
+        );
+        unsafe {
+            match original_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert_eq!(
+            outcome.settings.unwrap().search_paths,
+            [project.path().join("valid").to_string_lossy()]
+        );
+        assert!(!outcome.events.iter().any(|event| {
+            event.kind == SettingsEventKind::Error
+                && event.message.contains("complete configuration")
+        }));
     }
 
     /// A config layer using the deprecated `rootMarkers` key sets the outcome

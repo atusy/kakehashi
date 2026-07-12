@@ -137,15 +137,19 @@ pub(crate) fn expand_settings_paths(
 ) -> Result<(), ExpandErrors> {
     let mut errors = Vec::new();
     let mut expand = |path: &mut String| match expand_path(path, home, &env_fn) {
-        Ok(expanded) => {
-            let expanded = Path::new(&expanded);
-            *path = if expanded.is_relative() {
-                base.map_or_else(
-                    || expanded.to_string_lossy().into_owned(),
-                    |base| base.join(expanded).clean().to_string_lossy().into_owned(),
-                )
+        Ok(expanded_string) => {
+            let expanded_path = Path::new(&expanded_string);
+            *path = if expanded_path.is_relative() {
+                if let Some(base) = base {
+                    base.join(expanded_path)
+                        .clean()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    expanded_string
+                }
             } else {
-                expanded.to_string_lossy().into_owned()
+                expanded_string
             };
         }
         Err(error) => errors.push(error),

@@ -7,15 +7,6 @@ use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_set
 
 use super::super::Kakehashi;
 
-fn resolve_runtime_paths(
-    settings: &mut RawWorkspaceSettings,
-    workspace_root: Option<&std::path::Path>,
-    home: Option<&str>,
-    env_fn: impl Fn(&str) -> Option<String>,
-) -> Result<(), crate::config::expand::ExpandErrors> {
-    crate::config::expand::expand_settings_paths(settings, workspace_root, home, env_fn)
-}
-
 const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
     "searchPaths",
     "languages",
@@ -398,7 +389,7 @@ impl Kakehashi {
         };
 
         let root_path = self.settings_manager.root_path();
-        if let Err(errs) = resolve_runtime_paths(
+        if let Err(errs) = crate::config::expand::expand_settings_paths(
             &mut parsed,
             root_path.as_deref(),
             self.home_dir.as_deref(),
@@ -460,8 +451,13 @@ mod tests {
             ..Default::default()
         };
 
-        resolve_runtime_paths(&mut settings, Some(Path::new("/workspace")), None, |_| None)
-            .expect("relative runtime paths should resolve");
+        crate::config::expand::expand_settings_paths(
+            &mut settings,
+            Some(Path::new("/workspace")),
+            None,
+            |_| None,
+        )
+        .expect("relative runtime paths should resolve");
 
         assert_eq!(
             settings.search_paths,
