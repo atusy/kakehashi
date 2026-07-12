@@ -138,6 +138,25 @@ impl Drop for InstallMarkerGuard {
     }
 }
 
+#[cfg(test)]
+fn failed_parser_state_dir() -> PathBuf {
+    crate::install::test_state_dir()
+}
+
+#[cfg(not(test))]
+fn failed_parser_state_dir() -> PathBuf {
+    std::env::var_os("KAKEHASHI_STATE_DIR")
+        // An empty value resolves to the process cwd (writing crash files
+        // wherever it was started), so treat it as unset — matching how
+        // `resolve_data_dir` handles an empty `KAKEHASHI_DATA_DIR`.
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(crate::install::default_data_dir)
+        // Platform-aware last resort (not a hard-coded `/tmp`, which doesn't
+        // exist on Windows); only reached if the data dir can't resolve.
+        .unwrap_or_else(|| std::env::temp_dir().join("kakehashi"))
+}
+
 impl AutoInstallManager {
     /// Create a new `AutoInstallManager`.
     pub fn new(
@@ -164,16 +183,7 @@ impl AutoInstallManager {
     /// If initialization fails, returns an uninitialized registry whose
     /// `begin_parsing` calls fail closed before entering native parser code.
     pub fn init_failed_parser_registry() -> FailedParserRegistry {
-        let state_dir = std::env::var_os("KAKEHASHI_STATE_DIR")
-            // An empty value resolves to the process cwd (writing crash files
-            // wherever it was started), so treat it as unset — matching how
-            // `resolve_data_dir` handles an empty `KAKEHASHI_DATA_DIR`.
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(crate::install::default_data_dir)
-            // Platform-aware last resort (not a hard-coded `/tmp`, which doesn't
-            // exist on Windows); only reached if the data dir can't resolve.
-            .unwrap_or_else(|| std::env::temp_dir().join("kakehashi"));
+        let state_dir = failed_parser_state_dir();
 
         let registry = FailedParserRegistry::new(&state_dir);
 
@@ -520,6 +530,16 @@ impl AutoInstallManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn unit_test_crash_state_is_separate_from_shared_install_assets() {
+        let shared_install_dir = crate::install::test_data_dir();
+
+        let state_dir = failed_parser_state_dir();
+
+        assert_ne!(state_dir, shared_install_dir);
+        assert_eq!(state_dir, failed_parser_state_dir());
+    }
 
     fn create_test_manager() -> (AutoInstallManager, tempfile::TempDir) {
         let temp = tempdir().expect("Failed to create temp dir");
