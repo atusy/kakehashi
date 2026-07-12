@@ -789,6 +789,39 @@ fn test_language_status_fails_for_dangling_install_directory_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_status_fails_for_dangling_parser_entry_symlink() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir(&parser_dir).expect("Failed to create parser directory");
+    symlink(
+        "missing-parser",
+        parser_dir.join(format!("rust.{}", std::env::consts::DLL_EXTENSION)),
+    )
+    .expect("Failed to create dangling parser symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect parser directory"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_status_fails_for_dangling_query_entry_symlink() {
     use std::fs;
     use std::os::unix::fs::symlink;
