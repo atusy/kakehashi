@@ -93,10 +93,12 @@ impl QueryLoader {
             .then(|| base.join("queries").join(lang_name).join(file_name).clean())
     }
 
-    fn parser_library_path(base: &Path, language: &str, ext: &str) -> PathBuf {
-        base.join("parser")
-            .join(format!("{language}.{ext}"))
-            .clean()
+    fn parser_library_path(base: &Path, language: &str, ext: &str) -> Option<PathBuf> {
+        is_single_path_component(language).then(|| {
+            base.join("parser")
+                .join(format!("{language}.{ext}"))
+                .clean()
+        })
     }
 
     /// Resolve query inheritance and return the combined query content.
@@ -400,7 +402,7 @@ impl QueryLoader {
         // Otherwise, search in searchPaths: <base>/parser/
         for path in search_paths {
             for ext in PARSER_EXTENSIONS {
-                let parser_path = Self::parser_library_path(path.as_ref(), language, ext);
+                let parser_path = Self::parser_library_path(path.as_ref(), language, ext)?;
                 if parser_path.exists() {
                     return Some(parser_path);
                 }
@@ -512,6 +514,20 @@ mod tests {
         assert!(!is_single_path_component("../rust"));
         assert!(!is_single_path_component("rust/query"));
         assert!(!is_single_path_component("/rust"));
+    }
+
+    #[test]
+    fn resolve_library_path_rejects_language_path_traversal() {
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        for ext in PARSER_EXTENSIONS {
+            fs::write(dir.path().join(format!("outside.{ext}")), "not a parser").unwrap();
+        }
+
+        let result = QueryLoader::resolve_library_path(None, "../../outside", &[runtime]);
+
+        assert_eq!(result, None);
     }
 
     #[test]
