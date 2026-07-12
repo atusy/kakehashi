@@ -30,6 +30,7 @@ trait ParserFileOps {
     fn remove_file(&mut self, path: &Path) -> std::io::Result<()>;
     fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()>;
     fn finalize_backup_marker(&mut self, backup: &Path) -> std::io::Result<()>;
+    fn remove_intent_marker(&mut self, backup: &Path) -> std::io::Result<()>;
     fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()>;
 }
 
@@ -60,11 +61,11 @@ fn publish_parser_transactionally(
     let had_old_parser = match ops.rename(parser_file, backup_file) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            ops.remove_backup_marker(backup_file)?;
+            ops.remove_intent_marker(backup_file)?;
             false
         }
         Err(error) => {
-            if let Err(marker_error) = ops.remove_backup_marker(backup_file) {
+            if let Err(marker_error) = ops.remove_intent_marker(backup_file) {
                 return Err(std::io::Error::new(
                     error.kind(),
                     format!(
@@ -80,7 +81,7 @@ fn publish_parser_transactionally(
     if had_old_parser && let Err(finalize_error) = ops.finalize_backup_marker(backup_file) {
         let rollback = ops.rename(backup_file, parser_file);
         let cleanup = if rollback.is_ok() {
-            Some(ops.remove_backup_marker(backup_file))
+            Some(ops.remove_intent_marker(backup_file))
         } else {
             // Keep intent/final ownership discoverable when the working parser
             // remains stranded at the backup path.
@@ -245,21 +246,32 @@ impl ParserFileOps for StdParserFileOps {
             &parser_backup_ownership_sidecar(backup),
             PARSER_BACKUP_MARKER_CONTENT,
         )?;
-        fs::remove_file(parser_backup_intent_sidecar(backup))
+        if let Err(error) = fs::remove_file(parser_backup_intent_sidecar(backup)) {
+            let final_cleanup = fs::remove_file(parser_backup_ownership_sidecar(backup));
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to remove backup intent: {error}; finalized marker cleanup: {final_cleanup:?}"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
-        for marker in [
-            parser_backup_ownership_sidecar(backup),
-            parser_backup_intent_sidecar(backup),
-        ] {
-            match fs::remove_file(marker) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+        match fs::remove_file(parser_backup_ownership_sidecar(backup)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
-        Ok(())
+    }
+
+    fn remove_intent_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+        match fs::remove_file(parser_backup_intent_sidecar(backup)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1820,8 +1832,18 @@ mod tests {
                     "injected marker cleanup failure",
                 ));
             }
-            self.backup_markers.remove(backup);
             self.finalized_backup_markers.remove(backup);
+            Ok(())
+        }
+
+        fn remove_intent_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+            if self.fail_marker_removal {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected marker cleanup failure",
+                ));
+            }
+            self.backup_markers.remove(backup);
             Ok(())
         }
 
@@ -1830,6 +1852,12 @@ mod tests {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "injected marker finalization failure",
+                ));
+            }
+            if self.finalized_backup_markers.contains(backup) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "injected finalized marker collision",
                 ));
             }
             if !self.backup_markers.remove(backup) {
@@ -2062,6 +2090,25 @@ mod tests {
         assert_eq!(ops.files.get(&parser), Some(&"old"));
         assert!(!ops.files.contains_key(&backup));
         assert!(ops.backup_markers.contains(&backup));
+    }
+
+    #[test]
+    fn transactional_publish_preserves_colliding_finalized_sidecar() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.finalized_backup_markers.insert(backup.clone());
+
+        publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("finalized sidecar collision must abort");
+
+        assert_eq!(ops.files.get(&parser), Some(&"old"));
+        assert!(!ops.files.contains_key(&backup));
+        assert!(ops.finalized_backup_markers.contains(&backup));
+        assert!(!ops.backup_markers.contains(&backup));
     }
 
     #[test]
