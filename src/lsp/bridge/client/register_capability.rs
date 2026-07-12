@@ -13,15 +13,13 @@ use serde::Deserialize;
 use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::RegistrationParams;
 
-use crate::lsp::bridge::actor::ServerRequestDeps;
-
-/// Handle a `client/registerCapability` request, returning the JSON-RPC body
-/// the dispatcher wraps in a response.
+/// Parse a `client/registerCapability` request. The dispatcher publishes the
+/// returned registrations only after its success response is queued, so a
+/// dependent notification cannot overtake the acknowledgement.
 pub(in crate::lsp::bridge) fn handle(
     message: &serde_json::Value,
     server_prefix: &str,
-    deps: &ServerRequestDeps,
-) -> jsonrpc::Result<serde_json::Value> {
+) -> jsonrpc::Result<Vec<tower_lsp_server::ls_types::Registration>> {
     let Some(params) = message.get("params") else {
         warn!(
             target: "kakehashi::bridge::reader",
@@ -44,8 +42,7 @@ pub(in crate::lsp::bridge) fn handle(
                     server_prefix, reg.method, reg.id
                 );
             }
-            deps.dynamic_capabilities.register(reg_params.registrations);
-            Ok(serde_json::Value::Null)
+            Ok(reg_params.registrations)
         }
         Err(e) => {
             warn!(

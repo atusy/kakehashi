@@ -13,15 +13,12 @@ use serde::Deserialize;
 use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::UnregistrationParams;
 
-use crate::lsp::bridge::actor::ServerRequestDeps;
-
-/// Handle a `client/unregisterCapability` request, returning the JSON-RPC body
-/// the dispatcher wraps in a response.
+/// Parse a `client/unregisterCapability` request. The dispatcher publishes the
+/// returned removals only after its success response is queued.
 pub(in crate::lsp::bridge) fn handle(
     message: &serde_json::Value,
     server_prefix: &str,
-    deps: &ServerRequestDeps,
-) -> jsonrpc::Result<serde_json::Value> {
+) -> jsonrpc::Result<Vec<tower_lsp_server::ls_types::Unregistration>> {
     let Some(params) = message.get("params") else {
         warn!(
             target: "kakehashi::bridge::reader",
@@ -44,9 +41,7 @@ pub(in crate::lsp::bridge) fn handle(
                     server_prefix, unreg.method, unreg.id
                 );
             }
-            deps.dynamic_capabilities
-                .unregister(unreg_params.unregisterations);
-            Ok(serde_json::Value::Null)
+            Ok(unreg_params.unregisterations)
         }
         Err(e) => {
             warn!(

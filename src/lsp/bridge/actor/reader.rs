@@ -998,13 +998,44 @@ async fn handle_server_request(
         _ => {}
     }
 
+    // Publish dynamic-capability changes only after their acknowledgements are
+    // on the connection's FIFO. A workspace-folder notification that relies on
+    // a new registration must not overtake the registration response; likewise
+    // recycling after unregistration must happen after its response is queued.
+    if method == "client/registerCapability" {
+        match client::register_capability::handle(&message, server_prefix) {
+            Ok(registrations) => {
+                let response = jsonrpc::Response::from_ok(id, serde_json::Value::Null);
+                if send_server_response(&deps.response_tx, response, server_prefix, method).await {
+                    deps.dynamic_capabilities.register(registrations);
+                }
+            }
+            Err(error) => {
+                let response = jsonrpc::Response::from_error(id, error);
+                let _ =
+                    send_server_response(&deps.response_tx, response, server_prefix, method).await;
+            }
+        }
+        return;
+    }
+    if method == "client/unregisterCapability" {
+        match client::unregister_capability::handle(&message, server_prefix) {
+            Ok(unregistrations) => {
+                let response = jsonrpc::Response::from_ok(id, serde_json::Value::Null);
+                if send_server_response(&deps.response_tx, response, server_prefix, method).await {
+                    deps.dynamic_capabilities.unregister(unregistrations);
+                }
+            }
+            Err(error) => {
+                let response = jsonrpc::Response::from_error(id, error);
+                let _ =
+                    send_server_response(&deps.response_tx, response, server_prefix, method).await;
+            }
+        }
+        return;
+    }
+
     let body: jsonrpc::Result<serde_json::Value> = match method {
-        "client/registerCapability" => {
-            client::register_capability::handle(&message, server_prefix, deps)
-        }
-        "client/unregisterCapability" => {
-            client::unregister_capability::handle(&message, server_prefix, deps)
-        }
         "window/workDoneProgress/create" => {
             window::work_done_progress_create::handle(&message, server_prefix, deps)
         }
@@ -1052,7 +1083,7 @@ pub(in crate::lsp::bridge) async fn send_server_response(
     response: jsonrpc::Response,
     server_prefix: &str,
     method: &str,
-) {
+) -> bool {
     // Response implements Serialize, so convert to Value for OutboundMessage.
     // Serialization cannot fail in practice, but the project bans panics in
     // production code; dropping the response is the only sane fallback here.
@@ -1064,7 +1095,7 @@ pub(in crate::lsp::bridge) async fn send_server_response(
                 "{}Failed to serialize response for server request '{}': {}",
                 server_prefix, method, e
             );
-            return;
+            return false;
         }
     };
 
@@ -1077,7 +1108,9 @@ pub(in crate::lsp::bridge) async fn send_server_response(
             "{}Failed to send response for server request '{}': {}",
             server_prefix, method, e
         );
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
@@ -1869,7 +1902,11 @@ mod tests {
     #[tokio::test]
     async fn handle_message_register_capability_updates_registry() {
         let router = ResponseRouter::new();
-        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        response_tx
+            .send(OutboundMessage::Untracked(json!({ "sentinel": true })))
+            .await
+            .unwrap();
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
@@ -1904,9 +1941,25 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        let mut task = tokio::spawn(async move {
+            handle_message(message, &router, "", &deps).await;
+        });
 
-        // Registry should have the registration
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut task)
+                .await
+                .is_err(),
+            "the full response queue must backpressure capability publication"
+        );
+        assert!(
+            !dynamic_capabilities.has_registration("textDocument/diagnostic"),
+            "registration must remain private until its acknowledgement is queued"
+        );
+        let sentinel = response_rx.recv().await.expect("sentinel remains queued");
+        assert!(matches!(sentinel, OutboundMessage::Untracked(value) if value["sentinel"] == true));
+        task.await.unwrap();
+
+        // Registry becomes visible after the response obtains its FIFO slot.
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         // A response should have been sent
