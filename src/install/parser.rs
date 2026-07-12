@@ -438,11 +438,15 @@ fn reserve_parser_staging_file(
             PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::env::consts::DLL_EXTENSION
         ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        match options.open(&candidate) {
             Ok(file) => {
                 #[cfg(unix)]
                 {
@@ -455,7 +459,14 @@ fn reserve_parser_staging_file(
                         Err(_) => Ok((candidate, None)),
                     };
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                {
+                    // The parent retains a no-delete-sharing handle until the
+                    // re-exec child has opened its overlapping guard. This
+                    // closes the parent-exit/child-start cleanup race.
+                    return Ok((candidate, Some(file)));
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     drop(file);
                     return Ok((candidate, None));
@@ -1522,6 +1533,30 @@ mod tests {
             .expect("cleanup succeeds");
 
         assert!(!staged.exists(), "confirmed-dead staging file is removed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_guards_overlap_without_delete_window() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let (staged, parent_guard) =
+            reserve_parser_staging_file(&parser_dir, "lua").expect("reserve staging file");
+        let child_guard = open_windows_staging_guard(&staged).expect("open child guard");
+        let renamed = parser_dir.join("renamed");
+
+        assert!(
+            fs::rename(&staged, &renamed).is_err(),
+            "parent and child guards deny cleanup rename"
+        );
+        drop(parent_guard);
+        assert!(
+            fs::rename(&staged, &renamed).is_err(),
+            "child guard remains after parent exit"
+        );
+        drop(child_guard);
+        fs::rename(&staged, &renamed).expect("rename succeeds after compiler exit");
     }
 
     #[cfg(unix)]
