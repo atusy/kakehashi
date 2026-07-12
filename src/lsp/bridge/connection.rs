@@ -16,6 +16,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// processes are outside kakehashi's trust boundary.
 const MAX_INBOUND_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_INBOUND_HEADER_SIZE: usize = 8 * 1024;
+const MAX_INBOUND_HEADER_COUNT: usize = 64;
 
 fn validate_inbound_content_length(content_length: usize) -> io::Result<usize> {
     if content_length > MAX_INBOUND_MESSAGE_SIZE {
@@ -76,7 +77,14 @@ impl BridgeReader {
         loop {
             let buffered = self.stdout.fill_buf().await?;
             if buffered.is_empty() {
-                return Ok(line);
+                return if line.is_empty() {
+                    Ok(line)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "downstream connection closed mid-header",
+                    ))
+                };
             }
             let consumed = buffered
                 .iter()
@@ -94,6 +102,12 @@ impl BridgeReader {
             if line.ends_with(b"\n") {
                 return Ok(line);
             }
+            if *remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("downstream message headers exceed limit {MAX_INBOUND_HEADER_SIZE}"),
+                ));
+            }
         }
     }
 }
@@ -108,6 +122,7 @@ impl BridgeReader {
 
         let mut content_length: Option<usize> = None;
         let mut remaining_header_bytes = MAX_INBOUND_HEADER_SIZE;
+        let mut header_count = 0;
 
         // Read headers until empty line
         loop {
@@ -124,6 +139,13 @@ impl BridgeReader {
 
             if trimmed.is_empty() {
                 break; // Empty line = end of headers
+            }
+            header_count += 1;
+            if header_count > MAX_INBOUND_HEADER_COUNT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("downstream message has more than {MAX_INBOUND_HEADER_COUNT} headers"),
+                ));
             }
 
             if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
@@ -588,6 +610,47 @@ mod tests {
 
         assert_eq!(result.kind(), io::ErrorKind::InvalidData);
         assert!(result.to_string().contains("headers exceed"), "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_rejects_exact_limit_unterminated_header_promptly() {
+        let script = format!("printf '%0{}d' 0; sleep 10", MAX_INBOUND_HEADER_SIZE);
+        let mut conn = AsyncBridgeConnection::spawn(vec!["sh".into(), "-c".into(), script])
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), conn.read_message())
+            .await
+            .expect("exhausted header budget must not stall")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_reports_eof_mid_header() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".into(),
+            "-c".into(),
+            "printf 'Content-Length: 1'".into(),
+        ])
+        .await
+        .unwrap();
+        let error = conn.read_message().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_rejects_excessive_header_count() {
+        let headers = "X: y\r\n".repeat(MAX_INBOUND_HEADER_COUNT + 1);
+        let script = format!("printf '%s\\r\\n' '{}'", headers.replace('\'', "'\\''"));
+        let mut conn = AsyncBridgeConnection::spawn(vec!["sh".into(), "-c".into(), script])
+            .await
+            .unwrap();
+        let error = conn.read_message().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("headers"));
     }
 
     #[test]
