@@ -37,8 +37,21 @@ impl WorkspaceFolderSet {
     /// the connection has no folders to advertise).
     pub(crate) fn new(initial: Option<Vec<WorkspaceFolder>>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(initial)),
+            inner: Arc::new(Mutex::new(Self::deduplicate(initial))),
         }
+    }
+
+    fn deduplicate(mut folders: Option<Vec<WorkspaceFolder>>) -> Option<Vec<WorkspaceFolder>> {
+        if let Some(folders) = folders.as_mut() {
+            let mut unique = Vec::<WorkspaceFolder>::with_capacity(folders.len());
+            for folder in folders.drain(..) {
+                if !unique.iter().any(|existing| existing.uri == folder.uri) {
+                    unique.push(folder);
+                }
+            }
+            *folders = unique;
+        }
+        folders
     }
 
     /// Snapshot the current folders for answering a `workspace/workspaceFolders`
@@ -56,7 +69,7 @@ impl WorkspaceFolderSet {
         *self
             .inner
             .lock()
-            .recover_poison("WorkspaceFolderSet::replace") = folders;
+            .recover_poison("WorkspaceFolderSet::replace") = Self::deduplicate(folders);
     }
 
     /// Whether a folder with `folder`'s URI is already in the set.
@@ -145,6 +158,19 @@ mod tests {
 
         let empty = WorkspaceFolderSet::new(None);
         assert_eq!(empty.snapshot(), None);
+    }
+
+    #[test]
+    fn initial_and_replacement_snapshots_are_uri_unique() {
+        let renamed_a = WorkspaceFolder {
+            uri: folder("file:///a").uri,
+            name: "renamed".to_string(),
+        };
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a"), renamed_a.clone()]));
+        assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
+
+        set.replace(Some(vec![renamed_a.clone(), folder("file:///a")]));
+        assert_eq!(set.snapshot(), Some(vec![renamed_a]));
     }
 
     #[test]
