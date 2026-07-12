@@ -424,8 +424,9 @@ where
                         .map(|s| UpstreamId::String(s.to_string()))
                 });
 
-            if let Some(upstream_id) = id_to_cancel {
-                let generation = forwarder.request_generation(&upstream_id);
+            if let Some(upstream_id) = id_to_cancel
+                && let Some(generation) = forwarder.request_generation(&upstream_id)
+            {
                 let forwarder = forwarder.clone();
                 // Fire-and-forget: spawn without tracking JoinHandle.
                 //
@@ -442,7 +443,7 @@ where
                 // forwarding pass is about to read (capture-before-notify).
                 tokio::spawn(async move {
                     if let Err(e) = forwarder
-                        .forward_cancel_for_generation(upstream_id.clone(), generation)
+                        .forward_cancel_for_generation(upstream_id.clone(), Some(generation))
                         .await
                     {
                         // Log the error but don't fail - cancel forwarding is best-effort
