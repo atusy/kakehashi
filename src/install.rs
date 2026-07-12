@@ -36,11 +36,29 @@ use std::path::PathBuf;
 pub struct LanguageOperationLockGuard {
     _all_file: fs::File,
     _file: fs::File,
+    data_dir: PathBuf,
+    language: String,
 }
 
 /// Cross-process exclusive lock for operations that affect every language.
 pub struct AllLanguageOperationsLockGuard {
     _file: fs::File,
+    data_dir: PathBuf,
+}
+
+/// Proof that the caller holds an operation lock covering one language.
+pub enum LanguageOperationPermit<'a> {
+    Language(&'a LanguageOperationLockGuard),
+    All(&'a AllLanguageOperationsLockGuard),
+}
+
+impl LanguageOperationPermit<'_> {
+    pub(crate) fn covers(&self, data_dir: &std::path::Path, language: &str) -> bool {
+        match self {
+            Self::Language(guard) => guard.data_dir == data_dir && guard.language == language,
+            Self::All(guard) => guard.data_dir == data_dir,
+        }
+    }
 }
 
 fn open_all_language_operations_lock(data_dir: &std::path::Path) -> std::io::Result<fs::File> {
@@ -58,7 +76,10 @@ impl AllLanguageOperationsLockGuard {
     pub fn acquire(data_dir: &std::path::Path) -> std::io::Result<AllLanguageOperationsLockGuard> {
         let file = open_all_language_operations_lock(data_dir)?;
         file.lock_exclusive()?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            data_dir: data_dir.to_path_buf(),
+        })
     }
 }
 
@@ -86,6 +107,8 @@ impl LanguageOperationLockGuard {
         Ok(Self {
             _all_file: all_file,
             _file: file,
+            data_dir: data_dir.to_path_buf(),
+            language: language.to_string(),
         })
     }
 }
@@ -371,7 +394,11 @@ fn install_language_blocking_with_query_installer(
     // AlreadyExists means the artifact is present and usable — success,
     // not failure; treating it as an error made the auto-install manager
     // degrade a fully-installed language to "installed but with warnings".
-    match parser::install_parser_after_operation_started(language, &parser_options) {
+    match parser::install_parser_after_operation_started(
+        language,
+        &parser_options,
+        LanguageOperationPermit::Language(&_operation_lock),
+    ) {
         Ok(parser_result) => {
             result.parser_path = Some(parser_result.install_path);
         }
@@ -482,6 +509,24 @@ mod tests {
         all_file
             .try_lock_exclusive()
             .expect("the all-language lock becomes available after the language operation");
+    }
+
+    #[test]
+    fn operation_permit_is_bound_to_its_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let language = LanguageOperationLockGuard::acquire(temp.path(), "lua").unwrap();
+        let permit = LanguageOperationPermit::Language(&language);
+        assert!(permit.covers(temp.path(), "lua"));
+        assert!(!permit.covers(temp.path(), "python"));
+        assert!(!permit.covers(other.path(), "lua"));
+        drop(language);
+
+        let all = AllLanguageOperationsLockGuard::acquire(temp.path()).unwrap();
+        let permit = LanguageOperationPermit::All(&all);
+        assert!(permit.covers(temp.path(), "lua"));
+        assert!(permit.covers(temp.path(), "python"));
+        assert!(!permit.covers(other.path(), "lua"));
     }
 
     #[test]

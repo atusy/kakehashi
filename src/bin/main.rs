@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use kakehashi::install::{
-    AllLanguageOperationsLockGuard, LanguageOperationLockGuard, default_data_dir, metadata, parser,
-    queries,
+    AllLanguageOperationsLockGuard, LanguageOperationLockGuard, LanguageOperationPermit,
+    default_data_dir, metadata, parser, queries,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -643,8 +643,19 @@ fn run_language_uninstall(
         // Remove queries directory and any kakehashi-created backups under the
         // same lock used by install replacement, so uninstall cannot race a
         // concurrent install into resurrecting queries after reporting success.
-        match queries::remove_query_install_and_backups_after_operation_started(&queries_dir, lang)
-        {
+        let operation_permit = match &_operation_lock {
+            Some(lock) => LanguageOperationPermit::Language(lock),
+            None => LanguageOperationPermit::All(
+                all_operations_lock
+                    .as_ref()
+                    .expect("--all retains its exclusive operation lock"),
+            ),
+        };
+        match queries::remove_query_install_and_backups_after_operation_started(
+            &queries_dir,
+            lang,
+            operation_permit,
+        ) {
             Ok(removal) => {
                 if removal.removed_queries {
                     eprintln!("✓ Removed queries: {}", queries_dir.join(lang).display());
@@ -664,7 +675,19 @@ fn run_language_uninstall(
         // lock with parser publication, its operation marker must be written after
         // query cleanup so an installer that starts during that cleanup cannot
         // publish a parser after this command reports success.
-        match parser::remove_parser_install_after_operation_started(&parser_dir, lang) {
+        let operation_permit = match &_operation_lock {
+            Some(lock) => LanguageOperationPermit::Language(lock),
+            None => LanguageOperationPermit::All(
+                all_operations_lock
+                    .as_ref()
+                    .expect("--all retains its exclusive operation lock"),
+            ),
+        };
+        match parser::remove_parser_install_after_operation_started(
+            &parser_dir,
+            lang,
+            operation_permit,
+        ) {
             Ok(true) => {
                 eprintln!(
                     "✓ Removed parser: {}",
@@ -811,7 +834,11 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         compile: parser::ParserCompile::KillableSubprocess,
     };
 
-    match parser::install_parser_after_operation_started(language, &options) {
+    match parser::install_parser_after_operation_started(
+        language,
+        &options,
+        LanguageOperationPermit::Language(&_operation_lock),
+    ) {
         Ok(result) => {
             eprintln!("✓ Parser installed: {}", result.install_path.display());
             if verbose {
@@ -828,7 +855,10 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     eprintln!("Installing queries for '{}' to {:?}...", language, data_dir);
 
     match queries::install_queries_with_dependencies_after_install_started(
-        language, &data_dir, force,
+        language,
+        &data_dir,
+        force,
+        LanguageOperationPermit::Language(&_operation_lock),
     ) {
         Ok(result) => {
             eprintln!("✓ Queries installed: {}", result.install_path.display());

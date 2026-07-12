@@ -363,7 +363,11 @@ pub fn remove_parser_install(
         ))
     })?;
     let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
-    remove_parser_install_after_operation_started(parser_dir, language)
+    remove_parser_install_after_operation_started(
+        parser_dir,
+        language,
+        super::LanguageOperationPermit::Language(&_operation_lock),
+    )
 }
 
 /// Remove a parser while the caller holds this language's operation lock.
@@ -371,7 +375,20 @@ pub fn remove_parser_install(
 pub fn remove_parser_install_after_operation_started(
     parser_dir: &Path,
     language: &str,
+    permit: super::LanguageOperationPermit<'_>,
 ) -> Result<bool, ParserInstallError> {
+    let Some(data_dir) = parser_dir.parent() else {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "parser directory must have a data-directory parent",
+        )));
+    };
+    if !permit.covers(data_dir, language) {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover this parser removal",
+        )));
+    }
     let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
     let mut marker = fs::File::create(parser_operation_marker_path(parser_dir, language))?;
     writeln!(marker, "uninstall:{}", ulid::Ulid::new())?;
@@ -392,7 +409,11 @@ pub fn install_parser(
         return Err(unsafe_language_name_error(language));
     }
     let _operation_lock = super::LanguageOperationLockGuard::acquire(&options.data_dir, language)?;
-    install_parser_after_operation_started(language, options)
+    install_parser_after_operation_started(
+        language,
+        options,
+        super::LanguageOperationPermit::Language(&_operation_lock),
+    )
 }
 
 /// Install a parser while the caller holds this language's operation lock.
@@ -403,7 +424,14 @@ pub fn install_parser(
 pub fn install_parser_after_operation_started(
     language: &str,
     options: &InstallOptions,
+    permit: super::LanguageOperationPermit<'_>,
 ) -> Result<ParserInstallResult, ParserInstallError> {
+    if !permit.covers(&options.data_dir, language) {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover this parser install",
+        )));
+    }
     // `language` becomes path segments (`parser/<language>.<ext>` and the temp
     // file) and a URL/metadata key, so reject traversal-capable names before
     // touching the filesystem. Higher-level callers (auto-install) already gate

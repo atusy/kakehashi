@@ -170,7 +170,14 @@ pub fn install_queries_with_dependencies_after_install_started(
     language: &str,
     data_dir: &Path,
     force: bool,
+    permit: super::LanguageOperationPermit<'_>,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    if !permit.covers(data_dir, language) {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover this query install",
+        )));
+    }
     install_queries_with_dependencies_from_with_http_policy(
         NVIM_TREESITTER_QUERIES_URL,
         language,
@@ -529,7 +536,11 @@ pub fn remove_query_install_and_backups(
         ))
     })?;
     let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
-    remove_query_install_and_backups_after_operation_started(queries_parent, language)
+    remove_query_install_and_backups_after_operation_started(
+        queries_parent,
+        language,
+        super::LanguageOperationPermit::Language(&_operation_lock),
+    )
 }
 
 /// Remove queries while the caller holds this language's operation lock.
@@ -537,7 +548,20 @@ pub fn remove_query_install_and_backups(
 pub fn remove_query_install_and_backups_after_operation_started(
     queries_parent: &Path,
     language: &str,
+    permit: super::LanguageOperationPermit<'_>,
 ) -> Result<QueryRemoval, QueryInstallError> {
+    let Some(data_dir) = queries_parent.parent() else {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queries directory must have a data-directory parent",
+        )));
+    };
+    if !permit.covers(data_dir, language) {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover this query removal",
+        )));
+    }
     validate_safe_language_name(language)?;
     fs::create_dir_all(queries_parent)?;
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
