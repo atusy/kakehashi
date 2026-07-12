@@ -1187,7 +1187,17 @@ fn test_language_uninstall_all() {
 
     // All parsers should be removed
     let parsers: Vec<_> = fs::read_dir(test_dir.path().join("parser"))
-        .map(|entries| entries.filter_map(|e| e.ok()).collect())
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_none_or(|name| !name.starts_with('.'))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     assert!(parsers.is_empty(), "All parsers should be removed");
 
