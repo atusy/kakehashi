@@ -328,14 +328,14 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
             continue;
         }
         let backup = parser_dir.join(backup_name);
-        if !backup.try_exists()? && parser_backup_marker_is_owned(&marker)? {
+        if parser_backup_marker_is_owned(&marker)? {
             if staged {
                 match fs::remove_file(marker) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
-            } else {
+            } else if !backup.try_exists()? {
                 remove_parser_backup_marker(&backup)?;
             }
         }
@@ -2043,16 +2043,24 @@ mod tests {
             .with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
         let malformed_staging =
             parser_backup_ownership_sidecar(&owned_backup).with_extension("owner.not-a-ulid.tmp");
+        let colliding_backup = parser_dir.join(generated_backup_name("lua", 123, 6));
+        let colliding_staging = parser_backup_ownership_sidecar(&colliding_backup)
+            .with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
         fs::write(&owned_marker, PARSER_BACKUP_MARKER_CONTENT).expect("write owned marker");
         fs::write(&user_marker, b"user marker").expect("write user marker");
         fs::write(&staged_marker, PARSER_BACKUP_MARKER_CONTENT).expect("write staged marker");
         fs::write(&malformed_staging, PARSER_BACKUP_MARKER_CONTENT)
             .expect("write malformed staging marker");
+        fs::write(&colliding_backup, b"user backup").expect("write colliding backup");
+        fs::write(&colliding_staging, PARSER_BACKUP_MARKER_CONTENT)
+            .expect("write colliding staging marker");
 
         recover_parser_backups(&parser_dir, &canonical, "lua").expect("clean orphan markers");
 
         assert!(!owned_marker.exists());
         assert!(!staged_marker.exists());
+        assert!(!colliding_staging.exists());
+        assert!(colliding_backup.exists());
         assert!(malformed_staging.exists());
         assert!(user_marker.exists());
         assert!(!canonical.exists());
