@@ -808,7 +808,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
 
     let _operation_lock =
         LanguageOperationLockGuard::acquire(&data_dir, language).map_err(|e| {
-            eprintln!("✗ Failed to lock installation for '{}': {}", language, e);
+            eprintln!("✗ Failed to lock installation for {:?}: {}", language, e);
             ExitCode::FAILURE
         })?;
 
