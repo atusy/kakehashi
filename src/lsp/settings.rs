@@ -69,6 +69,11 @@ pub struct SettingsLoadOutcome {
     /// with the didChangeConfiguration path); it is intentionally kept out of
     /// `events` so the many callers that re-load settings do not re-warn.
     pub used_deprecated_root_markers: bool,
+    /// Fatal error from an explicitly requested configuration source.
+    ///
+    /// Missing implicit user/project files remain optional, but a path passed
+    /// through `--config-file` represents user intent and must not be skipped.
+    pub fatal_error: Option<String>,
 }
 
 pub fn load_settings(
@@ -80,6 +85,7 @@ pub fn load_settings(
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut used_deprecated_root_markers = false;
+    let mut fatal_error = None;
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
@@ -91,10 +97,15 @@ pub fn load_settings(
                 "Using {} explicit config file(s); default config locations skipped",
                 files.len()
             )));
-            files
+            let layers = files
                 .iter()
                 .map(|p| load_toml_file(p, &mut events, &mut used_deprecated_root_markers))
-                .collect()
+                .collect();
+            fatal_error = events
+                .iter()
+                .find(|event| event.kind == SettingsEventKind::Error)
+                .map(|event| event.message.clone());
+            layers
         } else {
             vec![
                 // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
@@ -143,6 +154,7 @@ pub fn load_settings(
         raw_settings,
         events,
         used_deprecated_root_markers,
+        fatal_error,
     }
 }
 

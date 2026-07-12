@@ -192,6 +192,10 @@ impl Kakehashi {
             .log_settings_events(&settings_outcome.events)
             .await;
 
+        if let Some(error) = settings_outcome.fatal_error {
+            return Err(tower_lsp_server::jsonrpc::Error::invalid_params(error));
+        }
+
         // Nudge users off the deprecated `rootMarkers` config key. The claim
         // guard latches session-wide so a later didChangeConfiguration carrying
         // `rootMarkers` does not warn a second time (and vice versa).
