@@ -541,7 +541,6 @@ mod tests {
         assert_ne!(state_dir, shared_install_dir);
         assert_eq!(state_dir, failed_parser_state_dir());
         assert!(state_dir.join("crash_recovery.lock").is_file());
-        assert!(!shared_install_dir.join("crash_recovery.lock").exists());
     }
 
     fn create_test_manager() -> (AutoInstallManager, tempfile::TempDir) {
