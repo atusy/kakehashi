@@ -272,15 +272,18 @@ fn recover_parser_backups(
         }
         return Ok(());
     }
-    backups.sort_by_key(|path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
-    let restore = backups.pop().expect("non-empty parser backup list");
+    let mut timed_backups = backups
+        .into_iter()
+        .map(|path| {
+            let modified = fs::metadata(&path)?.modified()?;
+            Ok((modified, path))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    timed_backups.sort_by_key(|(modified, _)| *modified);
+    let (_, restore) = timed_backups.pop().expect("non-empty parser backup list");
     fs::rename(&restore, parser_file)?;
     fs::remove_file(parser_backup_ownership_sidecar(&restore))?;
-    for obsolete in backups {
+    for (_, obsolete) in timed_backups {
         remove_owned_parser_backup(&obsolete)?;
     }
     Ok(())
