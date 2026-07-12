@@ -24,6 +24,8 @@ const ARCHIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Parser grammars are source archives, not vendored corpora; 100 MiB keeps
 /// normal tree-sitter parsers below the budget while bounding gzip bombs.
 const MAX_ARCHIVE_EXTRACTED_BYTES: u64 = 100 * 1024 * 1024;
+/// Maximum bytes accepted for one regular archive entry.
+const MAX_ARCHIVE_ENTRY_BYTES: u64 = MAX_ARCHIVE_EXTRACTED_BYTES;
 /// Extra tar header/padding budget above extracted payload bytes.
 const ARCHIVE_TAR_METADATA_MARGIN_BYTES: u64 = 10 * 1024 * 1024;
 /// Maximum decompressed tar stream bytes for parser archives.
@@ -632,23 +634,30 @@ fn extract_archive_with_limits<R: Read>(
             fs::create_dir_all(&target)?;
         } else {
             let entry_size = entry.size();
-            extracted_bytes = extracted_bytes.checked_add(entry_size).ok_or_else(|| {
-                ParserInstallError::ArchiveSizeLimitExceeded(format!(
-                    "extracted file bytes exceed {} bytes",
-                    MAX_ARCHIVE_EXTRACTED_BYTES
-                ))
-            })?;
-            if extracted_bytes > MAX_ARCHIVE_EXTRACTED_BYTES {
-                return Err(ParserInstallError::ArchiveSizeLimitExceeded(format!(
-                    "extracted file bytes exceed {} bytes while extracting {}",
-                    MAX_ARCHIVE_EXTRACTED_BYTES,
-                    relative.display()
-                )));
-            }
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
             if entry.header().entry_type().is_file() {
+                if entry_size > MAX_ARCHIVE_ENTRY_BYTES {
+                    return Err(ParserInstallError::ArchiveSizeLimitExceeded(format!(
+                        "archive entry exceeds {} bytes while extracting {}",
+                        MAX_ARCHIVE_ENTRY_BYTES,
+                        relative.display()
+                    )));
+                }
+                extracted_bytes = extracted_bytes.checked_add(entry_size).ok_or_else(|| {
+                    ParserInstallError::ArchiveSizeLimitExceeded(format!(
+                        "extracted file bytes exceed {} bytes",
+                        MAX_ARCHIVE_EXTRACTED_BYTES
+                    ))
+                })?;
+                if extracted_bytes > MAX_ARCHIVE_EXTRACTED_BYTES {
+                    return Err(ParserInstallError::ArchiveSizeLimitExceeded(format!(
+                        "extracted file bytes exceed {} bytes while extracting {}",
+                        MAX_ARCHIVE_EXTRACTED_BYTES,
+                        relative.display()
+                    )));
+                }
                 unpack_entry_atomically(&mut entry, &target, &relative)?;
             } else {
                 // Atomic publication pre-creates a regular tempfile, which is
@@ -686,6 +695,10 @@ fn unpack_entry_atomically<R: Read>(
             &format!("Failed to extract {}", relative.display()),
             error,
         ));
+    }
+
+    if target.is_file() || target.is_symlink() {
+        fs::remove_file(target)?;
     }
 
     temp_path.persist(target).map_err(|error| {
@@ -1800,7 +1813,7 @@ mod tests {
         match result {
             Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
                 assert!(
-                    message.contains("extracted file bytes exceed"),
+                    message.contains("archive entry exceeds"),
                     "expected archive size limit error, got: {message}"
                 );
             }
@@ -1827,7 +1840,7 @@ mod tests {
         match result {
             Err(ParserInstallError::ArchiveSizeLimitExceeded(message)) => {
                 assert!(
-                    message.contains("extracted file bytes exceed"),
+                    message.contains("archive entry exceeds"),
                     "expected archive size limit error, got: {message}"
                 );
             }
@@ -1992,6 +2005,18 @@ mod tests {
     }
 
     #[test]
+    fn archive_duplicate_regular_file_uses_last_entry() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let dest = temp.path().join("source");
+        let archive = gzip_archive(tar_archive_with_duplicate_payloads("parser-1.0.0"));
+
+        extract_archive(GzDecoder::new(&archive[..]), "parser", "v1.0.0", &dest)
+            .expect("duplicate regular paths retain tar overwrite semantics");
+
+        assert_eq!(fs::read(dest.join("payload.bin")).unwrap(), b"second");
+    }
+
+    #[test]
     fn archive_size_limit_errors_do_not_allow_git_fallback() {
         assert!(!archive_error_allows_git_fallback(
             &ParserInstallError::ArchiveSizeLimitExceeded("too large".to_string())
@@ -2124,6 +2149,26 @@ mod tests {
             builder.finish().expect("finish tar");
         }
 
+        archive
+    }
+
+    fn tar_archive_with_duplicate_payloads(root: &str) -> Vec<u8> {
+        use tar::{Builder, Header};
+
+        let mut archive = Vec::new();
+        {
+            let mut builder = Builder::new(&mut archive);
+            for payload in [b"first".as_slice(), b"second".as_slice()] {
+                let mut header = Header::new_gnu();
+                header.set_size(payload.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("{root}/payload.bin"), payload)
+                    .expect("append duplicate payload");
+            }
+            builder.finish().expect("finish tar");
+        }
         archive
     }
 
