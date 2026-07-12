@@ -161,9 +161,11 @@ fn test_config_file_two_files_merge_in_order() {
 /// falling back to defaults.
 #[test]
 fn test_config_file_nonexistent_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("missing.toml");
     let mut client = LspClient::builder()
         .arg("--config-file")
-        .arg("/nonexistent/kakehashi-test-config.toml")
+        .arg(config_path.to_str().unwrap())
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
