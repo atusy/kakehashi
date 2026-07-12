@@ -338,7 +338,7 @@ pub fn install_parser(
     // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
     // by this process still fails at the rename — a loaded DLL can't be removed — a
     // pre-existing platform limitation this scheme doesn't change.)
-    let tmp_file = reserve_parser_staging_file(&parser_dir, language)?;
+    let (tmp_file, _tmp_lock) = reserve_parser_staging_file(&parser_dir, language)?;
     let compiled = match options.compile {
         ParserCompile::KillableSubprocess => compile_parser(&source_dir, &tmp_file),
         ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
@@ -377,7 +377,7 @@ pub fn install_parser(
 fn reserve_parser_staging_file(
     parser_dir: &Path,
     language: &str,
-) -> Result<PathBuf, ParserInstallError> {
+) -> Result<(PathBuf, Option<fs::File>), ParserInstallError> {
     loop {
         let candidate = parser_dir.join(format!(
             ".{}.{}.{}.{}.tmp",
@@ -391,7 +391,18 @@ fn reserve_parser_staging_file(
             .create_new(true)
             .open(&candidate)
         {
-            Ok(_) => return Ok(candidate),
+            Ok(file) => {
+                #[cfg(unix)]
+                {
+                    file.lock_exclusive()?;
+                    return Ok((candidate, Some(file)));
+                }
+                #[cfg(not(unix))]
+                {
+                    drop(file);
+                    return Ok((candidate, None));
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(ParserInstallError::IoError(error)),
         }
