@@ -592,8 +592,20 @@ fn collect_installed_languages_for_uninstall(
                     path.display()
                 ));
             }
-            if is_parser && let Some(stem) = path.file_stem() {
-                languages.insert(stem.to_string_lossy().to_string());
+            if is_parser {
+                let language =
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .ok_or_else(|| {
+                            format!("parser entry '{}' has a non-UTF-8 name", path.display())
+                        })?;
+                if !queries::is_safe_language_name(language) {
+                    return Err(format!(
+                        "parser entry '{}' has an invalid language name",
+                        path.display()
+                    ));
+                }
+                languages.insert(language.to_string());
             }
         }
     }

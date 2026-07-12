@@ -1451,6 +1451,45 @@ fn test_language_uninstall_rejects_non_file_parser_entries_before_query_removal(
     }
 }
 
+#[test]
+fn test_language_uninstall_all_rejects_invalid_parser_name_before_removal() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let query_dir = test_dir.path().join("queries/a_valid");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&query_dir).expect("Failed to create query dir");
+    let valid_parser = parser_dir.join(format!("a_valid.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&valid_parser, "fake").expect("Failed to write valid parser");
+    fs::write(
+        parser_dir.join(format!("z.bad.{}", std::env::consts::DLL_EXTENSION)),
+        "fake",
+    )
+    .expect("Failed to write invalid parser");
+    fs::write(query_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(!output.status.success(), "invalid parser name must fail");
+    assert!(
+        valid_parser.exists(),
+        "bulk preflight must reject every invalid name before removing valid installs"
+    );
+    assert!(query_dir.exists(), "valid queries must remain untouched");
+}
+
 #[cfg(unix)]
 #[test]
 fn test_language_uninstall_all_removes_dangling_parser_entry() {
