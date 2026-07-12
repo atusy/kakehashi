@@ -646,16 +646,40 @@ impl LanguageServerPool {
         // upstream snapshot. Once committed below, all live capable handles are
         // notified synchronously and every incompatible handle is marked
         // shutting down before the next await.
-        let connections = Arc::clone(&self.connections).lock_owned().await;
-        let ordering_locks: Vec<_> = connections
-            .iter()
-            .filter(|(key, _)| key.is_client_fallback() || key.is_shared())
-            .map(|(_, handle)| handle.dynamic_capabilities().workspace_folder_ordering())
-            .collect();
-        let mut _ordering_guards = Vec::with_capacity(ordering_locks.len());
-        for ordering in ordering_locks {
-            _ordering_guards.push(ordering.lock_owned().await);
-        }
+        let (connections, _ordering_guards) = loop {
+            let ordered_handles: Vec<_> = {
+                let connections = self.connections.lock().await;
+                connections
+                    .iter()
+                    .filter(|(key, _)| key.is_client_fallback() || key.is_shared())
+                    .map(|(_, handle)| Arc::clone(handle))
+                    .collect()
+            };
+            let mut ordering_guards = Vec::with_capacity(ordered_handles.len());
+            for handle in &ordered_handles {
+                ordering_guards.push(
+                    handle
+                        .dynamic_capabilities()
+                        .workspace_folder_ordering()
+                        .lock_owned()
+                        .await,
+                );
+            }
+            let connections = Arc::clone(&self.connections).lock_owned().await;
+            let snapshot_is_current = connections
+                .iter()
+                .filter(|(key, _)| key.is_client_fallback() || key.is_shared())
+                .all(|(_, current)| {
+                    ordered_handles
+                        .iter()
+                        .any(|ordered| Arc::ptr_eq(ordered, current))
+                });
+            if snapshot_is_current {
+                break (connections, ordering_guards);
+            }
+            drop(connections);
+            drop(ordering_guards);
+        };
         if !self.workspace_folders.apply_change(added.clone(), removed) {
             return;
         }
@@ -3375,6 +3399,10 @@ mod tests {
             None,
             "propagation must not commit while capability ordering is held"
         );
+        let connections = tokio::time::timeout(Duration::from_secs(1), pool.connections.lock())
+            .await
+            .expect("capability ordering must not block unrelated connection routing");
+        drop(connections);
         handle.dynamic_capabilities().unregister(vec![
             tower_lsp_server::ls_types::Unregistration {
                 id: "workspace-folders".to_string(),
