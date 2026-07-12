@@ -1791,6 +1791,67 @@ mod tests {
         fs::rename(&staged, &renamed).expect("rename succeeds after child exit");
     }
 
+    #[cfg(windows)]
+    const WINDOWS_JOB_HELPER_PID_FILE: &str = "KAKEHASHI_WINDOWS_JOB_HELPER_PID_FILE";
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper for windows_job_kills_descendant_on_owner_exit"]
+    fn windows_job_descendant_helper() {
+        let pid_file = std::env::var_os(WINDOWS_JOB_HELPER_PID_FILE)
+            .map(PathBuf::from)
+            .expect("helper PID file");
+        arm_windows_compile_job().expect("arm helper Job Object");
+        let descendant = Command::new("cmd.exe")
+            .args(["/C", "ping -n 60 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn descendant");
+        fs::write(pid_file, descendant.id().to_string()).expect("publish descendant PID");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_kills_descendant_on_owner_exit() {
+        let temp = tempdir().expect("temp dir");
+        let pid_file = temp.path().join("descendant.pid");
+        let mut helper = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--ignored",
+                "--exact",
+                "install::parser::tests::windows_job_descendant_helper",
+                "--nocapture",
+            ])
+            .env(WINDOWS_JOB_HELPER_PID_FILE, &pid_file)
+            .spawn()
+            .expect("spawn Job Object helper");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let descendant_pid = loop {
+            if let Ok(pid) = fs::read_to_string(&pid_file)
+                && let Ok(pid) = pid.parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper did not publish descendant PID"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(process_is_running_windows(descendant_pid));
+
+        helper.kill().expect("kill Job Object owner");
+        helper.wait().expect("wait for helper");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_running_windows(descendant_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_is_running_windows(descendant_pid),
+            "kill-on-close Job Object terminates descendants"
+        );
+    }
+
     #[cfg(unix)]
     fn terminated_child_pid() -> u32 {
         let mut child = std::process::Command::new(
