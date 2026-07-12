@@ -466,7 +466,8 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
 
 /// Make an untrusted diagnostic field safe for the line-oriented `default`
 /// format: collapse whitespace runs and visibly escape terminal controls.
-/// Single-pass, with no intermediate collection.
+/// A validation pass borrows already-safe text; only rewritten fields need a
+/// second pass and an allocation.
 fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
     let mut previous_whitespace = false;
     let mut needs_rewrite = false;
@@ -747,6 +748,18 @@ mod tests {
             one_line("before\u{1b}[31mred\u{7f}\u{009b}after"),
             "before\\u{1b}[31mred\\u{7f}\\u{9b}after"
         );
+    }
+
+    #[test]
+    fn safe_default_fields_stay_borrowed() {
+        assert!(matches!(
+            one_line("ordinary Unicode: 日本語"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            one_line("unsafe\u{1b}"),
+            std::borrow::Cow::Owned(_)
+        ));
     }
 
     #[test]
