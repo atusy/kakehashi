@@ -488,12 +488,21 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
     // same scan and lock acquisition for each stranded backup.
     let mut recovered_languages = std::collections::HashSet::new();
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
         let path = entry.path();
         // Recovery artifacts must be real directories. Do not follow a
         // staging/backup symlink outside the queries root, and propagate
         // entry-type errors instead of silently treating them as absent.
-        if !entry.file_type()?.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
+        if !file_type.is_dir() {
             continue;
         }
         if let Some(language) = backup_language_name(&path) {
@@ -882,12 +891,21 @@ fn newest_complete_backup_dir(
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
 
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
         let path = entry.path();
         // This helper is also called independently of the outer recovery scan.
         // Never follow a generated-name backup symlink or suppress entry-type
         // errors while selecting a directory to rename into the canonical path.
-        if !entry.file_type()?.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
+        if !file_type.is_dir() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -896,10 +914,21 @@ fn newest_complete_backup_dir(
         if !generated_backup_matches_language(name, language) {
             continue;
         }
-        if !backup_is_complete_and_owned(&path)? {
+        let complete = match backup_is_complete_and_owned(&path) {
+            Ok(complete) => complete,
+            Err(QueryInstallError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if !complete {
             continue;
         }
-        let modified = entry.metadata()?.modified()?;
+        let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
         if newest
             .as_ref()
             .is_none_or(|(current, _)| modified > *current)
