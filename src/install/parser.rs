@@ -26,6 +26,8 @@ const PARSER_OPERATION_MARKER_SUFFIX: &str = ".operation";
 trait ParserFileOps {
     fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()>;
     fn remove_file(&mut self, path: &Path) -> std::io::Result<()>;
+    fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()>;
+    fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()>;
 }
 
 #[cfg(any(windows, test))]
@@ -36,7 +38,21 @@ fn publish_parser_transactionally(
     backup_file: &Path,
 ) -> std::io::Result<()> {
     let had_old_parser = match ops.rename(parser_file, backup_file) {
-        Ok(()) => true,
+        Ok(()) => {
+            if let Err(marker_error) = ops.create_backup_marker(backup_file) {
+                return match ops.rename(backup_file, parser_file) {
+                    Ok(()) => Err(marker_error),
+                    Err(rollback_error) => Err(std::io::Error::new(
+                        marker_error.kind(),
+                        format!(
+                            "failed to mark parser backup: {marker_error}; failed to restore backup '{}': {rollback_error}",
+                            backup_file.display()
+                        ),
+                    )),
+                };
+            }
+            true
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),
     };
@@ -45,8 +61,10 @@ fn publish_parser_transactionally(
         Ok(()) => {
             if had_old_parser {
                 match ops.remove_file(backup_file) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(()) => ops.remove_backup_marker(backup_file)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ops.remove_backup_marker(backup_file)?;
+                    }
                     Err(error) => {
                         return Err(std::io::Error::new(
                             error.kind(),
@@ -65,7 +83,17 @@ fn publish_parser_transactionally(
                 return Err(publish_error);
             }
             match ops.rename(backup_file, parser_file) {
-                Ok(()) => Err(publish_error),
+                Ok(()) => {
+                    if let Err(marker_error) = ops.remove_backup_marker(backup_file) {
+                        return Err(std::io::Error::new(
+                            publish_error.kind(),
+                            format!(
+                                "failed to publish parser: {publish_error}; restored parser but failed to remove backup marker: {marker_error}"
+                            ),
+                        ));
+                    }
+                    Err(publish_error)
+                }
                 Err(rollback_error) => Err(std::io::Error::new(
                     publish_error.kind(),
                     format!(
@@ -89,6 +117,23 @@ impl ParserFileOps for StdParserFileOps {
 
     fn remove_file(&mut self, path: &Path) -> std::io::Result<()> {
         fs::remove_file(path)
+    }
+
+    fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(parser_backup_ownership_sidecar(backup))?;
+        marker.write_all(b"ok\n")
+    }
+
+    fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+        match fs::remove_file(parser_backup_ownership_sidecar(backup)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1280,7 +1325,7 @@ fn invalid_metadata(message: String) -> ParserInstallError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use tempfile::tempdir;
 
     const TREE_SITTER_JSON_URL: &str =
@@ -1293,6 +1338,8 @@ mod tests {
         rollback_error_kind: Option<std::io::ErrorKind>,
         failed_removals: Vec<PathBuf>,
         vanished_removals: Vec<PathBuf>,
+        backup_markers: HashSet<PathBuf>,
+        fail_marker_creation: bool,
     }
 
     impl ParserFileOps for FakeParserFileOps {
@@ -1338,6 +1385,21 @@ mod tests {
                 .remove(path)
                 .map(|_| ())
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing file"))
+        }
+
+        fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+            if self.fail_marker_creation || !self.backup_markers.insert(backup.to_path_buf()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "injected marker collision",
+                ));
+            }
+            Ok(())
+        }
+
+        fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+            self.backup_markers.remove(backup);
+            Ok(())
         }
     }
 
@@ -1448,6 +1510,43 @@ mod tests {
 
         assert_eq!(ops.files.get(&parser), Some(&"new"));
         assert!(!ops.files.contains_key(&backup));
+    }
+
+    #[test]
+    fn transactional_publish_does_not_claim_colliding_backup() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.files.insert(backup.clone(), "user");
+        ops.failed_renames.push((parser.clone(), backup.clone()));
+
+        publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("backup collision must abort publication");
+
+        assert_eq!(ops.files.get(&parser), Some(&"old"));
+        assert_eq!(ops.files.get(&backup), Some(&"user"));
+        assert!(!ops.backup_markers.contains(&backup));
+    }
+
+    #[test]
+    fn transactional_publish_preserves_colliding_sidecar() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.backup_markers.insert(backup.clone());
+
+        publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("sidecar collision must abort publication");
+
+        assert_eq!(ops.files.get(&parser), Some(&"old"));
+        assert!(!ops.files.contains_key(&backup));
+        assert!(ops.backup_markers.contains(&backup));
     }
 
     fn generated_backup_name(language: &str, pid: u32, counter: usize) -> String {
