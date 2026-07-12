@@ -165,10 +165,11 @@ pub(crate) struct ConnectionHandle {
     connection_key: ConnectionKey,
     /// The workspace folders this connection currently serves, shared with the
     /// reader task (which answers downstream `workspace/workspaceFolders`
-    /// pulls). For a `preferSharedInstance` connection (#391) the pool grows it
-    /// as new marker roots join, each addition paired with a
-    /// `workspace/didChangeWorkspaceFolders`; for a per-root connection it is
-    /// seeded once and never mutated.
+    /// pulls). Shared and client-fallback connections track live upstream
+    /// deltas while preserving marker-owned roots; a `preferSharedInstance`
+    /// connection (#391) also grows as new marker roots join. Each live change
+    /// is paired with `workspace/didChangeWorkspaceFolders`. Per-root
+    /// connections are seeded once and never mutated.
     workspace_folders: WorkspaceFolderSet,
     /// Guards the one-time "opt-in server lacks `workspaceFolders` capability,
     /// falling back to per-root instances" log for this server (#391), so the
@@ -532,8 +533,9 @@ impl ConnectionHandle {
     }
 
     /// The workspace folders this connection currently serves (#391), shared
-    /// with the reader task. The pool grows it (and announces the new root)
-    /// when a `preferSharedInstance` connection takes on another marker root.
+    /// with the reader task. Shared and client-fallback sets follow live
+    /// upstream deltas without removing marker-owned roots; shared sets also
+    /// grow and announce when another marker root joins.
     pub(crate) fn workspace_folders(&self) -> &WorkspaceFolderSet {
         &self.workspace_folders
     }
