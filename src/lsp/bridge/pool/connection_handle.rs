@@ -821,6 +821,7 @@ impl ConnectionHandle {
         // Reader continues running to receive shutdown response
         self.reader_handle.stop_liveness_timer();
         *state = ConnectionState::Closing;
+        drop(state);
         self.state_watch.send_replace(ConnectionState::Closing);
     }
 
