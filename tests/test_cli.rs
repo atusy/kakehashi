@@ -1284,6 +1284,53 @@ fn test_language_install_rejects_unsafe_name_before_creating_data_dir() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_targeted_uninstall_revalidates_roots_after_confirmation() {
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::symlink;
+    use std::process::Stdio;
+
+    let test_dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    fs::create_dir_all(test_dir.path().join("parser")).unwrap();
+    fs::create_dir_all(test_dir.path().join("queries/lua")).unwrap();
+    let parser_name = format!("lua.{}", std::env::consts::DLL_EXTENSION);
+    fs::write(external.path().join(&parser_name), "keep").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stderr = child.stderr.take().unwrap();
+    let mut prompt = Vec::new();
+    while !prompt.ends_with(b"[y/N] ") {
+        let mut byte = [0];
+        stderr.read_exact(&mut byte).unwrap();
+        prompt.push(byte[0]);
+    }
+
+    fs::remove_dir(test_dir.path().join("parser")).unwrap();
+    symlink(external.path(), test_dir.path().join("parser")).unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(external.path().join(parser_name)).unwrap(),
+        "keep"
+    );
+}
+
 /// A bulk uninstall must include an install that starts after confirmation is
 /// requested but completes before its exclusive snapshot.
 #[test]

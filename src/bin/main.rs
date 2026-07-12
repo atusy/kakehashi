@@ -870,12 +870,24 @@ fn run_language_uninstall(
             eprintln!("No languages installed to uninstall.");
             return Ok(());
         }
-    } else if let Some(language) = targeted_language
-        && let Err(e) =
+    } else {
+        // Confirmation happens outside the lock, so validate roots again at
+        // the mutation point to close filesystem TOCTOU windows.
+        read_optional_install_dir(&parser_dir, "parser").map_err(|e| {
+            eprintln!("Failed to validate install roots: {e}");
+            ExitCode::FAILURE
+        })?;
+        let language = targeted_language.expect("targeted uninstall has a language");
+        preflight_targeted_query_state(&queries_dir, language).map_err(|e| {
+            eprintln!("Failed to preflight targeted query state: {e}");
+            ExitCode::FAILURE
+        })?;
+        if let Err(e) =
             queries::recover_interrupted_query_installs_for_language(&queries_dir, language)
-    {
-        eprintln!("Failed to recover interrupted query installs for '{language}': {e}");
-        return Err(ExitCode::FAILURE);
+        {
+            eprintln!("Failed to recover interrupted query installs for '{language}': {e}");
+            return Err(ExitCode::FAILURE);
+        }
     }
 
     // Uninstall each language

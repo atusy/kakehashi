@@ -185,6 +185,7 @@ pub fn install_queries_with_dependencies_after_install_started_under_operation_l
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
     install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         NVIM_TREESITTER_QUERIES_URL,
         language,
@@ -1287,6 +1288,23 @@ mod tests {
             "keep",
             "unsafe tombstone cleanup must not escape queries/"
         );
+    }
+
+    #[test]
+    fn under_operation_lock_install_rejects_unsafe_language_before_path_use() {
+        let temp = TempDir::new().unwrap();
+
+        let result = install_queries_with_dependencies_after_install_started_under_operation_lock(
+            "../../evil",
+            temp.path(),
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(QueryInstallError::InvalidLanguageName(_))
+        ));
+        assert!(!temp.path().join("queries").exists());
     }
 
     #[test]
