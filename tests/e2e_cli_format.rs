@@ -320,8 +320,21 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
     let ws = workspace_with(&[("tool", &source)]);
     let unknown = "x".repeat(9 * 1024);
     std::fs::write(ws.path().join("unknown"), &unknown).expect("write unknown text file");
-    std::fs::write(ws.path().join("binary"), vec![0xff; 9 * 1024])
-        .expect("write extensionless binary");
+    let sparse_path = ws.path().join("binary");
+    let sparse = std::fs::File::create(&sparse_path).expect("create extensionless sparse binary");
+    sparse
+        .set_len(64 * 1024 * 1024)
+        .expect("size sparse binary");
+    drop(sparse);
+    use std::io::{Seek as _, Write as _};
+    let mut sparse = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sparse_path)
+        .expect("open sparse binary");
+    sparse
+        .seek(std::io::SeekFrom::Start(0))
+        .expect("seek sparse binary");
+    sparse.write_all(&[0xff]).expect("mark sparse as binary");
     std::fs::write(
         ws.path().join("kakehashi.toml"),
         config_toml().replace("languages = [\"lua\"]", "languages = [\"python\"]"),

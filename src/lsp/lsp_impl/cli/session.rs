@@ -61,13 +61,14 @@ impl Kakehashi {
     }
 
     /// Whether a file discovered during a directory walk identifies a known
-    /// language by path or by its first line. Only path misses read content,
-    /// and only the first line is materialized, matching explicit-file shebang
-    /// and mode-line detection without reading the full document. Files whose
+    /// language by path or by a bounded first-line probe. Only path misses read
+    /// content. Files whose probe is truncated are retained for authoritative
+    /// detection during normal processing, preserving explicit-file parity
+    /// without unbounded allocation during discovery. Files whose
     /// first-line I/O fails are retained so the command's normal read path can
     /// report the operational error; invalid UTF-8 is filtered as non-text.
     pub(crate) fn cli_can_handle_discovered_file(&self, path: &Path) -> bool {
-        use std::io::BufRead as _;
+        use std::io::{BufRead as _, Read as _};
 
         if self.cli_can_handle_path(path) {
             return true;
@@ -78,23 +79,33 @@ impl Kakehashi {
             // unsupported language.
             return true;
         };
+        const MAX_FIRST_LINE_BYTES: usize = 8 * 1024;
         let mut first_line = Vec::new();
-        // Intentionally read the complete first line: syntect's first-line
-        // rules include mode markers that may occur near its end, and applying
-        // a different cutoff here would recreate explicit-vs-directory drift.
-        // This runs only for path-detection misses, one file at a time, and
-        // retains less data than normal processing (which reads the full file).
         if std::io::BufReader::new(file)
+            .take((MAX_FIRST_LINE_BYTES + 1) as u64)
             .read_until(b'\n', &mut first_line)
             .is_err()
         {
             return true;
         }
-        let Ok(first_line) = std::str::from_utf8(&first_line) else {
-            // An unknown extensionless binary is not an operational read
-            // failure and cannot participate in text language detection.
-            return false;
+        let truncated = first_line.len() > MAX_FIRST_LINE_BYTES;
+        let probe = &first_line[..first_line.len().min(MAX_FIRST_LINE_BYTES)];
+        let first_line = match std::str::from_utf8(probe) {
+            Ok(line) => line,
+            // A valid multibyte character may straddle the hard probe boundary.
+            Err(error) if truncated && error.error_len().is_none() => {
+                std::str::from_utf8(&probe[..error.valid_up_to()])
+                    .expect("valid_up_to always identifies valid UTF-8")
+            }
+            // Unknown extensionless binary content cannot participate in text
+            // language detection.
+            Err(_) => return false,
         };
+        if truncated {
+            // Syntect mode markers can occur after the probe. Keep valid text
+            // so the normal full-document path makes the authoritative choice.
+            return true;
+        }
         self.language
             .loadable_language_for_document(&path.to_string_lossy(), first_line)
             .is_some()
