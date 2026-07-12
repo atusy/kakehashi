@@ -43,7 +43,8 @@ const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["folds", "highlights"];
 const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] =
     &["aliases", "base", "bridge", "layers", "parser", "queries"];
 
-const KNOWN_LAYER_AGGREGATION_SETTING_KEYS: &[&str] = &["priorities", "strategy"];
+const KNOWN_LAYER_AGGREGATION_SETTING_KEYS: &[&str] =
+    &["minPublishIntervalMs", "priorities", "strategy"];
 
 const KNOWN_LAYERS_SETTING_KEYS: &[&str] = &["aggregation"];
 
