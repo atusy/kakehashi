@@ -656,6 +656,14 @@ fn generated_temp_parts(name: &str) -> Option<(&str, &str, &str)> {
     }
 }
 
+/// Whether a directory name belongs to the staging/backup namespace that
+/// [`recover_interrupted_query_installs`] may mutate.
+pub fn is_recovery_directory_name(name: &str) -> bool {
+    generated_backup_parts(name).is_some_and(|(language, _, _)| is_safe_language_name(language))
+        || generated_temp_parts(name)
+            .is_some_and(|(language, _, _)| is_safe_language_name(language))
+}
+
 fn remove_interrupted_temp_query_install(
     queries_parent: &Path,
     language: &str,

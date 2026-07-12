@@ -1762,6 +1762,50 @@ fn test_language_uninstall_all_preflights_recovery_backups_before_restore() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_ignores_unrelated_hidden_query_dirs() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let cache_dir = test_dir.path().join("queries/.cache");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&cache_dir).expect("Failed to create unrelated cache dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make unrelated cache unreadable");
+    if fs::read_dir(&cache_dir).is_ok() {
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore cache permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore cache permissions");
+    assert!(
+        output.status.success(),
+        "unrelated hidden directories must not block uninstall: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!parser.exists(), "valid parser must be removed");
+    assert!(cache_dir.exists(), "unrelated hidden directory must remain");
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {

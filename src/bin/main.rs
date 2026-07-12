@@ -523,10 +523,14 @@ fn installed_query_language_name_for_uninstall(
     let is_dir = file_type.is_dir() || file_type.is_symlink();
     let language = installed_query_language_name_if_dir(&path, is_dir);
     // Hidden staging/backup directories are skipped as installed languages,
-    // but recovery can mutate them into canonical installs. Validate every
-    // real directory before recovery so an unreadable candidate cannot be
-    // renamed first and fail only on the post-recovery scan.
-    if file_type.is_dir() {
+    // but recovery can mutate recognized ones into canonical installs. Avoid
+    // traversing unrelated hidden directories that neither recovery nor
+    // uninstall owns.
+    let is_recovery_dir = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(queries::is_recovery_directory_name);
+    if file_type.is_dir() && (language.is_some() || is_recovery_dir) {
         preflight_query_install_tree(&path)?;
     }
     Ok(language)
