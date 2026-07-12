@@ -15,6 +15,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// but a declared length must be bounded before allocation because downstream
 /// processes are outside kakehashi's trust boundary.
 const MAX_INBOUND_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+const MAX_INBOUND_HEADER_SIZE: usize = 8 * 1024;
 
 fn validate_inbound_content_length(content_length: usize) -> io::Result<usize> {
     if content_length > MAX_INBOUND_MESSAGE_SIZE {
@@ -69,6 +70,32 @@ impl BridgeReader {
             stdout: BufReader::new(stdout),
         }
     }
+
+    async fn read_header_line(&mut self, remaining: &mut usize) -> io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        loop {
+            let buffered = self.stdout.fill_buf().await?;
+            if buffered.is_empty() {
+                return Ok(line);
+            }
+            let consumed = buffered
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(buffered.len(), |index| index + 1);
+            if consumed > *remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("downstream message headers exceed limit {MAX_INBOUND_HEADER_SIZE}"),
+                ));
+            }
+            line.extend_from_slice(&buffered[..consumed]);
+            *remaining -= consumed;
+            self.stdout.consume(consumed);
+            if line.ends_with(b"\n") {
+                return Ok(line);
+            }
+        }
+    }
 }
 
 impl BridgeReader {
@@ -80,11 +107,17 @@ impl BridgeReader {
         use tokio::io::AsyncReadExt;
 
         let mut content_length: Option<usize> = None;
+        let mut remaining_header_bytes = MAX_INBOUND_HEADER_SIZE;
 
         // Read headers until empty line
         loop {
-            let mut line = String::new();
-            self.stdout.read_line(&mut line).await?;
+            let line = self.read_header_line(&mut remaining_header_bytes).await?;
+            let line = std::str::from_utf8(&line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid LSP header: {error}"),
+                )
+            })?;
 
             // Trim CRLF/LF endings
             let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -537,6 +570,24 @@ mod tests {
 
         assert_eq!(result.kind(), io::ErrorKind::InvalidData);
         assert!(result.to_string().contains("exceeds"), "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_rejects_oversized_unterminated_header() {
+        let script = format!("printf '%0{}d' 0; sleep 10", MAX_INBOUND_HEADER_SIZE + 1);
+        let mut conn =
+            AsyncBridgeConnection::spawn(vec!["sh".to_string(), "-c".to_string(), script])
+                .await
+                .expect("spawn header writer");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), conn.read_message())
+            .await
+            .expect("oversized header must be rejected before its terminator")
+            .expect_err("oversized header must fail");
+
+        assert_eq!(result.kind(), io::ErrorKind::InvalidData);
+        assert!(result.to_string().contains("headers exceed"), "{result}");
     }
 
     #[test]
