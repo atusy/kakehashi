@@ -564,6 +564,13 @@ fn claim_and_unlink_stale_parser_file(
             return Err(ParserInstallError::IoError(error));
         }
         let claimed = candidate.join("artifact");
+        // Among cooperating installers, `path` cannot change here: its
+        // create_new reservation remains present until this atomic rename, and
+        // every cleaner follows this same lock/claim protocol. A same-UID actor
+        // deliberately rewriting the private data directory can also delete an
+        // installed parser directly and is outside this filesystem protocol's
+        // trust boundary. The post-rename inode check still fail-closes without
+        // deleting an unexpected inode.
         match fs::rename(path, &claimed) {
             Ok(()) => {
                 let current = fs::symlink_metadata(&claimed)?;
@@ -697,7 +704,9 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
             // installer reserves staging paths with create_new, so after this
             // claim it may safely reuse the old PID/counter name without our
             // cleanup deleting its newly-created output.
-            let Some(claimed) = claim_and_unlink_stale_parser_file(parser_dir, &path)? else {
+            // Recovery is best-effort. An unreadable or otherwise unclaimable
+            // lookalike must not prevent installation from proceeding.
+            let Ok(Some(claimed)) = claim_and_unlink_stale_parser_file(parser_dir, &path) else {
                 continue;
             };
             remove_stale_cleanup_claim(&claimed);
@@ -1456,6 +1465,28 @@ mod tests {
 
         assert!(staged.is_dir(), "non-file staging path is preserved");
         assert!(claim.is_dir(), "non-file cleanup claim is preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_unreadable_staging_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let staged = parser_dir.join(format!(
+            ".lua.{}.0.{}.tmp",
+            terminated_child_pid(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"unreadable lookalike").expect("write staging file");
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o000))
+            .expect("remove read permission");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup remains best-effort");
+
+        assert!(staged.exists(), "unreadable staging file is preserved");
     }
 
     #[cfg(unix)]
