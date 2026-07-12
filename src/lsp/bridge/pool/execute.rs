@@ -405,6 +405,10 @@ mod tests {
     }
 
     async fn assert_concurrent_downstream_ids_are_unique(upstream_id: UpstreamId, name: &str) {
+        let numeric_upstream_id = match &upstream_id {
+            UpstreamId::Number(id) => Some(*id),
+            UpstreamId::String(_) => None,
+        };
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = test_host_uri(name);
         pool.open_host_incarnation(&host_uri, 1).await;
@@ -432,6 +436,18 @@ mod tests {
         let _ = tokio::join!(first_request, second_request);
 
         assert_ne!(first, second, "concurrent requests need fresh numeric ids");
+        if let Some(upstream_id) = numeric_upstream_id {
+            assert_ne!(
+                first.as_i64(),
+                upstream_id,
+                "downstream id mirrored upstream"
+            );
+            assert_ne!(
+                second.as_i64(),
+                upstream_id,
+                "downstream id mirrored upstream"
+            );
+        }
     }
 
     #[tokio::test]
