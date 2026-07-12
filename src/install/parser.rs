@@ -381,7 +381,12 @@ pub fn owned_parser_backup_languages(parser_dir: &Path) -> std::io::Result<Vec<S
             continue;
         };
         let marker = parser_backup_ownership_sidecar(&entry.path());
-        if parser_backup_marker_is_owned(&marker)? {
+        let canonical =
+            parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
+        if parser_backup_marker_is_owned(&marker)?
+            || (!canonical.try_exists()?
+                && parser_backup_marker_is_intent(&parser_backup_intent_sidecar(&entry.path()))?)
+        {
             languages.insert(language.to_owned());
         }
     }
@@ -403,14 +408,16 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
         let Some(marker_name) = marker.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let (backup_name, staged) = if let Some(backup_name) = marker_name.strip_suffix(".owner") {
-            (backup_name, false)
+        let (backup_name, kind) = if let Some(backup_name) = marker_name.strip_suffix(".owner") {
+            (backup_name, 0_u8)
+        } else if let Some(backup_name) = marker_name.strip_suffix(".owner.intent") {
+            (backup_name, 1_u8)
         } else if let Some((backup_name, nonce)) = marker_name
             .strip_suffix(".tmp")
             .and_then(|name| name.rsplit_once(".owner."))
             && ulid::Ulid::from_string(nonce).is_ok()
         {
-            (backup_name, true)
+            (backup_name, 2_u8)
         } else {
             continue;
         };
@@ -418,16 +425,23 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
             continue;
         }
         let backup = parser_dir.join(backup_name);
-        if parser_backup_marker_is_owned(&marker)? {
-            if staged {
+        let canonical = parser_dir.join(format!("{language}.{}", std::env::consts::DLL_EXTENSION));
+        if kind == 2 {
+            if parser_backup_marker_is_owned(&marker)? || parser_backup_marker_is_intent(&marker)? {
                 match fs::remove_file(marker) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
-            } else if !backup.try_exists()? {
+            }
+        } else if kind == 1 {
+            if parser_backup_marker_is_intent(&marker)?
+                && (!backup.try_exists()? || canonical.try_exists()?)
+            {
                 remove_parser_backup_marker(&backup)?;
             }
+        } else if parser_backup_marker_is_owned(&marker)? && !backup.try_exists()? {
+            remove_parser_backup_marker(&backup)?;
         }
     }
     Ok(())
@@ -2022,6 +2036,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owned_parser_backup_languages_discovers_crash_intent_only_without_canonical() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 9));
+        fs::write(&backup, b"working parser").expect("write backup");
+        fs::write(
+            parser_backup_intent_sidecar(&backup),
+            PARSER_BACKUP_INTENT_CONTENT,
+        )
+        .expect("write intent");
+
+        assert_eq!(
+            owned_parser_backup_languages(&parser_dir).expect("discover intent"),
+            vec!["lua"]
+        );
+        fs::write(
+            parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+            b"canonical",
+        )
+        .expect("write canonical");
+        assert!(
+            owned_parser_backup_languages(&parser_dir)
+                .expect("collision is not owned")
+                .is_empty()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn owned_parser_backup_languages_ignores_marker_symlink() {
@@ -2239,6 +2282,10 @@ mod tests {
         let colliding_backup = parser_dir.join(generated_backup_name("lua", 123, 6));
         let colliding_staging = parser_backup_ownership_sidecar(&colliding_backup)
             .with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
+        let orphan_intent_backup = parser_dir.join(generated_backup_name("lua", 123, 10));
+        let orphan_intent = parser_backup_intent_sidecar(&orphan_intent_backup);
+        let staged_intent = parser_backup_ownership_sidecar(&owned_backup)
+            .with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
         fs::write(&owned_marker, PARSER_BACKUP_MARKER_CONTENT).expect("write owned marker");
         fs::write(&user_marker, b"user marker").expect("write user marker");
         fs::write(&staged_marker, PARSER_BACKUP_MARKER_CONTENT).expect("write staged marker");
@@ -2247,12 +2294,16 @@ mod tests {
         fs::write(&colliding_backup, b"user backup").expect("write colliding backup");
         fs::write(&colliding_staging, PARSER_BACKUP_MARKER_CONTENT)
             .expect("write colliding staging marker");
+        fs::write(&orphan_intent, PARSER_BACKUP_INTENT_CONTENT).expect("write orphan intent");
+        fs::write(&staged_intent, PARSER_BACKUP_INTENT_CONTENT).expect("write staged intent");
 
         recover_parser_backups(&parser_dir, &canonical, "lua").expect("clean orphan markers");
 
         assert!(!owned_marker.exists());
         assert!(!staged_marker.exists());
         assert!(!colliding_staging.exists());
+        assert!(!orphan_intent.exists());
+        assert!(!staged_intent.exists());
         assert!(colliding_backup.exists());
         assert!(malformed_staging.exists());
         assert!(user_marker.exists());
