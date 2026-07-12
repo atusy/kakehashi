@@ -26,6 +26,7 @@ pub(crate) struct SettingsSnapshot {
 pub(crate) struct SettingsManager {
     root_path: ArcSwap<Option<PathBuf>>,
     settings_snapshot: ArcSwap<SettingsSnapshot>,
+    settings_changed: tokio::sync::watch::Sender<u64>,
     /// Client capabilities from initialize() - immutable after initialization.
     /// Uses OnceLock to enforce "set once, read many" semantics per LSP protocol.
     client_capabilities: OnceLock<ClientCapabilities>,
@@ -79,6 +80,7 @@ impl SettingsManager {
                 raw_settings: Arc::new(raw_settings),
                 settings: Arc::new(settings),
             })),
+            settings_changed: tokio::sync::watch::channel(0).0,
             client_capabilities: OnceLock::new(),
             root_markers_deprecation_warned: AtomicBool::new(false),
             unwrapped_didchange_deprecation_warned: AtomicBool::new(false),
@@ -159,6 +161,10 @@ impl SettingsManager {
         self.settings_snapshot.load_full()
     }
 
+    pub(crate) fn subscribe_settings_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.settings_changed.subscribe()
+    }
+
     /// Apply new workspace settings for later retrieval via `load_settings()`.
     pub(crate) fn apply_settings(&self, settings: WorkspaceSettings) {
         let raw_settings = RawWorkspaceSettings::from(&settings);
@@ -175,6 +181,9 @@ impl SettingsManager {
             raw_settings: Arc::new(raw_settings),
             settings: Arc::new(settings),
         }));
+        self.settings_changed.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
     }
 
     /// Returns true only if client declared workspace.semanticTokens.refreshSupport.

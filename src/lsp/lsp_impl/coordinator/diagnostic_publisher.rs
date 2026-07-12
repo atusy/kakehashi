@@ -771,8 +771,8 @@ impl DiagnosticPublisher {
         changed
     }
 
-    /// Re-run [`Self::republish`] for `host` once the quiet window elapses,
-    /// sending the (re-merged, latest) withheld set to the wire. At most one
+    /// Re-run [`Self::republish`] for `host` once the quiet window elapses or
+    /// settings change, sending or re-gating the latest withheld set. At most one
     /// task is parked per host at a time ([`WireAdmit::Defer`]'s
     /// `schedule_trailing`). Clears the gate's `pending` marker *before*
     /// re-running, so a defer racing the re-run schedules a fresh task rather
@@ -791,12 +791,16 @@ impl DiagnosticPublisher {
     /// [`WireAdmit::Defer`]: crate::lsp::diagnostic_cache::WireAdmit::Defer
     fn spawn_trailing_wire_publish(&self, host: Url, remaining: std::time::Duration) {
         let publisher = self.clone();
+        let mut settings_changed = self.settings_manager.subscribe_settings_changes();
         // Anchor the deadline NOW (at defer time), not at the task's first poll
         // — under load the first poll can lag, which would silently stretch the
         // quiet window.
         let deadline = tokio::time::Instant::now() + remaining;
         tokio::spawn(async move {
-            tokio::time::sleep_until(deadline).await;
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = settings_changed.changed() => {}
+            }
             if !publisher.aggregator.wire_gate_take_pending(&host) {
                 return; // gate forgotten while parked: debt cancelled
             }
@@ -1628,6 +1632,45 @@ mod tests {
             publisher.republish(&uri).await,
             RepublishOutcome::Unchanged,
             "after the flush an identical re-merge is a plain unchanged skip"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_zero_interval_flushes_existing_withheld_publish() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/live_zero.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        for message in ["first", "second"] {
+            server.diagnostics.record(
+                &uri,
+                DiagnosticSource::Host,
+                "rust_ls".to_string(),
+                Some(ProgressConnectionId::for_test(1)),
+                vec![diag(message)],
+            );
+            publisher.republish(&uri).await;
+        }
+        assert!(server.diagnostics.wire_gate_is_dirty(&uri));
+
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_interval(0));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !server.diagnostics.wire_gate_is_dirty(&uri),
+            "live zero interval must flush without waiting for another diagnostic event"
         );
     }
 
