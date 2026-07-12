@@ -61,15 +61,15 @@ impl Kakehashi {
     }
 
     /// Whether a file discovered during a directory walk identifies a known
-    /// language by path or by its first line. The bounded read keeps filtering
-    /// cheap while matching explicit-file shebang and mode-line detection.
+    /// language by path or by its first line. Only path misses read content,
+    /// and only the first line is materialized, matching explicit-file shebang
+    /// and mode-line detection without reading the full document.
     pub(crate) fn cli_can_handle_discovered_file(&self, path: &Path) -> bool {
-        use std::io::{BufRead as _, Read as _};
+        use std::io::BufRead as _;
 
         if self.cli_can_handle_path(path) {
             return true;
         }
-        const MAX_FIRST_LINE_BYTES: usize = 8 * 1024;
         let Ok(file) = std::fs::File::open(path) else {
             // Keep the candidate so the command's normal read path reports
             // the operational error instead of silently treating it as an
@@ -78,21 +78,18 @@ impl Kakehashi {
         };
         let mut first_line = Vec::new();
         if std::io::BufReader::new(file)
-            .take((MAX_FIRST_LINE_BYTES + 1) as u64)
             .read_until(b'\n', &mut first_line)
             .is_err()
         {
             return true;
         }
-        if first_line.len() > MAX_FIRST_LINE_BYTES {
-            // Preserve exact explicit-file semantics without making directory
-            // filtering allocate an unbounded line: let normal processing read
-            // the full document and perform its existing content detection.
-            return true;
-        }
-        let first_line = String::from_utf8_lossy(&first_line);
+        let Ok(first_line) = std::str::from_utf8(&first_line) else {
+            // An unknown extensionless binary is not an operational read
+            // failure and cannot participate in text language detection.
+            return false;
+        };
         self.language
-            .loadable_language_for_document(&path.to_string_lossy(), &first_line)
+            .loadable_language_for_document(&path.to_string_lossy(), first_line)
             .is_some()
     }
 

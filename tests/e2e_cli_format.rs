@@ -318,6 +318,10 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
     // or silently skipping the valid UTF-8 file.
     let source = format!("{prefix}{padding}é\nvalue = 1\n");
     let ws = workspace_with(&[("tool", &source)]);
+    let unknown = "x".repeat(9 * 1024);
+    std::fs::write(ws.path().join("unknown"), &unknown).expect("write unknown text file");
+    std::fs::write(ws.path().join("binary"), vec![0xff; 9 * 1024])
+        .expect("write extensionless binary");
     std::fs::write(
         ws.path().join("kakehashi.toml"),
         config_toml().replace("languages = [\"lua\"]", "languages = [\"python\"]"),
@@ -337,6 +341,7 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
         read(ws.path(), "tool"),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(read(ws.path(), "unknown"), unknown);
 }
 
 #[test]
