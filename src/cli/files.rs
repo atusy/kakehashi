@@ -134,12 +134,12 @@ pub(crate) fn collect_files(
     files.sort();
     let has_explicit_alias = explicit_inputs_have_alias(&mut explicit_identities);
     if has_explicit_alias {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::with_capacity(files.len());
         files.retain(|path| {
             // Preserve the stable sorted spelling for output, but compare the
             // resolved path so explicit filesystem aliases do not process one file
-            // twice. If an entry vanished after collection, retain its lexical
-            // path and let the caller report the existing read error.
+            // twice. If identity resolution fails after collection, retain the
+            // lexical path so the caller can report any later read error.
             let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
             seen.insert(identity)
         });
