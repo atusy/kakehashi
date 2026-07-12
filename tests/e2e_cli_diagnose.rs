@@ -116,10 +116,11 @@ fn e2e_diagnose_missing_explicit_config_exits_error() {
     let output = run_diagnose(ws.path(), &["doc.md"]);
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr_of(&output).contains("Config file not found"),
-        "stderr should report the missing explicit config: {}",
-        stderr_of(&output)
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr.matches("Config file not found").count(),
+        1,
+        "stderr should report the missing explicit config exactly once: {stderr}"
     );
 }
 
