@@ -1380,6 +1380,50 @@ fn test_language_uninstall_all_preflights_before_query_recovery() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_fails_when_query_recovery_fails() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    let stranded_tmp = queries_dir.join(".lua.4294967295.0.tmp");
+    fs::create_dir_all(&stranded_tmp).expect("Failed to create stranded query temp dir");
+    fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o500))
+        .expect("Failed to make queries dir read-only");
+
+    // Elevated environments may still create the recovery lock.
+    let probe = queries_dir.join("permission-probe");
+    if fs::write(&probe, "probe").is_ok() {
+        let _ = fs::remove_file(probe);
+        fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore queries dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore queries dir permissions");
+    assert!(
+        !output.status.success(),
+        "failed recovery must fail --all; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stranded_tmp.exists(), "failed recovery must stay visible");
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {

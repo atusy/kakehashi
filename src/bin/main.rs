@@ -597,6 +597,10 @@ fn run_language_uninstall(
         })?;
     }
     if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+        if all {
+            eprintln!("Failed to recover interrupted query installs: {e}");
+            return Err(ExitCode::FAILURE);
+        }
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }
 
