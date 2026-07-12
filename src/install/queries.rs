@@ -154,6 +154,7 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
     let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
     install_queries_with_dependencies_from_with_http_policy(
@@ -517,6 +518,23 @@ impl QueryRemoval {
 }
 
 pub fn remove_query_install_and_backups(
+    queries_parent: &Path,
+    language: &str,
+) -> Result<QueryRemoval, QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let data_dir = queries_parent.parent().ok_or_else(|| {
+        QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queries directory must have a data-directory parent",
+        ))
+    })?;
+    let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
+    remove_query_install_and_backups_after_operation_started(queries_parent, language)
+}
+
+/// Remove queries while the caller holds this language's operation lock.
+#[doc(hidden)]
+pub fn remove_query_install_and_backups_after_operation_started(
     queries_parent: &Path,
     language: &str,
 ) -> Result<QueryRemoval, QueryInstallError> {

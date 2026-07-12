@@ -353,6 +353,25 @@ pub fn remove_parser_install(
     parser_dir: &Path,
     language: &str,
 ) -> Result<bool, ParserInstallError> {
+    if !super::queries::is_safe_language_name(language) {
+        return Err(unsafe_language_name_error(language));
+    }
+    let data_dir = parser_dir.parent().ok_or_else(|| {
+        ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "parser directory must have a data-directory parent",
+        ))
+    })?;
+    let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
+    remove_parser_install_after_operation_started(parser_dir, language)
+}
+
+/// Remove a parser while the caller holds this language's operation lock.
+#[doc(hidden)]
+pub fn remove_parser_install_after_operation_started(
+    parser_dir: &Path,
+    language: &str,
+) -> Result<bool, ParserInstallError> {
     let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
     let mut marker = fs::File::create(parser_operation_marker_path(parser_dir, language))?;
     writeln!(marker, "uninstall:{}", ulid::Ulid::new())?;
@@ -369,6 +388,9 @@ pub fn install_parser(
     language: &str,
     options: &InstallOptions,
 ) -> Result<ParserInstallResult, ParserInstallError> {
+    if !super::queries::is_safe_language_name(language) {
+        return Err(unsafe_language_name_error(language));
+    }
     let _operation_lock = super::LanguageOperationLockGuard::acquire(&options.data_dir, language)?;
     install_parser_after_operation_started(language, options)
 }

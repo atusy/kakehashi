@@ -643,7 +643,8 @@ fn run_language_uninstall(
         // Remove queries directory and any kakehashi-created backups under the
         // same lock used by install replacement, so uninstall cannot race a
         // concurrent install into resurrecting queries after reporting success.
-        match queries::remove_query_install_and_backups(&queries_dir, lang) {
+        match queries::remove_query_install_and_backups_after_operation_started(&queries_dir, lang)
+        {
             Ok(removal) => {
                 if removal.removed_queries {
                     eprintln!("✓ Removed queries: {}", queries_dir.join(lang).display());
@@ -663,7 +664,7 @@ fn run_language_uninstall(
         // lock with parser publication, its operation marker must be written after
         // query cleanup so an installer that starts during that cleanup cannot
         // publish a parser after this command reports success.
-        match parser::remove_parser_install(&parser_dir, lang) {
+        match parser::remove_parser_install_after_operation_started(&parser_dir, lang) {
             Ok(true) => {
                 eprintln!(
                     "✓ Removed parser: {}",
