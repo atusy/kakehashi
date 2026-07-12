@@ -1524,6 +1524,46 @@ mod tests {
     }
 
     #[test]
+    fn existing_child_does_not_override_explicit_parent_uninstall() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let queries_parent = data_dir.join("queries");
+        let child_dir = queries_parent.join("child_lang");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join("highlights.scm"),
+            "; inherits: parent_lang\n(identifier) @variable\n",
+        )
+        .unwrap();
+        write_install_marker(&child_dir).unwrap();
+        write_uninstall_tombstone(&queries_parent, "parent_lang").unwrap();
+        let base_url = spawn_query_file_server(vec![(
+            "/parent_lang/highlights.scm",
+            "(comment) @comment\n",
+        )]);
+
+        let result = install_queries_with_dependencies_from_allowing_http_for_tests(
+            &base_url,
+            "child_lang",
+            &data_dir,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(path)) if path == child_dir),
+            "the already-installed child keeps its normal result"
+        );
+        assert!(
+            !queries_parent.join("parent_lang").exists(),
+            "dependency discovery from disk must preserve the parent's uninstall intent"
+        );
+        assert!(
+            uninstall_tombstone_path(&queries_parent, "parent_lang").is_file(),
+            "the skipped-child path must not authorize an implicit parent reinstall"
+        );
+    }
+
+    #[test]
     fn force_reinstall_preserves_existing_queries_on_required_download_failure() {
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().to_path_buf();
