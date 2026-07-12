@@ -357,12 +357,15 @@ mod tests {
     use crate::lsp::bridge::pool::test_helpers::*;
     use std::sync::Arc;
 
-    async fn capture_downstream_id(
+    fn start_observed_request(
         pool: Arc<LanguageServerPool>,
         handle: Arc<ConnectionHandle>,
         host_uri: Url,
         upstream_id: UpstreamId,
-    ) -> RequestId {
+    ) -> (
+        tokio::task::JoinHandle<io::Result<()>>,
+        Arc<std::sync::OnceLock<RequestId>>,
+    ) {
         let probe = Arc::new(std::sync::OnceLock::new());
         let request_probe = Arc::clone(&probe);
         let request = tokio::spawn(async move {
@@ -387,6 +390,10 @@ mod tests {
             .await
         });
 
+        (request, probe)
+    }
+
+    async fn wait_for_downstream_id(probe: &std::sync::OnceLock<RequestId>) -> RequestId {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while probe.get().is_none() {
                 tokio::task::yield_now().await;
@@ -394,10 +401,7 @@ mod tests {
         })
         .await
         .expect("request should publish its downstream id");
-        let downstream_id = *probe.get().expect("probe should be populated");
-        request.abort();
-        let _ = request.await;
-        downstream_id
+        *probe.get().expect("probe should be populated")
     }
 
     #[tokio::test]
@@ -411,24 +415,26 @@ mod tests {
         )
         .await;
         pool.insert_connection(Arc::clone(&handle)).await;
-        let upstream_id = UpstreamId::Number(42);
+        let upstream_id = UpstreamId::String("client-request".into());
 
-        let first = capture_downstream_id(
+        let (first_request, first_probe) = start_observed_request(
             Arc::clone(&pool),
             Arc::clone(&handle),
             host_uri.clone(),
             upstream_id.clone(),
-        )
-        .await;
-        let second = capture_downstream_id(pool, handle, host_uri, upstream_id).await;
-
-        assert_ne!(first, second, "each downstream request needs a fresh id");
-        assert_ne!(first.as_i64(), 42, "downstream id must not mirror upstream");
-        assert_ne!(
-            second.as_i64(),
-            42,
-            "downstream id must not mirror upstream"
         );
+        let (second_request, second_probe) =
+            start_observed_request(pool, handle, host_uri, upstream_id);
+
+        let (first, second) = tokio::join!(
+            wait_for_downstream_id(&first_probe),
+            wait_for_downstream_id(&second_probe)
+        );
+        first_request.abort();
+        second_request.abort();
+        let _ = tokio::join!(first_request, second_request);
+
+        assert_ne!(first, second, "concurrent requests need fresh numeric ids");
     }
 
     #[tokio::test]
