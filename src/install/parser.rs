@@ -1291,9 +1291,12 @@ mod tests {
 
     #[cfg(unix)]
     fn terminated_child_pid() -> u32 {
-        let mut child = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn short-lived child");
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("--help")
+        .spawn()
+        .expect("spawn short-lived child");
         let pid = child.id();
         child.wait().expect("wait for short-lived child");
         assert!(!process_is_running(pid), "reaped child PID is not running");
