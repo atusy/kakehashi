@@ -170,6 +170,19 @@ pub fn install_queries_with_dependencies_after_install_started(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
+    install_queries_with_dependencies_after_install_started_under_operation_lock(
+        language, data_dir, force,
+    )
+}
+
+/// Continue query installation while the caller holds the operation lock.
+#[doc(hidden)]
+pub fn install_queries_with_dependencies_after_install_started_under_operation_lock(
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
     install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         NVIM_TREESITTER_QUERIES_URL,
         language,

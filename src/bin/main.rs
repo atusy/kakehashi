@@ -745,9 +745,10 @@ fn run_language_uninstall(
         Some(language)
     };
     // Discovery and recovery may mutate stranded query state, so even the
-    // preliminary snapshot participates in the operation protocol. Release
-    // this shared lock before asking for input.
-    let preliminary_lock = kakehashi::install::operation_lock::LanguageOperationGuard::shared(
+    // preliminary snapshot participates in the operation protocol. A short
+    // exclusive phase prevents strict recursive scans from observing install
+    // renames mid-flight. Release it before asking for input.
+    let preliminary_lock = kakehashi::install::operation_lock::LanguageOperationGuard::exclusive(
         &data_dir,
     )
     .map_err(|e| {
@@ -1117,7 +1118,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     // Install queries (with inherited dependencies)
     eprintln!("Installing queries for '{}' to {:?}...", language, data_dir);
 
-    match queries::install_queries_with_dependencies_after_install_started(
+    match queries::install_queries_with_dependencies_after_install_started_under_operation_lock(
         language, &data_dir, force,
     ) {
         Ok(result) => {
