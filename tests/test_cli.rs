@@ -1342,7 +1342,7 @@ fn test_language_uninstall_all_removes_dangling_parser_entry() {
 
 #[cfg(unix)]
 #[test]
-fn test_language_uninstall_all_fails_before_removal_for_query_symlink_loop() {
+fn test_language_uninstall_all_removes_query_symlink_entry() {
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -1368,11 +1368,16 @@ fn test_language_uninstall_all_fails_before_removal_for_query_symlink_loop() {
         .expect("Failed to execute command");
 
     assert!(
-        !output.status.success(),
-        "an unreadable query entry must fail; stderr: {}",
+        output.status.success(),
+        "query symlink should be removable without resolving its target; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(parser.exists(), "preflight failure must not remove parsers");
+    assert!(!parser.exists(), "the discovered parser must be removed");
+    assert!(
+        fs::symlink_metadata(queries_dir.join("loop"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "query symlink entry must be removed"
+    );
 }
 
 #[cfg(unix)]

@@ -491,13 +491,10 @@ fn installed_query_language_name_for_uninstall(
     let file_type = entry
         .file_type()
         .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
-    let is_dir = if file_type.is_symlink() {
-        path.metadata()
-            .map_err(|e| format!("cannot resolve query entry '{}': {e}", path.display()))?
-            .is_dir()
-    } else {
-        file_type.is_dir()
-    };
+    // A safe-named symlink directly under queries/ is itself an uninstallable
+    // query-root entry. Do not follow it: a dangling target or loop must not
+    // make the kakehashi-owned namespace impossible to clean.
+    let is_dir = file_type.is_dir() || file_type.is_symlink();
     Ok(installed_query_language_name_if_dir(&path, is_dir))
 }
 
