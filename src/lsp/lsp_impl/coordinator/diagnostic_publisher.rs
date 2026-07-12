@@ -91,6 +91,25 @@ const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from
 /// Short enough that a downstream re-analysis still prompts a timely editor
 /// pull, but longer than the 1 ms-scale refresh bursts observed in #789.
 const FORWARDED_REFRESH_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+/// Bound staleness when a server emits refreshes continuously. This matches the
+/// existing diagnostics publish cadence and still reduces a sustained stream
+/// from an unbounded rate to at most one refresh per second.
+const FORWARDED_REFRESH_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn wait_for_forwarded_refresh_settle(aggregator: &DiagnosticAggregator, mut generation: u64) {
+    let deadline = tokio::time::Instant::now() + FORWARDED_REFRESH_MAX_WAIT;
+    loop {
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + FORWARDED_REFRESH_SETTLE_WINDOW).min(deadline),
+        )
+        .await;
+        let force = tokio::time::Instant::now() >= deadline;
+        match aggregator.finish_forwarded_refresh_wait(generation, force) {
+            Some(latest) => generation = latest,
+            None => return,
+        }
+    }
+}
 
 /// Bundles the state needed to merge the cache and publish for a host, so the
 /// notification feeds (reader push, host-event pull) can trigger a republish
@@ -124,24 +143,13 @@ impl DiagnosticPublisher {
     /// Coalesce a burst of downstream `workspace/diagnostic/refresh` requests
     /// into one forced upstream refresh after the burst settles (#789).
     pub(crate) fn request_forwarded_diagnostic_refresh(&self) {
-        let Some(mut generation) = self.aggregator.begin_forwarded_refresh_debounce() else {
+        let Some(generation) = self.aggregator.begin_forwarded_refresh_debounce() else {
             return;
         };
         let publisher = self.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(FORWARDED_REFRESH_SETTLE_WINDOW).await;
-                match publisher
-                    .aggregator
-                    .finish_forwarded_refresh_wait(generation)
-                {
-                    Some(latest) => generation = latest,
-                    None => {
-                        publisher.request_pull_diagnostic_refresh(true);
-                        break;
-                    }
-                }
-            }
+            wait_for_forwarded_refresh_settle(&publisher.aggregator, generation).await;
+            publisher.request_pull_diagnostic_refresh(true);
         });
     }
 
@@ -1473,6 +1481,29 @@ mod tests {
             RepublishOutcome::Unchanged,
             "the sealed set was recorded as last-published, so a re-merge is unchanged"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_stream_is_bounded_by_max_wait() {
+        let aggregator = Arc::new(DiagnosticAggregator::new());
+        let generation = aggregator
+            .begin_forwarded_refresh_debounce()
+            .expect("first refresh claims the debounce task");
+        let waiter_aggregator = Arc::clone(&aggregator);
+        let waiter = tokio::spawn(async move {
+            super::wait_for_forwarded_refresh_settle(&waiter_aggregator, generation).await;
+        });
+        tokio::task::yield_now().await;
+
+        for _ in 0..9 {
+            tokio::time::advance(std::time::Duration::from_millis(90)).await;
+            assert!(
+                aggregator.begin_forwarded_refresh_debounce().is_none(),
+                "continuous activity reuses the debounce task"
+            );
+        }
+        tokio::time::advance(std::time::Duration::from_millis(190)).await;
+        waiter.await.expect("debounce task completes at max wait");
     }
 
     #[tokio::test(start_paused = true)]

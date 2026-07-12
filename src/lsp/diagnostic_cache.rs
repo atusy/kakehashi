@@ -633,12 +633,12 @@ impl DiagnosticAggregator {
     /// Check whether activity occurred during the debounce wait. A newer
     /// generation restarts the settle window; `None` releases the task claim
     /// and tells the caller to forward exactly one refresh.
-    pub(crate) fn finish_forwarded_refresh_wait(&self, observed: u64) -> Option<u64> {
+    pub(crate) fn finish_forwarded_refresh_wait(&self, observed: u64, force: bool) -> Option<u64> {
         let mut debounce = self
             .forwarded_refresh_debounce
             .lock()
             .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
-        if debounce.generation != observed {
+        if !force && debounce.generation != observed {
             Some(debounce.generation)
         } else {
             debounce.task_scheduled = false;
@@ -2347,10 +2347,10 @@ mod tests {
             "burst activity must reuse the scheduled task"
         );
         let latest = agg
-            .finish_forwarded_refresh_wait(first)
+            .finish_forwarded_refresh_wait(first, false)
             .expect("activity during the wait restarts the settle window");
         assert_eq!(
-            agg.finish_forwarded_refresh_wait(latest),
+            agg.finish_forwarded_refresh_wait(latest, false),
             None,
             "a quiet window releases exactly one refresh"
         );
