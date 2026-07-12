@@ -472,12 +472,14 @@ fn claim_and_unlink_stale_parser_file(
     let file = match fs::OpenOptions::new()
         .read(true)
         // The pathname can be replaced after symlink_metadata. Never block if
-        // an external actor swaps in a FIFO before open.
-        .custom_flags(nix::libc::O_NONBLOCK)
+        // an external actor swaps in a FIFO before open, and never follow a
+        // symlink swapped into the final path component.
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW)
         .open(path)
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => return Ok(None),
         Err(error) => return Err(ParserInstallError::IoError(error)),
     };
     if !file.metadata()?.file_type().is_file() {
@@ -488,7 +490,7 @@ fn claim_and_unlink_stale_parser_file(
         Err(_) => return Ok(None),
     }
     let opened = file.metadata()?;
-    let current = match fs::metadata(path) {
+    let current = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ParserInstallError::IoError(error)),
@@ -539,8 +541,19 @@ fn process_is_running(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserInstallError> {
-    for entry in fs::read_dir(parser_dir)? {
-        let entry = entry?;
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         if let Some(pid) = cleanup_claim_pid(&path) {
             if !process_is_running(pid) {
@@ -1286,6 +1299,35 @@ mod tests {
 
         assert!(staged.is_dir(), "non-file staging path is preserved");
         assert!(claim.is_dir(), "non-file cleanup claim is preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_staging_symlink_and_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let target = temp.path().join("user-file");
+        fs::write(&target, b"user data").expect("write target");
+        let staged = parser_dir.join(format!(
+            ".lua.{}.0.{}.tmp",
+            terminated_child_pid(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        symlink(&target, &staged).expect("create staging-shaped symlink");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(
+            fs::symlink_metadata(&staged)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink(),
+            "staging-shaped symlink is preserved"
+        );
+        assert_eq!(fs::read(&target).expect("read target"), b"user data");
     }
 
     const TREE_SITTER_JSON_URL: &str =
