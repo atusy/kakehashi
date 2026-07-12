@@ -1785,6 +1785,46 @@ fn test_language_uninstall_preflights_target_query_contents() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_uninstall_cancel_does_not_recover_unrelated_languages() {
+    use std::fs;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let unrelated_tmp = test_dir.path().join("queries/.python.4294967295.0.tmp");
+    fs::create_dir_all(&unrelated_tmp).expect("Failed to create unrelated recovery temp");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn command");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"n\n")
+        .expect("Failed to cancel uninstall");
+    let output = child
+        .wait_with_output()
+        .expect("Failed to wait for command");
+
+    assert!(output.status.success(), "cancellation should succeed");
+    assert!(
+        unrelated_tmp.exists(),
+        "cancellation must not mutate another language's recovery state"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_uninstall_all_query_removal_failure_preserves_parser() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

@@ -697,6 +697,18 @@ fn run_language_uninstall(
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
+    let targeted_language = if all {
+        None
+    } else {
+        let language = language
+            .as_deref()
+            .expect("targeted uninstall has a language");
+        if !queries::is_safe_language_name(language) {
+            eprintln!("✗ Invalid language name {:?}", language);
+            return Err(ExitCode::FAILURE);
+        }
+        Some(language)
+    };
     // `--all` promises to discover the complete install before removing it.
     // Validate both roots before recovery, which may delete stale staging
     // directories or restore backups. Discard this first snapshot and rescan
@@ -714,20 +726,15 @@ fn run_language_uninstall(
             eprintln!("Failed to validate install roots: {e}");
             ExitCode::FAILURE
         })?;
-        let language = language
-            .as_deref()
-            .expect("targeted uninstall has a language");
+        let language = targeted_language.expect("targeted uninstall has a language");
         preflight_targeted_query_state(&queries_dir, language).map_err(|e| {
             eprintln!("Failed to preflight targeted query state: {e}");
             ExitCode::FAILURE
         })?;
     }
-    if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
-        if all {
-            eprintln!("Failed to recover interrupted query installs: {e}");
-            return Err(ExitCode::FAILURE);
-        }
-        eprintln!("Warning: failed to recover interrupted query installs: {e}");
+    if all && let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+        eprintln!("Failed to recover interrupted query installs: {e}");
+        return Err(ExitCode::FAILURE);
     }
 
     // Determine which languages to uninstall
@@ -740,7 +747,11 @@ fn run_language_uninstall(
             .into_iter()
             .collect()
     } else {
-        vec![language.expect("language required when --all not specified")]
+        vec![
+            targeted_language
+                .expect("targeted uninstall has a language")
+                .to_string(),
+        ]
     };
 
     if languages_to_uninstall.is_empty() {
@@ -765,6 +776,17 @@ fn run_language_uninstall(
             eprintln!("Cancelled.");
             return Ok(());
         }
+    }
+
+    // Targeted recovery is deliberately after confirmation and scoped to the
+    // requested language: cancellation and invalid input must not mutate any
+    // recovery state, especially not another language's artifacts.
+    if let Some(language) = targeted_language
+        && let Err(e) =
+            queries::recover_interrupted_query_installs_for_language(&queries_dir, language)
+    {
+        eprintln!("Failed to recover interrupted query installs for '{language}': {e}");
+        return Err(ExitCode::FAILURE);
     }
 
     // Uninstall each language

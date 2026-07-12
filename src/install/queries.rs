@@ -508,6 +508,35 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
     Ok(())
 }
 
+/// Recover only artifacts belonging to `language`.
+///
+/// Targeted uninstall uses this after confirmation so it neither mutates
+/// unrelated languages nor performs recovery when the user cancels.
+pub fn recover_interrupted_query_installs_for_language(
+    queries_parent: &Path,
+    language: &str,
+) -> Result<(), QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let entries = match fs::read_dir(queries_parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(QueryInstallError::IoError(e)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if let Some((temp_language, _)) = temp_language_name_and_pid(&path)
+            && temp_language == language
+        {
+            remove_interrupted_temp_query_install(queries_parent, language, &path)?;
+        }
+    }
+    recover_interrupted_query_install(queries_parent, language)
+}
+
 pub struct QueryRemoval {
     pub removed_queries: bool,
     pub removed_backups: bool,
