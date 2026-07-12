@@ -339,8 +339,11 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
     std::fs::write(
         ws.path().join("kakehashi.toml"),
         format!(
-            "{}\n[languages.cpp]\nbase = \"lua\"\n",
-            config_toml().replace("languages = [\"lua\"]", "languages = [\"python\", \"lua\"]")
+            "{}\n[languages.cpp]\nbase = \"lua\"\n\n[languages.cpp.bridge._self]\nenabled = true\n",
+            config_toml().replace(
+                "languages = [\"lua\"]",
+                "languages = [\"python\", \"lua\", \"cpp\"]"
+            )
         ),
     )
     .expect("write Python formatter config");
@@ -370,8 +373,8 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
     let explicit = run_format(ws.path(), &["modeline"]);
     assert!(explicit.status.success());
     assert!(
-        String::from_utf8_lossy(&explicit.stderr).contains("1 unchanged"),
-        "an explicit path must still use full first-line detection; stderr: {}",
+        read(ws.path(), "modeline").contains("-*- C++ -*-\nVALUE = 2"),
+        "an explicit path must use full first-line detection and formatting; stderr: {}",
         String::from_utf8_lossy(&explicit.stderr)
     );
 }
