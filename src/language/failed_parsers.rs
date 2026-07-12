@@ -69,7 +69,7 @@ impl FailedParserRegistry {
         }
     }
 
-    /// Path to the "parsing in progress" state file.
+    /// Path to the legacy single-session marker used by older versions.
     fn parsing_state_path(&self) -> PathBuf {
         self.state_dir.join("parsing_in_progress")
     }
@@ -269,11 +269,10 @@ impl FailedParserRegistry {
         }
     }
 
-    /// Persist current parsing state to disk.
+    /// Force the current active-parser set into this session's durable marker.
     ///
-    /// This should be called on graceful shutdown to enable crash detection
-    /// across process restarts. If parsers are currently being parsed, write
-    /// their names to the parsing_in_progress file (one per line).
+    /// Begin/end transitions already persist this state synchronously. This
+    /// explicit flush remains available to lifecycle paths such as shutdown.
     pub fn persist_state(&self) -> io::Result<()> {
         let _guard = self
             .persistence_lock
