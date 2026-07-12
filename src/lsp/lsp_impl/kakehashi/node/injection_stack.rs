@@ -46,6 +46,32 @@ pub(super) struct InjectionLayer {
     ambiguous: bool,
 }
 
+/// Layers rebuilt at an anchor plus ambiguity discovered at an unparseable
+/// next layer.
+///
+/// `terminal_ambiguous` matters when multiple ID-minting candidates existed,
+/// but every bounded reparse failed. There is no tree to append in that case,
+/// yet a missing requested layer must still fail closed as `Ambiguous` rather
+/// than being misreported as ordinary edit drift.
+pub(super) struct InjectionStack {
+    layers: Vec<InjectionLayer>,
+    terminal_ambiguous: bool,
+}
+
+impl std::ops::Deref for InjectionStack {
+    type Target = [InjectionLayer];
+
+    fn deref(&self) -> &Self::Target {
+        &self.layers
+    }
+}
+
+impl InjectionStack {
+    fn missing_layer_is_ambiguous(&self) -> bool {
+        self.terminal_ambiguous || self.last().is_some_and(|entry| entry.ambiguous)
+    }
+}
+
 /// Outcome of resolving a depth-keyed node reference.
 pub(super) enum NodeResolution<R> {
     Found(R),
@@ -94,13 +120,15 @@ pub(super) fn injection_stack_at(
     host_text: &str,
     host_tree: &tree_sitter::Tree,
     byte: usize,
-) -> Vec<InjectionLayer> {
-    let mut stack: Vec<InjectionLayer> = Vec::new();
-    stack.push(InjectionLayer {
-        tree: host_tree.clone(),
-        ranges: vec![whole_document_range(host_text)],
-        ambiguous: false,
-    });
+) -> InjectionStack {
+    let mut stack = InjectionStack {
+        layers: vec![InjectionLayer {
+            tree: host_tree.clone(),
+            ranges: vec![whole_document_range(host_text)],
+            ambiguous: false,
+        }],
+        terminal_ambiguous: false,
+    };
 
     let mut current_language: String = host_language.to_string();
 
@@ -228,10 +256,11 @@ pub(super) fn injection_stack_at(
         // still cannot prove that parent was the sibling which minted the id.
         let ambiguous = parent_ambiguous || viable_candidates > 1;
         let Some((resolved_lang, injected_tree, absolute_ranges)) = selected else {
+            stack.terminal_ambiguous = ambiguous;
             break;
         };
 
-        stack.push(InjectionLayer {
+        stack.layers.push(InjectionLayer {
             tree: injected_tree,
             ranges: absolute_ranges,
             ambiguous,
@@ -353,7 +382,7 @@ pub(super) fn with_resolved_node_ranges<R>(
     // only. `stack.get(layer)` is None when the nesting is now shallower.
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
     let Some(layer_entry) = stack.get(layer) else {
-        return if stack.last().is_some_and(|entry| entry.ambiguous) {
+        return if stack.missing_layer_is_ambiguous() {
             NodeResolution::Ambiguous
         } else {
             NodeResolution::NotFound
@@ -416,7 +445,7 @@ pub(super) fn with_resolved_node_pair<R>(
 
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, desc_start);
     let Some(layer_entry) = stack.get(layer) else {
-        return if stack.last().is_some_and(|entry| entry.ambiguous) {
+        return if stack.missing_layer_is_ambiguous() {
             NodeResolution::Ambiguous
         } else {
             NodeResolution::NotFound
@@ -957,6 +986,16 @@ fn walk_child_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparseable_ambiguous_next_layer_stays_ambiguous() {
+        let stack = InjectionStack {
+            layers: Vec::new(),
+            terminal_ambiguous: true,
+        };
+
+        assert!(stack.missing_layer_is_ambiguous());
+    }
 
     /// The stored layer trees must be exactly what the inline walk would
     /// visit over the same (text, tree): same (language, depth) sequence and
