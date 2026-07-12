@@ -13,7 +13,12 @@ pub struct LanguageOperationGuard {
 
 impl LanguageOperationGuard {
     pub fn shared(data_dir: &Path) -> io::Result<Self> {
-        let file = open_lock_file(data_dir)?;
+        let path = data_dir.join(OPERATION_LOCK_FILE);
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => open_lock_file(data_dir)?,
+            Err(e) => return Err(e),
+        };
         file.lock_shared()?;
         Ok(Self { _file: file })
     }
@@ -64,5 +69,19 @@ mod tests {
         drop(shared);
         acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         drop(waiter.join().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_opens_existing_lock_without_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        drop(LanguageOperationGuard::exclusive(temp.path()).unwrap());
+        let lock_path = temp.path().join(OPERATION_LOCK_FILE);
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let shared = LanguageOperationGuard::shared(temp.path()).unwrap();
+        drop(shared);
     }
 }
