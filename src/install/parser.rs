@@ -1295,6 +1295,8 @@ mod tests {
             std::env::current_exe().expect("resolve current test executable"),
         )
         .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn short-lived child");
         let pid = child.id();
