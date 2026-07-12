@@ -259,6 +259,71 @@ fn test_config_file_invalid_path_expansion_fails_initialization() {
     );
 }
 
+#[test]
+fn test_config_file_masked_invalid_path_expansion_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let invalid = dir.path().join("invalid.toml");
+    let valid = dir.path().join("valid.toml");
+    std::fs::write(
+        &invalid,
+        "searchPaths = [\"$KAKEHASHI_TEST_UNDEFINED/path\"]\n",
+    )
+    .unwrap();
+    std::fs::write(&valid, "searchPaths = [\"/valid\"]\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(invalid.to_str().unwrap())
+        .arg("--config-file")
+        .arg(valid.to_str().unwrap())
+        .env_remove("KAKEHASHI_TEST_UNDEFINED")
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    assert!(
+        response.get("error").is_some(),
+        "a later explicit layer must not mask an earlier layer's invalid path: {response}"
+    );
+}
+
+#[test]
+fn test_config_file_does_not_make_invalid_initialization_options_fatal() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("valid.toml");
+    std::fs::write(&config_path, "autoInstall = false\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_TEST_UNDEFINED")
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "searchPaths": ["$KAKEHASHI_TEST_UNDEFINED/path"]
+            }
+        }),
+    );
+
+    assert!(
+        response.get("result").is_some(),
+        "initializationOptions keep their existing non-fatal policy: {response}"
+    );
+}
+
 /// --config-file with an empty temp file gives defaults only (test isolation pattern).
 #[test]
 fn test_config_file_empty_file_gives_defaults() {

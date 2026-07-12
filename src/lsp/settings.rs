@@ -85,30 +85,47 @@ pub fn load_settings(
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut used_deprecated_root_markers = false;
-    let explicit_config_requested = crate::config::expand::config_file_override().is_some();
+    let mut fatal_error = None;
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
-    let config_layers: Vec<Option<RawWorkspaceSettings>> =
-        if let Some(files) = crate::config::expand::config_file_override() {
-            events.push(SettingsEvent::info(format!(
-                "Using {} explicit config file(s); default config locations skipped",
-                files.len()
-            )));
-            files
-                .iter()
-                .map(|p| load_toml_file(p, &mut events, &mut used_deprecated_root_markers))
-                .collect()
-        } else {
-            vec![
-                // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-                load_user_config_with_events(&mut events, &mut used_deprecated_root_markers),
-                // Layer 3: Project config from root_path/kakehashi.toml
-                load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers),
-            ]
-        };
+    let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(files) =
+        crate::config::expand::config_file_override()
+    {
+        events.push(SettingsEvent::info(format!(
+            "Using {} explicit config file(s); default config locations skipped",
+            files.len()
+        )));
+        let mut layers = Vec::with_capacity(files.len());
+        for path in files {
+            let event_start = events.len();
+            let layer = load_toml_file(path, &mut events, &mut used_deprecated_root_markers);
+            if fatal_error.is_none() {
+                fatal_error = events[event_start..]
+                    .iter()
+                    .find(|event| event.kind == SettingsEventKind::Error)
+                    .map(|event| event.message.clone());
+            }
+            if let Some(raw_settings) = layer.as_ref()
+                && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+            {
+                let message = format!("Path expansion failed in {}: {errs}", path.display());
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error.get_or_insert(message);
+            }
+            layers.push(layer);
+        }
+        layers
+    } else {
+        vec![
+            // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
+            load_user_config_with_events(&mut events, &mut used_deprecated_root_markers),
+            // Layer 3: Project config from root_path/kakehashi.toml
+            load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers),
+        ]
+    };
 
     // Layer 4: Override settings from initialization options or client configuration
     let override_settings = override_settings.and_then(|(source, value)| {
@@ -143,15 +160,6 @@ pub fn load_settings(
                 }
             },
         );
-
-    let fatal_error = explicit_config_requested
-        .then(|| {
-            events
-                .iter()
-                .find(|event| event.kind == SettingsEventKind::Error)
-                .map(|event| event.message.clone())
-        })
-        .flatten();
 
     SettingsLoadOutcome {
         settings,
