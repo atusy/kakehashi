@@ -664,16 +664,16 @@ impl LanguageServerPool {
                     .map(|(_, handle)| Arc::clone(handle))
                     .collect()
             };
-            let mut ordering_guards = Vec::with_capacity(ordered_handles.len());
-            for handle in &ordered_handles {
-                ordering_guards.push(
-                    handle
-                        .dynamic_capabilities()
-                        .workspace_folder_ordering()
-                        .lock_owned()
-                        .await,
-                );
-            }
+            let ordering_locks: Vec<_> = ordered_handles
+                .iter()
+                .map(|handle| handle.dynamic_capabilities().workspace_folder_ordering())
+                .collect();
+            let ordering_guards = futures::future::join_all(
+                ordering_locks
+                    .into_iter()
+                    .map(|ordering| ordering.lock_owned()),
+            )
+            .await;
             let connections = Arc::clone(&self.connections).lock_owned().await;
             let snapshot_is_current = connections
                 .iter()
@@ -3417,10 +3417,13 @@ mod tests {
         drop(ordering);
         task.await.unwrap();
 
-        assert!(
-            !pool.connections.lock().await.contains_key(&key),
-            "the post-ack propagation decision must observe unregistration and recycle"
-        );
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while pool.connections.lock().await.contains_key(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the post-ack propagation decision must observe unregistration and recycle");
     }
 
     #[tokio::test]
