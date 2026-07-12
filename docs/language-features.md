@@ -360,8 +360,9 @@ they came from; querying with an `id` from a different document returns `null`.
 | `kakehashi/node/namedChildren` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate **named** children, in document order |
 | `kakehashi/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | The node's current text |
 
-Positions use the LSP default encoding, UTF-16 code units. kakehashi does not
-currently advertise or negotiate an alternate position encoding.
+Positions always use UTF-16 code units. When the client advertises
+`general.positionEncodings`, kakehashi explicitly selects `utf-16`; otherwise
+both sides use the LSP default of UTF-16.
 
 ### The `injection` parameter
 

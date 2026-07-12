@@ -136,12 +136,12 @@ Controls whether the entry point resolves through tree-sitter's anonymous-inclus
 
 The boundary rules below are stated in terms of UTF-8 byte offsets (`b`, `[s, e)`, `L`), matching the representation used by tree-sitter internally. The API surface, however, accepts LSP `Position` values whose `character` field unit depends on the negotiated `positionEncoding`.
 
-**Kakehashi follows the LSP default**: the server does not advertise an explicit `positionEncoding` in `ServerCapabilities`, so per LSP 3.18 spec the client must treat `Position.character` as a **UTF-16 code unit** offset. The server converts each incoming `Position` to a UTF-8 byte offset (via `PositionMapper`) before applying any boundary rule. This conversion is transparent to clients, but two consequences matter:
+**Kakehashi uses UTF-16 exclusively**: when a client advertises `general.positionEncodings`, the server selects and announces `positionEncoding: "utf-16"`; when the capability is omitted, both sides use the LSP default of UTF-16. The server converts each incoming `Position` to a UTF-8 byte offset (via `PositionMapper`) before applying any boundary rule. This conversion is transparent to clients, but two consequences matter:
 
 - For documents containing only ASCII, UTF-16 code units, UTF-8 bytes, and characters coincide — most boundary discussions remain intuitive.
 - For documents with non-ASCII characters (multi-byte in UTF-8, multi-code-unit in UTF-16 for surrogate pairs), clients must compute `Position.character` in UTF-16 code units. Sending a byte-based character count will misalign with the byte ranges resolved server-side, especially around emoji or CJK glyphs at injection or node boundaries.
 
-If a client requires a different encoding (UTF-8 or UTF-32), it should negotiate via `general.positionEncodings` in the initialize request. Kakehashi may choose to support those in the future, but currently does not.
+Clients must support UTF-16 as required by LSP even when they also advertise UTF-8 or UTF-32. Kakehashi may support selecting those optional encodings in the future, but currently always selects UTF-16.
 
 #### Half-Open Intervals
 

@@ -6,19 +6,19 @@ use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
-    CodeActionOptions, CodeActionProviderCapability, CodeLensOptions, CompletionOptions,
-    DeclarationCapability, DeclarationOptions, DefinitionOptions, DiagnosticOptions,
-    DiagnosticServerCapabilities, DocumentFormattingOptions, DocumentLinkOptions,
-    DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions, DocumentSymbolOptions,
-    ExecuteCommandOptions, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHintOptions, InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf,
-    ReferenceOptions, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri,
-    WorkDoneProgressOptions,
+    ClientCapabilities, CodeActionOptions, CodeActionProviderCapability, CodeLensOptions,
+    CompletionOptions, DeclarationCapability, DeclarationOptions, DefinitionOptions,
+    DiagnosticOptions, DiagnosticServerCapabilities, DocumentFormattingOptions,
+    DocumentLinkOptions, DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions,
+    DocumentSymbolOptions, ExecuteCommandOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InlayHintOptions, InlayHintServerCapabilities,
+    LinkedEditingRangeServerCapabilities, OneOf, PositionEncodingKind, ReferenceOptions,
+    RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
 };
 use url::Url;
 
@@ -54,11 +54,20 @@ fn lsp_legend_modifiers() -> Vec<SemanticTokenModifier> {
         .collect()
 }
 
+fn host_position_encoding(capabilities: &ClientCapabilities) -> Option<PositionEncodingKind> {
+    capabilities
+        .general
+        .as_ref()
+        .and_then(|general| general.position_encodings.as_ref())
+        .map(|_| PositionEncodingKind::UTF16)
+}
+
 impl Kakehashi {
     pub(crate) async fn initialize_impl(
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult> {
+        let position_encoding = host_position_encoding(&params.capabilities);
         // Store client capabilities for LSP compliance checks (e.g., refresh support).
         // Uses SettingsManager which wraps OnceLock for "set once, read many" semantics.
         self.settings_manager
@@ -259,6 +268,7 @@ impl Kakehashi {
             }),
             offset_encoding: None,
             capabilities: ServerCapabilities {
+                position_encoding,
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
@@ -1596,6 +1606,31 @@ async fn upstream_forwarding_loop_with_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_announces_utf16_when_position_encodings_are_advertised() {
+        use tower_lsp_server::ls_types::{
+            ClientCapabilities, GeneralClientCapabilities, PositionEncodingKind,
+        };
+
+        let capabilities = ClientCapabilities {
+            general: Some(GeneralClientCapabilities {
+                position_encodings: Some(vec![PositionEncodingKind::UTF8]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            host_position_encoding(&capabilities),
+            Some(PositionEncodingKind::UTF16),
+        );
+        assert_eq!(
+            host_position_encoding(&ClientCapabilities::default()),
+            None,
+            "omitted capability uses the protocol's UTF-16 default",
+        );
+    }
 
     /// A throwaway cancel context for tests that don't exercise cancellation.
     fn test_forwarded_cancel() -> crate::lsp::bridge::ForwardedRequestCancel {

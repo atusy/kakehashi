@@ -152,12 +152,45 @@ pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std:
     }
 
     // 2. Reject if result is absent or null
-    if response.get("result").filter(|r| !r.is_null()).is_none() {
+    let Some(result) = response.get("result").filter(|r| !r.is_null()) else {
         return Err(std::io::Error::other(
             "bridge: initialize response missing valid result",
         ));
-    }
+    };
 
+    validate_utf16_encoding(
+        result
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("positionEncoding")),
+        "capabilities.positionEncoding",
+    )?;
+    validate_utf16_encoding(result.get("offsetEncoding"), "offsetEncoding")?;
+
+    Ok(())
+}
+
+fn validate_utf16_encoding(
+    announced: Option<&serde_json::Value>,
+    field: &str,
+) -> std::io::Result<()> {
+    let Some(announced) = announced else {
+        return Ok(());
+    };
+    if announced.is_null() {
+        // Optional JSON-RPC fields are commonly serialized as explicit null;
+        // like absence, that announces no alternative to the UTF-16 default.
+        return Ok(());
+    }
+    let Some(encoding) = announced.as_str() else {
+        return Err(std::io::Error::other(format!(
+            "bridge: downstream initialize {field} is non-string; UTF-16 is required"
+        )));
+    };
+    if encoding != "utf-16" {
+        return Err(std::io::Error::other(format!(
+            "bridge: downstream initialize {field} announced {encoding:?}; UTF-16 is required"
+        )));
+    }
     Ok(())
 }
 
@@ -397,6 +430,26 @@ mod tests {
     #[case::valid_result_with_null_error(
         serde_json::json!({"result": {"capabilities": {}}, "error": null})
     )]
+    #[case::explicit_utf16_position_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {"positionEncoding": "utf-16"}}
+        })
+    )]
+    #[case::legacy_utf16_offset_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {}, "offsetEncoding": "utf-16"}
+        })
+    )]
+    #[case::null_standard_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {"positionEncoding": null}}
+        })
+    )]
+    #[case::null_legacy_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {}, "offsetEncoding": null}
+        })
+    )]
     #[case::complex_result_object(
         serde_json::json!({
             "result": {
@@ -449,6 +502,41 @@ mod tests {
             expected_error,
             err_msg
         );
+    }
+
+    #[rstest]
+    #[case::standard_utf8(
+        serde_json::json!({
+            "result": {"capabilities": {"positionEncoding": "utf-8"}}
+        }),
+        "positionEncoding",
+        "utf-8",
+    )]
+    #[case::legacy_utf8(
+        serde_json::json!({
+            "result": {"capabilities": {}, "offsetEncoding": "utf-8"}
+        }),
+        "offsetEncoding",
+        "utf-8",
+    )]
+    #[case::malformed_standard_encoding(
+        serde_json::json!({
+            "result": {"capabilities": {"positionEncoding": 16}}
+        }),
+        "positionEncoding",
+        "non-string",
+    )]
+    #[trace]
+    fn validate_rejects_non_utf16_position_encoding(
+        #[case] response: serde_json::Value,
+        #[case] field: &str,
+        #[case] announced: &str,
+    ) {
+        let error = validate_initialize_response(&response)
+            .expect_err("non-UTF-16 downstream encoding must fail initialization");
+        let message = error.to_string();
+        assert!(message.contains(field), "unexpected error: {message}");
+        assert!(message.contains(announced), "unexpected error: {message}");
     }
 
     #[rstest]

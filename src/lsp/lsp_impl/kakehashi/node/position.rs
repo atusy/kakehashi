@@ -10,8 +10,9 @@
 //! ## Why LSP `Position`, not tree-sitter `Point`
 //!
 //! The whole protocol accepts and returns LSP `Position` at its boundary
-//! (node-reference-protocol §"Position Encoding"); kakehashi advertises no
-//! `positionEncoding`, so `character` is a UTF-16 code unit per LSP 3.18. A
+//! (node-reference-protocol §"Position Encoding"); kakehashi selects UTF-16
+//! explicitly when the client advertises position encodings and otherwise uses
+//! the LSP default, so `character` is always a UTF-16 code unit. A
 //! tree-sitter `Point.column` is a UTF-8 byte offset, which diverges from LSP
 //! around any non-ASCII character (emoji, CJK). Returning native points would
 //! make these the only accessors a client must special-case. Instead the server
