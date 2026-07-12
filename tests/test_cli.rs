@@ -1209,6 +1209,59 @@ fn test_language_uninstall_all() {
     assert!(queries.is_empty(), "All queries should be removed");
 }
 
+/// `--all` must not claim success when it cannot enumerate installed parsers.
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_fails_for_unreadable_parser_dir() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::write(
+        parser_dir.join(format!("testlang.{}", std::env::consts::DLL_EXTENSION)),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make parser dir unreadable");
+
+    // Elevated test environments may retain permission to read mode-000 paths.
+    // Skip there rather than asserting a failure the OS cannot produce.
+    if fs::read_dir(&parser_dir).is_ok() {
+        fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore parser dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore parser dir permissions");
+
+    assert!(
+        !output.status.success(),
+        "unreadable install state must fail instead of reporting success; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Failed to scan installed languages"),
+        "stderr should identify the failed install scan: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {

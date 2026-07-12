@@ -480,13 +480,77 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
+fn collect_installed_languages_for_uninstall(
+    parser_dir: &Path,
+    queries_dir: &Path,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    use std::fs;
+    use std::io::ErrorKind;
+
+    let mut languages = std::collections::BTreeSet::new();
+
+    let parser_entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => Some(entries),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "cannot read parser directory '{}': {e}",
+                parser_dir.display()
+            ));
+        }
+    };
+    if let Some(entries) = parser_entries {
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "cannot read an entry in parser directory '{}': {e}",
+                    parser_dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let is_parser = path
+                .extension()
+                .map(|ext| ext == std::env::consts::DLL_EXTENSION)
+                .unwrap_or(false);
+            if is_parser && let Some(stem) = path.file_stem() {
+                languages.insert(stem.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let query_entries = match fs::read_dir(queries_dir) {
+        Ok(entries) => Some(entries),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "cannot read queries directory '{}': {e}",
+                queries_dir.display()
+            ));
+        }
+    };
+    if let Some(entries) = query_entries {
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "cannot read an entry in queries directory '{}': {e}",
+                    queries_dir.display()
+                )
+            })?;
+            if let Some(name) = installed_query_language_name(&entry.path()) {
+                languages.insert(name);
+            }
+        }
+    }
+
+    Ok(languages)
+}
+
 /// Run the language uninstall command
 fn run_language_uninstall(
     language: Option<String>,
     force: bool,
     all: bool,
 ) -> Result<(), ExitCode> {
-    use std::collections::BTreeSet;
     use std::fs;
     use std::io::{self, Write};
 
@@ -503,31 +567,13 @@ fn run_language_uninstall(
 
     // Determine which languages to uninstall
     let languages_to_uninstall: Vec<String> = if all {
-        // Collect all installed languages
-        let mut languages = BTreeSet::new();
-
-        if let Ok(entries) = fs::read_dir(&parser_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_parser = path
-                    .extension()
-                    .map(|ext| ext == std::env::consts::DLL_EXTENSION)
-                    .unwrap_or(false);
-                if is_parser && let Some(stem) = path.file_stem() {
-                    languages.insert(stem.to_string_lossy().to_string());
-                }
-            }
-        }
-
-        if let Ok(entries) = fs::read_dir(&queries_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = installed_query_language_name(&entry.path()) {
-                    languages.insert(name);
-                }
-            }
-        }
-
-        languages.into_iter().collect()
+        collect_installed_languages_for_uninstall(&parser_dir, &queries_dir)
+            .map_err(|e| {
+                eprintln!("Failed to scan installed languages: {e}");
+                ExitCode::FAILURE
+            })?
+            .into_iter()
+            .collect()
     } else {
         vec![language.expect("language required when --all not specified")]
     };
