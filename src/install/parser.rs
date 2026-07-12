@@ -497,7 +497,10 @@ fn claim_and_unlink_stale_parser_file(
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(ParserInstallError::IoError(error)),
+            // Cleanup is opportunistic. Some Unix-backed data directories do
+            // not support hard links; leaving a stale artifact is preferable
+            // to making every future parser install fail there.
+            Err(_) => return Ok(None),
         }
     }
 }
