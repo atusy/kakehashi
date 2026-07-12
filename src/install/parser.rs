@@ -180,18 +180,21 @@ fn publish_marker_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 fn windows_verbatim_path(path: &Path) -> std::io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
     let absolute = std::path::absolute(path)?;
-    let text = absolute.as_os_str().to_string_lossy();
-    let verbatim = if text.starts_with(r"\\?\") {
-        text.into_owned()
-    } else if let Some(unc) = text.strip_prefix(r"\\") {
-        format!(r"\\?\UNC\{unc}")
-    } else {
-        format!(r"\\?\{text}")
-    };
-    Ok(std::ffi::OsStr::new(&verbatim)
-        .encode_wide()
-        .chain(Some(0))
-        .collect())
+    let encoded: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    let mut verbatim =
+        if encoded.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
+            encoded
+        } else if encoded.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            let mut path: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+            path.extend_from_slice(&encoded[2..]);
+            path
+        } else {
+            let mut path: Vec<u16> = r"\\?\".encode_utf16().collect();
+            path.extend(encoded);
+            path
+        };
+    verbatim.push(0);
+    Ok(verbatim)
 }
 
 #[cfg(windows)]
@@ -1776,6 +1779,31 @@ mod tests {
 
         assert_eq!(
             fs::read(marker).expect("read long marker"),
+            PARSER_BACKUP_INTENT_CONTENT
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_marker_publish_preserves_non_unicode_windows_path() {
+        use std::os::windows::ffi::OsStringExt;
+        let temp = tempdir().expect("temp dir");
+        let component = std::ffi::OsString::from_wide(&[
+            b'm' as u16,
+            b'a' as u16,
+            b'r' as u16,
+            b'k' as u16,
+            0xD800,
+        ]);
+        let directory = temp.path().join(component);
+        fs::create_dir(&directory).expect("create non-Unicode directory");
+        let marker = directory.join("backup.owner");
+
+        write_marker_atomically(&marker, PARSER_BACKUP_INTENT_CONTENT)
+            .expect("publish non-Unicode marker");
+
+        assert_eq!(
+            fs::read(marker).expect("read marker"),
             PARSER_BACKUP_INTENT_CONTENT
         );
     }
