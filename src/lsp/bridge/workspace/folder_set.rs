@@ -122,14 +122,16 @@ impl WorkspaceFolderSet {
             return false;
         }
         let folders = guard.get_or_insert_with(Vec::new);
-        let before = folders.clone();
+        let before_len = folders.len();
         folders.retain(|existing| !removed.iter().any(|removed| removed.uri == existing.uri));
+        let mut changed = folders.len() != before_len;
         for folder in added {
             if !folders.iter().any(|existing| existing.uri == folder.uri) {
                 folders.push(folder);
+                changed = true;
             }
         }
-        *folders != before
+        changed
     }
 
     /// Apply an upstream delta only after its effective wire delta is queued.
