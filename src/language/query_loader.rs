@@ -415,7 +415,8 @@ impl QueryLoader {
 
 fn is_single_path_component(value: &str) -> bool {
     let mut components = Path::new(value).components();
-    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+    matches!(components.next(), Some(Component::Normal(name)) if name == value)
+        && components.next().is_none()
 }
 
 fn normalize_inherited_language_name(name: &str) -> String {
@@ -513,6 +514,8 @@ mod tests {
         assert!(!is_single_path_component(".."));
         assert!(!is_single_path_component("../rust"));
         assert!(!is_single_path_component("rust/query"));
+        assert!(!is_single_path_component("rust/"));
+        assert!(!is_single_path_component("rust/."));
         assert!(!is_single_path_component("/rust"));
     }
 
