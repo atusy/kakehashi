@@ -302,14 +302,18 @@ pub fn remove_parser_install_and_backups(
     }
     cleanup_orphan_parser_backup_markers(parser_dir, language)?;
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
-    let mut removed = match fs::remove_file(parser_file) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
-    };
+    // Remove recovery copies first. If uninstall is interrupted, leaving the
+    // canonical parser is an incomplete uninstall that can be retried; deleting
+    // canonical first could let the next install resurrect an old backup.
+    let mut removed = false;
     for backup in parser_backup_files(parser_dir, language)? {
         remove_owned_parser_backup(&backup)?;
         removed = true;
+    }
+    match fs::remove_file(parser_file) {
+        Ok(()) => removed = true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     Ok(removed)
 }
