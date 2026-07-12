@@ -3,6 +3,18 @@
 
 use std::process::Command;
 
+#[cfg(unix)]
+fn directory_is_enumerable(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path)
+        .and_then(|entries| {
+            for entry in entries {
+                entry?;
+            }
+            Ok(())
+        })
+        .is_ok()
+}
+
 /// Test that --help flag shows help message with program description
 #[test]
 fn test_help_flag_shows_help_message() {
@@ -1236,7 +1248,7 @@ fn assert_uninstall_all_fails_for_unreadable_dir(dir_name: &str) {
 
     // Elevated test environments may retain permission to read mode-000 paths.
     // Skip there rather than asserting a failure the OS cannot produce.
-    if fs::read_dir(&install_dir).is_ok() {
+    if directory_is_enumerable(&install_dir) {
         fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o700))
             .expect("Failed to restore install dir permissions");
         return;
@@ -1621,7 +1633,7 @@ fn test_language_uninstall_all_preflights_before_query_recovery() {
     fs::create_dir_all(&stranded_tmp).expect("Failed to create stranded query temp dir");
     fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o000))
         .expect("Failed to make parser dir unreadable");
-    if fs::read_dir(&parser_dir).is_ok() {
+    if directory_is_enumerable(&parser_dir) {
         fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
             .expect("Failed to restore parser dir permissions");
         return;
@@ -1709,7 +1721,7 @@ fn test_language_uninstall_all_preflights_query_contents_before_parser_removal()
         .expect("Failed to write query");
     fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o000))
         .expect("Failed to make query dir unreadable");
-    if fs::read_dir(&query_dir).is_ok() {
+    if directory_is_enumerable(&query_dir) {
         fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o700))
             .expect("Failed to restore query dir permissions");
         return;
@@ -1754,7 +1766,7 @@ fn test_language_uninstall_preflights_target_query_contents() {
         .expect("Failed to write nested query");
     fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
         .expect("Failed to make nested query unreadable");
-    if fs::read_dir(&nested).is_ok() {
+    if directory_is_enumerable(&nested) {
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
             .expect("Failed to restore nested query permissions");
         return;
@@ -1836,7 +1848,7 @@ fn test_language_uninstall_ignores_unrelated_unreadable_recovery_state() {
         .expect("Failed to write unrelated recovery query");
     fs::set_permissions(&unrelated_tmp, fs::Permissions::from_mode(0o000))
         .expect("Failed to make unrelated recovery state unreadable");
-    if fs::read_dir(&unrelated_tmp).is_ok() {
+    if directory_is_enumerable(&unrelated_tmp) {
         fs::set_permissions(&unrelated_tmp, fs::Permissions::from_mode(0o700))
             .expect("Failed to restore recovery permissions");
         return;
@@ -1937,7 +1949,7 @@ fn test_language_uninstall_all_preflights_recovery_backups_before_restore() {
     .expect("Failed to mark backup ownership");
     fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
         .expect("Failed to make backup subtree unreadable");
-    if fs::read_dir(&nested).is_ok() {
+    if directory_is_enumerable(&nested) {
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
             .expect("Failed to restore backup permissions");
         return;
@@ -2038,7 +2050,7 @@ fn test_language_uninstall_all_ignores_unrelated_hidden_query_dirs() {
     fs::write(&parser, "fake").expect("Failed to write parser");
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o000))
         .expect("Failed to make unrelated cache unreadable");
-    if fs::read_dir(&cache_dir).is_ok() {
+    if directory_is_enumerable(&cache_dir) {
         fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700))
             .expect("Failed to restore cache permissions");
         return;
