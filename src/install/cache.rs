@@ -83,13 +83,15 @@ impl MetadataCache {
             .map(|metadata| metadata.permissions());
         let temporary_name = format!(".parsers.lua.{}.tmp", ulid::Ulid::new());
         let mut temporary = create_cache_temp(&cache_dir, &temporary_name)?;
-        write(&mut temporary, content)?;
-        if let Some(permissions) = existing_permissions {
-            temporary.set_permissions(permissions)?;
-        }
-        temporary.sync_all()?;
-        drop(temporary);
-        if let Err(error) = cache_dir.rename(&temporary_name, &cache_dir, "parsers.lua") {
+        let publish = (|| {
+            write(&mut temporary, content)?;
+            if let Some(permissions) = existing_permissions {
+                temporary.set_permissions(permissions)?;
+            }
+            temporary.sync_all()?;
+            publish_cache_temp(&cache_dir, temporary, &temporary_name)
+        })();
+        if let Err(error) = publish {
             let _ = cache_dir.remove_file(&temporary_name);
             return Err(error);
         }
@@ -119,6 +121,60 @@ impl MetadataCache {
         let cache =
             cap_primitives::fs::open_dir_nofollow(&root.into_std_file(), Path::new("cache"))?;
         Ok(cap_std::fs::Dir::from_std_file(cache))
+    }
+}
+
+#[cfg(not(windows))]
+fn publish_cache_temp(
+    cache_dir: &cap_std::fs::Dir,
+    temporary: cap_std::fs::File,
+    temporary_name: &str,
+) -> io::Result<()> {
+    drop(temporary);
+    cache_dir.rename(temporary_name, cache_dir, "parsers.lua")
+}
+
+#[cfg(windows)]
+fn publish_cache_temp(
+    cache_dir: &cap_std::fs::Dir,
+    temporary: cap_std::fs::File,
+    _temporary_name: &str,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let directory = cache_dir.try_clone()?.into_std_file();
+    let temporary = temporary.into_std();
+    let filename: Vec<u16> = "parsers.lua".encode_utf16().collect();
+    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = header + filename.len() * std::mem::size_of::<u16>();
+    let mut buffer = vec![0_u8; size];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `buffer` is sized for the fixed header plus the UTF-16 filename;
+    // both file handles remain alive for the call, and the relative filename is
+    // resolved by Windows against the validated cache-directory handle.
+    let succeeded = unsafe {
+        (*information).Anonymous.ReplaceIfExists = true;
+        (*information).RootDirectory = directory.as_raw_handle();
+        (*information).FileNameLength = u32::try_from(filename.len() * 2).unwrap();
+        std::ptr::copy_nonoverlapping(
+            filename.as_ptr(),
+            (*information).FileName.as_mut_ptr(),
+            filename.len(),
+        );
+        SetFileInformationByHandle(
+            temporary.as_raw_handle(),
+            FileRenameInfo,
+            information.cast(),
+            u32::try_from(size).unwrap(),
+        )
+    };
+    if succeeded == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -212,6 +268,19 @@ mod tests {
         // Read from cache
         let cached = cache.read().expect("Cache should be readable");
         assert_eq!(cached, content);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cache_write_atomically_replaces_existing_entry() {
+        let temp = tempdir().unwrap();
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("first").unwrap();
+
+        cache.write("second").unwrap();
+
+        assert_eq!(cache.read().as_deref(), Some("second"));
+        assert_eq!(fs::read_dir(&cache.cache_dir).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
@@ -382,6 +451,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(cache.cache_path()).unwrap(), "previous");
+        assert_eq!(fs::read_dir(&cache.cache_dir).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
