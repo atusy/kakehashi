@@ -739,6 +739,7 @@ fn write_forced_output_with(
                     format!("refusing to follow output symlink '{}'", path.display()),
                 ));
             }
+            reject_multiple_hard_links(path, &metadata)?;
             temporary
                 .as_file()
                 .set_permissions(metadata.permissions())?;
@@ -747,6 +748,60 @@ fn write_forced_output_with(
         }
         Err(error) => Err(error.error),
     }
+}
+
+#[cfg(unix)]
+fn reject_multiple_hard_links(
+    _path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    reject_hard_link_count(metadata.nlink())
+}
+
+#[cfg(windows)]
+fn reject_multiple_hard_links(
+    path: &std::path::Path,
+    _metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::File::open(path)?;
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the handle remains valid for the call and Windows initializes the
+    // complete output structure on success.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandle succeeded above.
+    let information = unsafe { information.assume_init() };
+    reject_hard_link_count(u64::from(information.nNumberOfLinks))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn reject_multiple_hard_links(
+    _path: &std::path::Path,
+    _metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn reject_hard_link_count(links: u64) -> std::io::Result<()> {
+    if links > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing atomic replacement of a file with {links} hard links; remove the aliases first"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Run the config init command
@@ -1238,6 +1293,53 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_output_rejects_multiply_linked_file_without_changes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        let alias = temp.path().join("alias.toml");
+        std::fs::write(&output, "existing").unwrap();
+        std::fs::hard_link(&output, &alias).unwrap();
+        let inode = std::fs::metadata(&output).unwrap().ino();
+
+        let error = write_forced_output(&output, "generated").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("hard links"));
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "existing");
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "existing");
+        assert_eq!(std::fs::metadata(output).unwrap().ino(), inode);
+        assert_eq!(std::fs::metadata(alias).unwrap().ino(), inode);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn force_output_rejects_windows_hard_links_without_changes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        let alias = temp.path().join("alias.toml");
+        std::fs::write(&output, "existing").unwrap();
+        if let Err(error) = std::fs::hard_link(&output, &alias) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create hard link: {error}");
+        }
+
+        let error = write_forced_output(&output, "generated").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("hard links"));
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
+        assert_eq!(std::fs::read_to_string(alias).unwrap(), "existing");
     }
 
     #[cfg(unix)]
