@@ -130,13 +130,13 @@ fn spawn_invalidated_connection_cleanup(
         // snapshot and coordinate these handles under its own deadline.
         drop(connections);
 
-        for key in &invalidated {
+        for key in invalidated {
             host_documents
                 .lock()
                 .await
-                .retain(|(_, connection_key), _| connection_key != key);
-            document_tracker.purge_connection(key).await;
-            purge_transition_locks(&open_transition_locks, key).await;
+                .retain(|(_, connection_key), _| connection_key != &key);
+            document_tracker.purge_connection(&key).await;
+            purge_transition_locks(&open_transition_locks, &key).await;
         }
         let mut shutdowns = tokio::task::JoinSet::new();
         for (key, handle) in &stale_handles {
